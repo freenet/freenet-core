@@ -1089,8 +1089,13 @@ async fn websocket_commands(
     // that carries a `UserSecretContext`, which only the hosted serve path
     // (which DOES install the limiter) ever derives.
     op_rate_limiter: Option<Extension<UserOpRateLimiter>>,
+    // The node's secrets dir for stamping per-user last-activity markers
+    // (#4561). OPTIONAL: only `serve_client_api_in_impl` installs it; the
+    // standalone test paths install nothing, so absence ⇒ no activity stamping.
+    activity_secrets_dir: Option<Extension<crate::server::ActivitySecretsDir>>,
 ) -> Response {
     let op_rate_limiter = op_rate_limiter.map(|Extension(l)| l);
+    let activity_secrets_dir = activity_secrets_dir.map(|Extension(d)| d);
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need from the DashMap
         // Track whether a token was provided but is invalid (stale/expired)
@@ -1149,6 +1154,7 @@ async fn websocket_commands(
             auth_and_instance,
             user_context,
             op_rate_limiter,
+            activity_secrets_dir,
             token_is_invalid,
             encoding_protoc,
             api_version,
@@ -1212,6 +1218,10 @@ async fn websocket_interface(
     // user's connections; consulted in `process_client_request` only when this
     // connection carries a `user_context`.
     op_rate_limiter: Option<UserOpRateLimiter>,
+    // The node's secrets dir for per-user last-activity stamping (#4561). `None`
+    // on standalone/test paths; an empty path also disables stamping. Used only
+    // when this connection carries a `user_context` (hosted mode).
+    activity_secrets_dir: Option<crate::server::ActivitySecretsDir>,
     token_is_invalid: bool,
     encoding_protoc: EncodingProtocol,
     api_version: ApiVersion,
@@ -1220,6 +1230,16 @@ async fn websocket_interface(
     let (mut response_rx, client_id) =
         new_client_connection(&request_sender, auth_token.clone()).await?;
     let (mut server_sink, mut client_stream) = ws.split();
+
+    // Stamp last-activity on CONNECT (#4561, inactive-user TTL): a fresh
+    // connection from a hosted user is activity, so refresh their `.last_seen`
+    // marker right away (debounced — a no-op if a recent stamp exists). Gated on
+    // `user_context.is_some()` so Local/non-hosted connections never write a
+    // marker. Best-effort and off the request hot path (runs once per
+    // connection). See `stamp_activity` for the wall-clock + debounce details.
+    if let (Some(ctx), Some(dir)) = (user_context.as_ref(), activity_secrets_dir.as_ref()) {
+        stamp_activity(dir, ctx);
+    }
     let contract_updates: Arc<Mutex<VecDeque<(_, mpsc::Receiver<HostResult>)>>> =
         Arc::new(Mutex::new(VecDeque::new()));
 
@@ -1336,6 +1356,7 @@ async fn websocket_interface(
                     auth_token.as_mut().map(|t| t.1),
                     user_context.as_ref(),
                     op_rate_limiter.as_ref(),
+                    activity_secrets_dir.as_ref(),
                     api_version,
                     &mut delegate_rate_limiter,
                     &mut conn_state,
@@ -1614,6 +1635,28 @@ fn extract_stream_content(
 /// (control / reassembly, already bounded per-connection by the stdlib) — does
 /// not count, so a client can always authenticate and disconnect even while
 /// throttled.
+/// Stamp a hosted user's durable last-activity marker (#4561, P5 of #4381,
+/// inactive-user TTL). Wraps [`crate::wasm_runtime::stamp_user_last_seen`] with
+/// the real wall-clock now and the default debounce, and short-circuits when no
+/// secrets dir is configured (empty path ⇒ standalone/test composition with no
+/// tree to mark). Cheap on the hot path: a single `stat`, and a write only when
+/// the marker is older than the debounce interval.
+fn stamp_activity(dir: &crate::server::ActivitySecretsDir, ctx: &UserSecretContext) {
+    let base = dir.0.as_ref();
+    if base.as_os_str().is_empty() {
+        return;
+    }
+    // Single shared wall-clock source (incl. its clamp-to-0) so the stamp hook
+    // and the reclaim sweep can never drift.
+    let now = crate::wasm_runtime::wall_clock_unix_secs();
+    crate::wasm_runtime::stamp_user_last_seen(
+        base,
+        ctx.user_id(),
+        now,
+        crate::wasm_runtime::DEFAULT_LAST_SEEN_DEBOUNCE_SECS,
+    );
+}
+
 fn is_rate_limited_op(req: &ClientRequest<'_>) -> bool {
     matches!(
         req,
@@ -1630,6 +1673,7 @@ async fn process_client_request(
     origin_contract: Option<ContractInstanceId>,
     user_context: Option<&UserSecretContext>,
     op_rate_limiter: Option<&UserOpRateLimiter>,
+    activity_secrets_dir: Option<&crate::server::ActivitySecretsDir>,
     api_version: ApiVersion,
     rate_limiter: &mut DelegateRateLimiter,
     conn_state: &mut ConnectionState,
@@ -1764,6 +1808,18 @@ async fn process_client_request(
             };
             return Ok(Some(Message::Binary(serialized.into())));
         }
+    }
+
+    // Stamp last-activity for this hosted user on EVERY request (#4561,
+    // inactive-user TTL). Done BEFORE the rate-limit check below so a user who
+    // is currently being THROTTLED still counts as active and can never be
+    // reclaimed as "abandoned" — a rate-limited request is the strongest
+    // possible evidence the user is present. Gated on `user_context.is_some()`
+    // (hosted mode honored a token), and debounced to ~free on the hot path
+    // (a single `stat`, no write, unless the marker is >1h stale). See
+    // `stamp_activity`.
+    if let (Some(ctx), Some(dir)) = (user_context, activity_secrets_dir) {
+        stamp_activity(dir, ctx);
     }
 
     // Per-user operation rate limit (#4561, P5 of #4381). Bounds how fast a
@@ -3817,6 +3873,7 @@ mod tests {
             None,
             user_context,
             op_rate_limiter,
+            None, // no activity stamping in rate-limit unit tests
             ApiVersion::V1,
             &mut delegate_rate_limiter,
             &mut conn_state,

@@ -823,8 +823,8 @@ impl ReDb {
         }
     }
 
-    /// Remove a per-user secrets index entry.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Remove a per-user secrets index entry. Called by the inactive-user TTL
+    /// reclaim (#4561, P5 of #4381) in production, and by index tests.
     pub fn remove_user_secrets_index(
         &self,
         delegate_key: &DelegateKey,

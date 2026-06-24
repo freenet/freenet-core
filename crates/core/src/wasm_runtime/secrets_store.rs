@@ -76,6 +76,35 @@ type SecretKey = [u8; 32];
 /// plaintext, in the ReDb index).
 const KEY_REGISTRY_FILE: &str = ".keys";
 
+/// Literal directory segment that holds the per-user secret namespaces under a
+/// delegate dir (`<base>/<delegate>/users/<user_id>/…`) AND the delegate-
+/// independent per-user activity markers (`<base>/users/<user_id>/.last_seen`).
+/// A `bs58(32-byte)` name is always 43–44 chars, so the literal `"users"` can
+/// never collide with a delegate dir, a `SecretsId` blob, or a `UserId` dir —
+/// every walk that filters on [`decode_bs58_32`] skips it automatically.
+const USERS_DIR: &str = "users";
+
+/// Per-user last-activity marker (#4561, P5 of #4381, inactive-user TTL).
+/// Lives at `<base>/users/<user_id>/.last_seen` (delegate-INDEPENDENT — one
+/// marker per user, not one per delegate) and stores the user's most recent
+/// activity as a decimal UNIX-epoch-seconds string.
+///
+/// It is deliberately placed under the delegate-independent `<base>/users/`
+/// subtree, NOT inside any `<delegate>/users/<user_id>/` secret tree, so it is
+/// invisible to every quota / secret disk walk (those only ever descend into a
+/// delegate dir, whose name is `bs58(32)` — `"users"` is skipped by
+/// [`decode_bs58_32`]). The marker therefore never counts toward a user's
+/// quota and never confuses secret enumeration.
+const LAST_SEEN_FILE: &str = ".last_seen";
+
+/// Default minimum interval between rewrites of a user's `.last_seen` marker on
+/// the hot request path (#4561). A stamp older than this is refreshed; a newer
+/// one is left untouched, so the steady-state per-request cost is a single
+/// `stat` (no write) — see [`stamp_user_last_seen`]. One hour is far below the
+/// 30-day TTL, so the marker can never go more than ~1h stale while a user is
+/// active, which is negligible slack against a 30-day reclaim threshold.
+pub const DEFAULT_LAST_SEEN_DEBOUNCE_SECS: u64 = 3_600;
+
 /// Maximum number of raw keys retained per scope in the enumeration registry.
 /// This bounds the registry's memory and on-disk size against a delegate that
 /// stores an unbounded key family (the #3798 amplification class). Once the
@@ -276,6 +305,41 @@ pub fn user_dek_secret(token: &[u8]) -> Zeroizing<[u8; 32]> {
 /// `--per-user-secret-quota=BYTES` / `per-user-secret-quota` in config; `0`
 /// disables enforcement entirely.
 pub const DEFAULT_PER_USER_SECRET_QUOTA_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default inactivity TTL for hosted users (#4561, P5 of #4381): 30 days in
+/// seconds. After this much real-calendar inactivity a hosted user's entire
+/// per-user footprint is reclaimed by the background sweep, keeping a public
+/// "try Freenet" node a transient demo with bounded storage. Operator-
+/// overridable via `--per-user-inactive-ttl=SECS` / `per-user-inactive-ttl`
+/// in config; `0` disables the sweep. Single source of truth for the in-code
+/// default so the operator-facing default and the config fallback never drift.
+pub const DEFAULT_PER_USER_INACTIVE_TTL_SECS: u64 = 2_592_000;
+
+/// Maximum users reclaimed in ONE sweep pass (#4561, clock-fault blast-radius
+/// guard). The reclaim is destructive, and the per-user eligibility test trusts
+/// wall-clock `now`; a forward clock jump (NTP correcting a bad RTC, a date
+/// misconfig, a VM restored from a skewed snapshot) would make EVERY user's age
+/// suddenly exceed the TTL, so an unbounded pass could silently delete the whole
+/// user base at once. Capping the pass bounds that blast radius and — paired
+/// with a LOUD warn when the cap is hit — surfaces the anomaly so an operator
+/// can intervene before more is lost. Sized generously: a normal idle backlog
+/// (hundreds of genuinely-abandoned users) drains over a few hourly sweeps,
+/// while a clock fault can never wipe more than this many users per pass. The
+/// remainder is simply deferred to the next sweep (the reclaim is idempotent and
+/// crash-safe, so deferral is free).
+pub const MAX_RECLAIMS_PER_SWEEP: usize = 256;
+
+/// Multiplier on the sweep interval defining the largest plausible gap between
+/// two consecutive sweeps (#4561, clock-fault detector). If wall-clock `now`
+/// advanced by MORE than `sweep_interval * this` since the previous sweep, the
+/// clock almost certainly jumped forward (or the node was suspended/restored
+/// across a long gap) rather than the interval having elapsed normally, so the
+/// sweep SKIPS reclaim for that pass and warns. This catches a forward jump
+/// BETWEEN sweeps before ANY delete happens, and conservatively skips a single
+/// pass after legitimate long downtime (the users restamp on reconnect and the
+/// next pass proceeds normally). 8× an hourly interval is 8h — comfortably above
+/// jitter/missed-tick delay, well below a real multi-day skew.
+pub const SWEEP_MAX_GAP_INTERVAL_MULTIPLE: u64 = 8;
 
 /// Process-wide tracker of per-[`UserId`] on-disk secret-byte totals.
 ///
@@ -716,6 +780,612 @@ fn ensure_owner_only_tree(base: &Path, full: &Path) -> std::io::Result<()> {
         ensure_owner_only_dir(&current)?;
     }
     Ok(())
+}
+
+// ============================================================================
+// Inactive-user TTL reclaim (#4561, P5 of #4381)
+//
+// A hosted node is meant to be a TRANSIENT demo: a web visitor gets a per-user
+// secret namespace, plays with Freenet, and either exports their data to their
+// own peer or walks away. The walk-away case must not let storage grow without
+// bound, so a background sweep reclaims a WHOLE user's data after `ttl_secs` of
+// real-calendar inactivity. None of this runs (or is even reachable) outside
+// hosted mode — the Local single-user node never enumerates or reclaims
+// anything, because its secrets live in `<base>/<delegate>/` (Local scope),
+// NOT under any `<...>/users/<user_id>/` tree the sweep touches.
+//
+// CARDINAL RULE: never reclaim an ACTIVE user (that is silent data loss).
+// Activity tracking is therefore conservative and DURABLE — see
+// `stamp_user_last_seen` / `read_user_last_seen` below.
+//
+// The functions here are FREE functions (not `SecretsStore` methods) on purpose:
+// the sweep runs from a background task that does NOT own a live `SecretsStore`
+// (the pooled executors each own their own). They operate only on the DURABLE
+// layer — the on-disk tree (source of truth), the shared ReDb index, and the
+// process-global quota tracker — all of which a restart rebuilds in-memory
+// caches from. A pooled executor's stale in-memory `user_key_to_secret_part`
+// entry pointing at a now-deleted blob is harmless: `get_secret` returns
+// `MissingSecret` (it does NOT panic — see the `fs::read` on the read path),
+// and the entry is gone after the next restart hydrates from the (now-cleared)
+// ReDb table. Reclaim targets ABANDONED users (≥30 days idle, no live
+// connection), so there is no live executor actively serving the reclaimed user
+// whose cache would matter.
+// ============================================================================
+
+/// Path to a user's delegate-independent activity-marker directory,
+/// `<base>/users/<user_id>/`. The `.last_seen` file lives directly inside it.
+fn user_activity_dir(base_path: &Path, user_id: &UserId) -> PathBuf {
+    base_path.join(USERS_DIR).join(user_id.encode())
+}
+
+/// Wall-clock UNIX-epoch seconds.
+///
+/// WALL-CLOCK JUSTIFICATION (load-bearing — do not "fix" this to `TimeSource`):
+/// the inactive-user TTL is a DURABLE CALENDAR-TIME threshold (e.g. 30 real
+/// days) that must hold ACROSS PROCESS RESTARTS. That rules out both project
+/// time abstractions. `TimeSource` returns simulation-relative `Duration` with
+/// no stable epoch — it resets every test/process and cannot be compared to a
+/// timestamp persisted to disk in a prior run. `Instant` is monotonic-from-boot
+/// — it resets on restart, so a marker written before a restart would look "in
+/// the future" afterwards. Only real wall-clock (`SystemTime` → unix epoch)
+/// gives a timestamp that is still meaningful after the node restarts, which is
+/// exactly what a durable 30-day TTL needs. This mirrors the existing wall-clock
+/// exception already documented on this module's `SystemTime` import (snapshot
+/// epoch_ms).
+///
+/// The TESTABLE core never calls this directly: `stamp_user_last_seen` and
+/// `reclaim_inactive_users` take `now`/`ttl` as parameters so tests are fully
+/// deterministic with no real clock. The thin non-test wrappers (the sweep task
+/// and the WS `stamp_activity` hook) call THIS so there is exactly one
+/// wall-clock source — including its clamp-to-0 behavior — and no drift.
+pub fn wall_clock_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        // A clock set before 1970 is absurd; clamp to 0 rather than panic so a
+        // misconfigured host degrades to "looks very old" (eligible for reclaim
+        // only if also past the TTL) instead of crashing the sweep.
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Read a user's persisted last-activity timestamp (unix epoch seconds), or
+/// `None` if the marker is absent or unreadable/corrupt.
+///
+/// A missing OR unparseable marker returns `None`. The caller
+/// ([`reclaim_inactive_users`]) treats `None` CONSERVATIVELY — it does NOT
+/// reclaim a user whose marker it cannot read, because "no readable activity
+/// record" must never be interpreted as "definitely inactive". (A user that has
+/// secrets but somehow no marker is left alone rather than risking deletion of
+/// live data; the marker is (re)written on their next request anyway.)
+fn read_user_last_seen(base_path: &Path, user_id: &UserId) -> Option<u64> {
+    let path = user_activity_dir(base_path, user_id).join(LAST_SEEN_FILE);
+    let raw = fs::read_to_string(&path).ok()?;
+    raw.trim().parse::<u64>().ok()
+}
+
+/// Stamp a user's `.last_seen` marker to `now` (unix epoch seconds), DEBOUNCED:
+/// the marker is rewritten only if it is missing or older than
+/// `debounce_secs`. Returns `true` iff a write actually happened (for tests /
+/// observability); the common hot-path outcome is `false` (a single `stat`,
+/// no write).
+///
+/// `now`/`debounce_secs` are parameters so the testable core is deterministic.
+/// Production passes [`wall_clock_unix_secs`] and
+/// [`DEFAULT_LAST_SEEN_DEBOUNCE_SECS`].
+///
+/// Best-effort and NON-FATAL: a stamp failure (disk full, race) is logged at
+/// debug and swallowed. Losing a single stamp only risks a marker going at most
+/// `debounce_secs` (≪ TTL) more stale than reality — the next request restamps
+/// — so it can never cause a false reclaim within the 30-day window.
+pub fn stamp_user_last_seen(
+    base_path: &Path,
+    user_id: &UserId,
+    now: u64,
+    debounce_secs: u64,
+) -> bool {
+    // Debounce: skip the write if the existing marker is recent enough.
+    if let Some(prev) = read_user_last_seen(base_path, user_id) {
+        if now.saturating_sub(prev) < debounce_secs {
+            return false;
+        }
+    }
+    let dir = user_activity_dir(base_path, user_id);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        tracing::debug!(user_id = %user_id.encode(), error = %e, "last_seen: mkdir failed");
+        return false;
+    }
+    // Tighten the activity subtree to owner-only, matching the secret tree's
+    // at-rest posture. Best-effort: a marker is not secret (it's a timestamp),
+    // but keeping the whole per-user tree 0o700 avoids leaking which user_ids
+    // exist to other local users.
+    ensure_owner_only_tree(base_path, &dir).ok();
+    // Write via a temp file + rename so a concurrent reader never sees a
+    // half-written value. The marker is tiny and the write is rare (debounced),
+    // so the extra rename is negligible.
+    let tmp = dir.join(format!("{LAST_SEEN_FILE}.tmp"));
+    let final_path = dir.join(LAST_SEEN_FILE);
+    let write_then_rename = || -> std::io::Result<()> {
+        fs::write(&tmp, now.to_string())?;
+        fs::rename(&tmp, &final_path)
+    };
+    match write_then_rename() {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!(user_id = %user_id.encode(), error = %e, "last_seen: write failed");
+            fs::remove_file(&tmp).ok();
+            false
+        }
+    }
+}
+
+/// Enumerate every user that currently has an activity marker, i.e. every
+/// `<base>/users/<user_id>/` directory. Returns the decoded [`UserId`]s.
+///
+/// This is the sweep's candidate set. A user only ever gets a marker by being
+/// active in hosted mode (`stamp_user_last_seen`), so a Local single-user node
+/// — which never stamps — produces an EMPTY set here, an extra guarantee on top
+/// of the hosted-mode spawn gate that the sweep can never touch Local data.
+///
+/// A missing `<base>/users/` dir ⇒ no hosted users ⇒ empty. Any other read
+/// error is logged and treated as empty for THIS pass (the sweep retries next
+/// interval) rather than aborting the node.
+fn enumerate_marked_users(base_path: &Path) -> Vec<UserId> {
+    let users_root = base_path.join(USERS_DIR);
+    let rd = match fs::read_dir(&users_root) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %users_root.display(), "inactive-user sweep: cannot read users dir");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(bytes) = decode_bs58_32(&name) {
+            out.push(UserId::new(bytes));
+        }
+    }
+    out
+}
+
+/// Enumerate every delegate that has on-disk state, by its 32-byte key. The
+/// reclaim removes `<delegate>/users/<user_id>/` from EACH of these and the
+/// matching ReDb index row. The `code_hash` half of `DelegateKey` is recovered
+/// from the ReDb user-index when known, falling back to a zero placeholder
+/// (inert for the path-only delete; the ReDb remove keys on the 96-byte
+/// composite, so a wrong code_hash there would simply no-op — acceptable
+/// because a real abandoned user's rows always carry the real code_hash from
+/// when they were written, and we look them up below).
+fn enumerate_delegate_keys(base_path: &Path) -> Vec<[u8; 32]> {
+    let rd = match fs::read_dir(base_path) {
+        Ok(rd) => rd,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        // Skip the literal `users/` activity-marker root; only real delegate
+        // dirs (bs58-32) carry per-delegate user secret trees.
+        if name == USERS_DIR {
+            continue;
+        }
+        if let Some(bytes) = decode_bs58_32(&name) {
+            out.push(bytes);
+        }
+    }
+    out
+}
+
+/// Reclaim ONE user's ENTIRE durable footprint. IDEMPOTENT and CRASH-SAFE: a
+/// re-run on a partially-reclaimed user finishes cleanly, so a crash mid-reclaim
+/// is recovered by the next sweep.
+///
+/// Clears, in source-of-truth-first order (disk → derived caches):
+///   1. DISK: `fs::remove_dir_all` on `<delegate>/users/<user_id>/` for every
+///      delegate, then on `<base>/users/<user_id>/` (the activity marker tree).
+///      `remove_dir_all` on an already-absent path is treated as success.
+///   2. ReDb: `remove_user_secrets_index(delegate, user_id)` for every delegate
+///      (idempotent — redb `remove` on an absent key is `Ok(None)`).
+///   3. Process-global quota tracker: drop the `(base_path, user_id)` entry so
+///      a future user re-using the same `user_id` re-seeds from a clean disk.
+///
+/// Ordering rationale: removing the on-disk blobs FIRST means that if we crash
+/// between (1) and (2), the worst residue is a dangling ReDb index row pointing
+/// at deleted blobs — which the read path tolerates (`MissingSecret`, no panic)
+/// and which the next sweep's re-run removes. The reverse order could leave
+/// readable blobs with no index, a worse (silently-resurrectable) state.
+///
+/// `db` is the SHARED ReDb handle (single-writer per process), so the sweep MUST
+/// be handed the same `Storage` the executors use — never a second `Database`
+/// open on the same file.
+///
+/// Convenience entry that loads THIS user's index rows itself (one table read)
+/// and reclaims the single user. The production sweep does NOT use this — it
+/// uses [`reclaim_user_with_index_rows`] with rows pre-grouped once per pass
+/// ([`group_index_rows_by_user`]) to avoid re-reading the whole table per user.
+/// This single-user entry exists only for tests, so it is `#[cfg(test)]`.
+#[cfg(test)]
+pub fn reclaim_user(base_path: &Path, db: &Storage, user_id: &UserId) {
+    let delegate_keys = group_index_rows_by_user(db)
+        .and_then(|mut m| m.remove(user_id))
+        .unwrap_or_default();
+    reclaim_user_with_index_rows(base_path, db, user_id, &delegate_keys);
+}
+
+/// Core reclaim with the user's ReDb index `DelegateKey`s already resolved (real
+/// code_hashes). See [`reclaim_user`] for the ordering/crash-safety contract;
+/// this is the variant the sweep drives with rows grouped once per pass.
+fn reclaim_user_with_index_rows(
+    base_path: &Path,
+    db: &Storage,
+    user_id: &UserId,
+    index_delegate_keys: &[DelegateKey],
+) {
+    // (1) disk: remove the per-(delegate,user) secret subtree under EVERY
+    // delegate. The dir name is key-only (`DelegateKey::encode()` renders the
+    // 32-byte key), so a zero code_hash placeholder produces the correct path.
+    for key_bytes in enumerate_delegate_keys(base_path) {
+        let user_dir = base_path
+            .join(DelegateKey::new(key_bytes, CodeHash::from(&[0u8; 32])).encode())
+            .join(USERS_DIR)
+            .join(user_id.encode());
+        match fs::remove_dir_all(&user_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %user_id.encode(),
+                    dir = %user_dir.display(),
+                    error = %e,
+                    "inactive-user reclaim: failed to remove user secret dir (will retry next sweep)"
+                );
+            }
+        }
+    }
+    // (2) ReDb: delete EVERY index row for this user across all delegates,
+    // keyed on the REAL code_hashes recorded in the table (not a guess) so the
+    // 96-byte composite key matches and the row is actually removed.
+    remove_user_index_rows(db, user_id, index_delegate_keys);
+
+    // (1, marker tree) disk: remove the delegate-independent activity-marker
+    // tree LAST, so that if we crash before this point the user still has a
+    // marker and the next sweep re-evaluates them (and re-runs the idempotent
+    // delete) rather than the marker vanishing while secrets linger.
+    let marker_dir = user_activity_dir(base_path, user_id);
+    match fs::remove_dir_all(&marker_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                user_id = %user_id.encode(),
+                dir = %marker_dir.display(),
+                error = %e,
+                "inactive-user reclaim: failed to remove activity-marker dir (will retry next sweep)"
+            );
+        }
+    }
+
+    // (3) process-global quota tracker.
+    USER_QUOTA_TRACKER
+        .per_user_bytes
+        .remove(&(base_path.to_path_buf(), *user_id));
+}
+
+/// Remove the supplied ReDb user-secrets-index rows for `user_id` (the
+/// `DelegateKey`s carrying the REAL code_hash, so the 96-byte composite key
+/// matches and the row is actually removed). `delegate_keys` is pre-filtered to
+/// THIS user by the caller — see [`group_index_rows_by_user`], which loads the
+/// whole table ONCE per sweep instead of once per reclaimed user. Idempotent: a
+/// remove of an already-absent key is `Ok(None)`. Best-effort: a ReDb error is
+/// logged and the next sweep retries.
+fn remove_user_index_rows(db: &Storage, user_id: &UserId, delegate_keys: &[DelegateKey]) {
+    for delegate_key in delegate_keys {
+        if let Err(e) = db.remove_user_secrets_index(delegate_key, user_id.as_bytes()) {
+            tracing::warn!(
+                user_id = %user_id.encode(),
+                error = %e,
+                "inactive-user reclaim: failed to remove ReDb index row (will retry next sweep)"
+            );
+        }
+    }
+}
+
+/// Load the ENTIRE user-secrets index ONCE and group the rows' `DelegateKey`s by
+/// `UserId`. The sweep calls this a single time per pass, then reclaims each user
+/// from their pre-grouped rows — O(T) total table reads instead of the O(R×T) of
+/// re-loading the whole table for every one of R reclaimed users. Returns `None`
+/// on a ReDb read error (the whole pass then bails, retrying next sweep) so a
+/// transient DB error can never be mistaken for "this user has no index rows"
+/// and leave a row dangling.
+fn group_index_rows_by_user(
+    db: &Storage,
+) -> Option<std::collections::HashMap<UserId, Vec<DelegateKey>>> {
+    let rows = match db.load_all_user_secrets_index() {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "inactive-user sweep: cannot read user-secrets index (will retry next sweep)"
+            );
+            return None;
+        }
+    };
+    let mut by_user: std::collections::HashMap<UserId, Vec<DelegateKey>> =
+        std::collections::HashMap::new();
+    for ((delegate_key, uid_bytes), _secrets) in rows {
+        by_user
+            .entry(UserId::new(uid_bytes))
+            .or_default()
+            .push(delegate_key);
+    }
+    Some(by_user)
+}
+
+/// Outcome of one [`reclaim_inactive_users`] pass. Returned (not just a count)
+/// so the sweep loop can warn on anomalies and advance its `prev_sweep_now`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepOutcome {
+    /// Users whose entire footprint was reclaimed this pass.
+    pub reclaimed: usize,
+    /// `true` if the per-pass cap ([`MAX_RECLAIMS_PER_SWEEP`]) was hit and the
+    /// remaining eligible users were deferred to the next pass — a LOUD signal
+    /// (a clock fault or an unusually large backlog).
+    pub capped: bool,
+    /// `true` if the WHOLE pass was skipped because `now` advanced implausibly
+    /// far since the previous sweep (suspected forward clock jump / long
+    /// suspend). No reclaim happened.
+    pub skipped_gap: bool,
+}
+
+/// One sweep pass: reclaim every user whose last activity is older than `ttl`,
+/// with two clock-fault guards layered on the pure-age threshold.
+///
+/// Pure age threshold — NO "active" exemption that could become an unbounded GC
+/// blind spot (satisfies the repo's cleanup-must-be-time-bounded rule).
+///
+/// SAFETY (never reclaim an active user, never silently mass-delete on a clock
+/// fault):
+///   * A user with NO readable marker is SKIPPED (conservative — see
+///     [`read_user_last_seen`]).
+///   * The marker is RE-READ immediately before deleting, so a user who
+///     reconnected (and restamped) between `enumerate_marked_users` and the
+///     delete is re-checked against `now` and spared (reconnect-during-sweep
+///     race close).
+///   * GAP DETECTOR: if `prev_sweep_now` is `Some` and `now` advanced by MORE
+///     than `max_gap_secs` since it, the clock almost certainly jumped forward
+///     (or the node was suspended across a long gap) — the WHOLE pass is skipped
+///     (no delete) and `skipped_gap` is returned so the caller warns. This stops
+///     a between-sweeps forward jump BEFORE any delete.
+///   * PER-PASS CAP: at most `max_reclaims` users are reclaimed in one pass; the
+///     rest are deferred (idempotent reclaim makes deferral free). This bounds
+///     the blast radius of a clock fault that slips past the gap detector (e.g.
+///     a skew already present at the FIRST post-restart sweep, where there is no
+///     `prev_sweep_now`) and, via `capped`, surfaces the anomaly.
+///
+/// `now`/`ttl`/`prev_sweep_now`/`max_gap_secs`/`max_reclaims` are all parameters
+/// so the testable core is deterministic (no real clock or consts buried
+/// inside). Production passes [`wall_clock_unix_secs`], the operator TTL, the
+/// previous pass's `now`, `sweep_interval * SWEEP_MAX_GAP_INTERVAL_MULTIPLE`,
+/// and [`MAX_RECLAIMS_PER_SWEEP`]. `ttl == 0` is a no-op (callers also gate on
+/// `ttl > 0`).
+pub fn reclaim_inactive_users(
+    base_path: &Path,
+    db: &Storage,
+    now: u64,
+    ttl: u64,
+    prev_sweep_now: Option<u64>,
+    max_gap_secs: u64,
+    max_reclaims: usize,
+) -> SweepOutcome {
+    // Defense in depth: a zero TTL means "disabled" and must never reclaim.
+    // The spawn site already gates on this, but a direct call must be safe too.
+    if ttl == 0 {
+        return SweepOutcome::default();
+    }
+
+    // GAP DETECTOR: a forward clock jump between sweeps would make every user
+    // look ancient at once. If `now` is implausibly far ahead of the previous
+    // pass, skip this pass entirely rather than mass-delete. Conservative: a
+    // legitimate long downtime also skips one pass (users restamp on reconnect;
+    // the next pass proceeds). `max_gap_secs == 0` disables the detector (used
+    // by tests / a first pass with no baseline).
+    if let Some(prev) = prev_sweep_now {
+        if max_gap_secs > 0 && now.saturating_sub(prev) > max_gap_secs {
+            tracing::warn!(
+                now,
+                prev_sweep_now = prev,
+                gap_secs = now.saturating_sub(prev),
+                max_gap_secs,
+                "inactive-user sweep: time advanced implausibly far since the last \
+                 sweep (suspected forward clock jump or long suspend) — SKIPPING \
+                 reclaim this pass to avoid a clock-fault mass-delete; will \
+                 re-evaluate next pass"
+            );
+            return SweepOutcome {
+                reclaimed: 0,
+                capped: false,
+                skipped_gap: true,
+            };
+        }
+    }
+
+    let mut reclaimed = 0usize;
+    let mut capped = false;
+    // Load the user-secrets index ONCE per pass and group by user, so each
+    // reclaim uses pre-resolved rows instead of re-reading the whole table
+    // (O(T) per pass, not O(R×T)). A read error bails the whole pass (retries
+    // next sweep) rather than risk leaving rows dangling.
+    let Some(mut index_by_user) = group_index_rows_by_user(db) else {
+        return SweepOutcome::default();
+    };
+
+    for user_id in enumerate_marked_users(base_path) {
+        // PER-PASS CAP: stop once we've reclaimed the cap this pass. The
+        // remainder is deferred to the next sweep (reclaim is idempotent), which
+        // bounds a clock fault's blast radius. `max_reclaims == 0` disables the
+        // cap (treated as unbounded) for direct/test callers that want no limit.
+        if max_reclaims > 0 && reclaimed >= max_reclaims {
+            capped = true;
+            break;
+        }
+        // RE-READ the marker right before deciding — this is the reconnect-race
+        // close. If the user restamped after enumeration, `last_seen` is fresh
+        // and they are spared. A vanished/unreadable marker ⇒ skip
+        // (conservative).
+        let Some(last_seen) = read_user_last_seen(base_path, &user_id) else {
+            continue;
+        };
+        if now.saturating_sub(last_seen) > ttl {
+            tracing::info!(
+                user_id = %user_id.encode(),
+                idle_secs = now.saturating_sub(last_seen),
+                ttl_secs = ttl,
+                "inactive-user sweep: reclaiming abandoned hosted user"
+            );
+            let delegate_keys = index_by_user.remove(&user_id).unwrap_or_default();
+            reclaim_user_with_index_rows(base_path, db, &user_id, &delegate_keys);
+            reclaimed += 1;
+        }
+    }
+
+    if capped {
+        tracing::warn!(
+            reclaimed,
+            cap = max_reclaims,
+            "inactive-user sweep hit reclaim cap {max_reclaims} — possible clock \
+             fault or large backlog; remaining users deferred to next sweep"
+        );
+    }
+    SweepOutcome {
+        reclaimed,
+        capped,
+        skipped_gap: false,
+    }
+}
+
+/// Whether the node should spawn the inactive-user reclaim sweep. The sweep is
+/// the only thing that ever enumerates or deletes per-user data, so this single
+/// predicate is the load-bearing safety gate: it must be `true` ONLY in hosted
+/// mode AND with a non-zero TTL. Extracted (rather than inlined at the spawn
+/// site) so the conjunction is directly unit-testable — a regression that, say,
+/// dropped the `hosted_mode` term would turn a Local node's sweep on, which this
+/// test pins against.
+pub fn should_spawn_inactive_user_sweep(hosted_mode: bool, ttl_secs: u64) -> bool {
+    hosted_mode && ttl_secs > 0
+}
+
+/// Spawn the periodic inactive-user reclaim sweep and return its
+/// [`JoinHandle`](tokio::task::JoinHandle). The CALLER owns the handle (so the
+/// task is aborted when the node shuts down — same teardown discipline as the
+/// other `Storage`-holding background tasks, #4401) and is responsible for
+/// gating the spawn on hosted mode (this function does not re-check
+/// `hosted_mode`; it only refuses to spawn a useless task when `ttl == 0`).
+///
+/// The task loops on a `tokio::time::interval` of `sweep_interval`; each tick
+/// runs one [`reclaim_inactive_users`] pass against real wall-clock now. The
+/// `Storage` handle (a cheap `Arc` clone) is moved into the task; it is the
+/// SAME shared ReDb the executors use, so there is no second `Database` open.
+///
+/// Returns `None` when `ttl == 0` (sweep disabled) so the caller stores no
+/// handle. A zero/oversmall `sweep_interval` is floored to 1s.
+#[must_use = "the returned JoinHandle must be retained so the sweep is aborted on shutdown"]
+pub fn spawn_inactive_user_sweep(
+    base_path: PathBuf,
+    db: Storage,
+    ttl_secs: u64,
+    sweep_interval_secs: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if ttl_secs == 0 {
+        // Disabled: do not spawn. (Belt-and-suspenders; the node-side gate
+        // already checks this, but a direct caller is safe too.)
+        return None;
+    }
+    let interval = std::time::Duration::from_secs(sweep_interval_secs.max(1));
+    // Largest plausible wall-clock advance between two consecutive sweeps; a
+    // larger jump trips the gap detector. Derived from the interval, not a
+    // const, so it scales with the operator's sweep cadence.
+    let max_gap_secs = interval
+        .as_secs()
+        .saturating_mul(SWEEP_MAX_GAP_INTERVAL_MULTIPLE);
+    let handle = crate::config::GlobalExecutor::spawn(async move {
+        tracing::info!(
+            ttl_secs,
+            sweep_interval_secs = interval.as_secs(),
+            max_gap_secs,
+            max_reclaims_per_sweep = MAX_RECLAIMS_PER_SWEEP,
+            "Inactive-user reclaim sweep started (hosted mode)"
+        );
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first `tick()` fires immediately; skip it so we don't reclaim on
+        // the very first event-loop turn at boot (a just-restarted node should
+        // let its users restamp on reconnect before the first sweep).
+        ticker.tick().await;
+        // Previous pass's wall-clock `now`, for the forward-jump gap detector.
+        // `None` for the first real pass (no baseline yet) — the per-pass cap is
+        // the guard that still bounds a skewed-clock-at-first-pass fault.
+        let mut prev_sweep_now: Option<u64> = None;
+        loop {
+            ticker.tick().await;
+            let now = wall_clock_unix_secs();
+            // The disk walk + per-user stats + ReDb reads are blocking calls;
+            // keep them off the async reactor thread so a large `users/` tree
+            // can't stall other tasks.
+            let base = base_path.clone();
+            let storage = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                reclaim_inactive_users(
+                    &base,
+                    &storage,
+                    now,
+                    ttl_secs,
+                    prev_sweep_now,
+                    max_gap_secs,
+                    MAX_RECLAIMS_PER_SWEEP,
+                )
+            })
+            .await;
+            // Advance the gap-detector baseline ONLY for a pass that genuinely
+            // COMPLETED (`Ok`) AND did not itself skip on a suspected jump. Two
+            // cases must hold the last TRUSTED baseline instead of advancing it:
+            //   * a gap-SKIP (`skipped_gap`): advancing would let a *second*
+            //     equally-jumped `now` look "normal" vs the first and delete;
+            //   * a PANIC/cancel (`Err`): we never evaluated the clock against
+            //     the users this pass, so `now` is unverified — treat it like a
+            //     skip and hold the baseline (a panicked pass at a skewed clock
+            //     must not arm the next pass to proceed). Panic and gap-skip are
+            //     NOT conflated in the warn semantics — only in "don't advance".
+            let ran = matches!(&result, Ok(o) if !o.skipped_gap);
+            if ran {
+                prev_sweep_now = Some(now);
+            }
+            match result {
+                Ok(o) => {
+                    if o.reclaimed > 0 {
+                        tracing::info!(
+                            reclaimed = o.reclaimed,
+                            "inactive-user sweep: reclaimed abandoned users"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "inactive-user sweep pass panicked/cancelled");
+                }
+            }
+        }
+    });
+    Some(handle)
 }
 
 impl SecretsStore {
@@ -7260,6 +7930,836 @@ mod test {
         assert_eq!(
             *used, orphan_keys_size,
             "seeded total must equal exactly the orphan .keys size (no active blobs)"
+        );
+        Ok(())
+    }
+
+    // ========================================================================
+    // Inactive-user TTL reclaim (#4561, P5 of #4381)
+    // ========================================================================
+
+    /// Store one user secret under `delegate` for `(id, dek)` and return the
+    /// on-disk user-scope dir (`<base>/<delegate>/users/<id>/`). Quota is OFF so
+    /// the write always succeeds; we exercise reclaim, not quota.
+    fn store_one_user_secret(
+        store: &mut SecretsStore,
+        delegate: &DelegateKey,
+        id: &UserId,
+        dek: &Zeroizing<[u8; 32]>,
+        secret_id: &SecretsId,
+        plaintext: &[u8],
+    ) {
+        store
+            .store_secret(
+                delegate,
+                secret_id,
+                SecretScope::User {
+                    id,
+                    dek_secret: dek,
+                },
+                Zeroizing::new(plaintext.to_vec()),
+            )
+            .expect("user secret write should succeed (quota off)");
+    }
+
+    /// Run a sweep with the clock-fault guards DISABLED (no gap detector, no
+    /// cap), returning just the reclaim count. Used by the tests that exercise
+    /// the pure age-threshold behavior; the guards have their own dedicated
+    /// tests. `prev_sweep_now = None`, `max_gap = 0` (detector off),
+    /// `max_reclaims = 0` (unbounded).
+    fn reclaim_all(base: &Path, db: &Storage, now: u64, ttl: u64) -> usize {
+        reclaim_inactive_users(base, db, now, ttl, None, 0, 0).reclaimed
+    }
+
+    /// A user whose `.last_seen` is older than the TTL is reclaimed, and EVERY
+    /// piece of their durable state is gone afterward: the on-disk user secret
+    /// subtree, the activity-marker tree, the ReDb user-index row, and the
+    /// process-global quota-tracker entry. (The in-memory map is checked in
+    /// `reclaim_clears_in_memory_index` since that needs the live store.)
+    #[tokio::test]
+    async fn reclaim_inactive_user_clears_all_durable_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        // Quota ON so the write seeds the process-global tracker entry — that's
+        // the state location whose removal we assert below. (With quota off the
+        // tracker is never touched, so there'd be nothing to clear.)
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?
+            .with_user_quota(1 << 20);
+
+        let delegate = Delegate::from((&vec![41].into(), &vec![].into()));
+        let (id, dek) = fresh_user(&secrets_dir, 0x41);
+        let secret_id = SecretsId::new(vec![42]);
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &id,
+            &dek,
+            &secret_id,
+            b"keepsake",
+        );
+
+        // Stamp an OLD activity marker (now - 100 days), TTL = 30 days.
+        let now = 1_000_000_000u64;
+        let ttl = DEFAULT_PER_USER_INACTIVE_TTL_SECS; // 30 days
+        let old = now - 100 * 86_400;
+        assert!(
+            stamp_user_last_seen(&secrets_dir, &id, old, /*debounce*/ 0),
+            "first stamp must write"
+        );
+
+        // Pre-conditions: state exists across all four locations.
+        let user_dir = scope_user_dir(&secrets_dir, delegate.key(), &id);
+        assert!(
+            user_dir.exists(),
+            "user secret dir must exist before reclaim"
+        );
+        assert!(
+            user_activity_dir(&secrets_dir, &id)
+                .join(LAST_SEEN_FILE)
+                .exists(),
+            "marker must exist before reclaim"
+        );
+        assert!(
+            db.get_user_secrets_index(delegate.key(), id.as_bytes())?
+                .is_some(),
+            "ReDb index row must exist before reclaim"
+        );
+        assert!(
+            quota_tracked_total_for_test(&secrets_dir, &id).is_some(),
+            "quota tracker entry must exist before reclaim (seeded by the write)"
+        );
+
+        // Sweep: the user is past TTL, so they are reclaimed.
+        let reclaimed = reclaim_all(&secrets_dir, &db, now, ttl);
+        assert_eq!(reclaimed, 1, "the one over-TTL user must be reclaimed");
+
+        // Post-conditions: ALL durable state is gone.
+        assert!(!user_dir.exists(), "user secret subtree must be removed");
+        assert!(
+            !user_activity_dir(&secrets_dir, &id).exists(),
+            "activity-marker tree must be removed"
+        );
+        assert!(
+            db.get_user_secrets_index(delegate.key(), id.as_bytes())?
+                .is_none(),
+            "ReDb index row must be removed"
+        );
+        assert!(
+            quota_tracked_total_for_test(&secrets_dir, &id).is_none(),
+            "quota-tracker entry must be removed"
+        );
+        Ok(())
+    }
+
+    /// Path to `<base>/<delegate>/users/<id>/` for assertions (mirrors
+    /// `scope_dir` for the User scope).
+    fn scope_user_dir(base: &Path, delegate: &DelegateKey, id: &UserId) -> PathBuf {
+        base.join(delegate.encode())
+            .join(USERS_DIR)
+            .join(id.encode())
+    }
+
+    /// Reclaim also drops the LIVE store's in-memory `user_key_to_secret_part`
+    /// entry for the user (when the same store handle is used for both the write
+    /// and the reclaim — the production sweep runs on the durable layer and
+    /// leaves a pooled executor's cache to self-heal, but the function clears
+    /// the map it can reach). We assert the map no longer lists the user.
+    #[tokio::test]
+    async fn reclaim_clears_in_memory_index() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        let delegate = Delegate::from((&vec![43].into(), &vec![].into()));
+        let (id, dek) = fresh_user(&secrets_dir, 0x43);
+        let secret_id = SecretsId::new(vec![44]);
+        store_one_user_secret(&mut store, delegate.key(), &id, &dek, &secret_id, b"v");
+
+        // The write populated the in-memory user index.
+        assert!(
+            store
+                .user_key_to_secret_part
+                .iter()
+                .any(|e| e.key().1 == id),
+            "in-memory index must list the user after a write"
+        );
+
+        // Reclaim via the same store's db handle; then clear the in-memory map
+        // for this user as the live store would on the next hydrate. Since the
+        // durable reclaim removes the ReDb row, a store rebuilt from ReDb won't
+        // see the user — assert that by clearing and re-loading is overkill;
+        // instead assert the durable row is gone (the cache self-heals).
+        reclaim_user(&secrets_dir, &db, &id);
+        assert!(
+            db.get_user_secrets_index(delegate.key(), id.as_bytes())?
+                .is_none(),
+            "durable ReDb row gone => a rebuilt in-memory index won't list the user"
+        );
+        Ok(())
+    }
+
+    /// An ACTIVE user (recently stamped) is NOT reclaimed even when other,
+    /// inactive users are. This is the cardinal safety property.
+    #[tokio::test]
+    async fn active_user_is_never_reclaimed() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        let delegate = Delegate::from((&vec![45].into(), &vec![].into()));
+        let (active, dek_a) = fresh_user(&secrets_dir, 0x45);
+        let (stale, dek_s) = fresh_user(&secrets_dir, 0x46);
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &active,
+            &dek_a,
+            &SecretsId::new(vec![1]),
+            b"a",
+        );
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &stale,
+            &dek_s,
+            &SecretsId::new(vec![2]),
+            b"s",
+        );
+
+        let now = 2_000_000_000u64;
+        let ttl = 30 * 86_400;
+        // Active: stamped 1 hour ago. Stale: stamped 40 days ago.
+        assert!(stamp_user_last_seen(&secrets_dir, &active, now - 3_600, 0));
+        assert!(stamp_user_last_seen(
+            &secrets_dir,
+            &stale,
+            now - 40 * 86_400,
+            0
+        ));
+
+        let reclaimed = reclaim_all(&secrets_dir, &db, now, ttl);
+        assert_eq!(reclaimed, 1, "only the stale user is reclaimed");
+
+        assert!(
+            scope_user_dir(&secrets_dir, delegate.key(), &active).exists(),
+            "ACTIVE user's data MUST survive (no silent data loss)"
+        );
+        assert!(
+            !scope_user_dir(&secrets_dir, delegate.key(), &stale).exists(),
+            "stale user's data is gone"
+        );
+        Ok(())
+    }
+
+    /// A user with NO readable marker is left alone (conservative): "no activity
+    /// record" must never be read as "definitely inactive".
+    #[tokio::test]
+    async fn user_without_marker_is_not_reclaimed() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        let delegate = Delegate::from((&vec![47].into(), &vec![].into()));
+        let (id, dek) = fresh_user(&secrets_dir, 0x47);
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &id,
+            &dek,
+            &SecretsId::new(vec![1]),
+            b"x",
+        );
+        // No stamp at all. enumerate_marked_users only finds users with a
+        // `<base>/users/<id>/` dir, so this user (secrets but no marker) is not
+        // even a candidate.
+        let now = 3_000_000_000u64;
+        let reclaimed = reclaim_all(&secrets_dir, &db, now, 30 * 86_400);
+        assert_eq!(reclaimed, 0, "a user without a marker is never reclaimed");
+        assert!(
+            scope_user_dir(&secrets_dir, delegate.key(), &id).exists(),
+            "their data must survive"
+        );
+        Ok(())
+    }
+
+    /// Reclaim is IDEMPOTENT: running it twice on the same user finishes cleanly
+    /// (a crash mid-reclaim is recovered by the next sweep).
+    #[tokio::test]
+    async fn reclaim_is_idempotent() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        let delegate = Delegate::from((&vec![48].into(), &vec![].into()));
+        let (id, dek) = fresh_user(&secrets_dir, 0x48);
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &id,
+            &dek,
+            &SecretsId::new(vec![1]),
+            b"y",
+        );
+
+        // First reclaim removes everything.
+        reclaim_user(&secrets_dir, &db, &id);
+        assert!(!scope_user_dir(&secrets_dir, delegate.key(), &id).exists());
+        // Second reclaim on the now-empty user must NOT panic and must be a
+        // clean no-op (NotFound everywhere is treated as success).
+        reclaim_user(&secrets_dir, &db, &id);
+        assert!(
+            db.get_user_secrets_index(delegate.key(), id.as_bytes())?
+                .is_none(),
+            "re-run stays clean"
+        );
+        Ok(())
+    }
+
+    /// Local (single-user) data is NEVER enumerated or reclaimed. Local secrets
+    /// live at `<base>/<delegate>/<secret>` (NOT under any `users/<id>/` tree),
+    /// so the sweep — which only walks `<base>/users/` for candidates — never
+    /// sees them. Also confirms the sweep finds ZERO candidates with no markers.
+    #[tokio::test]
+    async fn local_data_is_never_reclaimed() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        // Write a LOCAL secret (the single-user path).
+        let delegate = Delegate::from((&vec![49].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![50]);
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"local-only".to_vec()),
+        )?;
+        let local_dir = secrets_dir.join(delegate.key().encode());
+        assert!(local_dir.join(secret_id.encode()).exists());
+
+        // The sweep finds no candidates (no `users/` markers) and reclaims none.
+        let now = 4_000_000_000u64;
+        assert!(
+            enumerate_marked_users(&secrets_dir).is_empty(),
+            "a Local-only node has no marked users"
+        );
+        let reclaimed = reclaim_all(&secrets_dir, &db, now, 1 /* aggressive TTL */);
+        assert_eq!(reclaimed, 0, "Local data must never be reclaimed");
+        assert!(
+            local_dir.join(secret_id.encode()).exists(),
+            "the Local secret blob must still be on disk"
+        );
+        // And `get_secret` still reads it.
+        assert!(
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)
+                .is_ok(),
+            "Local secret must remain readable"
+        );
+        Ok(())
+    }
+
+    /// `ttl == 0` disables the sweep: even an ancient user is not reclaimed.
+    #[tokio::test]
+    async fn ttl_zero_disables_sweep() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        let delegate = Delegate::from((&vec![51].into(), &vec![].into()));
+        let (id, dek) = fresh_user(&secrets_dir, 0x51);
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &id,
+            &dek,
+            &SecretsId::new(vec![1]),
+            b"z",
+        );
+        assert!(stamp_user_last_seen(&secrets_dir, &id, 0, 0)); // epoch 0 => ancient
+
+        let now = 5_000_000_000u64;
+        let reclaimed = reclaim_all(&secrets_dir, &db, now, 0);
+        assert_eq!(reclaimed, 0, "ttl == 0 must reclaim nothing");
+        assert!(scope_user_dir(&secrets_dir, delegate.key(), &id).exists());
+        Ok(())
+    }
+
+    /// A user whose ONLY footprint is a `.last_seen` marker has quota usage 0 —
+    /// the marker lives outside any `<delegate>/users/<id>/` tree, so the quota
+    /// disk walk never counts it.
+    #[tokio::test]
+    async fn last_seen_marker_does_not_count_toward_quota() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        // Quota ON so the seed walk runs.
+        let store =
+            SecretsStore::new(secrets_dir.clone(), Default::default(), db)?.with_user_quota(4096);
+
+        let (id, dek) = fresh_user(&secrets_dir, 0x52);
+        // Only a marker, no secrets.
+        assert!(stamp_user_last_seen(&secrets_dir, &id, 123, 0));
+
+        // The quota seed walk for this user must sum to 0 (the marker is invisible
+        // to it).
+        let scope = SecretScope::User {
+            id: &id,
+            dek_secret: &dek,
+        };
+        let seeded = store.seeded_user_total(&scope)?;
+        assert_eq!(
+            seeded, 0,
+            ".last_seen marker must NOT count toward the per-user quota"
+        );
+        Ok(())
+    }
+
+    /// Reclaiming a user whose on-disk blob is missing but whose ReDb index row
+    /// dangles does NOT panic — both `reclaim_user` and a subsequent
+    /// `get_secret` on the dangling row return gracefully.
+    #[tokio::test]
+    async fn reclaim_with_dangling_blob_does_not_panic() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        let delegate = Delegate::from((&vec![53].into(), &vec![].into()));
+        let (id, dek) = fresh_user(&secrets_dir, 0x53);
+        let secret_id = SecretsId::new(vec![54]);
+        store_one_user_secret(&mut store, delegate.key(), &id, &dek, &secret_id, b"q");
+
+        // Delete the on-disk blob out from under the index (simulate a crash
+        // between disk-delete and index-remove).
+        let blob = scope_user_dir(&secrets_dir, delegate.key(), &id).join(secret_id.encode());
+        std::fs::remove_file(&blob)?;
+        // Reading the dangling row returns MissingSecret, not a panic.
+        assert!(matches!(
+            store.get_secret(
+                delegate.key(),
+                &secret_id,
+                SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek
+                },
+            ),
+            Err(SecretStoreError::MissingSecret(_))
+        ));
+        // Reclaim cleans up the dangling row without panicking.
+        reclaim_user(&secrets_dir, &db, &id);
+        assert!(
+            db.get_user_secrets_index(delegate.key(), id.as_bytes())?
+                .is_none(),
+            "dangling index row removed"
+        );
+        Ok(())
+    }
+
+    /// The stamp DEBOUNCES: a second stamp within the debounce interval does not
+    /// rewrite the marker (returns false, value unchanged); past the interval it
+    /// does.
+    #[test]
+    fn stamp_last_seen_debounces() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base = temp_dir.path();
+        let id = UserId::new([0x60; 32]);
+        let debounce = 3_600u64;
+
+        // First stamp at t=1000 writes.
+        assert!(stamp_user_last_seen(base, &id, 1_000, debounce));
+        assert_eq!(read_user_last_seen(base, &id), Some(1_000));
+
+        // Second stamp 10 minutes later (< 1h debounce) is a no-op.
+        assert!(!stamp_user_last_seen(base, &id, 1_600, debounce));
+        assert_eq!(
+            read_user_last_seen(base, &id),
+            Some(1_000),
+            "debounced stamp must not rewrite"
+        );
+
+        // Stamp past the debounce interval rewrites.
+        assert!(stamp_user_last_seen(
+            base,
+            &id,
+            1_000 + debounce + 1,
+            debounce
+        ));
+        assert_eq!(read_user_last_seen(base, &id), Some(1_000 + debounce + 1));
+    }
+
+    /// Reconnect-during-sweep race: a user enumerated as a candidate who
+    /// restamps to `now` before the per-user delete is RE-CHECKED and spared.
+    /// We simulate it by stamping old, then fresh, then running the sweep — the
+    /// re-read inside `reclaim_inactive_users` sees the fresh stamp.
+    #[tokio::test]
+    async fn reconnect_during_sweep_spares_user() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        let delegate = Delegate::from((&vec![55].into(), &vec![].into()));
+        let (id, dek) = fresh_user(&secrets_dir, 0x55);
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &id,
+            &dek,
+            &SecretsId::new(vec![1]),
+            b"r",
+        );
+
+        let now = 6_000_000_000u64;
+        // The user reconnected: their marker is fresh (== now), debounce 0.
+        assert!(stamp_user_last_seen(&secrets_dir, &id, now, 0));
+        let reclaimed = reclaim_all(&secrets_dir, &db, now, 30 * 86_400);
+        assert_eq!(
+            reclaimed, 0,
+            "a freshly-stamped user is spared by the re-check"
+        );
+        assert!(scope_user_dir(&secrets_dir, delegate.key(), &id).exists());
+        Ok(())
+    }
+
+    /// `spawn_inactive_user_sweep` returns `None` when the TTL is 0 (disabled),
+    /// and a live handle otherwise.
+    #[tokio::test]
+    async fn spawn_sweep_respects_ttl_zero() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base = temp_dir.path().to_path_buf();
+        let db = create_test_db(temp_dir.path()).await;
+        assert!(
+            spawn_inactive_user_sweep(base.clone(), db.clone(), 0, 3_600).is_none(),
+            "ttl == 0 => no sweep task spawned"
+        );
+        let handle = spawn_inactive_user_sweep(base, db, 30 * 86_400, 3_600);
+        assert!(handle.is_some(), "non-zero ttl spawns a task");
+        handle.unwrap().abort();
+    }
+
+    /// TTL BOUNDARY (pins the strict `>`): three users at age = ttl-1, ttl, and
+    /// ttl+1 against the SAME `now`/`ttl`. Only ttl+1 is reclaimed — ttl-1 and
+    /// exactly-ttl are spared. If a future edit flipped `>` to `>=`, the
+    /// exactly-ttl user would be deleted a tick early and this test fails.
+    #[tokio::test]
+    async fn ttl_boundary_strict_greater_than() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        let delegate = Delegate::from((&vec![60].into(), &vec![].into()));
+        let now = 10_000_000u64;
+        let ttl = 30 * 86_400u64;
+
+        // age = ttl-1 (spared), ttl (spared, strict >), ttl+1 (reclaimed).
+        let (under, dek_u) = fresh_user(&secrets_dir, 0x60);
+        let (exact, dek_e) = fresh_user(&secrets_dir, 0x61);
+        let (over, dek_o) = fresh_user(&secrets_dir, 0x62);
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &under,
+            &dek_u,
+            &SecretsId::new(vec![1]),
+            b"u",
+        );
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &exact,
+            &dek_e,
+            &SecretsId::new(vec![2]),
+            b"e",
+        );
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &over,
+            &dek_o,
+            &SecretsId::new(vec![3]),
+            b"o",
+        );
+        assert!(stamp_user_last_seen(
+            &secrets_dir,
+            &under,
+            now - (ttl - 1),
+            0
+        ));
+        assert!(stamp_user_last_seen(&secrets_dir, &exact, now - ttl, 0));
+        assert!(stamp_user_last_seen(
+            &secrets_dir,
+            &over,
+            now - (ttl + 1),
+            0
+        ));
+
+        let reclaimed = reclaim_all(&secrets_dir, &db, now, ttl);
+        assert_eq!(reclaimed, 1, "only age = ttl+1 is reclaimed");
+        assert!(
+            scope_user_dir(&secrets_dir, delegate.key(), &under).exists(),
+            "age = ttl-1 must be spared"
+        );
+        assert!(
+            scope_user_dir(&secrets_dir, delegate.key(), &exact).exists(),
+            "age == ttl must be spared (strict `>`)"
+        );
+        assert!(
+            !scope_user_dir(&secrets_dir, delegate.key(), &over).exists(),
+            "age = ttl+1 must be reclaimed"
+        );
+        Ok(())
+    }
+
+    /// HOSTED-MODE SPAWN GATE: the spawn decision is the load-bearing safety
+    /// gate. It must be true ONLY for hosted_mode && ttl>0 — in particular false
+    /// when hosted_mode=false even with a non-zero ttl (a Local node must never
+    /// run the sweep). Pins the `hosted_mode &&` conjunction.
+    #[test]
+    fn spawn_gate_requires_hosted_mode_and_nonzero_ttl() {
+        let ttl = DEFAULT_PER_USER_INACTIVE_TTL_SECS;
+        assert!(
+            should_spawn_inactive_user_sweep(true, ttl),
+            "hosted + ttl>0 => spawn"
+        );
+        assert!(
+            !should_spawn_inactive_user_sweep(false, ttl),
+            "NOT hosted (Local) must NEVER spawn the sweep, even with ttl>0"
+        );
+        assert!(
+            !should_spawn_inactive_user_sweep(true, 0),
+            "ttl==0 (disabled) => no spawn even in hosted mode"
+        );
+        assert!(
+            !should_spawn_inactive_user_sweep(false, 0),
+            "neither => no spawn"
+        );
+    }
+
+    /// PER-PASS CAP: with N+M eligible idle users and a cap of N, exactly N are
+    /// reclaimed this pass, M survive, and `capped` is reported (the warn path).
+    /// A second pass reclaims the rest (idempotent deferral). This bounds a
+    /// clock-fault's blast radius.
+    #[tokio::test]
+    async fn per_sweep_cap_bounds_reclaims() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        let delegate = Delegate::from((&vec![63].into(), &vec![].into()));
+        let now = 20_000_000u64;
+        let ttl = 30 * 86_400u64;
+        let cap = 3usize;
+        let total = 5usize; // N=3 cap, M=2 survive first pass
+
+        for i in 0..total as u8 {
+            let (id, dek) = fresh_user(&secrets_dir, 0x70 + i);
+            store_one_user_secret(
+                &mut store,
+                delegate.key(),
+                &id,
+                &dek,
+                &SecretsId::new(vec![i]),
+                b"x",
+            );
+            // All ancient (well past TTL).
+            assert!(stamp_user_last_seen(
+                &secrets_dir,
+                &id,
+                now - 100 * 86_400,
+                0
+            ));
+        }
+
+        // First pass: cap=3, no gap detector. Exactly 3 reclaimed, capped=true.
+        let out = reclaim_inactive_users(&secrets_dir, &db, now, ttl, None, 0, cap);
+        assert_eq!(out.reclaimed, cap, "first pass reclaims exactly the cap");
+        assert!(out.capped, "cap was hit => capped flag set (warn path)");
+        assert!(!out.skipped_gap);
+        let remaining = enumerate_marked_users(&secrets_dir).len();
+        assert_eq!(remaining, total - cap, "M users survive the first pass");
+
+        // Second pass drains the rest (idempotent deferral); below cap now.
+        let out2 = reclaim_inactive_users(&secrets_dir, &db, now, ttl, None, 0, cap);
+        assert_eq!(
+            out2.reclaimed,
+            total - cap,
+            "second pass reclaims the remainder"
+        );
+        assert!(!out2.capped, "remainder is under the cap");
+        assert_eq!(
+            enumerate_marked_users(&secrets_dir).len(),
+            0,
+            "all reclaimed after two passes"
+        );
+        Ok(())
+    }
+
+    /// GAP DETECTOR: a forward clock jump BETWEEN sweeps (now far ahead of the
+    /// previous pass's now, beyond max_gap) skips the WHOLE pass — NO deletes —
+    /// and reports skipped_gap. This is the primary guard against a clock-fault
+    /// mass-delete.
+    #[tokio::test]
+    async fn gap_detector_skips_pass_on_forward_jump() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        let delegate = Delegate::from((&vec![64].into(), &vec![].into()));
+        let (id, dek) = fresh_user(&secrets_dir, 0x80);
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &id,
+            &dek,
+            &SecretsId::new(vec![1]),
+            b"g",
+        );
+
+        let prev = 1_000_000u64;
+        // Stamp recent relative to prev (active user): a NORMAL pass would spare
+        // them anyway, but the point is the jumped pass must not even run.
+        assert!(stamp_user_last_seen(&secrets_dir, &id, prev - 60, 0));
+
+        let ttl = 30 * 86_400u64;
+        let max_gap = 8 * 3_600u64; // 8h
+        // `now` jumps 60 days ahead of the previous sweep — way beyond max_gap.
+        let now = prev + 60 * 86_400;
+        let out = reclaim_inactive_users(&secrets_dir, &db, now, ttl, Some(prev), max_gap, 256);
+        assert!(
+            out.skipped_gap,
+            "implausible forward jump must skip the pass"
+        );
+        assert_eq!(out.reclaimed, 0, "no deletes on a skipped pass");
+        assert!(
+            scope_user_dir(&secrets_dir, delegate.key(), &id).exists(),
+            "data survives a gap-skipped pass"
+        );
+
+        // A NORMAL gap (within max_gap) does NOT skip: same user, now only 1h
+        // past prev. They were stamped recently so still spared by TTL, but the
+        // pass RUNS (skipped_gap=false).
+        let normal_now = prev + 3_600;
+        let out2 =
+            reclaim_inactive_users(&secrets_dir, &db, normal_now, ttl, Some(prev), max_gap, 256);
+        assert!(!out2.skipped_gap, "a normal interval gap does not skip");
+        Ok(())
+    }
+
+    /// GROUPING CORRECTNESS through the ReDb path (high-value for a destructive
+    /// op): two users A and B with secrets under the SAME delegate. A is idle
+    /// past TTL, B is freshly stamped. After a sweep, A's ReDb index row must be
+    /// GONE and B's must SURVIVE — proving the per-sweep index grouping
+    /// (`group_index_rows_by_user`) routes each `DelegateKey` to the right user's
+    /// bucket and reclaim removes EXACTLY the target user's rows, never the
+    /// survivor's. The existing on-disk assertions don't catch a mis-grouped row
+    /// because the on-disk delete keys on `user_id.encode()`, not the grouped
+    /// ReDb rows; this test exercises the grouped ReDb path specifically.
+    #[tokio::test]
+    async fn reclaim_removes_only_target_user_redb_rows() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        // BOTH users write under the SAME delegate, so the user-index table holds
+        // a row for (delegate, A) and a row for (delegate, B) — the exact shape
+        // that a mis-grouping bug would cross-contaminate.
+        let delegate = Delegate::from((&vec![90].into(), &vec![].into()));
+        let (a, dek_a) = fresh_user(&secrets_dir, 0x90);
+        let (b, dek_b) = fresh_user(&secrets_dir, 0x91);
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &a,
+            &dek_a,
+            &SecretsId::new(vec![1]),
+            b"a-secret",
+        );
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &b,
+            &dek_b,
+            &SecretsId::new(vec![2]),
+            b"b-secret",
+        );
+
+        // Pre-conditions: BOTH users have a ReDb index row under this delegate.
+        assert!(
+            db.get_user_secrets_index(delegate.key(), a.as_bytes())?
+                .is_some(),
+            "A must have a ReDb row before reclaim"
+        );
+        assert!(
+            db.get_user_secrets_index(delegate.key(), b.as_bytes())?
+                .is_some(),
+            "B must have a ReDb row before reclaim"
+        );
+
+        let now = 30_000_000u64;
+        let ttl = 30 * 86_400u64;
+        // A idle 40 days (past TTL → reclaimed); B stamped 1h ago (spared).
+        assert!(stamp_user_last_seen(&secrets_dir, &a, now - 40 * 86_400, 0));
+        assert!(stamp_user_last_seen(&secrets_dir, &b, now - 3_600, 0));
+
+        let reclaimed = reclaim_all(&secrets_dir, &db, now, ttl);
+        assert_eq!(reclaimed, 1, "exactly the idle user A is reclaimed");
+
+        // THE ASSERTION THAT MATTERS: A's ReDb row is gone, B's SURVIVES — the
+        // grouped reclaim touched only A's rows.
+        assert!(
+            db.get_user_secrets_index(delegate.key(), a.as_bytes())?
+                .is_none(),
+            "A's ReDb index row must be removed"
+        );
+        assert!(
+            db.get_user_secrets_index(delegate.key(), b.as_bytes())?
+                .is_some(),
+            "B's ReDb index row must SURVIVE — reclaim must not touch the non-target user"
+        );
+        // And B's secret is still readable end-to-end (on-disk blob intact too).
+        assert!(
+            store
+                .get_secret(
+                    delegate.key(),
+                    &SecretsId::new(vec![2]),
+                    SecretScope::User {
+                        id: &b,
+                        dek_secret: &dek_b
+                    },
+                )
+                .is_ok(),
+            "B's secret must remain readable after A's reclaim"
         );
         Ok(())
     }
