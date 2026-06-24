@@ -151,11 +151,10 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
             // WebSocket binds to same IP as network for test isolation (prevents port conflicts)
             address: Some(network_bind_ip.into()),
             ws_api_port: Some(ws_api_port),
-            token_ttl_seconds: None,
-            token_cleanup_interval_seconds: None,
-            allowed_host: None,
-            allowed_source_cidrs: None,
-            hosted_mode: None,
+            // All other ws_api args default (None). `..Default::default()` so a
+            // new ws_api field (e.g. the per-user rate-limit fields, #4561) can't
+            // break this test helper's compile.
+            ..Default::default()
         },
         network_api: NetworkArgs {
             // Use varied IP for network socket to get unique ring locations
