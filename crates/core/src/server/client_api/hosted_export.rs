@@ -204,6 +204,24 @@ pub(crate) fn export_user_context_or_reject(
     }
 }
 
+/// Decide whether this export is over the per-user export rate limit.
+///
+/// Factored out of the handler so the throttle decision is unit-testable
+/// without standing up a node. Returns `true` to REJECT (over-rate). A `None`
+/// limiter (standalone composition / export limiting disabled) never rejects.
+/// On an admitted export this RECORDS the export time (advances the per-user
+/// interval clock), so the call has a side effect and must run exactly once per
+/// request.
+fn export_rate_limited(
+    limiter: Option<&crate::client_events::user_op_rate_limit::UserOpRateLimiter>,
+    user_context: &UserSecretContext,
+) -> bool {
+    match limiter {
+        Some(limiter) => !limiter.try_acquire_export(user_context.user_id()),
+        None => false,
+    }
+}
+
 /// `GET /v{1,2}/hosted/export` — export this hosted user's per-user delegate
 /// secrets as an encrypted bundle download.
 ///
@@ -257,6 +275,31 @@ async fn export_handler(req: axum::extract::Request) -> Response {
                 return (status, reason).into_response();
             }
         };
+
+    // Per-user export rate limit (#4561, P5 of #4381). Export enumerates AND
+    // re-encrypts every secret in the user's scope, so it is far more expensive
+    // than a single op and gets a SEPARATE, tighter limit (min-interval, not a
+    // token bucket). Checked right AFTER the token gate — so only an
+    // authenticated token-holder is throttled, keyed by the gate-derived
+    // (unforgeable) `user_id` — and BEFORE op_manager resolution so a flooding
+    // client gets the 429 back-off signal regardless of node readiness, and a
+    // rejected request never reaches the executor. The limiter Extension is
+    // layered by `serve_client_api_in_impl`; absence (standalone composition)
+    // ⇒ no export limiting. Over-rate ⇒ HTTP 429.
+    let limiter = req
+        .extensions()
+        .get::<crate::client_events::user_op_rate_limit::UserOpRateLimiter>();
+    if export_rate_limited(limiter, &user_context) {
+        tracing::warn!(
+            user_id = ?user_context.user_id(),
+            "Rejected hosted export: per-user export rate limit exceeded"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "export rate limit exceeded; retry shortly",
+        )
+            .into_response();
+    }
 
     // Per-node route to the executor, carried as an Extension and filled by the
     // node at startup. Absent (standalone `as_router` composition with no node)
@@ -466,5 +509,67 @@ mod tests {
         let public6 = Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
         let err = export_user_context_or_reject(&headers, public6, true).unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    // ---- Per-user EXPORT rate limit (#4561) -------------------------------
+
+    use crate::client_events::user_op_rate_limit::UserOpRateLimiter;
+
+    /// No limiter (standalone composition / export limiting off) never rejects,
+    /// no matter how many exports the same user requests.
+    #[test]
+    fn export_rate_limit_absent_limiter_never_rejects() {
+        let ctx = UserSecretContext::from_token(b"tok-export");
+        for _ in 0..10 {
+            assert!(
+                !export_rate_limited(None, &ctx),
+                "absent limiter must never reject"
+            );
+        }
+    }
+
+    /// With a tight export interval the FIRST export passes (not limited) and an
+    /// immediate SECOND export from the same user is rejected (over-rate). This
+    /// is the 429 path the handler maps.
+    #[test]
+    fn export_rate_limit_second_immediate_export_rejected() {
+        // 60s min interval, op rate/burst irrelevant to export limiting.
+        let limiter = UserOpRateLimiter::new(10, 50, 60);
+        let ctx = UserSecretContext::from_token(b"tok-export");
+        assert!(
+            !export_rate_limited(Some(&limiter), &ctx),
+            "first export must pass"
+        );
+        assert!(
+            export_rate_limited(Some(&limiter), &ctx),
+            "immediate second export must be rejected (429 path)"
+        );
+    }
+
+    /// Export interval is per-user: throttling user A does not throttle user B.
+    #[test]
+    fn export_rate_limit_is_per_user() {
+        let limiter = UserOpRateLimiter::new(10, 50, 60);
+        let a = UserSecretContext::from_token(b"user-a");
+        let b = UserSecretContext::from_token(b"user-b");
+        assert!(!export_rate_limited(Some(&limiter), &a), "A first passes");
+        assert!(export_rate_limited(Some(&limiter), &a), "A throttled");
+        assert!(
+            !export_rate_limited(Some(&limiter), &b),
+            "B independent of A"
+        );
+    }
+
+    /// Export interval of 0 disables export limiting: a flood always passes.
+    #[test]
+    fn export_rate_limit_disabled_passes_all() {
+        let limiter = UserOpRateLimiter::new(10, 50, 0);
+        let ctx = UserSecretContext::from_token(b"tok-export");
+        for _ in 0..10 {
+            assert!(
+                !export_rate_limited(Some(&limiter), &ctx),
+                "export limiting disabled (0): every export passes"
+            );
+        }
     }
 }

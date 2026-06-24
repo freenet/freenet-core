@@ -129,6 +129,7 @@ use crate::{
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
+use crate::client_events::user_op_rate_limit::UserOpRateLimiter;
 use crate::server::client_api::OriginContractMap;
 use crate::wasm_runtime::UserSecretContext;
 
@@ -1068,6 +1069,7 @@ async fn connection_info(
     next.run(req).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn websocket_commands(
     ws: WebSocketUpgrade,
     Extension(auth_token): Extension<Option<AuthToken>>,
@@ -1079,7 +1081,16 @@ async fn websocket_commands(
     // (hosted mode). `None` outside hosted mode or when no user token was
     // presented. Owned and moved into the connection task below.
     Extension(user_context): Extension<Option<UserSecretContext>>,
+    // Per-node per-user operation rate limiter (#4561, P5 of #4381). Installed
+    // as an `Extension` by `serve_client_api_in_impl` (the only path that has
+    // the operator config). OPTIONAL: the standalone `create_router` test path
+    // and `run_local_node` install no limiter, so absence ⇒ no op rate limiting.
+    // This is safe because op rate limiting only ever fires for a connection
+    // that carries a `UserSecretContext`, which only the hosted serve path
+    // (which DOES install the limiter) ever derives.
+    op_rate_limiter: Option<Extension<UserOpRateLimiter>>,
 ) -> Response {
+    let op_rate_limiter = op_rate_limiter.map(|Extension(l)| l);
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need from the DashMap
         // Track whether a token was provided but is invalid (stale/expired)
@@ -1137,6 +1148,7 @@ async fn websocket_commands(
             rs.clone(),
             auth_and_instance,
             user_context,
+            op_rate_limiter,
             token_is_invalid,
             encoding_protoc,
             api_version,
@@ -1186,6 +1198,7 @@ async fn notify_disconnect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn websocket_interface(
     request_sender: WebSocketRequest,
     mut auth_token: Option<(AuthToken, ContractInstanceId)>,
@@ -1194,6 +1207,11 @@ async fn websocket_interface(
     // `ClientConnection::Request` so every request from this connection (and
     // only this connection) binds to the same user namespace.
     user_context: Option<UserSecretContext>,
+    // Per-node per-user op rate limiter (hosted mode, #4561). `None` on the
+    // standalone/local paths that install no limiter. Shared across all of a
+    // user's connections; consulted in `process_client_request` only when this
+    // connection carries a `user_context`.
+    op_rate_limiter: Option<UserOpRateLimiter>,
     token_is_invalid: bool,
     encoding_protoc: EncodingProtocol,
     api_version: ApiVersion,
@@ -1317,6 +1335,7 @@ async fn websocket_interface(
                     &mut auth_token.as_mut().map(|t| t.0.clone()),
                     auth_token.as_mut().map(|t| t.1),
                     user_context.as_ref(),
+                    op_rate_limiter.as_ref(),
                     api_version,
                     &mut delegate_rate_limiter,
                     &mut conn_state,
@@ -1582,6 +1601,7 @@ async fn process_client_request(
     auth_token: &mut Option<AuthToken>,
     origin_contract: Option<ContractInstanceId>,
     user_context: Option<&UserSecretContext>,
+    op_rate_limiter: Option<&UserOpRateLimiter>,
     api_version: ApiVersion,
     rate_limiter: &mut DelegateRateLimiter,
     conn_state: &mut ConnectionState,
@@ -1696,6 +1716,41 @@ async fn process_client_request(
             let error: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
                 DelegateError::Missing(delegate_req.key().clone()),
             ))
+            .into();
+            let serialized = match conn_state.encoding_protoc {
+                EncodingProtocol::Flatbuffers => error
+                    .into_fbs_bytes()
+                    .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?,
+                EncodingProtocol::Native => {
+                    bincode::serialize(&Err::<HostResponse, ClientError>(error))
+                        .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?
+                }
+            };
+            return Ok(Some(Message::Binary(serialized.into())));
+        }
+    }
+
+    // Per-user operation rate limit (#4561, P5 of #4381). Bounds how fast a
+    // single HOSTED user can issue contract operations (GET/PUT/UPDATE/
+    // SUBSCRIBE) so one visitor cannot flood the node's executor/network. The
+    // check is GATED on `user_context.is_some()` — i.e. hosted mode honored a
+    // user token for this connection — so Local / non-hosted / tokenless
+    // connections are NEVER rate-limited (the "never break single-user default"
+    // invariant). Reject BEFORE forwarding to the node, so an over-rate request
+    // costs no executor/network work; the client retries shortly.
+    if let (Some(user_context), Some(limiter)) = (user_context, op_rate_limiter) {
+        if limiter.op_limiting_enabled()
+            && matches!(req, ClientRequest::ContractOp(_))
+            && !limiter.try_acquire_op(user_context.user_id())
+        {
+            tracing::debug!(
+                %client_id,
+                user_id = ?user_context.user_id(),
+                "Rejecting contract operation: per-user operation rate limit exceeded"
+            );
+            let error: ClientError = ErrorKind::OperationError {
+                cause: std::borrow::Cow::Borrowed("operation rate limit exceeded; retry shortly"),
+            }
             .into();
             let serialized = match conn_state.encoding_protoc {
                 EncodingProtocol::Flatbuffers => error
@@ -3645,5 +3700,167 @@ mod tests {
 
         let result: Result<HostResponse, ClientError> = Err(ErrorKind::NodeUnavailable.into());
         assert!(extract_stream_content(&result).is_none());
+    }
+
+    // ---- Per-user operation rate limit at the WS boundary (#4561) ----------
+
+    /// A native-encoded `Get` operation message, the cheapest contract op to
+    /// drive `process_client_request` with.
+    fn encoded_get_op() -> Message {
+        let req = ClientRequest::ContractOp(ContractRequest::Get {
+            key: ContractInstanceId::new([7u8; 32]),
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        });
+        Message::Binary(bincode::serialize(&req).unwrap().into())
+    }
+
+    /// Drive ONE request through `process_client_request` with the given
+    /// optional `user_context` + limiter. Returns:
+    /// - `Ok(true)`  => the request was FORWARDED to the node (no rejection),
+    /// - `Ok(false)` => the request was REJECTED with an error message,
+    ///   and asserts the error decodes to an `OperationError` (the rate-limit
+    ///   rejection variant),
+    /// and confirms forward/reject is consistent with whether anything landed
+    /// on the request channel.
+    async fn drive_one_op(
+        user_context: Option<&UserSecretContext>,
+        op_rate_limiter: Option<&UserOpRateLimiter>,
+    ) -> bool {
+        // Large channel so forwarding never blocks within the test.
+        let (tx, mut rx) = mpsc::channel::<ClientConnection>(64);
+        let mut delegate_rate_limiter = DelegateRateLimiter::new();
+        let mut conn_state = test_conn_state(EncodingProtocol::Native);
+        let mut auth_token: Option<AuthToken> = None;
+
+        let out = process_client_request(
+            ClientId::next(),
+            Ok(encoded_get_op()),
+            &tx,
+            &mut auth_token,
+            None,
+            user_context,
+            op_rate_limiter,
+            ApiVersion::V1,
+            &mut delegate_rate_limiter,
+            &mut conn_state,
+        )
+        .await
+        .expect("process_client_request should not error on a valid Get");
+
+        match out {
+            // No message returned => forwarded to the node. Confirm something
+            // actually landed on the request channel.
+            None => {
+                let forwarded = rx.try_recv().is_ok();
+                assert!(forwarded, "forwarded op must reach the request channel");
+                true
+            }
+            // A message returned => a rejection. Confirm it's the rate-limit
+            // OperationError and that NOTHING was forwarded.
+            Some(Message::Binary(bytes)) => {
+                let decoded: Result<HostResponse, ClientError> =
+                    bincode::deserialize(&bytes).expect("rejection must be a native error frame");
+                match decoded {
+                    Err(e) => assert!(
+                        matches!(e.kind(), ErrorKind::OperationError { .. }),
+                        "rate-limit rejection must be an OperationError, got {:?}",
+                        e.kind()
+                    ),
+                    Ok(_) => panic!("rejection frame must be an Err, not Ok"),
+                }
+                assert!(
+                    rx.try_recv().is_err(),
+                    "rejected op must NOT be forwarded to the node"
+                );
+                false
+            }
+            Some(other) => panic!("unexpected non-binary response: {other:?}"),
+        }
+    }
+
+    fn test_user_context(token: &[u8]) -> UserSecretContext {
+        UserSecretContext::from_token(token)
+    }
+
+    /// Local connections (no `user_context`) are NEVER rate-limited: a flood of
+    /// ops far exceeding any burst all forward, even with an aggressive limiter
+    /// present. This is the "never break single-user default" invariant.
+    #[tokio::test]
+    async fn ws_local_flood_is_never_rate_limited() {
+        // Tiny burst, so a hosted user would be throttled almost immediately.
+        let limiter = UserOpRateLimiter::new(1, 1, 0);
+        for i in 0..50 {
+            assert!(
+                drive_one_op(None, Some(&limiter)).await,
+                "Local op {i} must always forward (no user context => no limit)"
+            );
+        }
+        assert_eq!(
+            limiter.tracked_op_users(),
+            0,
+            "Local traffic must never even touch the per-user limiter"
+        );
+    }
+
+    /// A hosted connection (with `user_context`) is throttled: with burst=3,
+    /// the first 3 ops forward and the 4th is rejected as an OperationError.
+    #[tokio::test]
+    async fn ws_hosted_burst_then_reject() {
+        let limiter = UserOpRateLimiter::new(10, 3, 0);
+        let ctx = test_user_context(b"alice");
+        for i in 0..3 {
+            assert!(
+                drive_one_op(Some(&ctx), Some(&limiter)).await,
+                "hosted op {i} within burst should forward"
+            );
+        }
+        assert!(
+            !drive_one_op(Some(&ctx), Some(&limiter)).await,
+            "hosted op beyond burst must be rejected"
+        );
+    }
+
+    /// Hosted, but op limiting DISABLED (rate 0): a hosted flood still forwards.
+    #[tokio::test]
+    async fn ws_hosted_disabled_limit_forwards_all() {
+        let limiter = UserOpRateLimiter::new(0, 3, 0);
+        let ctx = test_user_context(b"bob");
+        for i in 0..20 {
+            assert!(
+                drive_one_op(Some(&ctx), Some(&limiter)).await,
+                "with op limiting disabled, hosted op {i} should forward"
+            );
+        }
+    }
+
+    /// No limiter Extension at all (standalone/local serve path): hosted-looking
+    /// context still forwards, because absence of the limiter means "disabled".
+    #[tokio::test]
+    async fn ws_no_limiter_extension_forwards_all() {
+        let ctx = test_user_context(b"carol");
+        for i in 0..20 {
+            assert!(
+                drive_one_op(Some(&ctx), None).await,
+                "no limiter Extension => op {i} forwards (limiting off)"
+            );
+        }
+    }
+
+    /// Two distinct hosted users get independent buckets at the WS boundary:
+    /// exhausting user A's burst does not throttle user B.
+    #[tokio::test]
+    async fn ws_two_users_independent_buckets() {
+        let limiter = UserOpRateLimiter::new(10, 2, 0);
+        let a = test_user_context(b"user-a");
+        let b = test_user_context(b"user-b");
+        assert!(drive_one_op(Some(&a), Some(&limiter)).await);
+        assert!(drive_one_op(Some(&a), Some(&limiter)).await);
+        assert!(!drive_one_op(Some(&a), Some(&limiter)).await, "A exhausted");
+        // B is independent.
+        assert!(drive_one_op(Some(&b), Some(&limiter)).await);
+        assert!(drive_one_op(Some(&b), Some(&limiter)).await);
+        assert!(!drive_one_op(Some(&b), Some(&limiter)).await, "B exhausted");
     }
 }
