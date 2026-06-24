@@ -105,6 +105,13 @@ fn node_config(
             address: Some(Ipv4Addr::LOCALHOST.into()),
             ws_api_port: Some(ws_port),
             hosted_mode: Some(hosted_mode),
+            // Disable the per-user op rate limit (#4561) for these tests: they
+            // exercise hosted EXPORT behaviour (#4531) and fire bulk store_secret
+            // loops (e.g. 64 ops) as a single user to set up / stress the export,
+            // which is unrelated to rate limiting and would otherwise trip the
+            // limiter. The dedicated rate-limit coverage lives in
+            // `user_op_rate_limit` unit tests.
+            per_user_op_rate_limit: Some(0),
             ..Default::default()
         },
         network_api: freenet::config::NetworkArgs {

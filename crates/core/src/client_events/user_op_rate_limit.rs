@@ -53,7 +53,14 @@ pub const DEFAULT_PER_USER_OP_RATE_LIMIT: u64 = 10;
 /// Default per-user burst capacity (max tokens that can accumulate). A user
 /// who has been idle can issue up to this many ops back-to-back before being
 /// throttled to the sustained [`DEFAULT_PER_USER_OP_RATE_LIMIT`].
-pub const DEFAULT_PER_USER_OP_BURST: u64 = 50;
+///
+/// Set generously (100): a heavy-room hosted user's app-load — room list +
+/// per-room state + member lists + delegate secret reads across many rooms —
+/// can plausibly burst past 50 ops in the first second after page load. A
+/// false-positive throttle there breaks the UX worse than allowing a slightly
+/// larger ONE-TIME burst; the sustained [`DEFAULT_PER_USER_OP_RATE_LIMIT`]
+/// (10/sec) is the real flood cap, the burst is just the initial allowance.
+pub const DEFAULT_PER_USER_OP_BURST: u64 = 100;
 
 /// Minimum seconds between hosted-export downloads per user (export is far more
 /// expensive than a single op, so it gets a separate, tighter limit). `0`
