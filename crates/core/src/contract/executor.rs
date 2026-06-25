@@ -971,7 +971,14 @@ where
 
         let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE, db.clone())?;
         let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE, db.clone())?;
-        let secret_store = SecretsStore::new(config.secrets_dir(), config.secrets.clone(), db)?;
+        // Thread the operator-configured per-user secret quota (#4561, P5 of
+        // #4381) into the store at construction. `0` = disabled (the default).
+        // Every pooled executor passes the SAME limit (same Config), while the
+        // per-user byte counters they enforce against live in the process-global
+        // tracker inside SecretsStore — so accounting is shared even though each
+        // executor builds its own store.
+        let secret_store = SecretsStore::new(config.secrets_dir(), config.secrets.clone(), db)?
+            .with_user_quota(config.per_user_secret_quota_bytes);
 
         Ok((contract_store, delegate_store, secret_store))
     }

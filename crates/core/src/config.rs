@@ -120,6 +120,42 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
+    /// Per-user secret-storage quota in bytes for HOSTED mode (#4561, P5 of
+    /// #4381). Bounds a single hosted user's (one `userToken`) TOTAL on-disk
+    /// footprint under their `users/<user_id>/` tree, summed across every
+    /// delegate — both the active secret-value blobs AND the `.keys`
+    /// enumeration registry (so many/large keys are charged too) — so a visitor
+    /// cannot fill the node's disk. Per-user secret-value snapshots are disabled
+    /// (hosted users are transient and don't need overwrite history), so there
+    /// is no `.snapshots/` growth to charge. REJECT-on-full (never evict —
+    /// secrets are authoritative identity/room keys, not a cache). Default:
+    /// 4 MiB. `0` disables enforcement. Has NO effect outside hosted mode —
+    /// local single-user secrets are never quota-checked (and keep snapshots).
+    #[arg(long = "per-user-secret-quota", env = "PER_USER_SECRET_QUOTA")]
+    pub per_user_secret_quota_bytes: Option<u64>,
+
+    /// Inactivity TTL, in seconds, after which a HOSTED user's entire
+    /// per-user data is reclaimed by a background sweep (#4561, P5 of #4381).
+    /// Keeps a public "try Freenet" node a transient demo with bounded storage:
+    /// a visitor who walks away has their namespace reclaimed after this many
+    /// real-calendar seconds of inactivity (durable across restarts). Default:
+    /// 2_592_000 (30 days). `0` disables the sweep entirely. Has NO effect
+    /// outside hosted mode — Local single-user data is never enumerated or
+    /// reclaimed (it lives outside the `users/<id>/` tree the sweep touches).
+    #[arg(long = "per-user-inactive-ttl", env = "PER_USER_INACTIVE_TTL")]
+    pub per_user_inactive_ttl_secs: Option<u64>,
+
+    /// How often, in seconds, the inactive-user reclaim sweep runs (#4561).
+    /// Only relevant when hosted mode is on and `per-user-inactive-ttl` is
+    /// non-zero. Default: 3_600 (hourly) — far finer than the 30-day TTL, so
+    /// reclamation lag is negligible while keeping the sweep's disk-walk cost
+    /// trivial. Must be > 0; `0` is treated as the default.
+    #[arg(
+        long = "inactive-user-sweep-interval",
+        env = "INACTIVE_USER_SWEEP_INTERVAL"
+    )]
+    pub inactive_user_sweep_interval_secs: Option<u64>,
+
     /// Byte budget for the compiled-WASM **contract** module cache. The
     /// **delegate** cache gets a fraction of this value
     /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`, currently 1/4), so the combined
@@ -180,6 +216,9 @@ impl Default for ConfigArgs {
                 allowed_host: None,
                 allowed_source_cidrs: None,
                 hosted_mode: None,
+                per_user_op_rate_limit: None,
+                per_user_op_burst: None,
+                per_user_export_min_interval_secs: None,
             },
             secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
@@ -188,6 +227,9 @@ impl Default for ConfigArgs {
             version: false,
             max_blocking_threads: None,
             max_hosting_storage: None,
+            per_user_secret_quota_bytes: None,
+            per_user_inactive_ttl_secs: None,
+            inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
             shutdown_drain_secs: None,
             telemetry: Default::default(),
@@ -350,6 +392,15 @@ impl ConfigArgs {
             self.ws_api
                 .hosted_mode
                 .get_or_insert(cfg.ws_api.hosted_mode);
+            self.ws_api
+                .per_user_op_rate_limit
+                .get_or_insert(cfg.ws_api.per_user_op_rate_limit);
+            self.ws_api
+                .per_user_op_burst
+                .get_or_insert(cfg.ws_api.per_user_op_burst);
+            self.ws_api
+                .per_user_export_min_interval_secs
+                .get_or_insert(cfg.ws_api.per_user_export_min_interval_secs);
             self.network_api
                 .address
                 .get_or_insert(cfg.network_api.address);
@@ -432,6 +483,12 @@ impl ConfigArgs {
             self.log_level.get_or_insert(cfg.log_level);
             self.max_hosting_storage
                 .get_or_insert(cfg.max_hosting_storage);
+            self.per_user_secret_quota_bytes
+                .get_or_insert(cfg.per_user_secret_quota_bytes);
+            self.per_user_inactive_ttl_secs
+                .get_or_insert(cfg.per_user_inactive_ttl_secs);
+            self.inactive_user_sweep_interval_secs
+                .get_or_insert(cfg.inactive_user_sweep_interval_secs);
             self.module_cache_budget_bytes
                 .get_or_insert(cfg.module_cache_budget_bytes);
             self.shutdown_drain_secs
@@ -858,6 +915,21 @@ impl ConfigArgs {
                     .transpose()?
                     .unwrap_or_default(),
                 hosted_mode: self.ws_api.hosted_mode.unwrap_or(false),
+                per_user_op_rate_limit: self
+                    .ws_api
+                    .per_user_op_rate_limit
+                    .unwrap_or_else(default_per_user_op_rate_limit),
+                per_user_op_burst: self
+                    .ws_api
+                    .per_user_op_burst
+                    .unwrap_or_else(default_per_user_op_burst),
+                per_user_export_min_interval_secs: self
+                    .ws_api
+                    .per_user_export_min_interval_secs
+                    .unwrap_or_else(default_per_user_export_min_interval_secs),
+                // Runtime-only: resolve the secrets dir for this mode so the WS
+                // serve layer can stamp per-user activity markers (#4561).
+                secrets_dir: config_paths.secrets_dir(mode),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -871,6 +943,26 @@ impl ConfigArgs {
             max_hosting_storage: self
                 .max_hosting_storage
                 .unwrap_or(crate::ring::DEFAULT_HOSTING_BUDGET_BYTES),
+            per_user_secret_quota_bytes: self
+                .per_user_secret_quota_bytes
+                .unwrap_or(crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64),
+            per_user_inactive_ttl_secs: self
+                .per_user_inactive_ttl_secs
+                .unwrap_or(default_per_user_inactive_ttl_secs()),
+            inactive_user_sweep_interval_secs: {
+                // `0` means "use the default" (an interval of 0 is meaningless —
+                // the sweep would otherwise floor it to 1s and hammer the disk).
+                // Remap here so the resolved value always reflects the documented
+                // semantics, rather than relying on a downstream `.max(1)`.
+                let v = self
+                    .inactive_user_sweep_interval_secs
+                    .unwrap_or(default_inactive_user_sweep_interval_secs());
+                if v == 0 {
+                    default_inactive_user_sweep_interval_secs()
+                } else {
+                    v
+                }
+            },
             module_cache_budget_bytes: self
                 .module_cache_budget_bytes
                 .unwrap_or_else(crate::wasm_runtime::default_module_cache_budget_bytes),
@@ -998,6 +1090,35 @@ pub struct Config {
         rename = "max-hosting-storage"
     )]
     pub max_hosting_storage: u64,
+    /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
+    /// #4381). Bounds a single hosted user's TOTAL on-disk footprint (active
+    /// secret-value blobs + the `.keys` enumeration registry) under their
+    /// `users/<user_id>/` tree, summed across delegates. Per-user value
+    /// snapshots are disabled, so there is no `.snapshots/` growth to charge.
+    /// REJECT-on-full (never evict). Default 4 MiB; `0` disables. No effect
+    /// outside hosted mode (local single-user secrets are never quota-checked).
+    #[serde(
+        default = "default_per_user_secret_quota_bytes",
+        rename = "per-user-secret-quota"
+    )]
+    pub per_user_secret_quota_bytes: u64,
+    /// Inactivity TTL in seconds after which a HOSTED user's entire per-user
+    /// data is reclaimed by a background sweep (#4561, P5 of #4381). Durable,
+    /// real-calendar time (survives restarts). Default 2_592_000 (30 days);
+    /// `0` disables the sweep. No effect outside hosted mode — Local
+    /// single-user data is never enumerated or reclaimed.
+    #[serde(
+        default = "default_per_user_inactive_ttl_secs",
+        rename = "per-user-inactive-ttl"
+    )]
+    pub per_user_inactive_ttl_secs: u64,
+    /// How often (seconds) the inactive-user reclaim sweep runs (#4561). Only
+    /// relevant in hosted mode with a non-zero TTL. Default 3_600 (hourly).
+    #[serde(
+        default = "default_inactive_user_sweep_interval_secs",
+        rename = "inactive-user-sweep-interval"
+    )]
+    pub inactive_user_sweep_interval_secs: u64,
     /// Byte budget for the compiled-WASM **contract** module cache. The
     /// delegate cache gets a fraction of this
     /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`), so the combined ceiling is
@@ -1058,6 +1179,29 @@ fn default_max_blocking_threads() -> usize {
 /// default and the in-code default from ever drifting apart.
 fn default_max_hosting_storage() -> u64 {
     crate::ring::DEFAULT_HOSTING_BUDGET_BYTES
+}
+
+/// Default per-user secret-storage quota (4 MiB). Resolves to
+/// [`crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES`], the single
+/// source of truth for the in-code default, so the operator-facing default and
+/// the store's fallback never drift apart.
+fn default_per_user_secret_quota_bytes() -> u64 {
+    crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64
+}
+
+/// Default inactive-user TTL (30 days). Resolves to
+/// [`crate::wasm_runtime::DEFAULT_PER_USER_INACTIVE_TTL_SECS`], the single
+/// source of truth, so the operator-facing default and the sweep's fallback
+/// never drift.
+const fn default_per_user_inactive_ttl_secs() -> u64 {
+    crate::wasm_runtime::DEFAULT_PER_USER_INACTIVE_TTL_SECS
+}
+
+/// Default inactive-user sweep interval (1 hour). Far finer than the 30-day
+/// TTL, so reclamation lag is negligible while the periodic disk walk stays
+/// cheap.
+const fn default_inactive_user_sweep_interval_secs() -> u64 {
+    3_600
 }
 
 /// Default contract-module cache byte budget, scaled to system RAM
@@ -1707,6 +1851,35 @@ pub struct WebsocketApiArgs {
     )]
     #[serde(rename = "hosted-mode", skip_serializing_if = "Option::is_none")]
     pub hosted_mode: Option<bool>,
+
+    /// Sustained per-user operation rate limit (requests/second) for HOSTED
+    /// mode (#4561, P5 of #4381). Bounds how fast a single hosted user (one
+    /// `userToken`) can issue contract operations (GET/PUT/UPDATE/SUBSCRIBE) so
+    /// one visitor cannot flood the node's executor and network. Over-rate
+    /// requests are REJECTED at the WebSocket boundary (the client retries).
+    /// Default: 10 req/sec. `0` disables operation rate limiting. Has NO effect
+    /// outside hosted mode — local single-user requests are never rate-limited.
+    #[arg(long = "per-user-op-rate-limit", env = "PER_USER_OP_RATE_LIMIT")]
+    pub per_user_op_rate_limit: Option<u64>,
+
+    /// Per-user operation burst capacity for HOSTED mode (#4561). The maximum
+    /// number of operations a user who has been idle can issue back-to-back
+    /// before being throttled to the sustained `--per-user-op-rate-limit`.
+    /// Default: 100. Paired with the rate limit above; only meaningful when
+    /// op rate limiting is enabled.
+    #[arg(long = "per-user-op-burst", env = "PER_USER_OP_BURST")]
+    pub per_user_op_burst: Option<u64>,
+
+    /// Minimum seconds between hosted-export downloads PER USER (#4561). The
+    /// export endpoint enumerates and re-encrypts every secret in the user's
+    /// scope, so it is far more expensive than a single op and gets a separate,
+    /// tighter limit. A request inside this window returns HTTP 429. Default:
+    /// 10s. `0` disables export rate limiting. Hosted-mode only.
+    #[arg(
+        long = "per-user-export-min-interval-secs",
+        env = "PER_USER_EXPORT_MIN_INTERVAL_SECS"
+    )]
+    pub per_user_export_min_interval_secs: Option<u64>,
 }
 
 /// Default telemetry endpoint (nova.locut.us OTLP collector).
@@ -1904,6 +2077,46 @@ pub struct WebsocketApiConfig {
     /// derived, so with the flag off the entire feature is inert.
     #[serde(default, rename = "hosted-mode")]
     pub hosted_mode: bool,
+
+    /// Sustained per-user operation rate limit (requests/second) for hosted
+    /// mode (#4561, P5 of #4381). Bounds how fast a single hosted user can
+    /// issue contract operations so one visitor cannot flood the node. `0`
+    /// disables op rate limiting. No effect outside hosted mode. Default 10.
+    #[serde(
+        default = "default_per_user_op_rate_limit",
+        rename = "per-user-op-rate-limit"
+    )]
+    pub per_user_op_rate_limit: u64,
+
+    /// Per-user operation burst capacity for hosted mode (#4561). Max ops a
+    /// previously-idle user may issue back-to-back before being throttled to
+    /// the sustained rate. Default 100.
+    #[serde(default = "default_per_user_op_burst", rename = "per-user-op-burst")]
+    pub per_user_op_burst: u64,
+
+    /// Minimum seconds between hosted-export downloads per user (#4561). Export
+    /// is expensive, so it gets a separate tighter limit; a request inside this
+    /// window returns HTTP 429. `0` disables export rate limiting. Default 10.
+    #[serde(
+        default = "default_per_user_export_min_interval_secs",
+        rename = "per-user-export-min-interval-secs"
+    )]
+    pub per_user_export_min_interval_secs: u64,
+
+    /// Resolved secrets directory for this node. RUNTIME-ONLY, NOT persisted
+    /// (`#[serde(skip)]`, like `TelemetryConfig::is_test_environment`): it is
+    /// derived from the full `Config` in `build()` (`config.secrets_dir()`), so
+    /// serializing/round-tripping a `WebsocketApiConfig` standalone leaves it
+    /// empty and `build()` repopulates it.
+    ///
+    /// The WS serve layer injects it as an `Extension` so the per-user
+    /// last-activity marker (#4561, P5 of #4381, inactive-user TTL) can be
+    /// stamped at the same `<base>/users/<user_id>/.last_seen` location the
+    /// reclaim sweep reads. Empty (the default on the standalone test paths)
+    /// disables stamping, which is correct for non-hosted/test composition that
+    /// has no secrets tree to mark.
+    #[serde(skip)]
+    pub secrets_dir: std::path::PathBuf,
 }
 
 #[inline]
@@ -1916,6 +2129,26 @@ const fn default_token_cleanup_interval_seconds() -> u64 {
     300 // 5 minutes
 }
 
+/// Default sustained per-user op rate (req/sec) in hosted mode. Resolves to the
+/// single source of truth in `client_events::user_op_rate_limit` so the
+/// operator-facing default and the limiter's in-code default never drift.
+#[inline]
+const fn default_per_user_op_rate_limit() -> u64 {
+    crate::client_events::user_op_rate_limit::DEFAULT_PER_USER_OP_RATE_LIMIT
+}
+
+/// Default per-user op burst capacity in hosted mode.
+#[inline]
+const fn default_per_user_op_burst() -> u64 {
+    crate::client_events::user_op_rate_limit::DEFAULT_PER_USER_OP_BURST
+}
+
+/// Default minimum seconds between hosted exports per user.
+#[inline]
+const fn default_per_user_export_min_interval_secs() -> u64 {
+    crate::client_events::user_op_rate_limit::DEFAULT_PER_USER_EXPORT_MIN_INTERVAL_SECS
+}
+
 impl From<SocketAddr> for WebsocketApiConfig {
     fn from(addr: SocketAddr) -> Self {
         Self {
@@ -1926,6 +2159,10 @@ impl From<SocketAddr> for WebsocketApiConfig {
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
             hosted_mode: false,
+            per_user_op_rate_limit: default_per_user_op_rate_limit(),
+            per_user_op_burst: default_per_user_op_burst(),
+            per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
+            secrets_dir: std::path::PathBuf::new(),
         }
     }
 }
@@ -1941,6 +2178,10 @@ impl Default for WebsocketApiConfig {
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
             hosted_mode: false,
+            per_user_op_rate_limit: default_per_user_op_rate_limit(),
+            per_user_op_burst: default_per_user_op_burst(),
+            per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
+            secrets_dir: std::path::PathBuf::new(),
         }
     }
 }
@@ -3841,6 +4082,9 @@ mod tests {
             version: false,
             max_blocking_threads: None,
             max_hosting_storage: None,
+            per_user_secret_quota_bytes: None,
+            per_user_inactive_ttl_secs: None,
+            inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
             shutdown_drain_secs: None,
             telemetry: Default::default(),
@@ -3896,6 +4140,12 @@ mod tests {
                 allowed_hosts: vec!["my-host".to_string()],
                 allowed_source_cidrs: vec!["10.0.0.0/8".parse().unwrap()],
                 hosted_mode: true,
+                per_user_op_rate_limit: 33,
+                per_user_op_burst: 77,
+                per_user_export_min_interval_secs: 17,
+                // serde-skip runtime field; repopulated by build() and not
+                // asserted in the round-trip (bound to `_` in the destructure).
+                secrets_dir: std::path::PathBuf::new(),
             },
             secrets: base.secrets.clone(),
             log_level: tracing::log::LevelFilter::Debug,
@@ -3906,6 +4156,9 @@ mod tests {
             location: Some(0.5),
             max_blocking_threads: 7,
             max_hosting_storage: 123_456_789,
+            per_user_secret_quota_bytes: 7_654_321,
+            per_user_inactive_ttl_secs: 1_234_567,
+            inactive_user_sweep_interval_secs: 7_200,
             module_cache_budget_bytes: 987_654_321,
             telemetry: TelemetryConfig {
                 enabled: false,
@@ -3940,6 +4193,9 @@ mod tests {
             location,
             max_blocking_threads,
             max_hosting_storage,
+            per_user_secret_quota_bytes,
+            per_user_inactive_ttl_secs,
+            inactive_user_sweep_interval_secs,
             module_cache_budget_bytes,
             telemetry,
             shutdown_drain_secs,
@@ -3956,6 +4212,18 @@ mod tests {
         assert_eq!(
             max_hosting_storage, seed.max_hosting_storage,
             "max_hosting_storage"
+        );
+        assert_eq!(
+            per_user_secret_quota_bytes, seed.per_user_secret_quota_bytes,
+            "per_user_secret_quota_bytes"
+        );
+        assert_eq!(
+            per_user_inactive_ttl_secs, seed.per_user_inactive_ttl_secs,
+            "per_user_inactive_ttl_secs"
+        );
+        assert_eq!(
+            inactive_user_sweep_interval_secs, seed.inactive_user_sweep_interval_secs,
+            "inactive_user_sweep_interval_secs"
         );
         assert_eq!(
             module_cache_budget_bytes, seed.module_cache_budget_bytes,
@@ -4059,6 +4327,10 @@ mod tests {
             allowed_hosts,
             allowed_source_cidrs,
             hosted_mode,
+            per_user_op_rate_limit,
+            per_user_op_burst,
+            per_user_export_min_interval_secs,
+            secrets_dir: _, // serde-skip runtime field, repopulated by build()
         } = ws_api;
         assert_eq!(ws_address, seed.ws_api.address, "ws_api.address");
         assert_eq!(ws_port, seed.ws_api.port, "ws_api.port");
@@ -4076,6 +4348,18 @@ mod tests {
             "allowed_source_cidrs"
         );
         assert_eq!(hosted_mode, seed.ws_api.hosted_mode, "ws_api.hosted_mode");
+        assert_eq!(
+            per_user_op_rate_limit, seed.ws_api.per_user_op_rate_limit,
+            "ws_api.per_user_op_rate_limit"
+        );
+        assert_eq!(
+            per_user_op_burst, seed.ws_api.per_user_op_burst,
+            "ws_api.per_user_op_burst"
+        );
+        assert_eq!(
+            per_user_export_min_interval_secs, seed.ws_api.per_user_export_min_interval_secs,
+            "ws_api.per_user_export_min_interval_secs"
+        );
 
         let TelemetryConfig {
             enabled,

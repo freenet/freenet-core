@@ -78,7 +78,7 @@ jobs:
       # Download baseline from merge-base commit (eliminates stale baseline problem)
       - name: Download Baseline from Merge-Base
         id: baseline-cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: target/criterion
           # Try exact match with merge-base SHA
@@ -195,7 +195,7 @@ jobs:
       # PRs use restore-keys to find the most recent one
       - name: Save Baseline to Main
         if: github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: target/criterion
           # Include SHA so each main commit has its own baseline

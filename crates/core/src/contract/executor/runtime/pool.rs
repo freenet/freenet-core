@@ -108,6 +108,14 @@ pub struct RuntimePool {
     /// prose hope. `Arc` so an admitted `ExportJob` can hold an owned permit
     /// across the spawned background task without borrowing the pool.
     export_semaphore: Arc<Semaphore>,
+    /// Inactive-user reclaim sweep task (#4561, P5 of #4381). `Some` ONLY when
+    /// hosted mode is on AND `per-user-inactive-ttl > 0`. The pool owns the
+    /// abort guard so the sweep — which holds a clone of the shared ReDb
+    /// `Storage` — is aborted when the pool is dropped on node shutdown, matching
+    /// the #4401 teardown discipline for every other `Storage`-holding task.
+    /// `None` on a Local single-user node, so that node spawns nothing and the
+    /// reclaim machinery is entirely inert.
+    _inactive_user_sweep: Option<crate::util::AbortOnDrop>,
 }
 
 /// Max hosted-mode secret exports allowed to run off-loop at once (#4381 P5),
@@ -374,6 +382,33 @@ impl RuntimePool {
 
         tracing::info!(pool_size = pool_size_usize, "RuntimePool created");
 
+        // Inactive-user reclaim sweep (#4561, P5 of #4381). Spawned ONLY in
+        // hosted mode with a non-zero TTL — a Local single-user node spawns
+        // nothing, never enumerates the `users/` tree, and so can never reclaim
+        // its own (Local-scope) data. The sweep holds a clone of the SAME shared
+        // ReDb `Storage` the executors use (single-writer per process), so we
+        // pass `shared_state_store.storage()` rather than opening a second
+        // database. Its abort guard is owned by the pool so node shutdown tears
+        // it down (#4401 discipline).
+        let inactive_user_sweep = if crate::wasm_runtime::should_spawn_inactive_user_sweep(
+            config.ws_api.hosted_mode,
+            config.per_user_inactive_ttl_secs,
+        ) {
+            crate::wasm_runtime::spawn_inactive_user_sweep(
+                config.secrets_dir(),
+                shared_state_store.storage(),
+                config.per_user_inactive_ttl_secs,
+                config.inactive_user_sweep_interval_secs,
+            )
+            .map(|handle| {
+                let mut guard = crate::util::AbortOnDrop::new();
+                guard.push(handle.abort_handle());
+                guard
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             runtimes,
             available: Semaphore::new(pool_size_usize),
@@ -395,6 +430,7 @@ impl RuntimePool {
             delegate_notification_rx: Some(delegate_notification_rx),
             in_flight_contracts: HashMap::new(),
             export_semaphore: Arc::new(Semaphore::new(effective_export_permits(pool_size_usize))),
+            _inactive_user_sweep: inactive_user_sweep,
         })
     }
 

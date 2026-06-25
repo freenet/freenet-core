@@ -276,11 +276,12 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             // Bind to varied IP for test isolation (prevents port conflicts in parallel tests)
                             address: Some(node_ip.into()),
                             ws_api_port: Some(ws_port),
-                            token_ttl_seconds: None,
-                            token_cleanup_interval_seconds: None,
-                            allowed_host: None,
-                            allowed_source_cidrs: None,
-                            hosted_mode: None,
+                            // All other ws_api args default (None) for tests. Use
+                            // `..Default::default()` rather than listing each field
+                            // so a new ws_api arg can't break this macro's compile
+                            // (the per-user rate-limit fields, #4561, did exactly
+                            // that before this change).
+                            ..Default::default()
                         },
                         network_api: freenet::config::NetworkArgs {
                             // Use varied IP for public_address (affects location calculation)
@@ -417,11 +418,12 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             // Bind to varied IP for test isolation (prevents port conflicts in parallel tests)
                             address: Some(node_ip.into()),
                             ws_api_port: Some(ws_port),
-                            token_ttl_seconds: None,
-                            token_cleanup_interval_seconds: None,
-                            allowed_host: None,
-                            allowed_source_cidrs: None,
-                            hosted_mode: None,
+                            // All other ws_api args default (None) for tests. Use
+                            // `..Default::default()` rather than listing each field
+                            // so a new ws_api arg can't break this macro's compile
+                            // (the per-user rate-limit fields, #4561, did exactly
+                            // that before this change).
+                            ..Default::default()
                         },
                         network_api: freenet::config::NetworkArgs {
                             // Use varied IP for public_address (affects location calculation)

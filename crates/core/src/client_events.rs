@@ -39,6 +39,12 @@ pub(crate) mod result_router;
 pub(crate) mod session_actor;
 #[cfg(test)]
 mod test_correlation;
+/// Per-user operation/export rate limiting for hosted mode (#4561, P5 of #4381).
+/// Not gated on the `websocket` feature: it has no axum dependency (just
+/// `DashMap` + `tokio::time` + `UserId`) and its `DEFAULT_*` constants are the
+/// single source of truth for the operator-config defaults in `config.rs`,
+/// which compiles with or without the feature.
+pub(crate) mod user_op_rate_limit;
 #[cfg(feature = "websocket")]
 pub(crate) mod websocket;
 
