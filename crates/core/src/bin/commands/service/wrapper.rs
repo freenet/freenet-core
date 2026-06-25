@@ -801,6 +801,11 @@ fn run_wrapper_loop(
 
         let mut cmd = std::process::Command::new(&exe_path);
         cmd.arg("network");
+        // Mark the child as supervised so it knows exit code 42 will actually be
+        // caught and applied (issue #4580). Without this, the node can only fall
+        // back to systemd's INVOCATION_ID, which the in-process wrapper path does
+        // not set.
+        cmd.env(super::super::auto_update::SUPERVISED_ENV_VAR, "1");
 
         // On Windows, prevent a console window from appearing for the child process.
         // The wrapper has already detached from the console via FreeConsole(),

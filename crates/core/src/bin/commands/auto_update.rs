@@ -17,6 +17,7 @@ use anyhow::Result;
 use semver::Version;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub use freenet::transport::{
@@ -27,6 +28,73 @@ pub use freenet::transport::{
 /// Exit code that signals "update needed and verified against GitHub".
 /// The service wrapper catches this and runs `freenet update` before restarting.
 pub const EXIT_CODE_UPDATE_NEEDED: i32 = 42;
+
+/// Environment variable set by every Freenet supervisor (systemd unit, macOS
+/// launchd wrapper script, and the Windows/Linux in-process `service
+/// run-wrapper` loop) on the `freenet network` child it spawns. Its presence is
+/// positive evidence that *something* will catch exit code 42 and run
+/// `freenet update` before restarting the node.
+///
+/// Auto-update is structurally supervised-install-only: the running node never
+/// replaces its own binary — it exits 42 and relies on its supervisor to apply
+/// the update and restart it. A bare `freenet network` run has no supervisor, so
+/// it detects the update, exits 42, dies, and is never restarted (issue #4580).
+/// We use this marker (and `INVOCATION_ID` as a systemd fallback) to tell the
+/// operator, loudly, when an update was detected but will not be applied.
+pub const SUPERVISED_ENV_VAR: &str = "FREENET_SUPERVISED";
+
+/// Whether the running node appears to be under a supervisor that will catch
+/// exit code 42 and apply the update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorStatus {
+    /// The authoritative [`SUPERVISED_ENV_VAR`] marker is set — a Freenet
+    /// supervisor spawned us and *will* catch exit 42 and run `freenet update`.
+    /// Nothing to warn about; exit 42 is expected to be applied.
+    Supervised,
+    /// We are under systemd (`INVOCATION_ID` is set) but our authoritative
+    /// marker is absent. systemd alone does not prove the unit has the
+    /// exit-42 → `freenet update` `ExecStopPost` hook: a custom unit,
+    /// `systemd-run`, or a hand-written service running `freenet network`
+    /// without that hook is also `INVOCATION_ID`-bearing. We therefore can't
+    /// confirm the update will be applied — warn, but more softly, since this
+    /// also covers older Freenet units installed before the marker existed.
+    SupervisedUnverified,
+    /// No evidence of any supervisor. Exit 42 will most likely kill the node
+    /// without the update ever being applied — the operator must run
+    /// `freenet update` manually (or install Freenet as a service).
+    Unsupervised,
+}
+
+/// Detect whether a supervisor is present, using an injectable env lookup so the
+/// logic is unit-testable without mutating the process environment.
+///
+/// Honest by construction: we only claim the fully-quiet [`Supervised`] state on
+/// *our own* marker. systemd's generic `INVOCATION_ID` is reported as
+/// [`SupervisedUnverified`] (still warned about, softly) because it does not
+/// prove the unit carries the exit-42 → `freenet update` hook. Absence of both
+/// is [`Unsupervised`], which drives the loud error.
+///
+/// [`Supervised`]: SupervisorStatus::Supervised
+/// [`SupervisedUnverified`]: SupervisorStatus::SupervisedUnverified
+/// [`Unsupervised`]: SupervisorStatus::Unsupervised
+pub fn detect_supervisor_status<F>(env_get: F) -> SupervisorStatus
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let present = |key: &str| env_get(key).is_some_and(|v| !v.trim().is_empty());
+    if present(SUPERVISED_ENV_VAR) {
+        SupervisorStatus::Supervised
+    } else if present("INVOCATION_ID") {
+        SupervisorStatus::SupervisedUnverified
+    } else {
+        SupervisorStatus::Unsupervised
+    }
+}
+
+/// Read the live supervisor status from the process environment.
+pub fn supervisor_status() -> SupervisorStatus {
+    detect_supervisor_status(|key| std::env::var(key).ok())
+}
 
 /// Initial backoff interval for update checks (1 minute).
 const INITIAL_BACKOFF: Duration = Duration::from_secs(60);
@@ -82,14 +150,39 @@ pub enum UpdateCheckResult {
 ///
 /// Security: This function verifies against GitHub, so a malicious peer
 /// claiming a fake version won't trigger an exit.
+/// Set the first time this process logs the auto-update lockout at warn! level,
+/// so the permanent locked-out state is surfaced loudly once rather than on
+/// every 60s update-loop tick (it can be hit from multiple triggers per tick).
+static LOCKOUT_WARNED: AtomicBool = AtomicBool::new(false);
+
 pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResult {
     // Don't check if we've failed too many times
     if !should_attempt_update() {
-        tracing::debug!(
-            failures = get_update_failure_count(),
-            max = MAX_UPDATE_FAILURES,
-            "Skipping update check - too many previous failures"
-        );
+        // Loud, operator-visible (issue #4580): a persistent lockout means this
+        // peer has stopped trying to auto-update entirely and will silently stay
+        // behind. A common cause is a non-writable binary path (e.g. a
+        // hand-installed binary the service account can't replace), which is a
+        // *permanent* lockout until an operator intervenes. Warn LOUDLY the first
+        // time we observe it this process, then drop to debug! so the permanent
+        // state does not spam the log every minute.
+        let failures = get_update_failure_count();
+        if !LOCKOUT_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                failures,
+                max = MAX_UPDATE_FAILURES,
+                "Auto-update is LOCKED OUT after {MAX_UPDATE_FAILURES} consecutive failed update \
+                 attempts and will NOT retry. This peer will stay on the current version until an \
+                 operator intervenes. Run `freenet update` manually to update and reset the \
+                 lockout; if updates keep failing, the binary path is likely not writable by this \
+                 account.",
+            );
+        } else {
+            tracing::debug!(
+                failures,
+                max = MAX_UPDATE_FAILURES,
+                "Skipping update check - auto-update locked out (already warned this process)"
+            );
+        }
         return UpdateCheckResult::Skipped;
     }
 
@@ -736,6 +829,116 @@ mod tests {
             "should_attempt_update must fall back to `false` when state_dir \
              is unavailable — falling back to `true` allows the exit-42 loop \
              to run unbounded on Windows service accounts without USERPROFILE."
+        );
+    }
+
+    #[test]
+    fn test_detect_supervisor_status_marker_present() {
+        // Issue #4580: the explicit FREENET_SUPERVISED marker (set by all three
+        // supervisors on the network child) is positive evidence of a supervisor.
+        let env = |key: &str| {
+            if key == SUPERVISED_ENV_VAR {
+                Some("1".to_string())
+            } else {
+                None
+            }
+        };
+        assert_eq!(detect_supervisor_status(env), SupervisorStatus::Supervised);
+    }
+
+    #[test]
+    fn test_detect_supervisor_status_invocation_id_is_unverified() {
+        // systemd sets INVOCATION_ID for EVERY service instance, including custom
+        // units / systemd-run that lack our exit-42 → `freenet update` hook. So a
+        // bare INVOCATION_ID is only *unverified* supervision: we still warn (more
+        // softly), rather than going fully quiet as if the update were guaranteed
+        // to apply. This is the false-positive guard from the Codex review.
+        let env = |key: &str| {
+            if key == "INVOCATION_ID" {
+                Some("a1b2c3d4".to_string())
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            detect_supervisor_status(env),
+            SupervisorStatus::SupervisedUnverified
+        );
+    }
+
+    #[test]
+    fn test_detect_supervisor_status_marker_beats_invocation_id() {
+        // When BOTH our authoritative marker and systemd's INVOCATION_ID are set
+        // (the normal Freenet systemd-unit case), the marker wins and we report
+        // the fully-quiet Supervised state.
+        let env = |key: &str| match key {
+            SUPERVISED_ENV_VAR => Some("1".to_string()),
+            "INVOCATION_ID" => Some("a1b2c3d4".to_string()),
+            _ => None,
+        };
+        assert_eq!(detect_supervisor_status(env), SupervisorStatus::Supervised);
+    }
+
+    #[test]
+    fn test_detect_supervisor_status_unsupervised_when_absent() {
+        // The whole point of #4580: a bare `freenet network` run has neither
+        // signal and must be reported as Unsupervised so the loud warning fires
+        // instead of silently exiting 42 with nothing to apply the update.
+        let env = |_key: &str| None;
+        assert_eq!(
+            detect_supervisor_status(env),
+            SupervisorStatus::Unsupervised
+        );
+    }
+
+    #[test]
+    fn test_detect_supervisor_status_empty_and_whitespace_are_not_evidence() {
+        // An empty or whitespace-only value (e.g. `FREENET_SUPERVISED=`) must NOT
+        // count as a supervisor — it would suppress the warning while leaving the
+        // update unapplied, which is exactly the silent failure we are fixing.
+        for value in ["", "   ", "\t", "\n"] {
+            let env = move |key: &str| {
+                if key == SUPERVISED_ENV_VAR || key == "INVOCATION_ID" {
+                    Some(value.to_string())
+                } else {
+                    None
+                }
+            };
+            assert_eq!(
+                detect_supervisor_status(env),
+                SupervisorStatus::Unsupervised,
+                "value {value:?} must not count as supervisor evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn test_locked_out_update_check_is_loud() {
+        // Source-scrape pin for #4580: when the failure lockout disables
+        // auto-update, the skip MUST be operator-visible (warn!), not a silent
+        // debug! line. A regression to debug! would re-hide the permanent
+        // lockout (e.g. non-writable binary path) the issue calls out.
+        let src = include_str!("auto_update.rs");
+        let (_, after_fn_start) = src
+            .split_once("pub async fn check_if_update_available(")
+            .expect("check_if_update_available definition not found");
+        let (_, after_guard) = after_fn_start
+            .split_once("if !should_attempt_update() {")
+            .expect("lockout guard not found");
+        let (guard_body, _) = after_guard
+            .split_once("return UpdateCheckResult::Skipped;")
+            .expect("could not locate end of lockout guard");
+        // Strip line comments so the explanatory comment (which itself mentions
+        // "warn!"/"debug!") cannot satisfy the assertion — match only on code.
+        let code_only: String = guard_body
+            .lines()
+            .map(|line| line.split_once("//").map(|(c, _)| c).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code_only.contains("tracing::warn!"),
+            "the auto-update lockout skip must log at warn! level so a permanent \
+             lockout is diagnosable (#4580), not silently dropped at debug!"
         );
     }
 

@@ -33,6 +33,18 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run the node in network mode (default if no subcommand specified)
+    ///
+    /// NOTE ON AUTO-UPDATE: a node detects new releases and exits with code 42
+    /// to request an update, but it does NOT update itself. Applying the update
+    /// requires a supervisor that catches exit code 42 and runs `freenet update`
+    /// before restarting — this is set up by `freenet service install` (systemd
+    /// on Linux, a launchd wrapper on macOS, the tray wrapper on Windows).
+    ///
+    /// A bare `freenet network` run has no such supervisor: it will detect an
+    /// update, exit, and NOT be restarted, so it stays on its current version.
+    /// To keep a hand-run node current, either run `freenet update` yourself when
+    /// prompted in the logs, or install Freenet as a service. Dirty/dev builds
+    /// disable auto-update entirely (it would clobber local changes).
     Network {
         #[command(flatten)]
         config: ConfigArgs,
@@ -306,10 +318,18 @@ async fn run_network_node_with_signals(
         use std::time::Instant;
 
         if auto_update_disabled {
-            tracing::info!(
+            // Loud, operator-visible (issue #4580): a dirty/dev build never even
+            // checks for updates, so this node will stay on its current version
+            // indefinitely with no further signal. That is the intended
+            // behaviour for a local build (auto-update would clobber local
+            // changes, #3245), but it must be surfaced rather than silent.
+            tracing::warn!(
                 git_dirty = build_info::GIT_DIRTY,
-                "Auto-update disabled: this is a dirty (locally modified) build. \
-                 Run `freenet update` manually if needed."
+                "Auto-update is DISABLED for this dirty (locally modified) build: this node will \
+                 NOT detect or apply updates and will stay on version {} until you act. This is \
+                 expected for a local build. Run `freenet update` manually to switch to the \
+                 latest release, or install a clean release build to re-enable auto-update.",
+                build_info::VERSION,
             );
             std::future::pending::<()>().await;
             return;
@@ -860,14 +880,78 @@ fn main() {
     // any worker threads. See `set_secure_umask` and issue #4196.
     set_secure_umask();
 
-    use commands::auto_update::{EXIT_CODE_UPDATE_NEEDED, UpdateNeededError};
+    use commands::auto_update::{
+        EXIT_CODE_UPDATE_NEEDED, SupervisorStatus, UpdateNeededError, supervisor_status,
+    };
 
     match freenet_main() {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             // Check if this is an "update needed" error from auto-update detection
-            if e.downcast_ref::<UpdateNeededError>().is_some() {
-                eprintln!("Update needed, exiting for service wrapper to handle update...");
+            if let Some(update) = e.downcast_ref::<UpdateNeededError>() {
+                // Auto-update is supervised-install-only: the node never replaces
+                // its own binary. It exits 42 and relies on a supervisor (systemd
+                // ExecStopPost, the macOS launchd wrapper, or the Windows/Linux
+                // in-process run-wrapper loop) to run `freenet update` and restart
+                // it. A bare `freenet network` run has no supervisor, so without a
+                // loud warning the update is detected and then silently never
+                // applied (issue #4580). Scale the message by whether we have any
+                // evidence of a supervisor.
+                match supervisor_status() {
+                    SupervisorStatus::Supervised => {
+                        tracing::info!(
+                            new_version = %update.new_version,
+                            "Update {} detected; exiting with code {EXIT_CODE_UPDATE_NEEDED} for \
+                             the service supervisor to apply it and restart.",
+                            update.new_version,
+                        );
+                        eprintln!("Update needed, exiting for service wrapper to handle update...");
+                    }
+                    SupervisorStatus::SupervisedUnverified => {
+                        // Under systemd but without our authoritative marker: the
+                        // unit may or may not have the exit-42 → `freenet update`
+                        // ExecStopPost hook (e.g. a custom or pre-marker unit).
+                        // Warn, but more softly than the bare-CLI case, and tell
+                        // the operator how to confirm.
+                        tracing::warn!(
+                            new_version = %update.new_version,
+                            "Update {} detected; exiting with code {EXIT_CODE_UPDATE_NEEDED}. This \
+                             process is under systemd but its unit was not marked with \
+                             FREENET_SUPERVISED, so we cannot confirm it has the exit-42 → \
+                             `freenet update` hook. If updates do not apply automatically, \
+                             reinstall the service with `freenet service install` (or add an \
+                             ExecStopPost that runs `freenet update` on exit 42).",
+                            update.new_version,
+                        );
+                        eprintln!(
+                            "Update {} detected, exiting with code {EXIT_CODE_UPDATE_NEEDED} for a \
+                             service supervisor to apply it. If updates do not apply, reinstall \
+                             with `freenet service install`.",
+                            update.new_version,
+                        );
+                    }
+                    SupervisorStatus::Unsupervised => {
+                        tracing::error!(
+                            new_version = %update.new_version,
+                            "Update {} was detected, but this process does NOT appear to be \
+                             running under a Freenet service supervisor. Auto-update only works \
+                             when Freenet is installed as a service (`freenet service install`): \
+                             the node exits with code {EXIT_CODE_UPDATE_NEEDED} expecting the \
+                             supervisor to run `freenet update` and restart it. A bare \
+                             `freenet network` run will now EXIT WITHOUT UPDATING and will not be \
+                             restarted. Run `freenet update` and relaunch, or install Freenet as \
+                             a service so future updates apply automatically.",
+                            update.new_version,
+                        );
+                        eprintln!(
+                            "WARNING: update {} detected but no service supervisor was found. \
+                             Exiting with code {EXIT_CODE_UPDATE_NEEDED} WITHOUT applying the \
+                             update. Run `freenet update` and relaunch, or install Freenet as a \
+                             service (`freenet service install`) so updates apply automatically.",
+                            update.new_version,
+                        );
+                    }
+                }
                 std::process::exit(EXIT_CODE_UPDATE_NEEDED);
             }
             // Another instance is already running — exit cleanly so systemd
@@ -1144,6 +1228,102 @@ mod tests {
             worker_dir_mode, 0o700,
             "directory created from tokio worker after set_secure_umask() should be 0o700, \
              got {worker_dir_mode:o}"
+        );
+    }
+
+    /// Strip Rust `//` line comments from source text so a source-scrape pin
+    /// matches only on actual code, not on a comment that happens to mention the
+    /// searched token (addresses the "passes with commented-out code" brittleness
+    /// the Codex review flagged). Crude but sufficient: we only feed it our own
+    /// source and never have `//` inside a string literal on the matched lines.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Source-scrape pin for issue #4580: the exit-42 handler in `main()` MUST
+    /// branch on supervisor status and escalate to a loud `error!` on the
+    /// unsupervised path. A bare `freenet network` run that detects an update,
+    /// exits 42, and dies without applying it is exactly the silent failure this
+    /// PR makes diagnosable; a regression that drops the branch (back to a bare
+    /// "exiting for service wrapper to handle update") would re-hide it.
+    #[test]
+    fn exit_42_path_warns_loudly_when_unsupervised() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let (_, after_branch) = src
+            .split_once("if let Some(update) = e.downcast_ref::<UpdateNeededError>() {")
+            .expect("exit-42 branch not found in main()");
+        let (branch_body, _) = after_branch
+            .split_once("std::process::exit(EXIT_CODE_UPDATE_NEEDED);")
+            .expect("could not locate end of exit-42 branch");
+        assert!(
+            branch_body.contains("SupervisorStatus::Unsupervised"),
+            "exit-42 handler must distinguish the unsupervised case (#4580)"
+        );
+        assert!(
+            branch_body.contains("tracing::error!"),
+            "exit-42 handler must log at error! level on the unsupervised path \
+             so the silent 'detected update, exited, never applied' failure is \
+             diagnosable (#4580)"
+        );
+    }
+
+    /// Source-scrape pin for #4580: the dirty-build branch that disables
+    /// auto-update entirely must be operator-visible (`warn!`), not a quiet
+    /// `info!`. A dirty build never checks for updates, so the only signal an
+    /// operator gets is this line.
+    #[test]
+    fn dirty_build_disables_update_loudly() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let (_, after_guard) = src
+            .split_once("if auto_update_disabled {")
+            .expect("dirty-build guard not found");
+        let (guard_body, _) = after_guard
+            .split_once("std::future::pending::<()>().await;")
+            .expect("could not locate end of dirty-build guard");
+        assert!(
+            guard_body.contains("tracing::warn!"),
+            "the dirty-build auto-update-disabled branch must log at warn! so it \
+             is operator-visible (#4580)"
+        );
+    }
+
+    /// Source-scrape pin for #4580: each Freenet supervisor must set the
+    /// `FREENET_SUPERVISED` marker on the `freenet network` child it spawns, so
+    /// the node can tell it is supervised and log calmly instead of erroring on
+    /// the exit-42 path. These run on every platform (we scrape source text, not
+    /// the cfg-gated generators) so a regression on any one platform's path is
+    /// caught by CI regardless of the runner OS.
+    #[test]
+    fn supervisors_set_supervised_marker() {
+        // The in-process wrapper loop (Windows + Linux service run-wrapper).
+        let wrapper_src = include_str!("commands/service/wrapper.rs");
+        assert!(
+            wrapper_src.contains("SUPERVISED_ENV_VAR"),
+            "the in-process wrapper must set the FREENET_SUPERVISED marker on the \
+             network child it spawns (#4580)"
+        );
+
+        // The macOS launchd wrapper script.
+        let macos_src = include_str!("commands/service/macos.rs");
+        assert!(
+            macos_src.contains("supervised_env = super::super::auto_update::SUPERVISED_ENV_VAR")
+                && macos_src.contains("export {supervised_env}=1"),
+            "the macOS wrapper script must export the FREENET_SUPERVISED marker \
+             so the launchd-supervised node detects its supervisor (#4580)"
+        );
+
+        // Both systemd unit templates (user + system).
+        let linux_src = include_str!("commands/service/linux.rs");
+        let marker_count = linux_src
+            .matches("Environment=FREENET_SUPERVISED=1")
+            .count();
+        assert!(
+            marker_count >= 2,
+            "both systemd unit templates must set Environment=FREENET_SUPERVISED=1 \
+             (#4580); found {marker_count}"
         );
     }
 }
