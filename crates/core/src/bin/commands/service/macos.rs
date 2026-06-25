@@ -133,6 +133,12 @@ pub fn generate_wrapper_script(binary_path: &Path) -> String {
 # Includes exponential backoff to prevent rapid restart loops on repeated failures.
 # On startup, kills any stale 'freenet network' processes to avoid port conflicts.
 
+# Mark the node child as supervised (issue #4580). This tells `freenet network`
+# that exit code 42 (update needed) will actually be caught and applied by this
+# wrapper, so it logs an informational message rather than a loud "no supervisor,
+# update will not be applied" error on exit.
+export {supervised_env}=1
+
 BACKOFF=10       # Initial backoff in seconds
 MAX_BACKOFF=300  # Maximum backoff (5 minutes)
 CONSECUTIVE_FAILURES=0
@@ -347,7 +353,8 @@ while true; do
     fi
 done
 "#,
-        binary = binary_path.display()
+        binary = binary_path.display(),
+        supervised_env = super::super::auto_update::SUPERVISED_ENV_VAR,
     )
 }
 

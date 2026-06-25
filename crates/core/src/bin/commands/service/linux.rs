@@ -267,6 +267,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Mark the node as supervised (issue #4580): tells `freenet network` that exit
+# code 42 (update needed) will be applied by ExecStopPost below, so it logs an
+# informational message instead of a loud "no supervisor" error on update exit.
+# systemd also sets INVOCATION_ID for every service, which the node detects as a
+# fallback; this makes the intent explicit and robust.
+Environment=FREENET_SUPERVISED=1
 # Stale-orphan self-heal (issue #3967): RestartPreventExitStatus=43 below
 # means an exit 43 ("another instance already running") never restarts the
 # unit. That is correct for a legitimate second instance, but if the port
@@ -372,6 +378,11 @@ Wants=network-online.target
 Type=simple
 User={username}
 Environment=HOME={home}
+# Mark the node as supervised (issue #4580): see the matching comment in the
+# user unit. Tells `freenet network` that exit code 42 (update needed) will be
+# applied by ExecStopPost below, so it logs an informational message instead of
+# a loud "no supervisor" error on update exit.
+Environment=FREENET_SUPERVISED=1
 # Stale-orphan self-heal (issue #3967): see the matching comment in the user
 # unit (including the systemd $$-escaping, the PPID-after-final-')' parse, and
 # why we do NOT anchor on the holder's exe equalling this unit's on-disk binary
