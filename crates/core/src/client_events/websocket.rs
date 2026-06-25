@@ -118,6 +118,7 @@ use futures::{FutureExt, SinkExt, StreamExt, future::BoxFuture, stream::SplitSin
 use headers::Header;
 use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc};
+use zeroize::Zeroizing;
 
 use crate::{
     client_events::AuthToken,
@@ -688,7 +689,14 @@ struct ConnectionInfo {
     /// the WS upgrade URL (the P2-frontend follow-up mints/stores/presents it).
     /// It is honored ONLY when the node runs in hosted mode; otherwise it is
     /// ignored entirely and every connection stays single-user.
-    user_token: Option<String>,
+    ///
+    /// Held in a [`Zeroizing`] buffer so the raw token bytes are wiped on drop
+    /// rather than lingering in freed heap memory: the token is the master seed
+    /// from which the per-user DEK derives (the derived DEK and plaintext
+    /// secrets are already `Zeroizing`). `serde` deserializes the inner `String`
+    /// and moves it into the wrapper, so the token never exists as a separate
+    /// un-zeroized owned copy.
+    user_token: Option<Zeroizing<String>>,
 }
 
 /// Decide a connection's per-user secret namespace from the hosted-mode flag
@@ -970,11 +978,15 @@ async fn connection_info(
     // default-to-false in a real hosted deployment that lost the injection would
     // disable per-user isolation (all users -> Local shared namespace ->
     // cross-user clobber) — for a security flag, fail-loud beats fail-silent.
-    let user_token = req
+    // Wrap the header value directly in `Zeroizing` (the `.to_str()` borrow into
+    // the header buffer is a separate concern) so the only owned copy of the raw
+    // token is wiped on drop. `user_token_q` is already `Zeroizing` from the
+    // query deserialization, so neither branch leaves a plain un-zeroized copy.
+    let user_token: Option<Zeroizing<String>> = req
         .headers()
         .get("x-freenet-user-token")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
+        .map(|s| Zeroizing::new(s.to_owned()))
         .or(user_token_q);
 
     // REFUSE-PLAINTEXT-TOKEN invariant (#4381): a `userToken` is a durable,
@@ -1011,6 +1023,13 @@ async fn connection_info(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case("https"));
 
+    // Borrow the token as a `&str` for the gate and derivation. This does NOT
+    // copy the token: it borrows out of the `Zeroizing<String>` buffer, which
+    // still owns the bytes and wipes them on drop. `derive_user_context` keeps
+    // its `Option<&str>` signature, so `from_token` receives byte-identical
+    // input — the only change here is the owning container's zero-on-drop.
+    let token_str: Option<&str> = user_token.as_deref().map(String::as_str);
+
     // `has_token` is a NON-EMPTY check, matching `derive_user_context`'s
     // empty-is-absent semantics. The browser shell sends `?userToken=` (empty)
     // for a brand-new user who has no token yet; that connection must fall
@@ -1019,11 +1038,11 @@ async fn connection_info(
     // token is treated as no token, so it is never gated.
     let user_context = match decide_user_token(
         hosted_mode.0,
-        user_token.as_deref().is_some_and(|t| !t.is_empty()),
+        token_str.is_some_and(|t| !t.is_empty()),
         source_ip,
         xfp_https,
     ) {
-        UserTokenDecision::Honor => derive_user_context(hosted_mode.0, user_token.as_deref()),
+        UserTokenDecision::Honor => derive_user_context(hosted_mode.0, token_str),
         UserTokenDecision::Local => None,
         UserTokenDecision::RejectInsecure => {
             // Fail LOUD, not silent. Dropping the token and falling back to Local
