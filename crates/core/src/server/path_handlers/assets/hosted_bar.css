@@ -98,3 +98,43 @@ iframe {
   color: #2a8a55;
   font-size: 12px;
 }
+
+/* Respect the OS dark-mode preference. Same restrained, near-monochrome
+   character as the light theme: charcoal bar, light-grey text, hairline
+   borders. */
+@media (prefers-color-scheme: dark) {
+  #fnbar {
+    background: #1c1c1e;
+    border-bottom-color: #303032;
+    color: #98989c;
+  }
+  #fnbar .fn {
+    color: #ececee;
+  }
+  #fnbar .nt {
+    color: #88888c;
+  }
+  #fnbar button {
+    color: #e6e6e8;
+    background: #2c2c2f;
+    border-color: #46464a;
+  }
+  #fnbar button:hover {
+    border-color: #6a6a6e;
+  }
+  #fnpop {
+    background: #252528;
+    border-color: #3a3a3e;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+    color: #c2c2c6;
+  }
+  #fnpop h4 {
+    color: #88888c;
+  }
+  #fnpop p {
+    color: #a0a0a4;
+  }
+  #fnok {
+    color: #5cbd83;
+  }
+}
