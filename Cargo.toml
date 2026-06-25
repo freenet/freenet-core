@@ -29,7 +29,7 @@ renegade-ml = "0.3.3"
 pin-project = "1"
 thiserror = "2"
 ulid = { version = "1.1", features = ["serde"] }
-zeroize = { version = "1.8", features = ["derive"] }
+zeroize = { version = "1.8", features = ["derive", "serde"] }
 
 # Async/networking
 axum = { version = "0.8", default-features = false }
