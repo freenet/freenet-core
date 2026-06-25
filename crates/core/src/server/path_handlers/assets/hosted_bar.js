@@ -15,6 +15,13 @@
   document.addEventListener('click', function (e) {
     if (!acct.contains(e.target)) pop.classList.remove('open');
   });
+  // Clicking into the sandboxed iframe (the app, which fills most of the page)
+  // does NOT fire the document click above — the click lands in the iframe's
+  // own document. It does blur the shell window, so dismiss the popover on
+  // focus loss too, otherwise it stays open until you click the bar again.
+  window.addEventListener('blur', function () {
+    pop.classList.remove('open');
+  });
   document.getElementById('fncopy').addEventListener('click', function () {
     var t =
       typeof __freenet_user_token !== 'undefined' ? __freenet_user_token : null;
