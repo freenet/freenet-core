@@ -1962,6 +1962,31 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "subscribe_hint_acted".to_string(),
                     serde_json::json!(snapshot.subscribe_hint_acted),
                 );
+                // Interest-weighted (two-tier) module-cache SHADOW gauges
+                // (#4441/#4534). Inserted here (not as inline `json!` keys) to
+                // keep the macro under its recursion limit, same as the
+                // placement gauges above — but this body is still hand-mirrored,
+                // so a new `RouterSnapshotInfo` field is invisible to the
+                // collector unless added here. Pinned by
+                // `router_snapshot_json_includes_interest_tier_shadow_gauges`.
+                obj.insert(
+                    "contract_module_cache_cold_evictable_bytes".to_string(),
+                    serde_json::json!(snapshot.contract_module_cache_cold_evictable_bytes),
+                );
+                obj.insert(
+                    "contract_module_cache_interested_bytes".to_string(),
+                    serde_json::json!(snapshot.contract_module_cache_interested_bytes),
+                );
+                obj.insert(
+                    "contract_module_cache_evictions_would_reclassify_total".to_string(),
+                    serde_json::json!(
+                        snapshot.contract_module_cache_evictions_would_reclassify_total
+                    ),
+                );
+                obj.insert(
+                    "migration_admission_would_change_total".to_string(),
+                    serde_json::json!(snapshot.migration_admission_would_change_total),
+                );
             }
             body
         }
@@ -2063,6 +2088,37 @@ mod tests {
             ("delegate_module_cache_total_bytes", 23),
             ("delegate_module_cache_budget_bytes", 29),
             ("delegate_module_cache_evictions_total", 31),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the interest-weighted (two-tier) module-cache SHADOW gauges
+    /// (#4441/#4534) must also reach the hand-mirrored OTLP body — same footgun
+    /// as the gauges above. These are always-on (flag-independent) and are the
+    /// production signal for whether flipping the
+    /// `FREENET_MODULE_CACHE_INTEREST_TIERED` flag (and the later #4534
+    /// admission-gate change) would help, so a silent drop here would defeat the
+    /// whole shadow-metrics purpose of this change.
+    #[test]
+    fn router_snapshot_json_includes_interest_tier_shadow_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.contract_module_cache_cold_evictable_bytes = Some(101);
+        info.contract_module_cache_interested_bytes = Some(103);
+        info.contract_module_cache_evictions_would_reclassify_total = Some(107);
+        info.migration_admission_would_change_total = Some(109);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("contract_module_cache_cold_evictable_bytes", 101),
+            ("contract_module_cache_interested_bytes", 103),
+            (
+                "contract_module_cache_evictions_would_reclassify_total",
+                107,
+            ),
+            ("migration_admission_would_change_total", 109),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

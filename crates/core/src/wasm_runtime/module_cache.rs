@@ -45,6 +45,55 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
+/// A predicate that reports whether a cached key is currently "of interest" to
+/// this node, i.e. something still depends on it being resident.
+///
+/// For the contract cache this is wired to
+/// [`Ring::contract_in_use`](crate::ring::Ring::contract_in_use) (a live local
+/// client subscription OR a downstream peer subscriber — deliberately NOT an
+/// upstream-only subscription, which is unbounded). It is `None` for caches
+/// that have no interest concept (the delegate cache, unlabeled/test caches),
+/// in which case eviction is always pure byte-LRU regardless of the feature
+/// flag.
+///
+/// Read inside `evict_to_budget` (under the cache `Mutex`); the predicate reads
+/// only the Ring's subscription DashMaps and never the cache, so there is no
+/// lock-order hazard (see `HostingManager::contract_in_use` rustdoc).
+pub(crate) type InterestPredicate<K> = Arc<dyn Fn(&K) -> bool + Send + Sync>;
+
+/// Environment variable that enables the interest-weighted (two-tier) eviction
+/// policy for the contract module cache. Default OFF — with the flag unset (or
+/// any value other than a recognized truthy string) eviction is EXACTLY the
+/// pre-existing pure byte-LRU, so this whole change is inert until an operator
+/// opts in. Mirrors the `FREENET_MODULE_CACHE_BUDGET_BYTES` env pattern.
+///
+/// When ON, an over-budget eviction first reclaims cold (no-interest) LRU
+/// entries; only if the interested set ALONE still exceeds the byte budget does
+/// it evict interested LRU entries too. The byte budget itself is never
+/// weakened (that would re-open the #4565 OOM risk) — no contract is pinned
+/// forever. See [`ModuleCache::evict_to_budget`].
+///
+/// Read ONCE at cache construction (`RuntimePool::new`), exactly like
+/// `FREENET_MODULE_CACHE_BUDGET_BYTES`: changing it requires a node RESTART to
+/// take effect — there is no live re-read.
+pub(crate) const INTEREST_TIERED_ENV: &str = "FREENET_MODULE_CACHE_INTEREST_TIERED";
+
+/// Parse the [`INTEREST_TIERED_ENV`] flag value into a bool. Recognizes the
+/// usual truthy spellings; anything else (including unset) is `false`, so the
+/// safe default is pure byte-LRU. Split out as a pure function so the parsing is
+/// unit-testable without touching the process environment.
+fn parse_interest_tiered_flag(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Read [`INTEREST_TIERED_ENV`] from the process environment (default OFF).
+pub(crate) fn interest_tiered_enabled() -> bool {
+    parse_interest_tiered_flag(std::env::var(INTEREST_TIERED_ENV).ok().as_deref())
+}
+
 /// Minimum gap between "cache is evicting at budget" operator warnings, so a
 /// memory-bound node logs the signal periodically instead of once per eviction.
 const EVICTION_WARN_INTERVAL: Duration = Duration::from_secs(300);
@@ -53,6 +102,22 @@ const EVICTION_WARN_INTERVAL: Duration = Duration::from_secs(300);
 /// cache emits a warning. A handful of evictions is normal churn; sustained
 /// eviction means the working set genuinely exceeds the budget.
 const EVICTION_WARN_THRESHOLD: u64 = 16;
+
+/// How often a cache HIT (`get`) is allowed to recompute the interest shadow
+/// gauges (cold-evictable vs interested bytes).
+///
+/// The `interest` predicate can flip for an already-cached contract WITHOUT any
+/// cache mutation — e.g. a client disconnects or a downstream lease expires —
+/// so recomputing the split only on insert/remove would leave the gauges (and
+/// the `migration_admission_would_change` floor) stale on a read-mostly cache
+/// (Codex review). Refreshing on `get` fixes that, but a full O(entries) scan on
+/// every hot lookup is too expensive; the gauges are consumed only at the 5-min
+/// snapshot cadence and at admission-gate time, so bounding the recompute to at
+/// most once per this interval keeps `get` cheap while bounding staleness to the
+/// interval on any node with ongoing contract traffic. Uses real wall-clock time
+/// (same rationale as the eviction warn window): it rate-limits a telemetry
+/// recompute, not node behavior, so it must advance in real time.
+const INTEREST_SHADOW_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// A least-recently-used cache bounded by the total byte size of its values.
 ///
@@ -90,9 +155,33 @@ pub(crate) struct ModuleCache<K: Hash + Eq, V> {
     /// `RuntimePool::new`; the `Ring` snapshot task reads from the same `Arc`.
     /// See [`ModuleCacheMetrics`].
     metrics: Option<Arc<ModuleCacheMetrics>>,
+    /// Optional "is this key still of interest?" predicate (the contract cache
+    /// wires it to `Ring::contract_in_use`; `None` for the delegate / test
+    /// caches). Drives the interest-tier of eviction AND the always-on shadow
+    /// metrics (cold-evictable vs interested bytes, would-reclassify count).
+    /// See [`InterestPredicate`].
+    interest: Option<InterestPredicate<K>>,
+    /// Whether the interest-weighted (two-tier) eviction policy is ACTIVE.
+    /// `true` only when both the [`INTEREST_TIERED_ENV`] flag is set AND an
+    /// `interest` predicate is present. With it `false`, eviction is exactly the
+    /// pre-existing pure byte-LRU — the shadow metrics are still computed (they
+    /// only need the predicate), but they do not change eviction behavior. This
+    /// is what makes the change inert by default and safe to merge.
+    interest_tiered_active: bool,
+    /// Last time a cache HIT recomputed the interest shadow gauges, throttled to
+    /// [`INTEREST_SHADOW_REFRESH_INTERVAL`]. `None` until the first throttled
+    /// refresh. Insert/remove always recompute (the entry set just changed);
+    /// this only governs the `get`-path refresh that catches interest flips with
+    /// no cache mutation. Real wall-clock `Instant` deliberately — see the
+    /// constant's docs and `window_started_at`.
+    last_interest_shadow_refresh: Option<Instant>,
 }
 
-impl<K: Hash + Eq, V> ModuleCache<K, V> {
+// `K: Clone` is required so the two-tier eviction can name (clone) the LRU cold
+// key it selects before `pop`-ing it; the real keys (`ContractKey`,
+// `DelegateKey`) and every test key (`u64`) are `Clone`, so this is not a new
+// restriction in practice.
+impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
     /// Create an empty cache with the given byte budget, an unlabeled
     /// ("module") operator-warning tag, and no metrics sink. Prefer
     /// [`Self::with_label`] in production so the eviction warning identifies
@@ -115,7 +204,26 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
         label: &'static str,
         metrics: Option<Arc<ModuleCacheMetrics>>,
     ) -> Self {
+        Self::with_label_and_interest(budget_bytes, label, metrics, None)
+    }
+
+    /// Like [`Self::with_label`] but also wires an optional interest predicate
+    /// (and reads the [`INTEREST_TIERED_ENV`] flag) so the contract cache can
+    /// participate in interest-weighted (two-tier) eviction.
+    ///
+    /// The two-tier policy is ACTIVE only when the flag is set AND `interest` is
+    /// `Some`. When `interest` is `Some` but the flag is unset, eviction stays
+    /// pure byte-LRU (today's behavior) while the always-on shadow metrics are
+    /// still computed from the predicate. When `interest` is `None`, this is
+    /// identical to [`Self::with_label`].
+    pub(crate) fn with_label_and_interest(
+        budget_bytes: usize,
+        label: &'static str,
+        metrics: Option<Arc<ModuleCacheMetrics>>,
+        interest: Option<InterestPredicate<K>>,
+    ) -> Self {
         let budget_bytes = budget_bytes.max(1);
+        let interest_tiered_active = interest.is_some() && interest_tiered_enabled();
         let cache = Self {
             // The LRU is unbounded by count; the byte budget is the only
             // bound. `usize::MAX` capacity means `LruCache` never evicts on
@@ -127,6 +235,9 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
             evictions_in_window: 0,
             window_started_at: None,
             metrics,
+            interest,
+            interest_tiered_active,
+            last_interest_shadow_refresh: None,
         };
         // Publish the budget immediately, so an idle cache (a node that hasn't
         // compiled a module yet, or a delegate cache that's never used) reports
@@ -137,14 +248,81 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
         cache
     }
 
+    /// Test-only constructor that wires an interest predicate AND forces the
+    /// two-tier policy on/off explicitly, bypassing the [`INTEREST_TIERED_ENV`]
+    /// read. This keeps the eviction-ordering tests deterministic and free of
+    /// process-environment races (the env is process-global and shared across
+    /// parallel tests). Production always goes through
+    /// [`Self::with_label_and_interest`], which reads the env flag.
+    #[cfg(test)]
+    pub(crate) fn with_interest_for_test(
+        budget_bytes: usize,
+        label: &'static str,
+        metrics: Option<Arc<ModuleCacheMetrics>>,
+        interest: InterestPredicate<K>,
+        tiered_active: bool,
+    ) -> Self {
+        let mut cache = Self::with_label_and_interest(budget_bytes, label, metrics, Some(interest));
+        cache.interest_tiered_active = tiered_active;
+        cache
+    }
+
     /// Look up a key, marking it most-recently-used on a hit. Returns a
     /// reference to the cached value (not the size).
+    ///
+    /// Also opportunistically (throttled) refreshes the interest shadow gauges,
+    /// so they track interest flips that happen with NO cache mutation (a client
+    /// disconnect / lease expiry between inserts). See
+    /// [`INTEREST_SHADOW_REFRESH_INTERVAL`].
     pub(crate) fn get<Q>(&mut self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.inner.get(key).map(|(v, _)| v)
+        // Apply the hit's recency update FIRST (moves the key to MRU), THEN
+        // sample the shadow. Sampling before the update would read pre-hit
+        // recency: a hit on the interested absolute-LRU entry would be counted as
+        // a divergence even though, immediately after the hit, that entry is MRU
+        // and the next victim may be cold (policies agree) — a false divergence
+        // signal (Codex review). `get` mutating recency is why the lookup must
+        // precede the refresh. We then re-`get` to return the borrow (idempotent:
+        // the key is already MRU, so the second lookup is a cheap hash probe).
+        let hit = self.inner.get(key).is_some();
+        self.maybe_refresh_interest_shadow();
+        if hit {
+            self.inner.get(key).map(|(v, _)| v)
+        } else {
+            None
+        }
+    }
+
+    /// Recompute the interest shadow gauges (the O(entries) cold/interested
+    /// split) if at least [`INTEREST_SHADOW_REFRESH_INTERVAL`] has elapsed since
+    /// the last refresh. No-op (no scan) for caches without a predicate or
+    /// metrics sink.
+    ///
+    /// Called from EVERY cache-touching path (get/insert/remove): the split is
+    /// O(entries) and calls `Ring::contract_in_use` per entry under the shared
+    /// cache mutex, so on a node with thousands of cached modules an unthrottled
+    /// recompute on every cold insert/compile would serialize an O(cache-size)
+    /// scan into the hot path even with the feature flag OFF (Codex review).
+    /// Throttling bounds that to once per interval; the gauges are consumed only
+    /// at the 5-min snapshot cadence and at admission-gate time, so the bounded
+    /// staleness is harmless. (Occupancy — the cheap O(1) gauge — is still
+    /// updated immediately on insert/remove; only this O(n) split is throttled.)
+    fn maybe_refresh_interest_shadow(&mut self) {
+        if self.interest.is_none() || self.metrics.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let due = match self.last_interest_shadow_refresh {
+            Some(prev) => now.duration_since(prev) >= INTEREST_SHADOW_REFRESH_INTERVAL,
+            None => true,
+        };
+        if due {
+            self.last_interest_shadow_refresh = Some(now);
+            self.record_interest_shadow();
+        }
     }
 
     /// Insert (or replace) a value, recording its byte size, then evict LRU
@@ -162,6 +340,10 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
         self.total_bytes = self.total_bytes.saturating_add(size_bytes);
         self.evict_to_budget();
         self.record_occupancy(self.inner.len(), self.total_bytes, self.budget_bytes);
+        // Throttled — see `maybe_refresh_interest_shadow`. The O(1) occupancy
+        // gauge above is always fresh; only the O(entries) interest split is
+        // rate-limited so a cold insert on a large cache stays cheap (flag-OFF).
+        self.maybe_refresh_interest_shadow();
     }
 
     /// Publish current occupancy into the metrics sink (no-op when this cache
@@ -180,17 +362,73 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
         }
     }
 
-    /// Evict least-recently-used entries until `total_bytes <= budget_bytes`,
-    /// keeping at least the single most-recently-used entry resident even if
-    /// it alone exceeds the budget (so an oversized contract can still run).
+    /// Whether the cached `key` is currently of interest (in use), per the
+    /// wired predicate. With no predicate (delegate / test caches) NOTHING is
+    /// classified as interested, so two-tier eviction collapses to pure LRU.
+    fn is_interested(&self, key: &K) -> bool {
+        self.interest
+            .as_ref()
+            .map(|pred| pred(key))
+            .unwrap_or(false)
+    }
+
+    /// Pick the least-recently-used COLD (no-interest) key, cloned so we can
+    /// `pop` it afterwards. `iter()` yields MRU→LRU, so `.rev()` walks LRU→MRU
+    /// and the first cold match is the LRU among the cold tier. Returns `None`
+    /// when every resident entry is interested (the interested set alone exceeds
+    /// the budget — the caller then falls back to plain LRU). Only called on the
+    /// flag-ON two-tier path.
+    fn lru_cold_key(&self) -> Option<K> {
+        self.inner
+            .iter()
+            .rev()
+            .map(|(k, _)| k)
+            .find(|k| !self.is_interested(k))
+            .cloned()
+    }
+
+    /// Evict entries until `total_bytes <= budget_bytes`, keeping at least the
+    /// single most-recently-used entry resident even if it alone exceeds the
+    /// budget (so an oversized contract can still run).
+    ///
+    /// # Two policies, one strict byte budget
+    ///
+    /// - **Pure byte-LRU (default / flag OFF):** evict the absolute LRU entry
+    ///   each step. EXACTLY the historical behavior — byte- AND cost-identical
+    ///   (no interest predicate is consulted on this path at all, so it stays
+    ///   O(evictions) under the shared module-cache mutex). The interest *shadow*
+    ///   accounting that estimates what two-tier WOULD do lives entirely in the
+    ///   throttled `record_interest_shadow` refresh, never in this hot loop
+    ///   (Codex review: don't scan on every default eviction).
+    /// - **Interest-weighted two-tier (flag ON + predicate present):** evict the
+    ///   LRU *cold* (no-interest) entry each step; only once NO cold entry
+    ///   remains (the interested set alone still exceeds the budget) does it fall
+    ///   back to evicting the LRU interested entry. No contract is pinned
+    ///   forever, and the byte budget is never weakened — both policies loop
+    ///   until `total_bytes <= budget_bytes`. This path consults the predicate
+    ///   (`lru_cold_key`) because the operator has opted into paying for it.
     fn evict_to_budget(&mut self) {
         let mut evicted_this_insert: u64 = 0;
         while self.total_bytes > self.budget_bytes && self.inner.len() > 1 {
-            if let Some((_, (_, evicted_size))) = self.inner.pop_lru() {
-                self.total_bytes = self.total_bytes.saturating_sub(evicted_size);
-                evicted_this_insert += 1;
+            // Pick the victim dictated by the ACTIVE policy. Only the flag-ON
+            // two-tier path touches the interest predicate; the default path is
+            // a plain `pop_lru` with zero interest work (historical cost).
+            let evicted_size = if self.interest_tiered_active {
+                // The two-tier victim is the LRU cold entry if one exists, else
+                // the absolute LRU (the interested set alone exceeds budget).
+                match self.lru_cold_key() {
+                    Some(cold_key) => self.inner.pop(&cold_key).map(|(_, size)| size),
+                    None => self.inner.pop_lru().map(|(_, (_, size))| size),
+                }
             } else {
-                break;
+                self.inner.pop_lru().map(|(_, (_, size))| size)
+            };
+            match evicted_size {
+                Some(size) => {
+                    self.total_bytes = self.total_bytes.saturating_sub(size);
+                    evicted_this_insert += 1;
+                }
+                None => break,
             }
         }
         if evicted_this_insert > 0 {
@@ -199,6 +437,66 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
             // it across the snapshot cadence to derive an eviction rate. Distinct
             // from `evictions_in_window`, which resets per warn window (#4440).
             self.add_evictions(evicted_this_insert);
+        }
+    }
+
+    /// Recompute and publish the always-on interest shadow signals in ONE pass:
+    ///
+    /// - **gauges:** total bytes of resident COLD (no-interest, freely
+    ///   evictable) entries and of resident INTERESTED entries.
+    /// - **would-reclassify counter:** incremented when the cache is currently in
+    ///   a state where the next plain-LRU eviction would pick an INTERESTED entry
+    ///   while a COLD entry exists — i.e. the two-tier policy WOULD diverge from
+    ///   plain LRU. This is the single source of truth for the divergence signal
+    ///   (the per-eviction-step accounting that used to live in `evict_to_budget`
+    ///   was removed so the flag-OFF eviction path stays byte- AND cost-identical
+    ///   to historical pure LRU — Codex review).
+    ///
+    /// All of this is independent of the feature flag (it only needs the
+    /// predicate) and is the per-node signal for whether flipping the flag would
+    /// relieve pressure. No-op when this cache has no metrics sink or no
+    /// predicate.
+    ///
+    /// ## The counter is APPROXIMATE
+    ///
+    /// Because it's sampled at the throttled refresh (`maybe_refresh_interest_shadow`,
+    /// ≤ once per [`INTEREST_SHADOW_REFRESH_INTERVAL`]) rather than counted per
+    /// eviction step, it is NOT an exact tally of reclassified evictions: a burst
+    /// of evictions between two refreshes contributes at most one increment, and a
+    /// long-lived divergence state contributes one increment per refresh it is
+    /// observed in. It is a faithful *divergence-pressure* signal (higher ⇒ the
+    /// two-tier policy would more often help), which is what the flip decision
+    /// needs — not a forensic eviction ledger.
+    fn record_interest_shadow(&self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        if self.interest.is_none() {
+            return;
+        }
+        let mut cold_evictable_bytes: u64 = 0;
+        let mut interested_bytes: u64 = 0;
+        let mut any_cold = false;
+        // `iter()` yields MRU→LRU, so the LAST entry seen is the absolute LRU —
+        // the entry plain-LRU would evict next. Track its interest so we can tell
+        // whether the next plain-LRU eviction would diverge from two-tier.
+        let mut lru_is_interested = false;
+        for (k, (_, size)) in self.inner.iter() {
+            let interested = self.is_interested(k);
+            if interested {
+                interested_bytes = interested_bytes.saturating_add(*size as u64);
+            } else {
+                cold_evictable_bytes = cold_evictable_bytes.saturating_add(*size as u64);
+                any_cold = true;
+            }
+            lru_is_interested = interested;
+        }
+        metrics.record_interest_shadow(self.label, cold_evictable_bytes, interested_bytes);
+        // Divergence-now: plain LRU would evict the (interested) absolute-LRU
+        // entry while a cold entry exists; two-tier would spare it and evict the
+        // cold one instead.
+        if lru_is_interested && any_cold {
+            metrics.add_would_reclassify(self.label, 1);
         }
     }
 
@@ -250,6 +548,9 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
         let (value, size) = self.inner.pop(key)?;
         self.total_bytes = self.total_bytes.saturating_sub(size);
         self.record_occupancy(self.inner.len(), self.total_bytes, self.budget_bytes);
+        // Throttled — see `maybe_refresh_interest_shadow` (keeps the O(entries)
+        // interest split off the hot path on large caches).
+        self.maybe_refresh_interest_shadow();
         Some(value)
     }
 
@@ -272,6 +573,32 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
     pub(crate) fn budget_bytes(&self) -> usize {
         self.budget_bytes
     }
+
+    /// Whether the interest-weighted two-tier policy is active on this cache
+    /// (test-only observability).
+    #[cfg(test)]
+    pub(crate) fn interest_tiered_active(&self) -> bool {
+        self.interest_tiered_active
+    }
+
+    /// Force an immediate (un-throttled) recompute of the interest shadow signals
+    /// and re-arm the throttle window. Used by the `router_snapshot` emitter's
+    /// on-demand refresher (`ModuleCacheMetrics::refresh_interest_shadow_now`) so
+    /// every emitted snapshot is fresh even on an idle cache, and by tests that
+    /// need deterministic gauges without sleeping past
+    /// [`INTEREST_SHADOW_REFRESH_INTERVAL`].
+    pub(crate) fn force_refresh_interest_shadow(&mut self) {
+        self.last_interest_shadow_refresh = Some(Instant::now());
+        self.record_interest_shadow();
+    }
+
+    /// Mark the interest-shadow throttle as DUE, so the next get/insert/remove
+    /// will recompute the gauges regardless of how recently one fired. Test-only,
+    /// used to exercise the throttled refresh path deterministically.
+    #[cfg(test)]
+    pub(crate) fn arm_interest_shadow_refresh(&mut self) {
+        self.last_interest_shadow_refresh = None;
+    }
 }
 
 /// Atomic occupancy gauges plus a monotonic eviction counter for one cache.
@@ -287,6 +614,24 @@ struct CacheGauges {
     /// Lifetime evictions (monotonic; the collector differences it across the
     /// snapshot cadence to derive an eviction rate).
     evictions_total: AtomicU64,
+    /// SHADOW (always-on, flag-independent): bytes of resident COLD (no-interest)
+    /// entries — the bytes the two-tier policy could freely reclaim. Last-write-
+    /// wins gauge, recomputed on every insert/remove. `0` for caches with no
+    /// interest predicate (delegate cache stays zero).
+    cold_evictable_bytes: AtomicU64,
+    /// SHADOW (always-on): bytes of resident INTERESTED (in-use) entries — the
+    /// floor the two-tier policy would protect first. Last-write-wins gauge.
+    interested_bytes: AtomicU64,
+    /// SHADOW (always-on): monotonic count of throttled refreshes that observed
+    /// the cache in a state where the next plain-LRU eviction WOULD pick an
+    /// interested entry while a cold one exists (two-tier would diverge). This is
+    /// a *divergence-pressure* signal sampled at the refresh cadence, NOT an exact
+    /// per-eviction tally — the per-step accounting was removed so the flag-OFF
+    /// eviction path stays cost-identical to historical pure LRU (Codex review).
+    /// Collected even with the flag OFF so the data to justify flipping it exists;
+    /// the collector differences it across the cadence. See
+    /// `ModuleCache::record_interest_shadow`.
+    evictions_would_reclassify_total: AtomicU64,
 }
 
 /// Per-node compiled-WASM module-cache occupancy + eviction telemetry (#4440),
@@ -310,6 +655,36 @@ struct CacheGauges {
 pub(crate) struct ModuleCacheMetrics {
     contract: CacheGauges,
     delegate: CacheGauges,
+    /// SHADOW (always-on, flag-independent): lifetime count of placement-
+    /// migration admission decisions where the current ≥90%-occupancy refuse
+    /// gate (#4534) and a hypothetical "admit if there are enough cold-evictable
+    /// bytes to make room" gate WOULD DISAGREE — i.e. the current gate refuses
+    /// but the cold tier could be reclaimed to fit the migration. Published by
+    /// the admission gate at `node.rs` (which has no per-cache handle), so it
+    /// lives at the node level rather than under a cache label. Monotonic; the
+    /// collector differences it across the cadence. The gate's BEHAVIOR is
+    /// unchanged in this PR — this only measures the would-be delta (#4534 is a
+    /// later, data-gated change).
+    ///
+    /// UPPER BOUND: the modeled cold-aware gate ignores the bytes the INCOMING
+    /// contract would add once it compiles, so it admits in a superset of the
+    /// cases a real gate would — this counter over-counts the eventual flip rate.
+    /// See [`migration_admission_would_change`] for the full rationale.
+    migration_admission_would_change_total: AtomicU64,
+    /// Hook that forces a fresh recompute of the contract cache's interest split
+    /// (cold-evictable / interested bytes) ON DEMAND. Set once by
+    /// `RuntimePool::new` to a closure that locks the contract `ModuleCache` and
+    /// calls `force_refresh_interest_shadow`.
+    ///
+    /// Without this, the interest gauges are only refreshed on the throttled
+    /// get/insert/remove path, which is UNBOUNDED on an idle cache: a node that
+    /// goes quiet after a mutation would emit stale interest bytes in every
+    /// `router_snapshot` indefinitely (Codex/coordinator review). The snapshot
+    /// emitter invokes this immediately before reading, so EVERY emitted 5-min
+    /// snapshot carries a fresh split regardless of traffic. The cheap O(1)
+    /// occupancy gauge and the live admission gate stay on the lock-free atomics;
+    /// only this O(entries) split is refreshed here, once per snapshot.
+    interest_shadow_refresher: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A point-in-time read of [`ModuleCacheMetrics`] for telemetry emission.
@@ -323,6 +698,17 @@ pub(crate) struct ModuleCacheMetricsSnapshot {
     pub delegate_total_bytes: u64,
     pub delegate_budget_bytes: u64,
     pub delegate_evictions_total: u64,
+    /// SHADOW (always-on): cold-evictable / interested byte split + the
+    /// would-reclassify eviction count for the contract cache (the only cache
+    /// with an interest predicate; delegate fields stay zero). See
+    /// [`CacheGauges`].
+    pub contract_cold_evictable_bytes: u64,
+    pub contract_interested_bytes: u64,
+    pub contract_evictions_would_reclassify_total: u64,
+    /// SHADOW (always-on): node-level would-change count for the migration
+    /// admission gate (#4534). See
+    /// [`ModuleCacheMetrics::migration_admission_would_change_total`].
+    pub migration_admission_would_change_total: u64,
 }
 
 impl ModuleCacheMetrics {
@@ -332,6 +718,34 @@ impl ModuleCacheMetrics {
         Self {
             contract: CacheGauges::default(),
             delegate: CacheGauges::default(),
+            migration_admission_would_change_total: AtomicU64::new(0),
+            interest_shadow_refresher: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Install the on-demand interest-split refresher (see the field docs).
+    /// Called once by `RuntimePool::new`; a second call is ignored (the
+    /// `OnceLock` keeps the first registration). The closure must lock the
+    /// contract cache and force a fresh recompute of its interest split.
+    pub(crate) fn set_interest_shadow_refresher(&self, refresher: Arc<dyn Fn() + Send + Sync>) {
+        // A second registration is intentionally a no-op: the first runtime pool
+        // owns the refresher for the node's lifetime. `set` returns `Err(_)` with
+        // the rejected closure if already set; drop it on purpose.
+        if self.interest_shadow_refresher.set(refresher).is_err() {
+            tracing::debug!(
+                "module-cache interest-shadow refresher already set; ignoring re-registration"
+            );
+        }
+    }
+
+    /// Force a fresh recompute of the contract cache's interest split, if a
+    /// refresher has been installed. Invoked by the `router_snapshot` emitter
+    /// immediately before `snapshot()` so every emitted snapshot is fresh even on
+    /// an idle cache. No-op before the runtime pool is built (early startup) or in
+    /// test/tool binaries with no WASM runtime.
+    pub(crate) fn refresh_interest_shadow_now(&self) {
+        if let Some(refresher) = self.interest_shadow_refresher.get() {
+            refresher();
         }
     }
 
@@ -368,6 +782,38 @@ impl ModuleCacheMetrics {
         }
     }
 
+    /// Publish the always-on interest shadow gauges (cold-evictable / interested
+    /// bytes) for the named cache (last-write-wins). No-op for unlabeled caches.
+    fn record_interest_shadow(
+        &self,
+        label: &str,
+        cold_evictable_bytes: u64,
+        interested_bytes: u64,
+    ) {
+        if let Some(g) = self.gauges_for(label) {
+            g.cold_evictable_bytes
+                .store(cold_evictable_bytes, Ordering::Relaxed);
+            g.interested_bytes
+                .store(interested_bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Add to the named cache's monotonic would-reclassify counter.
+    fn add_would_reclassify(&self, label: &str, count: u64) {
+        if let Some(g) = self.gauges_for(label) {
+            g.evictions_would_reclassify_total
+                .fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Record one placement-migration admission decision where the current gate
+    /// and the cold-evictable-aware gate WOULD disagree (#4534 shadow). Called
+    /// from the admission gate; does NOT change the gate's behavior. Monotonic.
+    pub(crate) fn record_migration_admission_would_change(&self) {
+        self.migration_admission_would_change_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read all gauges for telemetry.
     pub(crate) fn snapshot(&self) -> ModuleCacheMetricsSnapshot {
         let load = |g: &CacheGauges| {
@@ -389,6 +835,18 @@ impl ModuleCacheMetrics {
             delegate_total_bytes: dtb,
             delegate_budget_bytes: dbb,
             delegate_evictions_total: dev,
+            contract_cold_evictable_bytes: self
+                .contract
+                .cold_evictable_bytes
+                .load(Ordering::Relaxed),
+            contract_interested_bytes: self.contract.interested_bytes.load(Ordering::Relaxed),
+            contract_evictions_would_reclassify_total: self
+                .contract
+                .evictions_would_reclassify_total
+                .load(Ordering::Relaxed),
+            migration_admission_would_change_total: self
+                .migration_admission_would_change_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -437,6 +895,71 @@ fn occupancy_pct(total_bytes: u64, budget_bytes: u64) -> Option<u64> {
     // `saturating_mul` guards the (practically impossible) overflow of
     // `total_bytes * 100`; at realistic cache sizes (a few GiB) it never trips.
     Some(total_bytes.saturating_mul(100) / budget_bytes)
+}
+
+/// SHADOW (always-on, behavior-neutral): would the current ≥`ceiling_pct`-
+/// occupancy migration-admission refuse (#4534) flip to ADMIT under a
+/// hypothetical "admit if there's enough cold-evictable cache to make room"
+/// gate? Returns `true` only when the two gates DISAGREE for this snapshot:
+/// the current gate refuses (occupancy at/above the ceiling) **and** the
+/// cold-aware gate would admit because dropping all cold-evictable bytes would
+/// pull occupancy below the ceiling (i.e. the protected interested floor alone
+/// fits under it).
+///
+/// Pure (snapshot in, bool out) so it is unit-testable and so the live gate at
+/// `node.rs` can call it without changing its own behavior — it only feeds the
+/// `migration_admission_would_change_total` shadow counter. `None` budget means
+/// no pressure signal, so the gates cannot disagree (current gate already
+/// admits): returns `false`.
+///
+/// # This is an UPPER BOUND on the real gate's flip rate
+///
+/// The hypothetical cold-aware gate modeled here checks only whether the
+/// *interested floor* fits under the ceiling — it does NOT account for the bytes
+/// the INCOMING migrated contract would itself add to the cache once it compiles.
+/// A real "admit if cold-evictable can make room" gate would have to leave room
+/// for the newcomer too, so it would admit in a STRICT SUBSET of the cases this
+/// function flags. Therefore the resulting `migration_admission_would_change_total`
+/// counter OVER-counts: it is an upper bound on how often the eventual #4534
+/// admission change would actually flip a decision. That is the safe direction
+/// for a shadow metric used to size a future change (it never hides flip
+/// pressure), and it is called out in the field rustdoc and the PR body.
+fn migration_admission_would_change(
+    total_bytes: u64,
+    interested_bytes: u64,
+    budget_bytes: u64,
+    ceiling_pct: u64,
+) -> bool {
+    let Some(occupancy) = occupancy_pct(total_bytes, budget_bytes) else {
+        return false;
+    };
+    let current_refuses = occupancy >= ceiling_pct;
+    // The cold-aware gate keeps only the interested floor; everything else is
+    // cold-evictable. It would admit when that floor's occupancy is below the
+    // ceiling — i.e. there is enough cold cache to reclaim to make room.
+    let cold_aware_admits = match occupancy_pct(interested_bytes, budget_bytes) {
+        Some(floor_pct) => floor_pct < ceiling_pct,
+        None => false,
+    };
+    current_refuses && cold_aware_admits
+}
+
+/// Snapshot-driven wrapper over [`migration_admission_would_change`] for the
+/// live admission gate. Reads the contract cache's total / interested bytes and
+/// budget from `metrics` and reports whether the current ≥`ceiling_pct` refuse
+/// would flip to admit under the cold-evictable-aware policy. Behavior-neutral —
+/// callers use this ONLY to bump the shadow counter, never to gate.
+pub(crate) fn migration_admission_would_change_now(
+    metrics: &ModuleCacheMetrics,
+    ceiling_pct: u64,
+) -> bool {
+    let s = metrics.snapshot();
+    migration_admission_would_change(
+        s.contract_total_bytes,
+        s.contract_interested_bytes,
+        s.contract_budget_bytes,
+        ceiling_pct,
+    )
 }
 
 /// Lower clamp for the default contract-module cache budget (64 MiB).
@@ -1328,5 +1851,715 @@ mod tests {
         assert_eq!(occupancy_pct(900, 1_000), Some(90));
         // Just over the boundary stays refused.
         assert_eq!(occupancy_pct(901, 1_000), Some(90));
+    }
+
+    // ========================================================================
+    // Interest-weighted (two-tier) eviction (#4441/#4534).
+    // ========================================================================
+
+    /// Build an interest predicate over an explicit set of "interested" keys,
+    /// shared so a test can mutate which keys are in use across inserts.
+    fn interest_over(
+        set: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    ) -> InterestPredicate<u64> {
+        Arc::new(move |k: &u64| set.lock().unwrap().contains(k))
+    }
+
+    /// Flag parsing: only the recognized truthy spellings enable the policy;
+    /// everything else (including unset) is the safe default OFF.
+    #[test]
+    fn interest_tiered_flag_parses_truthy_only() {
+        for v in ["1", "true", "TRUE", " yes ", "On", "oN"] {
+            assert!(parse_interest_tiered_flag(Some(v)), "{v:?} must be truthy");
+        }
+        for v in ["0", "false", "no", "off", "", "2", "enable", "y"] {
+            assert!(
+                !parse_interest_tiered_flag(Some(v)),
+                "{v:?} must NOT enable the policy"
+            );
+        }
+        assert!(
+            !parse_interest_tiered_flag(None),
+            "unset env must default OFF (pure byte-LRU)"
+        );
+    }
+
+    /// Env READ-PATH: `with_label_and_interest` consults `interest_tiered_enabled()`
+    /// (the live env var) to decide whether the two-tier policy is active. With the
+    /// var set truthy the constructed contract cache is tiered; unset it is not.
+    /// Serialized via a process-wide guard and the prior value is restored, since
+    /// the environment is process-global.
+    #[test]
+    fn interest_tiered_enabled_reads_env_at_construction() {
+        use std::sync::Mutex as StdMutex;
+        // Serialize against any other test that might touch this same env var.
+        static ENV_GUARD: StdMutex<()> = StdMutex::new(());
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+
+        let prev = std::env::var(INTEREST_TIERED_ENV).ok();
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let pred = || interest_over(interested.clone());
+
+        // SAFETY: single-threaded within this serialized test; restored below.
+        unsafe { std::env::set_var(INTEREST_TIERED_ENV, "true") };
+        let on =
+            ModuleCache::<u64, ()>::with_label_and_interest(10, "contract", None, Some(pred()));
+        assert!(
+            on.interest_tiered_active(),
+            "flag set truthy → tiered policy active"
+        );
+
+        unsafe { std::env::remove_var(INTEREST_TIERED_ENV) };
+        let off =
+            ModuleCache::<u64, ()>::with_label_and_interest(10, "contract", None, Some(pred()));
+        assert!(
+            !off.interest_tiered_active(),
+            "flag unset → tiered policy inactive (safe default)"
+        );
+
+        // A predicate-less cache is never tiered regardless of the env.
+        unsafe { std::env::set_var(INTEREST_TIERED_ENV, "true") };
+        let none: ModuleCache<u64, ()> =
+            ModuleCache::with_label_and_interest(10, "contract", None, None);
+        assert!(
+            !none.interest_tiered_active(),
+            "no predicate → never tiered even with the flag on"
+        );
+
+        // Restore the prior environment.
+        match prev {
+            Some(v) => unsafe { std::env::set_var(INTEREST_TIERED_ENV, v) },
+            None => unsafe { std::env::remove_var(INTEREST_TIERED_ENV) },
+        }
+    }
+
+    /// Throttle transition: the get-path interest refresh fires when the window
+    /// is due and is suppressed when not. The first get fires (window un-armed);
+    /// an immediately-following get does NOT (the 10s window has not elapsed);
+    /// re-arming makes the next get fire again. Proven by watching the
+    /// would-reclassify counter (which only advances on a refresh that observes
+    /// the divergence state).
+    #[test]
+    fn interest_shadow_get_refresh_respects_throttle_window() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        interested.lock().unwrap().insert(0u64); // interested absolute LRU
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            1_000_000,
+            "contract",
+            Some(metrics.clone()),
+            interest_over(interested.clone()),
+            false,
+        );
+        // insert(0) is the first cache mutation; its throttled refresh fires
+        // (window un-armed), but at that point key 1 doesn't exist yet so there
+        // is no cold entry → no divergence sampled.
+        cache.insert(0, (), 6);
+        cache.insert(1, (), 6); // within the window → insert's refresh suppressed
+        assert_eq!(
+            metrics.snapshot().contract_evictions_would_reclassify_total,
+            0,
+            "the within-window insert must NOT refresh (throttled)"
+        );
+
+        // A get now is also within the window → suppressed, still 0.
+        let _ = cache.get(&1);
+        assert_eq!(
+            metrics.snapshot().contract_evictions_would_reclassify_total,
+            0,
+            "a within-window get must NOT refresh"
+        );
+
+        // Re-arm the window → the next get fires the refresh, which now observes
+        // the divergence state (interested LRU key 0 + cold key 1).
+        cache.arm_interest_shadow_refresh();
+        let _ = cache.get(&1);
+        assert_eq!(
+            metrics.snapshot().contract_evictions_would_reclassify_total,
+            1,
+            "after re-arming, the get refresh fires and samples the divergence"
+        );
+    }
+
+    /// With the flag OFF the eviction is EXACTLY today's pure byte-LRU even when
+    /// an interest predicate is present: the absolute LRU is evicted regardless
+    /// of interest. This is the property that makes the change inert by default.
+    #[test]
+    fn flag_off_evicts_absolute_lru_ignoring_interest() {
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        interested.lock().unwrap().insert(0u64); // key 0 is the in-use LRU
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            10,
+            "contract",
+            None,
+            interest_over(interested.clone()),
+            false, // flag OFF → pure LRU
+        );
+        assert!(!cache.interest_tiered_active());
+        cache.insert(0, (), 6); // interested, becomes LRU
+        cache.insert(1, (), 6); // cold; total 12 > 10 → evict the absolute LRU (key 0)
+        assert_eq!(cache.len(), 1);
+        assert!(
+            cache.get(&0).is_none(),
+            "flag OFF: the interested-but-LRU entry is evicted, exactly as plain LRU"
+        );
+        assert!(cache.get(&1).is_some());
+        assert!(cache.total_bytes() <= cache.budget_bytes());
+    }
+
+    /// A/B regression (coordinator review): a predicate-present cache with the
+    /// flag OFF must produce a BYTE-IDENTICAL resident set + `total_bytes` to a
+    /// no-predicate cache, after EVERY insert in an identical insert/evict
+    /// sequence. This pins the "flag-OFF == historical pure byte-LRU" invariant —
+    /// the interest predicate must not influence eviction at all when the flag is
+    /// off — across a churny mixed sequence, not just a single eviction.
+    #[test]
+    fn flag_off_resident_set_matches_no_predicate_cache_ab() {
+        const BUDGET: usize = 30; // holds 3 entries of 10 bytes
+        // Half the keys are "interested" — under the flag this would change
+        // eviction; with the flag OFF it must make NO difference.
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        for k in [0u64, 2, 4, 6, 8, 10] {
+            interested.lock().unwrap().insert(k);
+        }
+
+        let mut plain: ModuleCache<u64, ()> = ModuleCache::with_label(BUDGET, "delegate", None);
+        let mut predicated = ModuleCache::<u64, ()>::with_interest_for_test(
+            BUDGET,
+            "contract",
+            None,
+            interest_over(interested.clone()),
+            false, // flag OFF
+        );
+
+        // A deterministic mixed sequence: inserts, repeats, and touches that
+        // shuffle LRU recency. Each step is applied identically to both caches.
+        let sizes = [10usize, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10];
+        for (k, &size) in sizes.iter().enumerate() {
+            let key = k as u64;
+            plain.insert(key, (), size);
+            predicated.insert(key, (), size);
+
+            // Occasionally touch an older key to perturb LRU order identically.
+            if k % 3 == 0 && k > 0 {
+                let touch = (k as u64) - 1;
+                let _ = plain.get(&touch);
+                let _ = predicated.get(&touch);
+            }
+
+            assert_eq!(
+                plain.total_bytes(),
+                predicated.total_bytes(),
+                "total_bytes diverged after inserting key {key}"
+            );
+            assert_eq!(
+                plain.len(),
+                predicated.len(),
+                "resident count diverged after inserting key {key}"
+            );
+            // Byte-identical RESIDENT SET: every key present in one must be
+            // present in the other.
+            for probe in 0..=(k as u64) {
+                assert_eq!(
+                    plain.get(&probe).is_some(),
+                    predicated.get(&probe).is_some(),
+                    "residency of key {probe} diverged after inserting key {key} \
+                     (flag-OFF predicate cache must match pure LRU exactly)"
+                );
+            }
+        }
+    }
+
+    /// With the flag ON the two-tier policy evicts the cold (no-interest) entry
+    /// first and SPARES the interested one, even though the interested entry is
+    /// the absolute LRU. Strict byte budget still holds.
+    #[test]
+    fn flag_on_evicts_cold_first_sparing_interested() {
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        interested.lock().unwrap().insert(0u64); // key 0 is in use
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            10,
+            "contract",
+            None,
+            interest_over(interested.clone()),
+            true, // flag ON → two-tier
+        );
+        assert!(cache.interest_tiered_active());
+        cache.insert(0, (), 6); // interested, becomes the absolute LRU
+        cache.insert(1, (), 6); // cold; total 12 > 10 → two-tier evicts the COLD key 1
+        assert_eq!(cache.len(), 1);
+        assert!(
+            cache.get(&0).is_some(),
+            "two-tier: interested entry is spared even as the absolute LRU"
+        );
+        assert!(
+            cache.get(&1).is_none(),
+            "two-tier: the cold entry is evicted first"
+        );
+        assert!(cache.total_bytes() <= cache.budget_bytes());
+    }
+
+    /// When the interested set ALONE exceeds the byte budget, the two-tier
+    /// policy MUST fall back to evicting interested LRU entries — the byte budget
+    /// is never weakened (no contract is pinned forever). #4565 OOM guard.
+    #[test]
+    fn flag_on_evicts_interested_when_interested_alone_exceeds_budget() {
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // ALL keys are interested.
+        for k in 0..3u64 {
+            interested.lock().unwrap().insert(k);
+        }
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            10,
+            "contract",
+            None,
+            interest_over(interested.clone()),
+            true,
+        );
+        cache.insert(0, (), 6); // interested, LRU
+        cache.insert(1, (), 6); // interested; total 12 > 10, no cold to evict →
+        // fall back to interested LRU (key 0)
+        assert!(
+            cache.total_bytes() <= cache.budget_bytes(),
+            "byte budget is strict even when the whole working set is interested"
+        );
+        assert_eq!(cache.len(), 1);
+        assert!(
+            cache.get(&0).is_none(),
+            "interested LRU is evicted when interested-alone exceeds budget — \
+             nothing is pinned forever"
+        );
+        assert!(cache.get(&1).is_some());
+    }
+
+    /// Two-tier evicts as many cold entries as needed, then crosses into the
+    /// interested tier only when cold alone can't free enough — and stops the
+    /// moment the budget is met. Mixed working set.
+    #[test]
+    fn flag_on_drains_cold_then_crosses_into_interested() {
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // keys 0,1 interested; keys 2,3 cold. Insert order LRU→MRU: 0,1,2,3.
+        interested.lock().unwrap().insert(0u64);
+        interested.lock().unwrap().insert(1u64);
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            10,
+            "contract",
+            None,
+            interest_over(interested.clone()),
+            true,
+        );
+        cache.insert(0, (), 4); // interested
+        cache.insert(1, (), 4); // interested; total 8
+        // Insert cold key 2 (total 12 > 10): two-tier evicts the cold LRU (key 2
+        // itself is MRU, so the only cold entry is key 2 — but it's MRU, so the
+        // LRU cold is... key 2). Use a clearer sequence instead:
+        // reset and drive a deterministic mixed eviction.
+        cache.remove(&0);
+        cache.remove(&1);
+        // Fresh: insert cold 2, cold 3, interested 0, interested 1 (LRU→MRU).
+        cache.insert(2, (), 4); // cold, LRU
+        cache.insert(3, (), 4); // cold; total 8
+        cache.insert(0, (), 4); // interested; total 12 > 10 → evict cold LRU (key 2)
+        assert!(cache.total_bytes() <= cache.budget_bytes());
+        assert!(cache.get(&2).is_none(), "cold LRU evicted first");
+        assert!(cache.get(&3).is_some(), "second cold spared (budget met)");
+        assert!(cache.get(&0).is_some(), "interested newcomer kept");
+        // Now insert interested 1: total 12 > 10, one cold remains (key 3) →
+        // evict it before any interested.
+        cache.insert(1, (), 4);
+        assert!(cache.total_bytes() <= cache.budget_bytes());
+        assert!(
+            cache.get(&3).is_none(),
+            "remaining cold evicted before interested"
+        );
+        assert!(cache.get(&0).is_some(), "interested entries both spared");
+        assert!(cache.get(&1).is_some());
+    }
+
+    /// The always-on shadow gauges (cold-evictable / interested bytes) are
+    /// published from the interest predicate REGARDLESS of the flag, so the
+    /// pressure split is observable before anyone flips the policy on.
+    #[test]
+    fn shadow_interest_bytes_published_with_flag_off() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        interested.lock().unwrap().insert(0u64);
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            1_000_000,
+            "contract",
+            Some(metrics.clone()),
+            interest_over(interested.clone()),
+            false, // flag OFF — gauges must STILL be computed
+        );
+        cache.insert(0, (), 100); // interested
+        cache.insert(1, (), 250); // cold
+        cache.insert(2, (), 300); // cold
+        // The interest split is throttled on the insert path (Codex perf fix);
+        // force a deterministic recompute rather than depending on timing.
+        cache.force_refresh_interest_shadow();
+        let s = metrics.snapshot();
+        assert_eq!(s.contract_interested_bytes, 100, "only key 0 is interested");
+        assert_eq!(
+            s.contract_cold_evictable_bytes, 550,
+            "keys 1 + 2 are cold-evictable"
+        );
+    }
+
+    /// The would-reclassify shadow counter increments — even with the flag OFF —
+    /// when a (throttled) refresh observes the cache in a state where the next
+    /// plain-LRU eviction would pick an INTERESTED entry while a cold one exists
+    /// (two-tier would diverge). It is sampled at the refresh, NOT counted per
+    /// eviction step, so the flag-OFF eviction loop stays cost-identical to
+    /// historical pure LRU. This is the signal that justifies flipping the flag.
+    #[test]
+    fn shadow_would_reclassify_counts_divergence_state_with_flag_off() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // key 0 interested, key 1 cold. Insert order LRU→MRU: 0 (interested,
+        // absolute LRU), 1 (cold). The absolute LRU is interested while a cold
+        // entry exists → plain LRU would evict the interested one; two-tier would
+        // spare it → DIVERGENCE.
+        interested.lock().unwrap().insert(0u64);
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            1_000_000, // large budget: no eviction, so we isolate the SHADOW signal
+            "contract",
+            Some(metrics.clone()),
+            interest_over(interested.clone()),
+            false, // flag OFF: eviction is plain LRU; the shadow still samples
+        );
+        cache.insert(0, (), 6); // interested, absolute LRU
+        cache.insert(1, (), 6); // cold, MRU
+        cache.force_refresh_interest_shadow();
+        assert_eq!(
+            metrics.snapshot().contract_evictions_would_reclassify_total,
+            1,
+            "one refresh observed the divergence state (interested LRU + a cold entry)"
+        );
+        // A second refresh in the SAME divergence state increments again — the
+        // counter samples divergence PRESSURE per refresh, it is not idempotent.
+        cache.force_refresh_interest_shadow();
+        assert_eq!(
+            metrics.snapshot().contract_evictions_would_reclassify_total,
+            2,
+            "the counter samples per refresh while the divergence state persists"
+        );
+    }
+
+    /// No would-reclassify when the absolute LRU is already cold (plain LRU and
+    /// two-tier would evict the same entry) — even across repeated refreshes.
+    #[test]
+    fn shadow_would_reclassify_zero_when_lru_is_cold() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // key 0 cold (absolute LRU), key 1 interested (MRU). The next plain-LRU
+        // victim (key 0) is cold → two-tier agrees → NO divergence.
+        interested.lock().unwrap().insert(1u64);
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            1_000_000,
+            "contract",
+            Some(metrics.clone()),
+            interest_over(interested.clone()),
+            false,
+        );
+        cache.insert(0, (), 6); // cold, absolute LRU
+        cache.insert(1, (), 6); // interested, MRU
+        cache.force_refresh_interest_shadow();
+        cache.force_refresh_interest_shadow();
+        assert_eq!(
+            metrics.snapshot().contract_evictions_would_reclassify_total,
+            0,
+            "LRU is cold → policies agree → no divergence sampled"
+        );
+    }
+
+    /// No would-reclassify when there is no cold entry to reclaim (the whole
+    /// resident set is interested) — two-tier would fall back to plain LRU, so
+    /// they agree.
+    #[test]
+    fn shadow_would_reclassify_zero_when_all_interested() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        interested.lock().unwrap().insert(0u64);
+        interested.lock().unwrap().insert(1u64);
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            1_000_000,
+            "contract",
+            Some(metrics.clone()),
+            interest_over(interested.clone()),
+            false,
+        );
+        cache.insert(0, (), 6);
+        cache.insert(1, (), 6);
+        cache.force_refresh_interest_shadow();
+        assert_eq!(
+            metrics.snapshot().contract_evictions_would_reclassify_total,
+            0,
+            "no cold entry exists → two-tier would not diverge"
+        );
+    }
+
+    /// A cache HIT on the interested absolute-LRU entry must NOT be counted as a
+    /// divergence: the hit moves that entry to MRU, so immediately afterwards the
+    /// next plain-LRU victim is the (cold) entry and the policies agree. The
+    /// refresh must sample AFTER the hit's recency update, not before (Codex
+    /// review — sampling pre-hit recency produced a false divergence signal).
+    #[test]
+    fn shadow_get_hit_on_interested_lru_does_not_false_count() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // key 0 interested (absolute LRU), key 1 cold (MRU).
+        interested.lock().unwrap().insert(0u64);
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            1_000_000,
+            "contract",
+            Some(metrics.clone()),
+            interest_over(interested.clone()),
+            false,
+        );
+        cache.insert(0, (), 6); // interested, absolute LRU
+        cache.insert(1, (), 6); // cold, MRU
+        // Arm the throttle and HIT the interested LRU (key 0). After the hit key 0
+        // is MRU and key 1 (cold) is the new LRU → the next plain-LRU eviction
+        // would pick the cold entry → policies AGREE → no divergence.
+        cache.arm_interest_shadow_refresh();
+        let _ = cache.get(&0);
+        assert_eq!(
+            metrics.snapshot().contract_evictions_would_reclassify_total,
+            0,
+            "hitting the interested LRU makes it MRU; the post-hit LRU is cold, so \
+             the policies agree and no divergence may be counted"
+        );
+    }
+
+    /// The delegate / no-predicate path never publishes interest shadow gauges
+    /// and is always pure LRU regardless of the flag.
+    #[test]
+    fn no_predicate_cache_has_zero_interest_shadow() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let mut cache: ModuleCache<u64, ()> =
+            ModuleCache::with_label(10, "delegate", Some(metrics.clone()));
+        assert!(
+            !cache.interest_tiered_active(),
+            "no predicate → never tiered"
+        );
+        cache.insert(0, (), 6);
+        cache.insert(1, (), 6);
+        let s = metrics.snapshot();
+        // The delegate cache has no cold/interested split — both stay zero.
+        assert_eq!(s.contract_cold_evictable_bytes, 0);
+        assert_eq!(s.contract_interested_bytes, 0);
+    }
+
+    /// `migration_admission_would_change`: the gates disagree ONLY when the
+    /// current gate refuses (occupancy ≥ ceiling) AND dropping all cold-evictable
+    /// bytes would pull the interested floor below the ceiling.
+    #[test]
+    fn migration_admission_would_change_logic() {
+        const CEIL: u64 = 90;
+        // Over the ceiling but the interested floor alone is well under it →
+        // cold-aware gate would admit → the gates DISAGREE.
+        assert!(migration_admission_would_change(
+            /* total */ 950, /* interested */ 100, /* budget */ 1000, CEIL
+        ));
+        // Over the ceiling AND the interested floor alone is still over it →
+        // even the cold-aware gate refuses → the gates AGREE.
+        assert!(!migration_admission_would_change(950, 950, 1000, CEIL));
+        // Under the ceiling → current gate already admits → no disagreement.
+        assert!(!migration_admission_would_change(500, 100, 1000, CEIL));
+        // Budget uninitialized → no pressure signal → no disagreement.
+        assert!(!migration_admission_would_change(950, 100, 0, CEIL));
+        // Exactly at the ceiling counts as a refuse; floor under it → disagree.
+        assert!(migration_admission_would_change(900, 100, 1000, CEIL));
+    }
+
+    /// The node-level migration-admission would-change counter is monotonic and
+    /// surfaces in the snapshot.
+    #[test]
+    fn migration_admission_would_change_counter_accumulates() {
+        let m = ModuleCacheMetrics::new();
+        assert_eq!(m.snapshot().migration_admission_would_change_total, 0);
+        m.record_migration_admission_would_change();
+        m.record_migration_admission_would_change();
+        assert_eq!(m.snapshot().migration_admission_would_change_total, 2);
+    }
+
+    /// The on-demand interest-shadow refresher (the headline Arc-cycle fix):
+    /// installed on `ModuleCacheMetrics` capturing a `Weak<Mutex<ModuleCache>>`,
+    /// mirroring `RuntimePool::new`. Exercises BOTH halves of the
+    /// "fresh-snapshot-on-emit" mechanism without a `RuntimePool`:
+    ///
+    /// 1. **Cache alive:** flip interest with NO cache mutation, then
+    ///    `refresh_interest_shadow_now()` → the gauges reflect the flip (the
+    ///    end-to-end "every emitted snapshot is fresh on an idle cache" claim).
+    /// 2. **Cache dropped:** drop the owning `Arc`, then
+    ///    `refresh_interest_shadow_now()` → the `Weak::upgrade` fails, so it is a
+    ///    safe NO-OP (no panic) — proving the refresher holds only a `Weak` and
+    ///    cannot keep the cache/runtime alive (the reference-cycle fix).
+    #[test]
+    fn metrics_refresher_weak_handle_is_fresh_when_alive_and_noop_when_dropped() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        interested.lock().unwrap().insert(0u64);
+
+        // Hand-build the shared cache exactly as RuntimePool::new does.
+        let cache = Arc::new(std::sync::Mutex::new(
+            ModuleCache::<u64, ()>::with_interest_for_test(
+                1_000_000,
+                "contract",
+                Some(metrics.clone()),
+                interest_over(interested.clone()),
+                false,
+            ),
+        ));
+        cache.lock().unwrap().insert(0, (), 100); // interested
+        cache.lock().unwrap().insert(1, (), 250); // cold
+        cache.lock().unwrap().force_refresh_interest_shadow();
+        assert_eq!(metrics.snapshot().contract_interested_bytes, 100);
+
+        // Install the refresher capturing a WEAK handle (mirrors pool.rs).
+        let weak = Arc::downgrade(&cache);
+        metrics.set_interest_shadow_refresher(Arc::new(move || {
+            if let Some(c) = weak.upgrade() {
+                if let Ok(mut c) = c.lock() {
+                    c.force_refresh_interest_shadow();
+                }
+            }
+        }));
+
+        // (1) Cache alive: flip interest with NO cache mutation, then refresh via
+        // the metrics hook → gauges reflect the flip.
+        interested.lock().unwrap().remove(&0);
+        assert_eq!(
+            metrics.snapshot().contract_interested_bytes,
+            100,
+            "stale until the on-demand refresh runs"
+        );
+        metrics.refresh_interest_shadow_now();
+        let s = metrics.snapshot();
+        assert_eq!(
+            s.contract_interested_bytes, 0,
+            "on-demand refresh makes the emitted snapshot fresh on an idle cache"
+        );
+        assert_eq!(s.contract_cold_evictable_bytes, 350);
+
+        // (2) Cache dropped: the Weak no longer upgrades → refresh is a safe
+        // no-op and must NOT panic (the Arc-cycle fix: refresher holds only Weak).
+        drop(cache);
+        metrics.refresh_interest_shadow_now(); // must not panic
+        // Gauges retain their last value; the call simply did nothing.
+        assert_eq!(metrics.snapshot().contract_interested_bytes, 0);
+    }
+
+    /// The interest shadow gauges track interest flips that happen with NO cache
+    /// mutation (a client disconnect / lease expiry), picked up on the next
+    /// `get` via the throttled refresh — addressing the Codex review finding that
+    /// they would otherwise stay stale on a read-mostly cache. The first `get`
+    /// after the flip always refreshes (the throttle starts un-armed).
+    #[test]
+    fn interest_shadow_refreshes_on_get_after_interest_flip() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        interested.lock().unwrap().insert(0u64);
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            1_000_000,
+            "contract",
+            Some(metrics.clone()),
+            interest_over(interested.clone()),
+            false,
+        );
+        cache.insert(0, (), 100); // interested at insert time
+        cache.insert(1, (), 250); // cold
+        // Establish a deterministic baseline (insert-path refresh is throttled).
+        cache.force_refresh_interest_shadow();
+        let s = metrics.snapshot();
+        assert_eq!(s.contract_interested_bytes, 100);
+        assert_eq!(s.contract_cold_evictable_bytes, 250);
+
+        // Interest flips with NO cache mutation: key 0 is no longer in use.
+        interested.lock().unwrap().remove(&0);
+        // The gauges still say 100 interested until something reads + refreshes.
+        assert_eq!(metrics.snapshot().contract_interested_bytes, 100);
+
+        // Arm the throttle so the next `get` is due, then `get` triggers the
+        // throttled refresh and the gauges now reflect that NOTHING is
+        // interested — i.e. an interest flip with no cache mutation is picked up.
+        cache.arm_interest_shadow_refresh();
+        let _ = cache.get(&1);
+        let s = metrics.snapshot();
+        assert_eq!(
+            s.contract_interested_bytes, 0,
+            "interest flip with no cache mutation must be picked up on the next get"
+        );
+        assert_eq!(
+            s.contract_cold_evictable_bytes, 350,
+            "both entries are now cold-evictable"
+        );
+    }
+
+    /// Thrash-reduction model (#4441): a small HOT interested working set is
+    /// interleaved with a stream of cold one-shot contracts that overflow the
+    /// budget. With the flag ON, the hot set stays resident the whole time, so a
+    /// node would NEVER recompile it; with the flag OFF (plain byte-LRU) the cold
+    /// churn repeatedly evicts the hot set, forcing the recompile-on-access
+    /// thrash this change exists to relieve. We assert the resident-state
+    /// difference at the cache level (each cold insert simulates a cold-contract
+    /// access; a missing hot key would be a recompile in production).
+    #[test]
+    fn two_tier_keeps_hot_set_resident_under_cold_churn() {
+        // Budget holds the 2 hot entries (20) plus a little cold headroom (1
+        // cold entry of 10) — every additional cold insert must evict something.
+        let budget = 30usize;
+        let hot: [u64; 2] = [1000, 1001];
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        interested.lock().unwrap().insert(hot[0]);
+        interested.lock().unwrap().insert(hot[1]);
+
+        // Helper: prime the hot set, then run rounds of a COLD BURST (several
+        // cold one-shot contracts back-to-back, no hot access in between — the
+        // realistic shape where a stream of cold traffic pushes the hot set down
+        // the recency order) followed by hot accesses. Returns how many times a
+        // hot key was found MISSING at the start of a round (== a recompile in
+        // production). The burst length (3) matches the budget's entry capacity
+        // so plain LRU drains the hot set; two-tier protects it.
+        let run = |tiered: bool| -> u32 {
+            let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+                budget,
+                "contract",
+                None,
+                interest_over(interested.clone()),
+                tiered,
+            );
+            cache.insert(hot[0], (), 10);
+            cache.insert(hot[1], (), 10);
+            let mut hot_misses = 0u32;
+            let mut cold_key = 0u64;
+            for _round in 0..6 {
+                // Cold burst: 3 cold accesses with no interleaved hot touch.
+                for _ in 0..3 {
+                    cache.insert(cold_key, (), 10);
+                    cold_key += 1;
+                }
+                // Now the hot ops resume — recompile any hot key the burst evicted.
+                for &h in &hot {
+                    if cache.get(&h).is_none() {
+                        hot_misses += 1;
+                        cache.insert(h, (), 10);
+                    }
+                }
+            }
+            hot_misses
+        };
+
+        let tiered_misses = run(true);
+        let lru_misses = run(false);
+        assert_eq!(
+            tiered_misses, 0,
+            "two-tier policy must keep the hot interested set resident — zero recompiles"
+        );
+        assert!(
+            lru_misses > 0,
+            "plain byte-LRU evicts the hot set under cold churn (the #4441 thrash); \
+             tiered={tiered_misses} lru={lru_misses}"
+        );
     }
 }
