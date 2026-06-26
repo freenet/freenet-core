@@ -99,6 +99,22 @@ const EVICTION_WARN_INTERVAL: Duration = Duration::from_secs(300);
 /// eviction means the working set genuinely exceeds the budget.
 const EVICTION_WARN_THRESHOLD: u64 = 16;
 
+/// How often a cache HIT (`get`) is allowed to recompute the interest shadow
+/// gauges (cold-evictable vs interested bytes).
+///
+/// The `interest` predicate can flip for an already-cached contract WITHOUT any
+/// cache mutation — e.g. a client disconnects or a downstream lease expires —
+/// so recomputing the split only on insert/remove would leave the gauges (and
+/// the `migration_admission_would_change` floor) stale on a read-mostly cache
+/// (Codex review). Refreshing on `get` fixes that, but a full O(entries) scan on
+/// every hot lookup is too expensive; the gauges are consumed only at the 5-min
+/// snapshot cadence and at admission-gate time, so bounding the recompute to at
+/// most once per this interval keeps `get` cheap while bounding staleness to the
+/// interval on any node with ongoing contract traffic. Uses real wall-clock time
+/// (same rationale as the eviction warn window): it rate-limits a telemetry
+/// recompute, not node behavior, so it must advance in real time.
+const INTEREST_SHADOW_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// A least-recently-used cache bounded by the total byte size of its values.
 ///
 /// Unlike a plain count-capped `LruCache`, this evicts based on the sum of
@@ -148,6 +164,13 @@ pub(crate) struct ModuleCache<K: Hash + Eq, V> {
     /// only need the predicate), but they do not change eviction behavior. This
     /// is what makes the change inert by default and safe to merge.
     interest_tiered_active: bool,
+    /// Last time a cache HIT recomputed the interest shadow gauges, throttled to
+    /// [`INTEREST_SHADOW_REFRESH_INTERVAL`]. `None` until the first throttled
+    /// refresh. Insert/remove always recompute (the entry set just changed);
+    /// this only governs the `get`-path refresh that catches interest flips with
+    /// no cache mutation. Real wall-clock `Instant` deliberately — see the
+    /// constant's docs and `window_started_at`.
+    last_interest_shadow_refresh: Option<Instant>,
 }
 
 // `K: Clone` is required so the two-tier eviction can name (clone) the LRU cold
@@ -210,6 +233,7 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
             metrics,
             interest,
             interest_tiered_active,
+            last_interest_shadow_refresh: None,
         };
         // Publish the budget immediately, so an idle cache (a node that hasn't
         // compiled a module yet, or a delegate cache that's never used) reports
@@ -241,12 +265,37 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
 
     /// Look up a key, marking it most-recently-used on a hit. Returns a
     /// reference to the cached value (not the size).
+    ///
+    /// Also opportunistically (throttled) refreshes the interest shadow gauges,
+    /// so they track interest flips that happen with NO cache mutation (a client
+    /// disconnect / lease expiry between inserts). See
+    /// [`INTEREST_SHADOW_REFRESH_INTERVAL`].
     pub(crate) fn get<Q>(&mut self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        self.maybe_refresh_interest_shadow();
         self.inner.get(key).map(|(v, _)| v)
+    }
+
+    /// Recompute the interest shadow gauges if at least
+    /// [`INTEREST_SHADOW_REFRESH_INTERVAL`] has elapsed since the last
+    /// `get`-driven refresh. No-op (no scan) for caches without a predicate or
+    /// metrics sink. Bounds the cost of refreshing on the hot lookup path.
+    fn maybe_refresh_interest_shadow(&mut self) {
+        if self.interest.is_none() || self.metrics.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let due = match self.last_interest_shadow_refresh {
+            Some(prev) => now.duration_since(prev) >= INTEREST_SHADOW_REFRESH_INTERVAL,
+            None => true,
+        };
+        if due {
+            self.last_interest_shadow_refresh = Some(now);
+            self.record_interest_shadow();
+        }
     }
 
     /// Insert (or replace) a value, recording its byte size, then evict LRU
@@ -1972,6 +2021,48 @@ mod tests {
         m.record_migration_admission_would_change();
         m.record_migration_admission_would_change();
         assert_eq!(m.snapshot().migration_admission_would_change_total, 2);
+    }
+
+    /// The interest shadow gauges track interest flips that happen with NO cache
+    /// mutation (a client disconnect / lease expiry), picked up on the next
+    /// `get` via the throttled refresh — addressing the Codex review finding that
+    /// they would otherwise stay stale on a read-mostly cache. The first `get`
+    /// after the flip always refreshes (the throttle starts un-armed).
+    #[test]
+    fn interest_shadow_refreshes_on_get_after_interest_flip() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        interested.lock().unwrap().insert(0u64);
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            1_000_000,
+            "contract",
+            Some(metrics.clone()),
+            interest_over(interested.clone()),
+            false,
+        );
+        cache.insert(0, (), 100); // interested at insert time
+        cache.insert(1, (), 250); // cold
+        let s = metrics.snapshot();
+        assert_eq!(s.contract_interested_bytes, 100);
+        assert_eq!(s.contract_cold_evictable_bytes, 250);
+
+        // Interest flips with NO cache mutation: key 0 is no longer in use.
+        interested.lock().unwrap().remove(&0);
+        // The stale gauges still say 100 interested until something reads.
+        assert_eq!(metrics.snapshot().contract_interested_bytes, 100);
+
+        // A `get` triggers the throttled refresh (un-armed → fires immediately),
+        // and the gauges now reflect that NOTHING is interested.
+        let _ = cache.get(&1);
+        let s = metrics.snapshot();
+        assert_eq!(
+            s.contract_interested_bytes, 0,
+            "interest flip with no cache mutation must be picked up on the next get"
+        );
+        assert_eq!(
+            s.contract_cold_evictable_bytes, 350,
+            "both entries are now cold-evictable"
+        );
     }
 
     /// Thrash-reduction model (#4441): a small HOT interested working set is
