@@ -1987,6 +1987,11 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "migration_admission_would_change_total".to_string(),
                     serde_json::json!(snapshot.migration_admission_would_change_total),
                 );
+                // Renewal-terminus short-circuit counter (#4440 proposal 1).
+                obj.insert(
+                    "renewal_terminus_satisfied".to_string(),
+                    serde_json::json!(snapshot.renewal_terminus_satisfied),
+                );
             }
             body
         }
@@ -2174,12 +2179,14 @@ mod tests {
         info.subscribe_hint_sent = Some(11);
         info.subscribe_hint_received = Some(13);
         info.subscribe_hint_acted = Some(7);
+        info.renewal_terminus_satisfied = Some(9);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosted_contracts_count", 5u64),
             ("subscribe_hint_sent", 11),
             ("subscribe_hint_received", 13),
             ("subscribe_hint_acted", 7),
+            ("renewal_terminus_satisfied", 9),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

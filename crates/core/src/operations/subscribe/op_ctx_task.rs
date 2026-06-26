@@ -333,6 +333,55 @@ pub(crate) async fn run_renewal_subscribe(
     instance_id: ContractInstanceId,
     renewal_tx: Transaction,
 ) -> RenewalOutcome {
+    // #4440 proposal 1 — root-satisfied short-circuit.
+    //
+    // If this node is the body-holding subscription root for the contract (it
+    // hosts the body AND no connected neighbor is closer to the contract's ring
+    // location), it has no peer closer than itself to subscribe to. Renewing an
+    // upstream subscription would route the wire `Subscribe::Request` greedily
+    // toward the contract, dead-end at this node, and be retried every cycle —
+    // and at scale that loop is the renewal storm (in prod it also shows up as
+    // the renewal task overrunning its cycle deadline).
+    //
+    // A root has no use for an upstream subscription: hosting, eviction
+    // protection, and UPDATE delivery are all decoupled from the
+    // `active_subscriptions` lease (UPDATEs route to whoever is closest — this
+    // node — and fan out to interested peers independently of the lease). So the
+    // root takes a dedicated "root-satisfied" path: send NO wire request,
+    // deliver NO client result, and return `Success`. The renewal-loop's
+    // `SubscriptionRecoveryGuard::complete(true)` then clears the pending mark
+    // and resets the subscription backoff with success semantics; the
+    // `active_subscriptions` lease is intentionally allowed to lapse.
+    //
+    // This is NOT `complete_local_subscription`, whose semantics differ (it
+    // emits `LocalSubscribeComplete` and does not refresh the lease in the way a
+    // root needs); the root-satisfied path is deliberately distinct.
+    if op_manager
+        .ring
+        .is_body_holding_subscription_root_by_instance(&instance_id)
+    {
+        op_manager.ring.record_renewal_terminus_satisfied();
+        // Simulation-test observability (no-op in production — see
+        // `topology_registry::record_renewal_terminus_satisfied`).
+        if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
+            crate::ring::topology_registry::record_renewal_terminus_satisfied(addr);
+        }
+        tracing::debug!(
+            tx = %renewal_tx,
+            contract = %instance_id,
+            phase = "renewal_terminus_satisfied",
+            "subscribe renewal: node is the body-holding subscription root; \
+             satisfying renewal locally without an upstream request (#4440)"
+        );
+        return RenewalOutcome::Success;
+    }
+
+    // Not a body-holding root: renew normally over the wire. Record the
+    // wire-attempt for simulation-test observability (no-op in production).
+    if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
+        crate::ring::topology_registry::record_renewal_wire_attempt(addr);
+    }
+
     let result = drive_client_subscribe_inner(
         &op_manager,
         instance_id,
@@ -2814,6 +2863,54 @@ mod tests {
             classify_renewal_result(result),
             RenewalOutcome::Failed { .. }
         ));
+    }
+
+    /// #4440 proposal 1 — root-satisfied short-circuit pin.
+    ///
+    /// `run_renewal_subscribe` MUST check whether this node is the body-holding
+    /// subscription root for the contract and, if so, take the root-satisfied
+    /// path — return `RenewalOutcome::Success` WITHOUT calling
+    /// `drive_client_subscribe_inner` (no wire `Subscribe::Request`). A future
+    /// refactor that drops this check or moves it after the wire send would
+    /// silently reintroduce the renewal storm; this source-scrape pin fails the
+    /// build if that happens. (Behavioural coverage is the simulation test
+    /// `test_subscription_root_renewal_does_not_storm`; an equivalent unit test
+    /// would need a fully-built multi-peer Ring, hence the source pin — same
+    /// approach as `migration_counter_sites_present`.)
+    #[test]
+    fn run_renewal_subscribe_short_circuits_body_holding_root() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) async fn run_renewal_subscribe(")
+            .expect("run_renewal_subscribe must exist");
+        let drive_at = src[entry..]
+            .find("drive_client_subscribe_inner(")
+            .expect("run_renewal_subscribe must still drive the wire renewal in the non-root case");
+        let before_drive = &src[entry..entry + drive_at];
+
+        let predicate_at = before_drive
+            .find("is_body_holding_subscription_root_by_instance(&instance_id)")
+            .expect(
+                "run_renewal_subscribe must check is_body_holding_subscription_root_by_instance \
+                 BEFORE driving a wire renewal (the storm short-circuit)",
+            );
+        assert!(
+            before_drive[predicate_at..].contains("return RenewalOutcome::Success;"),
+            "the body-holding-root branch must return RenewalOutcome::Success (root-satisfied \
+             path) WITHOUT falling through to the wire renewal driver"
+        );
+        assert!(
+            before_drive[predicate_at..].contains("record_renewal_terminus_satisfied()"),
+            "the root-satisfied path must record the renewal_terminus_satisfied counter"
+        );
+        // The short-circuit must NOT reuse complete_local_subscription (different
+        // semantics — it emits LocalSubscribeComplete and was the wrong vehicle
+        // in an earlier draft). The dedicated path returns Success directly.
+        let branch = &before_drive[predicate_at..];
+        assert!(
+            !branch.contains("complete_local_subscription"),
+            "the root-satisfied path must be dedicated, not reuse complete_local_subscription"
+        );
     }
 
     // ── classify_executor_subscribe_result tests ─────────────────────

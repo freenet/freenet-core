@@ -10820,3 +10820,222 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
          and obtain NO state (the far host is off the greedy path toward the key)"
     );
 }
+
+/// Reproduction + regression test for the placement-migration renewal storm
+/// (#4440, the storm symptom of the #4404 placement work).
+///
+/// ## The storm
+///
+/// When the placement migration drifts a contract onto the peer closest to its
+/// ring location, that peer becomes the *body-holding subscription root*: it
+/// hosts the contract AND no connected neighbor is closer to the key. Such a
+/// peer has no peer closer than itself to subscribe to upstream. Before the fix,
+/// the subscription-renewal driver did not recognise that role: every renewal
+/// cycle it still sent a wire `Subscribe::Request`, which routes greedily toward
+/// the contract, dead-ends at the root itself, fails, and is retried on the next
+/// 30s cycle — forever. Across many such contracts that loop is the renewal
+/// storm that made the 500-node nightly go metastable (`subscribe: attempt
+/// timed out ... is_renewal: true` floods; in prod the renewal task also
+/// overruns its 25s cycle deadline).
+///
+/// ## What this test ignites
+///
+/// A small, deterministic topology where one node is unambiguously the
+/// body-holding subscription root for a contract AND keeps that contract in the
+/// renewal set (it holds a client subscription for it, so
+/// `contracts_needing_renewal()` returns it every cycle). Migration is enabled
+/// so the run reflects the production condition the storm appears under. Over the
+/// simulation the root's renewal driver fires repeatedly.
+///
+/// ## The deterministic signal
+///
+/// `is_renewal` is not recorded on the captured `NetLogMessage` event stream and
+/// the `subscription_renewal_outcome` telemetry is fire-and-forget to a remote
+/// collector, so neither is readable in-sim. Instead the renewal driver publishes
+/// a per-node counter into the simulation-only renewal-metrics registry
+/// (`freenet::dev_tool::{aggregate_renewal_metrics, get_renewal_metrics}`):
+///   - `wire_attempts`: the node sent (or attempted) a wire renewal request —
+///     the storm signature for a body-holding root, because each such attempt
+///     dead-ends and is retried.
+///   - `terminus_satisfied`: the renewal short-circuited via the root-satisfied
+///     path the fix adds.
+///
+/// **Before the fix** the root's renewals are all `wire_attempts` (the storm) and
+/// `terminus_satisfied` is zero — the asserts below FAIL. **After the fix** the
+/// root's renewals are `terminus_satisfied` and it makes essentially no wire
+/// renewal attempts — the asserts PASS. The test is run across several seeds
+/// because the storm is metastable (one green run is not proof).
+#[test_log::test]
+fn test_subscription_root_renewal_does_not_storm() {
+    use freenet::dev_tool::{
+        Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation,
+        aggregate_renewal_metrics, clear_renewal_metrics, get_renewal_metrics,
+    };
+
+    // The storm is metastable; assert across several seeds, not just one.
+    for seed in [0x4440_0001u64, 0x4440_0002, 0x4440_0003] {
+        let network_name = format!("renewal-storm-{seed:x}");
+        // Leak the name to obtain the &'static str SimNetwork::new requires; one
+        // small allocation per seed in a test is fine.
+        let network_name: &'static str = Box::leak(network_name.into_boxed_str());
+        setup_deterministic_state(seed);
+        // Start from a clean registry so a prior seed's counters can't leak in.
+        clear_renewal_metrics(network_name);
+
+        // Place the root node exactly at the key and everyone else far from it,
+        // so the root is unambiguously the closest connected peer (the
+        // body-holding subscription root) and no migration can move the contract
+        // off it.
+        let contract = SimOperation::create_test_contract(0x44);
+        let contract_id = *contract.key().id();
+        let contract_key = contract.key();
+        let key_loc = Location::from(&contract_key).as_f64();
+
+        let wrap = |x: f64| x.rem_euclid(1.0);
+        // node order 1 = root (AT the key); orders 2..=4 far from the key.
+        let node_locations = vec![
+            key_loc, // root
+            wrap(key_loc + 0.30),
+            wrap(key_loc + 0.45),
+            wrap(key_loc + 0.60),
+        ];
+        let num_nodes = node_locations.len();
+
+        let rt = create_runtime();
+        let mut sim = rt.block_on(async {
+            SimNetwork::new_with_node_locations(
+                network_name,
+                1,         // 1 gateway
+                num_nodes, // 4 regular nodes
+                10,        // ring_max_htl
+                7,         // rnd_if_htl_above
+                8,         // max_connections
+                3,         // min_connections
+                seed,
+                &node_locations,
+            )
+            .await
+        });
+        // Match the production condition the storm appears under: migration ON.
+        sim.enable_placement_migration();
+
+        let root_label = NodeLabel::node(network_name, 1); // AT the key
+
+        // Resolve the root's address now — `run_controlled_simulation` consumes
+        // `sim`, and we need this to key into the renewal-metrics registry after.
+        let root_addr = sim
+            .node_address(&root_label)
+            .unwrap_or_else(|| panic!("root node {root_label:?} has no address (seed {seed:x})"));
+
+        // Sanity: the root must be strictly closer to the key than every other
+        // regular node, so it is genuinely the body-holding subscription root.
+        let locs = sim.get_peer_locations(); // [gateway, node1..node4]
+        let ring_dist = |a: f64, b: f64| {
+            let d = (a - b).abs();
+            d.min(1.0 - d)
+        };
+        let root_dist = ring_dist(locs[1], key_loc);
+        let others_min = (2..=num_nodes)
+            .map(|i| ring_dist(locs[i], key_loc))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            root_dist < others_min,
+            "scenario setup wrong (seed {seed:x}): the root must be the closest peer to the key \
+             (root_dist={root_dist}, others_min={others_min})"
+        );
+
+        let operations = vec![
+            // The root genuinely HOSTS the contract (state + host_contract +
+            // active subscription), with no network propagation — so
+            // `is_subscription_root` is true and renewal eligibility starts.
+            ScheduledOperation::new(
+                root_label.clone(),
+                SimOperation::SeedHostedContract {
+                    contract: contract.clone(),
+                    state: vec![1, 2, 3, 4],
+                },
+            ),
+            // A local client on the root subscribes, so the contract stays in
+            // `contracts_needing_renewal()` every cycle (the client-subscription
+            // path), keeping the renewal driver firing on the root for the whole
+            // run regardless of lease timing.
+            ScheduledOperation::new(root_label.clone(), SimOperation::Subscribe { contract_id }),
+        ];
+
+        // Run long enough for the network to form and several 30s renewal cycles
+        // to fire on the root. `run_controlled_simulation` advances virtual time
+        // by the test client's sleeps (3s warmup + 3s per op + the
+        // post-operations wait), not the `simulation_duration` cap. The seeded
+        // active subscription has an 8-minute lease and only enters the renewal
+        // window at 6 minutes, so the post-operations wait must comfortably
+        // exceed that to exercise the renewal driver on the root. 540s gives
+        // several 30s renewal cycles inside the window. (Virtual time is cheap:
+        // this whole run is a few seconds of wall-clock under Turmoil.)
+        let result = sim.run_controlled_simulation(
+            seed,
+            operations,
+            Duration::from_secs(900),
+            Duration::from_secs(540),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "simulation failed (seed {seed:x}): {:?}",
+            result.turmoil_result.err()
+        );
+
+        // The root must still host the contract (its body-holding-root status,
+        // and thus the storm condition, held for the whole run).
+        assert!(
+            result.is_node_hosting(&root_label, &contract_key),
+            "root should still host the seeded contract after the simulation (seed {seed:x})"
+        );
+
+        let root_metrics = get_renewal_metrics(network_name, &root_addr).unwrap_or_default();
+        let totals = aggregate_renewal_metrics(network_name);
+
+        tracing::info!(
+            seed = format!("{seed:x}"),
+            root_wire_attempts = root_metrics.wire_attempts,
+            root_terminus_satisfied = root_metrics.terminus_satisfied,
+            total_wire_attempts = totals.wire_attempts,
+            total_terminus_satisfied = totals.terminus_satisfied,
+            "renewal storm metrics"
+        );
+
+        // The renewal driver must have actually run on the root — otherwise the
+        // test proves nothing (neither storm nor fix exercised).
+        assert!(
+            root_metrics.wire_attempts + root_metrics.terminus_satisfied > 0,
+            "renewal driver never ran on the body-holding root (seed {seed:x}); \
+             test exercised neither the storm nor the fix \
+             (wire_attempts={}, terminus_satisfied={})",
+            root_metrics.wire_attempts,
+            root_metrics.terminus_satisfied,
+        );
+
+        // CORE OF THE FIX: a body-holding subscription root satisfies its
+        // renewals locally and sends no wire renewal request.
+        //
+        // Before the fix this is the storm: every renewal on the root is a
+        // doomed wire attempt and `terminus_satisfied` is zero — both asserts
+        // below fail. After the fix the root's renewals are terminus-satisfied
+        // and it makes no wire renewal attempts.
+        assert!(
+            root_metrics.terminus_satisfied > 0,
+            "body-holding root never took the root-satisfied renewal path (seed {seed:x}): \
+             terminus_satisfied=0, wire_attempts={}. Before the #4440 fix the root storms \
+             with doomed upstream renewals instead of satisfying them locally.",
+            root_metrics.wire_attempts,
+        );
+        assert_eq!(
+            root_metrics.wire_attempts, 0,
+            "body-holding root must NOT send wire renewal requests — that is the storm \
+             (seed {seed:x}): wire_attempts={}, terminus_satisfied={}. Each wire renewal \
+             from a root routes greedily toward the key, dead-ends at the root, fails, and \
+             retries next cycle.",
+            root_metrics.wire_attempts, root_metrics.terminus_satisfied,
+        );
+
+        clear_renewal_metrics(network_name);
+    }
+}

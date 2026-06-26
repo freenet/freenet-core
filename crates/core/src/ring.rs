@@ -692,6 +692,46 @@ impl Ring {
     /// Maximum contract-directed CONNECTs per cycle.
     const MAX_CONTRACT_CONNECTS_PER_CYCLE: usize = 2;
 
+    /// Returns true if this peer is the body-holding subscription root for the
+    /// contract identified by `instance_id`: it hosts the contract (has the
+    /// body) AND no connected neighbor is closer to the contract's ring location
+    /// than this peer.
+    ///
+    /// This is the "body-holding terminus" predicate from the placement-migration
+    /// design. Such a peer has no peer closer than itself to subscribe to, so a
+    /// renewal toward the contract would dead-end and retry forever — the #4440
+    /// renewal storm. The renewal driver (which holds only the instance id) uses
+    /// this to short-circuit (proposal 1).
+    ///
+    /// Resolves the hosted [`ContractKey`] by matching `instance_id` against the
+    /// hosting set (a node hosts at most one contract per instance id, so the
+    /// match is exact), then delegates to [`Self::is_subscription_root`], whose
+    /// definition already requires `is_hosting_contract` (= has body) and
+    /// closest-connected, so the two predicates can never disagree. Returns
+    /// `false` when the contract is not hosted (no body → not a body-holding
+    /// terminus).
+    pub(crate) fn is_body_holding_subscription_root_by_instance(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> bool {
+        let Some(key) = self
+            .hosting_manager
+            .hosting_contract_keys()
+            .into_iter()
+            .find(|k| k.id() == instance_id)
+        else {
+            return false;
+        };
+        self.is_subscription_root(&key)
+    }
+
+    /// Record that a renewal short-circuited because this node is the
+    /// body-holding subscription root for the contract (#4440 proposal 1).
+    pub(crate) fn record_renewal_terminus_satisfied(&self) {
+        self.placement_migration_metrics
+            .record_renewal_terminus_satisfied();
+    }
+
     /// Returns true if this peer is the closest to the contract among its connected neighbors
     /// (i.e., it's a subscription root for this contract).
     fn is_subscription_root(&self, contract_key: &ContractKey) -> bool {
@@ -1412,6 +1452,7 @@ impl Ring {
             snapshot.subscribe_hint_sent = Some(pm.sent);
             snapshot.subscribe_hint_received = Some(pm.received);
             snapshot.subscribe_hint_acted = Some(pm.acted);
+            snapshot.renewal_terminus_satisfied = Some(pm.renewal_terminus_satisfied);
 
             tracing::info!(
                 failure_events = snapshot.failure_events,
@@ -1435,6 +1476,7 @@ impl Ring {
                 subscribe_hint_sent = pm.sent,
                 subscribe_hint_received = pm.received,
                 subscribe_hint_acted = pm.acted,
+                renewal_terminus_satisfied = pm.renewal_terminus_satisfied,
                 "router_snapshot"
             );
 
