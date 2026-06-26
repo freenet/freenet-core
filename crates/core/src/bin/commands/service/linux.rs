@@ -264,11 +264,28 @@ Description=Freenet Node
 Documentation=https://freenet.org
 After=network-online.target
 Wants=network-online.target
-# Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
-# a stale process). Without this, systemd restarts indefinitely.
-# SuccessExitStatus=42 ensures auto-update exits don't count as failures.
+# Crash-loop rate limiting (issue #4551). StartLimitBurst / StartLimitIntervalSec
+# are [Unit]-section directives (#4570 moved them here from [Service], where systemd
+# SILENTLY IGNORES them — which had disabled the limiter entirely, so with
+# Restart=always + RestartSec=10 a crashing node restarted every ~10s forever).
+#
+# Only a RAPID loop trips this: more than 5 starts within 120s. A legitimate
+# single restart (auto-update, an occasional reboot, a one-off crash) is nowhere
+# near 5-in-120s and is never penalised. A boot-wedge / fast crash exits 45 (a
+# counted failure — see SuccessExitStatus in [Service]), so a tight no-fix loop of
+# those trips the limiter and the unit stops; a node that ran healthily first
+# exits the burst-exempt code 42 (see crate::node::p2p_impl). BOTH 42 and 45 still
+# fire the ExecStopPost `freenet update` self-heal in [Service], so a boot-crash
+# that a newer release fixes recovers even though exit 45 is counted.
+#
+# StartLimitAction=none (the default, made explicit) STOPS the unit on trip (it
+# enters "failed") rather than rebooting the host — the desired terminal state
+# for a crash loop: better than looping forever, and loud to the operator.
+# Recover with `systemctl reset-failed freenet && systemctl start freenet` (the
+# lockout also clears on the next reboot / `freenet update`).
 StartLimitBurst=5
 StartLimitIntervalSec=120
+StartLimitAction=none
 
 [Service]
 Type=simple
@@ -278,6 +295,13 @@ Type=simple
 # systemd also sets INVOCATION_ID for every service, which the node detects as a
 # fallback; this makes the intent explicit and robust.
 Environment=FREENET_SUPERVISED=1
+# #4551: advertise to the node that THIS unit understands the fast-crash exit code
+# 45 — it keeps 45 out of SuccessExitStatus (so 45 counts toward StartLimitBurst),
+# sets StartLimitAction=none, and runs `freenet update` on exit 42 OR 45. The node
+# emits 45 only when it sees this marker, so a binary running under an OLD unit
+# (auto-updated but not reinstalled) or the mac/Windows wrapper keeps emitting the
+# self-healing exit 42 instead of a 45 the supervisor would mishandle.
+Environment={fast_crash_marker}=1
 # Stale-orphan self-heal (issue #3967): RestartPreventExitStatus=43 below
 # means an exit 43 ("another instance already running") never restarts the
 # unit. That is correct for a legitimate second instance, but if the port
@@ -305,7 +329,8 @@ Environment=FREENET_SUPERVISED=1
 ExecStartPre=-/bin/sh -c 'self=$$$$; ondisk=$$(timeout 5 {binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; exe=$$(readlink -f /proc/$$pid/exe 2>/dev/null); hv=""; [ -x "$$exe" ] && hv=$$(timeout 5 "$$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | awk "{{print \$$2}}"); mismatch=1; [ -n "$$ondisk" ] && [ -n "$$hv" ] && [ "$$hv" != "$$ondisk" ] && mismatch=0; if [ "$$ppid" = "1" ] && {{ [ "$$mismatch" = "0" ] || [ -z "$$hv" ]; }}; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
 ExecStart={binary} network
 Restart=always
-# Wait 10 seconds before restart to avoid rapid restart loops
+# Wait 10 seconds before restart to avoid rapid restart loops. The actual
+# crash-loop cap (StartLimit*) lives in the [Unit] section above (#4551).
 RestartSec=10
 # Allow 45 seconds for graceful shutdown before SIGKILL.
 # The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
@@ -315,15 +340,29 @@ RestartSec=10
 # cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
 TimeoutStopSec=45
 
-# Auto-update: if peer exits with code 42 (version mismatch with gateway),
-# run update before systemd restarts the service. The '-' prefix means
-# ExecStopPost failure won't affect service restart. $$EXIT_STATUS is doubled
-# so systemd passes a literal $EXIT_STATUS through to sh (which systemd itself
-# sets in the ExecStopPost environment).
-ExecStopPost=-/bin/sh -c '[ "$$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
-# Treat exit code 42 as success so it doesn't count against StartLimitBurst.
-# Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
-# exhaust the burst limit and permanently kill the service.
+# Auto-update / boot-crash self-heal: run `freenet update` before systemd
+# restarts the service when the node exits 42 (a healthy node that hit a version
+# mismatch / fatal fault) OR 45 (a fast crash / boot-wedge, #4551). Firing update
+# on 45 too preserves the #4549 self-heal for a boot-crash that a NEWER release
+# fixes — `freenet update` is a SEPARATE process that can succeed even when
+# `freenet network` crashes at startup. This does NOT exempt 45 from the
+# crash-loop limiter: ExecStopPost runs AFTER the process exits (the '-' prefix
+# means its own result never affects restart) and 45 stays OUT of
+# SuccessExitStatus below, so a no-fix tight loop still trips StartLimitBurst and
+# the unit stops. A `case` (not `&&`/`||`) avoids shell-precedence pitfalls.
+# $$EXIT_STATUS is doubled so systemd passes a literal $EXIT_STATUS through to sh
+# (systemd itself sets it in the ExecStopPost environment).
+ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 42|45) {binary} update --quiet ;; esac'
+# Exit 42 (auto-update) and 43 (another instance) are clean exits, so they are
+# not counted as failures — without this, rapid update cycles (exit 42 →
+# ExecStopPost → restart) could exhaust the burst limit and kill the service.
+# Exit 45 (fast-crash / boot-wedge, #4551) is deliberately NOT whitelisted here:
+# it must COUNT toward StartLimitBurst so a tight crash loop trips the [Unit]
+# limiter and the unit stops — even though the ExecStopPost above still runs
+# `freenet update` for it. Counting (StartLimit) and self-heal (ExecStopPost) are
+# independent: the former bounds a no-fix loop, the latter rescues a boot-crash a
+# newer release fixes. (44 is the internal bundle-update-staged code, never
+# emitted by `freenet network`.)
 SuccessExitStatus=42 43
 # Exit code 43 = another instance is already running on the port.
 # Do NOT restart — the existing instance is healthy.
@@ -356,7 +395,8 @@ CPUQuota=200%
 WantedBy=default.target
 "#,
         binary = binary_path.display(),
-        log_dir = log_dir.display()
+        log_dir = log_dir.display(),
+        fast_crash_marker = super::super::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR,
     )
 }
 
@@ -373,11 +413,14 @@ Description=Freenet Node
 Documentation=https://freenet.org
 After=network-online.target
 Wants=network-online.target
-# Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
-# a stale process). Without this, systemd restarts indefinitely.
-# SuccessExitStatus=42 ensures auto-update exits don't count as failures.
+# Crash-loop rate limiting (issue #4551) — see the matching comment in the user
+# unit. StartLimit* live in [Unit] (#4570); systemd silently ignores them in
+# [Service]. Only a rapid loop (>5 starts / 120s) trips; a fast crash exits the
+# counted code 45 while a healthy-then-died node exits the burst-exempt 42.
+# StartLimitAction=none stops the unit (it does NOT reboot the host) on trip.
 StartLimitBurst=5
 StartLimitIntervalSec=120
+StartLimitAction=none
 
 [Service]
 Type=simple
@@ -388,6 +431,10 @@ Environment=HOME={home}
 # applied by ExecStopPost below, so it logs an informational message instead of
 # a loud "no supervisor" error on update exit.
 Environment=FREENET_SUPERVISED=1
+# #4551 fast-crash-aware marker — see the matching comment in the user unit. The
+# node emits exit 45 only when this is present (this unit handles 45); otherwise it
+# keeps the self-healing exit 42.
+Environment={fast_crash_marker}=1
 # Stale-orphan self-heal (issue #3967): see the matching comment in the user
 # unit (including the systemd $$-escaping, the PPID-after-final-')' parse, and
 # why we do NOT anchor on the holder's exe equalling this unit's on-disk binary
@@ -403,7 +450,8 @@ Environment=FREENET_SUPERVISED=1
 ExecStartPre=-/bin/sh -c 'self=$$$$; ondisk=$$(timeout 5 {binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; exe=$$(readlink -f /proc/$$pid/exe 2>/dev/null); hv=""; [ -x "$$exe" ] && hv=$$(timeout 5 "$$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | awk "{{print \$$2}}"); mismatch=1; [ -n "$$ondisk" ] && [ -n "$$hv" ] && [ "$$hv" != "$$ondisk" ] && mismatch=0; if [ "$$ppid" = "1" ] && {{ [ "$$mismatch" = "0" ] || [ -z "$$hv" ]; }}; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
 ExecStart={binary} network
 Restart=always
-# Wait 10 seconds before restart to avoid rapid restart loops
+# Wait 10 seconds before restart to avoid rapid restart loops. The actual
+# crash-loop cap (StartLimit*) lives in the [Unit] section above (#4551).
 RestartSec=10
 # Allow 45 seconds for graceful shutdown before SIGKILL.
 # The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
@@ -413,15 +461,29 @@ RestartSec=10
 # cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
 TimeoutStopSec=45
 
-# Auto-update: if peer exits with code 42 (version mismatch with gateway),
-# run update before systemd restarts the service. The '-' prefix means
-# ExecStopPost failure won't affect service restart. $$EXIT_STATUS is doubled
-# so systemd passes a literal $EXIT_STATUS through to sh (which systemd itself
-# sets in the ExecStopPost environment).
-ExecStopPost=-/bin/sh -c '[ "$$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
-# Treat exit code 42 as success so it doesn't count against StartLimitBurst.
-# Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
-# exhaust the burst limit and permanently kill the service.
+# Auto-update / boot-crash self-heal: run `freenet update` before systemd
+# restarts the service when the node exits 42 (a healthy node that hit a version
+# mismatch / fatal fault) OR 45 (a fast crash / boot-wedge, #4551). Firing update
+# on 45 too preserves the #4549 self-heal for a boot-crash that a NEWER release
+# fixes — `freenet update` is a SEPARATE process that can succeed even when
+# `freenet network` crashes at startup. This does NOT exempt 45 from the
+# crash-loop limiter: ExecStopPost runs AFTER the process exits (the '-' prefix
+# means its own result never affects restart) and 45 stays OUT of
+# SuccessExitStatus below, so a no-fix tight loop still trips StartLimitBurst and
+# the unit stops. A `case` (not `&&`/`||`) avoids shell-precedence pitfalls.
+# $$EXIT_STATUS is doubled so systemd passes a literal $EXIT_STATUS through to sh
+# (systemd itself sets it in the ExecStopPost environment).
+ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 42|45) {binary} update --quiet ;; esac'
+# Exit 42 (auto-update) and 43 (another instance) are clean exits, so they are
+# not counted as failures — without this, rapid update cycles (exit 42 →
+# ExecStopPost → restart) could exhaust the burst limit and kill the service.
+# Exit 45 (fast-crash / boot-wedge, #4551) is deliberately NOT whitelisted here:
+# it must COUNT toward StartLimitBurst so a tight crash loop trips the [Unit]
+# limiter and the unit stops — even though the ExecStopPost above still runs
+# `freenet update` for it. Counting (StartLimit) and self-heal (ExecStopPost) are
+# independent: the former bounds a no-fix loop, the latter rescues a boot-crash a
+# newer release fixes. (44 is the internal bundle-update-staged code, never
+# emitted by `freenet network`.)
 SuccessExitStatus=42 43
 # Exit code 43 = another instance is already running on the port.
 # Do NOT restart — the existing instance is healthy.
@@ -456,7 +518,8 @@ WantedBy=multi-user.target
         binary = binary_path.display(),
         log_dir = log_dir.display(),
         username = username,
-        home = home_dir.display()
+        home = home_dir.display(),
+        fast_crash_marker = super::super::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR,
     )
 }
 
@@ -563,28 +626,57 @@ mod tests {
 
     use super::{generate_system_service_file, generate_user_service_file};
 
+    /// Byte offset of the section header line (a line whose trimmed content is
+    /// exactly `[name]`). Matches by LINE, not a naive substring search, so a
+    /// bracketed section name mentioned inside a comment (e.g. "...ignored in
+    /// `[Service]`" inside the `[Unit]` section, #4551) is never mistaken for the
+    /// real section header.
+    fn section_header_offset(unit: &str, name: &str) -> usize {
+        let header = format!("[{name}]");
+        let mut offset = 0usize;
+        for line in unit.split_inclusive('\n') {
+            if line.trim() == header {
+                return offset;
+            }
+            offset += line.len();
+        }
+        panic!("unit must contain a {header} section header line");
+    }
+
+    /// Body of the `[name]` section: everything between that section's header line
+    /// and the next section header line. Header lines are matched by line (a
+    /// comment containing a bracketed name is ignored), so this is robust to
+    /// `[Service]`/`[Unit]` being referenced inside comments.
     fn section<'a>(unit: &'a str, name: &str) -> &'a str {
         let header = format!("[{name}]");
-        let start = unit
-            .find(&header)
-            .unwrap_or_else(|| panic!("unit must contain {header} section"));
-        let content_start = start + header.len();
-        let content = &unit[content_start..];
-        let end = content
-            .find("\n[")
-            .map(|offset| content_start + offset)
-            .unwrap_or(unit.len());
-
-        &unit[content_start..end]
+        let mut offset = 0usize;
+        let mut body_start: Option<usize> = None;
+        for line in unit.split_inclusive('\n') {
+            let trimmed = line.trim();
+            match body_start {
+                None => {
+                    if trimmed == header {
+                        body_start = Some(offset + line.len());
+                    }
+                }
+                Some(start) => {
+                    if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains(' ')
+                    {
+                        return &unit[start..offset];
+                    }
+                }
+            }
+            offset += line.len();
+        }
+        match body_start {
+            Some(start) => &unit[start..],
+            None => panic!("unit must contain {header} section"),
+        }
     }
 
     fn assert_start_limit_directives_are_in_unit_section(unit_name: &str, unit: &str) {
-        let unit_header = unit
-            .find("[Unit]")
-            .unwrap_or_else(|| panic!("{unit_name} unit must contain [Unit]"));
-        let service_header = unit
-            .find("[Service]")
-            .unwrap_or_else(|| panic!("{unit_name} unit must contain [Service]"));
+        let unit_header = section_header_offset(unit, "Unit");
+        let service_header = section_header_offset(unit, "Service");
         let unit_section = section(unit, "Unit");
         let service_section = section(unit, "Service");
 

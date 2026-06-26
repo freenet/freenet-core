@@ -20,8 +20,8 @@ mod message;
 /// Node configuration, implementations and execution (entry points for the binaries).
 mod node;
 pub use node::{
-    EventLoopExitReason, Node, ShutdownHandle, enable_abort_on_fatal_listener_exit, run_local_node,
-    run_network_node,
+    EventLoopExitReason, Node, ShutdownHandle, enable_abort_on_fatal_listener_exit,
+    enable_fast_crash_exit_code, run_local_node, run_network_node,
 };
 
 /// Network operation/transaction state machines.

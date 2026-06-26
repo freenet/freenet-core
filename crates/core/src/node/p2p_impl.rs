@@ -26,25 +26,118 @@ use crate::{
 
 use super::{OpManager, background_task_monitor::BackgroundTaskMonitor};
 
-/// Exit code requested when the network event loop dies on a fatal (non-graceful)
-/// condition (#4549). `42` == `EXIT_CODE_UPDATE_NEEDED` (see
-/// `crates/core/src/bin/commands/auto_update.rs`) and is also hard-coded in the
+/// Exit code requested when a node that had been up for a *healthy* amount of
+/// time (>= [`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`]) dies on a fatal
+/// (non-graceful) listener condition (#4549). `42` == `EXIT_CODE_UPDATE_NEEDED`
+/// (see `crates/core/src/bin/commands/auto_update.rs`) and is matched by the
 /// GENERATED systemd unit template (`crates/core/src/bin/commands/service/linux.rs`,
 /// `[ "$EXIT_STATUS" = "42" ]`). Its `ExecStopPost` hook runs `freenet update`, so a
-/// wedged OLD binary auto-upgrades to a fixed version (the self-heal path that rolls
-/// this fix out), and `Restart=always` (`RestartSec=10`) restarts it.
+/// wedged OLD binary that ran fine for a while auto-upgrades to a fixed version (the
+/// self-heal path that rolls a fix out), and `Restart=always` (`RestartSec=10`)
+/// restarts it.
 ///
-/// The restart loop is bounded by `RestartSec` and is visible (a `CRITICAL` log per
-/// exit + climbing `NRestarts`) — strictly better than the #4549 dark wedge. NOTE:
-/// the unit's `StartLimitBurst`/`StartLimitIntervalSec` are currently emitted in the
-/// `[Service]` section, where systemd ignores them, so they do NOT rate-limit a
-/// repeating wedge today; moving them to `[Unit]` (and then a min-uptime exit-code
-/// guard) is tracked in #4551 and is out of scope for this hotfix.
+/// The unit also lists `42` in `SuccessExitStatus`, so it is treated as a clean exit
+/// and does NOT count toward the `[Unit]`-section `StartLimitBurst`. That is correct
+/// for a long-uptime node (a real fault / update), but it would let a *boot-wedge*
+/// loop restart forever — so a fatal exit that happens too soon after start uses
+/// [`FAST_CRASH_EXIT_CODE`] instead (see [`fatal_listener_exit_code`]).
 ///
 /// Caveat (macOS): the macOS service wrapper treats a non-zero `freenet update`
 /// result (the no-op "already up to date" exit) as a failure and applies restart
 /// backoff. Production gateways are Linux, so this only slows restart on macOS.
 const FATAL_LISTENER_EXIT_CODE: i32 = 42;
+
+/// Exit code for a fatal listener exit that happened too soon after start
+/// (uptime < [`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`]) to be a healthy node hitting
+/// an update / transient fault — i.e. a fast crash or boot-wedge (#4551).
+///
+/// It is deliberately DISTINCT from [`FATAL_LISTENER_EXIT_CODE`] (42) precisely so
+/// the systemd unit's `SuccessExitStatus=42 43` does NOT whitelist it: systemd then
+/// counts each fast-crash restart toward `StartLimitBurst`, so a tight loop trips
+/// the (now correctly `[Unit]`-placed) limiter and the unit is STOPPED instead of
+/// looping every ~10s forever. The boot-crash self-heal is NOT lost: the systemd
+/// unit's `ExecStopPost` runs `freenet update` on exit 42 OR 45, so a boot-crash
+/// that a newer release fixes still upgrades (the `freenet update` child is a
+/// separate process that can succeed even when `freenet network` crashes at
+/// startup). Counting and self-heal are independent.
+///
+/// Emitted ONLY when the binary opted in via [`enable_fast_crash_exit_code`] — which
+/// happens solely under a regenerated Freenet systemd unit that advertises 45 support
+/// (see [`EMIT_FAST_CRASH_EXIT_CODE`]). Under the macOS/Windows in-process run-wrapper
+/// (understands only exit 42; self-heals + bounds via its own backoff/50-cap), an old
+/// or custom systemd unit, or unsupervised, the node keeps emitting 42 so its existing
+/// self-heal is preserved.
+///
+/// NOT `44`: that is `EXIT_CODE_BUNDLE_UPDATE_STAGED`, an internal `freenet update`
+/// code never emitted by `freenet network`.
+const FAST_CRASH_EXIT_CODE: i32 = 45;
+
+/// Minimum uptime for a fatal listener exit to be treated as a "ran healthily,
+/// then died" event eligible for the burst-exempt auto-update self-heal path
+/// (exit [`FATAL_LISTENER_EXIT_CODE`] = 42). A fatal exit BELOW this threshold is
+/// classified as a fast crash / boot-wedge and uses the counted
+/// [`FAST_CRASH_EXIT_CODE`] instead so a tight loop is rate-limited.
+///
+/// 60s is comfortably longer than normal node startup (bind sockets, load
+/// contracts, connect to gateways) yet far below any "ran for a while" duration,
+/// so genuine boot-wedges fall below it while healthy nodes that later die fall
+/// above it. The exact value is not safety-critical: the `StartLimitBurst=5` /
+/// `StartLimitIntervalSec=120` cap only stops a *rapid* loop, and a legitimate
+/// single restart (update, reboot, one-off crash) never approaches 5-in-120s
+/// regardless of which code it used.
+const MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT: Duration = Duration::from_secs(60);
+
+/// Choose the process exit code for a fatal (non-graceful) network-listener exit,
+/// based on how long the node had been up and whether the supervisor understands the
+/// distinct fast-crash code (#4551).
+///
+/// - `fast_crash_enabled` && uptime < [`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`] →
+///   [`FAST_CRASH_EXIT_CODE`] (45): a counted failure, so a tight boot-wedge loop
+///   trips `StartLimitBurst` and the unit stops. The unit's `ExecStopPost` still
+///   runs `freenet update` on 45, so a fixable boot-crash self-heals.
+/// - otherwise → [`FATAL_LISTENER_EXIT_CODE`] (42): burst-exempt, fires the
+///   `freenet update` self-heal hook.
+///
+/// `fast_crash_enabled` comes from [`EMIT_FAST_CRASH_EXIT_CODE`], which the binary
+/// turns on ONLY under a regenerated Freenet systemd unit (the only supervisor that
+/// handles 45). See that flag's docs for why every other supervisor must keep 42.
+///
+/// Extracted as a pure function so the decision can be unit-tested without the
+/// surrounding `process::exit` (per `.claude/rules/deployment.md`).
+fn fatal_listener_exit_code(uptime: Duration, fast_crash_enabled: bool) -> i32 {
+    if fast_crash_enabled && uptime < MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT {
+        FAST_CRASH_EXIT_CODE
+    } else {
+        FATAL_LISTENER_EXIT_CODE
+    }
+}
+
+/// When `true`, a sub-[`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`] fatal listener exit
+/// uses the distinct [`FAST_CRASH_EXIT_CODE`] (45) instead of the default
+/// [`FATAL_LISTENER_EXIT_CODE`] (42). Off by default; the binary opts in (via
+/// [`enable_fast_crash_exit_code`]) ONLY when the supervisor is known to understand
+/// exit 45 — i.e. the freshly-generated Freenet systemd unit, detected by the
+/// supervisor marker it sets.
+///
+/// Gating is essential: exit 45 only helps under the regenerated systemd unit, where
+/// `SuccessExitStatus` excludes it (so it counts toward `StartLimitBurst`) and
+/// `ExecStopPost` runs `freenet update` on 42 OR 45 (boot-crash self-heal). Under any
+/// other supervisor, emitting 45 would be a generic failure that LOSES the exit-42
+/// self-heal: the macOS/Windows in-process run-wrapper only knows 42 (it self-heals
+/// and bounds the loop via its own backoff and 50-failure cap); an OLD or custom
+/// systemd unit (e.g. a node auto-updated to this binary but whose unit file was not
+/// regenerated) lacks the 45 handling; an unsupervised run is moot. So the default
+/// (flag off) keeps emitting 42 everywhere.
+static EMIT_FAST_CRASH_EXIT_CODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Opt in to the distinct [`FAST_CRASH_EXIT_CODE`] for fast boot-crashes (#4551).
+/// Call ONLY from the production node entry point, and ONLY after confirming the
+/// supervising systemd unit advertises support for exit 45 (see the entry point's
+/// marker check). See [`EMIT_FAST_CRASH_EXIT_CODE`].
+pub fn enable_fast_crash_exit_code() {
+    EMIT_FAST_CRASH_EXIT_CODE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// When `true`, a fatal (non-graceful) exit of the network event listener aborts
 /// the whole process with [`FATAL_LISTENER_EXIT_CODE`] instead of unwinding through
@@ -463,16 +556,30 @@ impl NodeP2P {
                if !listener_exit_is_graceful(&e)
                    && ABORT_ON_FATAL_LISTENER_EXIT.load(std::sync::atomic::Ordering::Relaxed)
                {
+                   // #4551: pick 42 (burst-exempt, fires the auto-update self-heal
+                   // hook) for a node that ran healthily before dying, vs the counted
+                   // FAST_CRASH_EXIT_CODE for a fast crash / boot-wedge so a tight loop
+                   // trips the unit's StartLimitBurst and is stopped instead of looping.
+                   // The fast-crash code is emitted only when the binary opted in (a
+                   // regenerated systemd unit that handles 45); otherwise 42 is kept so
+                   // an old unit / the mac/Windows run-wrapper still self-heals.
+                   let uptime = start_time.elapsed();
+                   let exit_code = fatal_listener_exit_code(
+                       uptime,
+                       EMIT_FAST_CRASH_EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed),
+                   );
                    eprintln!("CRITICAL: Network event listener exited (fatal): {e}");
                    tracing::error!(
                        error = %e,
-                       exit_code = FATAL_LISTENER_EXIT_CODE,
-                       uptime_secs = start_time.elapsed().as_secs(),
+                       exit_code,
+                       uptime_secs = uptime.as_secs(),
+                       fast_crash = exit_code == FAST_CRASH_EXIT_CODE,
                        "Network event listener exited unexpectedly; forcing immediate process \
-                        exit so the service manager restarts the node promptly and the \
-                        auto-update hook can fire (avoids the wedged-but-alive dark window, #4549)"
+                        exit so the service manager restarts the node promptly and (for a \
+                        long-uptime exit) the auto-update hook can fire (avoids the \
+                        wedged-but-alive dark window, #4549; crash-loop bounding, #4551)"
                    );
-                   std::process::exit(FATAL_LISTENER_EXIT_CODE);
+                   std::process::exit(exit_code);
                }
                eprintln!("CRITICAL: Network event listener exited: {e}");
                tracing::error!("Network event listener exited: {}", e);
@@ -846,10 +953,104 @@ mod tests {
             !ABORT_ON_FATAL_LISTENER_EXIT.load(std::sync::atomic::Ordering::Relaxed),
             "fatal-listener fast-exit must be opt-in (off unless the binary enables it)"
         );
+        // #4551: the distinct fast-crash exit code (45) must ALSO be opt-in — off
+        // unless the binary detects a 45-aware systemd unit. A default-on flip would
+        // emit 45 under the mac/Windows wrapper or an old unit, losing the exit-42
+        // self-heal.
+        assert!(
+            !EMIT_FAST_CRASH_EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed),
+            "fast-crash exit code must be opt-in (off unless the binary enables it)"
+        );
         assert_eq!(
             FATAL_LISTENER_EXIT_CODE, 42,
             "must match EXIT_CODE_UPDATE_NEEDED so the systemd ExecStopPost auto-update \
              hook fires on a wedge"
+        );
+    }
+
+    /// #4551: the fast-crash exit code must be distinct from the update code so the
+    /// systemd unit's `SuccessExitStatus=42 43` does NOT whitelist it — otherwise a
+    /// boot-wedge loop would be treated as a clean exit and never trip
+    /// `StartLimitBurst`. Also pin that it does not collide with the other declared
+    /// exit codes (43 = already-running, 44 = bundle-update-staged).
+    #[test]
+    fn fast_crash_exit_code_is_distinct_and_counted() {
+        assert_eq!(
+            FAST_CRASH_EXIT_CODE, 45,
+            "fast-crash code is 45 (45 must stay OUT of the unit's SuccessExitStatus \
+             so it counts toward StartLimitBurst)"
+        );
+        assert_ne!(
+            FAST_CRASH_EXIT_CODE, FATAL_LISTENER_EXIT_CODE,
+            "a fast crash must NOT reuse the burst-exempt update code 42"
+        );
+        // 43 = EXIT_CODE_ALREADY_RUNNING (RestartPreventExitStatus), 44 =
+        // EXIT_CODE_BUNDLE_UPDATE_STAGED. The fast-crash code must avoid both.
+        assert_ne!(
+            FAST_CRASH_EXIT_CODE, 43,
+            "must not collide with already-running (43)"
+        );
+        assert_ne!(
+            FAST_CRASH_EXIT_CODE, 44,
+            "must not collide with bundle-update-staged (44)"
+        );
+    }
+
+    /// #4551: with fast-crash enabled (a 45-aware systemd unit), a fatal listener exit
+    /// that happens *soon* after start is a fast crash / boot-wedge — it must use the
+    /// counted [`FAST_CRASH_EXIT_CODE`] so a tight loop trips the limiter. An exit after
+    /// a *healthy* uptime keeps the burst-exempt update code 42 so a real fault/update
+    /// self-heals and is never rate-limited.
+    #[test]
+    fn fatal_listener_exit_code_distinguishes_fast_crash_from_healthy_uptime() {
+        // Fast crash / boot-wedge: well under the healthy-uptime threshold.
+        for secs in [0u64, 1, 10, 30, 59] {
+            assert_eq!(
+                fatal_listener_exit_code(Duration::from_secs(secs), true),
+                FAST_CRASH_EXIT_CODE,
+                "with fast-crash enabled, a fatal exit after only {secs}s uptime is a \
+                 fast crash → counted code"
+            );
+        }
+        // Boundary: exactly the threshold counts as healthy (>= is update-exit).
+        assert_eq!(
+            fatal_listener_exit_code(MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT, true),
+            FATAL_LISTENER_EXIT_CODE,
+            "uptime exactly at the threshold is treated as a healthy-then-died exit"
+        );
+        // Healthy uptime: the node ran for a while before dying.
+        for secs in [60u64, 120, 3600, 86_400] {
+            assert_eq!(
+                fatal_listener_exit_code(Duration::from_secs(secs), true),
+                FATAL_LISTENER_EXIT_CODE,
+                "a fatal exit after {secs}s uptime keeps the burst-exempt update code"
+            );
+        }
+    }
+
+    /// #4551 (Codex P2): the fast-crash exit code 45 is meaningful ONLY under a
+    /// regenerated systemd unit that handles it (fast-crash DISABLED otherwise). Under
+    /// the macOS/Windows run-wrapper, an OLD/custom systemd unit (e.g. a node
+    /// auto-updated to this binary but not reinstalled), or unsupervised, the node must
+    /// keep emitting 42 — those supervisors self-heal on 42 (and the wrapper bounds the
+    /// loop with its own backoff + 50-failure cap), whereas a 45 is a generic crash that
+    /// loses the self-heal. So when fast-crash is disabled, every uptime — including a
+    /// fast boot-crash — must map to [`FATAL_LISTENER_EXIT_CODE`] (42).
+    #[test]
+    fn fatal_listener_exit_code_uses_update_code_when_fast_crash_disabled() {
+        for secs in [0u64, 1, 10, 30, 59, 60, 120, 3600, 86_400] {
+            assert_eq!(
+                fatal_listener_exit_code(Duration::from_secs(secs), false),
+                FATAL_LISTENER_EXIT_CODE,
+                "with fast-crash disabled, a fatal exit after {secs}s must keep exit 42 \
+                 (an old unit / the run-wrapper only understands 42); 45 would lose the \
+                 self-heal"
+            );
+        }
+        // The boundary value is also the update code when fast-crash is disabled.
+        assert_eq!(
+            fatal_listener_exit_code(MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT, false),
+            FATAL_LISTENER_EXIT_CODE,
         );
     }
 

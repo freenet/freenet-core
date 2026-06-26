@@ -241,6 +241,18 @@ async fn run_network_node_with_signals(
     // in teardown that leaves the node network-dead and spinning.
     freenet::enable_abort_on_fatal_listener_exit();
 
+    // #4551: only emit the distinct fast-crash exit code (45) for a sub-60s fatal
+    // exit when the supervising unit actually understands it. The regenerated Freenet
+    // systemd unit advertises that via SYSTEMD_FAST_CRASH_ENV_VAR (it keeps 45 out of
+    // SuccessExitStatus, sets StartLimitAction=none, and runs `freenet update` on 42
+    // OR 45). A node running this binary under an OLD/custom systemd unit (auto-updated
+    // but not reinstalled), under the macOS/Windows run-wrapper (knows only 42), or
+    // unsupervised must keep exiting 42 so its existing exit-42 self-heal/limiting
+    // still works — so the marker, not a broad systemd heuristic, is the gate.
+    if std::env::var_os(commands::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR).is_some() {
+        freenet::enable_fast_crash_exit_code();
+    }
+
     // Set up SIGTERM handler for Unix systems
     #[cfg(unix)]
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
