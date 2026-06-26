@@ -452,6 +452,61 @@ jobs:
           echo "=== SHA256 Checksums ==="
           cat SHA256SUMS.txt
 
+      - name: Sign SHA256SUMS.txt (ed25519)
+        # Produce a detached raw ed25519 signature over the exact bytes of
+        # SHA256SUMS.txt. The auto-update client (crates/core/.../update.rs)
+        # verifies this against a baked-in public key before trusting any hash
+        # in the manifest, which is what makes the checksum gate meaningful.
+        env:
+          # PEM-encoded ed25519 private key. Repo secret, available to this
+          # (non-fork) workflow. NOTE: the enclosing `attach-to-release` job
+          # only runs on tag pushes (see its `if:`), so this step runs as part
+          # of a real release, not on a plain workflow_dispatch. The separate
+          # `verify-signing-key` job covers the workflow_dispatch dry-run.
+          FREENET_RELEASE_SIGNING_KEY: ${{ secrets.FREENET_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          # An empty manifest means the checksum step matched no assets — a
+          # broken release. Signing it would produce a valid signature over
+          # nothing, so refuse here rather than ship a meaningless signature.
+          if [ ! -s SHA256SUMS.txt ]; then
+            echo "::error::SHA256SUMS.txt is missing or empty; refusing to sign."
+            exit 1
+          fi
+          if [ -z "${FREENET_RELEASE_SIGNING_KEY:-}" ]; then
+            # Degrade gracefully: clients tolerate an absent signature during
+            # the two-release transition (REQUIRE_RELEASE_SIGNATURE=false), so
+            # a missing secret must not fail the whole release. The upload step
+            # deletes any stale .sig so the release stays consistently unsigned.
+            echo "::warning::FREENET_RELEASE_SIGNING_KEY not set; release will be UNSIGNED."
+            exit 0
+          fi
+
+          # Write the key to a 0600 temp PEM and remove it on every exit path.
+          # Never echo the key (no set -x, no echo "$KEY"): it is only ever
+          # redirected into the file and passed to openssl by path.
+          KEY_FILE="$(mktemp)"
+          chmod 600 "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s\n' "$FREENET_RELEASE_SIGNING_KEY" > "$KEY_FILE"
+
+          # Raw ed25519 sign (-rawin: message is signed as-is; ed25519 hashes
+          # internally). Produces a 64-byte detached signature. Needs openssl
+          # >= 3.0, which ubuntu-latest provides.
+          openssl pkeyutl -sign -inkey "$KEY_FILE" -rawin \
+            -in SHA256SUMS.txt -out SHA256SUMS.txt.sig
+
+          # Shred the key immediately (belt-and-braces alongside the trap).
+          shred -u "$KEY_FILE" 2>/dev/null || rm -f "$KEY_FILE"
+          trap - EXIT
+
+          SIG_SIZE=$(wc -c < SHA256SUMS.txt.sig)
+          echo "Wrote SHA256SUMS.txt.sig (${SIG_SIZE} bytes)"
+          if [ "$SIG_SIZE" -ne 64 ]; then
+            echo "::error::Expected a 64-byte raw ed25519 signature, got ${SIG_SIZE} bytes"
+            exit 1
+          fi
+
       - name: Upload binaries to release
         env:
           # Coalesce on RELEASE_PAT so the `gh release edit --draft=false`
@@ -472,6 +527,19 @@ jobs:
             [ -f "$f" ] && ASSETS="$ASSETS $f"
           done
           ASSETS="$ASSETS SHA256SUMS.txt"
+          # Attach the detached signature when the signing step produced one
+          # (absent only if FREENET_RELEASE_SIGNING_KEY was unset).
+          if [ -f SHA256SUMS.txt.sig ]; then
+            ASSETS="$ASSETS SHA256SUMS.txt.sig"
+          else
+            # No signature this run. `--clobber` only replaces the assets we
+            # list, so a stale SHA256SUMS.txt.sig from a prior signed run for
+            # this tag would survive and be verified against the (possibly
+            # changed) manifest — making the release uninstallable instead of
+            # gracefully unsigned. Proactively delete any leftover signature.
+            gh release delete-asset "$TAG_NAME" SHA256SUMS.txt.sig \
+              --repo ${{ github.repository }} --yes 2>/dev/null || true
+          fi
 
           # Upload all available archives and checksums to the release
           gh release upload "$TAG_NAME" $ASSETS \
@@ -485,3 +553,59 @@ jobs:
             --repo ${{ github.repository }} \
             --draft=false
           echo "✅ Release $TAG_NAME published with all binaries attached"
+
+  verify-signing-key:
+    name: Verify release signing key (dry-run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Manual dry-run only: confirm the CI signing secret works AND matches the
+    # public key baked into the binary BEFORE relying on it for a real release.
+    # Runs nothing on normal pushes/tags (the real signing happens in
+    # attach-to-release); produces no release assets / side effects.
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Sign/verify round-trip and confirm the key matches the baked-in pubkey
+        env:
+          FREENET_RELEASE_SIGNING_KEY: ${{ secrets.FREENET_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FREENET_RELEASE_SIGNING_KEY:-}" ]; then
+            echo "::error::FREENET_RELEASE_SIGNING_KEY not set; cannot dry-run signing."
+            exit 1
+          fi
+
+          # The public key the auto-update binary verifies against
+          # (crates/core/src/bin/commands/update.rs FREENET_RELEASE_PUBKEY).
+          EXPECTED_PUBKEY_HEX="eb2986604e34a3f985279a7e70852f3764d3347fe82074d92b1e4bc6336f8664"
+
+          KEY_FILE="$(mktemp)"
+          chmod 600 "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s\n' "$FREENET_RELEASE_SIGNING_KEY" > "$KEY_FILE"
+
+          # Derive the raw 32-byte public key from the private key: the ed25519
+          # DER SubjectPublicKeyInfo is a fixed 12-byte prefix + the 32-byte key.
+          ACTUAL_PUBKEY_HEX="$(openssl pkey -in "$KEY_FILE" -pubout -outform DER \
+            | tail -c 32 | od -An -v -tx1 | tr -d ' \n')"
+          echo "Derived public key:  $ACTUAL_PUBKEY_HEX"
+          echo "Baked-in public key: $EXPECTED_PUBKEY_HEX"
+          if [ "$ACTUAL_PUBKEY_HEX" != "$EXPECTED_PUBKEY_HEX" ]; then
+            echo "::error::Signing key does NOT match the public key baked into the binary; \
+              every client would reject releases signed with this key."
+            exit 1
+          fi
+
+          # Full round-trip with the exact command the release uses.
+          printf 'dry-run release manifest\n' > sample.txt
+          openssl pkeyutl -sign -inkey "$KEY_FILE" -rawin -in sample.txt -out sample.sig
+          SIG_SIZE=$(wc -c < sample.sig)
+          if [ "$SIG_SIZE" -ne 64 ]; then
+            echo "::error::Expected a 64-byte raw ed25519 signature, got ${SIG_SIZE} bytes"
+            exit 1
+          fi
+          openssl pkey -in "$KEY_FILE" -pubout -out pub.pem
+          openssl pkeyutl -verify -pubin -inkey pub.pem -rawin -in sample.txt -sigfile sample.sig
+
+          shred -u "$KEY_FILE" 2>/dev/null || rm -f "$KEY_FILE"
+          trap - EXIT
+          echo "✅ Signing key matches the baked-in public key; sign/verify round-trip OK."

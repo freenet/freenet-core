@@ -63,6 +63,12 @@ a `::warning::` annotation telling you what to fix.
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
 | `RELEASE_AGENT_HMAC_VEGA` | gateway-update.yml | vega update fails (HTTP 401). |
+| `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | Releases are UNSIGNED (no `SHA256SUMS.txt.sig` attached). Clients accept unsigned releases during the transition window (`REQUIRE_RELEASE_SIGNATURE = false`), but once that flag is flipped to `true` in a future release, unsigned releases are REFUSED by the auto-updater. PEM-encoded ed25519 private key whose public half is baked into the updater (`update.rs` `FREENET_RELEASE_PUBKEY`). |
+
+To validate `FREENET_RELEASE_SIGNING_KEY` without cutting a release, run the
+`Build and Cross-Compile` workflow via `workflow_dispatch`: its
+`verify-signing-key` job derives the public key from the secret, asserts it
+matches the key baked into the binary, and does a sign/verify round-trip.
 
 `RELEASE_PAT` is a personal access token with `repo` (Contents, Pull
 requests, Metadata) and `workflow` scopes. See AGENTS.md → "Release Workflow
