@@ -151,6 +151,16 @@ pub enum UpdateCheckResult {
     /// Checked GitHub, newer version confirmed.
     /// The caller should clear the version mismatch flag.
     UpdateAvailable(String),
+    /// The newer version on GitHub is pinned known-bad on this node by a prior
+    /// crash-loop rollback (#4073). Distinct from [`Skipped`] so the caller does
+    /// NOT fall through to the legacy "max-backoff + 0 connections -> exit 42"
+    /// fallback: there is nothing safe to update to, so the node must stay put.
+    /// The caller should CLEAR the driving signal (version-mismatch / urgent) so
+    /// it stops trying to exit for this update; the signal re-arms on the next
+    /// peer handshake, which will pick up a later, strictly-newer fix.
+    ///
+    /// [`Skipped`]: UpdateCheckResult::Skipped
+    PinnedKnownBad,
 }
 
 /// Check if an update is available, respecting rate limits and failure counts.
@@ -254,8 +264,13 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                         "Newer version is pinned known-bad after a crash-loop rollback; not \
                          triggering auto-update to it (#4073)"
                     );
-                    increase_backoff();
-                    return UpdateCheckResult::Skipped;
+                    // Distinct result (NOT Skipped) so the caller clears the
+                    // driving signal and does not fall through to the legacy
+                    // max-backoff exit-42 fallback. Reset the GitHub-check
+                    // backoff so a later fix (a version newer than the pin) is
+                    // still noticed promptly once peers re-signal.
+                    reset_backoff();
+                    return UpdateCheckResult::PinnedKnownBad;
                 }
                 tracing::info!(
                     current = %current_version,
