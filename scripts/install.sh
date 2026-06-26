@@ -455,7 +455,7 @@ setup_service() {
                 fi
                 info "Setting up a system service (running as \$SUDO_USER=$SUDO_USER)..."
                 if "$bin" service install --system; then
-                    print_service_success "system"
+                    print_service_success "system" "$bin"
                 else
                     warn "System service installation failed."
                     warn_unsupervised "$bin"
@@ -464,7 +464,7 @@ setup_service() {
             fi
             info "Setting up a system service (requires sudo)..."
             if sudo "$bin" service install --system; then
-                print_service_success "system"
+                print_service_success "system" "$bin"
             elif has_system_unit; then
                 # We picked "system" to REFRESH an existing system unit, but the
                 # sudo refresh failed (e.g. no passwordless sudo in a scripted
@@ -479,7 +479,7 @@ setup_service() {
             else
                 warn "System service install via sudo failed; falling back to a user service."
                 if "$bin" service install; then
-                    print_service_success "user"
+                    print_service_success "user" "$bin"
                 else
                     warn "User service installation failed."
                     warn_unsupervised "$bin"
@@ -489,7 +489,7 @@ setup_service() {
         user)
             info "Setting up a user service (with lingering, so it runs when logged out)..."
             if "$bin" service install; then
-                print_service_success "user"
+                print_service_success "user" "$bin"
             else
                 warn "User service installation failed."
                 warn_unsupervised "$bin"
@@ -498,11 +498,18 @@ setup_service() {
     esac
 }
 
-# Print the post-install success blurb. "$1" = "system" or "user".
+# Print the post-install success blurb.
+#   $1 = "system" or "user"
+#   $2 = absolute path to the installed freenet binary
+# The system start command uses the ABSOLUTE binary path: it runs under sudo,
+# whose secure_path typically excludes ~/.local/bin, so a bare `sudo freenet`
+# would fail with "command not found".
 print_service_success() {
+    bin=$2
     echo ""
     if [ "$1" = "system" ]; then
-        success "System service installed! Start it with: sudo freenet service start --system"
+        success "System service installed! Start it with: sudo $bin service start --system"
+        echo "  (equivalently: sudo systemctl start freenet)"
     else
         success "Service installed! Start it with: freenet service start"
     fi
