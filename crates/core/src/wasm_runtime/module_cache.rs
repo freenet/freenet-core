@@ -2383,6 +2383,73 @@ mod tests {
         assert_eq!(m.snapshot().migration_admission_would_change_total, 2);
     }
 
+    /// The on-demand interest-shadow refresher (the headline Arc-cycle fix):
+    /// installed on `ModuleCacheMetrics` capturing a `Weak<Mutex<ModuleCache>>`,
+    /// mirroring `RuntimePool::new`. Exercises BOTH halves of the
+    /// "fresh-snapshot-on-emit" mechanism without a `RuntimePool`:
+    ///
+    /// 1. **Cache alive:** flip interest with NO cache mutation, then
+    ///    `refresh_interest_shadow_now()` → the gauges reflect the flip (the
+    ///    end-to-end "every emitted snapshot is fresh on an idle cache" claim).
+    /// 2. **Cache dropped:** drop the owning `Arc`, then
+    ///    `refresh_interest_shadow_now()` → the `Weak::upgrade` fails, so it is a
+    ///    safe NO-OP (no panic) — proving the refresher holds only a `Weak` and
+    ///    cannot keep the cache/runtime alive (the reference-cycle fix).
+    #[test]
+    fn metrics_refresher_weak_handle_is_fresh_when_alive_and_noop_when_dropped() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        interested.lock().unwrap().insert(0u64);
+
+        // Hand-build the shared cache exactly as RuntimePool::new does.
+        let cache = Arc::new(std::sync::Mutex::new(
+            ModuleCache::<u64, ()>::with_interest_for_test(
+                1_000_000,
+                "contract",
+                Some(metrics.clone()),
+                interest_over(interested.clone()),
+                false,
+            ),
+        ));
+        cache.lock().unwrap().insert(0, (), 100); // interested
+        cache.lock().unwrap().insert(1, (), 250); // cold
+        cache.lock().unwrap().force_refresh_interest_shadow();
+        assert_eq!(metrics.snapshot().contract_interested_bytes, 100);
+
+        // Install the refresher capturing a WEAK handle (mirrors pool.rs).
+        let weak = Arc::downgrade(&cache);
+        metrics.set_interest_shadow_refresher(Arc::new(move || {
+            if let Some(c) = weak.upgrade() {
+                if let Ok(mut c) = c.lock() {
+                    c.force_refresh_interest_shadow();
+                }
+            }
+        }));
+
+        // (1) Cache alive: flip interest with NO cache mutation, then refresh via
+        // the metrics hook → gauges reflect the flip.
+        interested.lock().unwrap().remove(&0);
+        assert_eq!(
+            metrics.snapshot().contract_interested_bytes,
+            100,
+            "stale until the on-demand refresh runs"
+        );
+        metrics.refresh_interest_shadow_now();
+        let s = metrics.snapshot();
+        assert_eq!(
+            s.contract_interested_bytes, 0,
+            "on-demand refresh makes the emitted snapshot fresh on an idle cache"
+        );
+        assert_eq!(s.contract_cold_evictable_bytes, 350);
+
+        // (2) Cache dropped: the Weak no longer upgrades → refresh is a safe
+        // no-op and must NOT panic (the Arc-cycle fix: refresher holds only Weak).
+        drop(cache);
+        metrics.refresh_interest_shadow_now(); // must not panic
+        // Gauges retain their last value; the call simply did nothing.
+        assert_eq!(metrics.snapshot().contract_interested_bytes, 0);
+    }
+
     /// The interest shadow gauges track interest flips that happen with NO cache
     /// mutation (a client disconnect / lease expiry), picked up on the next
     /// `get` via the throttled refresh — addressing the Codex review finding that
