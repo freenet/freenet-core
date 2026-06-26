@@ -2,12 +2,25 @@
 # Freenet installer script
 # Usage: curl -fsSL https://freenet.org/install.sh | sh
 #
-# This script installs Freenet to ~/.local/bin/ and optionally sets up
-# the system service.
+# This script installs Freenet to ~/.local/bin/ and sets up a supervised
+# service so the node auto-updates.
+#
+# A *supervised* install registers a service manager (systemd on Linux,
+# launchd on macOS) that catches the node's "update needed" exit (code 42)
+# and runs `freenet update`. An UNSUPERVISED node detects a new release,
+# exits to update, and never restarts on the new version - so it silently
+# stops updating. This installer therefore sets up supervision by DEFAULT.
+#
+# On Linux it prefers a system service when it can elevate (root or sudo) -
+# most reliable on the servers/VPS that dominate the node population - and
+# otherwise installs a user service WITH lingering enabled (so it still runs
+# when nobody is logged in). It only leaves a node unsupervised when you
+# explicitly opt out.
 #
 # Options (via environment variables):
 #   FREENET_INSTALL_DIR  - Installation directory (default: ~/.local/bin)
-#   FREENET_NO_SERVICE   - Set to 1 to skip service installation prompt
+#   FREENET_NO_SERVICE   - Set to 1 to install WITHOUT a service. The node
+#                          will NOT auto-update until you set one up.
 #   FREENET_VERSION      - Specific version to install (default: latest)
 #
 # NOTE: This file is mirrored at hugo-site/static/install.sh in
@@ -256,6 +269,180 @@ print_path_instructions() {
     echo ""
 }
 
+# ── Service supervision helpers ───────────────────────────────────────────
+#
+# A supervised install lets the node auto-update (the service manager catches
+# exit code 42 and runs `freenet update`). These helpers decide WHAT kind of
+# supervised service to set up. The pure decision functions
+# (`decide_linux_service_mode`, `resolve_service_action`) delegate every
+# environment probe to small overridable helpers so the test suite
+# (scripts/test-install-sh.sh) can exercise the logic without real root/sudo.
+
+# True if running as uid 0.
+is_root() {
+    [ "$(id -u 2>/dev/null)" = "0" ]
+}
+
+# True if sudo can run WITHOUT an interactive password prompt.
+sudo_noninteractive_ok() {
+    has_cmd sudo && sudo -n true 2>/dev/null
+}
+
+# True if a system-wide systemd unit already exists.
+has_system_unit() {
+    [ -f /etc/systemd/system/freenet.service ]
+}
+
+# True if a user systemd unit already exists for the invoking user.
+has_user_unit() {
+    [ -f "${HOME:-}/.config/systemd/user/freenet.service" ]
+}
+
+# Decide whether a fresh supervised Linux install should be a system service
+# or a user service. Pure function of two booleans so it is unit-testable.
+#   $1 = am_root     ("1"/"0")
+#   $2 = can_elevate ("1"/"0" - root, or sudo available)
+# Echoes "system" or "user". A system service is preferred whenever we can
+# elevate (it runs at boot, survives logout, and is the most reliable choice
+# on headless servers); otherwise we fall back to a user service (which the
+# binary sets up with lingering enabled).
+decide_linux_service_mode() {
+    if [ "$1" = "1" ] || [ "$2" = "1" ]; then
+        echo "system"
+    else
+        echo "user"
+    fi
+}
+
+# Resolve the effective Linux service action, honoring any existing install so
+# a re-run refreshes it instead of creating a duplicate of the other type.
+#   $1 = interactive ("1"/"0")
+# Echoes "system" or "user".
+resolve_service_action() {
+    interactive=$1
+
+    # Existing install wins: refresh the same kind we already have.
+    if has_system_unit; then
+        echo "system"
+        return
+    fi
+    if has_user_unit; then
+        echo "user"
+        return
+    fi
+
+    am_root=0
+    if is_root; then
+        am_root=1
+    fi
+
+    can_elevate=0
+    if [ "$am_root" = "1" ]; then
+        can_elevate=1
+    elif sudo_noninteractive_ok; then
+        can_elevate=1
+    elif [ "$interactive" = "1" ] && has_cmd sudo; then
+        # An interactive run can prompt for the sudo password.
+        can_elevate=1
+    fi
+
+    decide_linux_service_mode "$am_root" "$can_elevate"
+}
+
+# Loud warning printed whenever a node is left unsupervised.
+warn_unsupervised() {
+    bin=$1
+    echo ""
+    warn "Freenet is installed but NOT running under a service manager."
+    warn "An unsupervised node detects new releases, exits to update, and does"
+    warn "NOT restart on the new version - so it silently STOPS auto-updating."
+    echo ""
+    echo "To set up auto-updating supervision later, run ONE of:"
+    echo "  sudo $bin service install --system   # system service (best on servers)"
+    echo "  $bin service install                 # user service (enables lingering)"
+    echo ""
+}
+
+# Install a supervised service for the freenet binary "$1", choosing system vs
+# user (Linux) and falling back to an unsupervised install with a loud warning
+# only as a last resort. "$2" = interactive ("1"/"0").
+setup_service() {
+    bin=$1
+    interactive=$2
+
+    if [ "$os" = "macos" ]; then
+        # launchd user agent; no system/lingering distinction on macOS.
+        info "Setting up the Freenet service (launchd user agent)..."
+        if "$bin" service install; then
+            success "Service installed. Start it with: freenet service start"
+            echo "  Once running, open http://127.0.0.1:7509/ to view your dashboard."
+        else
+            warn "Service installation failed."
+            warn_unsupervised "$bin"
+        fi
+        return
+    fi
+
+    # Linux.
+    action=$(resolve_service_action "$interactive")
+    case "$action" in
+        system)
+            if is_root; then
+                # `curl ... | sudo sh` sets SUDO_USER, which the binary uses as
+                # the non-root service user; a pure-root login has no such user
+                # and the binary refuses to run the node as root.
+                if [ -z "${SUDO_USER:-}" ]; then
+                    warn "Running as root with no SUDO_USER set: the service must"
+                    warn "run as a non-root user. Re-run the installer as that user"
+                    warn "(e.g. 'sudo -u <user> sh install.sh') for a supervised setup."
+                    warn_unsupervised "$bin"
+                    return
+                fi
+                info "Setting up a system service (running as \$SUDO_USER=$SUDO_USER)..."
+                if "$bin" service install --system; then
+                    print_service_success "system"
+                else
+                    warn "System service installation failed."
+                    warn_unsupervised "$bin"
+                fi
+                return
+            fi
+            info "Setting up a system service (requires sudo)..."
+            if sudo "$bin" service install --system; then
+                print_service_success "system"
+            else
+                warn "System service install via sudo failed; falling back to a user service."
+                if "$bin" service install; then
+                    print_service_success "user"
+                else
+                    warn "User service installation failed."
+                    warn_unsupervised "$bin"
+                fi
+            fi
+            ;;
+        user)
+            info "Setting up a user service (with lingering, so it runs when logged out)..."
+            if "$bin" service install; then
+                print_service_success "user"
+            else
+                warn "User service installation failed."
+                warn_unsupervised "$bin"
+            fi
+            ;;
+    esac
+}
+
+# Print the post-install success blurb. "$1" = "system" or "user".
+print_service_success() {
+    echo ""
+    if [ "$1" = "system" ]; then
+        success "System service installed! Start it with: sudo freenet service start --system"
+    else
+        success "Service installed! Start it with: freenet service start"
+    fi
+    echo "  Once running, open http://127.0.0.1:7509/ to view your Freenet dashboard."
+}
+
 # Main installation logic
 main() {
     info "Freenet Installer"
@@ -417,67 +604,89 @@ main() {
         print_path_instructions "$install_dir"
     fi
 
-    # Ask about service installation (unless FREENET_NO_SERVICE is set).
+    # Set up a supervised service so the node auto-updates, UNLESS the user
+    # opted out with FREENET_NO_SERVICE=1. Supervision is the default because
+    # an unsupervised node silently stops updating (it exits to update and
+    # never restarts on the new version).
     #
     # When the script is piped via `curl ... | sh`, sh reads its own script
-    # source from stdin. A plain `read` at this point would consume bytes
-    # of script source instead of capturing the user's answer, so we
-    # redirect from /dev/tty in that case.
+    # source from stdin. A plain `read` would consume bytes of script source
+    # instead of the user's answer, so we redirect from /dev/tty in that case.
     #
-    # We detect "sh is reading the script from stdin" via $0: when sh runs
-    # a script file, $0 is the script path; when sh reads its source from
-    # stdin, $0 is the shell name itself (e.g. "sh", "bash"). In the
-    # script-file case we read from stdin as before, so existing
-    # automation patterns like `printf 'y\n' | sh install.sh` still work.
-    # The shell-name allowlist covers shells likely to appear as
-    # `curl ... | <shell>`; users piping to a more exotic shell can fall
-    # back to FREENET_NO_SERVICE=1 to bypass the prompt.
+    # We detect "sh is reading the script from stdin" via $0: when sh runs a
+    # script file, $0 is the script path; when sh reads its source from stdin,
+    # $0 is the shell name itself (e.g. "sh", "bash"). In the script-file case
+    # we read from stdin as before, so automation like
+    # `printf 'n\n' | sh install.sh` still works. The shell-name allowlist
+    # covers shells likely to appear as `curl ... | <shell>`.
     #
     # `{ true </dev/tty; } 2>/dev/null` is used instead of `[ -r /dev/tty ]`:
-    # the access check can succeed even when the process has no
-    # controlling terminal and the subsequent open(2) fails with ENXIO.
-    # Probe by actually opening /dev/tty.
+    # the access check can succeed even when the process has no controlling
+    # terminal and the subsequent open(2) fails with ENXIO. Probe by actually
+    # opening /dev/tty.
     #
-    # `read -r response || response=""` keeps EOF (e.g. Ctrl-D, closed
-    # stdin) from aborting the script under `set -eu`.
-    if [ "${FREENET_NO_SERVICE:-0}" != "1" ]; then
+    # `read -r response || response=""` keeps EOF (e.g. Ctrl-D, closed stdin)
+    # from aborting the script under `set -eu`.
+    if [ "${FREENET_NO_SERVICE:-0}" = "1" ]; then
+        info "FREENET_NO_SERVICE is set: installing without a service."
+        warn_unsupervised "$install_dir/freenet"
+    else
         echo ""
-        response=""
+        # answer_src: where to read the y/n answer from ("tty", "stdin", or ""
+        # for none). has_tty: whether a real terminal exists, used to decide
+        # whether an interactive sudo password prompt is possible.
+        answer_src=""
+        has_tty=0
         case "${0##*/}" in
             sh|bash|dash|ash|zsh|ksh|mksh|pdksh|yash|busybox|-sh|-bash|-dash|-ash|-zsh|-ksh|-mksh|-yash)
-                # Script source is on stdin (`curl | sh` form).
+                # `curl | sh` form: the script source is on stdin, so the only
+                # place an answer can come from is the controlling terminal.
                 if { true </dev/tty; } 2>/dev/null; then
-                    printf "Would you like to install Freenet as a system service? [y/N] "
-                    read -r response </dev/tty || response=""
+                    answer_src="tty"
+                    has_tty=1
                 fi
                 ;;
             *)
-                # Script ran as a file; stdin carries the user's answer.
-                printf "Would you like to install Freenet as a system service? [y/N] "
+                # Script ran as a file: stdin carries the answer (a terminal OR
+                # a pipe), preserving automation like
+                # `printf 'n\n' | sh install.sh`. An empty/EOF read keeps the
+                # supervised default.
+                answer_src="stdin"
+                if [ -t 0 ]; then
+                    has_tty=1
+                fi
+                ;;
+        esac
+
+        decline=0
+        if [ -n "$answer_src" ]; then
+            # Default is YES (supervision) - note the [Y/n].
+            printf "Set up Freenet to run as an auto-updating background service? [Y/n] "
+            response=""
+            if [ "$answer_src" = "tty" ]; then
+                read -r response </dev/tty || response=""
+            else
                 read -r response || response=""
-                ;;
-        esac
-        case "$response" in
-            [yY]|[yY][eE][sS])
-                info "Installing service..."
-                "$install_dir/freenet" service install
-                echo ""
-                success "Service installed! Start it with: freenet service start"
-                echo "  Once running, open http://127.0.0.1:7509/ to view your Freenet dashboard."
-                ;;
-            *)
-                info "Skipping service installation"
-                echo ""
-                echo "You can install the service later with:"
-                echo "  freenet service install"
-                echo ""
-                echo "To skip this prompt entirely in scripted installs, set FREENET_NO_SERVICE=1."
-                ;;
-        esac
+            fi
+            case "$response" in
+                [nN]|[nN][oO]) decline=1 ;;
+                *) decline=0 ;;
+            esac
+        else
+            info "No interactive terminal detected; setting up supervision by default."
+            info "(set FREENET_NO_SERVICE=1 to install without a service)"
+        fi
+
+        if [ "$decline" = "1" ]; then
+            info "Skipping service installation at your request."
+            warn_unsupervised "$install_dir/freenet"
+        else
+            setup_service "$install_dir/freenet" "$has_tty"
+        fi
     fi
 
     echo ""
-    echo "To run Freenet manually:"
+    echo "To run Freenet manually instead:"
     echo "  freenet network"
     echo ""
     echo "Once running, open http://127.0.0.1:7509/ to view your Freenet dashboard."
@@ -494,5 +703,9 @@ main() {
     echo "For more information, visit: https://freenet.org"
 }
 
-# Run main function
-main "$@"
+# Run main function, unless this file is being sourced by the test suite
+# (scripts/test-install-sh.sh sets FREENET_INSTALL_SH_LIB=1) purely to load
+# the helper functions for unit testing without performing an install.
+if [ "${FREENET_INSTALL_SH_LIB:-0}" != "1" ]; then
+    main "$@"
+fi
