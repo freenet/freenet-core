@@ -1109,8 +1109,12 @@ fn read_total_ram_bytes() -> Option<usize> {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // SAFETY: sysconf is a pure read of a system constant; no pointers.
+        // SAFETY: `sysconf` is an FFI call that is always sound to invoke with
+        // a valid name constant. It takes no pointers, has no preconditions for
+        // these names, and returns the value or -1 on error (handled by the
+        // `> 0` checks below).
         let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        // SAFETY: same FFI contract as the `_SC_PHYS_PAGES` call above.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if pages > 0 && page_size > 0 {
             (pages as usize).checked_mul(page_size as usize)

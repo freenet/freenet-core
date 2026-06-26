@@ -5534,6 +5534,7 @@ mod k_closest_source_tests {
     ///     else it wrongly classifies a node as root in cold-start / low-degree
     ///     topologies and suppresses a renewal that would in fact route to the
     ///     closer (not-ready) peer.
+    ///
     /// This pin fails the build if the mapping silently drifts from that intent.
     #[test]
     fn is_subscription_root_routability_matches_k_closest_eligibility() {
