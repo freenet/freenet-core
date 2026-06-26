@@ -3861,8 +3861,9 @@ mod tests {
     /// - `Ok(false)` => the request was REJECTED with an error message,
     ///   and asserts the error decodes to an `OperationError` (the rate-limit
     ///   rejection variant),
-    /// and confirms forward/reject is consistent with whether anything landed
-    /// on the request channel.
+    ///   and confirms forward/reject is consistent with whether anything landed
+    ///   on the request channel.
+    ///
     /// Drive a GET op (the common case for most rate-limit tests).
     async fn drive_one_op(
         user_context: Option<&UserSecretContext>,
