@@ -253,6 +253,25 @@ async fn run_network_node_with_signals(
         freenet::enable_fast_crash_exit_code();
     }
 
+    // #4073 crash-loop auto-rollback: once this (possibly freshly auto-updated)
+    // node has run healthily for the commit window, clear any post-update
+    // probation marker so ordinary later crashes never trigger a rollback. The
+    // window mirrors MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT — a node that survives
+    // it has cleared the same fast-crash boundary. Fire-and-forget: if the node
+    // crashes before the window elapses, the task dies with the process and the
+    // probation marker stays armed (so the supervisor's post-stop `freenet
+    // update` can count the crash and eventually roll back).
+    let commit_probation_task = {
+        let version = build_info::VERSION.to_string();
+        GlobalExecutor::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                commands::rollback::COMMIT_HEALTHY_UPTIME_SECS,
+            ))
+            .await;
+            commands::rollback::commit_probation(&version);
+        })
+    };
+
     // Set up SIGTERM handler for Unix systems
     #[cfg(unix)]
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -378,13 +397,24 @@ async fn run_network_node_with_signals(
             "Startup update check against GitHub"
         );
         if let Some(new_version) = startup_update_check(build_info::VERSION).await {
-            tracing::info!(
-                new_version = %new_version,
-                "Startup check: newer version on GitHub, triggering auto-update"
-            );
-            #[allow(clippy::let_underscore_must_use)]
-            let _ = update_tx.send(new_version);
-            return;
+            // #4073: don't auto-update to a version pinned known-bad on this
+            // node by a prior crash-loop rollback (the installer would refuse it
+            // anyway; this avoids a needless restart).
+            if commands::rollback::is_version_pinned_bad(&new_version) {
+                tracing::warn!(
+                    new_version = %new_version,
+                    "Startup check: newer version is pinned known-bad after a crash-loop rollback; \
+                     not triggering auto-update (#4073)"
+                );
+            } else {
+                tracing::info!(
+                    new_version = %new_version,
+                    "Startup check: newer version on GitHub, triggering auto-update"
+                );
+                #[allow(clippy::let_underscore_must_use)]
+                let _ = update_tx.send(new_version);
+                return;
+            }
         }
         tracing::debug!("Startup update check: no newer version found");
 
@@ -589,6 +619,7 @@ async fn run_network_node_with_signals(
     // Clean up tasks
     signal_task.abort();
     update_check_task.abort();
+    commit_probation_task.abort();
     #[cfg(all(unix, feature = "jemalloc-prof"))]
     heap_dump_task.abort();
 

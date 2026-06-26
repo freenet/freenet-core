@@ -586,12 +586,30 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
 /// #3934 (which was also the root cause of "Check for Updates" being
 /// broken in #3933). Null stdio is harmless on macOS/Linux because
 /// `--quiet` already suppresses all output.
-pub(super) fn spawn_update_command(exe_path: &Path) -> std::io::Result<std::process::ExitStatus> {
+///
+/// `post_stop_exit_code` is `Some(code)` ONLY when this update runs as part of
+/// the node's restart cycle (the node exited `code` and the wrapper is applying
+/// the update before relaunching). In that case the node's exit code is passed
+/// through [`POST_STOP_EXIT_CODE_ENV_VAR`] so `freenet update` can drive
+/// crash-loop auto-rollback (#4073). It MUST be `None` for tray / manual
+/// "Check for Updates" invocations, which are not crashes and must never be
+/// counted toward a rollback.
+pub(super) fn spawn_update_command(
+    exe_path: &Path,
+    post_stop_exit_code: Option<i32>,
+) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new(exe_path);
     cmd.args(["update", "--quiet"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+
+    if let Some(code) = post_stop_exit_code {
+        cmd.env(
+            super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR,
+            code.to_string(),
+        );
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -887,7 +905,8 @@ fn run_wrapper_loop(
                             // wrapper so the tray shows the correct new version.
                             // Exit 2 means already up to date — no restart needed.
                             status_tx.send(WrapperStatus::Updating).ok();
-                            let result = spawn_update_command(&exe_path);
+                            // Manual tray check: not a crash, so no post-stop code.
+                            let result = spawn_update_command(&exe_path, None);
                             match result {
                                 Ok(s) if s.success() => {
                                     log_wrapper_event(
@@ -977,7 +996,8 @@ fn run_wrapper_loop(
                             super::super::tray::TrayAction::CheckUpdate => {
                                 // Allow checking for updates even while stopped
                                 status_tx.send(WrapperStatus::Updating).ok();
-                                let result = spawn_update_command(&exe_path);
+                                // Manual tray check: not a crash, so no post-stop code.
+                                let result = spawn_update_command(&exe_path, None);
                                 match result {
                                     Ok(s) if s.success() => {
                                         log_wrapper_event(
@@ -1049,7 +1069,9 @@ fn run_wrapper_loop(
                 status_tx.send(WrapperStatus::Updating).ok();
             }
 
-            let result = spawn_update_command(&exe_path);
+            // Post-stop auto-update: pass the node's exit code so `freenet
+            // update` can drive crash-loop auto-rollback (#4073).
+            let result = spawn_update_command(&exe_path, Some(exit_code));
             let outcome = super::super::update::classify_update_subprocess(&result);
 
             // Drive the persistent auto-update failure counter used by
@@ -1230,7 +1252,9 @@ fn run_wrapper_loop(
                             #[cfg(any(target_os = "windows", target_os = "macos"))]
                             if let Some((_, status_tx)) = tray {
                                 status_tx.send(WrapperStatus::Updating).ok();
-                                let result = spawn_update_command(&exe_path);
+                                // Manual "Check for Updates" during backoff: not
+                                // a crash, so no post-stop code (#4073).
+                                let result = spawn_update_command(&exe_path, None);
                                 let outcome =
                                     super::super::update::classify_update_subprocess(&result);
 

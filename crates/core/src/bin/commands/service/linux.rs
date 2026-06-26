@@ -352,7 +352,11 @@ TimeoutStopSec=45
 # the unit stops. A `case` (not `&&`/`||`) avoids shell-precedence pitfalls.
 # $$EXIT_STATUS is doubled so systemd passes a literal $EXIT_STATUS through to sh
 # (systemd itself sets it in the ExecStopPost environment).
-ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 42|45) {binary} update --quiet ;; esac'
+# {post_stop_env} carries the node's exit status into `freenet update` so the
+# crash-loop auto-rollback (#4073) can tell a post-stop restart from a manual
+# update and count crashes of a probationary version. An OLD binary (e.g. one we
+# rolled back TO) simply ignores the unknown env var.
+ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 42|45) {post_stop_env}="$$EXIT_STATUS" {binary} update --quiet ;; esac'
 # Exit 42 (auto-update) and 43 (another instance) are clean exits, so they are
 # not counted as failures — without this, rapid update cycles (exit 42 →
 # ExecStopPost → restart) could exhaust the burst limit and kill the service.
@@ -397,6 +401,7 @@ WantedBy=default.target
         binary = binary_path.display(),
         log_dir = log_dir.display(),
         fast_crash_marker = super::super::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR,
+        post_stop_env = super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR,
     )
 }
 
@@ -473,7 +478,11 @@ TimeoutStopSec=45
 # the unit stops. A `case` (not `&&`/`||`) avoids shell-precedence pitfalls.
 # $$EXIT_STATUS is doubled so systemd passes a literal $EXIT_STATUS through to sh
 # (systemd itself sets it in the ExecStopPost environment).
-ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 42|45) {binary} update --quiet ;; esac'
+# {post_stop_env} carries the node's exit status into `freenet update` so the
+# crash-loop auto-rollback (#4073) can tell a post-stop restart from a manual
+# update and count crashes of a probationary version. An OLD binary (e.g. one we
+# rolled back TO) simply ignores the unknown env var.
+ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 42|45) {post_stop_env}="$$EXIT_STATUS" {binary} update --quiet ;; esac'
 # Exit 42 (auto-update) and 43 (another instance) are clean exits, so they are
 # not counted as failures — without this, rapid update cycles (exit 42 →
 # ExecStopPost → restart) could exhaust the burst limit and kill the service.
@@ -520,6 +529,7 @@ WantedBy=multi-user.target
         username = username,
         home = home_dir.display(),
         fast_crash_marker = super::super::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR,
+        post_stop_env = super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR,
     )
 }
 
@@ -742,5 +752,36 @@ mod tests {
 
         assert!(user_unit.contains("SuccessExitStatus=42"));
         assert!(system_unit.contains("SuccessExitStatus=42"));
+    }
+
+    #[test]
+    fn systemd_units_pass_node_exit_code_to_post_stop_update() {
+        // #4073 crash-loop auto-rollback: ExecStopPost must forward the node's
+        // exit status to `freenet update` (via the env var) so the updater can
+        // distinguish a post-stop restart from a manual update and count
+        // probation crashes. The env assignment must sit on the ExecStopPost
+        // line, which only fires on exit 42|45.
+        let env = super::super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR;
+        // systemd escapes `$$` to a literal `$`, so the generated unit carries
+        // `$$EXIT_STATUS`.
+        let expected = format!("42|45) {env}=\"$$EXIT_STATUS\"");
+        let user_unit = generate_user_service_file(
+            Path::new("/usr/local/bin/freenet"),
+            Path::new("/home/test/.local/state/freenet"),
+        );
+        let system_unit = generate_system_service_file(
+            Path::new("/usr/local/bin/freenet"),
+            Path::new("/home/test/.local/state/freenet"),
+            "testuser",
+            Path::new("/home/test"),
+        );
+        assert!(
+            user_unit.contains(&expected),
+            "user unit must pass {env} to the ExecStopPost update (#4073)"
+        );
+        assert!(
+            system_unit.contains(&expected),
+            "system unit must pass {env} to the ExecStopPost update (#4073)"
+        );
     }
 }

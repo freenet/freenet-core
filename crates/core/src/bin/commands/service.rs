@@ -3268,6 +3268,53 @@ echo "RC=$?"
         }
     }
 
+    /// #4073 crash-loop auto-rollback (cross-platform source-scrape pins).
+    ///
+    /// The supervisor → updater handoff that drives rollback is platform-gated
+    /// (systemd unit / macOS shell wrapper / in-process wrapper), so these
+    /// pins assert the wiring exists in the source on every CI platform rather
+    /// than only where the cfg'd code compiles.
+    #[test]
+    fn macos_wrapper_passes_node_exit_code_to_post_stop_update() {
+        let src = include_str!("service/macos.rs");
+        // The wrapper script must run `freenet update` with the node's exit code
+        // exported (only on the exit-42 update/crash branch), and bind the env
+        // name from the rollback module's constant.
+        assert!(
+            src.contains("{post_stop_env}=$EXIT_CODE \"{binary}\" update --quiet"),
+            "macOS wrapper must pass the node exit code to its post-stop \
+             `freenet update` for crash-loop auto-rollback (#4073)"
+        );
+        assert!(
+            src.contains("post_stop_env = super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR"),
+            "macOS wrapper must source the post-stop env var name from the \
+             rollback module so the two cannot drift (#4073)"
+        );
+    }
+
+    #[test]
+    fn in_process_wrapper_only_passes_exit_code_on_post_crash_update() {
+        let src = include_str!("service/wrapper.rs");
+        // The post-crash auto-update path passes the node's exit code.
+        assert!(
+            src.contains("spawn_update_command(&exe_path, Some(exit_code))"),
+            "the wrapper's post-stop auto-update must pass Some(exit_code) so \
+             `freenet update` can drive crash-loop auto-rollback (#4073)"
+        );
+        // Manual / tray "Check for Updates" paths must NOT pass an exit code —
+        // they are not crashes and must never be counted toward a rollback.
+        assert!(
+            src.contains("spawn_update_command(&exe_path, None)"),
+            "manual tray update paths must pass None so they are not counted as \
+             probation crashes (#4073)"
+        );
+        assert!(
+            src.contains("POST_STOP_EXIT_CODE_ENV_VAR"),
+            "spawn_update_command must set the post-stop env var from the \
+             rollback module constant (#4073)"
+        );
+    }
+
     /// Source-level regression pin for the `FreeConsole()` rule, mirroring
     /// `spawn_update_command_must_null_all_three_standard_handles`.
     ///

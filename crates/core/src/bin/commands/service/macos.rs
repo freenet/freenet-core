@@ -298,7 +298,10 @@ while true; do
 
     if [ $EXIT_CODE -eq 42 ]; then
         log_event "Update needed, running freenet update..."
-        if "{binary}" update --quiet; then
+        # Pass the node's exit code so crash-loop auto-rollback (#4073) can tell
+        # a post-stop restart from a manual update and count crashes of a
+        # probationary version.
+        if {post_stop_env}=$EXIT_CODE "{binary}" update --quiet; then
             log_event "Update successful, restarting..."
             CONSECUTIVE_FAILURES=0
             PORT_CONFLICT_KILLS=0
@@ -355,6 +358,7 @@ done
 "#,
         binary = binary_path.display(),
         supervised_env = super::super::auto_update::SUPERVISED_ENV_VAR,
+        post_stop_env = super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR,
     )
 }
 

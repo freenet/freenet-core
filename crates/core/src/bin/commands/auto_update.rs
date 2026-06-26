@@ -242,6 +242,21 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
             };
 
             if latest_ver > current {
+                // #4073 crash-loop auto-rollback: never trigger an exit-42
+                // update to a version pinned known-bad on this node by a prior
+                // rollback. The installer would refuse it anyway; skipping here
+                // also avoids a pointless restart cycle. The mismatch flag is
+                // kept (Skipped) so a later, strictly-newer fixed release is
+                // still picked up.
+                if super::rollback::is_version_pinned_bad(&latest) {
+                    tracing::warn!(
+                        version = %latest,
+                        "Newer version is pinned known-bad after a crash-loop rollback; not \
+                         triggering auto-update to it (#4073)"
+                    );
+                    increase_backoff();
+                    return UpdateCheckResult::Skipped;
+                }
                 tracing::info!(
                     current = %current_version,
                     latest = %latest,
@@ -305,7 +320,12 @@ async fn get_latest_version() -> Result<String> {
 }
 
 /// Get the state directory for update tracking files.
-fn state_dir() -> Option<PathBuf> {
+///
+/// `pub(crate)` so the crash-loop auto-rollback module (`commands::rollback`)
+/// persists its probation / known-bad markers in the SAME directory as the
+/// auto-update failure counter and backoff state, ensuring both the node and
+/// the supervisor-invoked `freenet update` agree on a single state location.
+pub(crate) fn state_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".local/state/freenet"))
 }
 
