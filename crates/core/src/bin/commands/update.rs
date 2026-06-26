@@ -197,32 +197,32 @@ impl UpdateCommand {
 
     async fn run_async(&self, current_version: &str) -> Result<()> {
         // #4073 crash-loop auto-rollback. When a supervisor runs `freenet
-        // update` immediately after the node stopped, it sets
-        // POST_STOP_EXIT_CODE_ENV_VAR with the node's exit code. If we are in
-        // post-update probation, treat the stop as a crash of the probationary
-        // version: count it, and roll back to the known-good binary once the
-        // crash threshold is reached — instead of performing a normal update.
-        // This needs no network call, so the crash/rollback path never depends
-        // on GitHub being reachable.
-        if let Some(exit_code) = rollback::post_stop_exit_code_from_env() {
-            match rollback::handle_post_stop(current_version) {
+        // update` immediately after the node stopped, it forwards the node's
+        // stop status (exit code or signal name) via POST_STOP_EXIT_CODE_ENV_VAR.
+        // If that status is a crash and we are in post-update probation, count
+        // it and roll back to the known-good binary once the crash threshold is
+        // reached — instead of performing a normal update. This needs no network
+        // call, so the crash/rollback path never depends on GitHub being
+        // reachable.
+        if let Some(status) = rollback::post_stop_status_from_env() {
+            match rollback::handle_post_stop(&status, current_version) {
                 rollback::PostStopOutcome::Proceed => {
-                    // Not a probation crash (no probation, or a stale marker):
-                    // fall through to the normal update flow below.
+                    // Not a probation crash (clean/voluntary stop, no probation,
+                    // or a stale marker): fall through to the normal update flow.
                 }
                 rollback::PostStopOutcome::CrashRecorded { crash_count } => {
                     // Critical brick-safety signal: emit on stderr even under
                     // --quiet (the supervisor routes it to the journal/log).
                     eprintln!(
                         "Freenet {current_version}: crash {crash_count}/{} during post-update \
-                         probation (node exit {exit_code}); not updating, will auto-roll-back if \
-                         it keeps crashing.",
+                         probation (node stop status {status}); not updating, will auto-roll-back \
+                         if it keeps crashing.",
                         rollback::ROLLBACK_CRASH_THRESHOLD,
                     );
                     tracing::warn!(
                         version = current_version,
                         crash_count,
-                        node_exit_code = exit_code,
+                        node_stop_status = %status,
                         threshold = rollback::ROLLBACK_CRASH_THRESHOLD,
                         "Post-update probation crash recorded (#4073)"
                     );
@@ -499,14 +499,24 @@ impl UpdateCommand {
         // binary as the known-good rollback target BEFORE overwriting it. Only
         // do so when transitioning from a committed/healthy version — if we are
         // already on probation the live binary is the UNPROVEN new version, so
-        // we must preserve the existing known-good snapshot rather than capture
-        // the unproven one. A capture failure (e.g. disk full) does not block
-        // the update; it just means no rollback safety net for this cycle.
-        let known_good_ready = if rollback::read_probation().is_some() {
-            rollback::known_good_binary_path().is_some_and(|p| p.exists())
+        // we must preserve the existing known-good snapshot (and its recorded
+        // size+hash) rather than capture the unproven one. A capture failure
+        // (e.g. disk full) does not block the update; it just means no rollback
+        // safety net for this cycle.
+        let known_good_meta = if let Some(existing) = rollback::read_probation() {
+            // Chained install while still on probation: keep the existing
+            // known-good blob's integrity metadata.
+            if rollback::known_good_binary_path().is_some_and(|p| p.exists()) {
+                Some(rollback::KnownGoodMeta {
+                    size: existing.rollback_size,
+                    sha256: existing.rollback_sha256,
+                })
+            } else {
+                None
+            }
         } else {
             match rollback::capture_known_good(&current_exe) {
-                Ok(()) => true,
+                Ok(meta) => Some(meta),
                 Err(e) => {
                     if !self.quiet {
                         eprintln!(
@@ -515,7 +525,7 @@ impl UpdateCommand {
                         );
                     }
                     tracing::warn!(error = %e, "Failed to capture known-good rollback binary (#4073)");
-                    false
+                    None
                 }
             }
         };
@@ -542,11 +552,12 @@ impl UpdateCommand {
         // Arm crash-loop rollback for the freshly-installed version. Skipped
         // when we have no known-good binary to fall back to, so we never
         // advertise a rollback target we cannot honour.
-        if known_good_ready {
+        if let Some(meta) = known_good_meta {
             rollback::begin_probation(
                 release.tag_name.trim_start_matches('v'),
                 current_version,
                 &current_exe,
+                &meta,
             );
         }
 

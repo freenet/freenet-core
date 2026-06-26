@@ -1055,6 +1055,48 @@ fn run_wrapper_loop(
             .map(|s| s.contains("already in use"))
             .unwrap_or(false);
 
+        // #4073 crash-loop auto-rollback (in-process). The exit-42 path below
+        // handles the voluntary-update code. Here we catch the OTHER non-graceful
+        // crash exits the watchdog never produces — panics (101), signal deaths
+        // (surfaced as exit code 1 here), and early-startup errors (1) — so a
+        // freshly-installed version that crash-loops on one of those still rolls
+        // back. Gated on an existing probation marker so an ordinary crash of a
+        // committed version never spawns an updater subprocess. Forwarding the
+        // exit code lets `freenet update` classify and count the crash locally
+        // (no GitHub call); if it rolled the binary back, re-exec the wrapper so
+        // the restored binary runs.
+        if exit_code != 0
+            && exit_code != WRAPPER_EXIT_ALREADY_RUNNING
+            && exit_code != WRAPPER_EXIT_UPDATE_NEEDED
+            && !is_port_conflict
+            && super::super::rollback::read_probation().is_some()
+        {
+            log_wrapper_event(
+                log_dir,
+                &format!(
+                    "Crash (exit {exit_code}) during update probation; checking crash-loop rollback..."
+                ),
+            );
+            let result = spawn_update_command(&exe_path, Some(exit_code));
+            if matches!(
+                super::super::update::classify_update_subprocess(&result),
+                super::super::update::UpdateSubprocessOutcome::BinaryReplaced
+            ) {
+                log_wrapper_event(
+                    log_dir,
+                    "Crash-loop auto-rollback restored the previous binary; restarting wrapper",
+                );
+                if spawn_new_wrapper(&exe_path, log_dir) {
+                    return Ok(());
+                }
+                // Re-exec failed: relaunch the child with the (now restored)
+                // on-disk binary rather than leaving no node running.
+                continue;
+            }
+            // Crash recorded / rollback unavailable: fall through to the normal
+            // crash backoff via the state machine below.
+        }
+
         // For exit code 42, run the update first and pass result to state machine.
         // On Windows, this works because replace_binary() renames the running exe
         // (freenet.exe → freenet.exe.old) rather than deleting it. Windows allows

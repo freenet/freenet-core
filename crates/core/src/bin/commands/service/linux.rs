@@ -340,23 +340,28 @@ RestartSec=10
 # cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
 TimeoutStopSec=45
 
-# Auto-update / boot-crash self-heal: run `freenet update` before systemd
-# restarts the service when the node exits 42 (a healthy node that hit a version
-# mismatch / fatal fault) OR 45 (a fast crash / boot-wedge, #4551). Firing update
-# on 45 too preserves the #4549 self-heal for a boot-crash that a NEWER release
-# fixes — `freenet update` is a SEPARATE process that can succeed even when
-# `freenet network` crashes at startup. This does NOT exempt 45 from the
-# crash-loop limiter: ExecStopPost runs AFTER the process exits (the '-' prefix
-# means its own result never affects restart) and 45 stays OUT of
-# SuccessExitStatus below, so a no-fix tight loop still trips StartLimitBurst and
-# the unit stops. A `case` (not `&&`/`||`) avoids shell-precedence pitfalls.
-# $$EXIT_STATUS is doubled so systemd passes a literal $EXIT_STATUS through to sh
-# (systemd itself sets it in the ExecStopPost environment).
-# {post_stop_env} carries the node's exit status into `freenet update` so the
-# crash-loop auto-rollback (#4073) can tell a post-stop restart from a manual
-# update and count crashes of a probationary version. An OLD binary (e.g. one we
-# rolled back TO) simply ignores the unknown env var.
-ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 42|45) {post_stop_env}="$$EXIT_STATUS" {binary} update --quiet ;; esac'
+# Auto-update / crash-loop rollback / boot-crash self-heal: run `freenet update`
+# before systemd restarts the service on ANY non-graceful exit — every
+# $EXIT_STATUS except 0 (graceful) and 43 (another instance already running).
+# That covers the voluntary update-needed exit 42, the fast-crash code 45
+# (#4551), AND the crash codes the listener watchdog never produces: panics
+# (101), SIGABRT/SIGKILL/SIGSEGV (134/137/139, which systemd may pass as signal
+# NAMES like ABRT/KILL/SEGV), and early-startup errors (1). `freenet update`
+# then either steps forward (42 / a newer release) or, for a crash of a
+# freshly-installed version still on probation, counts it and — once it keeps
+# crashing — rolls back to the previous binary (#4073). `freenet update` is a
+# SEPARATE process that can succeed even when `freenet network` crashes at
+# startup, preserving the #4549 self-heal.
+# This does NOT exempt crash codes from the limiter: ExecStopPost runs AFTER the
+# process exits (the '-' prefix means its own result never affects restart) and
+# 45 / 1 / 101 / signals stay OUT of SuccessExitStatus below, so a no-fix tight
+# loop still trips StartLimitBurst and the unit stops. A `case` (not `&&`/`||`)
+# avoids shell-precedence pitfalls. $$EXIT_STATUS is doubled so systemd passes a
+# literal $EXIT_STATUS through to sh. {post_stop_env} forwards that status to
+# `freenet update` so #4073 can tell a post-stop restart from a manual update
+# and classify the crash; an OLD binary (e.g. one we rolled back TO) ignores the
+# unknown env var.
+ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 0|43) ;; *) {post_stop_env}="$$EXIT_STATUS" {binary} update --quiet ;; esac'
 # Exit 42 (auto-update) and 43 (another instance) are clean exits, so they are
 # not counted as failures — without this, rapid update cycles (exit 42 →
 # ExecStopPost → restart) could exhaust the burst limit and kill the service.
@@ -466,23 +471,28 @@ RestartSec=10
 # cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
 TimeoutStopSec=45
 
-# Auto-update / boot-crash self-heal: run `freenet update` before systemd
-# restarts the service when the node exits 42 (a healthy node that hit a version
-# mismatch / fatal fault) OR 45 (a fast crash / boot-wedge, #4551). Firing update
-# on 45 too preserves the #4549 self-heal for a boot-crash that a NEWER release
-# fixes — `freenet update` is a SEPARATE process that can succeed even when
-# `freenet network` crashes at startup. This does NOT exempt 45 from the
-# crash-loop limiter: ExecStopPost runs AFTER the process exits (the '-' prefix
-# means its own result never affects restart) and 45 stays OUT of
-# SuccessExitStatus below, so a no-fix tight loop still trips StartLimitBurst and
-# the unit stops. A `case` (not `&&`/`||`) avoids shell-precedence pitfalls.
-# $$EXIT_STATUS is doubled so systemd passes a literal $EXIT_STATUS through to sh
-# (systemd itself sets it in the ExecStopPost environment).
-# {post_stop_env} carries the node's exit status into `freenet update` so the
-# crash-loop auto-rollback (#4073) can tell a post-stop restart from a manual
-# update and count crashes of a probationary version. An OLD binary (e.g. one we
-# rolled back TO) simply ignores the unknown env var.
-ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 42|45) {post_stop_env}="$$EXIT_STATUS" {binary} update --quiet ;; esac'
+# Auto-update / crash-loop rollback / boot-crash self-heal: run `freenet update`
+# before systemd restarts the service on ANY non-graceful exit — every
+# $EXIT_STATUS except 0 (graceful) and 43 (another instance already running).
+# That covers the voluntary update-needed exit 42, the fast-crash code 45
+# (#4551), AND the crash codes the listener watchdog never produces: panics
+# (101), SIGABRT/SIGKILL/SIGSEGV (134/137/139, which systemd may pass as signal
+# NAMES like ABRT/KILL/SEGV), and early-startup errors (1). `freenet update`
+# then either steps forward (42 / a newer release) or, for a crash of a
+# freshly-installed version still on probation, counts it and — once it keeps
+# crashing — rolls back to the previous binary (#4073). `freenet update` is a
+# SEPARATE process that can succeed even when `freenet network` crashes at
+# startup, preserving the #4549 self-heal.
+# This does NOT exempt crash codes from the limiter: ExecStopPost runs AFTER the
+# process exits (the '-' prefix means its own result never affects restart) and
+# 45 / 1 / 101 / signals stay OUT of SuccessExitStatus below, so a no-fix tight
+# loop still trips StartLimitBurst and the unit stops. A `case` (not `&&`/`||`)
+# avoids shell-precedence pitfalls. $$EXIT_STATUS is doubled so systemd passes a
+# literal $EXIT_STATUS through to sh. {post_stop_env} forwards that status to
+# `freenet update` so #4073 can tell a post-stop restart from a manual update
+# and classify the crash; an OLD binary (e.g. one we rolled back TO) ignores the
+# unknown env var.
+ExecStopPost=-/bin/sh -c 'case "$$EXIT_STATUS" in 0|43) ;; *) {post_stop_env}="$$EXIT_STATUS" {binary} update --quiet ;; esac'
 # Exit 42 (auto-update) and 43 (another instance) are clean exits, so they are
 # not counted as failures — without this, rapid update cycles (exit 42 →
 # ExecStopPost → restart) could exhaust the burst limit and kill the service.
@@ -756,15 +766,15 @@ mod tests {
 
     #[test]
     fn systemd_units_pass_node_exit_code_to_post_stop_update() {
-        // #4073 crash-loop auto-rollback: ExecStopPost must forward the node's
-        // exit status to `freenet update` (via the env var) so the updater can
-        // distinguish a post-stop restart from a manual update and count
-        // probation crashes. The env assignment must sit on the ExecStopPost
-        // line, which only fires on exit 42|45.
+        // #4073 crash-loop auto-rollback: ExecStopPost must (a) fire on ANY
+        // non-graceful exit (every status except 0 and 43) so panics / signals /
+        // early errors are covered, and (b) forward the node's stop status to
+        // `freenet update` via the env var so the updater can classify the
+        // crash. systemd escapes `$$` to a literal `$`.
         let env = super::super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR;
-        // systemd escapes `$$` to a literal `$`, so the generated unit carries
-        // `$$EXIT_STATUS`.
-        let expected = format!("42|45) {env}=\"$$EXIT_STATUS\"");
+        // Broadened guard: skip only 0 and 43; run update (with the status
+        // forwarded) for everything else.
+        let expected = format!(r#"case "$$EXIT_STATUS" in 0|43) ;; *) {env}="$$EXIT_STATUS""#);
         let user_unit = generate_user_service_file(
             Path::new("/usr/local/bin/freenet"),
             Path::new("/home/test/.local/state/freenet"),
@@ -775,13 +785,18 @@ mod tests {
             "testuser",
             Path::new("/home/test"),
         );
-        assert!(
-            user_unit.contains(&expected),
-            "user unit must pass {env} to the ExecStopPost update (#4073)"
-        );
-        assert!(
-            system_unit.contains(&expected),
-            "system unit must pass {env} to the ExecStopPost update (#4073)"
-        );
+        for (name, unit) in [("user", &user_unit), ("system", &system_unit)] {
+            assert!(
+                unit.contains(&expected),
+                "{name} unit must fire the post-stop update on any non-graceful exit and \
+                 forward {env} (#4073)"
+            );
+            // Regression guard: the OLD narrow `42|45)` form must be gone.
+            assert!(
+                !unit.contains("42|45)"),
+                "{name} unit still uses the narrow 42|45 ExecStopPost guard, missing \
+                 panic/signal/early-error crashes (#4073 M1)"
+            );
+        }
     }
 }

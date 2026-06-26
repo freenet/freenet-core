@@ -1207,16 +1207,24 @@ mod tests {
             "ExecStopPost must use the doubled $$EXIT_STATUS so systemd passes a \
              literal $EXIT_STATUS to sh (a single-$ revert silently breaks auto-update)"
         );
-        // #4551: ExecStopPost must fire `freenet update` for BOTH exit 42 (healthy
-        // node hit a fault/update) AND exit 45 (fast boot-crash) — firing on 45
-        // preserves the #4549 self-heal for a boot-crash a newer release fixes, while
-        // 45 staying out of SuccessExitStatus still counts it toward StartLimitBurst.
-        // A `case` (not `&&`/`||`) avoids shell-precedence pitfalls.
+        // #4073 / #4551: ExecStopPost must fire `freenet update` for ANY
+        // non-graceful exit — every status except 0 (graceful) and 43 (another
+        // instance) — so it covers the voluntary update-needed 42, the fast-crash
+        // 45, AND the panic/signal/early-error codes the watchdog never produces.
+        // Firing broadly preserves the #4549 self-heal AND enables crash-loop
+        // rollback (#4073); 45 and the crash codes staying out of
+        // SuccessExitStatus still count toward StartLimitBurst. A `case` (not
+        // `&&`/`||`) avoids shell-precedence pitfalls.
         assert!(
-            service_content.contains("case \"$$EXIT_STATUS\" in 42|45)")
+            service_content.contains("case \"$$EXIT_STATUS\" in 0|43) ;; *)")
                 && service_content.contains("update --quiet"),
-            "ExecStopPost must run `freenet update` for exit 42 OR 45 via a case \
-             statement (boot-crash self-heal preserved; #4551)"
+            "ExecStopPost must run `freenet update` for any non-graceful exit via a \
+             case that skips only 0 and 43 (#4073 broadened crash coverage; #4551)"
+        );
+        assert!(
+            !service_content.contains("42|45)"),
+            "ExecStopPost must not use the narrow 42|45 guard — it misses \
+             panic/signal/early-error crashes (#4073 M1)"
         );
         // #4551: the unit must advertise fast-crash (exit-45) support via the marker
         // env var the node gates on. Using the const (not a literal) pins template,
@@ -1309,12 +1317,18 @@ mod tests {
                 && service_content.contains("\"$$EXIT_STATUS\""),
             "ExecStopPost must use the doubled $$EXIT_STATUS (single-$ revert breaks auto-update)"
         );
-        // #4551: ExecStopPost fires `freenet update` for exit 42 OR 45 (system unit too).
+        // #4073 / #4551: ExecStopPost fires `freenet update` for ANY non-graceful
+        // exit (every status except 0 and 43) — system unit too.
         assert!(
-            service_content.contains("case \"$$EXIT_STATUS\" in 42|45)")
+            service_content.contains("case \"$$EXIT_STATUS\" in 0|43) ;; *)")
                 && service_content.contains("update --quiet"),
-            "ExecStopPost must run `freenet update` for exit 42 OR 45 via a case \
-             statement (boot-crash self-heal preserved; #4551)"
+            "ExecStopPost must run `freenet update` for any non-graceful exit via a \
+             case that skips only 0 and 43 (#4073 broadened crash coverage; #4551)"
+        );
+        assert!(
+            !service_content.contains("42|45)"),
+            "ExecStopPost must not use the narrow 42|45 guard — it misses \
+             panic/signal/early-error crashes (#4073 M1)"
         );
         // #4551: system unit must also set the fast-crash (exit-45) support marker.
         assert!(
