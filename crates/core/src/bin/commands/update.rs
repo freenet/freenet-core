@@ -301,7 +301,14 @@ impl UpdateCommand {
 
         let fdev_asset = release.assets.iter().find(|a| a.name == fdev_asset_name);
 
-        // Try to get checksums
+        // Try to download the SHA256SUMS.txt manifest. Checksum
+        // verification is MANDATORY (fail-closed) for the freenet binary
+        // install below — see the `required_checksum` gate. We still model
+        // acquisition as `Option` here so a manifest that is absent OR
+        // failed to download flows into the same single fail-closed gate
+        // (and so the best-effort fdev path can reuse it without aborting
+        // the whole run). Any specific download error is surfaced as a
+        // warning; the actual refusal-to-install happens at the gate.
         let checksums = if let Some(checksums_asset) =
             release.assets.iter().find(|a| a.name == "SHA256SUMS.txt")
         {
@@ -312,20 +319,12 @@ impl UpdateCommand {
                 Ok(c) => Some(c),
                 Err(e) => {
                     if !self.quiet {
-                        eprintln!(
-                            "Warning: Failed to download checksums: {}. Continuing without verification.",
-                            e
-                        );
+                        eprintln!("Warning: Failed to download checksums: {}.", e);
                     }
                     None
                 }
             }
         } else {
-            if !self.quiet {
-                eprintln!(
-                    "Warning: SHA256SUMS.txt not found in release. Continuing without checksum verification."
-                );
-            }
             None
         };
 
@@ -340,19 +339,22 @@ impl UpdateCommand {
         )
         .await?;
 
-        if let Some(checksums) = &checksums {
-            if let Some(expected_hash) = checksums.get(&freenet_asset_name) {
-                if !self.quiet {
-                    println!("Verifying freenet checksum...");
-                }
-                verify_checksum(&freenet_archive_path, expected_hash)?;
-            } else if !self.quiet {
-                eprintln!(
-                    "Warning: Checksum not found for {}. Continuing without verification.",
-                    freenet_asset_name
-                );
-            }
+        // Fail-closed checksum gate. A missing manifest, a missing entry
+        // for our asset, or a hash mismatch all REFUSE the install. This
+        // matches the macOS DMG path (`maybe_perform_bundle_update`), which
+        // already refuses unverified installs. The error propagates out of
+        // `download_and_install` BEFORE the `replace_binary` install step
+        // below — the only site that calls `record_update_failure` — so a
+        // verification failure is classified as a retryable `OtherFailure`
+        // (-> `NoChange`), NOT counted toward the `MAX_UPDATE_FAILURES`
+        // lockout. A transiently-missing manifest therefore retries under
+        // the existing exponential backoff rather than permanently
+        // disabling auto-update.
+        let expected_hash = required_checksum(checksums.as_ref(), &freenet_asset_name)?;
+        if !self.quiet {
+            println!("Verifying freenet checksum...");
         }
+        verify_checksum(&freenet_archive_path, expected_hash)?;
 
         // Use a subdirectory per archive to avoid filename collisions
         let freenet_extract_dir = temp_dir.path().join("freenet");
@@ -523,8 +525,13 @@ impl UpdateCommand {
             return;
         }
 
-        if let Some(checksums) = &checksums {
-            if let Some(expected_hash) = checksums.get(asset_name) {
+        // Fail-closed, like the freenet binary: never install fdev
+        // unverified. Because fdev updates are best-effort (they must never
+        // block the service-file update or restart that follows the freenet
+        // install), a missing/failed checksum here SKIPS the fdev update
+        // rather than aborting the whole run.
+        match required_checksum(checksums.as_ref(), asset_name) {
+            Ok(expected_hash) => {
                 if !self.quiet {
                     println!("Verifying fdev checksum...");
                 }
@@ -537,6 +544,12 @@ impl UpdateCommand {
                     }
                     return;
                 }
+            }
+            Err(e) => {
+                if !self.quiet {
+                    eprintln!("Warning: {} Skipping fdev update.", e);
+                }
+                return;
             }
         }
 
@@ -789,6 +802,34 @@ async fn download_checksums(url: &str) -> Result<Checksums> {
 
     let content = response.text().await.context("Failed to read checksums")?;
     Ok(Checksums::parse(&content))
+}
+
+/// Resolve the expected SHA-256 for a REQUIRED install artifact,
+/// **failing closed**. Returns the hex digest to compare against, or an
+/// error when no trustworthy checksum is available: a missing manifest
+/// (`checksums` is `None`) and a missing entry for `asset_name` both mean
+/// "refuse to install this unverified artifact". This is the single gate
+/// that gives Linux/Windows the same strictness the macOS DMG path already
+/// has (`maybe_perform_bundle_update`).
+///
+/// The returned value is a plain `anyhow::Error`. Callers in the freenet
+/// install path propagate it out of `download_and_install` BEFORE the
+/// `replace_binary` step (the only place that calls `record_update_failure`),
+/// so a refusal is classified as a retryable `OtherFailure` -> `NoChange`
+/// rather than counting toward the `MAX_UPDATE_FAILURES` lockout. A
+/// transiently-missing manifest therefore retries under the existing
+/// exponential backoff instead of permanently disabling auto-update.
+///
+/// Pure (no I/O) so the fail-closed contract is unit-testable on every CI
+/// runner regardless of target OS.
+fn required_checksum<'a>(checksums: Option<&'a Checksums>, asset_name: &str) -> Result<&'a str> {
+    checksums.and_then(|c| c.get(asset_name)).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No SHA256 checksum available for {asset_name}; refusing to install an \
+                 unverified binary. The release must publish a SHA256SUMS.txt that lists \
+                 {asset_name}.",
+        )
+    })
 }
 
 fn verify_checksum(file_path: &Path, expected_hash: &str) -> Result<()> {
@@ -3020,6 +3061,144 @@ done
         assert!(
             SCRIPT.contains("macOS DMG-swap updater"),
             "include_str! resolved to the wrong file"
+        );
+    }
+
+    // ---- Fail-closed checksum verification (auto-update security hardening). ----
+    //
+    // Before this change the Linux/Windows install path was fail-OPEN: a
+    // missing SHA256SUMS.txt, or a manifest with no entry for the asset,
+    // printed "Continuing without checksum verification" and installed the
+    // binary anyway. These tests pin the new fail-CLOSED contract: no
+    // trustworthy checksum -> refuse to install. The macOS DMG path already
+    // had this strictness (`maybe_perform_bundle_update`).
+
+    #[test]
+    fn required_checksum_missing_manifest_is_fail_closed() {
+        // SHA256SUMS.txt absent from the release, or its download failed,
+        // surfaces as `checksums == None`. The gate must refuse rather
+        // than proceed with an unverified binary.
+        let err = required_checksum(None, "freenet-x86_64-unknown-linux-musl.tar.gz")
+            .expect_err("a missing manifest must refuse to install (fail-closed)");
+        assert!(
+            err.to_string().contains("refusing to install"),
+            "error must state the install was refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn required_checksum_missing_entry_is_fail_closed() {
+        // Manifest present, but it lists no entry for our asset -> still
+        // refuse. (The asset could have been published without its hash, or
+        // the manifest could be for a different artifact set.)
+        let manifest = Checksums::parse("abc123  some-other-asset.tar.gz\n");
+        let err = required_checksum(Some(&manifest), "freenet-x86_64-unknown-linux-musl.tar.gz")
+            .expect_err("a missing entry must refuse to install (fail-closed)");
+        assert!(
+            err.to_string().contains("refusing to install"),
+            "error must state the install was refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn required_checksum_present_entry_returns_hash() {
+        // Happy path: a listed entry resolves to its hash so verification
+        // can proceed. Guards against the gate refusing valid installs.
+        let manifest = Checksums::parse(
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  \
+             freenet-x86_64-unknown-linux-musl.tar.gz\n",
+        );
+        assert_eq!(
+            required_checksum(Some(&manifest), "freenet-x86_64-unknown-linux-musl.tar.gz").unwrap(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        );
+    }
+
+    #[test]
+    fn verify_checksum_accepts_match_and_rejects_mismatch() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("artifact.bin");
+        let contents = b"freenet release artifact";
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(contents)
+            .unwrap();
+
+        // Compute the correct digest the same way verify_checksum does.
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(contents);
+        let correct = hasher.finalize().iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write as _;
+            write!(s, "{:02x}", b).unwrap();
+            s
+        });
+
+        verify_checksum(&path, &correct).expect("matching checksum must pass");
+        assert!(
+            verify_checksum(&path, &"0".repeat(64)).is_err(),
+            "a mismatched checksum must refuse (return Err), never silently pass"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checksum_refusal_is_retryable_not_a_lockout() {
+        // A fail-closed checksum refusal returns Err from
+        // `download_and_install` BEFORE `replace_binary`, so
+        // `record_update_failure` is never called and the process exits 1
+        // (anyhow error in `main`). The supervisor classifies exit 1 as
+        // OtherFailure -> NoChange: retry under backoff, NOT a
+        // MAX_UPDATE_FAILURES lockout. This pins the retry-not-lockout
+        // classification for the checksum-refusal path.
+        let exit = Ok(exit_with(1));
+        assert_eq!(
+            classify_update_subprocess(&exit),
+            UpdateSubprocessOutcome::OtherFailure,
+            "a checksum refusal exits 1, which must classify as OtherFailure"
+        );
+        assert_eq!(
+            update_counter_action(UpdateSubprocessOutcome::OtherFailure),
+            UpdateCounterAction::NoChange,
+            "OtherFailure must NOT increment the lockout counter (retry, don't lock out)"
+        );
+    }
+
+    #[test]
+    fn checksum_gate_precedes_install_and_records_no_failure() {
+        // Structural pin for the retry-not-lockout contract that the pure
+        // tests above can't reach. The fail-closed checksum gate
+        // (`required_checksum` + `verify_checksum` on the freenet archive)
+        // MUST run before `replace_binary` — the only site that calls
+        // `record_update_failure` — and no `record_update_failure` may sit
+        // between the gate and the install. If it did, a transiently
+        // missing checksum would count toward MAX_UPDATE_FAILURES and
+        // could permanently disable auto-update (the regression this PR
+        // guards against). The repo uses source-scrape pins like this for
+        // exactly this kind of ordering invariant (see
+        // bug-prevention-patterns.md).
+        const SRC: &str = include_str!("update.rs");
+
+        let gate = SRC
+            .find("required_checksum(checksums.as_ref(), &freenet_asset_name)")
+            .expect("freenet checksum gate must exist in download_and_install");
+        let verify = SRC
+            .find("verify_checksum(&freenet_archive_path")
+            .expect("freenet archive verify_checksum call must exist");
+        let install = SRC
+            .find("replace_binary(&extracted_freenet")
+            .expect("replace_binary install call must exist");
+
+        assert!(
+            gate < verify && verify < install,
+            "checksum gate + verify must precede the replace_binary install"
+        );
+        assert!(
+            !SRC[gate..install].contains("record_update_failure"),
+            "no record_update_failure may run between the checksum gate and \
+             replace_binary — a checksum refusal must stay a retryable \
+             OtherFailure, not a MAX_UPDATE_FAILURES lockout"
         );
     }
 }
