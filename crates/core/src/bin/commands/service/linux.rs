@@ -264,6 +264,11 @@ Description=Freenet Node
 Documentation=https://freenet.org
 After=network-online.target
 Wants=network-online.target
+# Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
+# a stale process). Without this, systemd restarts indefinitely.
+# SuccessExitStatus=42 ensures auto-update exits don't count as failures.
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -302,11 +307,6 @@ ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
-# Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
-# a stale process). Without this, systemd restarts indefinitely.
-# SuccessExitStatus=42 ensures auto-update exits don't count as failures.
-StartLimitBurst=5
-StartLimitIntervalSec=120
 # Allow 45 seconds for graceful shutdown before SIGKILL.
 # The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
 # (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
@@ -373,6 +373,11 @@ Description=Freenet Node
 Documentation=https://freenet.org
 After=network-online.target
 Wants=network-online.target
+# Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
+# a stale process). Without this, systemd restarts indefinitely.
+# SuccessExitStatus=42 ensures auto-update exits don't count as failures.
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -400,11 +405,6 @@ ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
-# Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
-# a stale process). Without this, systemd restarts indefinitely.
-# SuccessExitStatus=42 ensures auto-update exits don't count as failures.
-StartLimitBurst=5
-StartLimitIntervalSec=120
 # Allow 45 seconds for graceful shutdown before SIGKILL.
 # The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
 # (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
@@ -555,4 +555,100 @@ pub(super) fn service_logs(error_only: bool) -> Result<()> {
     };
 
     super::log_utils::tail_with_rotation(&log_dir, base_name)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::path::Path;
+
+    use super::{generate_system_service_file, generate_user_service_file};
+
+    fn section<'a>(unit: &'a str, name: &str) -> &'a str {
+        let header = format!("[{name}]");
+        let start = unit
+            .find(&header)
+            .unwrap_or_else(|| panic!("unit must contain {header} section"));
+        let content_start = start + header.len();
+        let content = &unit[content_start..];
+        let end = content
+            .find("\n[")
+            .map(|offset| content_start + offset)
+            .unwrap_or(unit.len());
+
+        &unit[content_start..end]
+    }
+
+    fn assert_start_limit_directives_are_in_unit_section(unit_name: &str, unit: &str) {
+        let unit_header = unit
+            .find("[Unit]")
+            .unwrap_or_else(|| panic!("{unit_name} unit must contain [Unit]"));
+        let service_header = unit
+            .find("[Service]")
+            .unwrap_or_else(|| panic!("{unit_name} unit must contain [Service]"));
+        let unit_section = section(unit, "Unit");
+        let service_section = section(unit, "Service");
+
+        for directive in ["StartLimitBurst=5", "StartLimitIntervalSec=120"] {
+            let occurrences = unit.lines().filter(|line| line.trim() == directive).count();
+            assert_eq!(
+                occurrences, 1,
+                "{unit_name} unit must emit exactly one {directive}"
+            );
+
+            let directive_offset = unit
+                .find(directive)
+                .unwrap_or_else(|| panic!("{unit_name} unit must contain {directive}"));
+            assert!(
+                directive_offset > unit_header && directive_offset < service_header,
+                "{directive} must appear after [Unit] and before [Service] in {unit_name} unit"
+            );
+            assert!(
+                unit_section.lines().any(|line| line.trim() == directive),
+                "{directive} must be in [Unit] for {unit_name} unit"
+            );
+            assert!(
+                !service_section.lines().any(|line| line.trim() == directive),
+                "{directive} must not be in [Service] for {unit_name} unit"
+            );
+        }
+    }
+
+    #[test]
+    fn user_unit_places_start_limit_directives_in_unit_section() {
+        let unit = generate_user_service_file(
+            Path::new("/usr/local/bin/freenet"),
+            Path::new("/home/test/.local/state/freenet"),
+        );
+
+        assert_start_limit_directives_are_in_unit_section("user", &unit);
+    }
+
+    #[test]
+    fn system_unit_places_start_limit_directives_in_unit_section() {
+        let unit = generate_system_service_file(
+            Path::new("/usr/local/bin/freenet"),
+            Path::new("/home/test/.local/state/freenet"),
+            "testuser",
+            Path::new("/home/test"),
+        );
+
+        assert_start_limit_directives_are_in_unit_section("system", &unit);
+    }
+
+    #[test]
+    fn systemd_units_keep_auto_update_success_exit_status() {
+        let user_unit = generate_user_service_file(
+            Path::new("/usr/local/bin/freenet"),
+            Path::new("/home/test/.local/state/freenet"),
+        );
+        let system_unit = generate_system_service_file(
+            Path::new("/usr/local/bin/freenet"),
+            Path::new("/home/test/.local/state/freenet"),
+            "testuser",
+            Path::new("/home/test"),
+        );
+
+        assert!(user_unit.contains("SuccessExitStatus=42"));
+        assert!(system_unit.contains("SuccessExitStatus=42"));
+    }
 }
