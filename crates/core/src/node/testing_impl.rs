@@ -375,6 +375,13 @@ pub struct ControlledSimulationResult {
     #[cfg(any(test, feature = "testing"))]
     #[allow(dead_code)]
     pub(crate) node_rings: HashMap<NodeLabel, Arc<crate::ring::Ring>>,
+    /// Per-peer subscription-renewal metrics captured at the end of the
+    /// simulation, keyed by socket address. Captured here (before the
+    /// `SimNetwork` is dropped, which clears the registry) so renewal-storm
+    /// tests can read `wire_attempts` / `terminus_satisfied` after the run
+    /// returns. See `crate::ring::topology_registry::RenewalMetrics` (#4440).
+    pub renewal_metrics:
+        HashMap<std::net::SocketAddr, crate::ring::topology_registry::RenewalMetrics>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -391,6 +398,28 @@ impl ControlledSimulationResult {
         self.node_rings
             .get(label)
             .is_some_and(|ring| ring.is_hosting_contract(key))
+    }
+
+    /// Subscription-renewal metrics for the peer at `addr` (captured before the
+    /// `SimNetwork` was dropped). Returns `RenewalMetrics::default()` (all zero)
+    /// if the peer recorded no renewal activity. See #4440.
+    pub fn renewal_metrics_for(
+        &self,
+        addr: &std::net::SocketAddr,
+    ) -> crate::ring::topology_registry::RenewalMetrics {
+        self.renewal_metrics.get(addr).copied().unwrap_or_default()
+    }
+
+    /// Sum of the renewal metrics across every peer in the simulation. See #4440.
+    pub fn aggregate_renewal_metrics(&self) -> crate::ring::topology_registry::RenewalMetrics {
+        self.renewal_metrics.values().fold(
+            crate::ring::topology_registry::RenewalMetrics::default(),
+            |mut acc, m| {
+                acc.wire_attempts += m.wire_attempts;
+                acc.terminus_satisfied += m.terminus_satisfied;
+                acc
+            },
+        )
     }
 }
 
@@ -4236,6 +4265,12 @@ impl SimNetwork {
         // Capture topology snapshots BEFORE self is dropped (which clears them)
         let topology_snapshots = get_all_topology_snapshots(&network_name);
 
+        // Capture renewal metrics BEFORE self is dropped — `SimNetwork::Drop`
+        // calls `clear_renewal_metrics(&self.name)`, so reading the registry
+        // after this function returns would always see an empty map (#4440).
+        let renewal_metrics =
+            crate::ring::topology_registry::get_all_renewal_metrics(&network_name);
+
         // Extract the live Rings captured during the run BEFORE self drops.
         let node_rings: HashMap<NodeLabel, Arc<crate::ring::Ring>> = self
             .shared_rings
@@ -4248,6 +4283,7 @@ impl SimNetwork {
             topology_snapshots,
             node_storages,
             node_rings,
+            renewal_metrics,
         }
     }
 

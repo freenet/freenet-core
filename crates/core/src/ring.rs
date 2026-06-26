@@ -315,6 +315,39 @@ fn classify_op_manager_ref<T>(slot: &RwLock<Option<Weak<T>>>) -> OpManagerState<
     }
 }
 
+/// Pure core of [`Ring::is_subscription_root`]'s neighbor scan: is there NO
+/// connected neighbor that is both *routable* (a renewal could route to it) and
+/// strictly closer to the contract than this node?
+///
+/// `my_distance` is this node's ring distance to the contract. Each neighbor is
+/// `(its location, is it routable)`:
+/// - A neighbor with no known location can't be compared, so it never makes us
+///   "not the root" on distance grounds (it is skipped).
+/// - A non-routable neighbor (transient or not-yet-ready) is skipped, mirroring
+///   the eligibility `k_closest_potentially_hosting` applies — so the predicate
+///   agrees with where a renewal would actually route (#4440).
+///
+/// Returns `true` when no routable neighbor is strictly closer (this node is the
+/// effective terminus), `false` otherwise. Factored out as a pure function so the
+/// distance/eligibility logic has direct unit coverage without a full `Ring`.
+fn no_closer_routable_neighbor(
+    my_distance: Distance,
+    contract_location: Location,
+    neighbors: impl Iterator<Item = (Option<Location>, bool)>,
+) -> bool {
+    for (peer_loc, routable) in neighbors {
+        if !routable {
+            continue;
+        }
+        if let Some(peer_loc) = peer_loc {
+            if peer_loc.distance(contract_location) < my_distance {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Race an `.await` point in a background loop against the Ring shutdown
 /// token. Returns `true` if shutdown fired (the caller should stop its loop)
 /// and `false` if the wrapped future completed first (carry on).
@@ -715,6 +748,12 @@ impl Ring {
         &self,
         instance_id: &ContractInstanceId,
     ) -> Option<ContractKey> {
+        // `hosting_contract_keys()` clones the hosting set and we linear-scan for
+        // the matching instance id. This runs at most once per renewal task
+        // (`SUBSCRIPTION_RECOVERY_INTERVAL` = 30 s, bounded by
+        // `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` per cycle), so the clone+scan is
+        // not on any hot path. A reverse instance-id → key index on the hosting
+        // cache would avoid the clone if this ever becomes per-message.
         let key = self
             .hosting_manager
             .hosting_contract_keys()
@@ -744,16 +783,45 @@ impl Ring {
         let my_distance = my_location.distance(contract_location);
 
         let connections = self.connection_manager.get_connections_by_location();
-        for (_loc, conns) in connections.iter() {
-            for conn in conns {
-                if let Some(peer_loc) = conn.location.location() {
-                    if peer_loc.distance(contract_location) < my_distance {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
+        let neighbors = connections.iter().flat_map(|(_loc, conns)| {
+            conns.iter().map(|conn| {
+                // A peer counts as a "closer routable neighbor" (so I'm NOT the
+                // root) only if a renewal could actually route to it. Match the
+                // ACTUAL eligibility `k_closest_potentially_hosting` applies, and
+                // mind its asymmetry between the two filters:
+                //
+                //  * Transient peers (short-TTL CONNECT-coordination slots) are
+                //    excluded UNCONDITIONALLY by `k_closest` (no fallback,
+                //    ring.rs ~:2401). So a transient closer neighbor is NOT a
+                //    real route target — exclude it here too. Without this, a
+                //    node whose only closer neighbor is transient would fail to
+                //    recognise itself as the terminus, wire-renew, dead-end (the
+                //    transient is excluded by `k_closest`), and storm (#4440).
+                //
+                //  * Not-yet-ready peers are excluded by `k_closest` ONLY when
+                //    ready candidates exist; if there are none it FALLS BACK to
+                //    the not-ready peers (ring.rs ~:2445). So a not-ready closer
+                //    neighbor CAN still be a route target. Treat it as routable
+                //    here (conservative): excluding it would wrongly classify the
+                //    node as the root in early-startup / low-degree topologies and
+                //    suppress a renewal that would in fact route to that closer
+                //    peer, delaying upstream subscription propagation. The cost of
+                //    treating a not-ready peer as routable is at most one extra
+                //    wire renewal (re-evaluated next cycle once it is ready),
+                //    which is strictly safer than suppressing a needed renewal.
+                //
+                // Addressless peers are treated as routable (conservative): they
+                // bypass the addr-keyed filters in `k_closest` too, so a renewal
+                // could still route to one.
+                let routable = match conn.location.socket_addr() {
+                    Some(addr) => !self.connection_manager.is_transient(addr),
+                    None => true,
+                };
+                (conn.location.location(), routable)
+            })
+        });
+
+        no_closer_routable_neighbor(my_distance, contract_location, neighbors)
     }
 
     /// Check if a contract-directed CONNECT is currently in backoff.
@@ -6410,6 +6478,105 @@ mod instant_now_pin_test {
              update EXPECTED_BARE_INSTANT_NOW; if this fired on PRODUCTION code, \
              migrate it to `self.time_source.now()` instead of bumping the count."
         );
+    }
+}
+
+/// Direct unit coverage for the pure core of `is_subscription_root` /
+/// `body_holding_subscription_root_key` (#4440). Building a full `Ring`
+/// fixture is heavyweight (async `Ring::new` spawns background tasks), so the
+/// distance + routability decision is factored into the pure
+/// `no_closer_routable_neighbor` helper and tested here. The hosting-gate and
+/// instance-id resolution are covered end-to-end by the simulation test
+/// `test_subscription_root_renewal_does_not_storm`.
+#[cfg(test)]
+mod subscription_root_predicate_tests {
+    use super::no_closer_routable_neighbor;
+    use crate::ring::location::Location;
+
+    // Contract at 0.50; "me" hosting it at distance 0.05 (I'm at 0.55).
+    const CONTRACT: f64 = 0.50;
+    fn contract_loc() -> Location {
+        Location::new(CONTRACT)
+    }
+    fn my_distance() -> super::Distance {
+        Location::new(0.55).distance(contract_loc())
+    }
+
+    #[test]
+    fn no_neighbors_means_terminus() {
+        // Hosting, closest by default (nobody else) → terminus.
+        assert!(no_closer_routable_neighbor(
+            my_distance(),
+            contract_loc(),
+            std::iter::empty(),
+        ));
+    }
+
+    #[test]
+    fn routable_closer_neighbor_means_not_terminus() {
+        // A ready, non-transient peer AT the key (distance 0) is strictly closer
+        // → I am NOT the terminus.
+        let neighbors = [(Some(Location::new(CONTRACT)), true)];
+        assert!(!no_closer_routable_neighbor(
+            my_distance(),
+            contract_loc(),
+            neighbors.into_iter(),
+        ));
+    }
+
+    #[test]
+    fn farther_routable_neighbor_keeps_terminus() {
+        // A routable peer that is FARTHER from the key than me (at 0.20,
+        // distance 0.30 > my 0.05) doesn't unseat me.
+        let neighbors = [(Some(Location::new(0.20)), true)];
+        assert!(no_closer_routable_neighbor(
+            my_distance(),
+            contract_loc(),
+            neighbors.into_iter(),
+        ));
+    }
+
+    #[test]
+    fn closer_but_non_routable_neighbor_keeps_terminus() {
+        // The ONLY closer neighbor is non-routable (a transient peer, which
+        // `k_closest` excludes unconditionally). A renewal could not route to
+        // it, so I am still the effective terminus — the #4440 false-negative
+        // guard. (Not-ready peers are mapped to routable=true by
+        // `is_subscription_root` because `k_closest` falls back to them, so they
+        // do NOT reach this `routable=false` case — see the mapping there.)
+        let neighbors = [(Some(Location::new(CONTRACT)), false)];
+        assert!(no_closer_routable_neighbor(
+            my_distance(),
+            contract_loc(),
+            neighbors.into_iter(),
+        ));
+    }
+
+    #[test]
+    fn closer_routable_among_non_routable_means_not_terminus() {
+        // Mixed: one closer non-routable peer (ignored) AND one closer routable
+        // peer (decisive) → NOT the terminus.
+        let neighbors = [
+            (Some(Location::new(0.51)), false), // closer but non-routable → skip
+            (Some(Location::new(0.49)), true),  // closer AND routable → unseats
+        ];
+        assert!(!no_closer_routable_neighbor(
+            my_distance(),
+            contract_loc(),
+            neighbors.into_iter(),
+        ));
+    }
+
+    #[test]
+    fn locationless_neighbor_does_not_unseat() {
+        // A routable neighbor with no known location can't be compared on
+        // distance, so it never makes us "not the root" on its own.
+        let neighbors = [(None, true)];
+        assert!(no_closer_routable_neighbor(
+            my_distance(),
+            contract_loc(),
+            neighbors.into_iter(),
+        ));
     }
 }
 

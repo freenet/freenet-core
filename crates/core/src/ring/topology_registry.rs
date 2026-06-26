@@ -239,6 +239,20 @@ pub fn get_renewal_metrics(network_name: &str, peer_addr: &SocketAddr) -> Option
         .map(|r| *r.value())
 }
 
+/// Snapshot all per-peer renewal metrics for a network into an owned map.
+///
+/// Used by `run_controlled_simulation` to capture the metrics BEFORE
+/// `SimNetwork::Drop` clears the registry, mirroring how it captures topology
+/// snapshots — the simulation consumes `self`, so its `Drop` (which calls
+/// [`clear_renewal_metrics`]) runs before control returns to the test.
+pub fn get_all_renewal_metrics(network_name: &str) -> HashMap<SocketAddr, RenewalMetrics> {
+    RENEWAL_METRICS_REGISTRY
+        .iter()
+        .filter(|entry| entry.key().0 == network_name)
+        .map(|entry| (entry.key().1, *entry.value()))
+        .collect()
+}
+
 /// Sum the renewal metrics across all peers in a network.
 pub fn aggregate_renewal_metrics(network_name: &str) -> RenewalMetrics {
     RENEWAL_METRICS_REGISTRY

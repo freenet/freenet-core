@@ -352,30 +352,48 @@ pub(crate) async fn run_renewal_subscribe(
     // `SubscriptionRecoveryGuard::complete(true)` then clears the pending mark
     // and resets the subscription backoff with success semantics.
     //
-    // It DOES refresh the LOCAL `active_subscriptions` lease, even though the
-    // lease has no upstream meaning for a root. This is purely local (extends an
-    // expiry in a local map — no wire traffic) and is what keeps the
-    // root-satisfied path cheap at scale: without it, a root with a client
-    // subscription (or recent local access) whose lease lapsed would be
-    // re-selected by `contracts_needing_renewal()` on EVERY 30s maintenance
-    // cycle (the client-subscription / local-access paths fire whenever there is
-    // no live lease), so it would consume a `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL`
-    // batch slot every cycle and could starve real (non-root) wire renewals that
-    // still need to reach the network. Refreshing the lease moves the root back
-    // onto the normal ~6-minute renewal cadence (lease-expiry path) instead of
-    // every cycle, while still never sending a wire request.
+    // Lease handling — CONDITIONAL on genuine, time-bounded interest:
+    //
+    //   * Root that is `contract_in_use` (has a local client subscription or a
+    //     downstream subscriber — both time-bounded, see `contract_in_use`):
+    //     refresh the LOCAL `active_subscriptions` lease. This is purely local
+    //     (extends an expiry in a local map — no wire traffic) and keeps the
+    //     root-satisfied path cheap at scale. Without it, an in-use root whose
+    //     lease lapsed would be re-selected by `contracts_needing_renewal()` on
+    //     EVERY 30s cycle (the client-subscription / local-access paths fire
+    //     whenever there is no live lease), consuming a
+    //     `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` batch slot every cycle and
+    //     starving real (non-root) wire renewals. Refreshing moves the in-use
+    //     root onto the normal ~6-minute lease-expiry cadence, and because the
+    //     interest signals are time-bounded the lease cannot self-perpetuate
+    //     past the interest.
+    //
+    //   * Root that is NOT `contract_in_use`: DO NOT refresh. Refreshing an
+    //     `is_subscribed`-only lease unconditionally would be an UNBOUNDED
+    //     retention exemption — `contracts_needing_renewal` section 1 renews any
+    //     live active subscription with no interest re-check, so an
+    //     unconditional refresh would re-select a no-interest root forever and
+    //     keep its lease (and thus the contract) alive indefinitely. That is
+    //     exactly the unbounded-`is_subscribed` retention the `contract_in_use`
+    //     rustdoc and the AGENTS.md time-bounded-exemption rule forbid. Letting
+    //     the lease lapse is correct: a no-interest root then drops out of the
+    //     renewal set entirely (no live active sub for path 1; no client
+    //     sub/recent access for paths 2/3), bounded and quiet.
     //
     // This is NOT `complete_local_subscription`, whose semantics differ (it
     // emits `LocalSubscribeComplete` and registers client interest); the
-    // root-satisfied path is deliberately distinct — a bare local lease refresh
-    // plus a clean `Success`.
+    // root-satisfied path is deliberately distinct — a conditional local lease
+    // refresh plus a clean `Success`.
     if let Some(key) = op_manager
         .ring
         .body_holding_subscription_root_key(&instance_id)
     {
-        // Refresh the local lease so the root is not re-selected for renewal
-        // every cycle (see rationale above). Local-only; no wire traffic.
-        op_manager.ring.subscribe(key);
+        // Only refresh the local lease when the root has genuine, time-bounded
+        // interest; otherwise let it lapse so the no-interest root leaves the
+        // renewal set (see rationale above). Local-only; never any wire traffic.
+        if op_manager.ring.contract_in_use(&key) {
+            op_manager.ring.subscribe(key);
+        }
         op_manager.ring.record_renewal_terminus_satisfied();
         // Simulation-test observability (no-op in production — see
         // `topology_registry::record_renewal_terminus_satisfied`).
@@ -387,13 +405,22 @@ pub(crate) async fn run_renewal_subscribe(
             contract = %key,
             phase = "renewal_terminus_satisfied",
             "subscribe renewal: node is the body-holding subscription root; \
-             satisfying renewal locally (lease refreshed, no upstream request) (#4440)"
+             satisfying renewal locally without an upstream request (#4440)"
         );
         return RenewalOutcome::Success;
     }
 
     // Not a body-holding root: renew normally over the wire. Record the
     // wire-attempt for simulation-test observability (no-op in production).
+    //
+    // This counts a renewal *entering the wire-renewal driver*, not a request
+    // confirmed on the wire — it is the upper bound on wire renewals for this
+    // contract this cycle. For an isolated / not-yet-joined node the driver may
+    // bail before sending (e.g. `PeerNotJoined` / no candidates), so the counter
+    // can over-count actual wire sends in those edge cases. That is fine for the
+    // test's purpose: the storm signature is "a body-holding root entering the
+    // wire path at all", and the counter being non-zero for a non-root host is
+    // exactly the stoppage-guard signal the test asserts.
     if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
         crate::ring::topology_registry::record_renewal_wire_attempt(addr);
     }
@@ -2919,12 +2946,21 @@ mod tests {
             before_drive[predicate_at..].contains("record_renewal_terminus_satisfied()"),
             "the root-satisfied path must record the renewal_terminus_satisfied counter"
         );
+        let branch = &before_drive[predicate_at..];
         assert!(
-            before_drive[predicate_at..].contains("op_manager.ring.subscribe(key)"),
-            "the root-satisfied path must refresh the LOCAL lease so the root is not \
-             re-selected for renewal every maintenance cycle (Codex P2): a lapsed lease \
+            branch.contains("op_manager.ring.subscribe(key)"),
+            "the root-satisfied path must be able to refresh the LOCAL lease so an in-use \
+             root is not re-selected for renewal every maintenance cycle: a lapsed lease \
              plus a client subscription / recent local access re-selects the root on every \
              30s cycle and can starve real wire renewals"
+        );
+        assert!(
+            branch.contains("contract_in_use(&key)"),
+            "the local lease refresh MUST be gated on contract_in_use — an unconditional \
+             refresh of an is_subscribed-only lease is an unbounded retention exemption \
+             (contracts_needing_renewal section 1 re-selects any live active sub with no \
+             interest re-check), violating the contract_in_use rustdoc + AGENTS.md \
+             time-bounded-exemption rule"
         );
         // The short-circuit must NOT reuse complete_local_subscription (different
         // semantics — it emits LocalSubscribeComplete and was the wrong vehicle
