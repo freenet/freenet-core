@@ -10852,8 +10852,10 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
 /// `is_renewal` is not recorded on the captured `NetLogMessage` event stream and
 /// the `subscription_renewal_outcome` telemetry is fire-and-forget to a remote
 /// collector, so neither is readable in-sim. Instead the renewal driver publishes
-/// a per-node counter into the simulation-only renewal-metrics registry
-/// (`freenet::dev_tool::{aggregate_renewal_metrics, get_renewal_metrics}`):
+/// a per-node counter into a simulation-only renewal-metrics registry that
+/// `run_controlled_simulation` snapshots before the `SimNetwork` is dropped; the
+/// test reads it via `ControlledSimulationResult::{renewal_metrics_for,
+/// aggregate_renewal_metrics}`:
 ///   - `wire_attempts`: the node sent (or attempted) a wire renewal request —
 ///     the storm signature for a body-holding root, because each such attempt
 ///     dead-ends and is retried.

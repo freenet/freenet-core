@@ -791,17 +791,20 @@ impl Ring {
                 // mind its asymmetry between the two filters:
                 //
                 //  * Transient peers (short-TTL CONNECT-coordination slots) are
-                //    excluded UNCONDITIONALLY by `k_closest` (no fallback,
-                //    ring.rs ~:2401). So a transient closer neighbor is NOT a
-                //    real route target — exclude it here too. Without this, a
-                //    node whose only closer neighbor is transient would fail to
-                //    recognise itself as the terminus, wire-renew, dead-end (the
-                //    transient is excluded by `k_closest`), and storm (#4440).
+                //    excluded UNCONDITIONALLY by `k_closest_potentially_hosting`
+                //    (no fallback — see its `is_transient(addr)` /
+                //    `skipped_transient` branch). So a transient closer neighbor
+                //    is NOT a real route target — exclude it here too. Without
+                //    this, a node whose only closer neighbor is transient would
+                //    fail to recognise itself as the terminus, wire-renew,
+                //    dead-end (the transient is excluded by `k_closest`), and
+                //    storm (#4440).
                 //
                 //  * Not-yet-ready peers are excluded by `k_closest` ONLY when
                 //    ready candidates exist; if there are none it FALLS BACK to
-                //    the not-ready peers (ring.rs ~:2445). So a not-ready closer
-                //    neighbor CAN still be a route target. Treat it as routable
+                //    the not-ready peers (its `not_ready_fallback` path). So a
+                //    not-ready closer neighbor CAN still be a route target. Treat
+                //    it as routable
                 //    here (conservative): excluding it would wrongly classify the
                 //    node as the root in early-startup / low-degree topologies and
                 //    suppress a renewal that would in fact route to that closer
@@ -5515,6 +5518,48 @@ mod k_closest_source_tests {
             body.contains("not_ready_fallback"),
             "k_closest_potentially_hosting must keep the not-yet-ready peer \
              fallback so cold-start nodes don't fail every GET with EmptyRing."
+        );
+    }
+
+    /// #4440: `is_subscription_root`'s routability mapping must stay in sync with
+    /// `k_closest_potentially_hosting`'s eligibility asymmetry, because the
+    /// renewal short-circuit only suppresses a wire renewal when no routable
+    /// neighbor is closer. The two filters differ:
+    ///   * transient peers are excluded UNCONDITIONALLY by k_closest → the root
+    ///     check must call `is_transient(addr)` and treat transient as
+    ///     non-routable, else a node whose only closer neighbor is transient
+    ///     fails to recognise itself as the terminus and storms.
+    ///   * not-ready peers are k_closest's *fallback* when no ready candidate
+    ///     exists → the root check must NOT exclude them (treat as routable),
+    ///     else it wrongly classifies a node as root in cold-start / low-degree
+    ///     topologies and suppresses a renewal that would in fact route to the
+    ///     closer (not-ready) peer.
+    /// This pin fails the build if the mapping silently drifts from that intent.
+    #[test]
+    fn is_subscription_root_routability_matches_k_closest_eligibility() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "fn is_subscription_root(&self, contract_key: &ContractKey) -> bool {",
+        );
+        assert!(
+            body.contains("is_transient(addr)"),
+            "is_subscription_root must call is_transient(addr) when deciding whether a \
+             closer neighbor is routable — k_closest excludes transient peers \
+             unconditionally, so a transient closer neighbor must NOT keep this node \
+             from being the terminus (#4440)."
+        );
+        // The not-ready filter (`is_peer_ready`) must NOT appear in the routability
+        // mapping: k_closest falls back to not-ready peers, so they remain valid
+        // route targets and the root check must treat them as routable. Anchoring on
+        // the absence of `is_peer_ready` guards against a future edit that
+        // "symmetrises" the two filters and reintroduces the false-positive-root bug.
+        assert!(
+            !body.contains("is_peer_ready"),
+            "is_subscription_root must NOT exclude not-ready peers (do not call \
+             is_peer_ready in the routability mapping): k_closest falls back to \
+             not-ready peers, so a not-ready closer neighbor is still a valid route \
+             target and must keep this node from short-circuiting its renewal (#4440)."
         );
     }
 }
