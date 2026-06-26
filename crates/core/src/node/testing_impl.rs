@@ -5304,7 +5304,7 @@ impl Drop for SimNetwork {
     fn drop(&mut self) {
         use crate::node::network_bridge::set_fault_injector;
         use crate::ring::topology_registry::{
-            clear_current_network_name, clear_topology_snapshots,
+            clear_current_network_name, clear_renewal_metrics, clear_topology_snapshots,
         };
         use crate::transport::in_memory_socket::{
             clear_network_address_mappings, remove_network_socket_registry,
@@ -5315,6 +5315,7 @@ impl Drop for SimNetwork {
         set_fault_injector(&self.name, None);
         unregister_network_time_source(&self.name);
         clear_topology_snapshots(&self.name);
+        clear_renewal_metrics(&self.name);
         remove_network_socket_registry(&self.name);
         clear_network_address_mappings(&self.name);
 
