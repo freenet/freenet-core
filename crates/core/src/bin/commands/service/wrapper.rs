@@ -1065,6 +1065,13 @@ fn run_wrapper_loop(
         // exit code lets `freenet update` classify and count the crash locally
         // (no GitHub call); if it rolled the binary back, re-exec the wrapper so
         // the restored binary runs.
+        //
+        // NOTE: intentional, benign difference from the macOS launchd wrapper
+        // script — that script does NOT pre-gate on a probation marker (it can't
+        // cheaply read one from shell), so a committed-version crash there spawns
+        // `freenet update` (which finds no marker -> Proceed). Both are safe; the
+        // in-process gate just avoids an unnecessary subprocess in the common
+        // committed-crash case where we have the marker check in hand.
         if exit_code != 0
             && exit_code != WRAPPER_EXIT_ALREADY_RUNNING
             && exit_code != WRAPPER_EXIT_UPDATE_NEEDED

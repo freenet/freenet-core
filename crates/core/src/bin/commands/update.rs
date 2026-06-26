@@ -495,40 +495,29 @@ impl UpdateCommand {
 
         let current_exe = std::env::current_exe().context("Failed to get current executable")?;
 
-        // #4073 crash-loop auto-rollback: snapshot the about-to-be-replaced
-        // binary as the known-good rollback target BEFORE overwriting it. Only
-        // do so when transitioning from a committed/healthy version — if we are
-        // already on probation the live binary is the UNPROVEN new version, so
-        // we must preserve the existing known-good snapshot (and its recorded
-        // size+hash) rather than capture the unproven one. A capture failure
-        // (e.g. disk full) does not block the update; it just means no rollback
+        // #4073 crash-loop auto-rollback: decide the rollback target BEFORE
+        // overwriting the live binary. `prepare_known_good_for_install` computes
+        // the snapshot blob AND its matching version label together, so they can
+        // never diverge: a genuine chained in-probation install keeps the
+        // existing known-good; anything else (no marker, a stale marker, or an
+        // externally-deleted blob) snapshots the about-to-be-replaced binary
+        // fresh and labels it the version we're replacing. A capture failure
+        // (e.g. disk full) does not block the update — it just means no rollback
         // safety net for this cycle.
-        let chained_in_probation = rollback::read_probation()
-            .filter(|existing| existing.new_version == current_version)
-            .filter(|_| rollback::known_good_binary_path().is_some_and(|p| p.exists()));
-        let known_good_meta = if let Some(existing) = chained_in_probation {
-            // Genuine chained install while still on probation for the version we
-            // are running: keep the existing known-good blob's integrity metadata
-            // (the live binary is the UNPROVEN new version). A marker for any
-            // OTHER version is stale and ignored here — we capture fresh below so
-            // we never roll back to an unrelated older binary.
-            Some(rollback::KnownGoodMeta {
-                size: existing.rollback_size,
-                sha256: existing.rollback_sha256,
-            })
-        } else {
-            match rollback::capture_known_good(&current_exe) {
-                Ok(meta) => Some(meta),
-                Err(e) => {
-                    if !self.quiet {
-                        eprintln!(
-                            "Warning: failed to snapshot known-good binary for crash-loop \
+        let known_good = match rollback::prepare_known_good_for_install(
+            current_version,
+            &current_exe,
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(e) => {
+                if !self.quiet {
+                    eprintln!(
+                        "Warning: failed to snapshot known-good binary for crash-loop \
                              rollback: {e}. Proceeding without rollback protection for this update."
-                        );
-                    }
-                    tracing::warn!(error = %e, "Failed to capture known-good rollback binary (#4073)");
-                    None
+                    );
                 }
+                tracing::warn!(error = %e, "Failed to capture known-good rollback binary (#4073)");
+                None
             }
         };
 
@@ -557,10 +546,10 @@ impl UpdateCommand {
         // probation marker (full/unwritable state dir) does NOT fail the update
         // — the binary is already installed — but it MUST be surfaced, since the
         // new version then has no rollback protection.
-        if let Some(meta) = known_good_meta {
+        if let Some((meta, previous_version)) = known_good {
             if let Err(e) = rollback::begin_probation(
                 release.tag_name.trim_start_matches('v'),
-                current_version,
+                &previous_version,
                 &current_exe,
                 &meta,
             ) {
@@ -1027,6 +1016,12 @@ impl Checksums {
 async fn get_latest_release() -> Result<Release> {
     let client = reqwest::Client::builder()
         .user_agent("freenet-updater")
+        // Bound the request (parity with auto_update::get_latest_version). The
+        // broadened post-stop ExecStopPost reaches this on every committed
+        // crash's Proceed path, so a hung GitHub connection during a crash must
+        // not stall the post-stop updater (only loosely bounded by
+        // TimeoutStopSec on systemd, and worse under the mac/in-process wrapper).
+        .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let response = client

@@ -22,6 +22,17 @@
 //!     (`SEGV`/`KILL`/`ABRT`), both of which classify as a crash,
 //!   * the fast-crash watchdog exit 45 (sub-60s fatal listener exit, #4551).
 //!
+//! DEPLOY WATCH (accepted tradeoff): an OOM-kill (SIGKILL/137) of the
+//! probationary version during the probation window counts toward rollback.
+//! This is intentional — a real memory-regression OOM is exactly the kind of
+//! bad release we want to roll back. But the production peer cap is 2 GB
+//! (`MemoryMax=2G`), so a legitimately memory-heavy-but-fine release could be
+//! OOM-killed on a capped peer and rolled back. After deploying a release that
+//! changes the memory profile, watch the 2 GB-capped peers for rollback churn
+//! and bump the cap (or fix the regression) rather than letting good releases
+//! bounce. The probation window is short (until first 60s-healthy boot), so a
+//! release that survives its first minute on a capped peer is not affected.
+//!
 //! It deliberately does NOT count as a crash:
 //!   * exit 0 (graceful shutdown), 43 (another instance already running),
 //!   * exit 42. On a systemd unit (which sets [`SYSTEMD_FAST_CRASH_ENV_VAR`])
@@ -171,7 +182,8 @@ pub(crate) struct ProbationState {
     pub new_version: String,
     /// The previous, known-good version we would roll back to.
     pub previous_version: String,
-    /// Path to the retained known-good binary blob ([`known_good_binary_path`]).
+    /// Path to the retained known-good binary blob (the `known_good_binary`
+    /// file in the state dir).
     pub rollback_binary: PathBuf,
     /// Path to the live binary to restore over on rollback.
     pub target_binary: PathBuf,
@@ -232,11 +244,6 @@ pub(crate) enum PostStopOutcome {
 
 fn state_dir() -> Option<PathBuf> {
     super::auto_update::state_dir()
-}
-
-/// Path to the retained known-good binary blob, if the state dir resolves.
-pub(crate) fn known_good_binary_path() -> Option<PathBuf> {
-    state_dir().map(|d| d.join(KNOWN_GOOD_BINARY_FILE))
 }
 
 // ── Durable write helpers (S7: atomic marker/pin; S3: fsync) ───────────────
@@ -305,15 +312,9 @@ fn sha256_file(path: &Path) -> Result<(u64, String)> {
 // ── Known-good capture ─────────────────────────────────────────────────────
 
 /// Copy `current_binary` to the known-good snapshot, durably (copy to a temp
-/// sibling, fsync, rename, fsync dir), and return its size + SHA-256. Called
-/// BEFORE the install overwrites the live binary, and ONLY when transitioning
-/// from a committed/healthy version (not while already on probation), so the
-/// snapshot is always a version that previously ran.
-pub(crate) fn capture_known_good(current_binary: &Path) -> Result<KnownGoodMeta> {
-    let dir = state_dir().context("could not resolve state directory")?;
-    capture_known_good_at(&dir, current_binary)
-}
-
+/// sibling, fsync, rename, fsync dir), and return its size + SHA-256. Called by
+/// [`prepare_known_good_for_install_at`] BEFORE the install overwrites the live
+/// binary, so the snapshot is always a version that previously ran.
 pub(crate) fn capture_known_good_at(dir: &Path, current_binary: &Path) -> Result<KnownGoodMeta> {
     use std::io::Write;
     std::fs::create_dir_all(dir).context("failed to create state directory")?;
@@ -342,27 +343,68 @@ pub(crate) fn capture_known_good_at(dir: &Path, current_binary: &Path) -> Result
 
 // ── Probation marker ───────────────────────────────────────────────────────
 
-/// Begin (or refresh) probation for `new_version`, just installed over the live
-/// binary at `target_binary`. `version_being_replaced` is the version of the
-/// binary that was overwritten; `meta` describes the retained known-good blob.
+/// Decide the rollback target for an install and snapshot it if needed,
+/// returning `(known_good_meta, previous_version)` — the integrity metadata of
+/// the rollback blob AND the version label that MUST accompany it.
 ///
-/// Carries the known-good rollback target forward ONLY for a genuine chained
-/// in-probation install — one where the existing marker's `new_version` equals
-/// the version we are now replacing (e.g. a manual `freenet update` run while
-/// still on probation for the running version). In that case the unproven
-/// running binary must NOT become the known-good, so we keep the existing
-/// `previous_version`. A marker for any OTHER version is stale (e.g. left over
-/// by an external/manual install or a rollback that failed to clear it) and is
-/// ignored: `previous_version` becomes `version_being_replaced`, matching the
-/// freshly-captured known-good blob. Clears any known-bad pin, since a
-/// successful forward install means we have moved on.
+/// The blob and the label are computed together here, in one place, so they can
+/// never diverge (the bug this fixes: capturing fresh in one site while
+/// carrying a stale label forward in another, which would later restore the
+/// wrong binary and report the wrong version).
+///
+/// - **Genuine chained in-probation install** — the existing marker is for the
+///   version we are replacing AND the known-good blob is still present: keep the
+///   existing blob (its recorded integrity meta) and carry its
+///   `previous_version` forward. The live binary is the unproven new version, so
+///   it must NOT become the known-good.
+/// - **Otherwise** — no marker, a stale marker for a different version, OR the
+///   blob was externally deleted: snapshot the about-to-be-replaced
+///   `current_binary` fresh and label it `current_version`, so the blob and the
+///   recorded `previous_version` always agree.
+///
+/// `Err` only if a needed fresh capture fails (full/unwritable state dir); the
+/// caller treats that as "no rollback protection this cycle".
+pub(crate) fn prepare_known_good_for_install(
+    current_version: &str,
+    current_binary: &Path,
+) -> Result<(KnownGoodMeta, String)> {
+    let dir = state_dir().context("could not resolve state directory")?;
+    prepare_known_good_for_install_at(&dir, current_version, current_binary)
+}
+
+pub(crate) fn prepare_known_good_for_install_at(
+    dir: &Path,
+    current_version: &str,
+    current_binary: &Path,
+) -> Result<(KnownGoodMeta, String)> {
+    if let Some(existing) = read_probation_at(dir) {
+        if existing.new_version == current_version && dir.join(KNOWN_GOOD_BINARY_FILE).exists() {
+            return Ok((
+                KnownGoodMeta {
+                    size: existing.rollback_size,
+                    sha256: existing.rollback_sha256,
+                },
+                existing.previous_version,
+            ));
+        }
+    }
+    let meta = capture_known_good_at(dir, current_binary)?;
+    Ok((meta, current_version.to_string()))
+}
+
+/// Begin (or refresh) probation for `new_version`, just installed over the live
+/// binary at `target_binary`. `previous_version` and `meta` are the label and
+/// integrity metadata of the rollback target, computed together by
+/// [`prepare_known_good_for_install`] so they cannot diverge. Clears any
+/// known-bad pin, since a successful forward install means we have moved on.
+///
 /// Returns `Err` if the probation marker could not be persisted (full /
 /// unwritable state dir). In that case the update still succeeded but the new
 /// version has NO crash-loop rollback protection, so the caller MUST surface
 /// the error rather than discard it.
 pub(crate) fn begin_probation(
     new_version: &str,
-    version_being_replaced: &str,
+    previous_version: &str,
     target_binary: &Path,
     meta: &KnownGoodMeta,
 ) -> Result<()> {
@@ -370,7 +412,7 @@ pub(crate) fn begin_probation(
         Some(dir) => begin_probation_at(
             dir.as_path(),
             new_version,
-            version_being_replaced,
+            previous_version,
             target_binary,
             meta,
         ),
@@ -383,25 +425,17 @@ pub(crate) fn begin_probation(
 pub(crate) fn begin_probation_at(
     dir: &Path,
     new_version: &str,
-    version_being_replaced: &str,
+    previous_version: &str,
     target_binary: &Path,
     meta: &KnownGoodMeta,
 ) -> Result<()> {
     let _mkdir = std::fs::create_dir_all(dir);
-    let rollback_binary = dir.join(KNOWN_GOOD_BINARY_FILE);
-    // Preserve the known-good baseline ONLY across a genuine chained
-    // in-probation install (existing marker is for the version we're replacing).
-    // A stale marker for any other version is ignored — see the rustdoc.
-    let previous_version = match read_probation_at(dir) {
-        Some(existing) if existing.new_version == version_being_replaced => {
-            existing.previous_version
-        }
-        _ => version_being_replaced.to_string(),
-    };
     let state = ProbationState {
         new_version: new_version.to_string(),
-        previous_version,
-        rollback_binary,
+        // Stored verbatim — the caller (prepare_known_good_for_install) is the
+        // single source of truth for the blob/label pairing.
+        previous_version: previous_version.to_string(),
+        rollback_binary: dir.join(KNOWN_GOOD_BINARY_FILE),
         target_binary: target_binary.to_path_buf(),
         rollback_size: meta.size,
         rollback_sha256: meta.sha256.clone(),
@@ -1100,49 +1134,72 @@ mod tests {
     }
 
     #[test]
-    fn begin_probation_preserves_known_good_across_chained_install() {
+    fn prepare_known_good_preserves_blob_and_label_for_genuine_chained_install() {
+        // Genuine chained install (existing marker is for the running version,
+        // blob present): keep the existing blob and carry its label forward.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        let live = setup_probation(dir, "0.2.84", "0.2.83");
+        setup_probation(dir, "0.2.84", "0.2.83"); // blob = the 0.2.83 (GOOD) binary
+        let blob_before = std::fs::read(known_good_path(dir)).unwrap();
+        let existing = read_probation_at(dir).unwrap();
+        // The running binary is the 0.2.84 (BAD) content from setup_probation.
+        let live = dir.join("bin").join("freenet");
 
-        // Chained forward install to 0.2.85 while still on probation for 0.2.84
-        // (the version we're replacing == the existing marker's new_version).
-        write_dummy_binary(&live, b"NEWEST");
-        let meta = KnownGoodMeta {
-            size: 6,
-            sha256: "y".repeat(64),
-        };
-        begin_probation_at(dir, "0.2.85", "0.2.84", &live, &meta).unwrap();
+        let (meta, previous) = prepare_known_good_for_install_at(dir, "0.2.84", &live).unwrap();
 
-        let state = read_probation_at(dir).unwrap();
-        assert_eq!(state.new_version, "0.2.85");
-        // Previous version is still the original known-good, not 0.2.84.
-        assert_eq!(state.previous_version, "0.2.83");
+        // Carried forward: previous == 0.2.83, blob unchanged, meta matches marker.
+        assert_eq!(previous, "0.2.83");
+        assert_eq!(std::fs::read(known_good_path(dir)).unwrap(), blob_before);
+        assert_eq!(meta.size, existing.rollback_size);
+        assert_eq!(meta.sha256, existing.rollback_sha256);
     }
 
     #[test]
-    fn begin_probation_ignores_stale_marker_for_other_version() {
-        // A leftover marker for a DIFFERENT version than the one being replaced
-        // (e.g. an external install) must NOT carry its previous_version forward
-        // — that would later roll back to an unrelated older binary.
+    fn prepare_known_good_recaptures_when_blob_externally_deleted() {
+        // #2 regression: if the known-good blob is externally deleted while a
+        // marker persists, a chained install must re-capture the CURRENT binary
+        // and label it the CURRENT version — never carry a stale label forward
+        // onto a freshly-captured blob (which would restore the wrong binary and
+        // report the wrong version on a later rollback).
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        // Stale marker: new=0.2.84, prev=0.2.83.
-        setup_probation(dir, "0.2.84", "0.2.83");
+        let live = setup_probation(dir, "0.2.84", "0.2.83");
+        // External deletion of the blob while the marker (new=0.2.84) remains.
+        std::fs::remove_file(known_good_path(dir)).unwrap();
 
-        // Install 0.2.90 over a running 0.2.88 (NOT the stale marker's 0.2.84).
+        let (meta, previous) = prepare_known_good_for_install_at(dir, "0.2.84", &live).unwrap();
+
+        // Re-captured fresh: label is the current version, blob == current binary,
+        // and the recorded meta matches the (re-captured) blob — they agree.
+        assert_eq!(previous, "0.2.84");
+        assert!(known_good_path(dir).exists());
+        assert_eq!(
+            std::fs::read(known_good_path(dir)).unwrap(),
+            std::fs::read(&live).unwrap()
+        );
+        let (size, hash) = sha256_file(&known_good_path(dir)).unwrap();
+        assert_eq!(meta.size, size);
+        assert_eq!(meta.sha256, hash);
+    }
+
+    #[test]
+    fn prepare_known_good_recaptures_for_stale_marker_other_version() {
+        // A leftover marker for a DIFFERENT version than the one being replaced
+        // must be ignored: capture fresh + label the current version.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        setup_probation(dir, "0.2.84", "0.2.83"); // stale marker (new=0.2.84)
         let live = dir.join("freenet2");
-        write_dummy_binary(&live, b"V88");
-        let meta = KnownGoodMeta {
-            size: 3,
-            sha256: "z".repeat(64),
-        };
-        begin_probation_at(dir, "0.2.90", "0.2.88", &live, &meta).unwrap();
+        write_dummy_binary(&live, b"V88-CONTENT");
 
-        let state = read_probation_at(dir).unwrap();
-        assert_eq!(state.new_version, "0.2.90");
-        // previous_version is the actual replaced version, not the stale 0.2.83.
-        assert_eq!(state.previous_version, "0.2.88");
+        // Replacing version 0.2.88 (NOT the stale marker's 0.2.84).
+        let (meta, previous) = prepare_known_good_for_install_at(dir, "0.2.88", &live).unwrap();
+
+        assert_eq!(previous, "0.2.88");
+        assert_eq!(std::fs::read(known_good_path(dir)).unwrap(), b"V88-CONTENT");
+        let (size, hash) = sha256_file(&known_good_path(dir)).unwrap();
+        assert_eq!(meta.size, size);
+        assert_eq!(meta.sha256, hash);
     }
 
     #[cfg(unix)]

@@ -266,10 +266,13 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                     );
                     // Distinct result (NOT Skipped) so the caller clears the
                     // driving signal and does not fall through to the legacy
-                    // max-backoff exit-42 fallback. Reset the GitHub-check
-                    // backoff so a later fix (a version newer than the pin) is
-                    // still noticed promptly once peers re-signal.
-                    reset_backoff();
+                    // max-backoff exit-42 fallback. GROW the GitHub-check backoff
+                    // (do NOT reset it): a node that has already rolled back to a
+                    // good version is in no hurry to find the fix, so it should
+                    // poll at most hourly rather than at the 60s floor while
+                    // peers keep advertising the pinned-bad version. An hourly
+                    // check still catches a later strictly-newer release.
+                    increase_backoff();
                     return UpdateCheckResult::PinnedKnownBad;
                 }
                 tracing::info!(
