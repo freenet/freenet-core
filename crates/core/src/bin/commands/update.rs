@@ -731,10 +731,17 @@ impl UpdateCommand {
         // with no /Applications/Freenet.app (skeptical review H1).
         let _update_lock = acquire_update_lock()?;
 
-        let checksums = match release.assets.iter().find(|a| a.name == "SHA256SUMS.txt") {
-            Some(a) => download_checksums(&a.browser_download_url).await.ok(),
-            None => None,
-        };
+        // Authenticate the manifest signature before trusting any DMG
+        // checksum, exactly like the Linux/Windows binary path. Apple
+        // notarization only proves Apple accepted *some* bundle — it does NOT
+        // bind the DMG to this release's manifest, so without this an attacker
+        // who can serve the release assets could pair a forged SHA256SUMS.txt
+        // with an older/wrong but still-notarized DMG (a downgrade) and pass
+        // the checksum gate. A present-but-invalid signature returns Err here;
+        // the macOS caller treats that as "skip this update and retry next
+        // cycle" (never a lockout, and never a fall-through to binary-replace
+        // that would corrupt the signed bundle).
+        let checksums = self.download_and_verify_checksums(release).await?;
 
         let scratch = tempfile::tempdir().context("Failed to create temp directory")?;
         let dmg_path = scratch.path().join(&dmg_asset_name);
@@ -877,17 +884,6 @@ async fn get_latest_release() -> Result<Release> {
         .json::<Release>()
         .await
         .context("Failed to parse release info")
-}
-
-// macOS DMG path only: the Linux/Windows binary path now goes through
-// `download_and_verify_checksums`, which fetches the raw manifest bytes via
-// `download_bytes` so the same buffer can be both signature-verified and
-// parsed. The macOS DMG is independently Apple-signed + notarized, so its
-// checksum check stays as-is for now.
-#[cfg(target_os = "macos")]
-async fn download_checksums(url: &str) -> Result<Checksums> {
-    let bytes = download_bytes(url).await?;
-    Ok(Checksums::parse(&String::from_utf8_lossy(&bytes)))
 }
 
 /// Download a small release asset fully into memory. Used for the

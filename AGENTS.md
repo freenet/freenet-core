@@ -272,6 +272,19 @@ End-to-end procedure for any maintainer is in
 `gh workflow run release.yml --field version=X.Y.Z`. The `RELEASE_PAT`
 section above is the prerequisite for the cascade to fire automatically.
 
+## Release artifact signing (`FREENET_RELEASE_SIGNING_KEY`)
+
+`cross-compile.yml` signs the release `SHA256SUMS.txt` with an ed25519 key
+(`FREENET_RELEASE_SIGNING_KEY` repo secret) and uploads `SHA256SUMS.txt.sig`.
+The auto-updater (`crates/core/src/bin/commands/update.rs`) verifies that
+signature against the public key baked into the binary (`FREENET_RELEASE_PUBKEY`)
+before trusting the checksum manifest. Rotating the key means updating BOTH the
+secret AND the baked-in `FREENET_RELEASE_PUBKEY` (a mismatch would make every
+client refuse the release). To verify the secret matches the baked-in key
+without cutting a release, run `cross-compile.yml` via `workflow_dispatch` and
+check the `verify-signing-key` job. The full prerequisites table (including the
+two-release `REQUIRE_RELEASE_SIGNATURE` transition) is in `docs/RELEASING.md`.
+
 ## Delegate secrets-at-rest
 
 Operator-facing documentation (encryption model, migration matrix,
