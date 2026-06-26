@@ -378,7 +378,21 @@ pub(crate) fn prepare_known_good_for_install_at(
     current_binary: &Path,
 ) -> Result<(KnownGoodMeta, String)> {
     if let Some(existing) = read_probation_at(dir) {
-        if existing.new_version == current_version && dir.join(KNOWN_GOOD_BINARY_FILE).exists() {
+        // Only preserve the existing rollback target for a GENUINE chained
+        // in-probation install: the marker is for the version we're replacing,
+        // the blob is present, AND the marker hasn't aged out. The age check
+        // mirrors handle_post_stop's TTL — a marker that survived past
+        // PROBATION_MAX_AGE_SECS means the current version has actually been
+        // running fine for a long time (commit just failed to clear the marker),
+        // so the CURRENT binary is the real known-good. Without this, the next
+        // update would carry forward the stale older blob/label and a later
+        // rollback would skip over the actual immediately-previous good version.
+        let fresh_enough =
+            now_unix().saturating_sub(existing.installed_at_unix) <= PROBATION_MAX_AGE_SECS;
+        if existing.new_version == current_version
+            && fresh_enough
+            && dir.join(KNOWN_GOOD_BINARY_FILE).exists()
+        {
             return Ok((
                 KnownGoodMeta {
                     size: existing.rollback_size,
@@ -1173,6 +1187,34 @@ mod tests {
         // and the recorded meta matches the (re-captured) blob — they agree.
         assert_eq!(previous, "0.2.84");
         assert!(known_good_path(dir).exists());
+        assert_eq!(
+            std::fs::read(known_good_path(dir)).unwrap(),
+            std::fs::read(&live).unwrap()
+        );
+        let (size, hash) = sha256_file(&known_good_path(dir)).unwrap();
+        assert_eq!(meta.size, size);
+        assert_eq!(meta.sha256, hash);
+    }
+
+    #[test]
+    fn prepare_known_good_recaptures_when_marker_aged_out() {
+        // A marker for the CURRENT version that survived past the TTL means the
+        // current version has actually run fine for a long time (commit failed
+        // to clear it). The next install must NOT carry the stale older blob
+        // forward — it must re-capture the current binary as the known-good.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let live = setup_probation(dir, "0.2.84", "0.2.83");
+        // Backdate the marker beyond the TTL.
+        let mut state = read_probation_at(dir).unwrap();
+        state.installed_at_unix = now_unix().saturating_sub(PROBATION_MAX_AGE_SECS + 60);
+        write_probation_at(dir, &state).unwrap();
+
+        let (meta, previous) = prepare_known_good_for_install_at(dir, "0.2.84", &live).unwrap();
+
+        // Re-captured: label is the current version (not the stale 0.2.83), and
+        // the blob is the current binary, so blob and label agree.
+        assert_eq!(previous, "0.2.84");
         assert_eq!(
             std::fs::read(known_good_path(dir)).unwrap(),
             std::fs::read(&live).unwrap()
