@@ -398,6 +398,21 @@ setup_service() {
                     warn_unsupervised "$bin"
                     return
                 fi
+                # The system unit runs as $SUDO_USER and points ExecStart at
+                # $bin. With `curl | sudo sh`, HOME is usually /root, so $bin
+                # lands under /root/.local/bin which $SUDO_USER cannot traverse:
+                # the unit would install but fail to start. Verify the service
+                # user can actually execute the binary before creating a unit
+                # that points at it. (As root, `sudo -u` needs no password.)
+                if ! sudo -u "$SUDO_USER" sh -c 'test -x "$1"' sh "$bin" 2>/dev/null; then
+                    warn "The installed binary at '$bin' is not accessible to user"
+                    warn "'$SUDO_USER' (it looks like it was installed under root's"
+                    warn "home). A system service pointing there would fail to start."
+                    warn "Re-run the installer as '$SUDO_USER' WITHOUT sudo:"
+                    warn "  curl -fsSL https://freenet.org/install.sh | sh"
+                    warn_unsupervised "$bin"
+                    return
+                fi
                 info "Setting up a system service (running as \$SUDO_USER=$SUDO_USER)..."
                 if "$bin" service install --system; then
                     print_service_success "system"
@@ -410,6 +425,17 @@ setup_service() {
             info "Setting up a system service (requires sudo)..."
             if sudo "$bin" service install --system; then
                 print_service_success "system"
+            elif has_system_unit; then
+                # We picked "system" to REFRESH an existing system unit, but the
+                # sudo refresh failed (e.g. no passwordless sudo in a scripted
+                # rerun). Do NOT fall back to a user service - that would leave
+                # BOTH a system and a user service installed (the duplicate the
+                # existing-install routing exists to prevent). The freshly
+                # downloaded binary is already in place at $bin and takes effect
+                # on the next restart of the existing service.
+                warn "Could not refresh the existing system service (needs sudo)."
+                warn "The updated binary is in place and takes effect on the next restart."
+                warn "To refresh the unit now, run: sudo $bin service install --system"
             else
                 warn "System service install via sudo failed; falling back to a user service."
                 if "$bin" service install; then
