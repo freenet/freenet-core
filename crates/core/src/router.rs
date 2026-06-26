@@ -268,6 +268,11 @@ pub(crate) struct RouterSnapshotInfo {
     pub subscribe_hint_sent: Option<u64>,
     pub subscribe_hint_received: Option<u64>,
     pub subscribe_hint_acted: Option<u64>,
+    /// Count of renewal cycles short-circuited because this node is the
+    /// body-holding subscription root for the contract (#4440 proposal 1).
+    /// Monotonic lifetime total; trends how much renewal traffic the
+    /// root-satisfied path removes. `None` until the snapshot task populates it.
+    pub renewal_terminus_satisfied: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
     /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
@@ -1094,6 +1099,7 @@ impl Router {
             subscribe_hint_sent: None,
             subscribe_hint_received: None,
             subscribe_hint_acted: None,
+            renewal_terminus_satisfied: None,
             // Renegade predictor diagnostics
             renegade_failure_events: self.renegade_predictor.len(),
             renegade_response_time_events: self.renegade_predictor.stage_sizes().1,

@@ -7,10 +7,11 @@
 //! low-overhead observability primitives that piggyback on the existing 5-minute
 //! `router_snapshot` gauge cadence — no new per-message events:
 //!
-//! 1. [`PlacementMigrationMetrics`] — three cumulative `AtomicU64` counters
-//!    (`sent` / `received` / `acted`) incremented at the three migration sites,
-//!    read once per snapshot. Lets us trend whether the migration is firing and
-//!    at what rate.
+//! 1. [`PlacementMigrationMetrics`] — cumulative `AtomicU64` counters
+//!    (`sent` / `received` / `acted` / `renewal_terminus_satisfied`) incremented
+//!    at the migration sites and the renewal driver, read once per snapshot.
+//!    Lets us trend whether the migration is firing and at what rate, and how
+//!    often a subscription-root renewal short-circuits (#4440 proposal 1).
 //! 2. [`placement_quality`] — a pure function over this node's ring location and
 //!    the locations of the contracts it hosts. Produces the host-to-hosted-key
 //!    ring-distance distribution (median / p90 / fraction within 0.1 / min /
@@ -37,6 +38,14 @@ pub(crate) struct PlacementMigrationMetrics {
     /// Incremented only when an inbound `SubscribeHint` actually triggers a
     /// directed subscribe (the migration is acted upon, not dropped by a gate).
     acted: AtomicU64,
+    /// Incremented each time a subscription-renewal cycle short-circuits because
+    /// this node is the body-holding subscription root for the contract (#4440
+    /// proposal 1). A body-holding root has no peer closer than itself to
+    /// subscribe to, so renewing an upstream subscription would route greedily
+    /// toward the contract, dead-end, and retry — the renewal storm. The root
+    /// instead satisfies its renewal locally and sends no wire request; this
+    /// counter trends how much renewal traffic that removes.
+    renewal_terminus_satisfied: AtomicU64,
 }
 
 /// A point-in-time read of [`PlacementMigrationMetrics`] for telemetry emission.
@@ -45,6 +54,7 @@ pub(crate) struct PlacementMigrationSnapshot {
     pub sent: u64,
     pub received: u64,
     pub acted: u64,
+    pub renewal_terminus_satisfied: u64,
 }
 
 impl PlacementMigrationMetrics {
@@ -68,12 +78,21 @@ impl PlacementMigrationMetrics {
         self.acted.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Read all three counters for telemetry.
+    /// Record that a renewal cycle short-circuited because this node is the
+    /// body-holding subscription root for the contract (#4440 proposal 1).
+    #[inline]
+    pub(crate) fn record_renewal_terminus_satisfied(&self) {
+        self.renewal_terminus_satisfied
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read all counters for telemetry.
     pub(crate) fn snapshot(&self) -> PlacementMigrationSnapshot {
         PlacementMigrationSnapshot {
             sent: self.sent.load(Ordering::Relaxed),
             received: self.received.load(Ordering::Relaxed),
             acted: self.acted.load(Ordering::Relaxed),
+            renewal_terminus_satisfied: self.renewal_terminus_satisfied.load(Ordering::Relaxed),
         }
     }
 }
@@ -265,7 +284,15 @@ mod tests {
     fn metrics_counters_increment_independently() {
         let m = PlacementMigrationMetrics::default();
         let s0 = m.snapshot();
-        assert_eq!((s0.sent, s0.received, s0.acted), (0, 0, 0));
+        assert_eq!(
+            (
+                s0.sent,
+                s0.received,
+                s0.acted,
+                s0.renewal_terminus_satisfied
+            ),
+            (0, 0, 0, 0)
+        );
 
         m.record_sent();
         m.record_sent();
@@ -273,11 +300,19 @@ mod tests {
         m.record_acted();
         m.record_received();
         m.record_received();
+        m.record_renewal_terminus_satisfied();
+        m.record_renewal_terminus_satisfied();
+        m.record_renewal_terminus_satisfied();
+        m.record_renewal_terminus_satisfied();
 
         let s1 = m.snapshot();
         assert_eq!(s1.sent, 2, "sent");
         assert_eq!(s1.received, 3, "received");
         assert_eq!(s1.acted, 1, "acted");
+        assert_eq!(
+            s1.renewal_terminus_satisfied, 4,
+            "renewal_terminus_satisfied"
+        );
     }
 
     /// Source-pin the three migration counter sites so a refactor that drops a

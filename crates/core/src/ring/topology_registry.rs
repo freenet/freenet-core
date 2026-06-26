@@ -175,6 +175,101 @@ pub fn clear_all_topology_snapshots() {
     TOPOLOGY_REGISTRY.clear();
 }
 
+// ============================================================================
+// Renewal-metrics registry (#4440 proposal 1 — simulation-test observability)
+// ============================================================================
+//
+// The subscription renewal storm (#4440) is invisible to the captured
+// `NetLogMessage` event stream: `is_renewal` is not recorded on the logged
+// subscribe events, and the `subscription_renewal_outcome` telemetry is
+// fire-and-forget to the remote collector. To assert the storm signature (and
+// its absence after the fix) deterministically in `run_simulation_direct`
+// tests, the renewal driver publishes a tiny per-node counter into this global
+// registry whenever a simulation network name is set (the same `thread_local`
+// gating the topology snapshots use). Production builds running outside a
+// simulation never set a network name, so this registry stays empty and the
+// `record_*` calls are cheap no-ops.
+
+/// Per-node subscription-renewal counters for one simulation network.
+///
+/// Cumulative lifetime totals, keyed by `(network_name, peer_address)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenewalMetrics {
+    /// Renewal cycles that sent (or attempted to send) a wire `Subscribe`
+    /// request because the node is NOT the body-holding subscription root.
+    /// Before the #4440 fix, a body-holding root falls into this bucket too —
+    /// every such attempt routes greedily toward the contract, dead-ends, and
+    /// is retried: the storm.
+    pub wire_attempts: u64,
+    /// Renewal cycles short-circuited by the root-satisfied path (#4440
+    /// proposal 1): the node is the body-holding subscription root, so it
+    /// satisfies the renewal locally and sends no wire request.
+    pub terminus_satisfied: u64,
+}
+
+static RENEWAL_METRICS_REGISTRY: LazyLock<DashMap<(String, SocketAddr), RenewalMetrics>> =
+    LazyLock::new(DashMap::new);
+
+/// Record that a renewal cycle sent (or attempted) a wire subscribe request.
+/// No-op outside a simulation context (no current network name).
+pub fn record_renewal_wire_attempt(peer_addr: SocketAddr) {
+    if let Some(network_name) = get_current_network_name() {
+        RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default()
+            .wire_attempts += 1;
+    }
+}
+
+/// Record that a renewal cycle short-circuited via the root-satisfied path.
+/// No-op outside a simulation context (no current network name).
+pub fn record_renewal_terminus_satisfied(peer_addr: SocketAddr) {
+    if let Some(network_name) = get_current_network_name() {
+        RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default()
+            .terminus_satisfied += 1;
+    }
+}
+
+/// Get the renewal metrics for a specific peer in a network.
+pub fn get_renewal_metrics(network_name: &str, peer_addr: &SocketAddr) -> Option<RenewalMetrics> {
+    RENEWAL_METRICS_REGISTRY
+        .get(&(network_name.to_string(), *peer_addr))
+        .map(|r| *r.value())
+}
+
+/// Snapshot all per-peer renewal metrics for a network into an owned map.
+///
+/// Used by `run_controlled_simulation` to capture the metrics BEFORE
+/// `SimNetwork::Drop` clears the registry, mirroring how it captures topology
+/// snapshots — the simulation consumes `self`, so its `Drop` (which calls
+/// [`clear_renewal_metrics`]) runs before control returns to the test.
+pub fn get_all_renewal_metrics(network_name: &str) -> HashMap<SocketAddr, RenewalMetrics> {
+    RENEWAL_METRICS_REGISTRY
+        .iter()
+        .filter(|entry| entry.key().0 == network_name)
+        .map(|entry| (entry.key().1, *entry.value()))
+        .collect()
+}
+
+/// Sum the renewal metrics across all peers in a network.
+pub fn aggregate_renewal_metrics(network_name: &str) -> RenewalMetrics {
+    RENEWAL_METRICS_REGISTRY
+        .iter()
+        .filter(|entry| entry.key().0 == network_name)
+        .fold(RenewalMetrics::default(), |mut acc, entry| {
+            acc.wire_attempts += entry.value().wire_attempts;
+            acc.terminus_satisfied += entry.value().terminus_satisfied;
+            acc
+        })
+}
+
+/// Clear renewal metrics for a network (for test cleanup).
+pub fn clear_renewal_metrics(network_name: &str) {
+    RENEWAL_METRICS_REGISTRY.retain(|key, _| key.0 != network_name);
+}
+
 /// Result of topology validation.
 #[derive(Debug, Default)]
 pub struct TopologyValidationResult {
