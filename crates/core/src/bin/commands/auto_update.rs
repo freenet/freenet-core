@@ -860,6 +860,56 @@ pub(crate) fn compare_versions_for_startup(current: &str, latest: &str) -> Optio
     }
 }
 
+// =============================================================================
+// Periodic re-poll scheduling (#4073)
+// =============================================================================
+
+/// Base interval between periodic direct-GitHub update re-polls.
+///
+/// After the one-shot startup check (#3864), update detection otherwise
+/// depends entirely on a peer signal (urgent / highest-seen / version
+/// mismatch). If an entire network sits on the same old version, no node
+/// re-checks GitHub and a freshly published release is never picked up until
+/// a node happens to restart. This recurring poll closes that gap: a
+/// long-running node re-asks GitHub directly on this cadence, without needing
+/// a restart.
+///
+/// 6h is deliberately conservative against GitHub's unauthenticated REST rate
+/// limit (60 requests/hour/IP): even at the jittered minimum (~4.5h) it is
+/// well under one request/hour, leaving headroom for the bursty
+/// peer-signal-driven checks that share the same IP budget. It is still
+/// frequent enough that a release propagates across the network within hours
+/// rather than never.
+pub const UPDATE_REPOLL_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// Fraction of jitter applied to each re-poll interval (±25%).
+///
+/// Without jitter, nodes that booted together (e.g. after a coordinated
+/// restart or outage) would re-poll — and therefore exit-42/restart — in
+/// lockstep, producing a thundering herd against both GitHub and the network.
+/// ±25% decorrelates them, preserving the load-spreading intent of the
+/// existing 0-60s startup jitter and 0-4h decentralized-discovery stagger.
+pub const UPDATE_REPOLL_JITTER_FRACTION: f64 = 0.25;
+
+/// Apply symmetric `±jitter_fraction` jitter to `base`, given a uniform random
+/// sample `rand_unit` in `[0, 1]`.
+///
+/// Pure and deterministic: the randomness is injected by the caller (in
+/// production, `GlobalRng`) so the scheduling math is unit-testable without
+/// waiting hours or depending on a clock. `rand_unit` and `jitter_fraction`
+/// are clamped to `[0, 1]` defensively.
+///
+/// Maps `rand_unit` linearly onto the factor range
+/// `[1 - jitter_fraction, 1 + jitter_fraction]`:
+/// `rand_unit = 0.0` → `base * (1 - frac)`, `0.5` → `base`,
+/// `1.0` → `base * (1 + frac)`.
+pub fn jittered_repoll_interval(base: Duration, jitter_fraction: f64, rand_unit: f64) -> Duration {
+    let jitter_fraction = jitter_fraction.clamp(0.0, 1.0);
+    let rand_unit = rand_unit.clamp(0.0, 1.0);
+    let factor = 1.0 - jitter_fraction + 2.0 * jitter_fraction * rand_unit;
+    base.mul_f64(factor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1655,5 +1705,91 @@ mod tests {
             backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
         }
         assert_eq!(backoff, MAX_BACKOFF);
+    }
+
+    #[test]
+    fn test_jittered_repoll_interval_bounds() {
+        // For ANY rand_unit in [0,1], the jittered interval must stay within
+        // ±UPDATE_REPOLL_JITTER_FRACTION of the base. The rate-limit and
+        // thundering-herd reasoning both depend on this property holding.
+        let base = UPDATE_REPOLL_INTERVAL;
+        let frac = UPDATE_REPOLL_JITTER_FRACTION;
+        let min = base.mul_f64(1.0 - frac);
+        let max = base.mul_f64(1.0 + frac);
+        for i in 0..=100 {
+            let rand_unit = i as f64 / 100.0;
+            let got = jittered_repoll_interval(base, frac, rand_unit);
+            assert!(
+                got >= min && got <= max,
+                "rand_unit={rand_unit}: {got:?} not in [{min:?}, {max:?}]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_jittered_repoll_interval_endpoints_and_midpoint() {
+        // Exact mapping at the three reference points (1000s base, ±25%).
+        let base = Duration::from_secs(1000);
+        assert_eq!(
+            jittered_repoll_interval(base, 0.25, 0.0),
+            Duration::from_secs(750)
+        );
+        assert_eq!(
+            jittered_repoll_interval(base, 0.25, 0.5),
+            Duration::from_secs(1000)
+        );
+        assert_eq!(
+            jittered_repoll_interval(base, 0.25, 1.0),
+            Duration::from_secs(1250)
+        );
+    }
+
+    #[test]
+    fn test_jittered_repoll_interval_deterministic() {
+        // Same inputs -> same output. The function must have no hidden global
+        // state, so a test can pin it without a clock or RNG.
+        let a = jittered_repoll_interval(UPDATE_REPOLL_INTERVAL, 0.25, 0.37);
+        let b = jittered_repoll_interval(UPDATE_REPOLL_INTERVAL, 0.25, 0.37);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_jittered_repoll_interval_clamps_out_of_range_inputs() {
+        let base = Duration::from_secs(1000);
+        // rand_unit is clamped to [0,1].
+        assert_eq!(
+            jittered_repoll_interval(base, 0.25, -5.0),
+            jittered_repoll_interval(base, 0.25, 0.0)
+        );
+        assert_eq!(
+            jittered_repoll_interval(base, 0.25, 5.0),
+            jittered_repoll_interval(base, 0.25, 1.0)
+        );
+        // jitter_fraction is clamped to [0,1]: a frac of 9.0 behaves as 1.0, so
+        // the factor range is [0, 2].
+        assert_eq!(
+            jittered_repoll_interval(base, 9.0, 0.0),
+            Duration::from_secs(0)
+        );
+        assert_eq!(
+            jittered_repoll_interval(base, 9.0, 1.0),
+            Duration::from_secs(2000)
+        );
+    }
+
+    #[test]
+    fn test_repoll_interval_is_under_github_rate_limit() {
+        // GitHub's unauthenticated REST limit is 60 requests/hour/IP. Even at
+        // the jittered minimum, the periodic re-poll alone must stay far under
+        // that (the bursty peer-signal checks share the same IP budget). We
+        // assert the minimum interval is >= 1 hour, i.e. <= 1 periodic request
+        // per hour — a >=60x safety margin.
+        let min =
+            jittered_repoll_interval(UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, 0.0);
+        assert!(
+            min >= Duration::from_secs(3600),
+            "minimum re-poll interval {min:?} must be >= 1h to stay well under \
+             GitHub's 60 req/hr unauthenticated limit"
+        );
     }
 }
