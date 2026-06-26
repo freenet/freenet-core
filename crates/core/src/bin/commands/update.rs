@@ -553,14 +553,25 @@ impl UpdateCommand {
 
         // Arm crash-loop rollback for the freshly-installed version. Skipped
         // when we have no known-good binary to fall back to, so we never
-        // advertise a rollback target we cannot honour.
+        // advertise a rollback target we cannot honour. A failure to persist the
+        // probation marker (full/unwritable state dir) does NOT fail the update
+        // — the binary is already installed — but it MUST be surfaced, since the
+        // new version then has no rollback protection.
         if let Some(meta) = known_good_meta {
-            rollback::begin_probation(
+            if let Err(e) = rollback::begin_probation(
                 release.tag_name.trim_start_matches('v'),
                 current_version,
                 &current_exe,
                 &meta,
-            );
+            ) {
+                if !self.quiet {
+                    eprintln!(
+                        "Warning: installed the update but failed to arm crash-loop rollback \
+                         protection: {e}. If this version crash-loops it will NOT auto-roll-back."
+                    );
+                }
+                tracing::warn!(error = %e, "Failed to arm crash-loop rollback probation (#4073)");
+            }
         }
 
         if !self.quiet {

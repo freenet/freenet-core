@@ -356,20 +356,27 @@ pub(crate) fn capture_known_good_at(dir: &Path, current_binary: &Path) -> Result
 /// ignored: `previous_version` becomes `version_being_replaced`, matching the
 /// freshly-captured known-good blob. Clears any known-bad pin, since a
 /// successful forward install means we have moved on.
+/// Returns `Err` if the probation marker could not be persisted (full /
+/// unwritable state dir). In that case the update still succeeded but the new
+/// version has NO crash-loop rollback protection, so the caller MUST surface
+/// the error rather than discard it.
 pub(crate) fn begin_probation(
     new_version: &str,
     version_being_replaced: &str,
     target_binary: &Path,
     meta: &KnownGoodMeta,
-) {
-    if let Some(dir) = state_dir() {
-        begin_probation_at(
+) -> Result<()> {
+    match state_dir() {
+        Some(dir) => begin_probation_at(
             dir.as_path(),
             new_version,
             version_being_replaced,
             target_binary,
             meta,
-        );
+        ),
+        // No state dir means the earlier known-good capture would also have
+        // failed (so this is unreachable in practice); nothing to arm.
+        None => Ok(()),
     }
 }
 
@@ -379,7 +386,7 @@ pub(crate) fn begin_probation_at(
     version_being_replaced: &str,
     target_binary: &Path,
     meta: &KnownGoodMeta,
-) {
+) -> Result<()> {
     let _mkdir = std::fs::create_dir_all(dir);
     let rollback_binary = dir.join(KNOWN_GOOD_BINARY_FILE);
     // Preserve the known-good baseline ONLY across a genuine chained
@@ -401,9 +408,11 @@ pub(crate) fn begin_probation_at(
         installed_at_unix: now_unix(),
         crash_count: 0,
     };
-    let _write = write_probation_at(dir, &state);
-    // Moving forward to a new version supersedes any prior known-bad pin.
+    // Moving forward to a new (non-pinned) version supersedes any prior
+    // known-bad pin; best-effort, independent of the marker write.
     clear_known_bad_at(dir);
+    write_probation_at(dir, &state)
+        .context("failed to write crash-loop probation marker; the installed version has no rollback protection")
 }
 
 /// Read the current probation marker, if any. A missing or unparseable marker
@@ -806,7 +815,7 @@ mod tests {
         let meta = capture_known_good_at(dir, &live).unwrap();
         // Now the live binary is "replaced" by the new (bad) version.
         write_dummy_binary(&live, b"BAD-BINARY");
-        begin_probation_at(dir, new_version, prev_version, &live, &meta);
+        begin_probation_at(dir, new_version, prev_version, &live, &meta).unwrap();
         live
     }
 
@@ -953,7 +962,7 @@ mod tests {
             size: 5,
             sha256: "x".repeat(64),
         };
-        begin_probation_at(dir, "0.2.85", "0.2.83", &live, &meta);
+        begin_probation_at(dir, "0.2.85", "0.2.83", &live, &meta).unwrap();
         assert!(!is_version_pinned_bad_at(dir, "0.2.84"));
     }
 
@@ -1103,7 +1112,7 @@ mod tests {
             size: 6,
             sha256: "y".repeat(64),
         };
-        begin_probation_at(dir, "0.2.85", "0.2.84", &live, &meta);
+        begin_probation_at(dir, "0.2.85", "0.2.84", &live, &meta).unwrap();
 
         let state = read_probation_at(dir).unwrap();
         assert_eq!(state.new_version, "0.2.85");
@@ -1128,7 +1137,7 @@ mod tests {
             size: 3,
             sha256: "z".repeat(64),
         };
-        begin_probation_at(dir, "0.2.90", "0.2.88", &live, &meta);
+        begin_probation_at(dir, "0.2.90", "0.2.88", &live, &meta).unwrap();
 
         let state = read_probation_at(dir).unwrap();
         assert_eq!(state.new_version, "0.2.90");
