@@ -279,8 +279,21 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        // Apply the hit's recency update FIRST (moves the key to MRU), THEN
+        // sample the shadow. Sampling before the update would read pre-hit
+        // recency: a hit on the interested absolute-LRU entry would be counted as
+        // a divergence even though, immediately after the hit, that entry is MRU
+        // and the next victim may be cold (policies agree) — a false divergence
+        // signal (Codex review). `get` mutating recency is why the lookup must
+        // precede the refresh. We then re-`get` to return the borrow (idempotent:
+        // the key is already MRU, so the second lookup is a cheap hash probe).
+        let hit = self.inner.get(key).is_some();
         self.maybe_refresh_interest_shadow();
-        self.inner.get(key).map(|(v, _)| v)
+        if hit {
+            self.inner.get(key).map(|(v, _)| v)
+        } else {
+            None
+        }
     }
 
     /// Recompute the interest shadow gauges (the O(entries) cold/interested
@@ -2282,6 +2295,39 @@ mod tests {
             metrics.snapshot().contract_evictions_would_reclassify_total,
             0,
             "no cold entry exists → two-tier would not diverge"
+        );
+    }
+
+    /// A cache HIT on the interested absolute-LRU entry must NOT be counted as a
+    /// divergence: the hit moves that entry to MRU, so immediately afterwards the
+    /// next plain-LRU victim is the (cold) entry and the policies agree. The
+    /// refresh must sample AFTER the hit's recency update, not before (Codex
+    /// review — sampling pre-hit recency produced a false divergence signal).
+    #[test]
+    fn shadow_get_hit_on_interested_lru_does_not_false_count() {
+        let metrics = Arc::new(ModuleCacheMetrics::new());
+        let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // key 0 interested (absolute LRU), key 1 cold (MRU).
+        interested.lock().unwrap().insert(0u64);
+        let mut cache = ModuleCache::<u64, ()>::with_interest_for_test(
+            1_000_000,
+            "contract",
+            Some(metrics.clone()),
+            interest_over(interested.clone()),
+            false,
+        );
+        cache.insert(0, (), 6); // interested, absolute LRU
+        cache.insert(1, (), 6); // cold, MRU
+        // Arm the throttle and HIT the interested LRU (key 0). After the hit key 0
+        // is MRU and key 1 (cold) is the new LRU → the next plain-LRU eviction
+        // would pick the cold entry → policies AGREE → no divergence.
+        cache.arm_interest_shadow_refresh();
+        let _ = cache.get(&0);
+        assert_eq!(
+            metrics.snapshot().contract_evictions_would_reclassify_total,
+            0,
+            "hitting the interested LRU makes it MRU; the post-hit LRU is cold, so \
+             the policies agree and no divergence may be counted"
         );
     }
 

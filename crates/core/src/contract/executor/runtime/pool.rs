@@ -334,13 +334,23 @@ impl RuntimePool {
         // emitter can recompute the contract cache's interest split right before
         // it reads, keeping every emitted snapshot fresh even on an idle cache
         // (the throttled get/insert/remove refresh is unbounded on a quiet node).
-        // The closure locks the SAME shared contract cache the executors use and
-        // forces an un-throttled recompute. Cheap O(entries) scan, once per 5-min
-        // snapshot. (Codex/coordinator review — bound shadow-gauge staleness.)
-        let refresher_cache = shared_contract_modules.clone();
+        // The closure forces an un-throttled recompute on the SAME shared contract
+        // cache the executors use. Cheap O(entries) scan, once per 5-min snapshot.
+        //
+        // It captures a WEAK handle (and upgrades at call time), NOT a strong
+        // Arc: `ModuleCacheMetrics` is owned by `Ring`, each `ModuleCache` holds a
+        // strong `Arc<ModuleCacheMetrics>`, and the cache's interest predicate
+        // holds an `Arc<Ring>` — a strong clone here would close a reference cycle
+        // (metrics → refresher → cache → metrics → … → ring) and leak the whole
+        // runtime/ring on pool/node drop (simulations, tests, restarts). The Weak
+        // breaks the cycle; when the cache is gone the refresh is a no-op.
+        // (Codex review.)
+        let refresher_cache = Arc::downgrade(&shared_contract_modules);
         module_cache_metrics.set_interest_shadow_refresher(Arc::new(move || {
-            if let Ok(mut cache) = refresher_cache.lock() {
-                cache.force_refresh_interest_shadow();
+            if let Some(cache) = refresher_cache.upgrade() {
+                if let Ok(mut cache) = cache.lock() {
+                    cache.force_refresh_interest_shadow();
+                }
             }
         }));
         // Shared delegate-context cache so a prompt round-trip routed to a
