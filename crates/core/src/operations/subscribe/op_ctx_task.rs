@@ -343,23 +343,39 @@ pub(crate) async fn run_renewal_subscribe(
     // and at scale that loop is the renewal storm (in prod it also shows up as
     // the renewal task overrunning its cycle deadline).
     //
-    // A root has no use for an upstream subscription: hosting, eviction
+    // A root has no use for an UPSTREAM subscription: hosting, eviction
     // protection, and UPDATE delivery are all decoupled from the
     // `active_subscriptions` lease (UPDATEs route to whoever is closest — this
     // node — and fan out to interested peers independently of the lease). So the
     // root takes a dedicated "root-satisfied" path: send NO wire request,
     // deliver NO client result, and return `Success`. The renewal-loop's
     // `SubscriptionRecoveryGuard::complete(true)` then clears the pending mark
-    // and resets the subscription backoff with success semantics; the
-    // `active_subscriptions` lease is intentionally allowed to lapse.
+    // and resets the subscription backoff with success semantics.
+    //
+    // It DOES refresh the LOCAL `active_subscriptions` lease, even though the
+    // lease has no upstream meaning for a root. This is purely local (extends an
+    // expiry in a local map — no wire traffic) and is what keeps the
+    // root-satisfied path cheap at scale: without it, a root with a client
+    // subscription (or recent local access) whose lease lapsed would be
+    // re-selected by `contracts_needing_renewal()` on EVERY 30s maintenance
+    // cycle (the client-subscription / local-access paths fire whenever there is
+    // no live lease), so it would consume a `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL`
+    // batch slot every cycle and could starve real (non-root) wire renewals that
+    // still need to reach the network. Refreshing the lease moves the root back
+    // onto the normal ~6-minute renewal cadence (lease-expiry path) instead of
+    // every cycle, while still never sending a wire request.
     //
     // This is NOT `complete_local_subscription`, whose semantics differ (it
-    // emits `LocalSubscribeComplete` and does not refresh the lease in the way a
-    // root needs); the root-satisfied path is deliberately distinct.
-    if op_manager
+    // emits `LocalSubscribeComplete` and registers client interest); the
+    // root-satisfied path is deliberately distinct — a bare local lease refresh
+    // plus a clean `Success`.
+    if let Some(key) = op_manager
         .ring
-        .is_body_holding_subscription_root_by_instance(&instance_id)
+        .body_holding_subscription_root_key(&instance_id)
     {
+        // Refresh the local lease so the root is not re-selected for renewal
+        // every cycle (see rationale above). Local-only; no wire traffic.
+        op_manager.ring.subscribe(key);
         op_manager.ring.record_renewal_terminus_satisfied();
         // Simulation-test observability (no-op in production — see
         // `topology_registry::record_renewal_terminus_satisfied`).
@@ -368,10 +384,10 @@ pub(crate) async fn run_renewal_subscribe(
         }
         tracing::debug!(
             tx = %renewal_tx,
-            contract = %instance_id,
+            contract = %key,
             phase = "renewal_terminus_satisfied",
             "subscribe renewal: node is the body-holding subscription root; \
-             satisfying renewal locally without an upstream request (#4440)"
+             satisfying renewal locally (lease refreshed, no upstream request) (#4440)"
         );
         return RenewalOutcome::Success;
     }
@@ -2889,9 +2905,9 @@ mod tests {
         let before_drive = &src[entry..entry + drive_at];
 
         let predicate_at = before_drive
-            .find("is_body_holding_subscription_root_by_instance(&instance_id)")
+            .find("body_holding_subscription_root_key(&instance_id)")
             .expect(
-                "run_renewal_subscribe must check is_body_holding_subscription_root_by_instance \
+                "run_renewal_subscribe must check body_holding_subscription_root_key \
                  BEFORE driving a wire renewal (the storm short-circuit)",
             );
         assert!(
@@ -2902,6 +2918,13 @@ mod tests {
         assert!(
             before_drive[predicate_at..].contains("record_renewal_terminus_satisfied()"),
             "the root-satisfied path must record the renewal_terminus_satisfied counter"
+        );
+        assert!(
+            before_drive[predicate_at..].contains("op_manager.ring.subscribe(key)"),
+            "the root-satisfied path must refresh the LOCAL lease so the root is not \
+             re-selected for renewal every maintenance cycle (Codex P2): a lapsed lease \
+             plus a client subscription / recent local access re-selects the root on every \
+             30s cycle and can starve real wire renewals"
         );
         // The short-circuit must NOT reuse complete_local_subscription (different
         // semantics — it emits LocalSubscribeComplete and was the wrong vehicle
