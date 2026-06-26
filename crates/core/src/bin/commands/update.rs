@@ -503,17 +503,19 @@ impl UpdateCommand {
         // size+hash) rather than capture the unproven one. A capture failure
         // (e.g. disk full) does not block the update; it just means no rollback
         // safety net for this cycle.
-        let known_good_meta = if let Some(existing) = rollback::read_probation() {
-            // Chained install while still on probation: keep the existing
-            // known-good blob's integrity metadata.
-            if rollback::known_good_binary_path().is_some_and(|p| p.exists()) {
-                Some(rollback::KnownGoodMeta {
-                    size: existing.rollback_size,
-                    sha256: existing.rollback_sha256,
-                })
-            } else {
-                None
-            }
+        let chained_in_probation = rollback::read_probation()
+            .filter(|existing| existing.new_version == current_version)
+            .filter(|_| rollback::known_good_binary_path().is_some_and(|p| p.exists()));
+        let known_good_meta = if let Some(existing) = chained_in_probation {
+            // Genuine chained install while still on probation for the version we
+            // are running: keep the existing known-good blob's integrity metadata
+            // (the live binary is the UNPROVEN new version). A marker for any
+            // OTHER version is stale and ignored here — we capture fresh below so
+            // we never roll back to an unrelated older binary.
+            Some(rollback::KnownGoodMeta {
+                size: existing.rollback_size,
+                sha256: existing.rollback_sha256,
+            })
         } else {
             match rollback::capture_known_good(&current_exe) {
                 Ok(meta) => Some(meta),

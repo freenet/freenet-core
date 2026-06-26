@@ -346,11 +346,16 @@ pub(crate) fn capture_known_good_at(dir: &Path, current_binary: &Path) -> Result
 /// binary at `target_binary`. `version_being_replaced` is the version of the
 /// binary that was overwritten; `meta` describes the retained known-good blob.
 ///
-/// Carries the known-good rollback target forward: if a probation marker
-/// already exists (a chained update WHILE on probation — e.g. a manual
-/// `freenet update`), we keep the existing `previous_version` rather than
-/// treating the unproven probationary binary as known-good. Clears any
-/// known-bad pin, since a successful forward install means we have moved on.
+/// Carries the known-good rollback target forward ONLY for a genuine chained
+/// in-probation install — one where the existing marker's `new_version` equals
+/// the version we are now replacing (e.g. a manual `freenet update` run while
+/// still on probation for the running version). In that case the unproven
+/// running binary must NOT become the known-good, so we keep the existing
+/// `previous_version`. A marker for any OTHER version is stale (e.g. left over
+/// by an external/manual install or a rollback that failed to clear it) and is
+/// ignored: `previous_version` becomes `version_being_replaced`, matching the
+/// freshly-captured known-good blob. Clears any known-bad pin, since a
+/// successful forward install means we have moved on.
 pub(crate) fn begin_probation(
     new_version: &str,
     version_being_replaced: &str,
@@ -377,10 +382,14 @@ pub(crate) fn begin_probation_at(
 ) {
     let _mkdir = std::fs::create_dir_all(dir);
     let rollback_binary = dir.join(KNOWN_GOOD_BINARY_FILE);
-    // Preserve the known-good baseline across a chained in-probation install.
+    // Preserve the known-good baseline ONLY across a genuine chained
+    // in-probation install (existing marker is for the version we're replacing).
+    // A stale marker for any other version is ignored — see the rustdoc.
     let previous_version = match read_probation_at(dir) {
-        Some(existing) => existing.previous_version,
-        None => version_being_replaced.to_string(),
+        Some(existing) if existing.new_version == version_being_replaced => {
+            existing.previous_version
+        }
+        _ => version_being_replaced.to_string(),
     };
     let state = ProbationState {
         new_version: new_version.to_string(),
@@ -585,13 +594,28 @@ pub(crate) fn handle_post_stop_at(
     // count it. Persist FIRST (local, no network) so the count survives even if
     // everything below is skipped.
     state.crash_count = state.crash_count.saturating_add(1);
-    let _write = write_probation_at(dir, &state);
+    let persisted = write_probation_at(dir, &state).is_ok();
 
     if !should_rollback(state.crash_count) {
+        // Below threshold we rely on the persisted count to accumulate across
+        // restarts. If the write failed (full / unwritable state dir) the count
+        // is lost and we would re-read the old value forever, never reaching the
+        // threshold before the supervisor gives up. Surface that as
+        // RollbackUnavailable instead of silently under-counting.
+        if !persisted {
+            return PostStopOutcome::RollbackUnavailable {
+                reason: "cannot persist probation crash count (state dir full/unwritable); \
+                         crashes cannot accumulate toward rollback"
+                    .to_string(),
+            };
+        }
         return PostStopOutcome::CrashRecorded {
             crash_count: state.crash_count,
         };
     }
+    // At/above threshold we proceed to roll back using the in-memory count even
+    // if the persist failed — the marker is removed on a successful rollback
+    // anyway, and a genuinely broken state dir will surface at the pin step (S6).
 
     // Threshold reached: roll back to the known-good binary.
     if !state.rollback_binary.exists() {
@@ -1072,7 +1096,8 @@ mod tests {
         let dir = tmp.path();
         let live = setup_probation(dir, "0.2.84", "0.2.83");
 
-        // Chained forward install to 0.2.85 while still on probation for 0.2.84.
+        // Chained forward install to 0.2.85 while still on probation for 0.2.84
+        // (the version we're replacing == the existing marker's new_version).
         write_dummy_binary(&live, b"NEWEST");
         let meta = KnownGoodMeta {
             size: 6,
@@ -1084,6 +1109,58 @@ mod tests {
         assert_eq!(state.new_version, "0.2.85");
         // Previous version is still the original known-good, not 0.2.84.
         assert_eq!(state.previous_version, "0.2.83");
+    }
+
+    #[test]
+    fn begin_probation_ignores_stale_marker_for_other_version() {
+        // A leftover marker for a DIFFERENT version than the one being replaced
+        // (e.g. an external install) must NOT carry its previous_version forward
+        // — that would later roll back to an unrelated older binary.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Stale marker: new=0.2.84, prev=0.2.83.
+        setup_probation(dir, "0.2.84", "0.2.83");
+
+        // Install 0.2.90 over a running 0.2.88 (NOT the stale marker's 0.2.84).
+        let live = dir.join("freenet2");
+        write_dummy_binary(&live, b"V88");
+        let meta = KnownGoodMeta {
+            size: 3,
+            sha256: "z".repeat(64),
+        };
+        begin_probation_at(dir, "0.2.90", "0.2.88", &live, &meta);
+
+        let state = read_probation_at(dir).unwrap();
+        assert_eq!(state.new_version, "0.2.90");
+        // previous_version is the actual replaced version, not the stale 0.2.83.
+        assert_eq!(state.previous_version, "0.2.88");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn crash_count_write_failure_is_rollback_unavailable() {
+        // If the probation crash count can't be persisted (full/unwritable state
+        // dir), we must surface RollbackUnavailable rather than silently
+        // under-counting forever (a lost increment would never reach threshold).
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        setup_probation(dir, "0.2.84", "0.2.83");
+
+        // Make the state dir read-only so the marker write (temp + rename) fails,
+        // while the existing marker + blob remain readable.
+        let orig = std::fs::metadata(dir).unwrap().permissions();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = handle_post_stop_at(dir, "101", "0.2.84");
+
+        // Restore perms before any assertion so tempdir cleanup always works.
+        std::fs::set_permissions(dir, orig).unwrap();
+
+        let PostStopOutcome::RollbackUnavailable { reason } = outcome else {
+            panic!("expected RollbackUnavailable, got {outcome:?}");
+        };
+        assert!(reason.contains("persist"), "reason: {reason}");
     }
 
     #[test]
