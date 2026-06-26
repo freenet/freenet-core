@@ -253,6 +253,25 @@ async fn run_network_node_with_signals(
         freenet::enable_fast_crash_exit_code();
     }
 
+    // #4073 crash-loop auto-rollback: once this (possibly freshly auto-updated)
+    // node has run healthily for the commit window, clear any post-update
+    // probation marker so ordinary later crashes never trigger a rollback. The
+    // window mirrors MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT — a node that survives
+    // it has cleared the same fast-crash boundary. Fire-and-forget: if the node
+    // crashes before the window elapses, the task dies with the process and the
+    // probation marker stays armed (so the supervisor's post-stop `freenet
+    // update` can count the crash and eventually roll back).
+    let commit_probation_task = {
+        let version = build_info::VERSION.to_string();
+        GlobalExecutor::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                commands::rollback::COMMIT_HEALTHY_UPTIME_SECS,
+            ))
+            .await;
+            commands::rollback::commit_probation(&version);
+        })
+    };
+
     // Set up SIGTERM handler for Unix systems
     #[cfg(unix)]
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -378,13 +397,24 @@ async fn run_network_node_with_signals(
             "Startup update check against GitHub"
         );
         if let Some(new_version) = startup_update_check(build_info::VERSION).await {
-            tracing::info!(
-                new_version = %new_version,
-                "Startup check: newer version on GitHub, triggering auto-update"
-            );
-            #[allow(clippy::let_underscore_must_use)]
-            let _ = update_tx.send(new_version);
-            return;
+            // #4073: don't auto-update to a version pinned known-bad on this
+            // node by a prior crash-loop rollback (the installer would refuse it
+            // anyway; this avoids a needless restart).
+            if commands::rollback::is_version_pinned_bad(&new_version) {
+                tracing::warn!(
+                    new_version = %new_version,
+                    "Startup check: newer version is pinned known-bad after a crash-loop rollback; \
+                     not triggering auto-update (#4073)"
+                );
+            } else {
+                tracing::info!(
+                    new_version = %new_version,
+                    "Startup check: newer version on GitHub, triggering auto-update"
+                );
+                #[allow(clippy::let_underscore_must_use)]
+                let _ = update_tx.send(new_version);
+                return;
+            }
         }
         tracing::debug!("Startup update check: no newer version found");
 
@@ -438,6 +468,19 @@ async fn run_network_node_with_signals(
                     UpdateCheckResult::Skipped => {
                         // GitHub not reachable or no update yet; will retry next tick
                     }
+                    UpdateCheckResult::PinnedKnownBad => {
+                        // #4073: the only newer release is pinned known-bad on
+                        // this node after a crash-loop rollback. Stop trying to
+                        // exit for it (the updater would only refuse it). Clear
+                        // the driving signals; they re-arm on the next peer
+                        // handshake, which will pick up a later, strictly-newer fix.
+                        clear_urgent_update();
+                        clear_version_mismatch();
+                        tracing::warn!(
+                            "Urgent update target is pinned known-bad after a crash-loop \
+                             rollback; staying put (#4073)"
+                        );
+                    }
                 }
             }
 
@@ -484,6 +527,19 @@ async fn run_network_node_with_signals(
                                     stagger_deadline = None;
                                     stagger_cooldown_until =
                                         Some(Instant::now() + STAGGER_COOLDOWN);
+                                }
+                                UpdateCheckResult::PinnedKnownBad => {
+                                    // #4073: discovered version is pinned known-bad
+                                    // after a crash-loop rollback. Drop the stagger
+                                    // and cool down (don't re-arm every tick); a
+                                    // later strictly-newer fix will re-trigger.
+                                    stagger_deadline = None;
+                                    stagger_cooldown_until =
+                                        Some(Instant::now() + STAGGER_COOLDOWN);
+                                    tracing::warn!(
+                                        "Staggered update target is pinned known-bad after a \
+                                         crash-loop rollback; cooling down (#4073)"
+                                    );
                                 }
                             }
                         }
@@ -559,6 +615,21 @@ async fn run_network_node_with_signals(
                         clear_version_mismatch();
                     }
                     UpdateCheckResult::Skipped => {}
+                    UpdateCheckResult::PinnedKnownBad => {
+                        // #4073: the gateway-advertised newer release is pinned
+                        // known-bad after a crash-loop rollback. Clear the
+                        // mismatch so the legacy "max-backoff + 0 connections ->
+                        // exit 42" / hard-timeout fallbacks never fire for a
+                        // version the updater will only refuse — that would be a
+                        // slow exit-42 restart loop. The flag re-arms on the next
+                        // mismatch handshake, catching a later strictly-newer fix.
+                        clear_version_mismatch();
+                        isolated_mismatch_since = None;
+                        tracing::warn!(
+                            "Version-mismatch update target is pinned known-bad after a \
+                             crash-loop rollback; staying put (#4073)"
+                        );
+                    }
                 }
             } else {
                 isolated_mismatch_since = None;
@@ -589,6 +660,7 @@ async fn run_network_node_with_signals(
     // Clean up tasks
     signal_task.abort();
     update_check_task.abort();
+    commit_probation_task.abort();
     #[cfg(all(unix, feature = "jemalloc-prof"))]
     heap_dump_task.abort();
 
@@ -1299,6 +1371,47 @@ mod tests {
             guard_body.contains("tracing::warn!"),
             "the dirty-build auto-update-disabled branch must log at warn! so it \
              is operator-visible (#4580)"
+        );
+    }
+
+    /// #4073: a version pinned known-bad after a crash-loop rollback must never
+    /// cause the node to exit for auto-update — the updater would only refuse it,
+    /// producing a slow exit-42 restart loop (the Codex finding on the reworked
+    /// PR). Every `UpdateCheckResult::PinnedKnownBad` arm in the update loop must
+    /// therefore handle the case WITHOUT calling `update_tx.send` (the only thing
+    /// that drives the exit-42 update path).
+    #[test]
+    fn pinned_known_bad_never_triggers_exit_42() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        // Build the needle from fragments so this test's OWN source text does not
+        // self-match the contiguous arm marker (include_str! pulls in this file).
+        let needle = concat!("UpdateCheckResult::", "PinnedKnownBad =>");
+        let arms: Vec<&str> = src.split(needle).skip(1).collect();
+        assert_eq!(
+            arms.len(),
+            3,
+            "expected a PinnedKnownBad arm in each of the 3 update-trigger \
+             priorities (urgent / stagger / legacy mismatch) (#4073)"
+        );
+        for (i, arm) in arms.iter().enumerate() {
+            // Bound each arm to before the next match's first arm (capped at 400
+            // chars) so a later UpdateAvailable send can't leak into the window.
+            let end = arm
+                .find("UpdateCheckResult::")
+                .unwrap_or(arm.len())
+                .min(400);
+            let body = &arm[..end];
+            assert!(
+                !body.contains("update_tx.send"),
+                "PinnedKnownBad arm #{i} must NOT send an update — exiting 42 to a \
+                 pinned version would loop (#4073)"
+            );
+        }
+        // The legacy-mismatch arm must also clear the mismatch flag so the
+        // max-backoff / hard-timeout exit-42 fallbacks never fire.
+        assert!(
+            src.contains("Version-mismatch update target is pinned known-bad"),
+            "the legacy-mismatch PinnedKnownBad arm must clear the mismatch flag (#4073)"
         );
     }
 

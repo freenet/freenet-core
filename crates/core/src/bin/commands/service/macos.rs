@@ -298,7 +298,10 @@ while true; do
 
     if [ $EXIT_CODE -eq 42 ]; then
         log_event "Update needed, running freenet update..."
-        if "{binary}" update --quiet; then
+        # Pass the node's exit code so crash-loop auto-rollback (#4073) can tell
+        # a post-stop restart from a manual update and count crashes of a
+        # probationary version.
+        if {post_stop_env}=$EXIT_CODE "{binary}" update --quiet; then
             log_event "Update successful, restarting..."
             CONSECUTIVE_FAILURES=0
             PORT_CONFLICT_KILLS=0
@@ -343,6 +346,22 @@ while true; do
             else
                 log_event "Port conflict persists after $MAX_PORT_CONFLICT_KILLS kill attempts. Manual intervention may be required ('pkill freenet'). Backing off..."
             fi
+        else
+            # #4073 crash-loop rollback / self-heal: a genuine non-graceful crash
+            # (panic, SIGSEGV/SIGABRT, early-startup error — NOT a port conflict).
+            # Run the post-stop updater with the exit code forwarded: if a
+            # freshly-installed version on probation keeps crashing it rolls back
+            # to the previous binary, and a genuine newer release self-heals
+            # forward. Exit 0 => binary changed (rolled back or updated) =>
+            # restart immediately; any other status => fall through to backoff.
+            if {post_stop_env}=$EXIT_CODE "{binary}" update --quiet; then
+                log_event "Post-crash update/rollback applied (exit $EXIT_CODE); restarting..."
+                CONSECUTIVE_FAILURES=0
+                PORT_CONFLICT_KILLS=0
+                BACKOFF=10
+                sleep 2
+                continue
+            fi
         fi
         CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
         PORT_CONFLICT_KILLS=0
@@ -355,6 +374,7 @@ done
 "#,
         binary = binary_path.display(),
         supervised_env = super::super::auto_update::SUPERVISED_ENV_VAR,
+        post_stop_env = super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR,
     )
 }
 

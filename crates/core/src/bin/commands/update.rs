@@ -8,6 +8,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::rollback;
+
 #[cfg(target_os = "macos")]
 use super::service::generate_wrapper_script;
 #[cfg(target_os = "linux")]
@@ -194,6 +196,70 @@ impl UpdateCommand {
     }
 
     async fn run_async(&self, current_version: &str) -> Result<()> {
+        // #4073 crash-loop auto-rollback. When a supervisor runs `freenet
+        // update` immediately after the node stopped, it forwards the node's
+        // stop status (exit code or signal name) via POST_STOP_EXIT_CODE_ENV_VAR.
+        // If that status is a crash and we are in post-update probation, count
+        // it and roll back to the known-good binary once the crash threshold is
+        // reached — instead of performing a normal update. This needs no network
+        // call, so the crash/rollback path never depends on GitHub being
+        // reachable.
+        if let Some(status) = rollback::post_stop_status_from_env() {
+            match rollback::handle_post_stop(&status, current_version) {
+                rollback::PostStopOutcome::Proceed => {
+                    // Not a probation crash (clean/voluntary stop, no probation,
+                    // or a stale marker): fall through to the normal update flow.
+                }
+                rollback::PostStopOutcome::CrashRecorded { crash_count } => {
+                    // Critical brick-safety signal: emit on stderr even under
+                    // --quiet (the supervisor routes it to the journal/log).
+                    eprintln!(
+                        "Freenet {current_version}: crash {crash_count}/{} during post-update \
+                         probation (node stop status {status}); not updating, will auto-roll-back \
+                         if it keeps crashing.",
+                        rollback::ROLLBACK_CRASH_THRESHOLD,
+                    );
+                    tracing::warn!(
+                        version = current_version,
+                        crash_count,
+                        node_stop_status = %status,
+                        threshold = rollback::ROLLBACK_CRASH_THRESHOLD,
+                        "Post-update probation crash recorded (#4073)"
+                    );
+                    // Exit "already up to date" so the supervisor backs off and
+                    // restarts the same binary rather than treating this as a
+                    // successful update.
+                    std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+                }
+                rollback::PostStopOutcome::RolledBack {
+                    restored_version,
+                    bad_version,
+                } => {
+                    eprintln!(
+                        "Freenet auto-rollback (#4073): version {bad_version} crash-looped after \
+                         an update; restored known-good {restored_version} and pinned {bad_version} \
+                         as known-bad on this node so it will not be re-applied automatically."
+                    );
+                    tracing::error!(
+                        bad_version = %bad_version,
+                        restored_version = %restored_version,
+                        "Auto-rolled back a crash-looping update (#4073)"
+                    );
+                    // Exit success so the supervisor restarts the restored binary.
+                    std::process::exit(0);
+                }
+                rollback::PostStopOutcome::RollbackUnavailable { reason } => {
+                    eprintln!(
+                        "Freenet auto-rollback (#4073) could not run ({reason}); leaving the node \
+                         to the supervisor's own crash limiter / operator. Run `freenet update \
+                         --force` once a fixed release is available."
+                    );
+                    tracing::error!(reason = %reason, "Auto-rollback unavailable (#4073)");
+                    std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+                }
+            }
+        }
+
         if !self.quiet {
             println!("Current version: {}", current_version);
             println!("Checking for updates...");
@@ -241,13 +307,36 @@ impl UpdateCommand {
             return Ok(());
         }
 
+        // #4073 crash-loop auto-rollback: refuse to (re-)install a version that
+        // a prior crash-loop rollback pinned as known-bad on THIS node, unless
+        // the operator explicitly forces it. This is what stops the
+        // update → crash → revert → re-update loop. A strictly-newer release (a
+        // fix) is not pinned and installs normally.
+        if !self.force && rollback::is_version_pinned_bad(latest_version) {
+            if !self.quiet {
+                println!(
+                    "Version {latest_version} is pinned as known-bad on this node after a previous \
+                     crash-loop; refusing to re-install it. Run `freenet update --force` to override."
+                );
+            }
+            tracing::warn!(
+                version = latest_version,
+                "Refusing to install a version pinned known-bad after crash-loop rollback (#4073)"
+            );
+            // Behave like 'already up to date' so a supervisor does not
+            // restart-loop trying to apply the bad version: there is nothing
+            // safe to install.
+            super::auto_update::clear_update_failures();
+            std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+        }
+
         if !self.quiet {
             println!("Downloading update...");
         }
-        self.download_and_install(&latest).await
+        self.download_and_install(&latest, current_version).await
     }
 
-    async fn download_and_install(&self, release: &Release) -> Result<()> {
+    async fn download_and_install(&self, release: &Release, current_version: &str) -> Result<()> {
         // macOS DMG-swap path: when running from inside a .app bundle,
         // in-place binary replacement would invalidate the bundle's code
         // signature and Gatekeeper would refuse to launch the result on
@@ -275,6 +364,19 @@ impl UpdateCommand {
                     if !self.quiet {
                         println!("Bundle update staged. Freenet will relaunch shortly.");
                     }
+                    // SCOPE NOTE (#4073): crash-loop auto-rollback is binary-level
+                    // (snapshot the previous binary, restore it on a crash loop).
+                    // It deliberately does NOT cover the macOS .app DMG-swap path:
+                    // reverting a bundle means retaining and re-swapping a whole
+                    // signed+notarized .app via the detached updater, a separate
+                    // mechanism out of scope here. We therefore exit BEFORE arming
+                    // probation — no probation marker is created for a bundle
+                    // update, so the post-stop handler (reached if a macOS
+                    // supervisor forwards the exit code) simply finds no marker and
+                    // proceeds normally, exactly as before this change. A
+                    // crash-looping DMG release is still bounded by the wrapper's
+                    // own consecutive-failure cap, unchanged. Bundle rollback is
+                    // tracked as future work.
                     std::process::exit(EXIT_CODE_BUNDLE_UPDATE_STAGED);
                 }
                 Ok(false) => {
@@ -392,6 +494,33 @@ impl UpdateCommand {
             extract_binary(&freenet_archive_path, &freenet_extract_dir, "freenet")?;
 
         let current_exe = std::env::current_exe().context("Failed to get current executable")?;
+
+        // #4073 crash-loop auto-rollback: decide the rollback target BEFORE
+        // overwriting the live binary. `prepare_known_good_for_install` computes
+        // the snapshot blob AND its matching version label together, so they can
+        // never diverge: a genuine chained in-probation install keeps the
+        // existing known-good; anything else (no marker, a stale marker, or an
+        // externally-deleted blob) snapshots the about-to-be-replaced binary
+        // fresh and labels it the version we're replacing. A capture failure
+        // (e.g. disk full) does not block the update — it just means no rollback
+        // safety net for this cycle.
+        let known_good = match rollback::prepare_known_good_for_install(
+            current_version,
+            &current_exe,
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(e) => {
+                if !self.quiet {
+                    eprintln!(
+                        "Warning: failed to snapshot known-good binary for crash-loop \
+                             rollback: {e}. Proceeding without rollback protection for this update."
+                    );
+                }
+                tracing::warn!(error = %e, "Failed to capture known-good rollback binary (#4073)");
+                None
+            }
+        };
+
         // The failure-counter record/clear is scoped to the install step
         // specifically, NOT to any earlier download / checksum / extract
         // failure. Those are transient (transient GitHub outage, flaky
@@ -408,6 +537,29 @@ impl UpdateCommand {
             Err(e) => {
                 super::auto_update::record_update_failure();
                 return Err(e);
+            }
+        }
+
+        // Arm crash-loop rollback for the freshly-installed version. Skipped
+        // when we have no known-good binary to fall back to, so we never
+        // advertise a rollback target we cannot honour. A failure to persist the
+        // probation marker (full/unwritable state dir) does NOT fail the update
+        // — the binary is already installed — but it MUST be surfaced, since the
+        // new version then has no rollback protection.
+        if let Some((meta, previous_version)) = known_good {
+            if let Err(e) = rollback::begin_probation(
+                release.tag_name.trim_start_matches('v'),
+                &previous_version,
+                &current_exe,
+                &meta,
+            ) {
+                if !self.quiet {
+                    eprintln!(
+                        "Warning: installed the update but failed to arm crash-loop rollback \
+                         protection: {e}. If this version crash-loops it will NOT auto-roll-back."
+                    );
+                }
+                tracing::warn!(error = %e, "Failed to arm crash-loop rollback probation (#4073)");
             }
         }
 
@@ -864,6 +1016,12 @@ impl Checksums {
 async fn get_latest_release() -> Result<Release> {
     let client = reqwest::Client::builder()
         .user_agent("freenet-updater")
+        // Bound the request (parity with auto_update::get_latest_version). The
+        // broadened post-stop ExecStopPost reaches this on every committed
+        // crash's Proceed path, so a hung GitHub connection during a crash must
+        // not stall the post-stop updater (only loosely bounded by
+        // TimeoutStopSec on systemd, and worse under the mac/in-process wrapper).
+        .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
     let response = client

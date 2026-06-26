@@ -151,6 +151,16 @@ pub enum UpdateCheckResult {
     /// Checked GitHub, newer version confirmed.
     /// The caller should clear the version mismatch flag.
     UpdateAvailable(String),
+    /// The newer version on GitHub is pinned known-bad on this node by a prior
+    /// crash-loop rollback (#4073). Distinct from [`Skipped`] so the caller does
+    /// NOT fall through to the legacy "max-backoff + 0 connections -> exit 42"
+    /// fallback: there is nothing safe to update to, so the node must stay put.
+    /// The caller should CLEAR the driving signal (version-mismatch / urgent) so
+    /// it stops trying to exit for this update; the signal re-arms on the next
+    /// peer handshake, which will pick up a later, strictly-newer fix.
+    ///
+    /// [`Skipped`]: UpdateCheckResult::Skipped
+    PinnedKnownBad,
 }
 
 /// Check if an update is available, respecting rate limits and failure counts.
@@ -242,6 +252,29 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
             };
 
             if latest_ver > current {
+                // #4073 crash-loop auto-rollback: never trigger an exit-42
+                // update to a version pinned known-bad on this node by a prior
+                // rollback. The installer would refuse it anyway; skipping here
+                // also avoids a pointless restart cycle. The mismatch flag is
+                // kept (Skipped) so a later, strictly-newer fixed release is
+                // still picked up.
+                if super::rollback::is_version_pinned_bad(&latest) {
+                    tracing::warn!(
+                        version = %latest,
+                        "Newer version is pinned known-bad after a crash-loop rollback; not \
+                         triggering auto-update to it (#4073)"
+                    );
+                    // Distinct result (NOT Skipped) so the caller clears the
+                    // driving signal and does not fall through to the legacy
+                    // max-backoff exit-42 fallback. GROW the GitHub-check backoff
+                    // (do NOT reset it): a node that has already rolled back to a
+                    // good version is in no hurry to find the fix, so it should
+                    // poll at most hourly rather than at the 60s floor while
+                    // peers keep advertising the pinned-bad version. An hourly
+                    // check still catches a later strictly-newer release.
+                    increase_backoff();
+                    return UpdateCheckResult::PinnedKnownBad;
+                }
                 tracing::info!(
                     current = %current_version,
                     latest = %latest,
@@ -305,7 +338,12 @@ async fn get_latest_version() -> Result<String> {
 }
 
 /// Get the state directory for update tracking files.
-fn state_dir() -> Option<PathBuf> {
+///
+/// `pub(crate)` so the crash-loop auto-rollback module (`commands::rollback`)
+/// persists its probation / known-bad markers in the SAME directory as the
+/// auto-update failure counter and backoff state, ensuring both the node and
+/// the supervisor-invoked `freenet update` agree on a single state location.
+pub(crate) fn state_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".local/state/freenet"))
 }
 

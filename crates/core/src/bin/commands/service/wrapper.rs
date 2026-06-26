@@ -586,12 +586,30 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
 /// #3934 (which was also the root cause of "Check for Updates" being
 /// broken in #3933). Null stdio is harmless on macOS/Linux because
 /// `--quiet` already suppresses all output.
-pub(super) fn spawn_update_command(exe_path: &Path) -> std::io::Result<std::process::ExitStatus> {
+///
+/// `post_stop_exit_code` is `Some(code)` ONLY when this update runs as part of
+/// the node's restart cycle (the node exited `code` and the wrapper is applying
+/// the update before relaunching). In that case the node's exit code is passed
+/// through [`POST_STOP_EXIT_CODE_ENV_VAR`] so `freenet update` can drive
+/// crash-loop auto-rollback (#4073). It MUST be `None` for tray / manual
+/// "Check for Updates" invocations, which are not crashes and must never be
+/// counted toward a rollback.
+pub(super) fn spawn_update_command(
+    exe_path: &Path,
+    post_stop_exit_code: Option<i32>,
+) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new(exe_path);
     cmd.args(["update", "--quiet"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+
+    if let Some(code) = post_stop_exit_code {
+        cmd.env(
+            super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR,
+            code.to_string(),
+        );
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -887,7 +905,8 @@ fn run_wrapper_loop(
                             // wrapper so the tray shows the correct new version.
                             // Exit 2 means already up to date — no restart needed.
                             status_tx.send(WrapperStatus::Updating).ok();
-                            let result = spawn_update_command(&exe_path);
+                            // Manual tray check: not a crash, so no post-stop code.
+                            let result = spawn_update_command(&exe_path, None);
                             match result {
                                 Ok(s) if s.success() => {
                                     log_wrapper_event(
@@ -977,7 +996,8 @@ fn run_wrapper_loop(
                             super::super::tray::TrayAction::CheckUpdate => {
                                 // Allow checking for updates even while stopped
                                 status_tx.send(WrapperStatus::Updating).ok();
-                                let result = spawn_update_command(&exe_path);
+                                // Manual tray check: not a crash, so no post-stop code.
+                                let result = spawn_update_command(&exe_path, None);
                                 match result {
                                     Ok(s) if s.success() => {
                                         log_wrapper_event(
@@ -1035,6 +1055,55 @@ fn run_wrapper_loop(
             .map(|s| s.contains("already in use"))
             .unwrap_or(false);
 
+        // #4073 crash-loop auto-rollback (in-process). The exit-42 path below
+        // handles the voluntary-update code. Here we catch the OTHER non-graceful
+        // crash exits the watchdog never produces — panics (101), signal deaths
+        // (surfaced as exit code 1 here), and early-startup errors (1) — so a
+        // freshly-installed version that crash-loops on one of those still rolls
+        // back. Gated on an existing probation marker so an ordinary crash of a
+        // committed version never spawns an updater subprocess. Forwarding the
+        // exit code lets `freenet update` classify and count the crash locally
+        // (no GitHub call); if it rolled the binary back, re-exec the wrapper so
+        // the restored binary runs.
+        //
+        // NOTE: intentional, benign difference from the macOS launchd wrapper
+        // script — that script does NOT pre-gate on a probation marker (it can't
+        // cheaply read one from shell), so a committed-version crash there spawns
+        // `freenet update` (which finds no marker -> Proceed). Both are safe; the
+        // in-process gate just avoids an unnecessary subprocess in the common
+        // committed-crash case where we have the marker check in hand.
+        if exit_code != 0
+            && exit_code != WRAPPER_EXIT_ALREADY_RUNNING
+            && exit_code != WRAPPER_EXIT_UPDATE_NEEDED
+            && !is_port_conflict
+            && super::super::rollback::read_probation().is_some()
+        {
+            log_wrapper_event(
+                log_dir,
+                &format!(
+                    "Crash (exit {exit_code}) during update probation; checking crash-loop rollback..."
+                ),
+            );
+            let result = spawn_update_command(&exe_path, Some(exit_code));
+            if matches!(
+                super::super::update::classify_update_subprocess(&result),
+                super::super::update::UpdateSubprocessOutcome::BinaryReplaced
+            ) {
+                log_wrapper_event(
+                    log_dir,
+                    "Crash-loop auto-rollback restored the previous binary; restarting wrapper",
+                );
+                if spawn_new_wrapper(&exe_path, log_dir) {
+                    return Ok(());
+                }
+                // Re-exec failed: relaunch the child with the (now restored)
+                // on-disk binary rather than leaving no node running.
+                continue;
+            }
+            // Crash recorded / rollback unavailable: fall through to the normal
+            // crash backoff via the state machine below.
+        }
+
         // For exit code 42, run the update first and pass result to state machine.
         // On Windows, this works because replace_binary() renames the running exe
         // (freenet.exe → freenet.exe.old) rather than deleting it. Windows allows
@@ -1049,7 +1118,9 @@ fn run_wrapper_loop(
                 status_tx.send(WrapperStatus::Updating).ok();
             }
 
-            let result = spawn_update_command(&exe_path);
+            // Post-stop auto-update: pass the node's exit code so `freenet
+            // update` can drive crash-loop auto-rollback (#4073).
+            let result = spawn_update_command(&exe_path, Some(exit_code));
             let outcome = super::super::update::classify_update_subprocess(&result);
 
             // Drive the persistent auto-update failure counter used by
@@ -1230,7 +1301,9 @@ fn run_wrapper_loop(
                             #[cfg(any(target_os = "windows", target_os = "macos"))]
                             if let Some((_, status_tx)) = tray {
                                 status_tx.send(WrapperStatus::Updating).ok();
-                                let result = spawn_update_command(&exe_path);
+                                // Manual "Check for Updates" during backoff: not
+                                // a crash, so no post-stop code (#4073).
+                                let result = spawn_update_command(&exe_path, None);
                                 let outcome =
                                     super::super::update::classify_update_subprocess(&result);
 

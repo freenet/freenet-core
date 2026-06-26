@@ -1207,16 +1207,24 @@ mod tests {
             "ExecStopPost must use the doubled $$EXIT_STATUS so systemd passes a \
              literal $EXIT_STATUS to sh (a single-$ revert silently breaks auto-update)"
         );
-        // #4551: ExecStopPost must fire `freenet update` for BOTH exit 42 (healthy
-        // node hit a fault/update) AND exit 45 (fast boot-crash) — firing on 45
-        // preserves the #4549 self-heal for a boot-crash a newer release fixes, while
-        // 45 staying out of SuccessExitStatus still counts it toward StartLimitBurst.
-        // A `case` (not `&&`/`||`) avoids shell-precedence pitfalls.
+        // #4073 / #4551: ExecStopPost must fire `freenet update` for ANY
+        // non-graceful exit — every status except 0 (graceful) and 43 (another
+        // instance) — so it covers the voluntary update-needed 42, the fast-crash
+        // 45, AND the panic/signal/early-error codes the watchdog never produces.
+        // Firing broadly preserves the #4549 self-heal AND enables crash-loop
+        // rollback (#4073); 45 and the crash codes staying out of
+        // SuccessExitStatus still count toward StartLimitBurst. A `case` (not
+        // `&&`/`||`) avoids shell-precedence pitfalls.
         assert!(
-            service_content.contains("case \"$$EXIT_STATUS\" in 42|45)")
+            service_content.contains("case \"$$EXIT_STATUS\" in 0|43) ;; *)")
                 && service_content.contains("update --quiet"),
-            "ExecStopPost must run `freenet update` for exit 42 OR 45 via a case \
-             statement (boot-crash self-heal preserved; #4551)"
+            "ExecStopPost must run `freenet update` for any non-graceful exit via a \
+             case that skips only 0 and 43 (#4073 broadened crash coverage; #4551)"
+        );
+        assert!(
+            !service_content.contains("42|45)"),
+            "ExecStopPost must not use the narrow 42|45 guard — it misses \
+             panic/signal/early-error crashes (#4073 M1)"
         );
         // #4551: the unit must advertise fast-crash (exit-45) support via the marker
         // env var the node gates on. Using the const (not a literal) pins template,
@@ -1309,12 +1317,18 @@ mod tests {
                 && service_content.contains("\"$$EXIT_STATUS\""),
             "ExecStopPost must use the doubled $$EXIT_STATUS (single-$ revert breaks auto-update)"
         );
-        // #4551: ExecStopPost fires `freenet update` for exit 42 OR 45 (system unit too).
+        // #4073 / #4551: ExecStopPost fires `freenet update` for ANY non-graceful
+        // exit (every status except 0 and 43) — system unit too.
         assert!(
-            service_content.contains("case \"$$EXIT_STATUS\" in 42|45)")
+            service_content.contains("case \"$$EXIT_STATUS\" in 0|43) ;; *)")
                 && service_content.contains("update --quiet"),
-            "ExecStopPost must run `freenet update` for exit 42 OR 45 via a case \
-             statement (boot-crash self-heal preserved; #4551)"
+            "ExecStopPost must run `freenet update` for any non-graceful exit via a \
+             case that skips only 0 and 43 (#4073 broadened crash coverage; #4551)"
+        );
+        assert!(
+            !service_content.contains("42|45)"),
+            "ExecStopPost must not use the narrow 42|45 guard — it misses \
+             panic/signal/early-error crashes (#4073 M1)"
         );
         // #4551: system unit must also set the fast-crash (exit-45) support marker.
         assert!(
@@ -3266,6 +3280,53 @@ echo "RC=$?"
                 pattern
             );
         }
+    }
+
+    /// #4073 crash-loop auto-rollback (cross-platform source-scrape pins).
+    ///
+    /// The supervisor → updater handoff that drives rollback is platform-gated
+    /// (systemd unit / macOS shell wrapper / in-process wrapper), so these
+    /// pins assert the wiring exists in the source on every CI platform rather
+    /// than only where the cfg'd code compiles.
+    #[test]
+    fn macos_wrapper_passes_node_exit_code_to_post_stop_update() {
+        let src = include_str!("service/macos.rs");
+        // The wrapper script must run `freenet update` with the node's exit code
+        // exported (only on the exit-42 update/crash branch), and bind the env
+        // name from the rollback module's constant.
+        assert!(
+            src.contains("{post_stop_env}=$EXIT_CODE \"{binary}\" update --quiet"),
+            "macOS wrapper must pass the node exit code to its post-stop \
+             `freenet update` for crash-loop auto-rollback (#4073)"
+        );
+        assert!(
+            src.contains("post_stop_env = super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR"),
+            "macOS wrapper must source the post-stop env var name from the \
+             rollback module so the two cannot drift (#4073)"
+        );
+    }
+
+    #[test]
+    fn in_process_wrapper_only_passes_exit_code_on_post_crash_update() {
+        let src = include_str!("service/wrapper.rs");
+        // The post-crash auto-update path passes the node's exit code.
+        assert!(
+            src.contains("spawn_update_command(&exe_path, Some(exit_code))"),
+            "the wrapper's post-stop auto-update must pass Some(exit_code) so \
+             `freenet update` can drive crash-loop auto-rollback (#4073)"
+        );
+        // Manual / tray "Check for Updates" paths must NOT pass an exit code —
+        // they are not crashes and must never be counted toward a rollback.
+        assert!(
+            src.contains("spawn_update_command(&exe_path, None)"),
+            "manual tray update paths must pass None so they are not counted as \
+             probation crashes (#4073)"
+        );
+        assert!(
+            src.contains("POST_STOP_EXIT_CODE_ENV_VAR"),
+            "spawn_update_command must set the post-stop env var from the \
+             rollback module constant (#4073)"
+        );
     }
 
     /// Source-level regression pin for the `FreeConsole()` rule, mirroring
