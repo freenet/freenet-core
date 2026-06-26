@@ -298,6 +298,28 @@ has_user_unit() {
     [ -f "${HOME:-}/.config/systemd/user/freenet.service" ]
 }
 
+# Echo the `User=` value of the existing system unit (empty if none/unset).
+existing_system_unit_user() {
+    [ -f /etc/systemd/system/freenet.service ] || return 0
+    sed -n 's/^User=//p' /etc/systemd/system/freenet.service 2>/dev/null | head -n1
+}
+
+# Decide whether it is safe to refresh an existing system unit. The binary
+# derives the service `User=` (and home/log/ExecStart paths) from the user the
+# refresh runs as, so refreshing as a DIFFERENT user would silently re-point
+# the service and orphan the original node's data/identity. Only refresh when
+# the unit's current user matches (or can't be determined). Pure + testable.
+#   $1 = existing `User=` value (may be empty)
+#   $2 = user the refresh would run as
+# Echoes "refresh" or "skip".
+should_refresh_system_unit() {
+    if [ -z "$1" ] || [ "$1" = "$2" ]; then
+        echo "refresh"
+    else
+        echo "skip"
+    fi
+}
+
 # Decide whether a fresh supervised Linux install should be a system service
 # or a user service. Pure function of two booleans so it is unit-testable.
 #   $1 = am_root     ("1"/"0")
@@ -387,6 +409,24 @@ setup_service() {
     action=$(resolve_service_action "$interactive")
     case "$action" in
         system)
+            # Refresh guard: an existing system unit is re-templated using the
+            # user the refresh runs as. Refreshing it as a DIFFERENT user would
+            # silently re-point the service (User=/home/log/ExecStart) and
+            # orphan the original node. Skip the refresh in that case - the new
+            # binary is already on disk and is picked up on the next restart.
+            if has_system_unit; then
+                refresh_user="${SUDO_USER:-$(id -un 2>/dev/null)}"
+                existing_user=$(existing_system_unit_user)
+                if [ "$(should_refresh_system_unit "$existing_user" "$refresh_user")" = "skip" ]; then
+                    warn "An existing system service runs as user '$existing_user'."
+                    warn "Not refreshing it as '$refresh_user' - that would re-point the"
+                    warn "service and orphan the original node's data/identity."
+                    warn "The updated binary is in place; restart the service to use it,"
+                    warn "or re-run the installer as '$existing_user' to refresh the unit."
+                    return
+                fi
+            fi
+
             if is_root; then
                 # `curl ... | sudo sh` sets SUDO_USER, which the binary uses as
                 # the non-root service user; a pure-root login has no such user

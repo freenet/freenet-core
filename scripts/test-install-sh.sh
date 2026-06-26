@@ -144,6 +144,22 @@ check_eq "resolve: fresh + interactive + sudo present -> system" "system" \
         has_user_unit() { return 1; }
     ' 1)"
 
+# ── should_refresh_system_unit: same-user refresh guard ────────────────────
+
+# Pure helper: only refresh an existing system unit when the unit's current
+# user matches the user the refresh would run as (else the refresh silently
+# re-points the service to a different account).
+refresh_decision() {
+    FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+        . "$INSTALL"
+        should_refresh_system_unit "$1" "$2"
+    ' _ "$1" "$2"
+}
+
+check_eq "refresh: same user -> refresh"      "refresh" "$(refresh_decision alice alice)"
+check_eq "refresh: different user -> skip"    "skip"    "$(refresh_decision alice bob)"
+check_eq "refresh: empty existing -> refresh" "refresh" "$(refresh_decision '' bob)"
+
 # ── sourcing the lib must not perform an install ───────────────────────────
 #
 # With FREENET_INSTALL_SH_LIB=1, sourcing install.sh must define functions but
