@@ -355,6 +355,14 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
             .cloned()
     }
 
+    /// Whether any resident entry is cold (no interest). Early-terminating, so
+    /// it is O(1) when the first entry checked is cold (the common case) — used
+    /// by the flag-OFF shadow path to decide divergence without the full ordered
+    /// `lru_key_in_tier` scan.
+    fn has_cold_entry(&self) -> bool {
+        self.inner.iter().any(|(k, _)| !self.is_interested(k))
+    }
+
     /// Evict entries until `total_bytes <= budget_bytes`, keeping at least the
     /// single most-recently-used entry resident even if it alone exceeds the
     /// budget (so an oversized contract can still run).
@@ -374,28 +382,49 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
     /// `evictions_would_reclassify_total` is incremented for every step where the
     /// two-tier victim would differ from the plain-LRU victim, so the production
     /// data needed to justify flipping the flag is collected even with it OFF.
+    ///
+    /// # Cost of the default (flag-OFF) path
+    ///
+    /// The default path must NOT regress the historical O(evictions) pure-LRU
+    /// cost (this runs under the shared module-cache mutex). It doesn't: the
+    /// shadow `would_reclassify` check is O(1) when the absolute LRU is cold (the
+    /// common, healthy case — two-tier would evict the same entry, no scan), and
+    /// only walks the cache to confirm a colder cold entry exists when the LRU is
+    /// *interested* AND the flag is OFF. The full LRU-ordered cold-key scan
+    /// (`lru_key_in_tier`) runs ONLY when the flag is ON, where it is required to
+    /// pick the victim. (Codex review: don't scan on every default eviction.)
     fn evict_to_budget(&mut self) {
         let mut evicted_this_insert: u64 = 0;
         let mut would_reclassify: u64 = 0;
         // With no interest predicate (delegate / unlabeled caches) plain LRU and
-        // the two-tier policy are identical, so skip the O(n)-per-step cold-LRU
-        // scan entirely — these caches keep EXACTLY today's pure-byte-LRU cost.
+        // the two-tier policy are identical, so skip ALL tier work — these caches
+        // keep EXACTLY today's pure-byte-LRU cost.
         let has_interest = self.interest.is_some();
         while self.total_bytes > self.budget_bytes && self.inner.len() > 1 {
-            // The plain-LRU victim is always the absolute LRU. The two-tier
-            // victim is the LRU cold entry if one exists, else the LRU overall
-            // (== the plain-LRU victim). They diverge exactly when the absolute
-            // LRU is interested while some colder-or-equal cold entry exists.
+            // The plain-LRU victim is always the absolute LRU.
             let plain_victim = self.inner.peek_lru().map(|(k, _)| k.clone());
             let victim = if has_interest {
-                let two_tier_victim = self.lru_key_in_tier(false).or_else(|| plain_victim.clone());
-                if plain_victim != two_tier_victim {
-                    would_reclassify += 1;
-                }
-                // Choose the victim dictated by the ACTIVE policy.
                 if self.interest_tiered_active {
+                    // Flag ON: pick the LRU cold entry (fall back to plain LRU
+                    // when none) — the only path that needs the ordered scan.
+                    let two_tier_victim =
+                        self.lru_key_in_tier(false).or_else(|| plain_victim.clone());
+                    if plain_victim != two_tier_victim {
+                        would_reclassify += 1;
+                    }
                     two_tier_victim
                 } else {
+                    // Flag OFF: evict plain LRU. For the shadow counter, the
+                    // two-tier policy would only DIVERGE when the plain victim is
+                    // interested AND some cold entry exists to evict instead — so
+                    // do the O(1) interest check first and only confirm a cold
+                    // entry exists (early-terminating) in that rarer case. This
+                    // keeps the healthy "LRU is cold" case at O(1) per step.
+                    if plain_victim.as_ref().is_some_and(|k| self.is_interested(k))
+                        && self.has_cold_entry()
+                    {
+                        would_reclassify += 1;
+                    }
                     plain_victim
                 }
             } else {
