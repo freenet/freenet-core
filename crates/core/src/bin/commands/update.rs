@@ -15,6 +15,42 @@ use super::service::{generate_system_service_file, generate_user_service_file};
 
 const GITHUB_API_URL: &str = "https://api.github.com/repos/freenet/freenet-core/releases/latest";
 
+/// Ed25519 public key (raw 32-byte, little-endian compressed point) used to
+/// authenticate the release `SHA256SUMS.txt` manifest before any binary is
+/// installed. The matching private key lives only in the
+/// `FREENET_RELEASE_SIGNING_KEY` CI secret; the release workflow signs the
+/// raw manifest bytes with it and uploads `SHA256SUMS.txt.sig` alongside the
+/// manifest (see `.github/workflows/cross-compile.yml`).
+///
+/// Authenticating the manifest is what makes the existing fail-closed
+/// checksum gate trustworthy: the checksums verify the binary against the
+/// manifest, and this signature verifies the manifest against a key the
+/// attacker does not hold.
+///
+/// The hex form (pinned by `release_pubkey_matches_published_hex`) is:
+/// `eb2986604e34a3f985279a7e70852f3764d3347fe82074d92b1e4bc6336f8664`.
+const FREENET_RELEASE_PUBKEY: [u8; 32] = [
+    0xeb, 0x29, 0x86, 0x60, 0x4e, 0x34, 0xa3, 0xf9, 0x85, 0x27, 0x9a, 0x7e, 0x70, 0x85, 0x2f, 0x37,
+    0x64, 0xd3, 0x34, 0x7f, 0xe8, 0x20, 0x74, 0xd9, 0x2b, 0x1e, 0x4b, 0xc6, 0x33, 0x6f, 0x86, 0x64,
+];
+
+/// Whether a release MUST carry a valid `SHA256SUMS.txt.sig` for the install
+/// to proceed.
+///
+/// Two-release transition (do NOT flip this in the same release that first
+/// ships signing):
+///   * **false (now):** when the signature asset is PRESENT it is always
+///     verified and an invalid/mismatched signature refuses the install
+///     (fail-closed); when it is ABSENT the install is still allowed (with a
+///     warning) so a node can keep updating to/from older, unsigned release
+///     lineages that predate signing.
+///   * **true (a later release):** an absent signature ALSO refuses the
+///     install. Only flip this once every release a live node could be
+///     updating from publishes a signature — i.e. after the signed floor is
+///     established — otherwise nodes on the unsigned lineage brick their own
+///     auto-update.
+const REQUIRE_RELEASE_SIGNATURE: bool = false;
+
 /// Exit code returned when the binary is already up to date (no update performed).
 /// Used by the service wrapper to avoid unnecessary restarts.
 pub const EXIT_CODE_ALREADY_UP_TO_DATE: i32 = 2;
@@ -301,32 +337,25 @@ impl UpdateCommand {
 
         let fdev_asset = release.assets.iter().find(|a| a.name == fdev_asset_name);
 
-        // Try to download the SHA256SUMS.txt manifest. Checksum
-        // verification is MANDATORY (fail-closed) for the freenet binary
-        // install below — see the `required_checksum` gate. We still model
-        // acquisition as `Option` here so a manifest that is absent OR
-        // failed to download flows into the same single fail-closed gate
-        // (and so the best-effort fdev path can reuse it without aborting
-        // the whole run). Any specific download error is surfaced as a
-        // warning; the actual refusal-to-install happens at the gate.
-        let checksums = if let Some(checksums_asset) =
-            release.assets.iter().find(|a| a.name == "SHA256SUMS.txt")
-        {
-            if !self.quiet {
-                println!("Downloading checksums...");
-            }
-            match download_checksums(&checksums_asset.browser_download_url).await {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    if !self.quiet {
-                        eprintln!("Warning: Failed to download checksums: {}.", e);
-                    }
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // Download the SHA256SUMS.txt manifest AND authenticate it with the
+        // baked-in release public key before trusting any hash inside it.
+        //
+        // Order matters: the signature authenticates the *manifest*, then the
+        // fail-closed `required_checksum` gate below verifies the *binary*
+        // against that now-trusted manifest. Without the signature step the
+        // checksum gate only proves the binary matches whatever manifest was
+        // served — which an attacker who can serve a manifest could forge.
+        //
+        // `download_and_verify_checksums` returns `None` when the manifest is
+        // absent or its download failed (the fail-closed `required_checksum`
+        // gate then refuses the install); it returns `Err` only for a
+        // signature that is present-but-invalid (or absent when signatures
+        // are required). That refusal, like the checksum gate, propagates out
+        // of `download_and_install` BEFORE the `replace_binary` install step
+        // (the only site that calls `record_update_failure`), so it is a
+        // retryable `OtherFailure` (-> `NoChange`), never a
+        // `MAX_UPDATE_FAILURES` lockout.
+        let checksums = self.download_and_verify_checksums(release).await?;
 
         let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
@@ -500,6 +529,71 @@ impl UpdateCommand {
         }
 
         Ok(())
+    }
+
+    /// Download `SHA256SUMS.txt` and, when the release published it,
+    /// `SHA256SUMS.txt.sig`, returning the parsed checksums only after the
+    /// manifest has been authenticated against [`FREENET_RELEASE_PUBKEY`].
+    ///
+    /// Returns:
+    ///   * `Ok(Some(checksums))` — manifest downloaded and (per the
+    ///     transition policy) authenticated; callers feed this into the
+    ///     fail-closed `required_checksum` gate.
+    ///   * `Ok(None)` — the manifest asset is absent, or its download failed.
+    ///     The caller's `required_checksum` gate turns this into a fail-closed
+    ///     refusal for the freenet binary (and a skip for best-effort fdev).
+    ///   * `Err` — a signature was present but INVALID (tampering / wrong
+    ///     key), the signature asset existed but could not be downloaded, or
+    ///     a signature was required ([`REQUIRE_RELEASE_SIGNATURE`]) but
+    ///     absent. All are fail-closed refusals; because this runs before
+    ///     `replace_binary`, they are retryable `OtherFailure`s, not lockouts.
+    ///
+    /// The signature is verified over the EXACT bytes the checksums are parsed
+    /// from (same in-memory buffer), so there is no time-of-check/time-of-use
+    /// gap between "what was authenticated" and "what is trusted".
+    async fn download_and_verify_checksums(&self, release: &Release) -> Result<Option<Checksums>> {
+        let Some(checksums_asset) = release.assets.iter().find(|a| a.name == "SHA256SUMS.txt")
+        else {
+            // No manifest at all. Leave the fail-closed `required_checksum`
+            // gate to refuse the binary install; nothing to authenticate.
+            return Ok(None);
+        };
+
+        if !self.quiet {
+            println!("Downloading checksums...");
+        }
+        let manifest_bytes = match download_bytes(&checksums_asset.browser_download_url).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if !self.quiet {
+                    eprintln!("Warning: Failed to download checksums: {}.", e);
+                }
+                return Ok(None);
+            }
+        };
+
+        // Fetch the detached signature when the release published one. If the
+        // asset exists but cannot be fetched, refuse rather than silently
+        // downgrading to an unverified install — a signed manifest whose
+        // signature we merely failed to retrieve must not be trusted.
+        let signature = match release
+            .assets
+            .iter()
+            .find(|a| a.name == "SHA256SUMS.txt.sig")
+        {
+            Some(sig_asset) => Some(
+                download_bytes(&sig_asset.browser_download_url)
+                    .await
+                    .context("Failed to download release signature SHA256SUMS.txt.sig")?,
+            ),
+            None => None,
+        };
+
+        verify_release_manifest_signature(&manifest_bytes, signature.as_deref(), self.quiet)?;
+
+        Ok(Some(Checksums::parse(&String::from_utf8_lossy(
+            &manifest_bytes,
+        ))))
     }
 
     /// Try to update fdev, printing warnings on failure. Never returns an error —
@@ -785,7 +879,23 @@ async fn get_latest_release() -> Result<Release> {
         .context("Failed to parse release info")
 }
 
+// macOS DMG path only: the Linux/Windows binary path now goes through
+// `download_and_verify_checksums`, which fetches the raw manifest bytes via
+// `download_bytes` so the same buffer can be both signature-verified and
+// parsed. The macOS DMG is independently Apple-signed + notarized, so its
+// checksum check stays as-is for now.
+#[cfg(target_os = "macos")]
 async fn download_checksums(url: &str) -> Result<Checksums> {
+    let bytes = download_bytes(url).await?;
+    Ok(Checksums::parse(&String::from_utf8_lossy(&bytes)))
+}
+
+/// Download a small release asset fully into memory. Used for the
+/// `SHA256SUMS.txt` manifest and its `.sig` detached signature, where the
+/// caller needs the exact bytes (to verify a signature over them, or to feed
+/// to `Signature::from_bytes`) rather than streaming to a file like
+/// [`download_file`].
+async fn download_bytes(url: &str) -> Result<Vec<u8>> {
     let client = reqwest::Client::builder()
         .user_agent("freenet-updater")
         .build()?;
@@ -794,14 +904,102 @@ async fn download_checksums(url: &str) -> Result<Checksums> {
         .get(url)
         .send()
         .await
-        .context("Failed to download checksums")?;
+        .context("Failed to download release asset")?;
 
     if !response.status().is_success() {
-        anyhow::bail!("Failed to download checksums: {}", response.status());
+        anyhow::bail!("Download failed: {}", response.status());
     }
 
-    let content = response.text().await.context("Failed to read checksums")?;
-    Ok(Checksums::parse(&content))
+    Ok(response
+        .bytes()
+        .await
+        .context("Failed to read release asset body")?
+        .to_vec())
+}
+
+/// Authenticate the raw bytes of `SHA256SUMS.txt` against the baked-in
+/// [`FREENET_RELEASE_PUBKEY`], applying the [`REQUIRE_RELEASE_SIGNATURE`]
+/// transition policy. Thin wrapper over [`verify_manifest_signature_with`] so
+/// the policy core (pubkey + require flag injectable) is unit-testable without
+/// the real signing key and on every target OS.
+fn verify_release_manifest_signature(
+    manifest_bytes: &[u8],
+    signature: Option<&[u8]>,
+    quiet: bool,
+) -> Result<()> {
+    verify_manifest_signature_with(
+        manifest_bytes,
+        signature,
+        &FREENET_RELEASE_PUBKEY,
+        REQUIRE_RELEASE_SIGNATURE,
+        quiet,
+    )
+}
+
+/// Policy core for release-manifest signature verification. Pure (no I/O) and
+/// fully parameterised so tests can exercise every branch — valid signature,
+/// tampered manifest, wrong key, absent signature under both policies —
+/// without ever touching the real private key.
+///
+/// Fail-closed contract:
+///   * signature PRESENT  -> `verify_strict`; any failure (tamper, wrong key,
+///     malformed length) returns `Err` (refuse the install).
+///   * signature ABSENT   -> `Err` iff `require_signature`, else `Ok` with a
+///     warning (the transition allowance for unsigned older lineages).
+fn verify_manifest_signature_with(
+    manifest_bytes: &[u8],
+    signature: Option<&[u8]>,
+    pubkey: &[u8; 32],
+    require_signature: bool,
+    quiet: bool,
+) -> Result<()> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    let Some(sig_bytes) = signature else {
+        if require_signature {
+            anyhow::bail!(
+                "Release is missing SHA256SUMS.txt.sig but a release signature is required; \
+                 refusing to install. The release must publish a signed checksum manifest."
+            );
+        }
+        if !quiet {
+            eprintln!(
+                "Warning: release did not publish SHA256SUMS.txt.sig; \
+                 installing without release-signature verification."
+            );
+        }
+        return Ok(());
+    };
+
+    // ed25519 signatures are exactly 64 bytes. A wrong length means the asset
+    // is truncated or not a raw signature — refuse rather than guess.
+    let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "Release signature has wrong length ({} bytes, expected 64); refusing to install.",
+            sig_bytes.len()
+        )
+    })?;
+    let parsed_signature = Signature::from_bytes(&sig_array);
+
+    let verifying_key = VerifyingKey::from_bytes(pubkey)
+        .context("Baked-in release public key is invalid; refusing to install")?;
+
+    // `verify_strict` rejects non-canonical / small-order points (the same
+    // hardening the website contract uses). A failure here means the manifest
+    // was tampered with or signed by a key we don't trust: fail closed.
+    verifying_key
+        .verify_strict(manifest_bytes, &parsed_signature)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Release signature verification failed: {e}. The checksum manifest may be \
+                 corrupted or tampered with; refusing to install."
+            )
+        })?;
+
+    if !quiet {
+        println!("Verified release signature.");
+    }
+    Ok(())
 }
 
 /// Resolve the expected SHA-256 for a REQUIRED install artifact,
@@ -3199,6 +3397,271 @@ done
             "no record_update_failure may run between the checksum gate and \
              replace_binary — a checksum refusal must stay a retryable \
              OtherFailure, not a MAX_UPDATE_FAILURES lockout"
+        );
+    }
+
+    // ---- Ed25519 release-manifest signing + verification (auto-update). ----
+    //
+    // The release workflow signs the raw bytes of SHA256SUMS.txt with the
+    // private half of FREENET_RELEASE_PUBKEY (openssl, raw ed25519) and
+    // uploads SHA256SUMS.txt.sig. The binary verifies that signature over the
+    // exact manifest bytes before trusting any checksum inside it. These tests
+    // pin: (a) the baked-in key matches the published hex, (b) the
+    // CI-openssl-sign <-> binary-dalek-verify interop is real, and (c) the
+    // fail-closed + transition policy of `verify_manifest_signature_with`.
+    //
+    // None of these tests use the real private key — they sign with throwaway
+    // keys (openssl-generated or dalek `from_bytes` with a fixed test seed).
+
+    /// A deterministic dalek signing key built from a fixed test seed. Never
+    /// the real release key. Returns (signing_key, raw 32-byte verifying key).
+    fn test_signing_key(seed: u8) -> (ed25519_dalek::SigningKey, [u8; 32]) {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key().to_bytes();
+        (sk, vk)
+    }
+
+    fn dalek_sign(sk: &ed25519_dalek::SigningKey, msg: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        sk.sign(msg).to_bytes()
+    }
+
+    const SAMPLE_MANIFEST: &[u8] =
+        b"abc123  freenet-x86_64-unknown-linux-musl.tar.gz\ndef456  fdev-x86_64-unknown-linux-musl.tar.gz\n";
+
+    #[test]
+    fn release_pubkey_matches_published_hex() {
+        // Pins the baked-in key to the documented hex. A copy-paste slip in
+        // the byte array would otherwise silently make every signature fail
+        // (or, worse, trust the wrong key).
+        let expected =
+            hex::decode("eb2986604e34a3f985279a7e70852f3764d3347fe82074d92b1e4bc6336f8664")
+                .unwrap();
+        assert_eq!(FREENET_RELEASE_PUBKEY.as_slice(), expected.as_slice());
+        // Must be a valid ed25519 point, or verification could never succeed.
+        ed25519_dalek::VerifyingKey::from_bytes(&FREENET_RELEASE_PUBKEY)
+            .expect("baked-in release public key must be a valid ed25519 point");
+    }
+
+    #[test]
+    fn transition_flag_is_false_until_signed_floor_established() {
+        // Tripwire for the two-release rollout. Flipping this to `true` makes
+        // an ABSENT signature refuse the install, which bricks auto-update for
+        // any node still updating from an unsigned older release. Only flip it
+        // (and then update this test) once every release a live node could be
+        // updating from publishes SHA256SUMS.txt.sig. See REQUIRE_RELEASE_SIGNATURE.
+        assert!(
+            !REQUIRE_RELEASE_SIGNATURE,
+            "do not require signatures until the signed floor is established; \
+             see the two-release transition note on REQUIRE_RELEASE_SIGNATURE"
+        );
+    }
+
+    #[test]
+    fn valid_signature_accepted() {
+        let (sk, vk) = test_signing_key(7);
+        let sig = dalek_sign(&sk, SAMPLE_MANIFEST);
+        verify_manifest_signature_with(SAMPLE_MANIFEST, Some(&sig), &vk, false, true)
+            .expect("a valid signature over the manifest must be accepted");
+        // Also accepted when signatures are required.
+        verify_manifest_signature_with(SAMPLE_MANIFEST, Some(&sig), &vk, true, true)
+            .expect("a valid signature must be accepted even when required");
+    }
+
+    #[test]
+    fn tampered_manifest_rejected() {
+        let (sk, vk) = test_signing_key(7);
+        let sig = dalek_sign(&sk, SAMPLE_MANIFEST);
+        let mut tampered = SAMPLE_MANIFEST.to_vec();
+        tampered[0] ^= 0x01; // flip one bit of the first checksum
+        let err = verify_manifest_signature_with(&tampered, Some(&sig), &vk, false, true)
+            .expect_err("a signature over different bytes must be refused (fail-closed)");
+        assert!(
+            err.to_string().contains("refusing to install"),
+            "tamper rejection must refuse the install, got: {err}"
+        );
+    }
+
+    #[test]
+    fn wrong_key_signature_rejected() {
+        // Signed by key A, verified against key B's public key.
+        let (sk_a, _vk_a) = test_signing_key(1);
+        let (_sk_b, vk_b) = test_signing_key(2);
+        let sig = dalek_sign(&sk_a, SAMPLE_MANIFEST);
+        let err = verify_manifest_signature_with(SAMPLE_MANIFEST, Some(&sig), &vk_b, false, true)
+            .expect_err("a signature from an untrusted key must be refused (fail-closed)");
+        assert!(err.to_string().contains("refusing to install"));
+    }
+
+    #[test]
+    fn malformed_signature_length_rejected() {
+        let (_sk, vk) = test_signing_key(3);
+        let short = [0u8; 63];
+        let err = verify_manifest_signature_with(SAMPLE_MANIFEST, Some(&short), &vk, false, true)
+            .expect_err("a wrong-length signature must be refused");
+        assert!(err.to_string().contains("wrong length"));
+    }
+
+    #[test]
+    fn absent_signature_allowed_when_not_required() {
+        // Transition behaviour: no .sig published -> allowed (with a warning).
+        verify_manifest_signature_with(SAMPLE_MANIFEST, None, &FREENET_RELEASE_PUBKEY, false, true)
+            .expect("absent signature must be allowed while not required");
+    }
+
+    #[test]
+    fn absent_signature_refused_when_required() {
+        // Post-transition behaviour: no .sig published -> refuse.
+        let err = verify_manifest_signature_with(
+            SAMPLE_MANIFEST,
+            None,
+            &FREENET_RELEASE_PUBKEY,
+            true,
+            true,
+        )
+        .expect_err("absent signature must be refused once signatures are required");
+        assert!(err.to_string().contains("refusing to install"));
+    }
+
+    /// Committed openssl-produced fixture: a raw ed25519 signature generated by
+    /// `openssl pkeyutl -sign -rawin` (the exact command CI uses) over a fixed
+    /// message, with the raw public key extracted from the openssl DER SPKI.
+    /// Verifying it through the binary's dalek path proves openssl <-> dalek
+    /// interop CONCRETELY and HERMETICALLY — no openssl needed at test time, so
+    /// CI always exercises the cross-implementation guarantee.
+    ///
+    /// Regenerate with:
+    ///   openssl genpkey -algorithm ed25519 -out k.pem
+    ///   printf 'freenet-release-interop-fixture-v1\n' > m.txt
+    ///   openssl pkeyutl -sign -inkey k.pem -rawin -in m.txt -out m.sig
+    ///   openssl pkey -in k.pem -pubout -outform DER | tail -c 32 | xxd -p -c64  # pubkey
+    ///   xxd -p -c64 m.sig                                                       # signature
+    #[test]
+    fn openssl_fixture_verifies_via_dalek() {
+        const FIXTURE_MSG: &[u8] = b"freenet-release-interop-fixture-v1\n";
+        let pubkey: [u8; 32] =
+            hex::decode("998007f01e8bd34d736017398822ce214bf78b81a2015e2e5e8de94d9c0cd2ae")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let sig =
+            hex::decode("062a3ae0db73cc41fcd73f2cbb29eb0cf0cdd9420bb49db7d204ddec8803e81a5aa653b68c13105fd12ee996e8a9ba5eb553ec310133c6913756dbef437b1f0a")
+                .unwrap();
+
+        verify_manifest_signature_with(FIXTURE_MSG, Some(&sig), &pubkey, true, true)
+            .expect("openssl-produced raw ed25519 signature must verify via the dalek path");
+
+        // And the fixture must fail closed if the message is altered, proving
+        // the verification is actually binding the openssl signature to the
+        // message bytes (not trivially passing).
+        let mut tampered = FIXTURE_MSG.to_vec();
+        tampered.push(b'!');
+        assert!(
+            verify_manifest_signature_with(&tampered, Some(&sig), &pubkey, true, true).is_err(),
+            "altering the fixture message must refuse (fail-closed)"
+        );
+    }
+
+    /// Live interop: generate a throwaway ed25519 key with openssl, sign a
+    /// sample SHA256SUMS the SAME way CI will (`pkeyutl -sign -rawin`), then
+    /// verify the resulting 64-byte signature through the binary's exact dalek
+    /// path. This is the proof the user most needs: CI-openssl-sign <->
+    /// binary-dalek-verify actually interoperate on this machine.
+    ///
+    /// Skips (does not fail) only when openssl is absent or too old for raw
+    /// ed25519 signing — the hermetic `openssl_fixture_verifies_via_dalek`
+    /// test still guarantees the interop in that case.
+    #[test]
+    fn interop_openssl_sign_dalek_verify() {
+        use std::process::Command;
+
+        // Environmental availability check: a missing/old openssl is a skip,
+        // not a failure (the committed fixture covers interop unconditionally).
+        let openssl_ok = Command::new("openssl")
+            .arg("version")
+            .output()
+            .ok()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !openssl_ok {
+            eprintln!("skipping interop_openssl_sign_dalek_verify: openssl not available");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_pem = dir.path().join("key.pem");
+        let msg = dir.path().join("SHA256SUMS.txt");
+        let sig = dir.path().join("SHA256SUMS.txt.sig");
+        let pub_der = dir.path().join("pub.der");
+
+        std::fs::write(&msg, SAMPLE_MANIFEST).unwrap();
+
+        let genkey = Command::new("openssl")
+            .args(["genpkey", "-algorithm", "ed25519", "-out"])
+            .arg(&key_pem)
+            .output()
+            .expect("spawn openssl genpkey");
+        if !genkey.status.success() {
+            eprintln!(
+                "skipping interop_openssl_sign_dalek_verify: openssl genpkey ed25519 unsupported"
+            );
+            return;
+        }
+
+        // The exact signing invocation the CI workflow uses.
+        let sign = Command::new("openssl")
+            .arg("pkeyutl")
+            .arg("-sign")
+            .arg("-inkey")
+            .arg(&key_pem)
+            .arg("-rawin")
+            .arg("-in")
+            .arg(&msg)
+            .arg("-out")
+            .arg(&sig)
+            .output()
+            .expect("spawn openssl pkeyutl sign");
+        if !sign.status.success() {
+            eprintln!(
+                "skipping interop_openssl_sign_dalek_verify: openssl raw ed25519 sign unsupported \
+                 (needs openssl >= 3.0)"
+            );
+            return;
+        }
+
+        // Extract the raw 32-byte public key: the ed25519 DER SubjectPublicKeyInfo
+        // is a fixed 12-byte prefix followed by the 32-byte key.
+        let pubout = Command::new("openssl")
+            .args(["pkey", "-pubout", "-outform", "DER", "-in"])
+            .arg(&key_pem)
+            .arg("-out")
+            .arg(&pub_der)
+            .output()
+            .expect("spawn openssl pkey pubout");
+        assert!(pubout.status.success(), "openssl pkey -pubout must succeed");
+
+        let der = std::fs::read(&pub_der).unwrap();
+        assert!(der.len() >= 32, "DER SPKI must contain a 32-byte key");
+        let pubkey: [u8; 32] = der[der.len() - 32..].try_into().unwrap();
+
+        let sig_bytes = std::fs::read(&sig).unwrap();
+        assert_eq!(
+            sig_bytes.len(),
+            64,
+            "openssl raw ed25519 signature must be exactly 64 bytes"
+        );
+
+        // The real interop assertion: openssl-signed, dalek-verified.
+        verify_manifest_signature_with(SAMPLE_MANIFEST, Some(&sig_bytes), &pubkey, true, true)
+            .expect("openssl-signed manifest must verify through the binary's dalek path");
+
+        // Fail-closed under tampering, end to end.
+        let mut tampered = SAMPLE_MANIFEST.to_vec();
+        tampered[0] ^= 0x01;
+        assert!(
+            verify_manifest_signature_with(&tampered, Some(&sig_bytes), &pubkey, true, true)
+                .is_err(),
+            "a tampered manifest must be refused even with a valid openssl signature"
         );
     }
 }

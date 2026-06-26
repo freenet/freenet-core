@@ -2034,6 +2034,7 @@ dependencies = [
  "delegate",
  "directories",
  "dirs",
+ "ed25519-dalek",
  "either",
  "event-listener",
  "flatbuffers 25.12.19",

@@ -452,6 +452,50 @@ jobs:
           echo "=== SHA256 Checksums ==="
           cat SHA256SUMS.txt
 
+      - name: Sign SHA256SUMS.txt (ed25519)
+        # Produce a detached raw ed25519 signature over the exact bytes of
+        # SHA256SUMS.txt. The auto-update client (crates/core/.../update.rs)
+        # verifies this against a baked-in public key before trusting any hash
+        # in the manifest, which is what makes the checksum gate meaningful.
+        env:
+          # PEM-encoded ed25519 private key. Repo secret; present on tag-push
+          # and workflow_dispatch (this workflow never runs on fork PRs).
+          FREENET_RELEASE_SIGNING_KEY: ${{ secrets.FREENET_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FREENET_RELEASE_SIGNING_KEY:-}" ]; then
+            # Degrade gracefully: clients tolerate an absent signature during
+            # the two-release transition (REQUIRE_RELEASE_SIGNATURE=false), so
+            # a missing secret must not fail the whole release.
+            echo "::warning::FREENET_RELEASE_SIGNING_KEY not set; release will be UNSIGNED."
+            exit 0
+          fi
+
+          # Write the key to a 0600 temp PEM and remove it on every exit path.
+          # Never echo the key (no set -x, no echo "$KEY"): it is only ever
+          # redirected into the file and passed to openssl by path.
+          KEY_FILE="$(mktemp)"
+          chmod 600 "$KEY_FILE"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          printf '%s\n' "$FREENET_RELEASE_SIGNING_KEY" > "$KEY_FILE"
+
+          # Raw ed25519 sign (-rawin: message is signed as-is; ed25519 hashes
+          # internally). Produces a 64-byte detached signature. Needs openssl
+          # >= 3.0, which ubuntu-latest provides.
+          openssl pkeyutl -sign -inkey "$KEY_FILE" -rawin \
+            -in SHA256SUMS.txt -out SHA256SUMS.txt.sig
+
+          # Shred the key immediately (belt-and-braces alongside the trap).
+          shred -u "$KEY_FILE" 2>/dev/null || rm -f "$KEY_FILE"
+          trap - EXIT
+
+          SIG_SIZE=$(wc -c < SHA256SUMS.txt.sig)
+          echo "Wrote SHA256SUMS.txt.sig (${SIG_SIZE} bytes)"
+          if [ "$SIG_SIZE" -ne 64 ]; then
+            echo "::error::Expected a 64-byte raw ed25519 signature, got ${SIG_SIZE} bytes"
+            exit 1
+          fi
+
       - name: Upload binaries to release
         env:
           # Coalesce on RELEASE_PAT so the `gh release edit --draft=false`
@@ -472,6 +516,9 @@ jobs:
             [ -f "$f" ] && ASSETS="$ASSETS $f"
           done
           ASSETS="$ASSETS SHA256SUMS.txt"
+          # Attach the detached signature when the signing step produced one
+          # (absent only if FREENET_RELEASE_SIGNING_KEY was unset).
+          [ -f SHA256SUMS.txt.sig ] && ASSETS="$ASSETS SHA256SUMS.txt.sig"
 
           # Upload all available archives and checksums to the release
           gh release upload "$TAG_NAME" $ASSETS \
