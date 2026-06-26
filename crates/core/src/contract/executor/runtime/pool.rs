@@ -306,11 +306,23 @@ impl RuntimePool {
         // process-global) keeps the gauges per-node. Both caches share one sink;
         // they're routed apart by their `"contract"` / `"delegate"` label.
         let module_cache_metrics = op_manager.ring.module_cache_metrics();
+        // Interest predicate for the CONTRACT cache only: a contract is "of
+        // interest" while `Ring::contract_in_use` holds (a live local client
+        // subscription OR a downstream peer subscriber — deliberately NOT an
+        // upstream-only subscription, which would be unbounded). This drives the
+        // interest-weighted (two-tier) eviction policy AND the always-on shadow
+        // metrics. The delegate cache has no interest concept, so it gets none
+        // and stays pure byte-LRU. Capturing a clone of the `Arc<Ring>` keeps
+        // `wasm_runtime` free of any `ring` dependency. See #4441 / #4534.
+        let ring_for_interest = op_manager.ring.clone();
+        let contract_interest: crate::wasm_runtime::InterestPredicate<ContractKey> =
+            Arc::new(move |key: &ContractKey| ring_for_interest.contract_in_use(key));
         let shared_contract_modules: SharedModuleCache<ContractKey> =
-            Arc::new(Mutex::new(ModuleCache::with_label(
+            Arc::new(Mutex::new(ModuleCache::with_label_and_interest(
                 contract_cache_budget,
                 "contract",
                 Some(module_cache_metrics.clone()),
+                Some(contract_interest),
             )));
         let shared_delegate_modules: SharedModuleCache<DelegateKey> =
             Arc::new(Mutex::new(ModuleCache::with_label(

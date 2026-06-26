@@ -1849,9 +1849,20 @@ where
             // headroom returns.
             // Read the per-node module-cache occupancy off the same `Ring` the
             // caches publish into (a process-global until #4488).
-            let contract_cache_occupancy = crate::wasm_runtime::contract_cache_occupancy_pct(
-                &op_manager.ring.module_cache_metrics(),
-            );
+            let module_cache_metrics = op_manager.ring.module_cache_metrics();
+            let contract_cache_occupancy =
+                crate::wasm_runtime::contract_cache_occupancy_pct(&module_cache_metrics);
+            // SHADOW (always-on, behavior-neutral): record when this refuse/admit
+            // decision WOULD flip under a "admit if cold-evictable cache can make
+            // room" gate. This does NOT change the gate below — it only feeds the
+            // `migration_admission_would_change_total` counter so the later #4534
+            // admission change can rest on production data (#4441/#4534).
+            if crate::wasm_runtime::migration_admission_would_change_now(
+                &module_cache_metrics,
+                MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT,
+            ) {
+                module_cache_metrics.record_migration_admission_would_change();
+            }
             if !migration_admission_allowed(contract_cache_occupancy) {
                 tracing::debug!(
                     key = %hint.key,

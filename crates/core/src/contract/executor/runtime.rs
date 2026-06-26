@@ -1234,9 +1234,10 @@ mod executor_pin_tests {
             .expect("RuntimePool::new must exist")
             // Take the first chunk of the function body. Whitespace is collapsed
             // so the assertions below survive line-wrapping / reformatting of the
-            // (now multi-line, metrics-threaded) cache construction.
+            // (now multi-line, metrics-threaded, interest-predicate-threaded)
+            // cache construction.
             .split("\n    ")
-            .take(80)
+            .take(110)
             .collect::<String>()
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -1246,14 +1247,26 @@ mod executor_pin_tests {
             "RuntimePool::new must size caches from config.module_cache_budget_bytes"
         );
         // The contract cache is built from `contract_cache_budget` with the
-        // "contract" label; the delegate cache from `delegate_cache_budget` with
-        // the "delegate" label. We assert each piece independently (rather than a
-        // single literal call string) so threading the metrics `Arc` through
-        // `with_label` (#4488) doesn't make this pin brittle.
+        // "contract" label (now via `with_label_and_interest`, which threads the
+        // `Ring::contract_in_use` interest predicate for two-tier eviction —
+        // #4441/#4534); the delegate cache from `delegate_cache_budget` with the
+        // "delegate" label. We assert each piece independently (rather than a
+        // single literal call string) so threading the metrics `Arc` / interest
+        // predicate doesn't make this pin brittle.
         assert!(
-            body.contains("ModuleCache::with_label( contract_cache_budget, \"contract\"")
-                || body.contains("ModuleCache::with_label(contract_cache_budget, \"contract\""),
+            body.contains(
+                "ModuleCache::with_label_and_interest( contract_cache_budget, \"contract\""
+            ) || body.contains(
+                "ModuleCache::with_label_and_interest(contract_cache_budget, \"contract\""
+            ),
             "RuntimePool::new must build the contract cache from the contract byte budget"
+        );
+        // The contract cache must thread the Ring interest predicate so two-tier
+        // eviction (and the shadow metrics) actually see contract_in_use.
+        assert!(
+            body.contains("contract_in_use"),
+            "RuntimePool::new must wire the Ring::contract_in_use interest predicate \
+             into the contract module cache (#4441/#4534)"
         );
         assert!(
             body.contains("ModuleCache::with_label( delegate_cache_budget, \"delegate\"")

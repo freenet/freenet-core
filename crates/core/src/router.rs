@@ -193,6 +193,29 @@ pub(crate) struct RouterSnapshotInfo {
     pub delegate_module_cache_total_bytes: Option<u64>,
     pub delegate_module_cache_budget_bytes: Option<u64>,
     pub delegate_module_cache_evictions_total: Option<u64>,
+    /// Interest-weighted (two-tier) module-cache SHADOW gauges (#4441/#4534),
+    /// populated by `Ring` from the same per-node `ModuleCacheMetrics` `Arc`.
+    /// These are ALWAYS ON, independent of the `FREENET_MODULE_CACHE_INTEREST_TIERED`
+    /// feature flag — they measure what the two-tier policy WOULD do so the
+    /// decision to flip the flag (and the later #4534 admission-gate change) can
+    /// rest on production data rather than guesswork:
+    /// - `cold_evictable_bytes`: resident contract-cache bytes the two-tier
+    ///   policy could freely reclaim (no client/downstream interest).
+    /// - `interested_bytes`: resident contract-cache bytes the two-tier policy
+    ///   would protect first (the in-use floor).
+    /// - `evictions_would_reclassify_total`: monotonic count of eviction steps
+    ///   whose victim the two-tier policy would pick differently from plain LRU.
+    /// - `migration_admission_would_change_total`: monotonic count of placement-
+    ///   migration admission decisions where the current ≥90%-occupancy refuse
+    ///   (#4534) would flip to admit if cold-evictable cache were considered.
+    ///
+    /// `None` until the WASM runtime has touched the cache. The contract cache
+    /// is the only one with an interest predicate; there are no delegate
+    /// equivalents.
+    pub contract_module_cache_cold_evictable_bytes: Option<u64>,
+    pub contract_module_cache_interested_bytes: Option<u64>,
+    pub contract_module_cache_evictions_would_reclassify_total: Option<u64>,
+    pub migration_admission_would_change_total: Option<u64>,
     /// UPDATE-broadcast stream-assembly gauges (#4440), populated by `Ring` from
     /// the process-global `BROADCAST_STREAM_METRICS` the broadcast queue
     /// publishes into. A streaming broadcast that fails to reach `Delivered`
@@ -1047,6 +1070,12 @@ impl Router {
             delegate_module_cache_total_bytes: None,
             delegate_module_cache_budget_bytes: None,
             delegate_module_cache_evictions_total: None,
+            // Interest-weighted (two-tier) module-cache shadow gauges,
+            // populated by Ring on the snapshot cadence (#4441/#4534).
+            contract_module_cache_cold_evictable_bytes: None,
+            contract_module_cache_interested_bytes: None,
+            contract_module_cache_evictions_would_reclassify_total: None,
+            migration_admission_would_change_total: None,
             // Broadcast stream-assembly + background-task health gauges,
             // populated by Ring on the snapshot cadence (#4440).
             broadcast_stream_attempts_total: None,

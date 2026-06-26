@@ -1324,6 +1324,20 @@ impl Ring {
             snapshot.delegate_module_cache_budget_bytes = Some(mc.delegate_budget_bytes);
             snapshot.delegate_module_cache_evictions_total = Some(mc.delegate_evictions_total);
 
+            // Interest-weighted (two-tier) module-cache SHADOW gauges
+            // (#4441/#4534): always-on, independent of the
+            // FREENET_MODULE_CACHE_INTEREST_TIERED feature flag. They quantify
+            // what the two-tier policy WOULD reclaim/reclassify and how many
+            // migration-admission decisions WOULD change, so flipping the flag
+            // (and the later #4534 admission change) can rest on production data.
+            snapshot.contract_module_cache_cold_evictable_bytes =
+                Some(mc.contract_cold_evictable_bytes);
+            snapshot.contract_module_cache_interested_bytes = Some(mc.contract_interested_bytes);
+            snapshot.contract_module_cache_evictions_would_reclassify_total =
+                Some(mc.contract_evictions_would_reclassify_total);
+            snapshot.migration_admission_would_change_total =
+                Some(mc.migration_admission_would_change_total);
+
             // UPDATE-broadcast stream-assembly failure gauge (#4440): the exact
             // signal that flagged the v0.2.73 incident. The broadcast queue
             // publishes monotonic totals into the process-global; emit the totals
