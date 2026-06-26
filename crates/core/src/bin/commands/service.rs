@@ -460,6 +460,54 @@ mod tests {
     use super::wrapper::*;
     use std::path::PathBuf;
 
+    /// Return the section header (e.g. `[Unit]`, `[Service]`) that a given `key=`
+    /// directive line appears under in a generated systemd unit, or `None` if the
+    /// directive is absent. Comment lines (`# ...`) and the directive's value are
+    /// ignored — only a line that *starts* with `{key}=` counts.
+    ///
+    /// Used to assert `StartLimitAction` lives in `[Unit]` (#4551): systemd SILENTLY
+    /// IGNORES the `StartLimit*` directives when placed in `[Service]`, so a substring
+    /// check that only proves the key *exists* would pass even with the limiter knob
+    /// disabled. (The `[Unit]` placement of `StartLimitBurst`/`StartLimitIntervalSec`
+    /// themselves is asserted by the linux.rs unit tests added in #4570.)
+    #[cfg(target_os = "linux")]
+    fn section_of_directive(unit: &str, key: &str) -> Option<String> {
+        let prefix = format!("{key}=");
+        let mut current: Option<String> = None;
+        for line in unit.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains(' ') {
+                current = Some(trimmed.to_string());
+            } else if trimmed.starts_with(&prefix) {
+                return current;
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn section_of_directive_parses_sections() {
+        let unit = "[Unit]\nDescription=x\nStartLimitBurst=5\n\n[Service]\nType=simple\n# StartLimitBurst=99 in a comment must be ignored\nExecStart=/bin/freenet network\n";
+        assert_eq!(
+            section_of_directive(unit, "Description").as_deref(),
+            Some("[Unit]")
+        );
+        assert_eq!(
+            section_of_directive(unit, "StartLimitBurst").as_deref(),
+            Some("[Unit]")
+        );
+        assert_eq!(
+            section_of_directive(unit, "Type").as_deref(),
+            Some("[Service]")
+        );
+        assert_eq!(
+            section_of_directive(unit, "ExecStart").as_deref(),
+            Some("[Service]")
+        );
+        assert_eq!(section_of_directive(unit, "Nonexistent"), None);
+    }
+
     #[test]
     fn command_line_args_strips_quoted_executable_path() {
         assert_eq!(
@@ -1117,9 +1165,35 @@ mod tests {
         assert!(service_content.contains("Restart=always"));
         assert!(service_content.contains("RestartSec=10"));
 
-        // Verify restart loop prevention (limits consecutive failures)
+        // Verify restart loop prevention (limits consecutive failures).
+        // StartLimitBurst/StartLimitIntervalSec are present and [Unit]-placed; their
+        // section placement is asserted by the linux.rs unit tests added in #4570
+        // (user_unit_places_start_limit_directives_in_unit_section). Here we only
+        // assert this PR's additions: StartLimitAction placement + the exit-45 guard.
         assert!(service_content.contains("StartLimitBurst=5"));
         assert!(service_content.contains("StartLimitIntervalSec=120"));
+        // #4551: StartLimitAction MUST also be in [Unit]; systemd SILENTLY IGNORES
+        // it in [Service] (same trap as StartLimitBurst). StartLimitAction=none stops
+        // (does not reboot) the host on a tripped loop.
+        assert_eq!(
+            section_of_directive(&service_content, "StartLimitAction").as_deref(),
+            Some("[Unit]"),
+            "StartLimitAction must be in [Unit] (#4551)"
+        );
+        assert!(
+            service_content.contains("StartLimitAction=none"),
+            "StartLimitAction=none keeps a tripped crash-loop as a stopped unit rather \
+             than rebooting the host (#4551)"
+        );
+        // The 45 fast-crash code (crate::node::p2p_impl) must NOT be whitelisted by
+        // SuccessExitStatus, or a boot-wedge loop would never count toward the burst.
+        assert!(
+            !service_content.contains("SuccessExitStatus=42 43 45")
+                && !service_content.contains("SuccessExitStatus=42 45 43")
+                && !service_content.contains("SuccessExitStatus=45"),
+            "exit 45 (fast-crash) must stay OUT of SuccessExitStatus so it counts \
+             toward StartLimitBurst (#4551)"
+        );
 
         // Verify auto-update support via ExecStopPost. The `$EXIT_STATUS` systemd
         // sets in the ExecStopPost environment must reach /bin/sh as a literal
@@ -1132,6 +1206,29 @@ mod tests {
                 && service_content.contains("\"$$EXIT_STATUS\""),
             "ExecStopPost must use the doubled $$EXIT_STATUS so systemd passes a \
              literal $EXIT_STATUS to sh (a single-$ revert silently breaks auto-update)"
+        );
+        // #4551: ExecStopPost must fire `freenet update` for BOTH exit 42 (healthy
+        // node hit a fault/update) AND exit 45 (fast boot-crash) — firing on 45
+        // preserves the #4549 self-heal for a boot-crash a newer release fixes, while
+        // 45 staying out of SuccessExitStatus still counts it toward StartLimitBurst.
+        // A `case` (not `&&`/`||`) avoids shell-precedence pitfalls.
+        assert!(
+            service_content.contains("case \"$$EXIT_STATUS\" in 42|45)")
+                && service_content.contains("update --quiet"),
+            "ExecStopPost must run `freenet update` for exit 42 OR 45 via a case \
+             statement (boot-crash self-heal preserved; #4551)"
+        );
+        // #4551: the unit must advertise fast-crash (exit-45) support via the marker
+        // env var the node gates on. Using the const (not a literal) pins template,
+        // entry-point check, and test to one source of truth so they can't drift —
+        // a drift would silently disable exit 45 (node never opts in).
+        assert!(
+            service_content.contains(&format!(
+                "Environment={}=1",
+                super::super::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR
+            )),
+            "user unit must set the {} marker so the node opts in to exit 45 (#4551)",
+            super::super::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR
         );
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
@@ -1190,6 +1287,20 @@ mod tests {
         assert!(service_content.contains("Restart=always"));
         assert!(service_content.contains("StartLimitBurst=5"));
         assert!(service_content.contains("StartLimitIntervalSec=120"));
+        // StartLimitBurst/IntervalSec [Unit] placement is asserted by #4570's linux.rs
+        // tests (system_unit_places_start_limit_directives_in_unit_section). Here we
+        // assert this PR's additions: StartLimitAction placement + the exit-45 guard.
+        assert_eq!(
+            section_of_directive(&service_content, "StartLimitAction").as_deref(),
+            Some("[Unit]"),
+            "StartLimitAction must be in [Unit] (#4551)"
+        );
+        assert!(service_content.contains("StartLimitAction=none"));
+        assert!(
+            !service_content.contains("SuccessExitStatus=42 43 45")
+                && !service_content.contains("SuccessExitStatus=45"),
+            "exit 45 (fast-crash) must stay OUT of SuccessExitStatus (#4551)"
+        );
         assert!(service_content.contains("LimitNOFILE=65536"));
         // ExecStopPost must double the env var (`$$EXIT_STATUS`) so systemd passes a
         // literal `$EXIT_STATUS` to sh; a single-`$` revert silently breaks auto-update.
@@ -1197,6 +1308,22 @@ mod tests {
             service_content.contains("ExecStopPost=")
                 && service_content.contains("\"$$EXIT_STATUS\""),
             "ExecStopPost must use the doubled $$EXIT_STATUS (single-$ revert breaks auto-update)"
+        );
+        // #4551: ExecStopPost fires `freenet update` for exit 42 OR 45 (system unit too).
+        assert!(
+            service_content.contains("case \"$$EXIT_STATUS\" in 42|45)")
+                && service_content.contains("update --quiet"),
+            "ExecStopPost must run `freenet update` for exit 42 OR 45 via a case \
+             statement (boot-crash self-heal preserved; #4551)"
+        );
+        // #4551: system unit must also set the fast-crash (exit-45) support marker.
+        assert!(
+            service_content.contains(&format!(
+                "Environment={}=1",
+                super::super::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR
+            )),
+            "system unit must set the {} marker so the node opts in to exit 45 (#4551)",
+            super::super::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR
         );
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)

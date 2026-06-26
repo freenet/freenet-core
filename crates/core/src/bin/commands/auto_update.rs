@@ -43,6 +43,21 @@ pub const EXIT_CODE_UPDATE_NEEDED: i32 = 42;
 /// operator, loudly, when an update was detected but will not be applied.
 pub const SUPERVISED_ENV_VAR: &str = "FREENET_SUPERVISED";
 
+/// Environment variable set ONLY by the freshly-generated Freenet **systemd** units
+/// (see `service/linux.rs`) on the `freenet network` child. Its presence is positive
+/// evidence that the supervising unit understands the distinct fast-crash exit code
+/// 45 (#4551): the unit keeps 45 OUT of `SuccessExitStatus` (so it counts toward
+/// `StartLimitBurst`), sets `StartLimitAction=none`, and fires `ExecStopPost`
+/// `freenet update` on exit 42 OR 45.
+///
+/// The node entry point gates [`freenet::enable_fast_crash_exit_code`] on this
+/// marker. Unlike [`SUPERVISED_ENV_VAR`], the macOS/Windows run-wrapper does NOT set
+/// it (the wrapper only understands exit 42), and an OLD systemd unit (e.g. a node
+/// auto-updated to a 45-aware binary but whose unit file was never regenerated) won't
+/// have it either — so in those cases the node keeps emitting the burst-exempt
+/// self-healing exit 42 rather than a 45 the supervisor would mishandle.
+pub const SYSTEMD_FAST_CRASH_ENV_VAR: &str = "FREENET_SYSTEMD_FAST_CRASH";
+
 /// Whether the running node appears to be under a supervisor that will catch
 /// exit code 42 and apply the update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
