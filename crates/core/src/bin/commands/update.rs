@@ -895,7 +895,17 @@ async fn download_checksums(url: &str) -> Result<Checksums> {
 /// caller needs the exact bytes (to verify a signature over them, or to feed
 /// to `Signature::from_bytes`) rather than streaming to a file like
 /// [`download_file`].
+///
+/// The read is capped so a compromised or buggy asset server cannot OOM the
+/// updater by streaming an unbounded body in place of a tiny manifest /
+/// signature. Exceeding the cap is treated as a (retryable) download failure,
+/// never a lockout.
 async fn download_bytes(url: &str) -> Result<Vec<u8>> {
+    // Generous vs. any real manifest (a few hundred bytes) or signature (64
+    // bytes), small enough to bound memory.
+    const MAX_ASSET_BYTES: usize = 4 * 1024 * 1024;
+    use futures::StreamExt;
+
     let client = reqwest::Client::builder()
         .user_agent("freenet-updater")
         .build()?;
@@ -910,11 +920,24 @@ async fn download_bytes(url: &str) -> Result<Vec<u8>> {
         anyhow::bail!("Download failed: {}", response.status());
     }
 
-    Ok(response
-        .bytes()
-        .await
-        .context("Failed to read release asset body")?
-        .to_vec())
+    // Reject early if the advertised length already blows the cap.
+    if let Some(len) = response.content_length() {
+        if len > MAX_ASSET_BYTES as u64 {
+            anyhow::bail!("release asset is {len} bytes, exceeding the {MAX_ASSET_BYTES}-byte cap");
+        }
+    }
+
+    // Stream and enforce the cap even when Content-Length is absent or lies.
+    let mut buf = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Failed to read release asset body")?;
+        if buf.len() + chunk.len() > MAX_ASSET_BYTES {
+            anyhow::bail!("release asset exceeds the {MAX_ASSET_BYTES}-byte cap");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Authenticate the raw bytes of `SHA256SUMS.txt` against the baked-in
