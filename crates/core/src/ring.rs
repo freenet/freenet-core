@@ -1314,6 +1314,14 @@ impl Ring {
             // read from the per-node `Arc` the caches publish into (they live
             // behind the contract-handler channel, unreachable from here; the
             // `RuntimePool` shares this `Arc` via `op_manager.ring`).
+            //
+            // Force a fresh recompute of the interest split (cold-evictable /
+            // interested bytes + would-reclassify) FIRST, so this snapshot is
+            // fresh even on a cache that's been idle since its last mutation —
+            // the throttled get/insert/remove refresh is unbounded on a quiet
+            // node (#4441/#4534 shadow-staleness fix). No-op before the runtime
+            // pool is built. Cheap O(entries), once per snapshot.
+            ring.module_cache_metrics.refresh_interest_shadow_now();
             let mc = ring.module_cache_metrics.snapshot();
             snapshot.contract_module_cache_entries = Some(mc.contract_entries);
             snapshot.contract_module_cache_total_bytes = Some(mc.contract_total_bytes);

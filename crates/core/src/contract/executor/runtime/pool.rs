@@ -328,8 +328,21 @@ impl RuntimePool {
             Arc::new(Mutex::new(ModuleCache::with_label(
                 delegate_cache_budget,
                 "delegate",
-                Some(module_cache_metrics),
+                Some(module_cache_metrics.clone()),
             )));
+        // Install the on-demand interest-shadow refresher so the `router_snapshot`
+        // emitter can recompute the contract cache's interest split right before
+        // it reads, keeping every emitted snapshot fresh even on an idle cache
+        // (the throttled get/insert/remove refresh is unbounded on a quiet node).
+        // The closure locks the SAME shared contract cache the executors use and
+        // forces an un-throttled recompute. Cheap O(entries) scan, once per 5-min
+        // snapshot. (Codex/coordinator review — bound shadow-gauge staleness.)
+        let refresher_cache = shared_contract_modules.clone();
+        module_cache_metrics.set_interest_shadow_refresher(Arc::new(move || {
+            if let Ok(mut cache) = refresher_cache.lock() {
+                cache.force_refresh_interest_shadow();
+            }
+        }));
         // Shared delegate-context cache so a prompt round-trip routed to a
         // different pool executor still finds its `ctx.write()` blob.
         let shared_delegate_contexts = crate::wasm_runtime::new_delegate_context_cache();
