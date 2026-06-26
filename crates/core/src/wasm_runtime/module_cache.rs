@@ -279,10 +279,20 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
         self.inner.get(key).map(|(v, _)| v)
     }
 
-    /// Recompute the interest shadow gauges if at least
-    /// [`INTEREST_SHADOW_REFRESH_INTERVAL`] has elapsed since the last
-    /// `get`-driven refresh. No-op (no scan) for caches without a predicate or
-    /// metrics sink. Bounds the cost of refreshing on the hot lookup path.
+    /// Recompute the interest shadow gauges (the O(entries) cold/interested
+    /// split) if at least [`INTEREST_SHADOW_REFRESH_INTERVAL`] has elapsed since
+    /// the last refresh. No-op (no scan) for caches without a predicate or
+    /// metrics sink.
+    ///
+    /// Called from EVERY cache-touching path (get/insert/remove): the split is
+    /// O(entries) and calls `Ring::contract_in_use` per entry under the shared
+    /// cache mutex, so on a node with thousands of cached modules an unthrottled
+    /// recompute on every cold insert/compile would serialize an O(cache-size)
+    /// scan into the hot path even with the feature flag OFF (Codex review).
+    /// Throttling bounds that to once per interval; the gauges are consumed only
+    /// at the 5-min snapshot cadence and at admission-gate time, so the bounded
+    /// staleness is harmless. (Occupancy — the cheap O(1) gauge — is still
+    /// updated immediately on insert/remove; only this O(n) split is throttled.)
     fn maybe_refresh_interest_shadow(&mut self) {
         if self.interest.is_none() || self.metrics.is_none() {
             return;
@@ -313,7 +323,10 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
         self.total_bytes = self.total_bytes.saturating_add(size_bytes);
         self.evict_to_budget();
         self.record_occupancy(self.inner.len(), self.total_bytes, self.budget_bytes);
-        self.record_interest_shadow();
+        // Throttled — see `maybe_refresh_interest_shadow`. The O(1) occupancy
+        // gauge above is always fresh; only the O(entries) interest split is
+        // rate-limited so a cold insert on a large cache stays cheap (flag-OFF).
+        self.maybe_refresh_interest_shadow();
     }
 
     /// Publish current occupancy into the metrics sink (no-op when this cache
@@ -536,7 +549,9 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
         let (value, size) = self.inner.pop(key)?;
         self.total_bytes = self.total_bytes.saturating_sub(size);
         self.record_occupancy(self.inner.len(), self.total_bytes, self.budget_bytes);
-        self.record_interest_shadow();
+        // Throttled — see `maybe_refresh_interest_shadow` (keeps the O(entries)
+        // interest split off the hot path on large caches).
+        self.maybe_refresh_interest_shadow();
         Some(value)
     }
 
@@ -565,6 +580,24 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
     #[cfg(test)]
     pub(crate) fn interest_tiered_active(&self) -> bool {
         self.interest_tiered_active
+    }
+
+    /// Force an immediate (un-throttled) recompute of the interest shadow
+    /// gauges. Test-only: production refreshes them throttled on get/insert/
+    /// remove, but tests need deterministic gauges without sleeping past
+    /// [`INTEREST_SHADOW_REFRESH_INTERVAL`].
+    #[cfg(test)]
+    pub(crate) fn force_refresh_interest_shadow(&mut self) {
+        self.last_interest_shadow_refresh = Some(Instant::now());
+        self.record_interest_shadow();
+    }
+
+    /// Mark the interest-shadow throttle as DUE, so the next get/insert/remove
+    /// will recompute the gauges regardless of how recently one fired. Test-only,
+    /// used to exercise the throttled refresh path deterministically.
+    #[cfg(test)]
+    pub(crate) fn arm_interest_shadow_refresh(&mut self) {
+        self.last_interest_shadow_refresh = None;
     }
 }
 
@@ -1938,6 +1971,9 @@ mod tests {
         cache.insert(0, (), 100); // interested
         cache.insert(1, (), 250); // cold
         cache.insert(2, (), 300); // cold
+        // The interest split is throttled on the insert path (Codex perf fix);
+        // force a deterministic recompute rather than depending on timing.
+        cache.force_refresh_interest_shadow();
         let s = metrics.snapshot();
         assert_eq!(s.contract_interested_bytes, 100, "only key 0 is interested");
         assert_eq!(
@@ -2071,17 +2107,21 @@ mod tests {
         );
         cache.insert(0, (), 100); // interested at insert time
         cache.insert(1, (), 250); // cold
+        // Establish a deterministic baseline (insert-path refresh is throttled).
+        cache.force_refresh_interest_shadow();
         let s = metrics.snapshot();
         assert_eq!(s.contract_interested_bytes, 100);
         assert_eq!(s.contract_cold_evictable_bytes, 250);
 
         // Interest flips with NO cache mutation: key 0 is no longer in use.
         interested.lock().unwrap().remove(&0);
-        // The stale gauges still say 100 interested until something reads.
+        // The gauges still say 100 interested until something reads + refreshes.
         assert_eq!(metrics.snapshot().contract_interested_bytes, 100);
 
-        // A `get` triggers the throttled refresh (un-armed → fires immediately),
-        // and the gauges now reflect that NOTHING is interested.
+        // Arm the throttle so the next `get` is due, then `get` triggers the
+        // throttled refresh and the gauges now reflect that NOTHING is
+        // interested — i.e. an interest flip with no cache mutation is picked up.
+        cache.arm_interest_shadow_refresh();
         let _ = cache.get(&1);
         let s = metrics.snapshot();
         assert_eq!(
