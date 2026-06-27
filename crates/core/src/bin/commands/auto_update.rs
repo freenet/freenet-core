@@ -142,12 +142,41 @@ impl std::fmt::Display for UpdateNeededError {
 
 impl std::error::Error for UpdateNeededError {}
 
+/// Sentinel error returned by [`get_latest_version`] when the global GitHub-poll
+/// token bucket is empty. Distinct from a network/parse error so the caller can
+/// tell "we deliberately skipped polling to bound load" apart from "GitHub was
+/// unreachable" — the two must drive different behaviour (the latter may fall
+/// back to a gateway-trust exit 42; the former must NOT, or local rate-limiting
+/// would itself trigger the restart loop the limiter exists to prevent).
+#[derive(Debug)]
+struct RateLimitedError;
+
+impl std::fmt::Display for RateLimitedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GitHub update poll rate-limited (token bucket empty)")
+    }
+}
+
+impl std::error::Error for RateLimitedError {}
+
 /// Result of an update check attempt.
 #[derive(Debug, PartialEq)]
 pub enum UpdateCheckResult {
     /// Rate limited, too many failures, or no update available yet - will retry later.
     /// The caller should NOT clear the version mismatch flag (preserve it for retry).
     Skipped,
+    /// The global GitHub-poll rate limiter (#4073) denied this check: we did NOT
+    /// reach GitHub at all. Distinct from [`Skipped`] because the caller must NOT
+    /// treat it as a "GitHub says no update / unreachable" signal — in
+    /// particular it must NOT feed the legacy "max-backoff + 0 connections ->
+    /// exit 42" gateway-trust fallback, since the supervisor-side `freenet
+    /// update` shares the same empty bucket and would just exit "already up to
+    /// date", turning local rate-limiting into a restart loop. The caller should
+    /// do nothing and retry once the bucket refills (the version-mismatch flag is
+    /// preserved).
+    ///
+    /// [`Skipped`]: UpdateCheckResult::Skipped
+    RateLimited,
     /// Checked GitHub, newer version confirmed.
     /// The caller should clear the version mismatch flag.
     UpdateAvailable(String),
@@ -307,6 +336,16 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
                 UpdateCheckResult::Skipped
             }
         }
+        Err(e) if e.downcast_ref::<RateLimitedError>().is_some() => {
+            // Our OWN rate limiter denied the poll — NOT a GitHub failure. Do not
+            // grow the backoff and (critically) return the distinct RateLimited
+            // result so the caller does not fall through to the gateway-trust
+            // exit-42 fallback. We simply retry once the bucket refills.
+            tracing::debug!(
+                "Update check skipped: GitHub poll rate-limited; will retry when the token bucket refills"
+            );
+            UpdateCheckResult::RateLimited
+        }
         Err(e) => {
             tracing::warn!(
                 "Failed to check GitHub for updates: {}. Will retry with increased backoff.",
@@ -329,7 +368,7 @@ async fn get_latest_version() -> Result<String> {
     // (`check_if_update_available`) treats it as `Skipped` and retries later —
     // the node keeps running, it just does not poll GitHub this tick.
     if !try_consume_github_poll() {
-        anyhow::bail!("GitHub update poll rate-limited (token bucket empty); will retry later");
+        return Err(RateLimitedError.into());
     }
 
     let client = reqwest::Client::builder()

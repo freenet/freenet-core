@@ -1479,6 +1479,17 @@ mod tests {
             super::super::rollback::ROLLBACK_CRASH_THRESHOLD < 50,
             "wrapper cap must exceed the rollback crash threshold"
         );
+        // The cap must target a tight crash LOOP, not occasional crashes: a child
+        // that ran healthily long enough resets the streak so it never
+        // accumulates to the cap over a long lifetime.
+        assert!(
+            script.contains("MIN_HEALTHY_RUNTIME=300"),
+            "wrapper must define a healthy-runtime threshold"
+        );
+        assert!(
+            script.contains("CHILD_RUNTIME") && script.contains("CONSECUTIVE_FAILURES=0"),
+            "wrapper must reset the consecutive-failure streak after a healthy run"
+        );
     }
 
     /// Regression for issue #3967: on exit 43 the wrapper must self-heal a

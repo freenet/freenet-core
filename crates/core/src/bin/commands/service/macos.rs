@@ -153,6 +153,13 @@ CONSECUTIVE_FAILURES=0
 # exit-0/exit-43 paths below). A non-zero exit here would just relaunch a fresh
 # wrapper with CONSECUTIVE_FAILURES reset to 0, defeating the cap entirely.
 MAX_CONSECUTIVE_FAILURES=50
+# A child that ran healthily for at least this long before exiting is treated as
+# "made progress": its failure does NOT count toward the consecutive cap. This
+# keeps the cap aimed at a tight CRASH LOOP (repeated fast failures) rather than
+# at a node that runs fine for a long time and then crashes occasionally — the
+# latter must keep being restarted, not eventually give up. Comfortably past the
+# #4073 60s commit window and the 300s max backoff.
+MIN_HEALTHY_RUNTIME=300
 PORT_CONFLICT_KILLS=0
 MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
 
@@ -308,6 +315,7 @@ while true; do
     # exit-43 self-heal path avoid mistaking our just-exited child for a
     # stale orphan still holding the port, and lets the TERM trap above forward
     # launchd's stop signal to the node for a graceful drain.
+    CHILD_START=$(date +%s)
     "{binary}" network 2>"$HOME/Library/Logs/freenet/freenet.error.log.last" &
     WRAPPER_CHILD_PID=$!
     # `wait` is interrupted by the trapped TERM; re-wait so we collect the
@@ -318,6 +326,13 @@ while true; do
         wait $WRAPPER_CHILD_PID
         EXIT_CODE=$?
     done
+    # How long the child ran this cycle. A long healthy run before a later
+    # non-zero exit clears the consecutive-failure streak (see give_up_if_failing
+    # / MIN_HEALTHY_RUNTIME) so only a tight crash loop trips the cap.
+    CHILD_RUNTIME=$(( $(date +%s) - CHILD_START ))
+    if [ "$CHILD_RUNTIME" -ge "$MIN_HEALTHY_RUNTIME" ]; then
+        CONSECUTIVE_FAILURES=0
+    fi
 
     if [ $EXIT_CODE -eq 42 ]; then
         log_event "Update needed, running freenet update..."
