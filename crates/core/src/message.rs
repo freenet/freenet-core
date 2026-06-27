@@ -80,6 +80,22 @@ impl Transaction {
         self.elapsed() >= crate::config::OPERATION_TTL
     }
 
+    /// Milliseconds-since-Unix-epoch encoded in this transaction's ULID at
+    /// creation time.
+    ///
+    /// In production this is the wall-clock creation time. In simulation mode
+    /// (`GlobalSimulationTime` set) it is a fixed epoch plus a counter that
+    /// increments by 1 per ULID GENERATED — NOT advanced by the simulation's
+    /// virtual clock. So across transactions it is a deterministic, monotonic
+    /// GENERATION-ORDER value, usable by tests as an *early-run ordering proxy*
+    /// against the simulation epoch — but it is NOT a literal virtual-time
+    /// reading, and its calibration to virtual seconds depends on ULID volume.
+    /// Cheap and feature-independent (the `trace-ot`-gated `started()` exposes
+    /// the same value as a `SystemTime`).
+    pub fn created_at_ms(&self) -> u64 {
+        self.id.timestamp_ms()
+    }
+
     #[cfg(feature = "trace-ot")]
     pub fn started(&self) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_millis(self.id.timestamp_ms())

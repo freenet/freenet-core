@@ -1444,6 +1444,41 @@ pub(crate) async fn join_ring_request(
 
     let current_connections = op_manager.ring.connection_manager.connection_count();
 
+    // Number of consecutive connect failures after which the bounded jitter
+    // magnitude (0.05 * 2^(failures-2)) saturates at its 0.25 cap: with the
+    // `(failures - 2).min(3)` shift, the cap is reached at `failures == 5`.
+    // Beyond this point, growing the offset no longer moves the target — the
+    // joiner keeps landing within ±0.25 of its own location, i.e. back in the
+    // SAME saturated gateway neighborhood. This is the #4362 bootstrap dead
+    // zone: late joiners cluster near a few gateways, those gateways hit
+    // max_connections, terminus-Rejects pile up, and bounded jitter cannot
+    // escape the local wall.
+    const JITTER_SATURATION_FAILURES: u32 = 5;
+    // Once failures exceed the saturation point AND we are still bootstrapping,
+    // widen the bootstrap target so retries route AWAY from the saturated
+    // neighborhood toward regions with spare capacity. One extra attempt of
+    // headroom past saturation avoids over-eagerly abandoning local
+    // exploration on a brief transient. See #4362.
+    //
+    // The widening is a BOUNDED probabilistic expansion of the jitter window,
+    // NOT a fresh uniform draw across the whole ring. A full ring-wide random
+    // target sends the joiner to an arbitrary location whose greedy route
+    // crosses the saturated regions and terminus-rejects on the way — that
+    // amplified the network-wide rejection count ~12x without improving the
+    // already-high reach-min rate. A bounded expansion (up to half the ring,
+    // the maximum ring distance) lets the joiner escape its local wall while
+    // keeping routes short, so it finds spare capacity without flooding.
+    const WIDE_REROUTE_FAILURE_THRESHOLD: u32 = JITTER_SATURATION_FAILURES + 1;
+    // Probability, per saturated retry, of taking the widened jitter rather
+    // than the standard bounded one. Keeping most retries at the standard
+    // magnitude preserves NAT-friendly local exploration; the occasional wide
+    // step is what breaks out of the dead zone. Named (not a bare literal):
+    // a coin flip is the simplest rate that escapes without dominating.
+    const WIDE_REROUTE_PROBABILITY: f64 = 0.5;
+    // Maximum widened jitter magnitude = half the ring (the largest possible
+    // ring distance). Bounds the escape step so routes stay short.
+    const WIDE_REROUTE_MAX_MAGNITUDE: f64 = 0.5;
+
     // Helper: apply jitter to base_location for NAT-compatible acceptor exploration.
     // After consecutive hole-punch failures, the same location routes to the same
     // acceptors. Jittering explores different ring regions.
@@ -1452,6 +1487,25 @@ pub(crate) async fn join_ring_request(
             .ring
             .connection_manager
             .increment_connect_jitter_failures(now);
+        // Bootstrap-only widened re-route: once bounded jitter has saturated
+        // and we are still below the gap-targeting threshold (true bootstrap),
+        // occasionally take a larger (but still bounded) jitter step so the
+        // retry leaves the saturated ±0.25 window without sending a full
+        // ring-wide random target through every saturated region (#4362).
+        let saturated_bootstrap = failures >= WIDE_REROUTE_FAILURE_THRESHOLD
+            && current_connections < GAP_TARGET_THRESHOLD;
+        if saturated_bootstrap && GlobalRng::random_bool(WIDE_REROUTE_PROBABILITY) {
+            let uniform_01 = (GlobalRng::random_u64() as f64) / (u64::MAX as f64);
+            let offset = WIDE_REROUTE_MAX_MAGNITUDE * (2.0 * uniform_01 - 1.0);
+            let widened = (base.as_f64() + offset).rem_euclid(1.0);
+            tracing::info!(
+                failures,
+                base = %base,
+                widened,
+                "connect: widened bootstrap re-route after saturated jitter (#4362)"
+            );
+            return Location::new(widened);
+        }
         if failures > 1 {
             // Jitter magnitude: 0.05 * 2^(failures-2), capped at 0.25
             let magnitude = (0.05 * (1u32 << (failures - 2).min(3)) as f64).min(0.25);

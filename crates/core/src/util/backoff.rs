@@ -238,6 +238,45 @@ impl<K: Eq + Hash + Clone> TrackedBackoff<K> {
         self.evict_if_needed();
     }
 
+    /// Record a fixed, non-escalating short backoff for a key.
+    ///
+    /// Unlike [`record_failure`](Self::record_failure), this does NOT increment
+    /// the consecutive-failure counter, so repeated calls always apply the same
+    /// `delay` (plus ±20% jitter) rather than escalating toward the exponential
+    /// cap. Use this when a failure should briefly throttle retries WITHOUT
+    /// signalling that the target is persistently bad — e.g. a capacity
+    /// `Rejected` received while still under `min_connections`, where escalating
+    /// the per-location backoff would trap the under-connected node (#4362).
+    ///
+    /// If the key already has a longer `retry_after` pending, it is left
+    /// untouched (we never shorten an existing, more pessimistic backoff).
+    ///
+    /// Time-boundedness (AGENTS.md): this is a *throttle*, not a GC exemption.
+    /// The entry self-expires `delay` (~seconds) after the last call, and
+    /// `cleanup_expired` evicts entries past `retry_after`; `last_failure` only
+    /// feeds LRU eviction, never an indefinite exemption from cleanup. A target
+    /// that keeps getting rejected is *supposed* to keep the short throttle —
+    /// it is cleared the moment a connection succeeds (`record_success`) and is
+    /// capacity-bounded by the tracker's LRU (`max_entries`). So there is no
+    /// permanently-refreshable blind spot to absolute-age-bound here.
+    pub fn record_short_backoff(&mut self, key: K, delay: Duration) {
+        let now = Instant::now();
+        // ±20% jitter to avoid synchronized retries (thundering herd); seeded
+        // GlobalRng keeps this reproducible in simulation.
+        let jitter_factor: f64 = GlobalRng::random_range(0.8_f64..=1.2_f64);
+        let jittered = delay.mul_f64(jitter_factor);
+        let entry = self.entries.entry(key).or_insert(BackoffEntry {
+            consecutive_failures: 0,
+            last_failure: now,
+            retry_after: now,
+        });
+        entry.last_failure = now;
+        // Never shorten an already-longer backoff (e.g. an earlier escalating
+        // failure on the same bucket).
+        entry.retry_after = entry.retry_after.max(now + jittered);
+        self.evict_if_needed();
+    }
+
     /// Record a success for a key.
     ///
     /// Clears the backoff state for that key.
@@ -431,6 +470,57 @@ mod tests {
         tracker.record_success(&key);
         assert!(!tracker.is_in_backoff(&key));
         assert_eq!(tracker.failure_count(&key), 0);
+    }
+
+    #[test]
+    fn test_record_short_backoff_does_not_escalate() {
+        // #4362: record_short_backoff applies a fixed delay without touching
+        // the consecutive-failure counter, so repeated calls never escalate.
+        let config = ExponentialBackoff::new(Duration::from_secs(30), Duration::from_secs(600));
+        let mut tracker: TrackedBackoff<String> = TrackedBackoff::new(config, 100);
+        let key = "test".to_string();
+
+        for _ in 0..5 {
+            tracker.record_short_backoff(key.clone(), Duration::from_secs(3));
+        }
+        assert_eq!(
+            tracker.failure_count(&key),
+            0,
+            "short backoff must not increment the escalating failure count"
+        );
+        assert!(tracker.is_in_backoff(&key));
+        // Remaining stays near the 3s short delay (±20% jitter ⇒ 2.4–3.6s),
+        // nowhere near the 30s escalating base.
+        let remaining = tracker.remaining_backoff(&key).expect("in backoff");
+        assert!(
+            remaining <= Duration::from_secs(5),
+            "short backoff should stay near 3s, got {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn test_record_short_backoff_never_shortens_longer() {
+        // The `.max()` in record_short_backoff must never pull an existing,
+        // longer retry_after earlier (#4362).
+        let config = ExponentialBackoff::new(Duration::from_secs(30), Duration::from_secs(600));
+        let mut tracker: TrackedBackoff<String> = TrackedBackoff::new(config, 100);
+        let key = "test".to_string();
+
+        // An escalating failure sets ~30s (±20% ⇒ 24–36s).
+        tracker.record_failure(key.clone());
+        let long = tracker.remaining_backoff(&key).expect("in backoff");
+        assert!(
+            long > Duration::from_secs(20),
+            "expected ~30s, got {long:?}"
+        );
+
+        // A 3s short backoff must NOT shorten it.
+        tracker.record_short_backoff(key.clone(), Duration::from_secs(3));
+        let after = tracker.remaining_backoff(&key).expect("still in backoff");
+        assert!(
+            after > Duration::from_secs(10),
+            "short backoff wrongly shortened {long:?} to {after:?}"
+        );
     }
 
     #[test]
