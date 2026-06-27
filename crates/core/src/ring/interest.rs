@@ -1220,10 +1220,21 @@ mod tests {
         ContractKey::from_id_and_code(ContractInstanceId::new(id), CodeHash::new(code))
     }
 
-    fn make_peer_key(_seed: u8) -> PeerKey {
-        use crate::transport::TransportKeypair;
-        let keypair = TransportKeypair::new();
-        PeerKey(keypair.public().clone())
+    /// Build a deterministic peer key from a seed.
+    ///
+    /// Deterministic-and-distinct so tests never rely on RNG distinctness:
+    /// distinct seeds always yield distinct keys, and the same seed always
+    /// yields the same key (mirrors the sibling `hosting.rs` test helper).
+    fn make_peer_key(seed: u8) -> PeerKey {
+        make_unique_peer_key(seed as u32)
+    }
+
+    /// Like `make_peer_key` but with a `u32` seed for tests that need more
+    /// than 256 pairwise-distinct peers (mirrors `make_unique_contract_key`).
+    fn make_unique_peer_key(seed: u32) -> PeerKey {
+        let mut bytes = [0u8; 32];
+        bytes[0..4].copy_from_slice(&seed.to_le_bytes());
+        PeerKey(crate::transport::TransportPublicKey::from_bytes(bytes))
     }
 
     fn make_manager() -> (TestInterestManager, SharedMockTimeSource) {
@@ -1265,9 +1276,14 @@ mod tests {
         let contract = make_contract_key(1);
 
         // Fill to exactly MAX distinct peers — each is new and accepted.
+        // Keys are deterministic AND pairwise-distinct (derived from a u32
+        // counter), so the test never relies on RNG distinctness: a leaked
+        // thread-local GlobalRng seed or a one-in-a-billion keypair collision
+        // can no longer make the 513th registration spuriously non-new and
+        // skip the cap branch (the cold-build flake this hardening fixes).
         let mut peers = Vec::with_capacity(MAX_INTERESTED_PEERS_PER_CONTRACT);
-        for _ in 0..MAX_INTERESTED_PEERS_PER_CONTRACT {
-            let peer = make_peer_key(0);
+        for i in 0..MAX_INTERESTED_PEERS_PER_CONTRACT {
+            let peer = make_unique_peer_key(i as u32);
             assert!(
                 manager.register_peer_interest(&contract, peer.clone(), None, false),
                 "registering a fresh peer below capacity must return is_new = true"
@@ -1281,8 +1297,9 @@ mod tests {
 
         // One MORE distinct peer is rejected: returns is_new = false (so it does
         // NOT trigger the #4359 first-viable-target broadcast flush) and the map
-        // length is unchanged.
-        let overflow_peer = make_peer_key(0);
+        // length is unchanged. Its seed is past the fill range, so it is
+        // guaranteed not already tracked.
+        let overflow_peer = make_unique_peer_key(MAX_INTERESTED_PEERS_PER_CONTRACT as u32);
         assert!(
             !manager.register_peer_interest(&contract, overflow_peer.clone(), None, false),
             "a new peer at capacity must be rejected (is_new = false)"
