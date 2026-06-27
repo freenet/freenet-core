@@ -43,6 +43,17 @@ pub enum ServiceCommand {
         /// servers, or environments without a user session bus.
         #[arg(long)]
         system: bool,
+        /// Do NOT enable systemd lingering for a user service.
+        ///
+        /// By default a user service enables lingering
+        /// (`loginctl enable-linger <user>`) so it keeps running without an
+        /// active login session — required for the auto-update self-heal to
+        /// work on a headless server (without it, a `--user` service is
+        /// stopped at logout and never catches the node's exit-42 "update
+        /// needed" signal). Pass this to keep the service login-scoped
+        /// instead. Has no effect on a `--system` service.
+        #[arg(long)]
+        no_linger: bool,
     },
     /// Uninstall the Freenet system service
     Uninstall {
@@ -116,7 +127,7 @@ impl ServiceCommand {
         config_dirs: Arc<ConfigPaths>,
     ) -> Result<()> {
         match self {
-            ServiceCommand::Install { system } => install_service(*system),
+            ServiceCommand::Install { system, no_linger } => install_service(*system, *no_linger),
             ServiceCommand::Uninstall {
                 system,
                 purge,
@@ -233,15 +244,17 @@ pub(super) fn dashboard_port_is_listening() -> bool {
 // so `use super::*` in the tests block pulls them all into scope.
 
 #[cfg(target_os = "linux")]
-fn install_service(system: bool) -> Result<()> {
-    linux::install_service(system)
+fn install_service(system: bool, no_linger: bool) -> Result<()> {
+    linux::install_service(system, no_linger)
 }
 #[cfg(target_os = "macos")]
-fn install_service(system: bool) -> Result<()> {
+fn install_service(system: bool, _no_linger: bool) -> Result<()> {
+    // Lingering is a systemd concept; macOS launchd has no equivalent.
     macos::install_service(system)
 }
 #[cfg(target_os = "windows")]
-fn install_service(system: bool) -> Result<()> {
+fn install_service(system: bool, _no_linger: bool) -> Result<()> {
+    // Lingering is a systemd concept; Windows has no equivalent.
     windows::install_service(system)
 }
 
@@ -370,7 +383,7 @@ pub use windows::stop_and_remove_service;
 
 // Fallback for unsupported platforms
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn install_service(_system: bool) -> Result<()> {
+fn install_service(_system: bool, _no_linger: bool) -> Result<()> {
     anyhow::bail!("Service installation is not supported on this platform")
 }
 

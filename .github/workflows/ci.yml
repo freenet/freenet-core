@@ -167,6 +167,19 @@ jobs:
       - name: Self-test announce-to-river
         run: bash scripts/release-agent/announce-to-river_test.sh
 
+      # install.sh now sets up a supervised service by default (issue #4073) so
+      # new nodes auto-update. The system-vs-user + lingering decision is the
+      # load-bearing new logic; these smoke tests pin it without needing real
+      # root/sudo. shellcheck guards the installer/uninstaller scripts too.
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint install/uninstall scripts (shellcheck)
+        run: shellcheck scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh
+      - name: Self-test install.sh service-mode decision
+        run: sh scripts/test-install-sh.sh
+      - name: Self-test uninstall.sh
+        run: sh scripts/test-uninstall-sh.sh
+
       - name: Check for old-style mod.rs files
         run: |
           # New modules must use foo.rs + foo/ style, not foo/mod.rs

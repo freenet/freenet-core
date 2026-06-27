@@ -114,16 +114,119 @@ fn systemctl_with_hint(system_mode: bool, args: &[&str], action: &str) -> Result
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn install_service(system: bool) -> Result<()> {
+pub(super) fn install_service(system: bool, no_linger: bool) -> Result<()> {
     if system {
+        // A system service runs at boot independent of any login session, so
+        // lingering does not apply to it; `no_linger` is ignored here.
         install_system_service()
     } else {
-        install_user_service()
+        install_user_service(no_linger)
+    }
+}
+
+/// The lingering action implied by the install flags. Pure decision split out
+/// from the side-effecting install so the policy can be unit-tested:
+/// a system service never lingers (it starts at boot); a user service enables
+/// lingering by default and skips it only on `--no-linger`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LingerAction {
+    /// System service: lingering is irrelevant (runs at boot regardless).
+    SystemService,
+    /// User service: enable lingering so it survives logout (the default).
+    EnableForUser,
+    /// User service with `--no-linger`: keep the service login-scoped.
+    SkipForUser,
+}
+
+#[cfg(target_os = "linux")]
+fn linger_action(system: bool, no_linger: bool) -> LingerAction {
+    if system {
+        LingerAction::SystemService
+    } else if no_linger {
+        LingerAction::SkipForUser
+    } else {
+        LingerAction::EnableForUser
+    }
+}
+
+/// Resolve the current login name, for enabling systemd lingering on a user
+/// service. Prefers `$USER`/`$LOGNAME`, falling back to `id -un`.
+#[cfg(target_os = "linux")]
+fn current_username() -> Option<String> {
+    for var in ["USER", "LOGNAME"] {
+        if let Ok(value) = std::env::var(var) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    std::process::Command::new("id")
+        .arg("-un")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+/// Whether systemd lingering is already enabled for `username`.
+#[cfg(target_os = "linux")]
+fn linger_enabled(username: &str) -> bool {
+    std::process::Command::new("loginctl")
+        .args(["show-user", username, "--property=Linger", "--value"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "yes")
+        .unwrap_or(false)
+}
+
+/// Enable systemd "lingering" for `username` so their `--user` services keep
+/// running without an active login session.
+///
+/// This is ESSENTIAL for a headless server: without lingering, a `--user`
+/// service is bound to the user's login session and is stopped at logout, so
+/// it never restarts on boot and never catches the node's exit-42 "update
+/// needed" signal — the node silently stops auto-updating. Enabling lingering
+/// is the user-service counterpart to a `--system` service starting at boot.
+///
+/// Best-effort: a failure only weakens auto-update across logout, so we warn
+/// (with a remediation hint) rather than aborting the install. Idempotent: a
+/// no-op when lingering is already enabled.
+#[cfg(target_os = "linux")]
+fn enable_linger(username: &str) {
+    if linger_enabled(username) {
+        println!("systemd lingering already enabled for user '{username}'.");
+        return;
+    }
+    match std::process::Command::new("loginctl")
+        .args(["enable-linger", username])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            println!(
+                "Enabled systemd lingering for user '{username}' \
+                 (the service runs without an active login session, so it \
+                 auto-updates on a headless server)."
+            );
+        }
+        _ => {
+            eprintln!(
+                "Warning: could not enable systemd lingering for user '{username}'.\n\
+                 The user service will run ONLY while you are logged in, so it will\n\
+                 NOT auto-update on a headless server. Enable it manually with:\n  \
+                 sudo loginctl enable-linger {username}\n\
+                 Or reinstall as a system service:\n  \
+                 sudo freenet service install --system"
+            );
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn install_user_service() -> Result<()> {
+fn install_user_service(no_linger: bool) -> Result<()> {
     use std::fs;
 
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
@@ -161,12 +264,57 @@ fn install_user_service() -> Result<()> {
     // Enable the service
     systemctl_with_hint(false, &["enable", "freenet"], "enable service")?;
 
+    // Enable lingering by default so the service runs without an active login
+    // session (the headless-server auto-update requirement). Opt out with
+    // `--no-linger` to keep the service login-scoped.
+    //
+    // install_user_service is only reached for a user install, so the
+    // SystemService arm is unreachable here, but matching exhaustively keeps
+    // the policy in one place.
+    let action = linger_action(false, no_linger);
+    let username = current_username();
+    let lingering = match action {
+        LingerAction::EnableForUser => match &username {
+            Some(user) => {
+                enable_linger(user);
+                linger_enabled(user)
+            }
+            None => {
+                eprintln!(
+                    "Warning: could not determine the current username to enable \
+                     systemd lingering. The user service will run only while you are \
+                     logged in (no auto-update across logout). Enable it manually with:\n  \
+                     sudo loginctl enable-linger <your-user>"
+                );
+                false
+            }
+        },
+        LingerAction::SkipForUser | LingerAction::SystemService => false,
+    };
+
+    let user_label = username.as_deref().unwrap_or("<your-user>");
+
     println!("Freenet user service installed successfully.");
     println!();
     println!("To start the service now:");
     println!("  freenet service start");
     println!();
-    println!("The service will start automatically on login.");
+    if lingering {
+        println!("The service will start automatically on login and on boot");
+        println!("(systemd lingering is enabled, so it keeps running when you log out).");
+    } else if matches!(action, LingerAction::SkipForUser) {
+        // The operator explicitly opted out, so don't nag with a remediation;
+        // just state the consequence plainly.
+        println!("The service will start automatically on login.");
+        println!("Lingering is disabled (--no-linger): the service stops at logout, so it");
+        println!("will not auto-update on a headless server. Re-enable it any time with:");
+        println!("  sudo loginctl enable-linger {user_label}");
+    } else {
+        println!("The service will start automatically on login.");
+        println!("NOTE: lingering could NOT be enabled, so the service stops at logout and");
+        println!("      will not auto-update on a headless server. Enable it with:");
+        println!("        sudo loginctl enable-linger {user_label}");
+    }
     println!("Logs will be written to: {}", log_dir.display());
 
     Ok(())
@@ -698,7 +846,26 @@ pub(super) fn service_logs(error_only: bool) -> Result<()> {
 mod tests {
     use std::path::Path;
 
-    use super::{generate_system_service_file, generate_user_service_file};
+    use super::{
+        LingerAction, generate_system_service_file, generate_user_service_file, linger_action,
+    };
+
+    /// Policy pin (issue #4073): a system service never lingers (it starts at
+    /// boot regardless), a user service enables lingering by default so it
+    /// survives logout on a headless server, and `--no-linger` keeps a user
+    /// service login-scoped. Lingering is the user-service counterpart to a
+    /// system service's boot start; without it a `--user` node stops at logout
+    /// and silently never auto-updates.
+    #[test]
+    fn linger_action_matches_policy() {
+        // System service: `no_linger` is irrelevant.
+        assert_eq!(linger_action(true, false), LingerAction::SystemService);
+        assert_eq!(linger_action(true, true), LingerAction::SystemService);
+        // User service defaults to enabling lingering.
+        assert_eq!(linger_action(false, false), LingerAction::EnableForUser);
+        // User service with --no-linger stays login-scoped.
+        assert_eq!(linger_action(false, true), LingerAction::SkipForUser);
+    }
 
     /// Byte offset of the section header line (a line whose trimmed content is
     /// exactly `[name]`). Matches by LINE, not a naive substring search, so a

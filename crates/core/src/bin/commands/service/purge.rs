@@ -129,8 +129,11 @@ pub(super) fn service_doctor(system: bool) -> Result<()> {
     println!("freenet service doctor: recovering service install...");
 
     // 1. Re-template wrapper/unit to the current binary.
+    //    no_linger=false: preserve the default linger behaviour when
+    //    re-templating a user service so a recovered headless install keeps
+    //    auto-updating across logout (linger enabling is idempotent).
     println!("  - Re-templating service wrapper/unit to the current binary...");
-    super::install_service(system)?;
+    super::install_service(system, false)?;
 
     // 2. Stop the managed service (best-effort: a wedged install may show the
     //    agent as not-running, in which case stop is a no-op we don't want to
