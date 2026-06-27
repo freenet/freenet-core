@@ -1490,6 +1490,19 @@ mod tests {
             script.contains("CHILD_RUNTIME") && script.contains("CONSECUTIVE_FAILURES=0"),
             "wrapper must reset the consecutive-failure streak after a healthy run"
         );
+        // A benign updater no-op (exit 2 = already up to date / rate-limited /
+        // pinned / install-gated) on the exit-42 path must NOT count toward the
+        // cap. The script captures UPDATE_RC and compares against the injected
+        // EXIT_CODE_ALREADY_UP_TO_DATE (2).
+        assert!(
+            script.contains("UPDATE_RC=$?")
+                && script.contains(&format!(
+                    "UPDATE_RC\" -eq {}",
+                    super::super::update::EXIT_CODE_ALREADY_UP_TO_DATE
+                )),
+            "exit-42 path must treat the updater's already-up-to-date/rate-limited \
+             exit as a benign no-op, not a counted failure"
+        );
     }
 
     /// Regression for issue #3967: on exit 43 the wrapper must self-heal a

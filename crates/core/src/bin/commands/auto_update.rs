@@ -660,12 +660,16 @@ fn read_github_poll_bucket_at(dir: &std::path::Path, file: &str) -> BucketRead {
     }
 }
 
-fn write_github_poll_bucket_at(dir: &std::path::Path, file: &str, bucket: &GithubPollBucket) {
-    let _mkdir = fs::create_dir_all(dir);
-    let _write = fs::write(
+fn write_github_poll_bucket_at(
+    dir: &std::path::Path,
+    file: &str,
+    bucket: &GithubPollBucket,
+) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::write(
         dir.join(file),
         format!("{} {}", bucket.tokens, bucket.updated_unix),
-    );
+    )
 }
 
 /// Try to consume one token from the named on-disk bucket in `dir`.
@@ -675,18 +679,23 @@ pub(crate) fn try_consume_github_poll_at(dir: &std::path::Path, file: &str, now_
         BucketRead::Present(s) => Some(s),
         BucketRead::Missing => None,
         BucketRead::Corrupt => {
-            // Deny this poll, and rewrite an empty bucket dated now so the
-            // limiter self-heals (a token trickles back after the refill
+            // Deny this poll, and (best-effort) rewrite an empty bucket dated now
+            // so the limiter self-heals (a token trickles back after the refill
             // interval) without ever granting a free token from the corrupt
-            // state. This makes a corrupt/torn bucket fail closed.
-            write_github_poll_bucket_at(
+            // state. This makes a corrupt/torn bucket fail closed; if the rewrite
+            // itself fails the next read stays corrupt and keeps denying.
+            if write_github_poll_bucket_at(
                 dir,
                 file,
                 &GithubPollBucket {
                     tokens: 0.0,
                     updated_unix: now_unix,
                 },
-            );
+            )
+            .is_err()
+            {
+                tracing::debug!("Could not reset corrupt GitHub-poll bucket; staying denied");
+            }
             return false;
         }
     };
@@ -696,8 +705,12 @@ pub(crate) fn try_consume_github_poll_at(dir: &std::path::Path, file: &str, now_
         GITHUB_POLL_BUCKET_CAPACITY,
         GITHUB_POLL_REFILL_SECS,
     );
-    write_github_poll_bucket_at(dir, file, &next);
-    allowed
+    // FAIL CLOSED: only allow the poll if we BOTH had a token AND persisted the
+    // post-consume state. If the write fails (read-only / full state dir), a
+    // missing bucket would otherwise read as full on every restart and grant an
+    // unbounded burst — so a non-persistable consume must deny instead.
+    let persisted = write_github_poll_bucket_at(dir, file, &next).is_ok();
+    allowed && persisted
 }
 
 fn try_consume_poll_bucket(file: &str) -> bool {
@@ -1330,7 +1343,8 @@ mod tests {
                 tokens: 0.0,
                 updated_unix: now,
             },
-        );
+        )
+        .unwrap();
         let far_future = now + (GITHUB_POLL_REFILL_SECS as u64) * 10_000;
 
         let cap = GITHUB_POLL_BUCKET_CAPACITY as u64;
@@ -1470,6 +1484,29 @@ mod tests {
         assert!(
             try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, 6_000_000),
             "first poll on a fresh node must be allowed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_github_poll_bucket_fails_closed_when_unpersistable() {
+        // Codex P2: if the post-consume state cannot be persisted (read-only /
+        // full state dir), the poll must be DENIED — otherwise a missing bucket
+        // would read as full on every restart and grant an unbounded burst,
+        // failing open. Make the dir read-only so the write fails.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let orig = std::fs::metadata(dir).unwrap().permissions();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let allowed = try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, 8_000_000);
+
+        // Restore perms before asserting so tempdir cleanup always works.
+        std::fs::set_permissions(dir, orig).unwrap();
+        assert!(
+            !allowed,
+            "an unpersistable consume must deny (fail closed), not allow"
         );
     }
 

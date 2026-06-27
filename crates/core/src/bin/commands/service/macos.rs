@@ -346,6 +346,19 @@ while true; do
             BACKOFF=10
             sleep 2
         else
+            UPDATE_RC=$?
+            if [ "$UPDATE_RC" -eq {already_up_to_date} ]; then
+                # Benign no-op: `freenet update` exited "already up to date" — no
+                # update was performed because we are already current, the target
+                # is rate-limited, pinned known-bad, or install-gated (#4073).
+                # This is NOT a failure, so it must NOT count toward the give-up
+                # cap; just restart the same binary after a short pause.
+                log_event "Update reported nothing to do (exit $UPDATE_RC); restarting without counting a failure."
+                PORT_CONFLICT_KILLS=0
+                BACKOFF=10
+                sleep 2
+                continue
+            fi
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
             give_up_if_failing
             log_event "Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..."
@@ -415,6 +428,7 @@ done
         binary = binary_path.display(),
         supervised_env = super::super::auto_update::SUPERVISED_ENV_VAR,
         post_stop_env = super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR,
+        already_up_to_date = super::super::update::EXIT_CODE_ALREADY_UP_TO_DATE,
     )
 }
 
