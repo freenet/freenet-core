@@ -250,12 +250,21 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
         return UpdateCheckResult::Skipped;
     }
 
-    // Record that we're checking now
-    record_check_time();
+    // NOTE: the last-check timestamp is recorded only when a GitHub poll is
+    // actually attempted (see the arms below), NOT here. A token-denied
+    // (rate-limited) poll must NOT advance `last_update_check`: if it did, the
+    // backoff gate above would short-circuit the next tick to a plain `Skipped`
+    // before reaching the `RateLimited` arm — and a `Skipped` at max backoff with
+    // 0 connections can still trigger the gateway-trust exit 42 (the loop the
+    // limiter exists to prevent), and the stagger path could wrongly enter its
+    // 24h cooldown.
 
     // Fetch latest version from GitHub
     match get_latest_version().await {
         Ok(latest) => {
+            // A real GitHub poll happened: record the check time so the backoff
+            // gate spaces out subsequent polls.
+            record_check_time();
             let current = match Version::parse(current_version) {
                 Ok(v) => v,
                 Err(e) => {
@@ -337,21 +346,27 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
             }
         }
         Err(e) if e.downcast_ref::<RateLimitedError>().is_some() => {
-            // Our OWN rate limiter denied the poll — NOT a GitHub failure. Do not
-            // grow the backoff and (critically) return the distinct RateLimited
-            // result so the caller does not fall through to the gateway-trust
-            // exit-42 fallback. We simply retry once the bucket refills.
+            // Our OWN rate limiter denied the poll — NOT a GitHub failure, and no
+            // network call was made. Deliberately do NOT record a check time or
+            // grow the backoff: recording would let the backoff gate mask this as
+            // a plain `Skipped` on the next tick (which can still trigger the
+            // gateway-trust exit 42 / the stagger cooldown). Return the distinct
+            // `RateLimited` so the caller does nothing and retries once the bucket
+            // refills.
             tracing::debug!(
                 "Update check skipped: GitHub poll rate-limited; will retry when the token bucket refills"
             );
             UpdateCheckResult::RateLimited
         }
         Err(e) => {
+            // A real GitHub poll was attempted (token consumed) but failed
+            // (network/parse). Record the check time + grow backoff so we retry
+            // later rather than hammering on every tick.
+            record_check_time();
             tracing::warn!(
                 "Failed to check GitHub for updates: {}. Will retry with increased backoff.",
                 e
             );
-            // Network error - increase backoff and retry later
             increase_backoff();
             UpdateCheckResult::Skipped
         }
@@ -1507,6 +1522,60 @@ mod tests {
         assert!(
             !allowed,
             "an unpersistable consume must deny (fail closed), not allow"
+        );
+    }
+
+    #[test]
+    fn test_rate_limited_poll_does_not_record_check_time_or_grow_backoff() {
+        // Source pin (#4073 Codex): a token-denied poll must not advance the
+        // last-check timestamp or grow the backoff, or the backoff gate would
+        // mask `RateLimited` as a plain `Skipped` on the next tick (which can
+        // still trigger the gateway-trust exit 42). So: (a) record_check_time()
+        // must NOT be called unconditionally before the get_latest_version match,
+        // and (b) the RateLimited arm must call neither record_check_time nor
+        // increase_backoff.
+        let src = include_str!("auto_update.rs");
+        let (_, body) = src
+            .split_once("pub async fn check_if_update_available(")
+            .expect("check_if_update_available not found");
+
+        // (a) Between the backoff gate and the match there must be no
+        // unconditional record_check_time().
+        let gate = body
+            .find("if !should_check_for_update(current_backoff) {")
+            .expect("backoff gate not found");
+        let match_pos = body
+            .find("match get_latest_version().await {")
+            .expect("get_latest_version match not found");
+        let between = &body[gate..match_pos];
+        // strip line comments so the explanatory NOTE mentioning the function name
+        // doesn't trip the check
+        let between_code: String = between
+            .lines()
+            .map(|l| l.split_once("//").map(|(c, _)| c).unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !between_code.contains("record_check_time()"),
+            "record_check_time() must NOT run unconditionally before the poll — a \
+             rate-limited poll would then advance the backoff gate and mask RateLimited"
+        );
+
+        // (b) The RateLimited arm must not record a check time or grow backoff.
+        let (_, rl_arm) = body
+            .split_once("e.downcast_ref::<RateLimitedError>().is_some() =>")
+            .expect("RateLimited arm not found");
+        let (rl_body, _) = rl_arm
+            .split_once("UpdateCheckResult::RateLimited")
+            .expect("RateLimited arm body not found");
+        let rl_code: String = rl_body
+            .lines()
+            .map(|l| l.split_once("//").map(|(c, _)| c).unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !rl_code.contains("record_check_time(") && !rl_code.contains("increase_backoff("),
+            "the RateLimited arm must not record a check time or grow backoff"
         );
     }
 
