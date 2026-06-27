@@ -431,6 +431,17 @@ impl UpdateCommand {
                 super::rollback::record_install_failure(latest_version)
             }
             // Transient install error: neither record nor clear — retry later.
+            //
+            // DELIBERATELY includes the fail-closed "missing artifact" refusals
+            // (absent SHA256SUMS.txt, no manifest entry for our asset, absent
+            // .sig when required) as well as download/network/extraction errors.
+            // A MISSING manifest/entry is the canonical release-PROPAGATION race
+            // (assets upload after the tag is live), so it self-resolves — gating
+            // it would risk permanently suppressing a good release that the node
+            // happened to poll seconds early, which is a worse regression than the
+            // already rate-limit-bounded retry cadence. Only a PRESENT-but-WRONG
+            // artifact (checksum mismatch / invalid signature) is an unambiguous
+            // bad-release signal and is gated above via ReleaseVerificationError.
             Err(_) => {}
         }
         install_result.map(|_| ())
@@ -1335,6 +1346,14 @@ fn verify_manifest_signature_with(
 /// rather than counting toward the `MAX_UPDATE_FAILURES` lockout. A
 /// transiently-missing manifest therefore retries under the existing
 /// exponential backoff instead of permanently disabling auto-update.
+///
+/// DELIBERATELY a plain error, NOT a [`ReleaseVerificationError`]: a missing
+/// manifest/entry is the canonical release-PROPAGATION race (the tag goes live
+/// before the assets finish uploading), so it must stay transient and NOT count
+/// toward the per-version install-failure gate (#4073) — gating it would risk
+/// permanently suppressing a good release polled seconds early. Only a
+/// PRESENT-but-WRONG artifact (hash mismatch / invalid signature) is the
+/// deterministic bad-release signal that gates.
 ///
 /// Pure (no I/O) so the fail-closed contract is unit-testable on every CI
 /// runner regardless of target OS.
