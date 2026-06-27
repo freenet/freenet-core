@@ -333,13 +333,30 @@ Restart=always
 # crash-loop cap (StartLimit*) lives in the [Unit] section above (#4551).
 RestartSec=10
 # Restart backoff (#4073): grow the inter-restart delay from RestartSec up to
-# RestartMaxDelaySec over RestartSteps restarts, so any residual crash/exit loop
-# that does NOT trip StartLimitBurst (e.g. a slow loop spaced just outside the
-# 120s burst window) still slows down instead of reconnecting to the gateway
-# every ~10s. This directly reduces gateway reconnect churn during a loop.
+# RestartMaxDelaySec over RestartSteps restarts, so a residual crash/exit loop
+# slows down (=> up to 300s between restarts) instead of reconnecting to the
+# gateway every ~10s -- gentler on the gateways, and it keeps the node trying for
+# a fix instead of hammering.
+#
+# DELIBERATE tradeoff with the #4551 crash-loop limiter (StartLimitBurst=5 /
+# StartLimitIntervalSec=120, StartLimitAction=none in [Unit]). The growing delay
+# changes WHICH crashes reach #4551's terminal "failed-state stop":
+#   * A TRUE fast crash (sub-second startup wedge) still clusters its first ~5
+#     restarts well inside the 120s window while the delay is still small, so it
+#     STILL trips StartLimitBurst and the unit terminal-stops. The #4551
+#     brick-loop guarantee is preserved for the case it was designed for.
+#   * A MEDIUM-runtime crash (node dies tens of seconds in) can, once the delay
+#     has grown toward 300s, be spaced PAST the 120s burst window, so it no
+#     longer trips StartLimitBurst and instead slow-flaps at <=300s rather than
+#     terminal-stopping. This is accepted: such a node is not a tight brick-loop,
+#     the slow cadence is easy on the gateways, and continuing to restart lets a
+#     later fixed release (via the ExecStopPost `freenet update` below) heal it.
+#     A bad UPDATE that crash-loops is still disarmed within its probation window
+#     by the #4073/#4591 auto-rollback regardless of this cadence.
+#
 # These directives require systemd >= 254; OLDER systemd silently IGNORES unknown
 # directives (they are not parse errors), so the unit degrades gracefully to the
-# fixed RestartSec=10 above.
+# fixed RestartSec=10 above (and #4551's limiter then behaves exactly as before).
 RestartSteps=10
 RestartMaxDelaySec=300
 # Allow 45 seconds for graceful shutdown before SIGKILL.
@@ -474,13 +491,30 @@ Restart=always
 # crash-loop cap (StartLimit*) lives in the [Unit] section above (#4551).
 RestartSec=10
 # Restart backoff (#4073): grow the inter-restart delay from RestartSec up to
-# RestartMaxDelaySec over RestartSteps restarts, so any residual crash/exit loop
-# that does NOT trip StartLimitBurst (e.g. a slow loop spaced just outside the
-# 120s burst window) still slows down instead of reconnecting to the gateway
-# every ~10s. This directly reduces gateway reconnect churn during a loop.
+# RestartMaxDelaySec over RestartSteps restarts, so a residual crash/exit loop
+# slows down (=> up to 300s between restarts) instead of reconnecting to the
+# gateway every ~10s -- gentler on the gateways, and it keeps the node trying for
+# a fix instead of hammering.
+#
+# DELIBERATE tradeoff with the #4551 crash-loop limiter (StartLimitBurst=5 /
+# StartLimitIntervalSec=120, StartLimitAction=none in [Unit]). The growing delay
+# changes WHICH crashes reach #4551's terminal "failed-state stop":
+#   * A TRUE fast crash (sub-second startup wedge) still clusters its first ~5
+#     restarts well inside the 120s window while the delay is still small, so it
+#     STILL trips StartLimitBurst and the unit terminal-stops. The #4551
+#     brick-loop guarantee is preserved for the case it was designed for.
+#   * A MEDIUM-runtime crash (node dies tens of seconds in) can, once the delay
+#     has grown toward 300s, be spaced PAST the 120s burst window, so it no
+#     longer trips StartLimitBurst and instead slow-flaps at <=300s rather than
+#     terminal-stopping. This is accepted: such a node is not a tight brick-loop,
+#     the slow cadence is easy on the gateways, and continuing to restart lets a
+#     later fixed release (via the ExecStopPost `freenet update` below) heal it.
+#     A bad UPDATE that crash-loops is still disarmed within its probation window
+#     by the #4073/#4591 auto-rollback regardless of this cadence.
+#
 # These directives require systemd >= 254; OLDER systemd silently IGNORES unknown
 # directives (they are not parse errors), so the unit degrades gracefully to the
-# fixed RestartSec=10 above.
+# fixed RestartSec=10 above (and #4551's limiter then behaves exactly as before).
 RestartSteps=10
 RestartMaxDelaySec=300
 # Allow 45 seconds for graceful shutdown before SIGKILL.
