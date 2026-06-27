@@ -262,6 +262,60 @@ fn running_under_cargo_test() -> bool {
         .unwrap_or(false)
 }
 
+/// Why a [`TelemetryReporter`] was not initialized.
+///
+/// Extracted from [`TelemetryReporter::new`] so the prod-vs-test decision is a
+/// pure function that can be unit-tested for BOTH directions without being
+/// defeated by the ambient `cfg(test)` / cargo-`deps/` environment of the test
+/// process itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelemetrySuppression {
+    /// Operator turned telemetry off (`telemetry-enabled = false`).
+    Disabled,
+    /// `--id` test environment (integration/CLI harness sets `is_test_environment`).
+    TestEnvironmentFlag,
+    /// A `cfg(test)` build or a binary running under a cargo test/bench harness.
+    TestHarness,
+}
+
+/// Decide whether telemetry should be suppressed, given the config plus the two
+/// test signals that a genuine production release binary never trips.
+///
+/// Pure and side-effect free: callers pass `cfg!(test)` and the result of
+/// [`running_under_cargo_test`] so this can be unit-tested for a prod release
+/// binary (`is_test_build = false`, `running_under_cargo_test = false`, no
+/// `--id` → MUST return `None`) AND for every test/sim path (MUST return
+/// `Some`).
+///
+/// CRITICAL (#4366 intent + the 0.2.81 telemetry-blackout regression):
+/// suppression is keyed ONLY on signals a real release binary never matches —
+/// it is deliberately NOT keyed on `cfg!(feature = "testing")`. That compile
+/// flag leaked onto the shipped `freenet` binary via Cargo resolver-v2 feature
+/// unification with `fdev` (which depends on `freenet` with
+/// `features = ["testing"]`), so every auto-updating release node since 0.2.81
+/// silently self-disabled telemetry. The real test/sim runs that #4366 must
+/// keep suppressed all run either under `cfg(test)` (unit tests) or from a
+/// cargo `deps/` harness (integration tests + nightly nextest sims), so the two
+/// remaining signals still catch them. The DST simulation framework
+/// (`node/testing_impl.rs`, used by `fdev` sims) never constructs a
+/// `TelemetryReporter` at all, so it cannot emit regardless.
+fn telemetry_suppression_reason(
+    config: &TelemetryConfig,
+    is_test_build: bool,
+    running_under_cargo_test: bool,
+) -> Option<TelemetrySuppression> {
+    if !config.enabled {
+        return Some(TelemetrySuppression::Disabled);
+    }
+    if config.is_test_environment {
+        return Some(TelemetrySuppression::TestEnvironmentFlag);
+    }
+    if is_test_build || running_under_cargo_test {
+        return Some(TelemetrySuppression::TestHarness);
+    }
+    None
+}
+
 impl TelemetryReporter {
     /// Create a new telemetry reporter.
     ///
@@ -270,47 +324,38 @@ impl TelemetryReporter {
     /// that have no `NetLogMessage` context.
     ///
     /// Returns None if telemetry is disabled, in a `--id` test environment,
-    /// or in a test build/harness (`cfg(test)` / `feature = "testing"` /
-    /// running under cargo test — see `running_under_cargo_test`).
+    /// or in a test build/harness (`cfg(test)` / running under a cargo
+    /// `deps/` harness — see `running_under_cargo_test` and
+    /// `telemetry_suppression_reason`).
     pub fn new(config: &TelemetryConfig, local_peer_id: String) -> Option<Self> {
-        if !config.enabled {
-            tracing::info!("Telemetry reporting is disabled");
-            return None;
-        }
-
-        // Disable telemetry in test environments (detected via --id flag) to avoid
-        // flooding the production collector with CI/integration test data.
-        if config.is_test_environment {
-            tracing::info!("Telemetry disabled in test environment (--id flag detected)");
-            return None;
-        }
-
-        // Belt-and-suspenders guard for test binaries that build `NodeConfig`
-        // directly without going through the `--id` CLI path, so
-        // `is_test_environment` stays false (the integration tests under
-        // `crates/core/tests/*.rs`, e.g. operations_before_join /
-        // hosted_mode_* / in_process_restart / error_notification). Without
-        // this, those tests shipped events — including simulation-loopback
-        // `get_not_found` and one-shot synthetic "gateway" peers — to the
-        // production OTLP collector at `DEFAULT_TELEMETRY_ENDPOINT`,
-        // contaminating network metrics (issue #4366).
+        // The suppression decision lives in the pure `telemetry_suppression_reason`
+        // so it can be unit-tested for both a production release binary (must NOT
+        // suppress) and every test/sim path (must suppress). See that function for
+        // why suppression is deliberately NOT keyed on `cfg!(feature = "testing")`
+        // — doing so silently disabled telemetry on every 0.2.81+ release node when
+        // Cargo feature-unification with `fdev` leaked `testing` onto the shipped
+        // `freenet` binary.
         //
-        // Three overlapping signals, none of which the real node binary
-        // matches, so production telemetry is unaffected:
-        //   - `cfg!(test)`: the library's own unit tests.
-        //   - `cfg!(feature = "testing")`: integration/simulation tests as
-        //     CI compiles them (`--features ...,testing`, see ci.yml /
-        //     simulation-nightly.yml).
-        //   - `running_under_cargo_test()`: a runtime check that also covers
-        //     the *documented* local dev path `cargo test -p freenet` WITHOUT
-        //     `--features testing` (AGENTS.md), where the library links as a
-        //     normal dependency so `cfg!(test)` is false and the integration
-        //     tests build `ConfigArgs::default()` (no `--id`). The real
-        //     `freenet` binary never runs from a cargo `deps/` test harness,
-        //     so it never trips this.
-        if cfg!(test) || cfg!(feature = "testing") || running_under_cargo_test() {
-            tracing::info!("Telemetry disabled in test build/harness");
-            return None;
+        // #4366 intent preserved: the integration tests under `crates/core/tests/*.rs`
+        // (operations_before_join / hosted_mode_* / in_process_restart / …) build
+        // `NodeConfig` directly without `--id`, so `is_test_environment` stays false;
+        // they still trip the `running_under_cargo_test()` signal (every cargo test
+        // binary runs from a `deps/` dir), so they continue to be suppressed and do
+        // not re-pollute the production OTLP collector.
+        match telemetry_suppression_reason(config, cfg!(test), running_under_cargo_test()) {
+            Some(TelemetrySuppression::Disabled) => {
+                tracing::info!("Telemetry reporting is disabled");
+                return None;
+            }
+            Some(TelemetrySuppression::TestEnvironmentFlag) => {
+                tracing::info!("Telemetry disabled in test environment (--id flag detected)");
+                return None;
+            }
+            Some(TelemetrySuppression::TestHarness) => {
+                tracing::info!("Telemetry disabled in test build/harness");
+                return None;
+            }
+            None => {}
         }
 
         let endpoint = config.endpoint.clone();
@@ -2003,34 +2048,97 @@ mod tests {
     // `TelemetryConfig` and `TelemetryReporter` come in via `super::*`.
     use super::*;
 
-    /// Regression for #4366: a test build must NOT initialize a
-    /// `TelemetryReporter` (and thus must not ship events to the production
-    /// OTLP collector) even when the config looks like a real production
-    /// node — `enabled: true`, the production `DEFAULT_TELEMETRY_ENDPOINT`,
-    /// and `is_test_environment: false`. That is exactly the config the
-    /// integration tests under `crates/core/tests/*.rs` build (via
-    /// `ConfigArgs { ..Default::default() }`, which leaves `--id` unset).
-    /// Before the fix they leaked synthetic peers / simulation-loopback
-    /// `get_not_found` events to `nova.locut.us:4318`.
-    ///
-    /// This test runs under `cfg(test)` (and via the cargo `deps/` harness),
-    /// so it pins the shared early-return that all three signals trigger —
-    /// `cfg!(test)`, `cfg!(feature = "testing")` (CI integration/sim runs),
-    /// and `running_under_cargo_test()` (the no-feature `cargo test -p freenet`
-    /// dev path). The production binary trips none of them and is unaffected.
-    #[test]
-    fn telemetry_reporter_suppressed_in_test_build() {
-        let prod_like = TelemetryConfig {
+    /// A config that looks exactly like a real production node: telemetry on,
+    /// the production `DEFAULT_TELEMETRY_ENDPOINT`, and `is_test_environment:
+    /// false` (no `--id`). The only thing separating a prod node from a test
+    /// run is the two ambient signals passed to `telemetry_suppression_reason`.
+    fn prod_like_config() -> TelemetryConfig {
+        TelemetryConfig {
             enabled: true,
             endpoint: crate::config::DEFAULT_TELEMETRY_ENDPOINT.to_string(),
             transport_snapshot_interval_secs: 30,
             is_test_environment: false,
             reference_ping_enabled: false,
             iface_tx_enabled: false,
-        };
+        }
+    }
+
+    /// Regression for #4366: a test build must NOT initialize a
+    /// `TelemetryReporter` (and thus must not ship events to the production
+    /// OTLP collector) even when the config looks like a real production
+    /// node. That is exactly the config the integration tests under
+    /// `crates/core/tests/*.rs` build (via `ConfigArgs { ..Default::default() }`,
+    /// which leaves `--id` unset). Before the fix they leaked synthetic peers /
+    /// simulation-loopback `get_not_found` events to `nova.locut.us:4318`.
+    ///
+    /// This test runs under `cfg(test)` AND from the cargo `deps/` harness, so
+    /// it pins the real entry point's early-return via the two surviving
+    /// signals — `cfg!(test)` and `running_under_cargo_test()`. The production
+    /// binary trips neither and is unaffected.
+    #[test]
+    fn telemetry_reporter_suppressed_in_test_build() {
         assert!(
-            TelemetryReporter::new(&prod_like, "peer-under-test".to_string()).is_none(),
+            TelemetryReporter::new(&prod_like_config(), "peer-under-test".to_string()).is_none(),
             "test builds must not ship telemetry to the production collector (#4366)"
+        );
+    }
+
+    /// The fix for the 0.2.81 telemetry blackout: a genuine production release
+    /// binary — `cfg(test)` false, NOT run from a cargo `deps/` harness, no
+    /// `--id` — must NOT self-suppress telemetry. Regressing this is exactly
+    /// what happened when Cargo feature-unification with `fdev` leaked
+    /// `feature = "testing"` onto the shipped `freenet` binary and the guard
+    /// keyed suppression on it: telemetry went silently OFF on every
+    /// auto-updating release node from 0.2.81 onward.
+    #[test]
+    fn prod_release_binary_emits_telemetry() {
+        assert_eq!(
+            telemetry_suppression_reason(
+                &prod_like_config(),
+                /* is_test_build */ false,
+                /* running_under_cargo_test */ false,
+            ),
+            None,
+            "a production release binary must NOT self-suppress telemetry"
+        );
+    }
+
+    /// The #4366 intent preserved: every real test/sim path that reaches
+    /// `TelemetryReporter::new` must still be suppressed so it can't re-pollute
+    /// the production collector. The DST simulation framework never builds a
+    /// `TelemetryReporter` at all; the paths that DO are unit tests (`cfg(test)`)
+    /// and integration / nightly-nextest sims (run from a cargo `deps/` harness),
+    /// both covered here, plus the `--id` CLI harness.
+    #[test]
+    fn test_and_sim_runs_still_suppress_telemetry() {
+        // Unit-test build: `cfg!(test)` is true.
+        assert_eq!(
+            telemetry_suppression_reason(&prod_like_config(), true, false),
+            Some(TelemetrySuppression::TestHarness),
+            "cfg(test) unit-test builds must suppress (#4366)"
+        );
+        // Integration test / nightly nextest sim: not a cfg(test) build, but the
+        // binary runs from a cargo `deps/` dir (no `--id`).
+        assert_eq!(
+            telemetry_suppression_reason(&prod_like_config(), false, true),
+            Some(TelemetrySuppression::TestHarness),
+            "cargo deps/ test harness runs must suppress (#4366)"
+        );
+        // `--id` test environment (integration/CLI harness).
+        let mut id_env = prod_like_config();
+        id_env.is_test_environment = true;
+        assert_eq!(
+            telemetry_suppression_reason(&id_env, false, false),
+            Some(TelemetrySuppression::TestEnvironmentFlag),
+            "--id test environments must suppress"
+        );
+        // Operator turned telemetry off.
+        let mut disabled = prod_like_config();
+        disabled.enabled = false;
+        assert_eq!(
+            telemetry_suppression_reason(&disabled, false, false),
+            Some(TelemetrySuppression::Disabled),
+            "telemetry-enabled = false must suppress"
         );
     }
 
