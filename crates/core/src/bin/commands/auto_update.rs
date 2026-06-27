@@ -596,33 +596,36 @@ fn github_poll_bucket_step(
     capacity: f64,
     refill_secs: f64,
 ) -> (GithubPollBucket, bool) {
+    // The stored timestamp must never move BACKWARDS. On a backwards clock
+    // (suspend/resume, NTP step) `saturating_sub` already prevents a negative
+    // refill THIS step — but if we then persisted the earlier `now_unix`, a later
+    // forward step back to the original time would measure elapsed from the
+    // rewound timestamp and grant refill credit for time that already elapsed
+    // before the rewind. Anchoring on `max(now, prev)` makes the bucket measure
+    // elapsed only from the highest timestamp ever seen, so a clock that dips and
+    // recovers yields zero net credit.
+    let stored_unix = match prev {
+        Some(s) => now_unix.max(s.updated_unix),
+        None => now_unix,
+    };
     let mut tokens = match prev {
         Some(s) => {
-            // saturating_sub guards against a backwards clock (suspend/resume,
-            // NTP step): a negative elapsed becomes 0 refill, never a credit.
             let elapsed = now_unix.saturating_sub(s.updated_unix) as f64;
             (s.tokens + elapsed / refill_secs).min(capacity)
         }
         None => capacity,
     };
-    if tokens >= 1.0 {
+    let allowed = tokens >= 1.0;
+    if allowed {
         tokens -= 1.0;
-        (
-            GithubPollBucket {
-                tokens,
-                updated_unix: now_unix,
-            },
-            true,
-        )
-    } else {
-        (
-            GithubPollBucket {
-                tokens,
-                updated_unix: now_unix,
-            },
-            false,
-        )
     }
+    (
+        GithubPollBucket {
+            tokens,
+            updated_unix: stored_unix,
+        },
+        allowed,
+    )
 }
 
 fn read_github_poll_bucket_at(dir: &std::path::Path) -> BucketRead {
@@ -1381,6 +1384,44 @@ mod tests {
             "no token should be available after a backwards clock"
         );
         assert_eq!(next.tokens, 0.0, "no negative-time credit");
+        // Critically: the stored timestamp must NOT rewind, or a later forward
+        // step would grant credit for already-elapsed time (Codex finding).
+        assert_eq!(
+            next.updated_unix, 5_000_000,
+            "stored timestamp must not move backwards"
+        );
+    }
+
+    #[test]
+    fn test_github_poll_bucket_dip_then_recover_grants_no_credit() {
+        // End-to-end: drain the bucket at T, dip the clock back by a full refill
+        // interval (denied, no credit), then return to T. The recovery must NOT
+        // grant a refill token for the window that elapsed before the dip.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let t = 10_000_000u64;
+
+        let cap = GITHUB_POLL_BUCKET_CAPACITY as u64;
+        for _ in 0..cap {
+            assert!(try_consume_github_poll_at(dir, t));
+        }
+        assert!(!try_consume_github_poll_at(dir, t), "drained at T");
+
+        // Clock dips back a full refill interval.
+        assert!(
+            !try_consume_github_poll_at(dir, t - GITHUB_POLL_REFILL_SECS as u64),
+            "still empty during the backwards dip"
+        );
+        // Clock returns to T: must NOT have been credited a token by the dip.
+        assert!(
+            !try_consume_github_poll_at(dir, t),
+            "returning to T must not grant credit for pre-dip time"
+        );
+        // A genuine refill interval PAST the high-water mark does grant one token.
+        assert!(try_consume_github_poll_at(
+            dir,
+            t + GITHUB_POLL_REFILL_SECS as u64
+        ));
     }
 
     #[test]
