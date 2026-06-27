@@ -1948,7 +1948,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next();
-        self.outbound_stream_with_id(stream_id, data.into(), None, None)
+        self.outbound_stream_with_id(stream_id, data.into(), None, None, None)
             .await;
     }
 
@@ -1966,6 +1966,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         completion_tx: Option<tokio::sync::oneshot::Sender<super::BroadcastDeliveryOutcome>>,
+        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::send_stream(
@@ -1981,6 +1982,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.time_source.clone(),
                 metadata,
                 completion_tx,
+                progress,
             )
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
@@ -1997,6 +1999,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         outbound_stream_id: StreamId,
         inbound_handle: streaming::StreamHandle,
         metadata: Option<bytes::Bytes>,
+        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::pipe_stream(
@@ -2011,6 +2014,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.remote_conn.congestion_controller.clone(),
                 self.time_source.clone(),
                 metadata,
+                progress,
             )
             .instrument(span!(tracing::Level::DEBUG, "pipe_stream")),
         );
@@ -2391,11 +2395,12 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         completion_tx: Option<tokio::sync::oneshot::Sender<super::BroadcastDeliveryOutcome>>,
+        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.outbound_stream_with_id(stream_id, data, metadata, completion_tx)
+            self.outbound_stream_with_id(stream_id, data, metadata, completion_tx, progress)
                 .await;
             Ok(())
         })
@@ -2406,11 +2411,12 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         outbound_stream_id: StreamId,
         inbound_handle: streaming::StreamHandle,
         metadata: Option<bytes::Bytes>,
+        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move {
-            self.pipe_stream_to_remote(outbound_stream_id, inbound_handle, metadata)
+            self.pipe_stream_to_remote(outbound_stream_id, inbound_handle, metadata, progress)
                 .await;
             Ok(())
         })
@@ -2962,6 +2968,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
             None,
             None,
         ))

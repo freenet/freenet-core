@@ -18,6 +18,7 @@ pub(crate) mod get;
 pub(crate) mod op_ctx;
 pub(crate) mod orphan_streams;
 pub(crate) mod put;
+pub(crate) mod stream_progress;
 pub(crate) mod subscribe;
 #[cfg(test)]
 pub(crate) mod test_utils;

@@ -253,6 +253,12 @@ async fn drive_client_put_inner(
         /// rustdoc and freenet-git#53 for the failure mode this
         /// addresses.
         max_advancements: usize,
+        /// Stream-progress liveness bundle for streaming-eligible payloads
+        /// (#4001). `Some` only when `should_use_streaming` is true; the retry
+        /// loop then uses a stream-inactivity timeout instead of the fixed
+        /// `attempt_timeout`. `None` for non-streaming PUTs (fixed deadline,
+        /// behaviour unchanged).
+        stream_progress: Option<crate::operations::stream_progress::StreamProgress>,
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
@@ -320,6 +326,10 @@ async fn drive_client_put_inner(
         fn attempt_timeout(&self) -> std::time::Duration {
             self.attempt_timeout
         }
+
+        fn stream_progress(&self) -> Option<crate::operations::stream_progress::StreamProgress> {
+            self.stream_progress.clone()
+        }
     }
 
     let attempt_timeout =
@@ -333,10 +343,11 @@ async fn drive_client_put_inner(
         .size()
         .saturating_add(contract.data().len())
         .saturating_add(contract.params().size());
-    let max_advancements = if crate::operations::should_use_streaming(
+    let is_streaming = crate::operations::should_use_streaming(
         op_manager.streaming_threshold,
         payload_size_estimate,
-    ) {
+    );
+    let max_advancements = if is_streaming {
         // Streaming PUTs: 0 advancements = 1 attempt × up-to-600s
         // `STREAMING_ATTEMPT_TIMEOUT_CAP`. Per
         // `MAX_PEER_ADVANCEMENTS_STREAMING` rustdoc, allowing even
@@ -351,6 +362,23 @@ async fn drive_client_put_inner(
         MAX_PEER_ADVANCEMENTS_NON_STREAMING
     };
 
+    // Stream-progress liveness (#4001): only for streaming-eligible payloads.
+    // The retry loop then replaces the fixed `attempt_timeout` with a true
+    // stream-inactivity timeout driven by per-fragment progress recorded by the
+    // originator-loopback relay-streaming task. Production uses `RealTime`;
+    // DST/VirtualTime is injected via the unit tests on `drive_retry_loop`.
+    let stream_progress = if is_streaming {
+        use crate::operations::stream_progress::StreamProgress;
+        use crate::simulation::RealTime;
+        // The StreamProgress owns this single RealTime: the handle's record()/
+        // since_last() and the retry loop's sleeps all read it, so writer and
+        // reader share one epoch (#4001 single-epoch invariant). DST/VirtualTime
+        // is injected via the unit tests on drive_retry_loop.
+        Some(StreamProgress::new(RealTime::new()))
+    } else {
+        None
+    };
+
     let mut driver = PutRetryDriver {
         op_manager,
         key,
@@ -363,6 +391,7 @@ async fn drive_client_put_inner(
         current_target,
         attempt_timeout,
         max_advancements,
+        stream_progress,
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
@@ -1386,12 +1415,20 @@ where
                 );
                 return Err(err);
             }
+            // Originator loopback: the retry-loop task (Task A) registered a
+            // stream-progress handle keyed by `incoming_tx` before sending. We
+            // (Task B) look it up and thread it into the transport so each
+            // fragment dispatch records a tick, driving the retry loop's
+            // stream-inactivity timeout (#4001). `None` here (non-streaming
+            // relay, no registered handle) degrades to the plain send.
+            let progress = op_manager.stream_progress_registry().get(&incoming_tx);
             if let Err(err) = conn_manager
-                .send_stream(
+                .send_stream_with_progress(
                     next_addr,
                     stream_id,
                     bytes::Bytes::from(payload_bytes),
                     None,
+                    progress,
                 )
                 .await
             {
@@ -3129,20 +3166,30 @@ mod tests {
         let entry = src
             .find("fn drive_client_put_inner")
             .expect("drive_client_put_inner must exist");
-        // Anchor on the `max_advancements` binding; the if/else
-        // block including its inline rationale comment can be
-        // hundreds of bytes, hence the generous window.
+        // Anchor on the `is_streaming` binding: #4001 hoisted the
+        // streaming decision into `let is_streaming = should_use_streaming(…)`
+        // (shared by both the advancement-cap selection and the
+        // stream-progress handle), so the window starts there and spans the
+        // cap selection that follows. The if/else block including its inline
+        // rationale comment can be hundreds of bytes, hence the generous
+        // window.
         let cap_decision = src[entry..]
-            .find("let max_advancements =")
-            .expect("drive_client_put_inner must compute `let max_advancements = …`");
-        let window = &src[entry + cap_decision..entry + cap_decision + 1500];
+            .find("let is_streaming =")
+            .expect("drive_client_put_inner must compute `let is_streaming = …`");
+        let window = &src[entry + cap_decision..entry + cap_decision + 1800];
         assert!(
             window.contains("should_use_streaming("),
-            "drive_client_put_inner's max_advancements selection must \
+            "drive_client_put_inner's streaming decision must \
              gate on should_use_streaming(threshold, \
              payload_size_estimate). A flat \
              MAX_PEER_ADVANCEMENTS_NON_STREAMING for all PUTs re-opens \
              freenet-git#53."
+        );
+        assert!(
+            window.contains("let max_advancements = if is_streaming"),
+            "the advancement-cap selection must gate on the hoisted \
+             `is_streaming` flag derived from should_use_streaming, so the \
+             streaming cap and the stream-progress handle stay in lockstep."
         );
         assert!(
             window.contains("MAX_PEER_ADVANCEMENTS_STREAMING")

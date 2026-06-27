@@ -2825,6 +2825,7 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
         _completion_tx: Option<
             tokio::sync::oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>,
         >,
+        _progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<(), crate::transport::TransportError>>
@@ -2845,6 +2846,7 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
         _outbound_stream_id: crate::transport::peer_connection::StreamId,
         _inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
         _metadata: Option<bytes::Bytes>,
+        _progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<(), crate::transport::TransportError>>

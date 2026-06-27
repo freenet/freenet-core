@@ -721,6 +721,11 @@ pub(super) async fn broadcast_to_single_peer(
             // when the actual stream transfer finishes.
             let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
 
+            // channel-safety: ok — broadcast_to_single_peer runs on the detached
+            // broadcast-queue task, not the event loop; the StreamSend this
+            // enqueues is drained by the loop, so it cannot self-stall it. The
+            // #4001 `None` progress arg that brought this statement into the diff
+            // does not change the send path.
             if let Err(err) = bridge
                 .send_stream_with_completion(
                     peer_addr,
@@ -728,6 +733,7 @@ pub(super) async fn broadcast_to_single_peer(
                     bytes::Bytes::from(payload_bytes),
                     metadata,
                     Some(completion_tx),
+                    None,
                 )
                 .await
             {

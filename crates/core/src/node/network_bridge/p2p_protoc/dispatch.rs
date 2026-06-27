@@ -347,6 +347,7 @@ impl P2pConnManager {
                 data,
                 metadata,
                 completion_tx,
+                progress,
             }) => EventResult::Event(
                 ConnEvent::StreamSend {
                     target_addr,
@@ -354,6 +355,7 @@ impl P2pConnManager {
                     data,
                     metadata,
                     completion_tx,
+                    progress,
                 }
                 .into(),
             ),

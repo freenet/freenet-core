@@ -31,6 +31,7 @@ use crate::{
     message::{InterestMessage, MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction},
     operations::{
         OpCtx, OpError, connect::ConnectForwardEstimator, orphan_streams::OrphanStreamRegistry,
+        stream_progress::StreamProgressRegistry,
     },
     ring::{
         ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff, PeerKey, PeerKeyLocation,
@@ -132,6 +133,16 @@ pub(crate) struct OpManager {
     /// Coordinates transport layer (which receives fragments) with operations layer
     /// (which receives RequestStreaming/ResponseStreaming messages).
     orphan_stream_registry: Arc<OrphanStreamRegistry>,
+    /// Per-`Transaction` registry of streaming-PUT progress handles (#4001).
+    ///
+    /// A client streaming PUT runs the retry-loop task and the originator-
+    /// loopback relay-streaming task separately, sharing only the
+    /// `Transaction` id. The retry loop inserts a `StreamProgressHandle` here
+    /// before sending and removes it on exit; the loopback relay looks it up
+    /// and records per-fragment progress so the retry loop can use a true
+    /// stream-inactivity timeout instead of a fixed per-attempt deadline. See
+    /// `operations::stream_progress`.
+    stream_progress_registry: Arc<StreamProgressRegistry>,
     /// Size threshold in bytes above which streaming is used.
     pub streaming_threshold: usize,
     /// Backoff tracker for failed gateway connection attempts.
@@ -232,6 +243,7 @@ impl Clone for OpManager {
             pending_broadcasts: self.pending_broadcasts.clone(),
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
+            stream_progress_registry: self.stream_progress_registry.clone(),
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
@@ -418,6 +430,7 @@ impl OpManager {
             ),
             request_router,
             orphan_stream_registry,
+            stream_progress_registry: Arc::new(StreamProgressRegistry::new()),
             streaming_threshold,
             gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
             gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
@@ -1064,6 +1077,15 @@ impl OpManager {
     #[allow(dead_code)] // Phase 3 infrastructure - will be used when streaming handlers are implemented
     pub fn orphan_stream_registry(&self) -> &Arc<OrphanStreamRegistry> {
         &self.orphan_stream_registry
+    }
+
+    /// Returns a reference to the streaming-PUT progress registry (#4001).
+    ///
+    /// The retry loop inserts/removes a `StreamProgressHandle` keyed by the
+    /// attempt `Transaction`; the originator-loopback relay-streaming driver
+    /// looks it up to record per-fragment progress.
+    pub(crate) fn stream_progress_registry(&self) -> &Arc<StreamProgressRegistry> {
+        &self.stream_progress_registry
     }
 
     /// Determines if streaming should be used for a payload of the given size.
