@@ -68,8 +68,18 @@ jobs:
       # mirror or a from-source compile — and the smoke test would pass while
       # the exact failure mode it exists to detect (a broken release upload)
       # went unnoticed. The whole point is to fail when the GitHub asset is bad.
+      # cargo-binstall resolves the release by hitting the GitHub REST API
+      # (GET /repos/.../releases/tags/v{version}). Authenticate those calls
+      # with GITHUB_TOKEN: unauthenticated they share the per-IP 60 req/hr
+      # limit, and GitHub-hosted runner IPs are shared across tenants, so the
+      # lookup intermittently 403s and the step hard-fails (the smoke test
+      # runs with compile fallback disabled, so a 403 can't fall through).
+      # binstall auto-detects GITHUB_TOKEN/GH_TOKEN and switches to the
+      # 5000 req/hr authenticated limit. See run 28280841654 (2026-06-27).
       - name: Install freenet via cargo binstall
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo binstall --no-confirm --strategies crate-meta-data \
             --targets "${{ matrix.target }}" \
@@ -77,6 +87,8 @@ jobs:
 
       - name: Install fdev via cargo binstall
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cargo binstall --no-confirm --strategies crate-meta-data \
             --targets "${{ matrix.target }}" \
