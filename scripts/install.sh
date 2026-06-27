@@ -304,6 +304,16 @@ existing_system_unit_user() {
     sed -n 's/^User=//p' /etc/systemd/system/freenet.service 2>/dev/null | head -n1
 }
 
+# Echo the binary path the existing system unit launches (the first field of
+# its `ExecStart=`, which the template renders as `<binary> network`). Empty if
+# there is no unit / no ExecStart. Used to tell whether a freshly downloaded
+# binary actually lands where the running service looks for it.
+existing_system_unit_binary() {
+    [ -f /etc/systemd/system/freenet.service ] || return 0
+    sed -n 's/^ExecStart=//p' /etc/systemd/system/freenet.service 2>/dev/null \
+        | head -n1 | awk '{print $1}'
+}
+
 # Decide whether it is safe to refresh an existing system unit. The binary
 # derives the service `User=` (and home/log/ExecStart paths) from the user the
 # refresh runs as, so refreshing as a DIFFERENT user would silently re-point
@@ -421,8 +431,26 @@ setup_service() {
                     warn "An existing system service runs as user '$existing_user'."
                     warn "Not refreshing it as '$refresh_user' - that would re-point the"
                     warn "service and orphan the original node's data/identity."
-                    warn "The updated binary is in place; restart the service to use it,"
-                    warn "or re-run the installer as '$existing_user' to refresh the unit."
+                    # Whether "just restart it" is accurate depends on WHERE this
+                    # run put the new binary. With the default per-user install
+                    # dir, '$refresh_user's binary is under their home while the
+                    # existing unit's ExecStart still points at '$existing_user's
+                    # binary, so a restart would keep running the OLD version.
+                    # Only claim the update is in place when the paths match (e.g.
+                    # a shared FREENET_INSTALL_DIR); otherwise direct the operator
+                    # to re-run as the service user so the binary lands where the
+                    # unit looks for it.
+                    existing_bin=$(existing_system_unit_binary)
+                    if [ -n "$existing_bin" ] && [ "$existing_bin" != "$bin" ]; then
+                        warn "This run installed the new binary at '$bin', but the"
+                        warn "existing service runs '$existing_bin' (which was NOT"
+                        warn "updated), so restarting it would keep the OLD version."
+                        warn "To update it, re-run the installer as '$existing_user'."
+                    else
+                        warn "The updated binary is in place; restart the service to use"
+                        warn "it, or re-run the installer as '$existing_user' to refresh"
+                        warn "the unit."
+                    fi
                     return
                 fi
             fi
