@@ -1456,14 +1456,22 @@ mod tests {
             "wrapper must call the give-up helper to exit the loop on too many failures"
         );
         // The helper must actually exit (terminate the loop), not just log.
+        // It MUST exit 0: the plist sets KeepAlive.SuccessfulExit=false, so a
+        // non-zero exit would be respawned by launchd (resetting the counter),
+        // defeating the cap. Only a clean exit 0 is an intentional terminal stop.
         let helper_idx = script
             .find("give_up_if_failing() {")
             .expect("give_up_if_failing helper must be defined");
         let helper_body = &script[helper_idx..];
         let brace_end = helper_body.find("}").expect("helper body");
+        let helper = &helper_body[..brace_end];
         assert!(
-            helper_body[..brace_end].contains("exit 1"),
-            "give_up_if_failing must exit the wrapper (exit 1) when the cap is hit"
+            helper.contains("exit 0"),
+            "give_up_if_failing must exit 0 so launchd (SuccessfulExit=false) does not respawn"
+        );
+        assert!(
+            !helper.contains("exit 1"),
+            "give_up_if_failing must NOT exit non-zero — launchd would respawn and reset the counter"
         );
         // The cap must sit above the crash-loop rollback threshold so rollback
         // always fires first.

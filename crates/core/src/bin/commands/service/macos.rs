@@ -147,8 +147,11 @@ CONSECUTIVE_FAILURES=0
 # that never succeeds — does not thrash and poll GitHub forever. Mirrors the
 # in-process run-wrapper's WRAPPER_MAX_CONSECUTIVE_FAILURES cap (service.rs) and
 # stays well above the #4073 crash-loop rollback threshold (3) so rollback always
-# fires first. launchd's KeepAlive.SuccessfulExit=false means exit 1 is treated
-# as a failure and is NOT auto-respawned, so this is a genuine terminal stop.
+# fires first. The give-up path exits 0 (NOT non-zero): the plist sets
+# KeepAlive.SuccessfulExit=false, so launchd RESPAWNS on a non-zero exit and only
+# treats a clean exit 0 as an intentional terminal stop (same reasoning as the
+# exit-0/exit-43 paths below). A non-zero exit here would just relaunch a fresh
+# wrapper with CONSECUTIVE_FAILURES reset to 0, defeating the cap entirely.
 MAX_CONSECUTIVE_FAILURES=50
 PORT_CONFLICT_KILLS=0
 MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
@@ -167,11 +170,13 @@ log_event() {{
 
 # Exit the wrapper loop once consecutive failures hit the cap, so a node that
 # never comes up healthy stops restarting (and stops polling GitHub) instead of
-# looping forever. Called right after each failure increment.
+# looping forever. Called right after each failure increment. Exits 0 so launchd
+# (KeepAlive.SuccessfulExit=false) treats it as an intentional stop and does NOT
+# respawn — a non-zero exit would be respawned and reset the counter.
 give_up_if_failing() {{
     if [ "$CONSECUTIVE_FAILURES" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
-        log_event "Giving up after $CONSECUTIVE_FAILURES consecutive failures; stopping wrapper (exit 1) for operator intervention."
-        exit 1
+        log_event "Giving up after $CONSECUTIVE_FAILURES consecutive failures; stopping wrapper for operator intervention (clean exit so launchd does not respawn)."
+        exit 0
     fi
 }}
 
