@@ -43,13 +43,24 @@
 //!    `Origin: null`, which is exactly what a sandboxed contract iframe presents
 //!    (the sandbox omits `allow-same-origin`), so the per-contract iframe is
 //!    excluded here.
-//! 3. **No per-contract `AuthToken`.** A per-contract webapp's shell page is
-//!    same-origin with the node (so it would pass the origin check) but carries a
-//!    per-contract `AuthToken` registered in the [`OriginContractMap`]. The
-//!    node's own first-party dashboard carries no such token. So any request
-//!    presenting a registered origin-contract token — via the `Authorization`
-//!    bearer header, the `authToken` query param, or the `Authorization` cookie —
-//!    is rejected, excluding the per-contract `AuthToken` origin.
+//! 3. **No per-contract `AuthToken`** (best-effort defense-in-depth, NOT the
+//!    primary iframe exclusion). A per-contract webapp's shell page is
+//!    same-origin with the node, so it would pass check #2; it carries a
+//!    per-contract `AuthToken` registered in the [`OriginContractMap`], while the
+//!    node's own first-party dashboard carries none. So a request presenting a
+//!    registered origin-contract token — via the `Authorization` bearer header,
+//!    the `authToken` query param, or the `Authorization` cookie — is rejected.
+//!    But this only CLASSIFIES a *well-behaved* client that actually presents its
+//!    token: a hostile script could simply omit the token to evade this check, so
+//!    #3 cannot be relied on to exclude a malicious contract web app on its own.
+//!
+//! The load-bearing exclusion of sandboxed contract iframes is **check #2**: the
+//! sandbox omits `allow-same-origin`, so the iframe presents `Origin: null`,
+//! which `is_origin_trusted` rejects. Check #3 is an extra layer that catches a
+//! cooperative same-origin shell page; it does NOT backstop #2. A future
+//! maintainer MUST NOT weaken check #2 (e.g. start admitting `Origin: null` or a
+//! cross-site origin) on the belief that #3 will still keep contract web apps
+//! out — it will not.
 //!
 //! The bundle's decryption key is the real authorization for the DATA: a caller
 //! who passes the gate still cannot import anything they cannot decrypt. The
@@ -186,6 +197,17 @@ fn import_gate_or_reject(
             "import is not available to contract web apps",
         ));
     }
+
+    // DEFERRED (Sec-Fetch-Site hardening, #4592 follow-up): browsers attach
+    // `Sec-Fetch-Site: same-origin` to a first-party fetch and `cross-site` to a
+    // cross-origin one. Checking it would add a fetch-metadata CSRF layer on top
+    // of the Origin gate (#2). We do NOT enforce it here on purpose: the header
+    // is browser-only, so a legitimate non-browser client (a future
+    // `freenet secrets import --live` CLI, curl in a migration script) omits it
+    // entirely. "Reject when missing" would break those clients; "enforce only
+    // when present" is weaker and needs a deliberate call. Left as a follow-up
+    // decision rather than a silent default. Until then the Origin gate (#2) is
+    // the CSRF boundary.
 
     Ok(())
 }

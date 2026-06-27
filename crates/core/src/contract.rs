@@ -1319,10 +1319,11 @@ where
     }
 }
 
-/// Send an `ImportSecretsResponse` to a still-waiting client inline (the
-/// rejection paths: no deferral ctx, busy, unsupported). Logs at debug if the
-/// client already disconnected. The import mirror of
-/// [`send_export_response_inline`] (#4592).
+/// Send the `ImportSecretsResponse` to the waiting client. Because the live
+/// import (#4592) runs fully ON the contract loop (no off-loop deferral, unlike
+/// the export), this is the SOLE response path for the import and carries EVERY
+/// outcome — success and failure alike — not just rejections. Logs at debug if
+/// the client already disconnected.
 async fn send_import_response_inline<CH>(
     contract_handler: &mut CH,
     id: handler::EventId,
@@ -1342,11 +1343,15 @@ async fn send_import_response_inline<CH>(
     }
 }
 
-/// Handle a completed off-loop import (#4592): return/replace the executor in the
-/// pool and answer the parked client. Runs ON the loop (the pool return needs
-/// `&mut contract_handler`), but the work is just a pool slot-return + a oneshot
-/// send — microseconds, never the import itself. Mirror of
-/// [`handle_export_resume`].
+/// Resume a PUT/UPDATE upsert whose related-contract fetch was deferred off-loop
+/// (#4391). Runs ON the contract loop. Reclaims the parked client responder,
+/// injects the off-loop-fetched related states so the re-run resolves them
+/// locally (no second network round trip), re-runs the upsert in DEFERRABLE mode
+/// (a further `DeferRelated` is converted to `MissingRelated` — the one-deferral
+/// cap), then answers the parked client exactly once. This is the related-contract
+/// upsert resume path, NOT a secrets-import path: the live import (#4592) runs
+/// fully on-loop and never defers (see the `ImportSecrets` arm and
+/// [`send_import_response_inline`]).
 async fn handle_deferred_resume<CH>(
     contract_handler: &mut CH,
     deferral_ctx: &mut DeferralCtx,

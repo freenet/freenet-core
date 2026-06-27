@@ -337,6 +337,37 @@ async fn build_token_bundle(
     Ok(bundle)
 }
 
+/// Same as [`build_token_bundle`] but seals under a user-chosen PASSPHRASE
+/// (Argon2id-stretched) instead of a token. This is the file-upload-fallback
+/// path of #4592 (`X-Freenet-Bundle-Key-Kind: passphrase`): the user supplies
+/// the same passphrase they protected the export with.
+async fn build_passphrase_bundle(
+    delegate_key: &DelegateKey,
+    secret_key: &[u8],
+    value: &[u8],
+    passphrase: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let tmp = tempfile::tempdir()?;
+    let secrets_dir = tmp.path().join("secrets");
+    std::fs::create_dir_all(&secrets_dir)?;
+    let db = freenet::storages::Storage::new(tmp.path()).await?;
+    let secrets = Secrets::load_for_secrets_dir(&secrets_dir)?;
+    let mut store = SecretsStore::new(secrets_dir, secrets, db)?;
+    let secret_id = SecretsId::new(secret_key.to_vec());
+    store.store_secret(
+        delegate_key,
+        &secret_id,
+        SecretScope::Local,
+        Zeroizing::new(value.to_vec()),
+    )?;
+    let bundle = export_bundle(
+        &store,
+        SecretScope::Local,
+        &BundleKeyMaterial::Passphrase(passphrase),
+    )?;
+    Ok(bundle)
+}
+
 /// `POST /v1/import`. `origin` → `Origin` header; `key`/`kind`/`overwrite` →
 /// the bundle headers. Returns the raw response so callers assert on status.
 async fn http_import(
@@ -447,6 +478,80 @@ async fn live_import_round_trip_node_stays_up() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Same round-trip as above but via the PASSPHRASE KDF (Argon2id) instead of the
+/// token HKDF — the file-upload-fallback path of #4592. Seal a bundle under a
+/// passphrase, import it with `X-Freenet-Bundle-Key-Kind: passphrase`, and read
+/// the secret back through the live stack while the node stays up. Only the token
+/// path was exercised end-to-end before; this covers the passphrase branch of the
+/// live import (`BundleKeyKind::Passphrase` → `BundleKeyMaterial::Passphrase`).
+#[serial_test::serial]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn live_import_passphrase_round_trip_node_stays_up() -> anyhow::Result<()> {
+    let _pool = PoolSizeEnv::set(4);
+    let node = TestNode::start().await?;
+    let port = node.ws_port;
+
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+
+    const PASSPHRASE: &str = "correct horse battery staple";
+    const SECRET_KEY: &[u8] = b"passphrase-imported-secret-key";
+    const VALUE: &[u8] = b"the-value-sealed-under-a-passphrase";
+
+    let bundle =
+        build_passphrase_bundle(&delegate_key, SECRET_KEY, VALUE, PASSPHRASE.as_bytes()).await?;
+    assert_eq!(
+        &bundle[0..4],
+        b"FNSX",
+        "fixture must produce an FNSX bundle"
+    );
+
+    let origin = format!("http://127.0.0.1:{port}");
+
+    // Sanity: the secret is NOT present before the import.
+    let mut conn = connect_plain(port).await?;
+    register_delegate(&mut conn, &delegate, &delegate_key).await?;
+    assert!(
+        !has_secret_via_delegate(&mut conn, &delegate_key, SECRET_KEY).await?,
+        "secret must be absent before import"
+    );
+
+    // Import over HTTP with the PASSPHRASE kind.
+    let resp = http_import(
+        port,
+        bundle,
+        Some(PASSPHRASE),
+        Some("passphrase"),
+        false,
+        Some(&origin),
+    )
+    .await?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "live passphrase import over loopback must be 200 OK"
+    );
+    let report: ImportResponseBody = resp.json().await?;
+    assert_eq!(report.imported, 1, "exactly the one secret imports");
+    assert!(report.skipped.is_empty());
+
+    // Read it back THROUGH THE LIVE STACK while the node is still running.
+    let read = get_secret_via_delegate(&mut conn, &delegate_key, SECRET_KEY).await?;
+    assert_eq!(
+        read.as_deref(),
+        Some(VALUE),
+        "the passphrase-imported secret must decrypt to its original plaintext via the live node"
+    );
+    assert!(
+        has_secret_via_delegate(&mut conn, &delegate_key, SECRET_KEY).await?,
+        "has_secret must see the imported secret"
+    );
+
+    drop(conn);
+    node.shutdown().await;
+    Ok(())
+}
+
 /// A wrong key cannot decrypt the bundle: 4xx, and NOTHING is written (the
 /// decrypt fails before any write). The secret stays absent on the live node.
 #[serial_test::serial]
@@ -476,9 +581,10 @@ async fn live_import_wrong_key_rejected_no_write() -> anyhow::Result<()> {
         Some(&origin),
     )
     .await?;
-    assert!(
-        resp.status().is_client_error(),
-        "a wrong key must be a 4xx (client fault), got {}",
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "a wrong key must be 422 UNPROCESSABLE_ENTITY (ImportBadBundle → no write), got {}",
         resp.status()
     );
 
