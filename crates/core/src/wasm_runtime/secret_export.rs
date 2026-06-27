@@ -329,10 +329,20 @@ fn seal_bundle(
             })
             .collect(),
     };
+    seal_payload(&payload, material)
+}
 
+/// Serialize + encrypt an already-built [`BundlePayload`] into a complete bundle
+/// byte string. Split out from [`seal_bundle`] so tests can seal a hand-crafted
+/// payload (e.g. one with a deliberately malformed entry) through the exact same
+/// crypto path a real export uses.
+fn seal_payload(
+    payload: &BundlePayload,
+    material: &BundleKeyMaterial<'_>,
+) -> Result<Vec<u8>, ExportError> {
     // CBOR-serialize into a Zeroizing buffer (it holds plaintext secrets).
     let mut plaintext = Zeroizing::new(Vec::new());
-    ciborium::ser::into_writer(&payload, &mut *plaintext)
+    ciborium::ser::into_writer(payload, &mut *plaintext)
         .map_err(|e| ExportError::CborSer(e.to_string()))?;
 
     // Random salt + nonce per bundle.
@@ -543,7 +553,15 @@ pub fn import_bundle(
 ) -> Result<ImportReport, ExportError> {
     let payload = open_bundle(bundle, material)?;
 
-    let mut report = ImportReport::default();
+    // FIRST PASS — validate EVERY entry's key/hash field lengths BEFORE writing
+    // anything. A `BadEntryField` discovered mid-write would otherwise leave the
+    // already-written entries committed while the call returns an error; callers
+    // (notably the live-import HTTP endpoint, which classifies `BadEntryField` as
+    // a "corrupt bundle ⇒ NOTHING written" 4xx) advertise no-partial-write on
+    // that failure. Combined with `open_bundle`'s all-or-nothing decrypt, this
+    // makes the whole decrypt+parse phase fail before the first store write, so
+    // the no-partial-write guarantee holds for malformed entries too.
+    let mut parsed: Vec<(DelegateKey, [u8; 32])> = Vec::with_capacity(payload.entries.len());
     for entry in &payload.entries {
         // Reconstruct the typed DelegateKey from the two 32-byte halves.
         let delegate_bytes: [u8; 32] =
@@ -577,7 +595,12 @@ pub fn import_bundle(
                     expected: 32,
                 })?;
         let delegate = DelegateKey::new(delegate_bytes, CodeHash::from(&code_hash_bytes));
+        parsed.push((delegate, secret_hash));
+    }
 
+    // SECOND PASS — every entry is now known well-formed; write them.
+    let mut report = ImportReport::default();
+    for (entry, (delegate, secret_hash)) in payload.entries.iter().zip(parsed) {
         let plaintext = Zeroizing::new(entry.plaintext.clone());
         let scope = target_scope.as_scope();
         let wrote = store
@@ -933,6 +956,67 @@ mod test {
         assert_eq!(report.imported, 1);
         assert!(report.skipped.is_empty());
         assert_eq!(read_local(&target, &d, &h), b"orig");
+    }
+
+    /// A bundle that decrypts cleanly (correct key) but whose SECOND entry has a
+    /// malformed (wrong-length) `delegate_key` must be rejected with
+    /// `BadEntryField` and write NOTHING — not even the well-formed FIRST entry.
+    /// Guards the no-partial-write guarantee the live-import endpoint advertises
+    /// for a corrupt bundle (it classifies `BadEntryField` as a 4xx with nothing
+    /// written). Without the pre-write validation pass, entry 0 would be
+    /// committed before entry 1's length check failed.
+    #[tokio::test]
+    async fn import_malformed_entry_writes_nothing_before_rejecting() {
+        let d = delegate(9);
+        let good_secret = SecretsId::new(b"good".to_vec());
+        let pass = BundleKeyMaterial::Passphrase(b"pw");
+
+        let payload = BundlePayload {
+            schema_version: PAYLOAD_SCHEMA_V1,
+            source_scope: "local".to_string(),
+            created_unix_secs: 0,
+            entries: vec![
+                // Well-formed entry — would import fine on its own.
+                BundleEntry {
+                    delegate_key: d.key().bytes().to_vec(),
+                    code_hash: d.key().code_hash().as_ref().to_vec(),
+                    secret_hash: good_secret.hash().to_vec(),
+                    plaintext: b"should-not-be-written".to_vec(),
+                },
+                // Malformed entry — delegate_key is 31 bytes, not 32.
+                BundleEntry {
+                    delegate_key: vec![0u8; 31],
+                    code_hash: vec![0u8; 32],
+                    secret_hash: vec![0u8; 32],
+                    plaintext: b"irrelevant".to_vec(),
+                },
+            ],
+        };
+        let bundle = seal_payload(&payload, &pass).expect("seal");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let err = import_bundle(&mut store, &bundle, &pass, &TargetScope::Local, false)
+            .expect_err("a malformed entry must be rejected");
+        assert!(
+            matches!(
+                err,
+                ExportError::BadEntryField {
+                    field: "delegate_key",
+                    ..
+                }
+            ),
+            "expected BadEntryField(delegate_key), got {err:?}"
+        );
+
+        // CRITICAL: the well-formed first entry must NOT have been written — the
+        // rejection happens in the pre-write validation pass.
+        let entries = store.export_scope_entries(SecretScope::Local).unwrap();
+        assert!(
+            entries.is_empty(),
+            "a rejected (malformed) import must write NOTHING, found {} entries",
+            entries.len()
+        );
     }
 
     #[tokio::test]
