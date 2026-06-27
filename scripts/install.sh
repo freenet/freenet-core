@@ -453,6 +453,30 @@ setup_service() {
                     warn_unsupervised "$bin"
                     return
                 fi
+                # Executing the binary is not enough: the auto-update path
+                # (ExecStopPost -> `freenet update`, run as $SUDO_USER) REPLACES
+                # the binary in place. replace_binary writes a temp file in the
+                # binary's directory and renames it over the binary, so it needs
+                # WRITE permission on that DIRECTORY (rename/unlink are governed
+                # by directory perms, not the file's own mode/owner). A
+                # root-owned install dir the service user can read+execute but
+                # not write (e.g. FREENET_INSTALL_DIR=/usr/local/bin under
+                # `curl | sudo sh`) passes the exec check above yet would fail
+                # EVERY auto-update -- the exact silent "stops updating" failure
+                # this installer exists to prevent. Refuse to set up a service
+                # that cannot update itself.
+                bindir=$(dirname "$bin")
+                if ! sudo -u "$SUDO_USER" sh -c 'test -w "$1"' sh "$bindir" 2>/dev/null; then
+                    warn "The install directory '$bindir' is not writable by the"
+                    warn "service user '$SUDO_USER', so the node could not replace its"
+                    warn "own binary when auto-updating (it would silently stop"
+                    warn "updating). Install to a user-writable location instead -"
+                    warn "e.g. re-run as '$SUDO_USER' WITHOUT sudo (which defaults"
+                    warn "to a writable directory under their home):"
+                    warn "  curl -fsSL https://freenet.org/install.sh | sh"
+                    warn_unsupervised "$bin"
+                    return
+                fi
                 info "Setting up a system service (running as \$SUDO_USER=$SUDO_USER)..."
                 if "$bin" service install --system; then
                     print_service_success "system" "$bin"
