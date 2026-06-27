@@ -332,6 +332,33 @@ Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
 # crash-loop cap (StartLimit*) lives in the [Unit] section above (#4551).
 RestartSec=10
+# Restart backoff (#4073): grow the inter-restart delay from RestartSec up to
+# RestartMaxDelaySec over RestartSteps restarts, so a residual crash/exit loop
+# slows down (=> up to 300s between restarts) instead of reconnecting to the
+# gateway every ~10s -- gentler on the gateways, and it keeps the node trying for
+# a fix instead of hammering.
+#
+# DELIBERATE tradeoff with the #4551 crash-loop limiter (StartLimitBurst=5 /
+# StartLimitIntervalSec=120, StartLimitAction=none in [Unit]). The growing delay
+# changes WHICH crashes reach #4551's terminal "failed-state stop":
+#   * A TRUE fast crash (sub-second startup wedge) still clusters its first ~5
+#     restarts well inside the 120s window while the delay is still small, so it
+#     STILL trips StartLimitBurst and the unit terminal-stops. The #4551
+#     brick-loop guarantee is preserved for the case it was designed for.
+#   * A MEDIUM-runtime crash (node dies tens of seconds in) can, once the delay
+#     has grown toward 300s, be spaced PAST the 120s burst window, so it no
+#     longer trips StartLimitBurst and instead slow-flaps at <=300s rather than
+#     terminal-stopping. This is accepted: such a node is not a tight brick-loop,
+#     the slow cadence is easy on the gateways, and continuing to restart lets a
+#     later fixed release (via the ExecStopPost `freenet update` below) heal it.
+#     A bad UPDATE that crash-loops is still disarmed within its probation window
+#     by the #4073/#4591 auto-rollback regardless of this cadence.
+#
+# These directives require systemd >= 254; OLDER systemd silently IGNORES unknown
+# directives (they are not parse errors), so the unit degrades gracefully to the
+# fixed RestartSec=10 above (and #4551's limiter then behaves exactly as before).
+RestartSteps=10
+RestartMaxDelaySec=300
 # Allow 45 seconds for graceful shutdown before SIGKILL.
 # The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
 # (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
@@ -463,6 +490,33 @@ Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
 # crash-loop cap (StartLimit*) lives in the [Unit] section above (#4551).
 RestartSec=10
+# Restart backoff (#4073): grow the inter-restart delay from RestartSec up to
+# RestartMaxDelaySec over RestartSteps restarts, so a residual crash/exit loop
+# slows down (=> up to 300s between restarts) instead of reconnecting to the
+# gateway every ~10s -- gentler on the gateways, and it keeps the node trying for
+# a fix instead of hammering.
+#
+# DELIBERATE tradeoff with the #4551 crash-loop limiter (StartLimitBurst=5 /
+# StartLimitIntervalSec=120, StartLimitAction=none in [Unit]). The growing delay
+# changes WHICH crashes reach #4551's terminal "failed-state stop":
+#   * A TRUE fast crash (sub-second startup wedge) still clusters its first ~5
+#     restarts well inside the 120s window while the delay is still small, so it
+#     STILL trips StartLimitBurst and the unit terminal-stops. The #4551
+#     brick-loop guarantee is preserved for the case it was designed for.
+#   * A MEDIUM-runtime crash (node dies tens of seconds in) can, once the delay
+#     has grown toward 300s, be spaced PAST the 120s burst window, so it no
+#     longer trips StartLimitBurst and instead slow-flaps at <=300s rather than
+#     terminal-stopping. This is accepted: such a node is not a tight brick-loop,
+#     the slow cadence is easy on the gateways, and continuing to restart lets a
+#     later fixed release (via the ExecStopPost `freenet update` below) heal it.
+#     A bad UPDATE that crash-loops is still disarmed within its probation window
+#     by the #4073/#4591 auto-rollback regardless of this cadence.
+#
+# These directives require systemd >= 254; OLDER systemd silently IGNORES unknown
+# directives (they are not parse errors), so the unit degrades gracefully to the
+# fixed RestartSec=10 above (and #4551's limiter then behaves exactly as before).
+RestartSteps=10
+RestartMaxDelaySec=300
 # Allow 45 seconds for graceful shutdown before SIGKILL.
 # The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
 # (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
@@ -745,6 +799,42 @@ mod tests {
         );
 
         assert_start_limit_directives_are_in_unit_section("system", &unit);
+    }
+
+    #[test]
+    fn systemd_units_have_restart_backoff() {
+        // #4073: both units must add escalating restart backoff
+        // (RestartSteps + RestartMaxDelaySec) on top of RestartSec so a residual
+        // loop that doesn't trip StartLimitBurst still slows down (fewer gateway
+        // reconnects). These are systemd >= 254 directives that older systemd
+        // ignores; we only assert they are emitted in [Service].
+        let user_unit = generate_user_service_file(
+            Path::new("/usr/local/bin/freenet"),
+            Path::new("/home/test/.local/state/freenet"),
+        );
+        let system_unit = generate_system_service_file(
+            Path::new("/usr/local/bin/freenet"),
+            Path::new("/home/test/.local/state/freenet"),
+            "testuser",
+            Path::new("/home/test"),
+        );
+        for (name, unit) in [("user", &user_unit), ("system", &system_unit)] {
+            let service = section(unit, "Service");
+            assert!(
+                service.lines().any(|l| l.trim() == "RestartSec=10"),
+                "{name} unit must keep the base RestartSec"
+            );
+            assert!(
+                service.lines().any(|l| l.trim() == "RestartSteps=10"),
+                "{name} unit must emit RestartSteps in [Service]"
+            );
+            assert!(
+                service
+                    .lines()
+                    .any(|l| l.trim() == "RestartMaxDelaySec=300"),
+                "{name} unit must emit RestartMaxDelaySec in [Service]"
+            );
+        }
     }
 
     #[test]

@@ -1436,6 +1436,75 @@ mod tests {
         );
     }
 
+    /// Regression for #4073 (aggregate-load bounding): the macOS wrapper's
+    /// `while true` loop must give up after a consecutive-failure cap, so a
+    /// committed version that crash-loops (or an update that never succeeds) does
+    /// not restart and poll GitHub forever. Mirrors the in-process run-wrapper's
+    /// WRAPPER_MAX_CONSECUTIVE_FAILURES cap.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_wrapper_caps_consecutive_failures() {
+        let binary_path = PathBuf::from("/usr/local/bin/freenet");
+        let script = generate_wrapper_script(&binary_path);
+
+        assert!(
+            script.contains("MAX_CONSECUTIVE_FAILURES=50"),
+            "wrapper must define a consecutive-failure cap"
+        );
+        assert!(
+            script.contains("give_up_if_failing"),
+            "wrapper must call the give-up helper to exit the loop on too many failures"
+        );
+        // The helper must actually exit (terminate the loop), not just log.
+        // It MUST exit 0: the plist sets KeepAlive.SuccessfulExit=false, so a
+        // non-zero exit would be respawned by launchd (resetting the counter),
+        // defeating the cap. Only a clean exit 0 is an intentional terminal stop.
+        let helper_idx = script
+            .find("give_up_if_failing() {")
+            .expect("give_up_if_failing helper must be defined");
+        let helper_body = &script[helper_idx..];
+        let brace_end = helper_body.find("}").expect("helper body");
+        let helper = &helper_body[..brace_end];
+        assert!(
+            helper.contains("exit 0"),
+            "give_up_if_failing must exit 0 so launchd (SuccessfulExit=false) does not respawn"
+        );
+        assert!(
+            !helper.contains("exit 1"),
+            "give_up_if_failing must NOT exit non-zero — launchd would respawn and reset the counter"
+        );
+        // The cap must sit above the crash-loop rollback threshold so rollback
+        // always fires first.
+        assert!(
+            super::super::rollback::ROLLBACK_CRASH_THRESHOLD < 50,
+            "wrapper cap must exceed the rollback crash threshold"
+        );
+        // The cap must target a tight crash LOOP, not occasional crashes: a child
+        // that ran healthily long enough resets the streak so it never
+        // accumulates to the cap over a long lifetime.
+        assert!(
+            script.contains("MIN_HEALTHY_RUNTIME=300"),
+            "wrapper must define a healthy-runtime threshold"
+        );
+        assert!(
+            script.contains("CHILD_RUNTIME") && script.contains("CONSECUTIVE_FAILURES=0"),
+            "wrapper must reset the consecutive-failure streak after a healthy run"
+        );
+        // A benign updater no-op (exit 2 = already up to date / rate-limited /
+        // pinned / install-gated) on the exit-42 path must NOT count toward the
+        // cap. The script captures UPDATE_RC and compares against the injected
+        // EXIT_CODE_ALREADY_UP_TO_DATE (2).
+        assert!(
+            script.contains("UPDATE_RC=$?")
+                && script.contains(&format!(
+                    "UPDATE_RC\" -eq {}",
+                    super::super::update::EXIT_CODE_ALREADY_UP_TO_DATE
+                )),
+            "exit-42 path must treat the updater's already-up-to-date/rate-limited \
+             exit as a benign no-op, not a counted failure"
+        );
+    }
+
     /// Regression for issue #3967: on exit 43 the wrapper must self-heal a
     /// STALE ORPHAN holding the service port instead of unconditionally
     /// standing down. Standing down (`exit 0`) under launchd

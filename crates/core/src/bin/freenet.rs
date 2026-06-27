@@ -397,14 +397,18 @@ async fn run_network_node_with_signals(
             "Startup update check against GitHub"
         );
         if let Some(new_version) = startup_update_check(build_info::VERSION).await {
-            // #4073: don't auto-update to a version pinned known-bad on this
-            // node by a prior crash-loop rollback (the installer would refuse it
-            // anyway; this avoids a needless restart).
-            if commands::rollback::is_version_pinned_bad(&new_version) {
+            // #4073: don't auto-update to a version that is locally BLOCKED — a
+            // crash-loop known-bad pin OR a version that has repeatedly failed to
+            // install (checksum / signature / download / extract). The installer
+            // would refuse it anyway; gating here avoids a needless exit-42
+            // restart cycle and is what stops the failed-install loop.
+            if commands::rollback::is_version_pinned_bad(&new_version)
+                || commands::rollback::is_version_install_gated(&new_version)
+            {
                 tracing::warn!(
                     new_version = %new_version,
-                    "Startup check: newer version is pinned known-bad after a crash-loop rollback; \
-                     not triggering auto-update (#4073)"
+                    "Startup check: newer version is locally blocked (crash-loop known-bad pin or \
+                     repeated install failures); not triggering auto-update (#4073)"
                 );
             } else {
                 tracing::info!(
@@ -468,6 +472,12 @@ async fn run_network_node_with_signals(
                     UpdateCheckResult::Skipped => {
                         // GitHub not reachable or no update yet; will retry next tick
                     }
+                    UpdateCheckResult::RateLimited => {
+                        // #4073: our own GitHub-poll rate limiter denied the
+                        // check. Do nothing and retry when the bucket refills —
+                        // do NOT exit 42 (the supervisor's `freenet update`
+                        // shares the empty bucket and would no-op).
+                    }
                     UpdateCheckResult::PinnedKnownBad => {
                         // #4073: the only newer release is pinned known-bad on
                         // this node after a crash-loop rollback. Stop trying to
@@ -527,6 +537,12 @@ async fn run_network_node_with_signals(
                                     stagger_deadline = None;
                                     stagger_cooldown_until =
                                         Some(Instant::now() + STAGGER_COOLDOWN);
+                                }
+                                UpdateCheckResult::RateLimited => {
+                                    // #4073: rate-limited by our own bucket — keep the
+                                    // stagger deadline armed (do NOT enter the long
+                                    // cooldown) so we re-check promptly once the bucket
+                                    // refills, without hitting GitHub meanwhile.
                                 }
                                 UpdateCheckResult::PinnedKnownBad => {
                                     // #4073: discovered version is pinned known-bad
@@ -615,6 +631,16 @@ async fn run_network_node_with_signals(
                         clear_version_mismatch();
                     }
                     UpdateCheckResult::Skipped => {}
+                    UpdateCheckResult::RateLimited => {
+                        // #4073: our own GitHub-poll rate limiter denied the
+                        // check. Crucially do NOT fall through to the max-backoff
+                        // "trust the gateway, exit 42" fallback above (this is a
+                        // separate match arm, so a RateLimited result never
+                        // reaches it): the supervisor's `freenet update` shares
+                        // the same empty bucket and would just exit "already up to
+                        // date", so exiting here would be a pointless restart loop.
+                        // Keep the mismatch flag and retry once the bucket refills.
+                    }
                     UpdateCheckResult::PinnedKnownBad => {
                         // #4073: the gateway-advertised newer release is pinned
                         // known-bad after a crash-loop rollback. Clear the
@@ -1413,6 +1439,38 @@ mod tests {
             src.contains("Version-mismatch update target is pinned known-bad"),
             "the legacy-mismatch PinnedKnownBad arm must clear the mismatch flag (#4073)"
         );
+    }
+
+    /// #4073: a `RateLimited` update-check result (our own GitHub-poll bucket was
+    /// empty) must NEVER drive an exit-42 update. Routing it through the
+    /// `Skipped` path would let the legacy "max-backoff + 0 connections -> exit
+    /// 42" gateway-trust fallback fire on a poll we deliberately skipped, and
+    /// since the supervisor-side `freenet update` shares the same empty bucket it
+    /// would just no-op — a pointless restart loop. So every `RateLimited` arm
+    /// must be its own arm that does NOT call `update_tx.send`.
+    #[test]
+    fn rate_limited_never_triggers_exit_42() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let needle = concat!("UpdateCheckResult::", "RateLimited =>");
+        let arms: Vec<&str> = src.split(needle).skip(1).collect();
+        assert_eq!(
+            arms.len(),
+            3,
+            "expected a RateLimited arm in each of the 3 update-trigger priorities \
+             (urgent / stagger / legacy mismatch) (#4073)"
+        );
+        for (i, arm) in arms.iter().enumerate() {
+            let end = arm
+                .find("UpdateCheckResult::")
+                .unwrap_or(arm.len())
+                .min(400);
+            let body = &arm[..end];
+            assert!(
+                !body.contains("update_tx.send"),
+                "RateLimited arm #{i} must NOT send an update — exiting 42 while \
+                 rate-limited would loop (#4073)"
+            );
+        }
     }
 
     /// Source-scrape pin for #4580: each Freenet supervisor must set the

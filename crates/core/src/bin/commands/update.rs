@@ -174,6 +174,58 @@ pub fn macos_dmg_asset_name(tag_name: &str) -> String {
     format!("Freenet-{}.dmg", version)
 }
 
+/// Deterministic "this release's artifacts do not verify" error: a checksum
+/// MISMATCH or an invalid/wrong-length release signature.
+///
+/// Distinct from TRANSIENT failures (GitHub/download outage, a checksum manifest
+/// that is still propagating, extraction/disk errors) so the per-target-version
+/// install-failure gate (#4073) engages ONLY for a genuinely bad / un-installable
+/// release — never for a flaky network that will succeed once it recovers.
+/// Gating on transient failures would permanently suppress a perfectly good
+/// release after a brief outage (Codex finding).
+#[derive(Debug)]
+struct ReleaseVerificationError(String);
+
+impl std::fmt::Display for ReleaseVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ReleaseVerificationError {}
+
+/// Whether `err` is a deterministic release-verification failure (checksum /
+/// signature), i.e. a "bad release" signal that should count toward the
+/// install-failure gate. Checks the top-level error type; the verification call
+/// sites deliberately propagate it without wrapping `.context()` so this
+/// downcast stays reliable.
+fn is_release_verification_failure(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ReleaseVerificationError>().is_some()
+}
+
+/// Outcome of [`UpdateCommand::download_and_install`] that the caller needs to
+/// drive the per-target-version install-failure gate (#4073). A plain `Ok(())`
+/// is ambiguous on macOS: the bundle path returns `Ok(())` BOTH on a real
+/// install (handled by exiting the process) and on a DMG-swap *failure* that is
+/// deliberately swallowed to avoid corrupting the signed bundle. The caller must
+/// not treat the latter as a success (which would clear the gate and let a
+/// failing DMG retry forever), so we distinguish them explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallOutcome {
+    /// A new binary/bundle was actually installed: clear the install-failure gate.
+    Installed,
+    /// The macOS DMG-swap failed and was swallowed (return `Ok` to protect the
+    /// signed bundle) — NO update was installed. `verification_failure` is true
+    /// when the cause was a deterministic DMG checksum/signature failure (counts
+    /// toward the gate) and false for a transient failure (leaves the gate
+    /// unchanged so a flaky network does not gate a good release).
+    ///
+    /// Only constructed on macOS; the variant exists on all targets so the
+    /// caller's match is uniform.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    BundleSkipped { verification_failure: bool },
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct UpdateCommand {
     /// Only check if an update is available without installing
@@ -265,7 +317,7 @@ impl UpdateCommand {
             println!("Checking for updates...");
         }
 
-        let latest = get_latest_release().await?;
+        let latest = get_latest_release(self.force, self.quiet).await?;
 
         let latest_version = latest.tag_name.trim_start_matches('v');
         if !self.quiet {
@@ -292,6 +344,10 @@ impl UpdateCommand {
             // take this `AlreadyUpToDate` branch without ever touching
             // the counter (skeptical-review H1 on PR #3941).
             super::auto_update::clear_update_failures();
+            // We are at (or ahead of) the latest release, so there is no failing
+            // target install to gate anymore — clear the per-version
+            // install-failure counter too (#4073).
+            super::rollback::clear_install_failures();
             // Exit with a distinct code so the service wrapper knows no update
             // was performed and can skip the unnecessary restart.
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
@@ -307,21 +363,29 @@ impl UpdateCommand {
             return Ok(());
         }
 
-        // #4073 crash-loop auto-rollback: refuse to (re-)install a version that
-        // a prior crash-loop rollback pinned as known-bad on THIS node, unless
-        // the operator explicitly forces it. This is what stops the
-        // update → crash → revert → re-update loop. A strictly-newer release (a
-        // fix) is not pinned and installs normally.
-        if !self.force && rollback::is_version_pinned_bad(latest_version) {
+        // #4073: refuse to (re-)install a version that is locally BLOCKED, unless
+        // the operator explicitly forces it. Two independent reasons:
+        //   * crash-loop known-bad pin — the version installed and then
+        //     crash-looped; this stops update → crash → revert → re-update.
+        //   * install-failure gate — the version has failed to install
+        //     (checksum / signature / download / extract) too many times; this
+        //     stops detect → exit 42 → failed install → restart → re-detect.
+        // A strictly-newer release (a fix) matches neither and installs normally.
+        if !self.force
+            && (rollback::is_version_pinned_bad(latest_version)
+                || rollback::is_version_install_gated(latest_version))
+        {
             if !self.quiet {
                 println!(
-                    "Version {latest_version} is pinned as known-bad on this node after a previous \
-                     crash-loop; refusing to re-install it. Run `freenet update --force` to override."
+                    "Version {latest_version} is locally blocked on this node (crash-loop known-bad \
+                     pin or repeated install failures); refusing to (re-)install it. Run \
+                     `freenet update --force` to override."
                 );
             }
             tracing::warn!(
                 version = latest_version,
-                "Refusing to install a version pinned known-bad after crash-loop rollback (#4073)"
+                "Refusing to install a locally-blocked version (known-bad pin or install-failure \
+                 gate) (#4073)"
             );
             // Behave like 'already up to date' so a supervisor does not
             // restart-loop trying to apply the bad version: there is nothing
@@ -333,10 +397,61 @@ impl UpdateCommand {
         if !self.quiet {
             println!("Downloading update...");
         }
-        self.download_and_install(&latest, current_version).await
+        // #4073 per-target-version install-failure gate. Count a DETERMINISTIC
+        // install failure of this version — a checksum mismatch or invalid
+        // release signature (`ReleaseVerificationError`) — toward the gate. After
+        // INSTALL_FAILURE_GATE_THRESHOLD such failures of the SAME version, the
+        // node's update detection and the installer stop acting on it (see
+        // `rollback::is_version_install_gated`), breaking the
+        // detect → exit 42 → failed install → restart loop a bad
+        // manifest/checksum/signature would otherwise sustain indefinitely.
+        //
+        // TRANSIENT failures (GitHub/download outage, a still-propagating
+        // checksum manifest, extraction/disk errors) are deliberately NOT
+        // counted: they self-resolve, and gating on them would permanently
+        // suppress a perfectly good release after a brief outage. A successful
+        // install clears the counter (we have moved forward).
+        //
+        // On the macOS DMG-swap path `download_and_install` exits the process on
+        // success and never returns here; a swallowed bundle FAILURE returns
+        // `BundleSkipped { verification_failure }`, which carries the same
+        // deterministic-vs-transient distinction.
+        let install_result = self.download_and_install(&latest, current_version).await;
+        match &install_result {
+            Ok(InstallOutcome::Installed) => super::rollback::clear_install_failures(),
+            Ok(InstallOutcome::BundleSkipped {
+                verification_failure,
+            }) => {
+                if *verification_failure {
+                    super::rollback::record_install_failure(latest_version);
+                }
+                // transient bundle failure: leave the gate unchanged.
+            }
+            Err(e) if is_release_verification_failure(e) => {
+                super::rollback::record_install_failure(latest_version)
+            }
+            // Transient install error: neither record nor clear — retry later.
+            //
+            // DELIBERATELY includes the fail-closed "missing artifact" refusals
+            // (absent SHA256SUMS.txt, no manifest entry for our asset, absent
+            // .sig when required) as well as download/network/extraction errors.
+            // A MISSING manifest/entry is the canonical release-PROPAGATION race
+            // (assets upload after the tag is live), so it self-resolves — gating
+            // it would risk permanently suppressing a good release that the node
+            // happened to poll seconds early, which is a worse regression than the
+            // already rate-limit-bounded retry cadence. Only a PRESENT-but-WRONG
+            // artifact (checksum mismatch / invalid signature) is an unambiguous
+            // bad-release signal and is gated above via ReleaseVerificationError.
+            Err(_) => {}
+        }
+        install_result.map(|_| ())
     }
 
-    async fn download_and_install(&self, release: &Release, current_version: &str) -> Result<()> {
+    async fn download_and_install(
+        &self,
+        release: &Release,
+        current_version: &str,
+    ) -> Result<InstallOutcome> {
         // macOS DMG-swap path: when running from inside a .app bundle,
         // in-place binary replacement would invalidate the bundle's code
         // signature and Gatekeeper would refuse to launch the result on
@@ -400,7 +515,15 @@ impl UpdateCommand {
                             "Bundle update failed: {e}. Skipping update to avoid corrupting the signed bundle. Next attempt will retry."
                         );
                     }
-                    return Ok(());
+                    // No update was installed. Surface as a bundle-skip carrying
+                    // whether the cause was a deterministic DMG checksum/signature
+                    // failure (counts toward the gate, #4073) vs a transient one
+                    // (leaves the gate unchanged), even though we exit 0 to
+                    // protect the signed bundle.
+                    let verification_failure = is_release_verification_failure(&e);
+                    return Ok(InstallOutcome::BundleSkipped {
+                        verification_failure,
+                    });
                 }
                 Err(e) => {
                     // Not in a bundle: safe to fall through to binary-
@@ -680,7 +803,7 @@ impl UpdateCommand {
             }
         }
 
-        Ok(())
+        Ok(InstallOutcome::Installed)
     }
 
     /// Download `SHA256SUMS.txt` and, when the release published it,
@@ -1013,7 +1136,33 @@ impl Checksums {
     }
 }
 
-async fn get_latest_release() -> Result<Release> {
+async fn get_latest_release(force: bool, quiet: bool) -> Result<Release> {
+    // Persistent rate limit (#4073): this is the supervisor-side choke point —
+    // the on-crash / on-update `freenet update` one-shot reaches GitHub through
+    // here. It uses its OWN on-disk token bucket (the INSTALL bucket), separate
+    // from the node's `get_latest_version` (NODE bucket), so the node — which
+    // always runs first in a restart cycle — can never spend the installer's
+    // tokens and starve a legitimate update. Because each `freenet update` is a
+    // fresh process, an in-memory limiter would reset on every restart and not
+    // bound a loop; the on-disk bucket holds the limit across restarts.
+    //
+    // `--force` (an explicit operator action) bypasses the limiter. An automated,
+    // token-denied poll exits EXIT_CODE_ALREADY_UP_TO_DATE so the supervisor
+    // treats it as "nothing to do" and backs off, rather than as a failure that
+    // would count toward any lockout.
+    if !force && !super::auto_update::try_consume_install_poll() {
+        if !quiet {
+            eprintln!(
+                "Update check rate-limited (too many recent GitHub polls); skipping this cycle. \
+                 Run `freenet update --force` to override."
+            );
+        }
+        tracing::warn!(
+            "GitHub update poll rate-limited (token bucket empty); exiting as up-to-date (#4073)"
+        );
+        std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+    }
+
     let client = reqwest::Client::builder()
         .user_agent("freenet-updater")
         // Bound the request (parity with auto_update::get_latest_version). The
@@ -1149,12 +1298,14 @@ fn verify_manifest_signature_with(
     };
 
     // ed25519 signatures are exactly 64 bytes. A wrong length means the asset
-    // is truncated or not a raw signature — refuse rather than guess.
+    // is truncated or not a raw signature — refuse rather than guess. This is a
+    // deterministic bad-artifact signal (ReleaseVerificationError) so it counts
+    // toward the install-failure gate (#4073).
     let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-        anyhow::anyhow!(
+        ReleaseVerificationError(format!(
             "Release signature has wrong length ({} bytes, expected 64); refusing to install.",
             sig_bytes.len()
-        )
+        ))
     })?;
     let parsed_signature = Signature::from_bytes(&sig_array);
 
@@ -1163,14 +1314,15 @@ fn verify_manifest_signature_with(
 
     // `verify_strict` rejects non-canonical / small-order points (the same
     // hardening the website contract uses). A failure here means the manifest
-    // was tampered with or signed by a key we don't trust: fail closed.
+    // was tampered with or signed by a key we don't trust: fail closed. Typed as
+    // a ReleaseVerificationError so it counts toward the install-failure gate.
     verifying_key
         .verify_strict(manifest_bytes, &parsed_signature)
         .map_err(|e| {
-            anyhow::anyhow!(
+            ReleaseVerificationError(format!(
                 "Release signature verification failed: {e}. The checksum manifest may be \
                  corrupted or tampered with; refusing to install."
-            )
+            ))
         })?;
 
     if !quiet {
@@ -1194,6 +1346,14 @@ fn verify_manifest_signature_with(
 /// rather than counting toward the `MAX_UPDATE_FAILURES` lockout. A
 /// transiently-missing manifest therefore retries under the existing
 /// exponential backoff instead of permanently disabling auto-update.
+///
+/// DELIBERATELY a plain error, NOT a [`ReleaseVerificationError`]: a missing
+/// manifest/entry is the canonical release-PROPAGATION race (the tag goes live
+/// before the assets finish uploading), so it must stay transient and NOT count
+/// toward the per-version install-failure gate (#4073) — gating it would risk
+/// permanently suppressing a good release polled seconds early. Only a
+/// PRESENT-but-WRONG artifact (hash mismatch / invalid signature) is the
+/// deterministic bad-release signal that gates.
 ///
 /// Pure (no I/O) so the fail-closed contract is unit-testable on every CI
 /// runner regardless of target OS.
@@ -1231,12 +1391,15 @@ fn verify_checksum(file_path: &Path, expected_hash: &str) -> Result<()> {
     });
 
     if actual_hash != expected_hash {
-        anyhow::bail!(
-            "Checksum verification failed!\nExpected: {}\nGot:      {}\n\
-             The download may be corrupted or tampered with.",
-            expected_hash,
-            actual_hash
-        );
+        // Deterministic "bad release" signal: the downloaded artifact does not
+        // match the (signature-authenticated) manifest. Typed so the caller
+        // counts it toward the per-version install-failure gate (#4073), unlike a
+        // transient download error.
+        return Err(ReleaseVerificationError(format!(
+            "Checksum verification failed!\nExpected: {expected_hash}\nGot:      {actual_hash}\n\
+             The download may be corrupted or tampered with."
+        ))
+        .into());
     }
 
     Ok(())
@@ -3574,6 +3737,99 @@ done
             "no record_update_failure may run between the checksum gate and \
              replace_binary — a checksum refusal must stay a retryable \
              OtherFailure, not a MAX_UPDATE_FAILURES lockout"
+        );
+    }
+
+    #[test]
+    fn verification_failures_are_classified_transient_are_not() {
+        // The gate keys off is_release_verification_failure. A checksum mismatch
+        // and an invalid/wrong-length signature must classify as deterministic
+        // verification failures (gate-worthy); a generic/transient error (e.g. a
+        // download outage) must NOT.
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("artifact");
+        std::fs::write(&f, b"the actual bytes").unwrap();
+        // Wrong expected hash -> checksum mismatch.
+        let mismatch = verify_checksum(&f, &"0".repeat(64)).unwrap_err();
+        assert!(
+            is_release_verification_failure(&mismatch),
+            "checksum mismatch must be a verification failure"
+        );
+
+        // Invalid signature (random 64 bytes against the real pubkey).
+        let bad_sig = [7u8; 64];
+        let sig_err = verify_manifest_signature_with(
+            b"some manifest",
+            Some(&bad_sig),
+            &FREENET_RELEASE_PUBKEY,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            is_release_verification_failure(&sig_err),
+            "invalid signature must be a verification failure"
+        );
+
+        // Wrong-length signature.
+        let short_sig_err = verify_manifest_signature_with(
+            b"some manifest",
+            Some(&[1u8, 2, 3]),
+            &FREENET_RELEASE_PUBKEY,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            is_release_verification_failure(&short_sig_err),
+            "wrong-length signature must be a verification failure"
+        );
+
+        // A generic/transient error must NOT classify as a verification failure.
+        let transient = anyhow::anyhow!("Failed to download file: connection reset");
+        assert!(
+            !is_release_verification_failure(&transient),
+            "a transient download error must NOT count toward the gate"
+        );
+    }
+
+    #[test]
+    fn install_failure_gate_only_counts_verification_failures() {
+        // #4073 (Codex): the per-version install-failure gate must engage only on
+        // DETERMINISTIC verification failures (checksum/signature), NOT on
+        // transient ones (download/network/extraction) — gating a good release
+        // after a brief outage is a regression. Source-scrape pins on run_async's
+        // match (the macOS path isn't exercised on Linux CI).
+        const SRC: &str = include_str!("update.rs");
+        let (_, run_async) = SRC
+            .split_once("let install_result = self.download_and_install(")
+            .expect("download_and_install call site not found");
+        let (matchbody, _) = run_async
+            .split_once("install_result.map(|_| ())")
+            .expect("end of install-result match not found");
+
+        // The Installed outcome clears the gate.
+        assert!(
+            matchbody.contains(
+                "Ok(InstallOutcome::Installed) => super::rollback::clear_install_failures()"
+            ),
+            "the Installed outcome must clear the install-failure gate"
+        );
+        // The deterministic-verification Err arm records a failure.
+        assert!(
+            matchbody.contains("Err(e) if is_release_verification_failure(e) =>")
+                && matchbody.contains("record_install_failure"),
+            "a verification-failure Err must record toward the gate"
+        );
+        // The catch-all transient Err arm must NOT record (it is a no-op).
+        let (_, after_catch) = matchbody
+            .split_once("// Transient install error: neither record nor clear")
+            .expect("transient Err arm must be present and documented");
+        let catch_body = &after_catch[..after_catch.find('}').unwrap_or(after_catch.len())];
+        assert!(
+            !catch_body.contains("record_install_failure")
+                && !catch_body.contains("clear_install_failures"),
+            "the transient Err arm must neither record nor clear the gate"
         );
     }
 

@@ -564,6 +564,122 @@ pub(crate) fn is_version_pinned_bad_at(dir: &Path, version: &str) -> bool {
     read_known_bad_at(dir).as_deref() == Some(version)
 }
 
+// ── Per-target-version install-failure gate ────────────────────────────────
+//
+// Distinct from the crash-loop known-bad pin above: the pin fires when an
+// already-INSTALLED version crash-loops, whereas this gate fires when a version
+// repeatedly FAILS TO INSTALL (checksum / signature / download / extract). The
+// #4586 fail-closed checksum gate turned a bad-manifest install from a
+// self-terminating failure into a NON-counting one (it is classified
+// `OtherFailure` => `NoChange`, so it never trips the #3934 lockout), which left
+// the node free to loop: detect newer X → exit 42 → `freenet update` → install
+// fails the gate → no install → re-detect → exit 42 → … forever.
+//
+// This gate breaks that loop. Each failed install of a target version increments
+// a persisted per-version counter; once the SAME version has failed
+// [`INSTALL_FAILURE_GATE_THRESHOLD`] times it is gated, and both the node's
+// update detection and the installer stop acting on it until a STRICTLY-NEWER
+// version appears. Like the pin, the gate is keyed by exact version string, so a
+// newer release (a fix) never matches and installs normally.
+//
+// Degrade-safe (NOT fail-closed like the rate-limit bucket): a missing or
+// corrupt gate file reads as "not gated". Treating a corrupt file as "gate
+// everything" could brick auto-update entirely (we would not know which version
+// to exempt), so the conservative choice here is the opposite of the bucket's —
+// the GitHub-spam dimension is already bounded by the rate-limit bucket, and
+// atomic tmp+rename writes make corruption unlikely in the first place.
+
+/// Consecutive failed installs of the SAME target version before that version is
+/// gated out of the node's update detection and the installer. Mirrors the spirit
+/// of [`ROLLBACK_CRASH_THRESHOLD`] (three confirmations: one is noise, two could
+/// be unlucky, by the third the version is demonstrably not installable here).
+pub(crate) const INSTALL_FAILURE_GATE_THRESHOLD: u32 = 3;
+
+/// Per-target-version install-failure record (JSON: version + consecutive count).
+const INSTALL_FAILURES_FILE: &str = "install_failures.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InstallFailureState {
+    /// The target version whose install has been failing.
+    pub version: String,
+    /// Consecutive failed installs of that version.
+    pub count: u32,
+}
+
+pub(crate) fn read_install_failures_at(dir: &Path) -> Option<InstallFailureState> {
+    let raw = std::fs::read_to_string(dir.join(INSTALL_FAILURES_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_install_failures_at(dir: &Path, state: &InstallFailureState) -> Result<()> {
+    let raw = serde_json::to_vec(state).context("serialize install-failure state")?;
+    atomic_write(&dir.join(INSTALL_FAILURES_FILE), &raw)
+}
+
+fn clear_install_failures_at(dir: &Path) {
+    let _rm = std::fs::remove_file(dir.join(INSTALL_FAILURES_FILE));
+}
+
+/// Record one failed install of `version`. If the record is for a different
+/// version (e.g. a newer release became the target), it RESETS to track the new
+/// version with a count of 1 — so an old gated version never blocks a new one,
+/// and a transient failure of a new version starts its own count.
+pub(crate) fn record_install_failure_at(dir: &Path, version: &str) {
+    let next = match read_install_failures_at(dir) {
+        Some(prev) if prev.version == version => InstallFailureState {
+            version: version.to_string(),
+            count: prev.count.saturating_add(1),
+        },
+        _ => InstallFailureState {
+            version: version.to_string(),
+            count: 1,
+        },
+    };
+    if let Err(e) = write_install_failures_at(dir, &next) {
+        // Best-effort: if we cannot persist the counter the gate simply will not
+        // engage for this version, and the rate-limit bucket still bounds the
+        // GitHub load. Surface it for diagnosis rather than failing the update.
+        tracing::warn!(
+            version,
+            error = %e,
+            "Failed to persist per-version install-failure counter (#4073)"
+        );
+    }
+}
+
+/// Record one failed install of `version` against the shared state directory.
+pub fn record_install_failure(version: &str) {
+    if let Some(dir) = state_dir() {
+        record_install_failure_at(&dir, version);
+    }
+}
+
+/// Clear the install-failure counter (called after a successful install / when
+/// the node is confirmed already up to date — we have moved forward).
+pub fn clear_install_failures() {
+    if let Some(dir) = state_dir() {
+        clear_install_failures_at(&dir);
+    }
+}
+
+/// Whether `version` is currently gated by repeated install failures: the stored
+/// record is for this exact version AND has reached the threshold. A
+/// strictly-newer version never matches (different string), so a fix is never
+/// blocked. Degrade-safe: missing/corrupt record => not gated.
+pub(crate) fn is_version_install_gated_at(dir: &Path, version: &str) -> bool {
+    match read_install_failures_at(dir) {
+        Some(state) => state.version == version && state.count >= INSTALL_FAILURE_GATE_THRESHOLD,
+        None => false,
+    }
+}
+
+/// Whether `version` is install-gated against the shared state directory.
+pub fn is_version_install_gated(version: &str) -> bool {
+    state_dir()
+        .map(|d| is_version_install_gated_at(d.as_path(), version))
+        .unwrap_or(false)
+}
+
 // ── Post-stop crash classification / handling / rollback ───────────────────
 
 /// Read the raw post-stop status string the supervisor forwarded, if any. May
@@ -1303,6 +1419,144 @@ mod tests {
         assert_eq!(
             handle_post_stop_at(dir, "101", "0.2.84"),
             PostStopOutcome::Proceed
+        );
+    }
+
+    #[test]
+    fn install_gate_engages_after_threshold_failures_of_same_version() {
+        // Core #4073 regression: repeated failed installs of the SAME version
+        // must, after the threshold, gate that version out of update detection —
+        // this is what bounds the detect → exit 42 → failed install → restart
+        // loop a bad manifest/checksum would otherwise sustain forever.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        for n in 1..INSTALL_FAILURE_GATE_THRESHOLD {
+            record_install_failure_at(dir, "0.2.90");
+            assert!(
+                !is_version_install_gated_at(dir, "0.2.90"),
+                "below threshold ({n}) must not gate yet"
+            );
+        }
+        record_install_failure_at(dir, "0.2.90");
+        assert!(
+            is_version_install_gated_at(dir, "0.2.90"),
+            "threshold reached: version must be gated"
+        );
+    }
+
+    #[test]
+    fn install_gate_allows_strictly_newer_version() {
+        // A gated version must NOT block a different (newer) release — the fix.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for _ in 0..INSTALL_FAILURE_GATE_THRESHOLD {
+            record_install_failure_at(dir, "0.2.90");
+        }
+        assert!(is_version_install_gated_at(dir, "0.2.90"));
+        assert!(
+            !is_version_install_gated_at(dir, "0.2.91"),
+            "a newer version must not be gated by an older version's failures"
+        );
+    }
+
+    #[test]
+    fn install_gate_resets_when_target_version_changes() {
+        // If a newer release becomes the failing target, the counter resets to
+        // track it (count 1), so the old version's accumulated failures don't
+        // instantly gate the new one.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for _ in 0..INSTALL_FAILURE_GATE_THRESHOLD {
+            record_install_failure_at(dir, "0.2.90");
+        }
+        assert!(is_version_install_gated_at(dir, "0.2.90"));
+
+        record_install_failure_at(dir, "0.2.91");
+        let state = read_install_failures_at(dir).unwrap();
+        assert_eq!(state.version, "0.2.91");
+        assert_eq!(state.count, 1, "new target starts a fresh count");
+        assert!(!is_version_install_gated_at(dir, "0.2.91"));
+        // The old version is no longer tracked, so it is no longer gated either.
+        assert!(!is_version_install_gated_at(dir, "0.2.90"));
+    }
+
+    #[test]
+    fn install_gate_cleared_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for _ in 0..INSTALL_FAILURE_GATE_THRESHOLD {
+            record_install_failure_at(dir, "0.2.90");
+        }
+        assert!(is_version_install_gated_at(dir, "0.2.90"));
+
+        clear_install_failures_at(dir);
+        assert!(read_install_failures_at(dir).is_none());
+        assert!(!is_version_install_gated_at(dir, "0.2.90"));
+        // Clearing an already-clear counter is idempotent.
+        clear_install_failures_at(dir);
+        assert!(!is_version_install_gated_at(dir, "0.2.90"));
+    }
+
+    #[test]
+    fn install_gate_degrades_safe_on_missing_or_corrupt() {
+        // Degrade-safe (NOT fail-closed): a missing or corrupt record reads as
+        // "not gated" so a torn file can never brick auto-update entirely.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Missing.
+        assert!(!is_version_install_gated_at(dir, "0.2.90"));
+        assert!(read_install_failures_at(dir).is_none());
+
+        // Corrupt.
+        std::fs::write(dir.join(INSTALL_FAILURES_FILE), "{not valid json").unwrap();
+        assert!(read_install_failures_at(dir).is_none());
+        assert!(!is_version_install_gated_at(dir, "0.2.90"));
+    }
+
+    #[test]
+    fn install_gate_uses_atomic_write_no_temp_left_behind() {
+        // Writes go through atomic_write (tmp + rename); no stray temp remains.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        record_install_failure_at(dir, "0.2.90");
+        assert!(read_install_failures_at(dir).is_some());
+        let leftover_tmp = dir.join(format!(".{INSTALL_FAILURES_FILE}.tmp"));
+        assert!(
+            !leftover_tmp.exists(),
+            "atomic_write must not leave a temp file behind"
+        );
+    }
+
+    #[test]
+    fn install_failure_loop_is_bounded_by_the_gate() {
+        // End-to-end bound: simulate the failed-install loop. Each cycle the node
+        // would detect X and the supervisor's `freenet update` would fail to
+        // install X (recording a failure). After at most
+        // INSTALL_FAILURE_GATE_THRESHOLD cycles the node's detection is gated and
+        // stops emitting exit 42 for X — so the loop cannot run unbounded.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let mut emitted_exit_42 = 0u32;
+        for _cycle in 0..1000 {
+            // Node detection: would it emit exit 42 for X this cycle?
+            if is_version_install_gated_at(dir, "0.2.90") {
+                break; // gated -> node stays put, loop is broken
+            }
+            emitted_exit_42 += 1;
+            // Supervisor runs `freenet update`, install fails -> record.
+            record_install_failure_at(dir, "0.2.90");
+        }
+
+        assert!(
+            is_version_install_gated_at(dir, "0.2.90"),
+            "the loop must end with the version gated"
+        );
+        assert_eq!(
+            emitted_exit_42, INSTALL_FAILURE_GATE_THRESHOLD,
+            "node must stop emitting exit 42 after exactly the threshold cycles"
         );
     }
 

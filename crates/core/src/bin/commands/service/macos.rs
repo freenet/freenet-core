@@ -142,6 +142,24 @@ export {supervised_env}=1
 BACKOFF=10       # Initial backoff in seconds
 MAX_BACKOFF=300  # Maximum backoff (5 minutes)
 CONSECUTIVE_FAILURES=0
+# Give up (exit the wrapper) after this many consecutive failures, so a
+# persistently-failing node — a committed version that crash-loops, or an update
+# that never succeeds — does not thrash and poll GitHub forever. Mirrors the
+# in-process run-wrapper's WRAPPER_MAX_CONSECUTIVE_FAILURES cap (service.rs) and
+# stays well above the #4073 crash-loop rollback threshold (3) so rollback always
+# fires first. The give-up path exits 0 (NOT non-zero): the plist sets
+# KeepAlive.SuccessfulExit=false, so launchd RESPAWNS on a non-zero exit and only
+# treats a clean exit 0 as an intentional terminal stop (same reasoning as the
+# exit-0/exit-43 paths below). A non-zero exit here would just relaunch a fresh
+# wrapper with CONSECUTIVE_FAILURES reset to 0, defeating the cap entirely.
+MAX_CONSECUTIVE_FAILURES=50
+# A child that ran healthily for at least this long before exiting is treated as
+# "made progress": its failure does NOT count toward the consecutive cap. This
+# keeps the cap aimed at a tight CRASH LOOP (repeated fast failures) rather than
+# at a node that runs fine for a long time and then crashes occasionally — the
+# latter must keep being restarted, not eventually give up. Comfortably past the
+# #4073 60s commit window and the 300s max backoff.
+MIN_HEALTHY_RUNTIME=300
 PORT_CONFLICT_KILLS=0
 MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
 
@@ -155,6 +173,18 @@ MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
 # and so does not accumulate.
 log_event() {{
     logger -t freenet "$1"
+}}
+
+# Exit the wrapper loop once consecutive failures hit the cap, so a node that
+# never comes up healthy stops restarting (and stops polling GitHub) instead of
+# looping forever. Called right after each failure increment. Exits 0 so launchd
+# (KeepAlive.SuccessfulExit=false) treats it as an intentional stop and does NOT
+# respawn — a non-zero exit would be respawned and reset the counter.
+give_up_if_failing() {{
+    if [ "$CONSECUTIVE_FAILURES" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
+        log_event "Giving up after $CONSECUTIVE_FAILURES consecutive failures; stopping wrapper for operator intervention (clean exit so launchd does not respawn)."
+        exit 0
+    fi
 }}
 
 # Print a binary's full version identity line, e.g.
@@ -285,6 +315,7 @@ while true; do
     # exit-43 self-heal path avoid mistaking our just-exited child for a
     # stale orphan still holding the port, and lets the TERM trap above forward
     # launchd's stop signal to the node for a graceful drain.
+    CHILD_START=$(date +%s)
     "{binary}" network 2>"$HOME/Library/Logs/freenet/freenet.error.log.last" &
     WRAPPER_CHILD_PID=$!
     # `wait` is interrupted by the trapped TERM; re-wait so we collect the
@@ -295,6 +326,13 @@ while true; do
         wait $WRAPPER_CHILD_PID
         EXIT_CODE=$?
     done
+    # How long the child ran this cycle. A long healthy run before a later
+    # non-zero exit clears the consecutive-failure streak (see give_up_if_failing
+    # / MIN_HEALTHY_RUNTIME) so only a tight crash loop trips the cap.
+    CHILD_RUNTIME=$(( $(date +%s) - CHILD_START ))
+    if [ "$CHILD_RUNTIME" -ge "$MIN_HEALTHY_RUNTIME" ]; then
+        CONSECUTIVE_FAILURES=0
+    fi
 
     if [ $EXIT_CODE -eq 42 ]; then
         log_event "Update needed, running freenet update..."
@@ -308,7 +346,21 @@ while true; do
             BACKOFF=10
             sleep 2
         else
+            UPDATE_RC=$?
+            if [ "$UPDATE_RC" -eq {already_up_to_date} ]; then
+                # Benign no-op: `freenet update` exited "already up to date" — no
+                # update was performed because we are already current, the target
+                # is rate-limited, pinned known-bad, or install-gated (#4073).
+                # This is NOT a failure, so it must NOT count toward the give-up
+                # cap; just restart the same binary after a short pause.
+                log_event "Update reported nothing to do (exit $UPDATE_RC); restarting without counting a failure."
+                PORT_CONFLICT_KILLS=0
+                BACKOFF=10
+                sleep 2
+                continue
+            fi
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+            give_up_if_failing
             log_event "Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..."
             sleep $BACKOFF
             BACKOFF=$((BACKOFF * 2))
@@ -364,6 +416,7 @@ while true; do
             fi
         fi
         CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+        give_up_if_failing
         PORT_CONFLICT_KILLS=0
         log_event "Exited with code $EXIT_CODE, restarting after backoff..."
         sleep $BACKOFF
@@ -375,6 +428,7 @@ done
         binary = binary_path.display(),
         supervised_env = super::super::auto_update::SUPERVISED_ENV_VAR,
         post_stop_env = super::super::rollback::POST_STOP_EXIT_CODE_ENV_VAR,
+        already_up_to_date = super::super::update::EXIT_CODE_ALREADY_UP_TO_DATE,
     )
 }
 
