@@ -95,6 +95,7 @@ fn sandbox_origin_from_headers(headers: &axum::http::HeaderMap) -> String {
 }
 
 pub(crate) mod hosted_export;
+pub(crate) mod hosted_import;
 mod permission_prompts;
 mod v1;
 mod v2;
@@ -215,6 +216,12 @@ impl HttpClientApi {
             // `ExportOpManagerHandle` Extension below.
             .merge(hosted_export::routes(ApiVersion::V1))
             .merge(hosted_export::routes(ApiVersion::V2))
+            // Live "import my data" endpoint (P3-live of #4592). Writes secrets,
+            // so it is gated to the node's own dashboard origin over loopback
+            // (see `hosted_import`). Reuses the SAME per-node
+            // `ExportOpManagerHandle` Extension below to reach the executor.
+            .merge(hosted_import::routes(ApiVersion::V1))
+            .merge(hosted_import::routes(ApiVersion::V2))
             .merge(permission_prompts::routes())
             .layer(Extension(origin_contracts.clone()))
             .layer(Extension(pending_prompts))

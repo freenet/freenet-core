@@ -518,6 +518,8 @@ pub(crate) async fn has_contract(
         | crate::contract::ContractHandlerEvent::DelegateResponse(_)
         | crate::contract::ContractHandlerEvent::ExportUserSecrets { .. }
         | crate::contract::ContractHandlerEvent::ExportUserSecretsResponse(_)
+        | crate::contract::ContractHandlerEvent::ImportSecrets { .. }
+        | crate::contract::ContractHandlerEvent::ImportSecretsResponse(_)
         | crate::contract::ContractHandlerEvent::PutQuery { .. }
         | crate::contract::ContractHandlerEvent::PutResponse { .. }
         | crate::contract::ContractHandlerEvent::GetQuery { .. }

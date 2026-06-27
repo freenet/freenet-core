@@ -523,7 +523,12 @@ fn is_caller_trusted(
 ///    victim-hostname:7509`, `Origin: https://evil.com`, which would
 ///    otherwise pass an Origin-less allowed-host check. When the
 ///    `AllowedHosts` extension is missing, branch 3 is inactive.
-fn is_origin_trusted(
+///
+/// `pub(crate)` so the live-import endpoint (`hosted_import`) reuses the EXACT
+/// same origin-trust decision as the permission-prompt CSRF guard — one source
+/// of truth for "is this request from the node's own dashboard/shell origin (and
+/// not a sandboxed `Origin: null` contract iframe)". See `hosted_import`'s gate.
+pub(crate) fn is_origin_trusted(
     headers: &HeaderMap,
     origin: &str,
     allowed_hosts: Option<&AllowedHosts>,

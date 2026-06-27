@@ -107,6 +107,12 @@ pub struct RuntimePool {
     /// enforced anti-deadlock invariant (see `effective_export_permits`), not a
     /// prose hope. `Arc` so an admitted `ExportJob` can hold an owned permit
     /// across the spawned background task without borrowing the pool.
+    ///
+    /// NOTE: this is EXPORT-only. The live secret IMPORT (#4592) deliberately
+    /// runs ON the contract loop (serialized with delegate `store_secret`), not
+    /// off-loop, so it takes no permit here — see the `import_secrets` impl and
+    /// the `ImportSecrets` arm in `contract.rs` for why (the store write path
+    /// assumes node-wide write serialization).
     export_semaphore: Arc<Semaphore>,
     /// Inactive-user reclaim sweep task (#4561, P5 of #4381). `Some` ONLY when
     /// hosted mode is on AND `per-user-inactive-ttl > 0`. The pool owns the
@@ -1161,6 +1167,46 @@ impl ContractExecutor for RuntimePool {
                 }
             }
         }
+        result
+    }
+
+    /// Run a live secret import ON the contract loop (#4592). DELIBERATELY
+    /// on-loop, NOT off-loop like the export: the import WRITES to the
+    /// `SecretsStore`, whose write path (fixed sibling `.tmp` + check-then-write)
+    /// assumes node-wide write serialization. Checking out a pooled executor and
+    /// running the import here — awaited by the single-threaded contract loop —
+    /// keeps every secret write in one serialization domain (with delegate
+    /// `store_secret`), so an import can never race another writer on the same
+    /// secret file (Codex P1). The heavy work is acceptable on the loop because
+    /// the endpoint is loopback + dashboard-gated (operator's one-shot migration),
+    /// not the authenticated-remote DoS surface that justified off-loop export.
+    ///
+    /// `pop_executor().await` always succeeds promptly: an in-flight export holds
+    /// at most `pool_size-1` executors, so >=1 is always free for the loop.
+    async fn import_secrets(
+        &mut self,
+        target_scope: crate::contract::handler::ImportTargetScope,
+        bundle: &[u8],
+        key: &[u8],
+        key_kind: crate::contract::handler::BundleKeyKind,
+        overwrite: bool,
+    ) -> Result<crate::wasm_runtime::secret_export::ImportReport, ExecutorError> {
+        use crate::contract::handler::{BundleKeyKind, ImportTargetScope};
+        use crate::wasm_runtime::secret_export::{BundleKeyMaterial, TargetScope};
+        let mut executor = self.pop_executor().await;
+        let scope = match target_scope {
+            ImportTargetScope::Local => TargetScope::Local,
+        };
+        let material = match key_kind {
+            BundleKeyKind::Token => BundleKeyMaterial::Token(key),
+            BundleKeyKind::Passphrase => BundleKeyMaterial::Passphrase(key),
+        };
+        // Synchronous decrypt + per-secret write. No `.await` between checkout and
+        // return, so the executor is held for exactly this op.
+        let result = executor.import_secrets(&scope, bundle, &material, overwrite);
+        // The import runs no WASM, so the executor stays healthy; route it back
+        // through the health-checked return for accounting parity with every op.
+        self.return_checked(executor, "import_secrets").await;
         result
     }
 

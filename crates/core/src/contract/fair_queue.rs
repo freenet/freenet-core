@@ -465,6 +465,8 @@ fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceI
         | ContractHandlerEvent::DelegateResponse(_)
         | ContractHandlerEvent::ExportUserSecrets { .. }
         | ContractHandlerEvent::ExportUserSecretsResponse(_)
+        | ContractHandlerEvent::ImportSecrets { .. }
+        | ContractHandlerEvent::ImportSecretsResponse(_)
         | ContractHandlerEvent::PutResponse { .. }
         | ContractHandlerEvent::GetResponse { .. }
         | ContractHandlerEvent::UpdateResponse { .. }

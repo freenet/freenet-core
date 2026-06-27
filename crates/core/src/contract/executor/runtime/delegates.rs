@@ -52,6 +52,48 @@ impl Executor<Runtime> {
             })
     }
 
+    /// Import delegate secrets from an encrypted `bundle` into this node's
+    /// secrets store at `target_scope`, LIVE — the durable counterpart of
+    /// [`Self::export_user_secrets`] and the mutating mirror of it (P3-live of
+    /// #4592). Runs on the executor (which owns the `SecretsStore` via its
+    /// `Runtime`). Unlike the read-only export, this is invoked ON the contract
+    /// loop by the pool caller (`RuntimePool::import_secrets`) — the import WRITES
+    /// and the store write path assumes node-wide write serialization, so it must
+    /// not run off-loop where it could race another writer on the same secret.
+    ///
+    /// The bundle is decrypted under `material`; `import_bundle` authenticates
+    /// the WHOLE bundle BEFORE writing anything, so a wrong key / corrupt bundle
+    /// fails with NOTHING written (all-or-nothing on the key). `overwrite`
+    /// controls collision handling (skip+report vs overwrite-with-snapshot).
+    ///
+    /// A client-input failure (wrong key, bad magic, truncated/unsupported
+    /// bundle, malformed entry) is preserved as the typed [`ImportBadBundle`]
+    /// marker so the HTTP layer can map it to a 4xx instead of a generic 500;
+    /// its `Display` text is non-secret (never echoes the key or plaintext).
+    /// Node-side failures (store/IO) stay an opaque executor error (→ 500). The
+    /// `material` and the plaintext it decrypts live only in borrowed/`Zeroizing`
+    /// buffers; nothing is logged.
+    pub fn import_secrets(
+        &mut self,
+        target_scope: &crate::wasm_runtime::secret_export::TargetScope,
+        bundle: &[u8],
+        material: &crate::wasm_runtime::secret_export::BundleKeyMaterial<'_>,
+        overwrite: bool,
+    ) -> Result<crate::wasm_runtime::secret_export::ImportReport, ExecutorError> {
+        use crate::contract::executor::{ImportBadBundle, is_bad_bundle_input};
+        self.runtime
+            .import_secret_bundle(bundle, material, target_scope, overwrite)
+            .map_err(|e| {
+                if is_bad_bundle_input(&e) {
+                    ExecutorError::other(ImportBadBundle {
+                        message: e.to_string(),
+                    })
+                } else {
+                    ExecutorError::other(anyhow::anyhow!("secret import failed: {e}"))
+                }
+            })
+    }
+
     pub fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
