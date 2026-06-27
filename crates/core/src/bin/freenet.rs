@@ -228,9 +228,11 @@ async fn run_network_node_with_signals(
     shutdown_handle: freenet::ShutdownHandle,
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
-        UpdateCheckResult, UpdateNeededError, check_if_update_available, clear_version_mismatch,
-        get_open_connection_count, has_reached_max_backoff, has_version_mismatch, reset_backoff,
-        startup_update_check, version_mismatch_generation,
+        UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, UpdateCheckResult,
+        UpdateNeededError, check_if_update_available, clear_version_mismatch,
+        get_open_connection_count, has_reached_max_backoff, has_version_mismatch,
+        jittered_repoll_interval, reset_backoff, should_attempt_update, startup_update_check,
+        version_mismatch_generation,
     };
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
@@ -332,11 +334,16 @@ async fn run_network_node_with_signals(
 
     // Monitor for version mismatches and check for updates (#3204).
     //
-    // Three update triggers (checked each 60s tick):
+    // Four update triggers (checked each 60s tick):
     //   1. Urgent update: remote's min_compatible > our version → verify with GitHub, exit immediately
     //   2. Decentralized discovery: highest_seen_version > our version → start stagger timer,
     //      verify with GitHub when timer expires
     //   3. Legacy mismatch: existing backoff-based mechanism (fallback)
+    //   4. Periodic re-poll (#4073): re-run the direct startup GitHub check on a
+    //      recurring, jittered ~6h schedule so a long-running node still notices a
+    //      new release without a restart — even when every peer is on the same old
+    //      version (so triggers 1-3 never fire). Detection-only: feeds the SAME
+    //      exit-42 path.
     //
     // GitHub verification before exit-42 is always required — decentralized discovery
     // tells us *when* to check, GitHub confirms *what* to install.
@@ -444,11 +451,26 @@ async fn run_network_node_with_signals(
         // few hours indefinitely when peers report a version that isn't on GitHub yet.
         const STAGGER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
+        // Compute the delay until the next periodic GitHub re-poll, jittering the
+        // base interval by ±UPDATE_REPOLL_JITTER_FRACTION using GlobalRng so nodes
+        // that booted together do not poll (and restart) in lockstep.
+        let repoll_delay = || {
+            let rand_unit = freenet::config::GlobalRng::random_range(0.0_f64..1.0);
+            jittered_repoll_interval(
+                UPDATE_REPOLL_INTERVAL,
+                UPDATE_REPOLL_JITTER_FRACTION,
+                rand_unit,
+            )
+        };
+
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut last_mismatch_generation = version_mismatch_generation();
         let mut isolated_mismatch_since: Option<Instant> = None;
         let mut stagger_deadline: Option<Instant> = None;
         let mut stagger_cooldown_until: Option<Instant> = None;
+        // First periodic re-poll is one (jittered) interval out; the boot-time
+        // startup_update_check above already covered "right now".
+        let mut next_repoll = Instant::now() + repoll_delay();
         let our_version = parse_our_version();
 
         loop {
@@ -659,6 +681,87 @@ async fn run_network_node_with_signals(
                 }
             } else {
                 isolated_mismatch_since = None;
+            }
+
+            // --- Priority 4: Periodic direct GitHub re-poll (#4073) ---
+            //
+            // Independent of any peer signal: re-run the SAME one-shot startup
+            // GitHub check on a recurring, jittered schedule so a node that has
+            // been up for a long time still notices a new release without a
+            // restart. Before this, once the boot-time startup check ran, all
+            // further detection depended on a peer signal (priorities 1-3); if an
+            // entire network sat on the same old version, no node re-checked GitHub
+            // and a freshly published release was never picked up.
+            //
+            // Detection-only: a discovered update feeds the SAME `update_tx` →
+            // graceful-shutdown → exit-42 → `freenet update` path as every trigger
+            // above — identical to the startup check — so all existing
+            // apply/verify/signing safety (checksum fail-closed #4586, signature
+            // verify #4587, crash-loop bounding #4551/#4588) applies unchanged.
+            //
+            // Fail-open + self-throttling: `startup_update_check` returns None on
+            // any GitHub/parse/network error, so a failed poll (rate-limit,
+            // outage) simply retries at the next interval (~6h) — it never hammers
+            // the API or crashes the node. At 6h ± 25% the minimum interval is
+            // ~4.5h, far under GitHub's unauthenticated 60 req/hr/IP limit. The
+            // 60s tick advances `next_repoll`, so only one re-poll runs per
+            // interval and (being sequential in this single task) it never
+            // overlaps an in-flight check.
+            if Instant::now() >= next_repoll {
+                next_repoll = Instant::now() + repoll_delay();
+                // Respect the persistent auto-update failure lockout (#3934).
+                // When installs keep failing (e.g. a non-writable binary path)
+                // the failure counter reaches MAX_UPDATE_FAILURES and the
+                // peer-signal triggers (priorities 1-3) stop exiting for
+                // auto-update via `check_if_update_available`. The periodic
+                // re-poll MUST honor the same lockout — otherwise a locked-out
+                // long-running node would exit-42 every interval and make the
+                // supervisor rerun the same failing update, reintroducing the
+                // exact loop the lockout exists to stop. (The boot-time startup
+                // check bypasses the lockout, but only once per restart; a
+                // *recurring* bypass is the regression.) A successful manual
+                // `freenet update` clears the counter and re-enables this path.
+                if should_attempt_update() {
+                    tracing::debug!(
+                        current = build_info::VERSION,
+                        "Periodic re-poll: checking GitHub directly for a newer release"
+                    );
+                    if let Some(new_version) = startup_update_check(build_info::VERSION).await {
+                        // #4073 (rebase onto #4591/#4593): mirror the boot-time
+                        // startup check — never exit-42 to a version that is
+                        // locally BLOCKED (crash-loop known-bad pin OR repeatedly
+                        // failed install: checksum / signature / download /
+                        // extract). The installer would refuse it anyway, so an
+                        // exit-42 here is a pointless restart cycle; gating it is
+                        // what keeps the failed-install loop stopped. (Rate-limit
+                        // is already honored upstream: this path reaches GitHub
+                        // through `get_latest_version`, which consumes a node
+                        // token and returns None here when the bucket is empty.)
+                        if commands::rollback::is_version_pinned_bad(&new_version)
+                            || commands::rollback::is_version_install_gated(&new_version)
+                        {
+                            tracing::warn!(
+                                new_version = %new_version,
+                                "Periodic re-poll: newer version is locally blocked (crash-loop \
+                                 known-bad pin or repeated install failures); not triggering \
+                                 auto-update (#4073)"
+                            );
+                        } else {
+                            tracing::info!(
+                                new_version = %new_version,
+                                "Periodic re-poll: newer version on GitHub, triggering auto-update"
+                            );
+                            #[allow(clippy::let_underscore_must_use)]
+                            let _ = update_tx.send(new_version);
+                            return;
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        "Periodic re-poll: skipped — auto-update locked out after repeated \
+                         failed installs (#3934); run `freenet update` to recover"
+                    );
+                }
             }
         }
     });
@@ -1507,6 +1610,36 @@ mod tests {
             marker_count >= 2,
             "both systemd unit templates must set Environment=FREENET_SUPERVISED=1 \
              (#4580); found {marker_count}"
+        );
+    }
+
+    /// Source-scrape pin (#4073 / Codex P2): the periodic re-poll MUST gate on
+    /// `should_attempt_update()` so it honors the persistent auto-update failure
+    /// lockout (#3934). Without the gate, a locked-out long-running node (e.g. a
+    /// non-writable binary path that makes every install fail) would exit-42 once
+    /// per re-poll interval and make the supervisor rerun the same failing
+    /// update, reintroducing the loop the lockout exists to stop. The boot-time
+    /// startup check bypasses the lockout, but only once per restart; the
+    /// recurring re-poll must not.
+    #[test]
+    fn periodic_repoll_respects_update_lockout() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        // `should_attempt_update()` (with parens) appears only at the re-poll
+        // gate; the bare name without parens is the `use` import. The re-poll's
+        // GitHub call is the LAST `startup_update_check(...)` in the file (the
+        // first is the boot-time startup check).
+        let gate = src.find("should_attempt_update()").expect(
+            "periodic re-poll must gate on should_attempt_update() to honor the \
+             #3934 auto-update failure lockout",
+        );
+        let repoll_check = src
+            .rfind("startup_update_check(build_info::VERSION).await")
+            .expect("periodic re-poll startup_update_check call not found");
+        assert!(
+            gate < repoll_check,
+            "the should_attempt_update() lockout gate must precede the periodic \
+             re-poll's startup_update_check call, so a locked-out node does not \
+             exit-42 in a loop (#4073 / #3934)"
         );
     }
 }
