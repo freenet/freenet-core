@@ -488,12 +488,15 @@ async fn drive_client_connect_inner(
                 // there is a real "stop probing this region" signal).
                 //
                 // Below min: apply a SHORT, non-escalating backoff instead of
-                // the escalating one. This still throttles the retry cadence
-                // (so the joiner stops hammering the saturated neighborhood
-                // every fast-tick, bounding the network-wide rejection storm)
-                // but never ramps toward the 600s trap, so the under-connected
-                // node keeps probing and 2b's widened re-route can find spare
-                // capacity. Throttled refinement of the #4348 "under-min
+                // the escalating one. This still throttles THIS connect-driver
+                // retry cadence (so the joiner stops re-issuing CONNECTs into
+                // the saturated neighborhood every fast-tick, bounding the
+                // network-wide rejection storm) but never ramps toward the
+                // 600s trap, so the under-connected node keeps probing and 2b's
+                // widened re-route can find spare capacity. The maintenance
+                // loop still bypasses location backoff entirely under min via
+                // should_respect_location_backoff(); this is the connect-driver
+                // counterpart. Throttled refinement of the #4348 "under-min
                 // ignores location backoff" escape. See #4362.
                 let current_connections = op_manager.ring.connection_manager.connection_count();
                 let min_connections = op_manager.ring.connection_manager.min_connections;

@@ -274,6 +274,13 @@ impl ConnectionBackoff {
         let bucket = LocationBucket::from_location(target);
         self.inner.failure_count(&bucket)
     }
+
+    /// Get the remaining backoff for a location (for testing).
+    #[cfg(test)]
+    fn remaining_backoff(&self, target: Location) -> Option<Duration> {
+        let bucket = LocationBucket::from_location(target);
+        self.inner.remaining_backoff(&bucket)
+    }
 }
 
 #[cfg(test)]
@@ -329,23 +336,42 @@ mod tests {
     #[test]
     fn test_short_reject_backoff_never_shortens_escalated() {
         // If an escalating failure already set a long backoff, a subsequent
-        // short reject must not pull the retry time earlier.
+        // short reject must not pull the retry time earlier — this guards the
+        // `.max()` in TrackedBackoff::record_short_backoff (#4362).
         let mut backoff = ConnectionBackoff::new();
         let loc = Location::new(0.5);
 
-        // One real failure → 30s base backoff (the escalating path).
+        // One real failure → 30s base backoff (the escalating path, ±20%
+        // jitter ⇒ 24–36s remaining).
         backoff.record_failure(loc);
-        let escalated = backoff.failure_count(loc);
-        assert_eq!(escalated, 1);
+        assert_eq!(backoff.failure_count(loc), 1);
+        let escalated_remaining = backoff
+            .remaining_backoff(loc)
+            .expect("escalated failure must leave a remaining backoff");
+        assert!(
+            escalated_remaining > Duration::from_secs(20),
+            "30s base backoff should leave >20s remaining, got {escalated_remaining:?}"
+        );
 
-        // A short reject must not reset the escalating counter back down.
+        // A short reject must not reset the escalating counter…
         backoff.record_short_reject_backoff(loc);
         assert_eq!(
             backoff.failure_count(loc),
             1,
             "short reject must not touch the escalating failure count"
         );
-        assert!(backoff.is_in_backoff(loc));
+        // …and crucially must NOT shorten the ~30s remaining backoff down to
+        // the 3s short delay. Without the `.max()`, this would drop to ~3s.
+        // `is_in_backoff` alone can't catch that (true for both), so assert
+        // the remaining time stayed well above the short delay.
+        let after_short = backoff
+            .remaining_backoff(loc)
+            .expect("location must still be in backoff");
+        assert!(
+            after_short > Duration::from_secs(10),
+            "short reject wrongly shortened the escalated backoff to {after_short:?} \
+             (should have stayed near the ~30s escalation, not the 3s short delay)"
+        );
     }
 
     #[test]

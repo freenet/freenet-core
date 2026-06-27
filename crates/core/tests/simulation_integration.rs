@@ -9511,14 +9511,25 @@ fn test_bootstrap_acceptance_no_dead_zone() {
     const MIN_CONNECTIONS: usize = 4;
     const MAX_CONNECTIONS: usize = 12;
 
-    // Mid-simulation virtual-time checkpoint. By this point the broken code is
-    // still deep in the dead zone (46/100 nodes peer_ready==false at T+306s),
-    // so requiring most nodes to reach min_connections here is exactly the
-    // assertion that fails on broken code and passes once retries re-route.
+    // Early-simulation checkpoint. This is NOT a literal virtual-time bound:
+    // `created_at_ms()` decodes a transaction's ULID timestamp, which in
+    // simulation mode is GlobalSimulationTime = a fixed epoch + a counter that
+    // increments by 1 per ULID GENERATED (config.rs), not advanced by the
+    // sim's virtual clock. So this filter selects "transactions among roughly
+    // the first CHECKPOINT_MS ULIDs generated" — a monotonic GENERATION-ORDER
+    // proxy for "early in the run", whose calibration depends on ULID volume.
+    // It is sufficient here: on broken code the dead zone persists deep into
+    // the run (46/100 nodes peer_ready==false at T+306s of wall-equivalent
+    // sim), so almost no nodes reach min_connections in the early window;
+    // requiring most nodes to reach it early is exactly what fails on broken
+    // code and passes once retries re-route. The constant is named *_MS for
+    // continuity with the epoch arithmetic, not because it is literally
+    // milliseconds of virtual time.
     const CHECKPOINT_MS: u64 = 120_000;
     // Fraction of nodes that must have reached min_connections by the
     // checkpoint. Mirrors the >=90% topology-formation floor used by
-    // test_connection_growth_stall_regression.
+    // test_connection_growth_stall_regression. Measured run reaches 95/100
+    // (so the 90% floor has ~5 nodes of headroom).
     const REACHED_MIN_FRACTION: f64 = 0.90;
 
     // NOTE on connect_rejected: this test deliberately does NOT assert an upper
@@ -9535,7 +9546,8 @@ fn test_bootstrap_acceptance_no_dead_zone() {
 
     // Replicate the deterministic sim epoch derived inside
     // run_controlled_simulation so transaction ULID timestamps can be mapped
-    // back to virtual time since simulation start.
+    // back to a generation-order offset since simulation start (see the
+    // CHECKPOINT_MS note above — this is an ordering proxy, not literal time).
     const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years in ms
     let epoch_ms = BASE_EPOCH_MS + (SEED % RANGE_MS);
@@ -9607,16 +9619,16 @@ fn test_bootstrap_acceptance_no_dead_zone() {
             .count();
 
         // (b) Per-peer max open-connection count observed at any Connected
-        // event whose transaction was created at or before the virtual-time
+        // event whose transaction was created at or before the early-run
         // checkpoint. `Transaction::created_at_ms()` decodes the ULID
-        // timestamp, which in simulation mode is GlobalSimulationTime
-        // (virtual), so this is a deterministic virtual-time filter — not wall
-        // clock.
+        // timestamp (GlobalSimulationTime = epoch + per-ULID counter), so this
+        // is a deterministic GENERATION-ORDER filter — an early-run proxy, not
+        // literal virtual time (see the CHECKPOINT_MS note above).
         let checkpoint_at_ms = epoch_ms.saturating_add(CHECKPOINT_MS);
         let mut max_count_by_peer: HashMap<_, usize> = HashMap::new();
         let mut peers_seen: HashSet<_> = HashSet::new();
         for log in logs.iter() {
-            if let Some(count) = log.kind.connect_connection_count() {
+            if let Some(count) = log.kind.connect_peer_connection_count() {
                 peers_seen.insert(log.peer_id.clone());
                 if log.tx.created_at_ms() <= checkpoint_at_ms {
                     let entry = max_count_by_peer.entry(log.peer_id.clone()).or_insert(0);

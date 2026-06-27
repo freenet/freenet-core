@@ -93,17 +93,38 @@ CORRECT:
 WHY: Backing off a target for a local problem prevents connecting to it
 later when local conditions improve (e.g., more connections acquired).
 
-COROLLARY (under-min backoff escape, #4348):
-  A node still BELOW min_connections must IGNORE per-target-location
-  backoff entirely and keep probing. Its under-connection is by definition
-  a local capacity problem, so a `Rejected`-stamped 30s→600s location
-  backoff would trap a poorly-positioned node permanently below min.
-  connection_maintenance gates this via should_respect_location_backoff()
-  (honor backoff only at/above min). Storm safety is preserved by the
-  adaptive fast-tick backoff + max_concurrent cap, not by location backoff.
+COROLLARY (under-min backoff escape, #4348 + #4362 refinement):
+  A node still BELOW min_connections must not let the full escalating
+  30s→600s location backoff trap it: its under-connection is by definition
+  a local capacity problem, and a `Rejected`-stamped escalating backoff on
+  a poorly-positioned node would park it permanently below min.
 
-See: ring.rs connection_maintenance + should_respect_location_backoff,
-issues #3414, #4348
+  This plays out differently on the two paths that consult location backoff:
+
+  - MAINTENANCE loop (ring.rs connection_maintenance): IGNORES per-target
+    location backoff entirely while under min, gated by
+    should_respect_location_backoff() (honor backoff only at/above min).
+
+  - CONNECT DRIVER retry path (operations/connect/op_ctx_task.rs, #4362):
+    on a capacity `Rejected` while under min it does NOT ignore location
+    backoff entirely — it stamps a SHORT, fixed, NON-escalating reject
+    backoff (UNDER_MIN_REJECT_BACKOFF = 3s, time-bounded via TrackedBackoff::
+    record_short_backoff, which never escalates the failure count and never
+    shortens an already-longer escalated backoff). This is what provides
+    storm safety on the driver path: skipping the backoff entirely (an
+    earlier #4362 attempt) let under-min joiners re-probe every fast-tick
+    and produced a ~12x terminus-rejection storm. The short fixed pause
+    throttles the retry cadence without ramping toward the 600s trap, so the
+    joiner keeps probing and the 2b widened re-route can find spare capacity.
+
+  At/above min, BOTH paths honor the full escalating backoff (there a
+  `Rejected` is a genuine "stop probing this region" signal). On the
+  maintenance loop, storm safety under min is still the adaptive fast-tick
+  backoff + max_concurrent cap (not location backoff).
+
+See: ring.rs connection_maintenance + should_respect_location_backoff;
+operations/connect/op_ctx_task.rs Rejected arm + ConnectionBackoff::
+record_short_reject_backoff; issues #3414, #4348, #4362
 ```
 
 ### Routing Decisions

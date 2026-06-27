@@ -81,11 +81,17 @@ impl Transaction {
     }
 
     /// Milliseconds-since-Unix-epoch encoded in this transaction's ULID at
-    /// creation time. In simulation mode this is `GlobalSimulationTime`
-    /// (deterministic virtual time), so it can be used by tests to anchor a
-    /// virtual-time checkpoint against the simulation epoch. In production it
-    /// is the wall-clock creation time. Cheap and feature-independent (the
-    /// `trace-ot`-gated `started()` exposes the same value as a `SystemTime`).
+    /// creation time.
+    ///
+    /// In production this is the wall-clock creation time. In simulation mode
+    /// (`GlobalSimulationTime` set) it is a fixed epoch plus a counter that
+    /// increments by 1 per ULID GENERATED — NOT advanced by the simulation's
+    /// virtual clock. So across transactions it is a deterministic, monotonic
+    /// GENERATION-ORDER value, usable by tests as an *early-run ordering proxy*
+    /// against the simulation epoch — but it is NOT a literal virtual-time
+    /// reading, and its calibration to virtual seconds depends on ULID volume.
+    /// Cheap and feature-independent (the `trace-ot`-gated `started()` exposes
+    /// the same value as a `SystemTime`).
     pub fn created_at_ms(&self) -> u64 {
         self.id.timestamp_ms()
     }
