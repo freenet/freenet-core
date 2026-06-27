@@ -3662,6 +3662,167 @@ mod tests {
         crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
     }
 
+    /// Outbound-`send` burst coverage related to #3321 (Gap 3 of #3367): a
+    /// *burst* of consecutive UDP send failures on a live `PeerConnection`'s
+    /// public `send` path must each surface as a *transient* error and must NOT
+    /// consume/poison the connection object, and once the failures clear the
+    /// same connection must send successfully again.
+    ///
+    /// SCOPE — read this before assuming more than the test proves. This test
+    /// exercises the *outbound* entry point only:
+    /// `send` -> `outbound_short_message` -> `packet_sending().await?`, which
+    /// PROPAGATES the `SendFailed` error to the caller. It pins that this path
+    /// classifies a send-failure burst as transient and recovers. It does NOT
+    /// execute the #3321 connection-*teardown* decision: that decision lives in
+    /// the `recv()` swallow guards (`peer_connection.rs` ~1091/1186/1428, which
+    /// `continue` rather than tear down on a transient send error) and in the
+    /// `p2p_protoc.rs` listener (~3092-3108). Driving those teardown sites under
+    /// a transient send-failure burst is a separate follow-up; this test does
+    /// not run them.
+    ///
+    /// The existing `send_failure_returns_transient_error` /
+    /// `transient_send_failure_then_recovery_succeeds` /
+    /// `send_failed_kinds_classify_as_transient` tests all drive the STATELESS
+    /// `packet_sending` free function — they pin error *classification* on the
+    /// free function but never go through a real `PeerConnection`'s `send`. This
+    /// test adds that `PeerConnection::send` level of coverage via a
+    /// `FailableTestSocket`.
+    ///
+    /// What the test asserts:
+    ///   1. Each failed send returns `Err` classified as transient
+    ///      (`is_transient_send_failure()`, NOT `ConnectionClosed`), and the
+    ///      `&mut PeerConnection` is neither consumed nor poisoned — we keep
+    ///      calling `send` on the same object across the whole burst.
+    ///   2. After flipping the failure flag off, the very same connection sends
+    ///      successfully and the packet arrives on the rx side.
+    ///
+    /// If the transient-error contract regressed so that a send failure mapped
+    /// to `ConnectionClosed` (or any non-transient variant), the per-send
+    /// classification assertion below would fail before recovery is reached.
+    ///
+    /// NOTE on the swallow sites: the claim that the `recv()`-loop swallow
+    /// guards are not unit-drivable would be overstated. Site ~1091 (the
+    /// ACK-receipt `noop` send) IS drivable in principle — the
+    /// `recv_records_packet_metrics_post_authentication` test below already
+    /// builds a `PeerConnection` and drives `recv()` to completion with a
+    /// hand-crafted encrypted inbound packet, which is the same machinery a
+    /// recv-loop swallow-guard test would need. Site ~1428 is gated on the
+    /// `ack_check` interval timer, which never fires under this module's no-op
+    /// mock clock, so that one is genuinely not drivable here. A recv-loop
+    /// swallow-guard test for site ~1091 is the natural follow-up to this PR.
+    #[tokio::test]
+    async fn connection_survives_burst_of_transient_send_failures() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let time_source = SharedMockTimeSource::new();
+        let (_inbound_tx, inbound_rx) = mpsc::channel(16);
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 3).into(), 50003);
+
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+
+        // Drive the connection's outbound path through a socket whose sends we
+        // can flip to failing on demand. The rx end lets us prove a post-burst
+        // send actually leaves the connection.
+        let (sock_tx, mut sock_rx) = mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16);
+        let fail_sends = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let socket = Arc::new(FailableTestSocket::new(sock_tx, fail_sends.clone()));
+
+        let rolling_rtt_stats = crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+            remote_addr,
+            time_source.clone(),
+        );
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker,
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher,
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            remote_protoc_version: None,
+            transport_secret_key: keypair.secret,
+            congestion_controller,
+            token_bucket,
+            socket,
+            global_bandwidth: None,
+            rolling_rtt_stats,
+            time_source,
+        };
+
+        let mut conn = PeerConnection::new(remote_conn);
+
+        // Burst phase: several consecutive io::Errors hit the same live
+        // connection. Each must surface as a transient error and must NOT
+        // consume/poison `conn` — we keep reusing the same `&mut conn`.
+        const BURST: usize = 5;
+        for attempt in 0..BURST {
+            let err = conn
+                .send(b"payload".to_vec())
+                .await
+                .expect_err("send must fail while the socket is failing");
+            assert!(
+                err.is_transient_send_failure(),
+                "burst send #{attempt} must be a transient send failure so the \
+                 connection survives (#3321/#3367), got: {err:?}"
+            );
+            assert!(
+                !matches!(err, TransportError::ConnectionClosed(_)),
+                "burst send #{attempt} must NOT be ConnectionClosed — the \
+                 outbound send path must report a transient failure, not a \
+                 closed connection (#3321 classification contract)"
+            );
+        }
+        // Nothing should have reached the wire during the burst.
+        assert!(
+            sock_rx.try_recv().is_err(),
+            "no packet should leave the socket while sends are failing"
+        );
+
+        // Recovery phase: stop failing and send once more on the SAME
+        // connection object. Success + an actual packet on the rx side proves
+        // the outbound path recovered on the same `&mut conn`.
+        //
+        // Determinism note (keepalive task): `SharedMockTimeSource` inherits
+        // the default `supports_keepalive() == true`, so `PeerConnection::new`
+        // spawned a live keepalive task. Because that time source's `sleep` is
+        // a no-op, the task immediately attempted a Ping `socket.send_to`,
+        // which failed (the fail flag was still `true` at construction) and
+        // made the task `break` out and self-terminate on its first send error
+        // — BEFORE this recovery phase runs. That is why the keepalive task
+        // cannot race the `sock_rx` assertions below (it can never emit a Ping
+        // into the now-succeeding socket). If a future keepalive change makes
+        // the task survive a transient send error, this test would need an
+        // explicit drain/filter on `sock_rx` to stay deterministic.
+        fail_sends.store(false, std::sync::atomic::Ordering::Relaxed);
+        conn.send(b"payload".to_vec())
+            .await
+            .expect("send must succeed once the transient failure clears");
+        let (target, _bytes) = sock_rx
+            .try_recv()
+            .expect("the post-burst send must actually leave the connection");
+        assert_eq!(
+            target, remote_addr,
+            "recovered send must be addressed to the connected peer"
+        );
+    }
+
     /// Regression test for #4000: a Pong received for a pending keep-alive
     /// Ping must record an RTT sample, so quiet connections that never
     /// complete a stream transfer still contribute to the RTT statistics.
