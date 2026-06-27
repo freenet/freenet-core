@@ -703,6 +703,82 @@ async fn live_import_collision_skips_and_reports() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Collision handling with `overwrite=true`: re-importing the same secret key
+/// with a DIFFERENT value REPLACES the existing value (imported=1, nothing
+/// skipped), and the new value is readable via the live stack. Exercises the
+/// `X-Freenet-Import-Overwrite: true` header → `overwrite: true` event-field
+/// wiring end-to-end (the `import_bundle(overwrite=true)` core is unit-tested,
+/// but the HTTP header-to-event path was not covered live).
+#[serial_test::serial]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn live_import_overwrite_replaces_existing() -> anyhow::Result<()> {
+    let _pool = PoolSizeEnv::set(4);
+    let node = TestNode::start().await?;
+    let port = node.ws_port;
+
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+
+    const TOKEN: &str = "overwrite-key-eeeeeeeeeeeeeeeeeeee";
+    const SECRET_KEY: &[u8] = b"overwrite-secret";
+    const VALUE_OLD: &[u8] = b"the-old-value";
+    const VALUE_NEW: &[u8] = b"the-overwritten-value";
+
+    let origin = format!("http://127.0.0.1:{port}");
+
+    // First import lands the old value.
+    let bundle = build_token_bundle(&delegate_key, SECRET_KEY, VALUE_OLD, TOKEN.as_bytes()).await?;
+    let resp = http_import(
+        port,
+        bundle,
+        Some(TOKEN),
+        Some("token"),
+        false,
+        Some(&origin),
+    )
+    .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let first: ImportResponseBody = resp.json().await?;
+    assert_eq!(first.imported, 1);
+
+    // Re-import the SAME key with a NEW value and overwrite=true → replaces it.
+    let bundle = build_token_bundle(&delegate_key, SECRET_KEY, VALUE_NEW, TOKEN.as_bytes()).await?;
+    let resp = http_import(
+        port,
+        bundle,
+        Some(TOKEN),
+        Some("token"),
+        true,
+        Some(&origin),
+    )
+    .await?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let second: ImportResponseBody = resp.json().await?;
+    assert_eq!(
+        second.imported, 1,
+        "overwrite=true must re-import (replace) the colliding secret"
+    );
+    assert!(
+        second.skipped.is_empty(),
+        "overwrite=true must not report a skip"
+    );
+
+    // The live stack now returns the NEW value.
+    let mut conn = connect_plain(port).await?;
+    register_delegate(&mut conn, &delegate, &delegate_key).await?;
+    assert_eq!(
+        get_secret_via_delegate(&mut conn, &delegate_key, SECRET_KEY)
+            .await?
+            .as_deref(),
+        Some(VALUE_NEW),
+        "the overwritten secret must decrypt to the NEW plaintext via the live node"
+    );
+
+    drop(conn);
+    node.shutdown().await;
+    Ok(())
+}
+
 /// RAII guard that sets `FREENET_RUNTIME_POOL_SIZE` for the duration of a
 /// (serialized) test and restores it on drop. Safe only because these tests are
 /// `#[serial]` — no other node start overlaps the env-var window.
