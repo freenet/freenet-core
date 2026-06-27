@@ -307,16 +307,25 @@ pub struct NodeConfig {
     #[serde(skip)]
     pub(crate) governance_config_override: Option<crate::contract::governance::GovernanceConfig>,
     /// Test-only override for the placement-migration version floor
-    /// (`SUBSCRIBE_HINT_MIN_VERSION`). Simulation peers all report the current
-    /// build version, which is below the production floor until release, so the
-    /// `SubscribeHint` gate would never fire in a sim. A test that exercises the
-    /// migration cascade sets this to `Some((0,0,0))` for its own nodes, leaving
-    /// every other sim (and production) at the real floor — so the cascade is
-    /// opt-in and cannot perturb unrelated simulations.
+    /// (`SUBSCRIBE_HINT_MIN_VERSION`). The floor is consulted as
+    /// `subscribe_hint_floor_override().unwrap_or(SUBSCRIBE_HINT_MIN_VERSION)`
+    /// on both the send gate (`p2p_protoc::peer_supports_subscribe_hint`) and the
+    /// receive gate (`node::handle_pure_network_message_v1`).
     ///
-    /// `None` in production. Not cfg-gated for the same reason as
-    /// `governance_config_override`: `node::testing_impl` sets it and is compiled
-    /// unconditionally. `#[serde(skip)]`; never serialized.
+    /// In production this is `None` → the real `(0,2,80)` floor (untouched).
+    ///
+    /// In simulations the crate version is now AT/ABOVE the real floor, so a
+    /// `None` override would make the `SubscribeHint` gate fire in EVERY sim and
+    /// pile migration load onto unrelated simulations (the #4601 regression that
+    /// reddened the 500-node nightly). `SimNetwork` therefore defaults this to an
+    /// unreachable floor (`SimNetwork::SIM_MIGRATION_DISABLED_FLOOR`) — FAIL-CLOSED,
+    /// so migration is genuinely OPT-IN. A test exercising the cascade calls
+    /// `SimNetwork::enable_placement_migration`, which sets it to `Some((0,0,0))`
+    /// for its own nodes; every other sim stays off and cannot be perturbed.
+    ///
+    /// Not cfg-gated for the same reason as `governance_config_override`:
+    /// `node::testing_impl` sets it and is compiled unconditionally.
+    /// `#[serde(skip)]`; never serialized.
     #[serde(skip)]
     pub(crate) subscribe_hint_floor_override: Option<(u8, u8, u16)>,
 }

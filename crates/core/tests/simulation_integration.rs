@@ -11275,3 +11275,214 @@ fn test_no_interest_subscription_root_lease_lapses() {
         "no-interest root lease lapsed as expected"
     );
 }
+
+/// Opt-in migration-at-scale regression guard (#4601).
+///
+/// ## What this is the home for
+///
+/// The placement-migration (`SubscribeHint`) cascade is OFF by default in every
+/// simulation since #4601 (the per-node version floor defaults to an unreachable
+/// value — see `SimNetwork::SIM_MIGRATION_DISABLED_FLOOR`), so the general
+/// throughput nightlies no longer carry migration load. This test is the
+/// DEDICATED place that turns migration ON (`enable_placement_migration`) and
+/// proves its load is BOUNDED at scale — not merely that the sim completes.
+///
+/// ## The bound it asserts
+///
+/// The production subscription-renewal driver
+/// (`Ring::recover_orphaned_subscriptions`) hard-caps the number of renewal
+/// tasks it spawns per 30s recovery cycle at
+/// `Ring::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` (10), regardless of how many
+/// contracts are eligible. That per-node rate cap is the reason the renewal path
+/// is load-safe in production (prod telemetry shows real peers well under it).
+/// This test exercises the cap by hosting MANY (`NUM_CONTRACTS` = 20) contracts
+/// on one node, all of which enter the 2-minute renewal window simultaneously
+/// (they share an ~8-minute lease set at startup) so a single cycle has far more
+/// eligible contracts than the cap. It then asserts, via the per-node
+/// `max_cycle_batch` metric (the largest `attempted` count any cycle reached):
+///
+///   * (cap holds, EVERY node) `max_cycle_batch <= MAX_RECOVERY_ATTEMPTS_PER_INTERVAL`.
+///     This is the regression guard: if the spawn cap were removed, the loaded
+///     node would record `max_cycle_batch == NUM_CONTRACTS` (20) and FAIL.
+///   * (cap engaged, loaded node) `max_cycle_batch == MAX_RECOVERY_ATTEMPTS_PER_INTERVAL`.
+///     Proves demand exceeded the cap and the cap actually clipped — without
+///     this the bound above could pass vacuously on a node that never had >10
+///     eligible contracts at once.
+///
+/// ## Why migration must be ON for this to be meaningful
+///
+/// With migration ON the loaded node also nudges its closer-to-the-key neighbors
+/// to host its contracts (directed subscribes), so the run carries the real
+/// migration traffic the #4601 regression piled onto unrelated sims. The test
+/// additionally asserts at least one contract migrated onto another node, so the
+/// cascade is genuinely exercised (not silently inert).
+#[test_log::test]
+fn test_placement_migration_at_scale_renewal_load_stays_bounded() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    // Mirrors `ring::Ring::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` (private to the
+    // crate). The renewal driver breaks its spawn loop once `attempted` reaches
+    // this value, so no node may exceed it in a single 30s cycle. Frozen value;
+    // if the production constant changes, update this and the rationale above.
+    const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: u64 = 10;
+    // Hosted-on-the-loaded-node contract count. Chosen well above the cap so a
+    // single renewal-window cycle has many more eligible contracts than the cap
+    // can spawn — that is what makes the cap regression detectable.
+    const NUM_CONTRACTS: usize = 20;
+
+    // Metastable load behavior: assert across several seeds, not just one.
+    for seed in [0x4601_0001u64, 0x4601_0002, 0x4601_0003] {
+        let network_name = format!("migration-scale-{seed:x}");
+        // Leak to obtain the &'static str SimNetwork::new requires; one small
+        // allocation per seed in a test is fine (same pattern as the storm test).
+        let network_name: &'static str = Box::leak(network_name.into_boxed_str());
+        setup_deterministic_state(seed);
+
+        // 1 gateway + 8 regular nodes spread around the ring. The loaded node
+        // (node 1) sits at 0.5; the others are scattered so that for most of the
+        // hosted contracts SOME peer is strictly closer to the key than the
+        // loaded node — giving the migration cascade real targets to nudge.
+        let loaded_loc = 0.5;
+        let node_locations = vec![
+            loaded_loc, // node 1 = the loaded node
+            0.05, 0.15, 0.30, 0.42, 0.62, 0.78, 0.92,
+        ];
+        let num_nodes = node_locations.len();
+
+        let rt = create_runtime();
+        let mut sim = rt.block_on(async {
+            SimNetwork::new_with_node_locations(
+                network_name,
+                1,         // 1 gateway
+                num_nodes, // 8 regular nodes
+                10,        // ring_max_htl
+                7,         // rnd_if_htl_above
+                16,        // max_connections (room for the small mesh)
+                3,         // min_connections
+                seed,
+                &node_locations,
+            )
+            .await
+        });
+        // OPT IN to placement migration — the whole point of this test.
+        sim.enable_placement_migration();
+
+        let loaded_label = NodeLabel::node(network_name, 1);
+        let loaded_addr = sim
+            .node_address(&loaded_label)
+            .unwrap_or_else(|| panic!("loaded node has no address (seed {seed:x})"));
+
+        // Build NUM_CONTRACTS distinct contracts and host them all on the loaded
+        // node (seeded as genuinely hosted + actively subscribed at startup, so
+        // their leases all start together → they all enter the renewal window in
+        // the same cycle). A client Subscribe per contract keeps them
+        // renewal-eligible past lease expiry (path 2) so the high-demand window
+        // spans several cycles.
+        let contracts: Vec<_> = (0..NUM_CONTRACTS)
+            .map(|i| SimOperation::create_test_contract(i as u8))
+            .collect();
+        let contract_keys: Vec<_> = contracts.iter().map(|c| c.key()).collect();
+
+        let mut operations = Vec::with_capacity(NUM_CONTRACTS * 2);
+        for contract in &contracts {
+            operations.push(ScheduledOperation::new(
+                loaded_label.clone(),
+                SimOperation::SeedHostedContract {
+                    contract: contract.clone(),
+                    state: vec![1, 2, 3, 4],
+                },
+            ));
+        }
+        for contract in &contracts {
+            operations.push(ScheduledOperation::new(
+                loaded_label.clone(),
+                SimOperation::Subscribe {
+                    contract_id: *contract.key().id(),
+                },
+            ));
+        }
+
+        // Run past the 6-minute renewal-window opening (8-min lease − 2-min
+        // window) and several 30s cycles into it. 540s post-op wait gives the
+        // window-burst cycles where all NUM_CONTRACTS are eligible at once.
+        let result = sim.run_controlled_simulation(
+            seed,
+            operations,
+            Duration::from_secs(900),
+            Duration::from_secs(540),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "simulation failed (seed {seed:x}): {:?}",
+            result.turmoil_result.err()
+        );
+
+        let loaded_metrics = result.renewal_metrics_for(&loaded_addr);
+        let totals = result.aggregate_renewal_metrics();
+        tracing::info!(
+            seed = format!("{seed:x}"),
+            loaded_max_cycle_batch = loaded_metrics.max_cycle_batch,
+            loaded_wire_attempts = loaded_metrics.wire_attempts,
+            loaded_terminus = loaded_metrics.terminus_satisfied,
+            agg_max_cycle_batch = totals.max_cycle_batch,
+            agg_wire_attempts = totals.wire_attempts,
+            "migration-at-scale renewal load"
+        );
+
+        // (A) CAP HOLDS for EVERY node — the regression guard. If the per-cycle
+        // spawn cap were removed, the loaded node (with NUM_CONTRACTS eligible at
+        // once) would record max_cycle_batch == NUM_CONTRACTS > the cap.
+        for (addr, m) in &result.renewal_metrics {
+            assert!(
+                m.max_cycle_batch <= MAX_RECOVERY_ATTEMPTS_PER_INTERVAL,
+                "node {addr} spawned {} renewal tasks in a single 30s cycle (seed {seed:x}) — \
+                 exceeds the production cap MAX_RECOVERY_ATTEMPTS_PER_INTERVAL={}. The renewal \
+                 rate cap in recover_orphaned_subscriptions has regressed (#4601).",
+                m.max_cycle_batch,
+                MAX_RECOVERY_ATTEMPTS_PER_INTERVAL,
+            );
+        }
+
+        // (B) CAP ENGAGED on the loaded node — non-vacuous. With NUM_CONTRACTS
+        // (>cap) eligible simultaneously, the loaded node must have hit the cap in
+        // at least one cycle. If this is < cap the test proved nothing about the
+        // cap (demand never exceeded it), so the guard in (A) would be vacuous.
+        assert_eq!(
+            loaded_metrics.max_cycle_batch, MAX_RECOVERY_ATTEMPTS_PER_INTERVAL,
+            "loaded node never reached the renewal cap (seed {seed:x}): max_cycle_batch={}, \
+             expected exactly MAX_RECOVERY_ATTEMPTS_PER_INTERVAL={}. With {} contracts entering \
+             the renewal window together the cap must clip a cycle to exactly the cap; a lower \
+             value means the high-demand burst did not form and (A) is vacuous.",
+            loaded_metrics.max_cycle_batch, MAX_RECOVERY_ATTEMPTS_PER_INTERVAL, NUM_CONTRACTS,
+        );
+
+        // (C) MIGRATION genuinely ran — at least one hosted contract migrated
+        // onto another node via the directed-subscribe cascade. Without this the
+        // test could pass with migration silently inert (which would defeat its
+        // purpose as migration's scale home).
+        let mut migrated: Vec<(usize, usize)> = Vec::new();
+        for ci in 0..NUM_CONTRACTS {
+            // Non-loaded regular nodes are node_no 2..=num_nodes (node 1 is the
+            // loaded host; the loaded node hosting its own seeded contract is not
+            // a migration).
+            for n in 2..=num_nodes {
+                if result.is_node_hosting(&NodeLabel::node(network_name, n), &contract_keys[ci]) {
+                    migrated.push((ci, n));
+                }
+            }
+        }
+        assert!(
+            !migrated.is_empty(),
+            "placement migration was enabled but NO contract migrated off the loaded node to a \
+             closer neighbor (seed {seed:x}). Either the cascade is inert (gate regression) or \
+             the topology never let a neighbor become a migration target — the test is not \
+             exercising migration. (contract_idx, node_no) hosting pairs: {migrated:?}",
+        );
+
+        tracing::info!(
+            seed = format!("{seed:x}"),
+            migrated_pairs = migrated.len(),
+            "migration-at-scale: cap held, cap engaged, migration ran"
+        );
+    }
+}

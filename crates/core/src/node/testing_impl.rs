@@ -417,6 +417,8 @@ impl ControlledSimulationResult {
             |mut acc, m| {
                 acc.wire_attempts += m.wire_attempts;
                 acc.terminus_satisfied += m.terminus_satisfied;
+                // Per-node peak → aggregate as the max across peers.
+                acc.max_cycle_batch = acc.max_cycle_batch.max(m.max_cycle_batch);
                 acc
             },
         )
@@ -1010,11 +1012,14 @@ pub struct SimNetwork {
     /// path actually feeds the detector. See #4301.
     governance_config_override: Option<crate::contract::governance::GovernanceConfig>,
     /// Per-node placement-migration version-floor override (see
-    /// [`SimNetwork::enable_placement_migration`]). `None` leaves the production
-    /// floor, so the `SubscribeHint` cascade stays OFF in sim (its peers report a
-    /// version below the floor) — only a test that explicitly enables migration
-    /// gets the cascade. Keeps the migration feature from perturbing unrelated
-    /// simulations.
+    /// [`SimNetwork::enable_placement_migration`]). Defaults to
+    /// `Some(SIM_MIGRATION_DISABLED_FLOOR)` (an unreachable floor) so the
+    /// `SubscribeHint` cascade is FAIL-CLOSED — OFF — in every sim regardless of
+    /// build version, and only a test that explicitly calls
+    /// `enable_placement_migration` gets the cascade. This keeps migration from
+    /// perturbing unrelated simulations now that the crate version is past the
+    /// real production floor (#4601). Production is untouched: `NodeConfig::new`
+    /// sets this to `None`, which resolves to the real `SUBSCRIBE_HINT_MIN_VERSION`.
     subscribe_hint_floor_override: Option<(u8, u8, u16)>,
     /// Per-node capture slots for the live `Arc<Ring>`, populated by
     /// `run_controlled_simulation` so governance sim tests can read each
@@ -1043,6 +1048,19 @@ pub struct SimNetwork {
 impl SimNetwork {
     /// Default seed for deterministic simulation
     pub const DEFAULT_SEED: u64 = 0xDEADBEEF_CAFEBABE;
+
+    /// Placement-migration version floor that pins the `SubscribeHint` cascade
+    /// OFF for a simulation: an unreachable value above any real or simulated
+    /// crate version, so `version_supports_subscribe_hint` always returns false.
+    /// This is the per-node default for every `SimNetwork` (see `new_inner`),
+    /// making migration genuinely OPT-IN in sims; `enable_placement_migration`
+    /// lowers it to [`Self::SIM_MIGRATION_ENABLED_FLOOR`]. See #4601.
+    pub(crate) const SIM_MIGRATION_DISABLED_FLOOR: (u8, u8, u16) = (255, 255, 65535);
+
+    /// Placement-migration version floor that forces the `SubscribeHint` cascade
+    /// ON for a simulation regardless of build version (every peer's version is
+    /// `>= (0,0,0)`). Set by [`Self::enable_placement_migration`].
+    pub(crate) const SIM_MIGRATION_ENABLED_FLOOR: (u8, u8, u16) = (0, 0, 0);
 
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -1167,7 +1185,16 @@ impl SimNetwork {
             skip_convergence_wait: false,
             churn_config: None,
             governance_config_override: None,
-            subscribe_hint_floor_override: None,
+            // Fail-closed by default: pin the placement-migration (`SubscribeHint`)
+            // cascade OFF for every simulation unless a test explicitly opts in
+            // via `enable_placement_migration`. The cascade gates on the build
+            // version being `>= SUBSCRIBE_HINT_MIN_VERSION` (0.2.80); since this
+            // crate is now past that floor, a `None` override (real floor) would
+            // run migration in EVERY sim and pile directed-subscribe + renewal
+            // load onto unrelated simulations — the #4601 regression that turned
+            // the 500-node nightly red. Defaulting to an unreachable floor keeps
+            // migration genuinely opt-in, as the docs have always claimed.
+            subscribe_hint_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
             shared_rings: HashMap::new(),
             node_port_override,
         };
@@ -1298,58 +1325,53 @@ impl SimNetwork {
     }
 
     /// Enable the placement-migration (`SubscribeHint`) cascade for this
-    /// simulation by lowering the version floor to `(0,0,0)` on every node.
+    /// simulation by lowering the version floor to
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`] (`(0,0,0)`) on every node.
     ///
-    /// The cascade's default depends on the build version: peers report the
-    /// current build version, so the gate fires whenever that version is `>=`
-    /// the production `SUBSCRIBE_HINT_MIN_VERSION` (currently `(0,2,80)`). This
-    /// crate is already past that floor, so #4404 migration is ON by default in
-    /// sim now — call [`disable_placement_migration`](Self::disable_placement_migration)
-    /// to pin it OFF for a test whose premise assumes the contract stays put.
-    /// This method forces it ON regardless of build version (floor `(0,0,0)`),
-    /// for a test that specifically exercises migration; every other sim is left
-    /// untouched. Like `with_governance_config`, this patches the already-built
-    /// node/gateway configs (config_* ran during construction when the override
-    /// was still `None`).
+    /// Migration is OFF by default in every `SimNetwork` (the per-node floor
+    /// defaults to the unreachable [`Self::SIM_MIGRATION_DISABLED_FLOOR`], so the
+    /// `SubscribeHint` gate never fires — see `new_inner` and #4601). This makes
+    /// the cascade genuinely opt-in: only a test that specifically exercises
+    /// migration calls this to force it ON regardless of build version; every
+    /// other sim is left untouched and cannot be perturbed by migration load.
+    /// Like `with_governance_config`, this patches the already-built node/gateway
+    /// configs (config_* ran during construction with the disabled default).
     #[allow(dead_code)]
     pub fn enable_placement_migration(&mut self) -> &mut Self {
-        const TEST_FLOOR: (u8, u8, u16) = (0, 0, 0);
-        self.subscribe_hint_floor_override = Some(TEST_FLOOR);
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.subscribe_hint_floor_override = floor;
         for (builder, _) in self.gateways.iter_mut() {
-            builder.config.subscribe_hint_floor_override = Some(TEST_FLOOR);
+            builder.config.subscribe_hint_floor_override = floor;
         }
         for (builder, _) in self.nodes.iter_mut() {
-            builder.config.subscribe_hint_floor_override = Some(TEST_FLOOR);
+            builder.config.subscribe_hint_floor_override = floor;
         }
         self
     }
 
     /// Force the placement-migration (`SubscribeHint`) cascade OFF for this
-    /// simulation, regardless of the build version, by raising the per-node
-    /// version floor to an unreachable value `(255, 255, 65535)`.
+    /// simulation by pinning the per-node version floor to the unreachable
+    /// [`Self::SIM_MIGRATION_DISABLED_FLOOR`].
     ///
     /// The mirror of [`enable_placement_migration`](Self::enable_placement_migration).
-    /// The cascade is already OFF by default in sim *on a build below the
-    /// production `SUBSCRIBE_HINT_MIN_VERSION` floor* — but a test must not rely
-    /// on that build-version gating: when the build version reaches the floor
-    /// (e.g. on the v0.2.73 release branch, where #4404 ships active), the
-    /// default flips to ON and silently perturbs any test whose premise assumes
-    /// the contract stays put. A test that exercises relay/assembly/dead-end
-    /// mechanics (not placement) calls this to pin migration OFF at any build
-    /// version. Like `enable_placement_migration`, this patches the
-    /// already-built node/gateway configs (config_* ran during construction
-    /// when the override was still `None`).
+    /// Since #4601 the cascade is already OFF by default in every sim (the
+    /// per-node floor defaults to this same unreachable value), so this is now
+    /// belt-and-suspenders: it makes a test's "migration must stay off" premise
+    /// explicit at the call site. Calling it is harmless and recommended for
+    /// tests whose correctness depends on migration NOT running. Like
+    /// `enable_placement_migration`, this patches the already-built node/gateway
+    /// configs.
     #[allow(dead_code)]
     pub fn disable_placement_migration(&mut self) -> &mut Self {
         // Unreachable floor: no real or simulated peer version reaches it, so
         // `version_supports_subscribe_hint` always returns false → cascade off.
-        const UNREACHABLE_FLOOR: (u8, u8, u16) = (255, 255, 65535);
-        self.subscribe_hint_floor_override = Some(UNREACHABLE_FLOOR);
+        let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
+        self.subscribe_hint_floor_override = floor;
         for (builder, _) in self.gateways.iter_mut() {
-            builder.config.subscribe_hint_floor_override = Some(UNREACHABLE_FLOOR);
+            builder.config.subscribe_hint_floor_override = floor;
         }
         for (builder, _) in self.nodes.iter_mut() {
-            builder.config.subscribe_hint_floor_override = Some(UNREACHABLE_FLOOR);
+            builder.config.subscribe_hint_floor_override = floor;
         }
         self
     }
