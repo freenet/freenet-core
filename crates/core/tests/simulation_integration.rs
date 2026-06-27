@@ -9406,9 +9406,13 @@ fn test_get_reliability_diagnostic() {
         "Only {} GET outcome transactions — too few for meaningful analysis",
         total_outcomes
     );
+    // Success-rate floor raised from the catastrophic-only 0.50 to 0.90 now
+    // that #4362 is fixed: with late joiners actually joining, the measured
+    // run reaches 100% (91/91). 0.90 leaves headroom for seed-to-seed jitter
+    // while still catching a real regression.
     assert!(
-        success_rate >= 0.50,
-        "GET success rate {:.1}% is catastrophically low (below 50%). \
+        success_rate >= 0.90,
+        "GET success rate {:.1}% below 0.90 floor (#4362 fixed should keep this high). \
          {} succeeded, {} not_found, {} failures, {} timeouts out of {} total. \
          See #3570 for context.",
         success_rate * 100.0,
@@ -9420,16 +9424,20 @@ fn test_get_reliability_diagnostic() {
     );
     // Dispatch accounting (#4361): scheduled GETs that never dispatch an
     // operation silently shrink the denominator, so the success rate can
-    // look healthy while most of the test never ran. Currently 42/100
-    // dispatch: the rest are rejected with an explicit PeerNotJoined
-    // (the node had no completed transport handshake when its signal
-    // arrived — a footprint of the bootstrap acceptance collapse, #4362)
-    // and the harness does not retry. Catastrophic floor only — raise it
-    // when #4362 is fixed.
+    // look healthy while most of the test never ran. The historical floor
+    // was NUM_NODES/3 (33) because the bootstrap acceptance collapse (#4362)
+    // left ~46/100 nodes with no completed transport handshake when their
+    // GET signal arrived (rejected with PeerNotJoined, no harness retry).
+    // With #4362 fixed (joiners re-route off saturated gateways and join
+    // early under a short non-escalating reject backoff), the measured run
+    // dispatches 86/100. Floor set to 80/100 = achieved minus a ~6-node
+    // safety margin for seed-to-seed jitter; still ~2.4x the broken baseline,
+    // so it locks the fix in without being flaky.
     assert!(
-        dispatched_nodes >= NUM_NODES / 3,
+        dispatched_nodes >= NUM_NODES * 8 / 10,
         "Only {}/{} scheduled GETs dispatched an operation — the test \
-         exercised only a fraction of its workload (#4361)",
+         exercised only a fraction of its workload; the bootstrap acceptance \
+         collapse (#4362) appears to have regressed (#4361)",
         dispatched_nodes,
         NUM_NODES
     );
@@ -9465,6 +9473,188 @@ fn test_get_reliability_diagnostic() {
         success_rate * 100.0,
         nodes_with_state,
         NUM_NODES
+    );
+}
+
+/// Regression test for the bootstrap acceptance collapse (#4362).
+///
+/// Unlike `test_get_reliability_diagnostic`, which asserts on GET outcomes,
+/// this test asserts on the TOPOLOGY-FORMATION timeline so it pins the actual
+/// fix rather than a downstream symptom:
+///
+///   (a) the number of `connect_rejected` events stays far below the ~5936
+///       observed on the broken code — the terminus-rejection storm that
+///       defined the dead zone, and
+///   (b) a high fraction of nodes climb to `min_connections` early (by a
+///       mid-sim virtual-time checkpoint), proving the ~T+320s unblock moved
+///       to the front of the run.
+///
+/// Same seed/params as `test_get_reliability_diagnostic`. On the broken code
+/// the joiner stamps a 30s→600s location backoff on its own (jittered)
+/// location every time a saturated gateway neighborhood terminus-rejects it,
+/// then retries into the same wall — so the rejection count explodes and most
+/// nodes sit below `min_connections` for minutes. With the joiner-side
+/// re-route (skip the under-min location backoff + widen the target after the
+/// bounded jitter saturates), retries route toward regions with spare
+/// capacity and the floor lifts early.
+// Long-running topology test (~2min). Runs in nightly CI.
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_bootstrap_acceptance_no_dead_zone() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x3570_D1A6_0001;
+    const NETWORK_NAME: &str = "bootstrap-no-dead-zone";
+    const NUM_NODES: usize = 100;
+    const NUM_GATEWAYS: usize = 3;
+    const RING_MAX_HTL: usize = 10;
+    const MIN_CONNECTIONS: usize = 4;
+    const MAX_CONNECTIONS: usize = 12;
+
+    // Mid-simulation virtual-time checkpoint. By this point the broken code is
+    // still deep in the dead zone (46/100 nodes peer_ready==false at T+306s),
+    // so requiring most nodes to reach min_connections here is exactly the
+    // assertion that fails on broken code and passes once retries re-route.
+    const CHECKPOINT_MS: u64 = 120_000;
+    // Fraction of nodes that must have reached min_connections by the
+    // checkpoint. Mirrors the >=90% topology-formation floor used by
+    // test_connection_growth_stall_regression.
+    const REACHED_MIN_FRACTION: f64 = 0.90;
+
+    // NOTE on connect_rejected: this test deliberately does NOT assert an upper
+    // bound on the network-wide connect_rejected count. An earlier draft
+    // asserted `connect_rejected < ~5936` (the broken-code baseline), but that
+    // premise is structurally wrong. The broken code's LOW rejection count was
+    // a SYMPTOM of stuck nodes: a capacity Rejected stamped a 30s→600s location
+    // backoff and the joiner stopped retrying. The #4362 fix unblocks those
+    // nodes by letting under-min joiners keep probing (throttled by a short
+    // backoff), which inherently produces MORE connection attempts — hence MORE
+    // terminus rejections — while actually forming the topology. Rejection
+    // count therefore moves OPPOSITE to health here; the honest signal is the
+    // reach-min timeline below. The count is logged for diagnostics only.
+
+    // Replicate the deterministic sim epoch derived inside
+    // run_controlled_simulation so transaction ULID timestamps can be mapped
+    // back to virtual time since simulation start.
+    const BASE_EPOCH_MS: u64 = 1577836800000; // 2020-01-01 00:00:00 UTC
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years in ms
+    let epoch_ms = BASE_EPOCH_MS + (SEED % RANGE_MS);
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            NUM_GATEWAYS,
+            NUM_NODES,
+            RING_MAX_HTL,
+            7, // rnd_if_htl_above
+            MAX_CONNECTIONS,
+            MIN_CONNECTIONS,
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Seed one PUT so the network has real traffic, mirroring the diagnostic
+    // test. The assertions key off topology events, not the GET outcomes.
+    let contract = SimOperation::create_test_contract(0x35);
+    let contract_id = *contract.key().id();
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: vec![0x35; 64],
+            subscribe: true,
+        },
+    )];
+    for i in 0..NUM_NODES {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(600),
+        Duration::from_secs(120),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let rt = create_runtime();
+    let (connect_rejected, reached_min_by_checkpoint, total_peers_seen) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+
+        // (a) Count terminus-rejections across the whole run.
+        let connect_rejected = logs
+            .iter()
+            .filter(|log| log.kind.is_connect_rejected())
+            .count();
+
+        // (b) Per-peer max open-connection count observed at any Connected
+        // event whose transaction was created at or before the virtual-time
+        // checkpoint. `Transaction::created_at_ms()` decodes the ULID
+        // timestamp, which in simulation mode is GlobalSimulationTime
+        // (virtual), so this is a deterministic virtual-time filter — not wall
+        // clock.
+        let checkpoint_at_ms = epoch_ms.saturating_add(CHECKPOINT_MS);
+        let mut max_count_by_peer: HashMap<_, usize> = HashMap::new();
+        let mut peers_seen: HashSet<_> = HashSet::new();
+        for log in logs.iter() {
+            if let Some(count) = log.kind.connect_connection_count() {
+                peers_seen.insert(log.peer_id.clone());
+                if log.tx.created_at_ms() <= checkpoint_at_ms {
+                    let entry = max_count_by_peer.entry(log.peer_id.clone()).or_insert(0);
+                    *entry = (*entry).max(count);
+                }
+            }
+        }
+        let reached_min = max_count_by_peer
+            .values()
+            .filter(|&&c| c >= MIN_CONNECTIONS)
+            .count();
+        (connect_rejected, reached_min, peers_seen.len())
+    });
+
+    tracing::info!(
+        "=== Bootstrap acceptance timeline (#4362) ===\n\
+         connect_rejected={} (diagnostic only — NOT asserted; see note above)\n\
+         nodes reaching min_connections({}) by T+{}s: {}/{} peers seen",
+        connect_rejected,
+        MIN_CONNECTIONS,
+        CHECKPOINT_MS / 1000,
+        reached_min_by_checkpoint,
+        total_peers_seen,
+    );
+
+    // Most nodes must reach min_connections by the mid-sim checkpoint.
+    // Denominator is the full node count, so nodes that never emitted a
+    // Connected event (still wedged in the dead zone) count against the floor.
+    let required = (NUM_NODES as f64 * REACHED_MIN_FRACTION).ceil() as usize;
+    assert!(
+        reached_min_by_checkpoint >= required,
+        "only {}/{} nodes reached min_connections({}) by T+{}s (needed >= {}) — \
+         the bootstrap dead zone still parks late joiners below min (#4362)",
+        reached_min_by_checkpoint,
+        NUM_NODES,
+        MIN_CONNECTIONS,
+        CHECKPOINT_MS / 1000,
+        required,
     );
 }
 

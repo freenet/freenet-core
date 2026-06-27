@@ -212,6 +212,36 @@ impl ConnectionBackoff {
         );
     }
 
+    /// Short, non-escalating backoff applied to a target location when a
+    /// capacity `Rejected` arrives while the local node is still BELOW
+    /// `min_connections` (#4362).
+    ///
+    /// Rationale for the value: the under-min connection-maintenance loop
+    /// fast-ticks roughly once per second while bootstrapping. The previous
+    /// behaviour stamped the full escalating 30s→600s backoff here, which
+    /// trapped poorly-positioned late joiners below min for minutes (the
+    /// bootstrap dead zone). Skipping the backoff entirely (the first #4362
+    /// attempt) let the joiner re-probe every fast-tick, which DID lift the
+    /// reach-min floor but unleashed a ~12x terminus-rejection storm because
+    /// nothing throttled the retry cadence. A few seconds is the sweet spot:
+    /// long enough to skip several fast-ticks (bounding the rejection storm),
+    /// short enough that the joiner keeps probing aggressively and never falls
+    /// into the 600s trap. 3s = ~3 skipped fast-ticks per rejection.
+    const UNDER_MIN_REJECT_BACKOFF: Duration = Duration::from_secs(3);
+
+    /// Record the short, non-escalating under-min reject backoff (#4362).
+    ///
+    /// See [`UNDER_MIN_REJECT_BACKOFF`](Self::UNDER_MIN_REJECT_BACKOFF) for the
+    /// rationale. This deliberately does NOT escalate the per-location failure
+    /// count, so a node that keeps getting capacity-rejected near a saturated
+    /// gateway is throttled by a fixed few-second pause rather than ramping
+    /// toward the 10-minute cap.
+    pub fn record_short_reject_backoff(&mut self, target: Location) {
+        let bucket = LocationBucket::from_location(target);
+        self.inner
+            .record_short_backoff(bucket, Self::UNDER_MIN_REJECT_BACKOFF);
+    }
+
     /// Record a successful connection to a target location.
     ///
     /// Clears the backoff state for that location bucket.
@@ -276,6 +306,46 @@ mod tests {
 
         backoff.record_success(loc);
         assert!(!backoff.is_in_backoff(loc));
+    }
+
+    #[test]
+    fn test_short_reject_backoff_does_not_escalate() {
+        // #4362: the under-min short reject backoff must NOT increment the
+        // escalating failure counter, so a node repeatedly capacity-rejected
+        // near a saturated gateway keeps getting the same few-second pause
+        // rather than ramping toward the 600s trap.
+        let mut backoff = ConnectionBackoff::new();
+        let loc = Location::new(0.5);
+
+        for _ in 0..10 {
+            backoff.record_short_reject_backoff(loc);
+        }
+        // Failure count stays at 0 — short backoff never escalates.
+        assert_eq!(backoff.failure_count(loc), 0);
+        // It still throttles: the location is in backoff right after recording.
+        assert!(backoff.is_in_backoff(loc));
+    }
+
+    #[test]
+    fn test_short_reject_backoff_never_shortens_escalated() {
+        // If an escalating failure already set a long backoff, a subsequent
+        // short reject must not pull the retry time earlier.
+        let mut backoff = ConnectionBackoff::new();
+        let loc = Location::new(0.5);
+
+        // One real failure → 30s base backoff (the escalating path).
+        backoff.record_failure(loc);
+        let escalated = backoff.failure_count(loc);
+        assert_eq!(escalated, 1);
+
+        // A short reject must not reset the escalating counter back down.
+        backoff.record_short_reject_backoff(loc);
+        assert_eq!(
+            backoff.failure_count(loc),
+            1,
+            "short reject must not touch the escalating failure count"
+        );
+        assert!(backoff.is_in_backoff(loc));
     }
 
     #[test]

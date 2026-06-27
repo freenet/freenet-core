@@ -475,9 +475,46 @@ async fn drive_client_connect_inner(
                     desired_location = %dl,
                     "connect driver: explicit rejection from relay"
                 );
-                op_manager
-                    .ring
-                    .record_connection_failure(dl, ConnectionFailureReason::Rejected);
+                // Under min_connections a Rejected reflects the *acceptor's*
+                // capacity (a saturated gateway neighborhood), NOT a property
+                // of our desired location `dl`. Stamping the full escalating
+                // 30s→600s location backoff on `dl` (which is a jitter of our
+                // OWN location) traps late joiners that cluster near the same
+                // saturated gateways: every retry routes into the same wall and
+                // re-stamps an ever-longer backoff until the node is parked
+                // below min for minutes (the bootstrap dead zone).
+                //
+                // At/above min: keep the full escalating backoff (a Rejected
+                // there is a real "stop probing this region" signal).
+                //
+                // Below min: apply a SHORT, non-escalating backoff instead of
+                // the escalating one. This still throttles the retry cadence
+                // (so the joiner stops hammering the saturated neighborhood
+                // every fast-tick, bounding the network-wide rejection storm)
+                // but never ramps toward the 600s trap, so the under-connected
+                // node keeps probing and 2b's widened re-route can find spare
+                // capacity. Throttled refinement of the #4348 "under-min
+                // ignores location backoff" escape. See #4362.
+                let current_connections = op_manager.ring.connection_manager.connection_count();
+                let min_connections = op_manager.ring.connection_manager.min_connections;
+                if current_connections >= min_connections {
+                    op_manager
+                        .ring
+                        .record_connection_failure(dl, ConnectionFailureReason::Rejected);
+                } else {
+                    op_manager.ring.record_connection_short_reject_backoff(dl);
+                    tracing::debug!(
+                        tx = %tx,
+                        desired_location = %dl,
+                        current_connections,
+                        min_connections,
+                        "connect driver: under min_connections, applying short \
+                         non-escalating reject backoff (#4362)"
+                    );
+                }
+                // Gateway rotation backoff is UNCONDITIONAL: even under min we
+                // want the next attempt to advance to a DIFFERENT gateway so we
+                // escape the saturated neighborhood (2c).
                 {
                     let mut backoff = op_manager.gateway_backoff.lock();
                     backoff.record_failure(gateway_addr);

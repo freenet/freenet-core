@@ -694,6 +694,18 @@ impl Ring {
         backoff.record_failure_with_reason(target, reason);
     }
 
+    /// Record a short, non-escalating backoff for `target` (#4362).
+    ///
+    /// Used when a capacity `Rejected` arrives while the node is still below
+    /// `min_connections`: we want to throttle the retry cadence briefly so it
+    /// stops hammering a saturated gateway neighborhood every fast-tick,
+    /// WITHOUT stamping the escalating 30s→600s backoff that would trap the
+    /// under-connected node. See `ConnectionBackoff::record_short_reject_backoff`.
+    pub fn record_connection_short_reject_backoff(&self, target: Location) {
+        let mut backoff = self.connection_backoff.lock();
+        backoff.record_short_reject_backoff(target);
+    }
+
     /// Record a successful connection to clear backoff.
     pub fn record_connection_success(&self, target: Location) {
         let mut backoff = self.connection_backoff.lock();

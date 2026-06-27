@@ -327,6 +327,34 @@ impl EventKind {
         matches!(self, EventKind::Get(GetEvent::ResponseSent { .. }))
     }
 
+    /// Returns `true` if this is a CONNECT rejected event (a peer sent a
+    /// `Rejected` upstream for a connect request).
+    ///
+    /// Used by the bootstrap-acceptance regression test (#4362) to count how
+    /// many connect attempts were terminus-rejected during a cold-start sim.
+    pub fn is_connect_rejected(&self) -> bool {
+        matches!(self, EventKind::Connect(ConnectEvent::Rejected { .. }))
+    }
+
+    /// Returns the open-connection count a peer had immediately after a
+    /// CONNECT `Connected` event (`this_peer_connection_count`), `None` for all
+    /// other events.
+    ///
+    /// Used by the bootstrap-acceptance regression test (#4362) to chart how
+    /// quickly nodes climb toward `min_connections` during cold start.
+    // Wildcard is deliberate, mirroring `get_request_htl`: this accessor cares
+    // about exactly one variant; new variants should not require updates.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn connect_connection_count(&self) -> Option<usize> {
+        match self {
+            EventKind::Connect(ConnectEvent::Connected {
+                this_peer_connection_count,
+                ..
+            }) => Some(*this_peer_connection_count),
+            _ => None,
+        }
+    }
+
     /// Returns `true` if this is a GET request event.
     pub fn is_get_request(&self) -> bool {
         matches!(self, EventKind::Get(GetEvent::Request { .. }))

@@ -238,6 +238,36 @@ impl<K: Eq + Hash + Clone> TrackedBackoff<K> {
         self.evict_if_needed();
     }
 
+    /// Record a fixed, non-escalating short backoff for a key.
+    ///
+    /// Unlike [`record_failure`](Self::record_failure), this does NOT increment
+    /// the consecutive-failure counter, so repeated calls always apply the same
+    /// `delay` (plus ±20% jitter) rather than escalating toward the exponential
+    /// cap. Use this when a failure should briefly throttle retries WITHOUT
+    /// signalling that the target is persistently bad — e.g. a capacity
+    /// `Rejected` received while still under `min_connections`, where escalating
+    /// the per-location backoff would trap the under-connected node (#4362).
+    ///
+    /// If the key already has a longer `retry_after` pending, it is left
+    /// untouched (we never shorten an existing, more pessimistic backoff).
+    pub fn record_short_backoff(&mut self, key: K, delay: Duration) {
+        let now = Instant::now();
+        // ±20% jitter to avoid synchronized retries (thundering herd); seeded
+        // GlobalRng keeps this reproducible in simulation.
+        let jitter_factor: f64 = GlobalRng::random_range(0.8_f64..=1.2_f64);
+        let jittered = delay.mul_f64(jitter_factor);
+        let entry = self.entries.entry(key).or_insert(BackoffEntry {
+            consecutive_failures: 0,
+            last_failure: now,
+            retry_after: now,
+        });
+        entry.last_failure = now;
+        // Never shorten an already-longer backoff (e.g. an earlier escalating
+        // failure on the same bucket).
+        entry.retry_after = entry.retry_after.max(now + jittered);
+        self.evict_if_needed();
+    }
+
     /// Record a success for a key.
     ///
     /// Clears the backoff state for that key.
