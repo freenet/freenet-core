@@ -205,6 +205,16 @@ pub struct RenewalMetrics {
     /// proposal 1): the node is the body-holding subscription root, so it
     /// satisfies the renewal locally and sends no wire request.
     pub terminus_satisfied: u64,
+    /// Largest number of renewal tasks this node spawned in ANY single 30s
+    /// recovery cycle (the per-cycle batch size, `attempted`). This is the
+    /// direct, deterministic measurement of the production renewal rate cap:
+    /// `recover_orphaned_subscriptions` breaks its spawn loop once `attempted`
+    /// reaches `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` (10), so under the cap this
+    /// value can never exceed 10 no matter how many contracts are eligible. A
+    /// migration-at-scale test asserts `max_cycle_batch <= 10` per node as the
+    /// regression guard for the cap (#4601); if the cap were removed, a node
+    /// with N > 10 simultaneously-eligible contracts would record N here.
+    pub max_cycle_batch: u64,
 }
 
 static RENEWAL_METRICS_REGISTRY: LazyLock<DashMap<(String, SocketAddr), RenewalMetrics>> =
@@ -229,6 +239,21 @@ pub fn record_renewal_terminus_satisfied(peer_addr: SocketAddr) {
             .entry((network_name, peer_addr))
             .or_default()
             .terminus_satisfied += 1;
+    }
+}
+
+/// Record the number of renewal tasks spawned in one 30s recovery cycle (the
+/// per-cycle batch size), keeping the per-node running maximum. No-op outside a
+/// simulation context (no current network name). Used by the migration-at-scale
+/// test to assert the production renewal rate cap holds per node (#4601).
+pub fn record_renewal_cycle_batch(peer_addr: SocketAddr, batch_size: u64) {
+    if let Some(network_name) = get_current_network_name() {
+        let mut entry = RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default();
+        if batch_size > entry.max_cycle_batch {
+            entry.max_cycle_batch = batch_size;
+        }
     }
 }
 
@@ -261,6 +286,10 @@ pub fn aggregate_renewal_metrics(network_name: &str) -> RenewalMetrics {
         .fold(RenewalMetrics::default(), |mut acc, entry| {
             acc.wire_attempts += entry.value().wire_attempts;
             acc.terminus_satisfied += entry.value().terminus_satisfied;
+            // Aggregate as the max across peers (it is a per-node peak, not a
+            // count), so the aggregate stays meaningful as "worst single-cycle
+            // batch any node reached".
+            acc.max_cycle_batch = acc.max_cycle_batch.max(entry.value().max_cycle_batch);
             acc
         })
 }

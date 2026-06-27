@@ -2071,6 +2071,23 @@ impl Ring {
                     "Subscription renewal cycle complete"
                 );
             }
+
+            // Simulation-test observability (no-op in production — gated on a
+            // current network name, like the wire-attempt/terminus counters):
+            // record this cycle's spawn count so a migration-at-scale test can
+            // assert the per-node renewal rate cap holds (`attempted` is bounded
+            // by `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` above). Only when this
+            // cycle actually spawned renewals — a zero batch never raises the
+            // per-node max, so skip it to avoid creating empty registry entries.
+            // See #4601.
+            if attempted > 0 {
+                if let Some(addr) = ring.connection_manager.get_own_addr() {
+                    crate::ring::topology_registry::record_renewal_cycle_batch(
+                        addr,
+                        attempted as u64,
+                    );
+                }
+            }
         }
     }
 
