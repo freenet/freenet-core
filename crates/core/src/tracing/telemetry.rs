@@ -336,12 +336,22 @@ impl TelemetryReporter {
         // Cargo feature-unification with `fdev` leaked `testing` onto the shipped
         // `freenet` binary.
         //
-        // #4366 intent preserved: the integration tests under `crates/core/tests/*.rs`
-        // (operations_before_join / hosted_mode_* / in_process_restart / …) build
-        // `NodeConfig` directly without `--id`, so `is_test_environment` stays false;
-        // they still trip the `running_under_cargo_test()` signal (every cargo test
-        // binary runs from a `deps/` dir), so they continue to be suppressed and do
-        // not re-pollute the production OTLP collector.
+        // #4366 intent preserved: the IN-PROCESS integration tests under
+        // `crates/core/tests/*.rs` (operations_before_join / hosted_mode_* /
+        // in_process_restart / …) build `NodeConfig` directly without `--id`, so
+        // `is_test_environment` stays false; they still trip the
+        // `running_under_cargo_test()` signal (every cargo test binary runs from a
+        // `deps/` dir), so they continue to be suppressed and do not re-pollute the
+        // production OTLP collector.
+        //
+        // CAVEAT: that `deps/` signal only covers nodes running INSIDE the test
+        // binary. A test that spawns the real `freenet` binary as a SUBPROCESS
+        // (e.g. `crates/core/tests/persistence_roundtrip.rs`) runs it from
+        // `target/<profile>/freenet`, whose parent is not `deps/`, and without
+        // `--id` — so neither test signal fires and the subprocess would default
+        // telemetry ON. Such tests MUST pin it off explicitly with
+        // `.env("FREENET_TELEMETRY_ENABLED", "false")` (the same env this flag
+        // reads). Do not assume subprocess-spawned nodes are auto-suppressed.
         match telemetry_suppression_reason(config, cfg!(test), running_under_cargo_test()) {
             Some(TelemetrySuppression::Disabled) => {
                 tracing::info!("Telemetry reporting is disabled");
