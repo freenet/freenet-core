@@ -174,6 +174,27 @@ pub fn macos_dmg_asset_name(tag_name: &str) -> String {
     format!("Freenet-{}.dmg", version)
 }
 
+/// Outcome of [`UpdateCommand::download_and_install`] that the caller needs to
+/// drive the per-target-version install-failure gate (#4073). A plain `Ok(())`
+/// is ambiguous on macOS: the bundle path returns `Ok(())` BOTH on a real
+/// install (handled by exiting the process) and on a DMG-swap *failure* that is
+/// deliberately swallowed to avoid corrupting the signed bundle. The caller must
+/// not treat the latter as a success (which would clear the gate and let a
+/// failing DMG retry forever), so we distinguish them explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallOutcome {
+    /// A new binary/bundle was actually installed: clear the install-failure gate.
+    Installed,
+    /// The macOS DMG-swap failed and was swallowed (return `Ok` to protect the
+    /// signed bundle) — NO update was installed. Counts as an install failure so
+    /// the gate engages after the threshold, even though the process exits 0.
+    ///
+    /// Only constructed on macOS; the variant exists on all targets so the
+    /// caller's match is uniform.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    BundleSkipped,
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct UpdateCommand {
     /// Only check if an update is available without installing
@@ -360,13 +381,21 @@ impl UpdateCommand {
         // binary-level gate (bounded instead by the wrapper's own cap).
         let install_result = self.download_and_install(&latest, current_version).await;
         match &install_result {
-            Ok(()) => super::rollback::clear_install_failures(),
-            Err(_) => super::rollback::record_install_failure(latest_version),
+            Ok(InstallOutcome::Installed) => super::rollback::clear_install_failures(),
+            // A swallowed macOS bundle failure installed nothing — count it toward
+            // the gate so a persistently-failing DMG is gated after the threshold.
+            Ok(InstallOutcome::BundleSkipped) | Err(_) => {
+                super::rollback::record_install_failure(latest_version)
+            }
         }
-        install_result
+        install_result.map(|_| ())
     }
 
-    async fn download_and_install(&self, release: &Release, current_version: &str) -> Result<()> {
+    async fn download_and_install(
+        &self,
+        release: &Release,
+        current_version: &str,
+    ) -> Result<InstallOutcome> {
         // macOS DMG-swap path: when running from inside a .app bundle,
         // in-place binary replacement would invalidate the bundle's code
         // signature and Gatekeeper would refuse to launch the result on
@@ -430,7 +459,10 @@ impl UpdateCommand {
                             "Bundle update failed: {e}. Skipping update to avoid corrupting the signed bundle. Next attempt will retry."
                         );
                     }
-                    return Ok(());
+                    // No update was installed — surface as a bundle-skip so the
+                    // caller records an install failure toward the gate (#4073),
+                    // even though we exit 0 to protect the signed bundle.
+                    return Ok(InstallOutcome::BundleSkipped);
                 }
                 Err(e) => {
                     // Not in a bundle: safe to fall through to binary-
@@ -710,7 +742,7 @@ impl UpdateCommand {
             }
         }
 
-        Ok(())
+        Ok(InstallOutcome::Installed)
     }
 
     /// Download `SHA256SUMS.txt` and, when the release published it,
@@ -3630,6 +3662,34 @@ done
             "no record_update_failure may run between the checksum gate and \
              replace_binary — a checksum refusal must stay a retryable \
              OtherFailure, not a MAX_UPDATE_FAILURES lockout"
+        );
+    }
+
+    #[test]
+    fn bundle_skip_records_install_failure_not_clear() {
+        // #4073 (Codex): on macOS a swallowed DMG-swap failure returns
+        // `Ok(InstallOutcome::BundleSkipped)` (exit 0 to protect the signed
+        // bundle) — it installed NOTHING, so the caller must RECORD an
+        // install-failure toward the per-version gate, NOT clear it. Otherwise a
+        // persistently-failing DMG would retry forever. Source-scrape pin since
+        // the macOS path isn't exercised on Linux CI.
+        const SRC: &str = include_str!("update.rs");
+        let arm = SRC
+            .find("Ok(InstallOutcome::BundleSkipped)")
+            .expect("run_async must match the BundleSkipped outcome");
+        // The BundleSkipped arm must route to record_install_failure, and the
+        // ONLY clear_install_failures in the match must be on the Installed arm.
+        let after = &SRC[arm..arm + 400.min(SRC.len() - arm)];
+        assert!(
+            after.contains("record_install_failure"),
+            "the BundleSkipped outcome must record an install failure (gate), not clear it"
+        );
+        let installed = SRC
+            .find("Ok(InstallOutcome::Installed) => super::rollback::clear_install_failures()")
+            .expect("the Installed outcome must clear the install-failure gate");
+        assert!(
+            installed < arm,
+            "Installed (clear) arm precedes BundleSkipped (record) arm"
         );
     }
 
