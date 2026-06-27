@@ -397,14 +397,18 @@ async fn run_network_node_with_signals(
             "Startup update check against GitHub"
         );
         if let Some(new_version) = startup_update_check(build_info::VERSION).await {
-            // #4073: don't auto-update to a version pinned known-bad on this
-            // node by a prior crash-loop rollback (the installer would refuse it
-            // anyway; this avoids a needless restart).
-            if commands::rollback::is_version_pinned_bad(&new_version) {
+            // #4073: don't auto-update to a version that is locally BLOCKED — a
+            // crash-loop known-bad pin OR a version that has repeatedly failed to
+            // install (checksum / signature / download / extract). The installer
+            // would refuse it anyway; gating here avoids a needless exit-42
+            // restart cycle and is what stops the failed-install loop.
+            if commands::rollback::is_version_pinned_bad(&new_version)
+                || commands::rollback::is_version_install_gated(&new_version)
+            {
                 tracing::warn!(
                     new_version = %new_version,
-                    "Startup check: newer version is pinned known-bad after a crash-loop rollback; \
-                     not triggering auto-update (#4073)"
+                    "Startup check: newer version is locally blocked (crash-loop known-bad pin or \
+                     repeated install failures); not triggering auto-update (#4073)"
                 );
             } else {
                 tracing::info!(

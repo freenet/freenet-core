@@ -142,6 +142,14 @@ export {supervised_env}=1
 BACKOFF=10       # Initial backoff in seconds
 MAX_BACKOFF=300  # Maximum backoff (5 minutes)
 CONSECUTIVE_FAILURES=0
+# Give up (exit the wrapper) after this many consecutive failures, so a
+# persistently-failing node — a committed version that crash-loops, or an update
+# that never succeeds — does not thrash and poll GitHub forever. Mirrors the
+# in-process run-wrapper's WRAPPER_MAX_CONSECUTIVE_FAILURES cap (service.rs) and
+# stays well above the #4073 crash-loop rollback threshold (3) so rollback always
+# fires first. launchd's KeepAlive.SuccessfulExit=false means exit 1 is treated
+# as a failure and is NOT auto-respawned, so this is a genuine terminal stop.
+MAX_CONSECUTIVE_FAILURES=50
 PORT_CONFLICT_KILLS=0
 MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
 
@@ -155,6 +163,16 @@ MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
 # and so does not accumulate.
 log_event() {{
     logger -t freenet "$1"
+}}
+
+# Exit the wrapper loop once consecutive failures hit the cap, so a node that
+# never comes up healthy stops restarting (and stops polling GitHub) instead of
+# looping forever. Called right after each failure increment.
+give_up_if_failing() {{
+    if [ "$CONSECUTIVE_FAILURES" -ge "$MAX_CONSECUTIVE_FAILURES" ]; then
+        log_event "Giving up after $CONSECUTIVE_FAILURES consecutive failures; stopping wrapper (exit 1) for operator intervention."
+        exit 1
+    fi
 }}
 
 # Print a binary's full version identity line, e.g.
@@ -309,6 +327,7 @@ while true; do
             sleep 2
         else
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+            give_up_if_failing
             log_event "Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..."
             sleep $BACKOFF
             BACKOFF=$((BACKOFF * 2))
@@ -364,6 +383,7 @@ while true; do
             fi
         fi
         CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+        give_up_if_failing
         PORT_CONFLICT_KILLS=0
         log_event "Exited with code $EXIT_CODE, restarting after backoff..."
         sleep $BACKOFF

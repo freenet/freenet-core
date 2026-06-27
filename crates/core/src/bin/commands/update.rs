@@ -265,7 +265,7 @@ impl UpdateCommand {
             println!("Checking for updates...");
         }
 
-        let latest = get_latest_release().await?;
+        let latest = get_latest_release(self.force, self.quiet).await?;
 
         let latest_version = latest.tag_name.trim_start_matches('v');
         if !self.quiet {
@@ -292,6 +292,10 @@ impl UpdateCommand {
             // take this `AlreadyUpToDate` branch without ever touching
             // the counter (skeptical-review H1 on PR #3941).
             super::auto_update::clear_update_failures();
+            // We are at (or ahead of) the latest release, so there is no failing
+            // target install to gate anymore — clear the per-version
+            // install-failure counter too (#4073).
+            super::rollback::clear_install_failures();
             // Exit with a distinct code so the service wrapper knows no update
             // was performed and can skip the unnecessary restart.
             std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
@@ -307,21 +311,29 @@ impl UpdateCommand {
             return Ok(());
         }
 
-        // #4073 crash-loop auto-rollback: refuse to (re-)install a version that
-        // a prior crash-loop rollback pinned as known-bad on THIS node, unless
-        // the operator explicitly forces it. This is what stops the
-        // update → crash → revert → re-update loop. A strictly-newer release (a
-        // fix) is not pinned and installs normally.
-        if !self.force && rollback::is_version_pinned_bad(latest_version) {
+        // #4073: refuse to (re-)install a version that is locally BLOCKED, unless
+        // the operator explicitly forces it. Two independent reasons:
+        //   * crash-loop known-bad pin — the version installed and then
+        //     crash-looped; this stops update → crash → revert → re-update.
+        //   * install-failure gate — the version has failed to install
+        //     (checksum / signature / download / extract) too many times; this
+        //     stops detect → exit 42 → failed install → restart → re-detect.
+        // A strictly-newer release (a fix) matches neither and installs normally.
+        if !self.force
+            && (rollback::is_version_pinned_bad(latest_version)
+                || rollback::is_version_install_gated(latest_version))
+        {
             if !self.quiet {
                 println!(
-                    "Version {latest_version} is pinned as known-bad on this node after a previous \
-                     crash-loop; refusing to re-install it. Run `freenet update --force` to override."
+                    "Version {latest_version} is locally blocked on this node (crash-loop known-bad \
+                     pin or repeated install failures); refusing to (re-)install it. Run \
+                     `freenet update --force` to override."
                 );
             }
             tracing::warn!(
                 version = latest_version,
-                "Refusing to install a version pinned known-bad after crash-loop rollback (#4073)"
+                "Refusing to install a locally-blocked version (known-bad pin or install-failure \
+                 gate) (#4073)"
             );
             // Behave like 'already up to date' so a supervisor does not
             // restart-loop trying to apply the bad version: there is nothing
@@ -333,7 +345,25 @@ impl UpdateCommand {
         if !self.quiet {
             println!("Downloading update...");
         }
-        self.download_and_install(&latest, current_version).await
+        // #4073 per-target-version install-failure gate: count a failed install
+        // of this version (checksum / signature / download / extract / replace).
+        // After INSTALL_FAILURE_GATE_THRESHOLD failures of the SAME version, the
+        // node's update detection and the installer stop acting on it (see
+        // `rollback::is_version_install_gated`), which breaks the
+        // detect → exit 42 → failed install → restart loop that a bad
+        // manifest/checksum/signature would otherwise sustain indefinitely. A
+        // successful install clears the counter (we have moved forward).
+        //
+        // NOTE: on the macOS DMG-swap path `download_and_install` exits the
+        // process (EXIT_CODE_BUNDLE_UPDATE_STAGED) on success and never returns
+        // here, so the bundle path is intentionally out of scope for this
+        // binary-level gate (bounded instead by the wrapper's own cap).
+        let install_result = self.download_and_install(&latest, current_version).await;
+        match &install_result {
+            Ok(()) => super::rollback::clear_install_failures(),
+            Err(_) => super::rollback::record_install_failure(latest_version),
+        }
+        install_result
     }
 
     async fn download_and_install(&self, release: &Release, current_version: &str) -> Result<()> {
@@ -1013,7 +1043,31 @@ impl Checksums {
     }
 }
 
-async fn get_latest_release() -> Result<Release> {
+async fn get_latest_release(force: bool, quiet: bool) -> Result<Release> {
+    // Global persistent rate limit (#4073): this is the supervisor-side choke
+    // point — the on-crash / on-update `freenet update` one-shot reaches GitHub
+    // through here, and shares the same on-disk token bucket as the node's
+    // in-process `get_latest_version`. Because each `freenet update` is a fresh
+    // process, an in-memory limiter would reset on every restart and not bound a
+    // loop at all; the on-disk bucket holds the limit across restarts.
+    //
+    // `--force` (an explicit operator action) bypasses the limiter. An automated,
+    // token-denied poll exits EXIT_CODE_ALREADY_UP_TO_DATE so the supervisor
+    // treats it as "nothing to do" and backs off, rather than as a failure that
+    // would count toward any lockout.
+    if !force && !super::auto_update::try_consume_github_poll() {
+        if !quiet {
+            eprintln!(
+                "Update check rate-limited (too many recent GitHub polls); skipping this cycle. \
+                 Run `freenet update --force` to override."
+            );
+        }
+        tracing::warn!(
+            "GitHub update poll rate-limited (token bucket empty); exiting as up-to-date (#4073)"
+        );
+        std::process::exit(EXIT_CODE_ALREADY_UP_TO_DATE);
+    }
+
     let client = reqwest::Client::builder()
         .user_agent("freenet-updater")
         // Bound the request (parity with auto_update::get_latest_version). The

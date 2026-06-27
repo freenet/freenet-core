@@ -1436,6 +1436,43 @@ mod tests {
         );
     }
 
+    /// Regression for #4073 (aggregate-load bounding): the macOS wrapper's
+    /// `while true` loop must give up after a consecutive-failure cap, so a
+    /// committed version that crash-loops (or an update that never succeeds) does
+    /// not restart and poll GitHub forever. Mirrors the in-process run-wrapper's
+    /// WRAPPER_MAX_CONSECUTIVE_FAILURES cap.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_wrapper_caps_consecutive_failures() {
+        let binary_path = PathBuf::from("/usr/local/bin/freenet");
+        let script = generate_wrapper_script(&binary_path);
+
+        assert!(
+            script.contains("MAX_CONSECUTIVE_FAILURES=50"),
+            "wrapper must define a consecutive-failure cap"
+        );
+        assert!(
+            script.contains("give_up_if_failing"),
+            "wrapper must call the give-up helper to exit the loop on too many failures"
+        );
+        // The helper must actually exit (terminate the loop), not just log.
+        let helper_idx = script
+            .find("give_up_if_failing() {")
+            .expect("give_up_if_failing helper must be defined");
+        let helper_body = &script[helper_idx..];
+        let brace_end = helper_body.find("}").expect("helper body");
+        assert!(
+            helper_body[..brace_end].contains("exit 1"),
+            "give_up_if_failing must exit the wrapper (exit 1) when the cap is hit"
+        );
+        // The cap must sit above the crash-loop rollback threshold so rollback
+        // always fires first.
+        assert!(
+            super::super::rollback::ROLLBACK_CRASH_THRESHOLD < 50,
+            "wrapper cap must exceed the rollback crash threshold"
+        );
+    }
+
     /// Regression for issue #3967: on exit 43 the wrapper must self-heal a
     /// STALE ORPHAN holding the service port instead of unconditionally
     /// standing down. Standing down (`exit 0`) under launchd

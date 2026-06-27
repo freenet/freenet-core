@@ -332,6 +332,16 @@ Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
 # crash-loop cap (StartLimit*) lives in the [Unit] section above (#4551).
 RestartSec=10
+# Restart backoff (#4073): grow the inter-restart delay from RestartSec up to
+# RestartMaxDelaySec over RestartSteps restarts, so any residual crash/exit loop
+# that does NOT trip StartLimitBurst (e.g. a slow loop spaced just outside the
+# 120s burst window) still slows down instead of reconnecting to the gateway
+# every ~10s. This directly reduces gateway reconnect churn during a loop.
+# These directives require systemd >= 254; OLDER systemd silently IGNORES unknown
+# directives (they are not parse errors), so the unit degrades gracefully to the
+# fixed RestartSec=10 above.
+RestartSteps=10
+RestartMaxDelaySec=300
 # Allow 45 seconds for graceful shutdown before SIGKILL.
 # The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
 # (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
@@ -463,6 +473,16 @@ Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops. The actual
 # crash-loop cap (StartLimit*) lives in the [Unit] section above (#4551).
 RestartSec=10
+# Restart backoff (#4073): grow the inter-restart delay from RestartSec up to
+# RestartMaxDelaySec over RestartSteps restarts, so any residual crash/exit loop
+# that does NOT trip StartLimitBurst (e.g. a slow loop spaced just outside the
+# 120s burst window) still slows down instead of reconnecting to the gateway
+# every ~10s. This directly reduces gateway reconnect churn during a loop.
+# These directives require systemd >= 254; OLDER systemd silently IGNORES unknown
+# directives (they are not parse errors), so the unit degrades gracefully to the
+# fixed RestartSec=10 above.
+RestartSteps=10
+RestartMaxDelaySec=300
 # Allow 45 seconds for graceful shutdown before SIGKILL.
 # The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
 # (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
@@ -745,6 +765,42 @@ mod tests {
         );
 
         assert_start_limit_directives_are_in_unit_section("system", &unit);
+    }
+
+    #[test]
+    fn systemd_units_have_restart_backoff() {
+        // #4073: both units must add escalating restart backoff
+        // (RestartSteps + RestartMaxDelaySec) on top of RestartSec so a residual
+        // loop that doesn't trip StartLimitBurst still slows down (fewer gateway
+        // reconnects). These are systemd >= 254 directives that older systemd
+        // ignores; we only assert they are emitted in [Service].
+        let user_unit = generate_user_service_file(
+            Path::new("/usr/local/bin/freenet"),
+            Path::new("/home/test/.local/state/freenet"),
+        );
+        let system_unit = generate_system_service_file(
+            Path::new("/usr/local/bin/freenet"),
+            Path::new("/home/test/.local/state/freenet"),
+            "testuser",
+            Path::new("/home/test"),
+        );
+        for (name, unit) in [("user", &user_unit), ("system", &system_unit)] {
+            let service = section(unit, "Service");
+            assert!(
+                service.lines().any(|l| l.trim() == "RestartSec=10"),
+                "{name} unit must keep the base RestartSec"
+            );
+            assert!(
+                service.lines().any(|l| l.trim() == "RestartSteps=10"),
+                "{name} unit must emit RestartSteps in [Service]"
+            );
+            assert!(
+                service
+                    .lines()
+                    .any(|l| l.trim() == "RestartMaxDelaySec=300"),
+                "{name} unit must emit RestartMaxDelaySec in [Service]"
+            );
+        }
     }
 
     #[test]

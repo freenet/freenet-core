@@ -252,17 +252,21 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
             };
 
             if latest_ver > current {
-                // #4073 crash-loop auto-rollback: never trigger an exit-42
-                // update to a version pinned known-bad on this node by a prior
-                // rollback. The installer would refuse it anyway; skipping here
-                // also avoids a pointless restart cycle. The mismatch flag is
-                // kept (Skipped) so a later, strictly-newer fixed release is
-                // still picked up.
-                if super::rollback::is_version_pinned_bad(&latest) {
+                // #4073: never trigger an exit-42 update to a version that is
+                // locally BLOCKED — either pinned known-bad by a prior crash-loop
+                // rollback, OR gated after repeatedly failing to install (checksum
+                // / signature / download / extract). In both cases the installer
+                // would refuse it anyway, so emitting exit 42 only produces a
+                // pointless restart cycle. The mismatch flag is kept (handled like
+                // the pin) so a later, strictly-newer fixed release is still
+                // picked up.
+                if super::rollback::is_version_pinned_bad(&latest)
+                    || super::rollback::is_version_install_gated(&latest)
+                {
                     tracing::warn!(
                         version = %latest,
-                        "Newer version is pinned known-bad after a crash-loop rollback; not \
-                         triggering auto-update to it (#4073)"
+                        "Newer version is locally blocked (crash-loop known-bad pin or repeated \
+                         install failures); not triggering auto-update to it (#4073)"
                     );
                     // Distinct result (NOT Skipped) so the caller clears the
                     // driving signal and does not fall through to the legacy
@@ -317,6 +321,17 @@ pub async fn check_if_update_available(current_version: &str) -> UpdateCheckResu
 
 /// Fetch the latest version string from GitHub releases API.
 async fn get_latest_version() -> Result<String> {
+    // Global persistent rate limit (#4073): refuse to hit GitHub when the shared
+    // token bucket is empty. This is the in-node choke point (the node's startup
+    // check, the #4589 re-poll, and the peer-signal loop all reach GitHub through
+    // here); the supervisor-side `freenet update` is bounded by the same bucket
+    // at `get_latest_release`. A denied poll returns Err so the caller
+    // (`check_if_update_available`) treats it as `Skipped` and retries later —
+    // the node keeps running, it just does not poll GitHub this tick.
+    if !try_consume_github_poll() {
+        anyhow::bail!("GitHub update poll rate-limited (token bucket empty); will retry later");
+    }
+
     let client = reqwest::Client::builder()
         .user_agent("freenet-updater")
         .timeout(Duration::from_secs(10))
@@ -456,6 +471,197 @@ pub fn clear_update_failures() {
 /// explicit directory.
 pub(crate) fn clear_update_failures_at(dir: &std::path::Path) {
     let _rm = fs::remove_file(dir.join("update_failures"));
+}
+
+// ── Global persistent GitHub-poll rate limit (token bucket) ────────────────
+//
+// Issue #4073 aggregate-load bounding: every GitHub release poll — the startup
+// check, the #4589 re-poll, the peer-signal `check_if_update_available` loop,
+// AND the supervisor-invoked one-shot `freenet update` — funnels through a
+// SINGLE on-disk token bucket so that no combination of restarts, peer signals,
+// or repeated failed installs can make one node hammer the GitHub REST API.
+//
+// The bucket is persisted in `state_dir()` (not in memory) precisely so the
+// fresh, short-lived `freenet update` process honours the same limit across
+// restarts: an in-memory limiter would reset to full on every relaunch and so
+// would not bound a restart loop at all.
+//
+// Capacity / refill are tuned so NORMAL operation never trips the limit while a
+// runaway loop is firmly capped:
+//   * Normal load is tiny: ~1 boot poll + the staggered re-poll (a few times a
+//     day) + the occasional real install. That is far below the capacity, and
+//     each consumed token refills within ~10 min.
+//   * A runaway loop (e.g. a release whose install always fails the checksum /
+//     signature gate, so the node re-detects → exit 42 → `freenet update` →
+//     fails → restart → re-detect …) is bounded to roughly one token per
+//     [`GITHUB_POLL_REFILL_SECS`] once the initial capacity is drained, i.e.
+//     ~6 GitHub calls/hour/node regardless of how fast it restarts.
+//
+// Capacity is set a little above the number of polls the per-target-version
+// install-failure gate (`rollback::is_version_install_gated`) needs to engage
+// (3 failed installs, each cycle costing a node poll + an install poll). That
+// guarantees the gate — which is what actually STOPS the restart loop — reaches
+// its threshold before the bucket would starve the install path, after which
+// the node stops emitting exit 42 entirely and the bucket only has to absorb a
+// brief residual.
+
+/// Maximum number of GitHub release polls that can be made in a burst before the
+/// refill rate takes over. Comfortably above a real detect→install burst and
+/// above the ~6 polls the install-failure gate needs to engage, yet far below
+/// any rate that would matter to GitHub.
+pub(crate) const GITHUB_POLL_BUCKET_CAPACITY: f64 = 8.0;
+
+/// Refill interval: one token returns every ~10 minutes, so the sustained poll
+/// rate of any loop is capped at ~6 GitHub REST calls/hour/node.
+pub(crate) const GITHUB_POLL_REFILL_SECS: f64 = 600.0;
+
+/// On-disk bucket file (plain text: `"<tokens> <updated_unix>"`).
+const GITHUB_POLL_BUCKET_FILE: &str = "github_poll_bucket";
+
+/// Token-bucket state persisted across processes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GithubPollBucket {
+    pub tokens: f64,
+    pub updated_unix: u64,
+}
+
+/// How an on-disk bucket read resolved. Distinguishes a legitimately-absent
+/// bucket (first boot) from a corrupt/torn one so they can be handled
+/// differently: missing initialises to a full bucket (so the first real poll is
+/// never blocked), whereas corrupt is treated conservatively (deny) so a torn
+/// write cannot be used to reset the limiter to full.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BucketRead {
+    Missing,
+    Corrupt,
+    Present(GithubPollBucket),
+}
+
+/// Seconds since the Unix epoch (wall clock). The bucket only needs elapsed
+/// real time between polls; tests inject `now_unix` directly into the pure
+/// helpers below rather than relying on this.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Pure token-bucket step. Refills `prev` for the elapsed time, then attempts to
+/// spend one token. `prev == None` means "no prior state" and starts from a full
+/// bucket so a fresh node's first poll is always allowed. Returns the new state
+/// and whether a token was spent (the poll is allowed).
+fn github_poll_bucket_step(
+    prev: Option<GithubPollBucket>,
+    now_unix: u64,
+    capacity: f64,
+    refill_secs: f64,
+) -> (GithubPollBucket, bool) {
+    let mut tokens = match prev {
+        Some(s) => {
+            // saturating_sub guards against a backwards clock (suspend/resume,
+            // NTP step): a negative elapsed becomes 0 refill, never a credit.
+            let elapsed = now_unix.saturating_sub(s.updated_unix) as f64;
+            (s.tokens + elapsed / refill_secs).min(capacity)
+        }
+        None => capacity,
+    };
+    if tokens >= 1.0 {
+        tokens -= 1.0;
+        (
+            GithubPollBucket {
+                tokens,
+                updated_unix: now_unix,
+            },
+            true,
+        )
+    } else {
+        (
+            GithubPollBucket {
+                tokens,
+                updated_unix: now_unix,
+            },
+            false,
+        )
+    }
+}
+
+fn read_github_poll_bucket_at(dir: &std::path::Path) -> BucketRead {
+    match fs::read_to_string(dir.join(GITHUB_POLL_BUCKET_FILE)) {
+        Ok(raw) => {
+            let mut it = raw.split_whitespace();
+            match (
+                it.next().and_then(|t| t.parse::<f64>().ok()),
+                it.next().and_then(|t| t.parse::<u64>().ok()),
+            ) {
+                // Reject non-finite / negative token counts as corrupt: a NaN
+                // would make every comparison false and could be abused to
+                // bypass the limiter.
+                (Some(tokens), Some(updated_unix)) if tokens.is_finite() && tokens >= 0.0 => {
+                    BucketRead::Present(GithubPollBucket {
+                        tokens,
+                        updated_unix,
+                    })
+                }
+                _ => BucketRead::Corrupt,
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BucketRead::Missing,
+        // Any other read error (permissions, etc.) is treated as corrupt =>
+        // deny, conservatively, rather than granting a free poll.
+        Err(_) => BucketRead::Corrupt,
+    }
+}
+
+fn write_github_poll_bucket_at(dir: &std::path::Path, bucket: &GithubPollBucket) {
+    let _mkdir = fs::create_dir_all(dir);
+    let _write = fs::write(
+        dir.join(GITHUB_POLL_BUCKET_FILE),
+        format!("{} {}", bucket.tokens, bucket.updated_unix),
+    );
+}
+
+/// Try to consume one GitHub-poll token from the on-disk bucket in `dir`.
+/// Returns `true` if a poll is permitted (token spent), `false` if rate-limited.
+pub(crate) fn try_consume_github_poll_at(dir: &std::path::Path, now_unix: u64) -> bool {
+    let prev = match read_github_poll_bucket_at(dir) {
+        BucketRead::Present(s) => Some(s),
+        BucketRead::Missing => None,
+        BucketRead::Corrupt => {
+            // Deny this poll, and rewrite an empty bucket dated now so the
+            // limiter self-heals (a token trickles back after the refill
+            // interval) without ever granting a free token from the corrupt
+            // state. This makes a corrupt/torn bucket fail closed.
+            write_github_poll_bucket_at(
+                dir,
+                &GithubPollBucket {
+                    tokens: 0.0,
+                    updated_unix: now_unix,
+                },
+            );
+            return false;
+        }
+    };
+    let (next, allowed) = github_poll_bucket_step(
+        prev,
+        now_unix,
+        GITHUB_POLL_BUCKET_CAPACITY,
+        GITHUB_POLL_REFILL_SECS,
+    );
+    write_github_poll_bucket_at(dir, &next);
+    allowed
+}
+
+/// Try to consume one GitHub-poll token from the global persistent bucket.
+///
+/// Returns `false` (deny) when the state directory cannot be resolved — with
+/// nowhere to persist the bucket we cannot bound a loop, so denying is the safe
+/// choice (mirrors [`should_attempt_update`]'s `unwrap_or(false)`).
+pub(crate) fn try_consume_github_poll() -> bool {
+    match state_dir() {
+        Some(dir) => try_consume_github_poll_at(&dir, now_unix()),
+        None => false,
+    }
 }
 
 /// Check if we should attempt an update based on failure history.
@@ -992,6 +1198,180 @@ mod tests {
             code_only.contains("tracing::warn!"),
             "the auto-update lockout skip must log at warn! level so a permanent \
              lockout is diagnosable (#4580), not silently dropped at debug!"
+        );
+    }
+
+    #[test]
+    fn test_github_poll_bucket_allows_initial_burst_then_caps() {
+        // Fresh (missing) bucket starts full: the first CAPACITY polls at the
+        // same instant are allowed, the next is denied (token-bucket cap).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = 1_000_000u64;
+
+        let cap = GITHUB_POLL_BUCKET_CAPACITY as u64;
+        for i in 0..cap {
+            assert!(
+                try_consume_github_poll_at(dir, now),
+                "poll {i} within capacity must be allowed"
+            );
+        }
+        assert!(
+            !try_consume_github_poll_at(dir, now),
+            "poll beyond capacity at the same instant must be denied"
+        );
+    }
+
+    #[test]
+    fn test_github_poll_bucket_refills_over_time() {
+        // After draining, one token returns per refill interval (and no more).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut now = 2_000_000u64;
+
+        let cap = GITHUB_POLL_BUCKET_CAPACITY as u64;
+        for _ in 0..cap {
+            assert!(try_consume_github_poll_at(dir, now));
+        }
+        assert!(!try_consume_github_poll_at(dir, now), "drained");
+
+        // Half a refill interval: still not enough for a whole token.
+        now += (GITHUB_POLL_REFILL_SECS as u64) / 2;
+        assert!(
+            !try_consume_github_poll_at(dir, now),
+            "half a refill interval is < 1 token"
+        );
+
+        // A full refill interval from the last write: exactly one token back.
+        now += GITHUB_POLL_REFILL_SECS as u64;
+        assert!(
+            try_consume_github_poll_at(dir, now),
+            "one refill interval should grant exactly one token"
+        );
+        assert!(
+            !try_consume_github_poll_at(dir, now),
+            "only one token should have refilled"
+        );
+    }
+
+    #[test]
+    fn test_github_poll_bucket_refill_is_capped_at_capacity() {
+        // A long idle period cannot accumulate more than CAPACITY tokens (no
+        // unbounded credit that would let a later burst exceed the cap).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = 3_000_000u64;
+
+        // Seed an empty bucket, then jump far into the future.
+        write_github_poll_bucket_at(
+            dir,
+            &GithubPollBucket {
+                tokens: 0.0,
+                updated_unix: now,
+            },
+        );
+        let far_future = now + (GITHUB_POLL_REFILL_SECS as u64) * 10_000;
+
+        let cap = GITHUB_POLL_BUCKET_CAPACITY as u64;
+        for _ in 0..cap {
+            assert!(try_consume_github_poll_at(dir, far_future));
+        }
+        assert!(
+            !try_consume_github_poll_at(dir, far_future),
+            "refill must be capped at CAPACITY regardless of idle time"
+        );
+    }
+
+    #[test]
+    fn test_github_poll_bucket_denies_on_corrupt_file() {
+        // A corrupt/unparseable bucket must FAIL CLOSED (deny) so a torn write
+        // cannot be used to reset the limiter to full and bypass it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join(GITHUB_POLL_BUCKET_FILE), "not-a-bucket").unwrap();
+
+        assert!(
+            !try_consume_github_poll_at(dir, 4_000_000),
+            "corrupt bucket must deny the poll"
+        );
+
+        // And it self-heals to an empty-but-valid bucket: a poll one refill
+        // interval later is allowed again (never a free token from the corrupt
+        // state).
+        assert!(matches!(
+            read_github_poll_bucket_at(dir),
+            BucketRead::Present(_)
+        ));
+        assert!(try_consume_github_poll_at(
+            dir,
+            4_000_000 + GITHUB_POLL_REFILL_SECS as u64
+        ));
+    }
+
+    #[test]
+    fn test_github_poll_bucket_nan_and_negative_are_corrupt() {
+        // Non-finite / negative token counts must be rejected as corrupt rather
+        // than trusted (a NaN compares false everywhere and could bypass the cap).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for bad in ["NaN 100", "inf 100", "-1 100", "5", "5 notanint"] {
+            std::fs::write(dir.join(GITHUB_POLL_BUCKET_FILE), bad).unwrap();
+            assert_eq!(
+                read_github_poll_bucket_at(dir),
+                BucketRead::Corrupt,
+                "{bad:?} must read as corrupt"
+            );
+        }
+    }
+
+    #[test]
+    fn test_github_poll_bucket_backwards_clock_gives_no_credit() {
+        // A backwards clock (suspend/resume, NTP step) must never credit tokens.
+        let prev = GithubPollBucket {
+            tokens: 0.0,
+            updated_unix: 5_000_000,
+        };
+        let (next, allowed) = github_poll_bucket_step(
+            Some(prev),
+            4_000_000, // earlier than updated_unix
+            GITHUB_POLL_BUCKET_CAPACITY,
+            GITHUB_POLL_REFILL_SECS,
+        );
+        assert!(
+            !allowed,
+            "no token should be available after a backwards clock"
+        );
+        assert_eq!(next.tokens, 0.0, "no negative-time credit");
+    }
+
+    #[test]
+    fn test_github_poll_bucket_missing_is_full_not_denied() {
+        // Regression guard: a legitimately-absent bucket (first boot) must NOT be
+        // treated like a corrupt one — the first real poll has to go through, or
+        // a fresh node could never detect an update.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert_eq!(read_github_poll_bucket_at(dir), BucketRead::Missing);
+        assert!(
+            try_consume_github_poll_at(dir, 6_000_000),
+            "first poll on a fresh node must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_get_latest_version_consults_rate_limit_bucket() {
+        // Source pin: the in-node GitHub fetch MUST gate on the persistent token
+        // bucket at its top, or the loop's GitHub spam is unbounded again (#4073).
+        let src = include_str!("auto_update.rs");
+        let (_, body) = src
+            .split_once("async fn get_latest_version() -> Result<String> {")
+            .expect("get_latest_version definition not found");
+        let (head, _) = body
+            .split_once("reqwest::Client::builder()")
+            .expect("client builder not found");
+        assert!(
+            head.contains("try_consume_github_poll()"),
+            "get_latest_version must consume a rate-limit token before hitting GitHub"
         );
     }
 
