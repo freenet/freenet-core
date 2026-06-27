@@ -36,6 +36,46 @@ const FREENET_RELEASE_PUBKEY: [u8; 32] = [
     0x64, 0xd3, 0x34, 0x7f, 0xe8, 0x20, 0x74, 0xd9, 0x2b, 0x1e, 0x4b, 0xc6, 0x33, 0x6f, 0x86, 0x64,
 ];
 
+/// Ed25519 public key (raw 32-byte, little-endian compressed point) reserved
+/// as the OFFLINE backup / key-revocation key.
+///
+/// Unlike [`FREENET_RELEASE_PUBKEY`], whose private half lives in the
+/// `FREENET_RELEASE_SIGNING_KEY` CI secret, the private half of THIS key is
+/// kept strictly offline — never in CI, GitHub Actions secrets, or any
+/// online system. Its sole purpose is to authorize a key-revocation message
+/// in the event the online release-signing key is ever compromised, so a
+/// recovery is possible without trusting the (potentially stolen) release key.
+///
+/// RESERVED — there is intentionally NO verification mechanism wired up yet.
+/// The code that fetches and verifies a revocation message signed by this key
+/// is future work, deferred to ride the signed-policy-over-Freenet delivery
+/// layer (see the auto-update epic #4073). The key MUST nevertheless be baked
+/// into the binary NOW: a revocation can only ever be honored by a peer whose
+/// build already carries the key to verify it against. A key added in a later
+/// release cannot protect binaries that shipped before it, which is exactly
+/// the population a compromise-recovery needs to reach. Hence it is shipped
+/// ahead of the mechanism, deliberately.
+///
+/// The hex form (pinned by `revocation_pubkey_matches_published_hex`) is:
+/// `c93f086b6be206867b65a05592a22146ea72147270d1b356bc368455d13d3722`.
+//
+// This is a `#[used] static`, NOT a `const`, on purpose. A `const` has no
+// storage of its own — it is inlined at each use site — so a `const` that no
+// runtime path references (only the pin test does) contributes ZERO bytes to
+// the release binary. That would defeat the entire point of this key: it has
+// to physically ship in the artifact NOW so a future revocation can be
+// honored by binaries already in the field. `#[used]` forces the bytes into
+// the object file AND retains them against linker dead-code elimination
+// (`--gc-sections`) even though nothing reads the key yet. `#[used]` also
+// marks the item as used, so no dead_code warning is emitted. Verified: with
+// a plain `const` the 32 key bytes are absent from `target/.../freenet`; as a
+// `#[used] static` they are present.
+#[used]
+static FREENET_REVOCATION_PUBKEY: [u8; 32] = [
+    0xc9, 0x3f, 0x08, 0x6b, 0x6b, 0xe2, 0x06, 0x86, 0x7b, 0x65, 0xa0, 0x55, 0x92, 0xa2, 0x21, 0x46,
+    0xea, 0x72, 0x14, 0x72, 0x70, 0xd1, 0xb3, 0x56, 0xbc, 0x36, 0x84, 0x55, 0xd1, 0x3d, 0x37, 0x22,
+];
+
 /// Whether a release MUST carry a valid `SHA256SUMS.txt.sig` for the install
 /// to proceed.
 ///
@@ -3874,6 +3914,24 @@ done
         // Must be a valid ed25519 point, or verification could never succeed.
         ed25519_dalek::VerifyingKey::from_bytes(&FREENET_RELEASE_PUBKEY)
             .expect("baked-in release public key must be a valid ed25519 point");
+    }
+
+    #[test]
+    fn revocation_pubkey_matches_published_hex() {
+        // Pins the reserved offline backup/revocation key to its documented
+        // hex. This both locks the value (a copy-paste slip would otherwise be
+        // silent, since no runtime path references the key yet) and "uses" the
+        // const so it carries the reserved key without a dead_code warning.
+        // The verification mechanism is deferred; see the doc comment on
+        // FREENET_REVOCATION_PUBKEY and the auto-update epic #4073.
+        let expected =
+            hex::decode("c93f086b6be206867b65a05592a22146ea72147270d1b356bc368455d13d3722")
+                .unwrap();
+        assert_eq!(FREENET_REVOCATION_PUBKEY.as_slice(), expected.as_slice());
+        // Must be a valid ed25519 point, or a future revocation message could
+        // never be verified against it.
+        ed25519_dalek::VerifyingKey::from_bytes(&FREENET_REVOCATION_PUBKEY)
+            .expect("baked-in revocation public key must be a valid ed25519 point");
     }
 
     #[test]

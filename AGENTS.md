@@ -285,6 +285,24 @@ without cutting a release, run `cross-compile.yml` via `workflow_dispatch` and
 check the `verify-signing-key` job. The full prerequisites table (including the
 two-release `REQUIRE_RELEASE_SIGNATURE` transition) is in `docs/RELEASING.md`.
 
+### Reserved offline revocation key (`FREENET_REVOCATION_PUBKEY`)
+
+A second ed25519 public key, `FREENET_REVOCATION_PUBKEY`, is baked into the
+binary alongside `FREENET_RELEASE_PUBKEY` but serves a different purpose: it is
+the OFFLINE backup / key-revocation key. Its private half is kept strictly
+offline (never in CI or GitHub secrets, unlike `FREENET_RELEASE_SIGNING_KEY`),
+so it can authorize a key-revocation message even if the online release-signing
+key is compromised. It is RESERVED — the mechanism to fetch and verify a
+revocation message signed by it is deferred to the future signed-policy-over-
+Freenet delivery layer (auto-update epic #4073). It must nevertheless be shipped
+now: a revocation can only be honored by peers whose binary already carries the
+key, so it cannot be retrofitted into already-released builds. The value is
+pinned by the `revocation_pubkey_matches_published_hex` test in `update.rs`.
+It is declared as a `#[used] static` (NOT a `const`) on purpose: a `const`
+with no runtime reader is inlined to nothing and would be absent from the
+shipped binary, defeating the bake-in. Do not "simplify" it to a `const`
+until a runtime path actually reads it.
+
 ## Delegate secrets-at-rest
 
 Operator-facing documentation (encryption model, migration matrix,
