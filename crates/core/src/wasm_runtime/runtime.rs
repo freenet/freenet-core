@@ -305,6 +305,49 @@ impl Runtime {
         super::secret_export::export_bundle(&self.secret_store, scope, material)
     }
 
+    /// Import secrets from an encrypted [`super::secret_export`] bundle into this
+    /// runtime's secrets store at `target_scope` (the live counterpart of the
+    /// offline `freenet secrets import` CLI — but without stopping the node,
+    /// P3-live of #4592).
+    ///
+    /// The MUTATING analogue of [`Self::export_secret_bundle`], and the ONLY
+    /// route to the `pub(super) secret_store` for a write from outside the
+    /// `wasm_runtime` module (the executor lives in a different module tree and
+    /// cannot touch the field directly, so it wraps secret access in `Runtime`
+    /// methods exactly as `register_delegate` / `export_secret_bundle` do).
+    ///
+    /// All-or-nothing on the KEY: [`super::secret_export::import_bundle`] calls
+    /// `open_bundle` (which decrypts the WHOLE bundle and authenticates it)
+    /// BEFORE any write, so a wrong key / corrupt bundle returns an error with
+    /// NOTHING written. Plaintext exists only in the `Zeroizing` buffers inside
+    /// `import_bundle`; the re-encrypted-at-rest blobs are written under this
+    /// node's per-delegate DEK.
+    ///
+    /// PERFORMANCE: this decrypts every entry AND writes each to disk (one ReDb
+    /// index update + one file per secret), synchronously. The live-import caller
+    /// (`RuntimePool::import_secrets`) runs it ON the contract loop (serialized
+    /// with delegate `store_secret`) — DELIBERATELY on-loop, because the import
+    /// WRITES and the store write path assumes node-wide write serialization
+    /// (running it off-loop would let it race another writer on the same secret
+    /// file). The loop-block is acceptable: the endpoint is loopback +
+    /// dashboard-gated (a one-shot operator migration), not the authenticated-
+    /// remote DoS surface that justified moving the read-only EXPORT off-loop.
+    pub(crate) fn import_secret_bundle(
+        &mut self,
+        bundle: &[u8],
+        material: &super::secret_export::BundleKeyMaterial<'_>,
+        target_scope: &super::secret_export::TargetScope,
+        overwrite: bool,
+    ) -> Result<super::secret_export::ImportReport, super::secret_export::ExportError> {
+        super::secret_export::import_bundle(
+            &mut self.secret_store,
+            bundle,
+            material,
+            target_scope,
+            overwrite,
+        )
+    }
+
     pub fn build_with_config(
         contract_store: ContractStore,
         delegate_store: DelegateStore,

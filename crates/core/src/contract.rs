@@ -24,10 +24,11 @@ pub(crate) use executor::{
 // Re-export CRDT emulation functions for testing
 pub use executor::mock_runtime::{clear_crdt_contracts, is_crdt_contract, register_crdt_contract};
 pub(crate) use handler::{
-    ClientResponsesReceiver, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
-    ContractHandlerEvent, NetworkContractHandler, RedactedToken, SenderHalve, SessionMessage,
-    StashedResponder, StoreResponse, WaitingResolution, WaitingTransaction,
-    client_responses_channel, contract_handler_channel,
+    BundleKeyKind, ClientResponsesReceiver, ClientResponsesSender, ContractHandler,
+    ContractHandlerChannel, ContractHandlerEvent, ImportBundle, ImportTargetScope,
+    NetworkContractHandler, RedactedToken, SenderHalve, SessionMessage, StashedResponder,
+    StoreResponse, WaitingResolution, WaitingTransaction, client_responses_channel,
+    contract_handler_channel,
     in_memory::{
         MemoryContractHandler, MockWasmContractHandler, MockWasmHandlerBuilder,
         SimulationContractHandler, SimulationHandlerBuilder,
@@ -1318,6 +1319,34 @@ where
     }
 }
 
+/// Send an `ImportSecretsResponse` to a still-waiting client inline (the
+/// rejection paths: no deferral ctx, busy, unsupported). Logs at debug if the
+/// client already disconnected. The import mirror of
+/// [`send_export_response_inline`] (#4592).
+async fn send_import_response_inline<CH>(
+    contract_handler: &mut CH,
+    id: handler::EventId,
+    result: Result<crate::wasm_runtime::secret_export::ImportReport, ExecutorError>,
+) where
+    CH: ContractHandler + Send + 'static,
+{
+    if let Err(error) = contract_handler
+        .channel()
+        .send_to_sender(id, ContractHandlerEvent::ImportSecretsResponse(result))
+        .await
+    {
+        tracing::debug!(
+            error = %error,
+            "Failed to send IMPORT response (client may have disconnected)"
+        );
+    }
+}
+
+/// Handle a completed off-loop import (#4592): return/replace the executor in the
+/// pool and answer the parked client. Runs ON the loop (the pool return needs
+/// `&mut contract_handler`), but the work is just a pool slot-return + a oneshot
+/// send — microseconds, never the import itself. Mirror of
+/// [`handle_export_resume`].
 async fn handle_deferred_resume<CH>(
     contract_handler: &mut CH,
     deferral_ctx: &mut DeferralCtx,
@@ -1838,6 +1867,10 @@ async fn send_queue_full_response(
         ContractHandlerEvent::ExportUserSecrets { .. } => {
             ContractHandlerEvent::ExportUserSecretsResponse(Err(make_err()))
         }
+        // Import likewise has a typed response variant the HTTP handler awaits.
+        ContractHandlerEvent::ImportSecrets { .. } => {
+            ContractHandlerEvent::ImportSecretsResponse(Err(make_err()))
+        }
         // Events without error response variants: drop the oneshot sender to
         // unblock the caller. The caller's receiver will get a RecvError, which
         // maps to ContractError::NoEvHandlerResponse. This prevents leaking
@@ -1845,6 +1878,7 @@ async fn send_queue_full_response(
         ContractHandlerEvent::DelegateRequest { .. }
         | ContractHandlerEvent::DelegateResponse(_)
         | ContractHandlerEvent::ExportUserSecretsResponse(_)
+        | ContractHandlerEvent::ImportSecretsResponse(_)
         | ContractHandlerEvent::PutResponse { .. }
         | ContractHandlerEvent::GetResponse { .. }
         | ContractHandlerEvent::UpdateResponse { .. }
@@ -2390,6 +2424,52 @@ where
                 }
             }
         }
+        ContractHandlerEvent::ImportSecrets {
+            target_scope,
+            bundle,
+            key_material,
+            key_kind,
+            overwrite,
+        } => {
+            // Live secret import (P3-live of #4592). Runs ON this serial contract
+            // loop — DELIBERATELY, unlike the hosted EXPORT which is off-loop.
+            //
+            // The import is the FIRST writer to the `SecretsStore` outside the
+            // serial loop's existing on-loop write path (delegate `store_secret`).
+            // The store's write path (fixed sibling `.tmp` + check-then-write
+            // collision handling) assumes node-wide write serialization; running
+            // the import off-loop on a separate pooled executor would let it race
+            // an on-loop delegate write (or another import) on the same secret
+            // file and corrupt it. Running it on the loop keeps every secret WRITE
+            // in one serialization domain, matching that assumption (Codex P1).
+            //
+            // Blocking the loop for the import's duration is acceptable here
+            // because — unlike the export — this endpoint is gated to LOOPBACK +
+            // the node's own dashboard origin (`hosted_import`): only the node's
+            // operator, over loopback, in a one-shot migration, can trigger it.
+            // It is NOT the authenticated-REMOTE token-holder DoS surface that
+            // justified moving export off-loop (#4381 P5). The request body is
+            // also bounded (`MAX_IMPORT_BUNDLE_BYTES`).
+            //
+            // Log only non-secret shape (bytes/scope/overwrite); never the key.
+            tracing::debug!(
+                bytes = bundle.expose().len(),
+                ?target_scope,
+                overwrite,
+                "Processing live secret import request"
+            );
+            let result = contract_handler
+                .executor()
+                .import_secrets(
+                    target_scope,
+                    bundle.expose(),
+                    key_material.expose(),
+                    key_kind,
+                    overwrite,
+                )
+                .await;
+            send_import_response_inline(contract_handler, id, result).await;
+        }
         ContractHandlerEvent::RegisterSubscriberListener {
             key,
             client_id,
@@ -2531,6 +2611,7 @@ where
         }
         ContractHandlerEvent::DelegateResponse(_)
         | ContractHandlerEvent::ExportUserSecretsResponse(_)
+        | ContractHandlerEvent::ImportSecretsResponse(_)
         | ContractHandlerEvent::PutResponse { .. }
         | ContractHandlerEvent::GetResponse { .. }
         | ContractHandlerEvent::UpdateResponse { .. }

@@ -127,7 +127,11 @@ impl ExportOpManagerHandle {
     }
 
     /// Resolve the live `OpManager`, if the node is up and not torn down.
-    fn current(&self) -> Option<Arc<OpManager>> {
+    ///
+    /// `pub(crate)` so the live-import endpoint (`hosted_import`) can REUSE this
+    /// same per-node handle to reach the executor (it submits an `ImportSecrets`
+    /// event on the same op_manager the export endpoint uses).
+    pub(crate) fn current(&self) -> Option<Arc<OpManager>> {
         self.0.get().and_then(Weak::upgrade)
     }
 }

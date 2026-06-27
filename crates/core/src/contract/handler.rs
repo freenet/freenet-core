@@ -732,6 +732,55 @@ impl std::fmt::Debug for RedactedToken {
     }
 }
 
+/// Which key-derivation the import bundle was sealed with. The bundle header
+/// also records the KDF, and [`crate::wasm_runtime::secret_export::open_bundle`]
+/// rejects a mismatch with a clean auth failure — so a wrong `kind` surfaces as
+/// a 4xx (bad key/bundle), never a panic or a 500.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BundleKeyKind {
+    /// HKDF-SHA256 over the opaque per-user token (the hosted-export default).
+    Token,
+    /// Argon2id over a user passphrase (the offline `freenet secrets export
+    /// --passphrase` form, supported for the file-upload fallback).
+    Passphrase,
+}
+
+/// Where a live import places the incoming secrets. v1 supports only `Local`
+/// (a normal single-user node taking its data home, #4592); the `User` re-host
+/// target is reserved for a future hosted-side flow and is not constructed by
+/// any current endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportTargetScope {
+    /// Place imported secrets at the node-local / single-user scope.
+    Local,
+}
+
+/// The raw bundle bytes carried on a [`ContractHandlerEvent::ImportSecrets`]
+/// event. Wraps `Vec<u8>` only so its `Debug` prints the byte LENGTH instead of
+/// dumping the (up-to-256-MiB) ciphertext into a log line — `ContractHandlerEvent`
+/// derives `Debug` and is logged. The bytes are encrypted-at-rest ciphertext
+/// (the plaintext is only ever materialized inside `import_bundle`'s `Zeroizing`
+/// buffers), not a secret; the wrapper exists purely to keep a multi-hundred-
+/// megabyte `?event` log line from ever forming.
+pub(crate) struct ImportBundle(Vec<u8>);
+
+impl ImportBundle {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the raw bundle bytes (handed to `import_bundle`).
+    pub(crate) fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ImportBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ImportBundle({} bytes)", self.0.len())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ContractHandlerEvent {
     DelegateRequest {
@@ -766,6 +815,32 @@ pub(crate) enum ContractHandlerEvent {
     /// Response to an `ExportUserSecrets` request: the encrypted bundle bytes,
     /// or an executor error.
     ExportUserSecretsResponse(Result<Vec<u8>, ExecutorError>),
+    /// Import delegate secrets from an encrypted bundle into this node's local
+    /// (single-user) `SecretsStore`, LIVE — without stopping the node (P3-live
+    /// of #4592, the durable counterpart of [`Self::ExportUserSecrets`]). The
+    /// raw `bundle` bytes are decrypted with `key_material` (interpreted per
+    /// `key_kind`); the decrypt is all-or-nothing and runs BEFORE any write, so
+    /// a wrong key / corrupt bundle fails with nothing written.
+    ///
+    /// `key_material` is the high-value bundle decryption key, redacted in
+    /// `Debug` and wiped on drop; `bundle`'s `Debug` prints only its length.
+    /// Neither is ever rendered by the `Display` impl.
+    ImportSecrets {
+        /// Where the imported secrets land. v1 is always `Local`.
+        target_scope: ImportTargetScope,
+        /// The encrypted bundle bytes (`FNSX` format).
+        bundle: ImportBundle,
+        /// Raw bundle-key material, redacted in `Debug` and wiped on drop.
+        key_material: RedactedToken,
+        /// How to interpret `key_material` (token-HKDF vs passphrase-Argon2id).
+        key_kind: BundleKeyKind,
+        /// Collision policy: `false` skips+reports an entry whose secret already
+        /// exists; `true` overwrites it (the prior value is snapshotted first).
+        overwrite: bool,
+    },
+    /// Response to an `ImportSecrets` request: the per-entry import accounting,
+    /// or an executor error.
+    ImportSecretsResponse(Result<crate::wasm_runtime::secret_export::ImportReport, ExecutorError>),
     /// Try to push/put a new value into the contract
     PutQuery {
         key: ContractKey,
@@ -1000,6 +1075,28 @@ impl std::fmt::Display for ContractHandlerEvent {
                     bundle.len()
                 ),
                 Err(e) => write!(f, "export user secrets failed {{ {e} }}"),
+            },
+            // `key_material` deliberately omitted (high-value credential); the
+            // bundle is rendered as a byte count only (never its contents).
+            ContractHandlerEvent::ImportSecrets {
+                target_scope,
+                bundle,
+                key_kind,
+                overwrite,
+                ..
+            } => write!(
+                f,
+                "import secrets {{ scope: {target_scope:?}, {} bytes, kind: {key_kind:?}, overwrite: {overwrite} }}",
+                bundle.expose().len()
+            ),
+            ContractHandlerEvent::ImportSecretsResponse(result) => match result {
+                Ok(report) => write!(
+                    f,
+                    "import secrets response {{ imported: {}, skipped: {} }}",
+                    report.imported,
+                    report.skipped.len()
+                ),
+                Err(e) => write!(f, "import secrets failed {{ {e} }}"),
             },
         }
     }

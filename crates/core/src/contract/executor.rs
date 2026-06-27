@@ -156,6 +156,56 @@ impl std::fmt::Display for ExportBusy {
 
 impl std::error::Error for ExportBusy {}
 
+/// Typed marker carried by an [`ExecutorError`] when a live secret import failed
+/// on CLIENT-supplied input: a wrong decryption key, bad magic, a truncated or
+/// unsupported bundle, an unknown KDF, a malformed entry, or a post-decrypt CBOR
+/// parse failure. Lets the import HTTP layer downcast and return a 4xx (the
+/// client uploaded the wrong bundle/key) instead of a generic 500. The `message`
+/// is non-secret (it never echoes the key or any plaintext), so it is safe to
+/// surface. See #4592.
+#[derive(Debug, Clone)]
+pub struct ImportBadBundle {
+    pub message: String,
+}
+
+impl std::fmt::Display for ImportBadBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ImportBadBundle {}
+
+/// Classify a [`crate::wasm_runtime::secret_export::ExportError`] from an import
+/// as CLIENT-input (the uploaded bundle/key is wrong → 4xx) vs NODE-side (store
+/// / IO / internal → 500).
+///
+/// Exhaustive match (no wildcard) so a future `ExportError` variant fails to
+/// COMPILE here until it is explicitly classified — the catch-all would
+/// otherwise silently misclassify a new variant (and trip
+/// `clippy::wildcard_enum_match_arm`).
+pub(crate) fn is_bad_bundle_input(e: &crate::wasm_runtime::secret_export::ExportError) -> bool {
+    use crate::wasm_runtime::secret_export::ExportError;
+    match e {
+        // Client uploaded the wrong bundle or presented the wrong key.
+        ExportError::AuthFailed
+        | ExportError::BadMagic
+        | ExportError::UnsupportedVersion(_)
+        | ExportError::UnknownKdf(_)
+        | ExportError::Truncated(_)
+        | ExportError::BadEntryField { .. }
+        | ExportError::CborDe(_) => true,
+        // Node-side faults (or not reachable on the import path): a 500.
+        ExportError::TooLarge { .. }
+        | ExportError::Store(_)
+        | ExportError::Runtime(_)
+        | ExportError::CborSer(_)
+        | ExportError::Argon2(_)
+        | ExportError::EncryptFailed
+        | ExportError::Io(_) => false,
+    }
+}
+
 /// Typed marker carried by an [`ExecutorError`] when an upsert was invoked
 /// in *deferrable* mode (see [`ContractExecutor::upsert_contract_state_deferrable`])
 /// and discovered it needs to fetch related contracts from the network to
@@ -400,6 +450,18 @@ impl ExecutorError {
         match &self.inner {
             Either::Left(_) => false,
             Either::Right(err) => err.downcast_ref::<ExportBusy>().is_some(),
+        }
+    }
+
+    /// Returns true if this error is the typed [`ImportBadBundle`] marker (a live
+    /// import rejected because the client-supplied bundle/key was wrong: wrong
+    /// key, bad magic, truncated/unsupported bundle, or a malformed entry). The
+    /// import HTTP handler gates a 4xx on this — a client-input fault, NOT a node
+    /// fault, so it must not read as a 500. See #4592.
+    pub fn is_import_bad_bundle(&self) -> bool {
+        match &self.inner {
+            Either::Left(_) => false,
+            Either::Right(err) => err.downcast_ref::<ImportBadBundle>().is_some(),
         }
     }
 
@@ -712,6 +774,33 @@ pub(crate) trait ContractExecutor: Send + 'static {
         done: runtime::ExportDone,
     ) -> impl Future<Output = Result<Vec<u8>, ExecutorError>> + Send {
         async move { done.into_result() }
+    }
+
+    /// Import delegate secrets from an encrypted `bundle` into the node's secrets
+    /// store at `target_scope`, LIVE (#4592). Runs ON the contract loop
+    /// (serialized with delegate `store_secret`) — DELIBERATELY not off-loop like
+    /// the export, because the import WRITES and the store write path assumes
+    /// node-wide write serialization (see `RuntimePool::import_secrets` and the
+    /// `ImportSecrets` arm in `contract.rs`).
+    ///
+    /// Default returns a not-supported error: only the production `RuntimePool`
+    /// (which owns real `SecretsStore`-backed executors) supports import; mock
+    /// executors keep no on-disk secrets.
+    fn import_secrets(
+        &mut self,
+        _target_scope: crate::contract::handler::ImportTargetScope,
+        _bundle: &[u8],
+        _key: &[u8],
+        _key_kind: crate::contract::handler::BundleKeyKind,
+        _overwrite: bool,
+    ) -> impl Future<
+        Output = Result<crate::wasm_runtime::secret_export::ImportReport, ExecutorError>,
+    > + Send {
+        async move {
+            Err(ExecutorError::other(anyhow::anyhow!(
+                "secret import is not supported by this executor"
+            )))
+        }
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
