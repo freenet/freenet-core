@@ -113,6 +113,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     time_source: T,
     metadata: Option<Bytes>,
     completion_tx: Option<oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>>,
+    progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let bytes_to_send = stream_to_send.len() as u64;
@@ -387,6 +388,13 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
 
         next_fragment_number += 1;
         sent_so_far += 1;
+        if let Some(p) = &progress {
+            // record() reads the handle's OWN clock (the originator's
+            // TimeSource), NOT this connection's time_source — the two have
+            // different epochs and mixing them defeats the inactivity timeout
+            // (#4001 single-epoch invariant; see stream_progress.rs).
+            p.record();
+        }
     }
 
     // Gather congestion control stats for telemetry
@@ -482,6 +490,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
     metadata: Option<Bytes>,
+    progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let total_bytes = inbound_handle.total_bytes();
@@ -763,6 +772,13 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
 
         sent_so_far += packet_size as u64;
         fragment_number += 1;
+        if let Some(p) = &progress {
+            // record() reads the handle's OWN clock (the originator's
+            // TimeSource), NOT this connection's time_source — the two have
+            // different epochs and mixing them defeats the inactivity timeout
+            // (#4001 single-epoch invariant; see stream_progress.rs).
+            p.record();
+        }
     }
 
     let generic_stats = congestion_controller.stats();
@@ -922,6 +938,7 @@ mod tests {
             time_source,
             None,
             None,
+            None,
         ));
 
         let mut inbound_bytes = Vec::with_capacity(message.len());
@@ -1031,6 +1048,7 @@ mod tests {
             time_source,
             None,
             None,
+            None,
         ));
 
         // Wait for send task to complete
@@ -1130,6 +1148,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
             None,
             None,
         ));
@@ -1239,6 +1258,7 @@ mod tests {
             time_source,
             None,
             None,
+            None,
         ));
 
         // With start_paused=true, tokio auto-advances time through sleep calls.
@@ -1324,6 +1344,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
             None,
             None,
         ));
@@ -1419,6 +1440,7 @@ mod tests {
             time_source,
             None,
             None,
+            None,
         ));
 
         let err = send_task
@@ -1488,6 +1510,7 @@ mod tests {
             token_bucket,
             cc_for_send,
             time_source,
+            None,
             None,
             None,
         ));
@@ -1561,6 +1584,7 @@ mod tests {
             time_source,
             None,
             Some(completion_tx),
+            None,
         ));
 
         // Drain the socket so the stream can run to completion.
@@ -1635,6 +1659,7 @@ mod tests {
             time_source,
             None,
             Some(completion_tx),
+            None,
         ));
 
         let result = background_task.await?;
@@ -1718,6 +1743,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
             None,
         ));
 
@@ -1881,6 +1907,7 @@ mod tests {
             congestion_controller,
             time_source,
             None,
+            None,
         ));
 
         let result = pipe_task.await.expect("join error");
@@ -1950,6 +1977,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
             None,
         ));
 
@@ -2032,6 +2060,7 @@ mod tests {
             token_bucket,
             congestion_controller,
             time_source,
+            None,
             None,
         ));
 

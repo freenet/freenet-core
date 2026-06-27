@@ -682,6 +682,7 @@ pub(crate) trait PeerConnectionApi: Send {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 
     /// Pipes an inbound stream to the remote peer, forwarding fragments as they arrive.
@@ -697,6 +698,7 @@ pub(crate) trait PeerConnectionApi: Send {
         outbound_stream_id: crate::transport::peer_connection::StreamId,
         inbound_handle: crate::transport::peer_connection::streaming::StreamHandle,
         metadata: Option<bytes::Bytes>,
+        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 }
 

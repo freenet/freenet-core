@@ -466,6 +466,20 @@ pub(crate) trait RetryDriver {
     fn attempt_timeout(&self) -> std::time::Duration {
         OPERATION_TTL
     }
+
+    /// Optional per-attempt stream-progress liveness for streaming PUTs (#4001).
+    ///
+    /// Defaults to `None`: GET / SUBSCRIBE and non-streaming drivers use the
+    /// fixed [`Self::attempt_timeout`] path unchanged. When `Some`, the retry
+    /// loop replaces the fixed per-attempt deadline with a stream-inactivity
+    /// timeout driven by the returned [`StreamProgress`] (Notify + atomic
+    /// tiebreak) bounded by the hard
+    /// [`crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP`] ceiling. PUT
+    /// overrides this only for streaming-eligible payloads. The seam is
+    /// additive: a later GET/SUBSCRIBE PR can plug into the same default.
+    fn stream_progress(&self) -> Option<crate::operations::stream_progress::StreamProgress> {
+        None
+    }
 }
 
 /// Maximum cheap, fast retries of a `NotificationError` (local callback
@@ -489,6 +503,75 @@ pub(crate) trait RetryDriver {
 /// negligible wall-clock vs a single `STREAMING_ATTEMPT_TIMEOUT_CAP`
 /// (600 s) and stays well under any WS-client per-attempt patience.
 const MAX_INFRA_RETRIES: usize = 3;
+
+/// Await a single streaming attempt under a stream-inactivity timeout (#4001).
+///
+/// Returns `Ok(reply)` when the terminal reply arrives, `Err(())` when the
+/// attempt is abandoned (no fragment for [`STREAM_OP_INACTIVITY_TIMEOUT`], or
+/// the hard [`STREAMING_ATTEMPT_TIMEOUT_CAP`] ceiling is reached). Both map to
+/// the shared `outcome="timeout"` advance arm in [`drive_retry_loop`].
+///
+/// The three concurrent arms:
+/// 1. **Terminal reply** — `ctx.send_and_await(request)`; identical to the
+///    non-streaming path's awaited future, just not wrapped in a fixed timeout.
+/// 2. **Inactivity loop** — wakes on each `Notify` ping and, on each inactivity
+///    sleep expiry, re-reads `last_progress` via the atomic; only declares a
+///    stall when the atomic CONFIRMS no fragment landed in the race window
+///    (the tiebreak that closes the `Notify` lost-wakeup gap).
+/// 3. **Hard ceiling** — a sibling [`STREAMING_ATTEMPT_TIMEOUT_CAP`] sleep,
+///    OUTSIDE the inactivity loop, so a stream that keeps dribbling fragments
+///    forever still can't hold the driver hostage indefinitely.
+///
+/// All sleeps go through the driver's `TimeSource` (via [`StreamProgress`]) so
+/// the path is VirtualTime-correct under DST — `tokio::time::sleep`/`timeout`
+/// would not advance under VirtualTime.
+async fn await_streaming_attempt(
+    ctx: &mut OpCtx,
+    request: NetMessage,
+    progress: &crate::operations::stream_progress::StreamProgress,
+) -> Result<Result<NetMessage, OpError>, ()> {
+    use crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
+    use crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
+
+    let handle = progress.handle();
+    let round_trip = ctx.send_and_await(request);
+    tokio::pin!(round_trip);
+
+    // Arm 3: hard ceiling sibling — a single sleep started once, raced against
+    // the terminal reply and the inactivity loop.
+    let ceiling = progress.sleep(STREAMING_ATTEMPT_TIMEOUT_CAP);
+    tokio::pin!(ceiling);
+
+    loop {
+        // Arm 2 (inner): one inactivity window. Re-created each iteration so a
+        // `Notify` ping resets the clock by restarting the sleep.
+        let inactivity = progress.sleep(STREAM_OP_INACTIVITY_TIMEOUT);
+
+        tokio::select! {
+            // Arm 1: terminal reply (unchanged semantics).
+            reply = &mut round_trip => return Ok(reply),
+            // Arm 3: hard ceiling.
+            _ = &mut ceiling => return Err(()),
+            // Arm 2: a fragment landed — reset the inactivity window.
+            _ = handle.notified() => continue,
+            // Arm 2: inactivity window elapsed with no Notify ping. Before
+            // declaring a stall, re-read the atomic: a fragment that landed in
+            // the Notify race window (notify_one permit consumed elsewhere, or
+            // store-then-no-wake ordering) makes `since_last` < the window, so
+            // reset and continue. Only a confirmed stall returns Err(()).
+            _ = inactivity => {
+                // `since_last()` reads the handle's own clock — the SAME clock
+                // record() writes to — so this elapsed value is the true gap
+                // since the last fragment (#4001 single-epoch invariant).
+                let elapsed = handle.since_last();
+                if elapsed < STREAM_OP_INACTIVITY_TIMEOUT {
+                    continue;
+                }
+                return Err(());
+            }
+        }
+    }
+}
 
 /// Drive a retry loop against the network.
 ///
@@ -526,7 +609,36 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         let attempt_timeout = driver.attempt_timeout();
         let mut ctx = op_manager.op_ctx(attempt_tx);
-        let round_trip = tokio::time::timeout(attempt_timeout, ctx.send_and_await(request)).await;
+
+        // `round_trip: Result<Result<NetMessage, OpError>, ()>` — `Err(())`
+        // models "attempt timed out" (fixed deadline OR streaming stall/ceiling)
+        // so the downstream match arms below are shared by both paths.
+        let round_trip = match driver.stream_progress() {
+            // Non-streaming path (GET / SUBSCRIBE / non-streaming PUT):
+            // UNCHANGED fixed-deadline `tokio::time::timeout`.
+            None => tokio::time::timeout(attempt_timeout, ctx.send_and_await(request))
+                .await
+                .map_err(|_| ()),
+            // Streaming PUT path (#4001): replace the fixed deadline with a
+            // stream-inactivity timeout driven by real per-fragment progress,
+            // bounded by the STREAMING_ATTEMPT_TIMEOUT_CAP hard ceiling.
+            //
+            // The retry-loop task and the originator-loopback relay-streaming
+            // task share only `attempt_tx`, so we publish the progress handle
+            // into the `OpManager`-owned registry BEFORE sending; the loopback
+            // relay looks it up by `attempt_tx` and records per fragment.
+            // `StreamProgressGuard` removes the entry on Drop — so it is cleaned
+            // up on EVERY exit (success, stall, ceiling, error) AND if this
+            // future is cancelled or panics mid-`await`. It cannot leak.
+            Some(progress) => {
+                let _progress_guard = crate::operations::stream_progress::StreamProgressGuard::new(
+                    op_manager.stream_progress_registry().clone(),
+                    attempt_tx,
+                    progress.handle(),
+                );
+                await_streaming_attempt(&mut ctx, request, &progress).await
+            }
+        };
 
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the
@@ -1880,5 +1992,262 @@ mod tests {
                 other => panic!("expected PeerDisconnected, got: {other:?}"),
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // #4001 stream-inactivity timeout regression tests.
+    //
+    // These drive `await_streaming_attempt` — the core of `drive_retry_loop`'s
+    // streaming branch — directly, which avoids standing up an `OpManager`.
+    // They run under tokio's `start_paused` virtual clock with `RealTime` as
+    // the `TimeSource`; `RealTime::sleep`/`now` delegate to tokio's (paused,
+    // auto-advancing) clock, so virtual time advances deterministically when
+    // all tasks are idle. This is the same pattern as
+    // `renewal_per_attempt_timeout_fires_before_outer_cancel`.
+    //
+    // `await_streaming_attempt` returns `Ok(reply)` on the terminal reply and
+    // `Err(())` on a stream-inactivity stall or the hard ceiling. The pre-fix
+    // behaviour (the non-streaming `None` arm: a fixed `OPERATION_TTL`/scaled
+    // deadline) would fire `Err(())` at the fixed deadline regardless of
+    // fragment progress — which is exactly the #4001 self-retry-while-in-flight
+    // bug these tests guard against.
+    // -------------------------------------------------------------------------
+
+    use crate::operations::stream_progress::{
+        STREAM_OP_INACTIVITY_TIMEOUT, StreamProgress, StreamProgressHandle,
+    };
+    // `TimeSource` is needed for `RealTime::now()` in the elapsed-time asserts.
+    use crate::simulation::{RealTime, TimeSource};
+
+    /// Build an `(OpCtx, StreamProgress)` pair plus the executor receiver, all
+    /// sharing a fresh `RealTime` (tokio paused clock). The returned handle is
+    /// the SAME one bundled in the `StreamProgress` (so its record()/since_last()
+    /// read the loop's clock — the #4001 single-epoch invariant). The receiver
+    /// lets a test spawn a fake peer that replies on its own schedule.
+    fn streaming_attempt_fixture() -> (
+        OpCtx,
+        Transaction,
+        StreamProgressHandle,
+        StreamProgress,
+        mpsc::Receiver<crate::node::OpExecutionPayload>,
+    ) {
+        let (receiver, sender) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            op_execution_receiver,
+            ..
+        } = receiver;
+        let tx = Transaction::new::<ConnectMsg>();
+        let ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+        let progress = StreamProgress::new(RealTime::new());
+        let handle = progress.handle();
+        (ctx, tx, handle, progress, op_execution_receiver)
+    }
+
+    /// A fragment lands every ~10 s of virtual time for 120 s (well past the
+    /// 60 s `OPERATION_TTL` cliff that the OLD fixed-deadline path would fire
+    /// at), then the peer replies at ~125 s. The streaming-inactivity path MUST
+    /// return the terminal reply (`Ok`) — it MUST NOT time out — because the
+    /// 30 s inactivity window is continuously reset by progress.
+    ///
+    /// This FAILS against the pre-#4001 fixed-deadline behaviour: a 60 s
+    /// (or even payload-scaled) deadline fires `Err(())` at 60 s while the
+    /// stream is still flowing, producing the version-conflict self-retry.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_put_does_not_retry_while_chunks_flow() {
+        let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
+
+        // Fake peer: record progress every 10 s for 120 s, reply at 125 s.
+        let producer = tokio::spawn(async move {
+            let (reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
+            for _ in 0..12 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                handle.record();
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            reply_sender
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
+                .expect("capacity-1 reply channel accepts the reply");
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
+        assert!(
+            result.is_ok(),
+            "stream that keeps flowing for 125 s must deliver the terminal \
+             reply, not time out — a fixed 60 s deadline would have fired the \
+             #4001 self-retry here"
+        );
+        assert_eq!(result.unwrap().unwrap().id(), &tx);
+        producer.await.expect("producer task panicked");
+    }
+
+    /// Progress flows for 40 s then stops. The 30 s inactivity timeout MUST
+    /// fire ~70 s in (40 s of progress + 30 s of silence), returning `Err(())`
+    /// exactly once. Asserts the stall is detected on a genuinely dead stream.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_put_retries_on_true_stall() {
+        let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
+
+        // Fake peer: progress every 10 s for 40 s, then go silent forever
+        // (never replies). The inactivity timeout must fire.
+        let producer = tokio::spawn(async move {
+            let (_reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                handle.record();
+            }
+            // Hold the reply sender open but never reply; sleep beyond the
+            // ceiling so the task doesn't drop the channel and synthesise a
+            // close before the inactivity timeout fires.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+
+        let start = RealTime::new();
+        let t0 = start.now();
+        let outbound = dummy_reply_with_tx(tx);
+        let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
+        let elapsed = start.now().saturating_sub(t0);
+        assert!(result.is_err(), "a stalled stream must time out (Err)");
+        // Stall detected after 40 s progress + 30 s silence ≈ 70 s, and well
+        // before the 600 s ceiling.
+        assert!(
+            elapsed >= Duration::from_secs(60) && elapsed < Duration::from_secs(120),
+            "inactivity stall should fire ~70 s in (40 s progress + 30 s idle), \
+             got {elapsed:?}"
+        );
+        producer.abort();
+    }
+
+    /// A stream that records a fragment forever (never replies, never stalls
+    /// for 30 s) MUST still be bounded: the hard 600 s
+    /// `STREAMING_ATTEMPT_TIMEOUT_CAP` ceiling fires and returns `Err(())`.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_put_hard_ceiling_fires() {
+        let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
+
+        // Fake peer: keep recording progress every 10 s indefinitely so the
+        // inactivity window NEVER expires — only the ceiling can stop it.
+        let producer = tokio::spawn(async move {
+            let (_reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                handle.record();
+            }
+        });
+
+        let start = RealTime::new();
+        let t0 = start.now();
+        let outbound = dummy_reply_with_tx(tx);
+        let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
+        let elapsed = start.now().saturating_sub(t0);
+        assert!(result.is_err(), "the hard ceiling must abandon the attempt");
+        assert!(
+            elapsed >= crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
+            "ceiling must fire at/after STREAMING_ATTEMPT_TIMEOUT_CAP (600 s), \
+             got {elapsed:?}"
+        );
+        producer.abort();
+    }
+
+    /// The atomic tiebreak: a fragment whose `record()` store lands inside the
+    /// inactivity window — but whose `Notify` ping is lost (the realistic race
+    /// `Notify` alone cannot cover) — MUST be observed via the `since_last`
+    /// atomic re-check and suppress a false stall.
+    ///
+    /// To exercise the *atomic* path deterministically (not the task scheduler),
+    /// each fragment lands at `window - RACE_SLACK` of virtual time: every
+    /// window expiry therefore finds `since_last < window` and resets via the
+    /// atomic, keeping the attempt alive until the reply. A poll-/Notify-only
+    /// implementation that ignored the atomic would falsely stall.
+    #[tokio::test(start_paused = true)]
+    async fn streaming_put_progress_during_inactivity_race() {
+        // Land each fragment just inside the window so the atomic re-check —
+        // not a fresh timer — is what keeps the stream alive.
+        const RACE_SLACK: Duration = Duration::from_millis(500);
+        let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
+
+        let producer = tokio::spawn(async move {
+            let (reply_sender, _outbound, _target) =
+                rx.recv().await.expect("outbound msg should be delivered");
+            // Several fragments landing just before each inactivity boundary.
+            for _ in 0..5 {
+                tokio::time::sleep(STREAM_OP_INACTIVITY_TIMEOUT - RACE_SLACK).await;
+                handle.record();
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            reply_sender
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
+                .expect("capacity-1 reply channel accepts the reply");
+        });
+
+        let outbound = dummy_reply_with_tx(tx);
+        let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
+        assert!(
+            result.is_ok(),
+            "a fragment landing inside the inactivity window must reset it via \
+             the atomic tiebreak, not trigger a false stall"
+        );
+        assert_eq!(result.unwrap().unwrap().id(), &tx);
+        producer.await.expect("producer task panicked");
+    }
+
+    /// Control: a driver whose `stream_progress()` returns `None` (every
+    /// non-streaming op: GET / SUBSCRIBE / small PUT) is byte-identical to the
+    /// pre-#4001 fixed-deadline path — `drive_retry_loop` takes the
+    /// `None => tokio::time::timeout(...)` arm. Pin that the default trait hook
+    /// is `None` so the streaming branch is never entered for those drivers.
+    #[test]
+    fn non_streaming_put_uses_fixed_timeout() {
+        struct NonStreamingDriver;
+        impl RetryDriver for NonStreamingDriver {
+            type Terminal = ();
+            fn new_attempt_tx(&mut self) -> Transaction {
+                unreachable!()
+            }
+            fn build_request(&mut self, _attempt_tx: Transaction) -> NetMessage {
+                unreachable!()
+            }
+            fn classify(&mut self, _reply: NetMessage) -> AttemptOutcome<()> {
+                unreachable!()
+            }
+            fn advance(&mut self) -> AdvanceOutcome {
+                unreachable!()
+            }
+        }
+        assert!(
+            NonStreamingDriver.stream_progress().is_none(),
+            "non-streaming drivers MUST return None so drive_retry_loop keeps \
+             the unchanged fixed-deadline timeout path"
+        );
+
+        // Source pin: the `None` arm of the stream_progress branch is the
+        // unchanged `tokio::time::timeout` path.
+        const SRC: &str = include_str!("op_ctx.rs");
+        let loop_pos = SRC
+            .find("pub(crate) async fn drive_retry_loop")
+            .expect("drive_retry_loop must exist");
+        let body = &SRC[loop_pos..];
+        let branch_pos = body
+            .find("match driver.stream_progress() {")
+            .expect("drive_retry_loop must branch on driver.stream_progress()");
+        let after = &body[branch_pos..];
+        let none_arm = after.find("None =>").expect("None arm must exist");
+        let some_arm = after
+            .find("Some(progress) =>")
+            .expect("Some arm must exist");
+        assert!(
+            none_arm < some_arm,
+            "None arm must precede Some arm in the stream_progress branch"
+        );
+        let none_body = &after[none_arm..some_arm];
+        assert!(
+            none_body
+                .contains("tokio::time::timeout(attempt_timeout, ctx.send_and_await(request))"),
+            "the None arm MUST remain the unchanged fixed-deadline \
+             tokio::time::timeout path; non-streaming ops must not regress"
+        );
     }
 }

@@ -61,6 +61,23 @@ pub(crate) trait NetworkBridge: Send + Sync {
         metadata: Option<bytes::Bytes>,
     ) -> impl Future<Output = ConnResult<()>> + Send;
 
+    /// Like [`Self::send_stream`] but attaches an optional stream-progress
+    /// liveness handle (#4001) so the transport records a tick per dispatched
+    /// fragment. Used ONLY by the originator-loopback PUT relay so the
+    /// retry-loop task can apply a true stream-inactivity timeout. The default
+    /// delegates to [`Self::send_stream`] (handle dropped), keeping mock and
+    /// non-streaming bridges unchanged.
+    fn send_stream_with_progress(
+        &self,
+        target_addr: SocketAddr,
+        stream_id: crate::transport::peer_connection::StreamId,
+        data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
+        _progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+    ) -> impl Future<Output = ConnResult<()>> + Send {
+        self.send_stream(target_addr, stream_id, data, metadata)
+    }
+
     /// Pipe an inbound stream to a peer, forwarding fragments as they arrive.
     ///
     /// Unlike `send_stream` which takes complete data and fragments it, this forwards

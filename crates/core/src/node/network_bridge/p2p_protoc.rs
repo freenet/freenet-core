@@ -170,6 +170,10 @@ pub(crate) enum P2pBridgeEvent {
         /// carrying a [`BroadcastDeliveryOutcome`] so the queue distinguishes a
         /// real delivery from a drop (#4235).
         completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        /// Optional per-fragment progress handle for the streaming-PUT retry
+        /// loop (#4001). Threaded through to `send_stream` so the originator's
+        /// retry loop sees liveness ticks. `None` for every non-originator path.
+        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     },
     /// Pipe an inbound stream to a target, forwarding fragments incrementally.
     PipeStream {
@@ -283,7 +287,13 @@ impl P2pBridge {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     ) -> super::ConnResult<()> {
+        // channel-safety: ok — sole caller is the broadcast-queue task
+        // (broadcast_to_single_peer), a detached spawned task, not the event
+        // loop; the StreamSend it enqueues is drained by the loop, so it cannot
+        // self-stall it. Grandfathered enqueue; the #4001 `progress` field that
+        // brought this statement into the diff does not change the send path.
         self.ev_listener_tx
             .send(P2pBridgeEvent::StreamSend {
                 target_addr,
@@ -291,6 +301,7 @@ impl P2pBridge {
                 data,
                 metadata,
                 completion_tx,
+                progress,
             })
             .await
             .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
@@ -444,6 +455,10 @@ impl NetworkBridge for P2pBridge {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
     ) -> super::ConnResult<()> {
+        // channel-safety: ok — grandfathered streaming enqueue; callers are
+        // off-loop spawned op/relay tasks, not the event loop (which drains
+        // StreamSend). The #4001 `progress: None` field that brought this
+        // statement into the diff does not change the send path.
         self.ev_listener_tx
             .send(P2pBridgeEvent::StreamSend {
                 target_addr,
@@ -451,6 +466,37 @@ impl NetworkBridge for P2pBridge {
                 data,
                 metadata,
                 completion_tx: None,
+                progress: None,
+            })
+            .await
+            .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
+        Ok(())
+    }
+
+    async fn send_stream_with_progress(
+        &self,
+        target_addr: SocketAddr,
+        stream_id: StreamId,
+        data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
+        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
+    ) -> super::ConnResult<()> {
+        // Enqueues the streaming send carrying the #4001 progress handle so
+        // `outbound_stream::send_stream` records a tick per fragment.
+        // channel-safety: ok — sole caller is the originator-loopback PUT relay
+        // (drive_relay_put), which runs on a spawned op task, not the event
+        // loop; the StreamSend it enqueues is drained by the loop, so it cannot
+        // self-stall it. Identical send path to the grandfathered `send_stream`
+        // above; completion_tx stays None (no broadcast-queue concurrency on
+        // the originator PUT path).
+        self.ev_listener_tx
+            .send(P2pBridgeEvent::StreamSend {
+                target_addr,
+                stream_id,
+                data,
+                metadata,
+                completion_tx: None,
+                progress,
             })
             .await
             .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
@@ -1686,6 +1732,7 @@ impl P2pConnManager {
                             data,
                             metadata,
                             completion_tx,
+                            progress,
                         } => {
                             // The event loop must never block indefinitely on a single
                             // congested peer. Reserve a slot with the same 500 ms
@@ -1714,6 +1761,7 @@ impl P2pConnManager {
                                             data,
                                             metadata,
                                             completion_tx,
+                                            progress,
                                         }));
                                     }
                                     Ok(Err(_closed)) => {
@@ -2770,6 +2818,9 @@ pub(super) enum ConnEvent {
         /// Optional completion signal for broadcast queue concurrency control,
         /// carrying a [`BroadcastDeliveryOutcome`] (#4235).
         completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
+        /// Optional per-fragment progress handle for the streaming-PUT retry
+        /// loop (#4001). `None` for every non-originator path.
+        progress: Option<crate::operations::stream_progress::StreamProgressHandle>,
     },
     /// Pipe an inbound stream to a peer, forwarding fragments as they arrive.
     /// Used for low-latency forwarding at intermediate nodes.
@@ -2869,6 +2920,7 @@ async fn handle_peer_channel_message(
                     data,
                     metadata,
                     completion_tx,
+                    progress,
                     ..
                 } => {
                     tracing::debug!(
@@ -2879,7 +2931,7 @@ async fn handle_peer_channel_message(
                         "[CONN_LIFECYCLE] Sending operations stream data to peer"
                     );
                     if let Err(error) = conn
-                        .send_stream_data(stream_id, data, metadata, completion_tx)
+                        .send_stream_data(stream_id, data, metadata, completion_tx, progress)
                         .await
                     {
                         tracing::error!(
@@ -2905,7 +2957,7 @@ async fn handle_peer_channel_message(
                         "[CONN_LIFECYCLE] Piping stream to peer"
                     );
                     if let Err(error) = conn
-                        .pipe_stream_data(outbound_stream_id, inbound_handle, metadata)
+                        .pipe_stream_data(outbound_stream_id, inbound_handle, metadata, None)
                         .await
                     {
                         tracing::error!(
