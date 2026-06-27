@@ -367,7 +367,7 @@ async fn get_latest_version() -> Result<String> {
     // at `get_latest_release`. A denied poll returns Err so the caller
     // (`check_if_update_available`) treats it as `Skipped` and retries later —
     // the node keeps running, it just does not poll GitHub this tick.
-    if !try_consume_github_poll() {
+    if !try_consume_node_poll() {
         return Err(RateLimitedError.into());
     }
 
@@ -512,50 +512,55 @@ pub(crate) fn clear_update_failures_at(dir: &std::path::Path) {
     let _rm = fs::remove_file(dir.join("update_failures"));
 }
 
-// ── Global persistent GitHub-poll rate limit (token bucket) ────────────────
+// ── Persistent GitHub-poll rate limit (token buckets) ──────────────────────
 //
-// Issue #4073 aggregate-load bounding: every GitHub release poll — the startup
-// check, the #4589 re-poll, the peer-signal `check_if_update_available` loop,
-// AND the supervisor-invoked one-shot `freenet update` — funnels through a
-// SINGLE on-disk token bucket so that no combination of restarts, peer signals,
-// or repeated failed installs can make one node hammer the GitHub REST API.
+// Issue #4073 aggregate-load bounding: every GitHub release poll is gated by an
+// on-disk token bucket so that no combination of restarts, peer signals, or
+// repeated failed installs can make one node hammer the GitHub REST API. The
+// buckets are persisted in `state_dir()` (not in memory) precisely so the fresh,
+// short-lived `freenet update` process honours the limit across restarts: an
+// in-memory limiter would reset to full on every relaunch and not bound a
+// restart loop at all.
 //
-// The bucket is persisted in `state_dir()` (not in memory) precisely so the
-// fresh, short-lived `freenet update` process honours the same limit across
-// restarts: an in-memory limiter would reset to full on every relaunch and so
-// would not bound a restart loop at all.
+// There are TWO independent buckets, one per fetch path:
+//   * the NODE bucket gates the in-process `get_latest_version` (startup check,
+//     #4589 re-poll, peer-signal loop);
+//   * the INSTALL bucket gates the supervisor-invoked `get_latest_release`
+//     (`freenet update`).
 //
-// Capacity / refill are tuned so NORMAL operation never trips the limit while a
+// They are SEPARATE on purpose. The node always runs before the supervisor's
+// `freenet update` in a restart cycle (it detects, exits 42, THEN the installer
+// runs), so a single shared bucket would let the node win every token race and
+// starve the installer — a low/refilling shared bucket could leave a legitimate
+// update unable to actually fetch+install while the node keeps spending the lone
+// refill token to re-confirm it. Two buckets bound each path independently and
+// remove that ordering bias.
+//
+// Capacity / refill are tuned so NORMAL operation never trips a limit while a
 // runaway loop is firmly capped:
 //   * Normal load is tiny: ~1 boot poll + the staggered re-poll (a few times a
-//     day) + the occasional real install. That is far below the capacity, and
-//     each consumed token refills within ~10 min.
-//   * A runaway loop (e.g. a release whose install always fails the checksum /
-//     signature gate, so the node re-detects → exit 42 → `freenet update` →
-//     fails → restart → re-detect …) is bounded to roughly one token per
-//     [`GITHUB_POLL_REFILL_SECS`] once the initial capacity is drained, i.e.
-//     ~6 GitHub calls/hour/node regardless of how fast it restarts.
-//
-// Capacity is set a little above the number of polls the per-target-version
-// install-failure gate (`rollback::is_version_install_gated`) needs to engage
-// (3 failed installs, each cycle costing a node poll + an install poll). That
-// guarantees the gate — which is what actually STOPS the restart loop — reaches
-// its threshold before the bucket would starve the install path, after which
-// the node stops emitting exit 42 entirely and the bucket only has to absorb a
-// brief residual.
+//     day) + the occasional real install — far below capacity, and each consumed
+//     token refills within ~10 min.
+//   * A runaway loop is bounded to ~1 token per [`GITHUB_POLL_REFILL_SECS`] once
+//     the initial capacity drains, i.e. ~6 GitHub calls/hour/node PER PATH
+//     regardless of restart rate. (The per-target-version install-failure gate
+//     normally stops the failed-install loop well before then.)
 
-/// Maximum number of GitHub release polls that can be made in a burst before the
-/// refill rate takes over. Comfortably above a real detect→install burst and
-/// above the ~6 polls the install-failure gate needs to engage, yet far below
-/// any rate that would matter to GitHub.
+/// Maximum number of GitHub release polls (per path) in a burst before the
+/// refill rate takes over. Comfortably above a real detect→install burst and any
+/// normal daily activity, yet far below any rate that would matter to GitHub.
 pub(crate) const GITHUB_POLL_BUCKET_CAPACITY: f64 = 8.0;
 
 /// Refill interval: one token returns every ~10 minutes, so the sustained poll
-/// rate of any loop is capped at ~6 GitHub REST calls/hour/node.
+/// rate of any loop is capped at ~6 GitHub REST calls/hour/node per path.
 pub(crate) const GITHUB_POLL_REFILL_SECS: f64 = 600.0;
 
-/// On-disk bucket file (plain text: `"<tokens> <updated_unix>"`).
-const GITHUB_POLL_BUCKET_FILE: &str = "github_poll_bucket";
+/// On-disk bucket file for the in-process node poll path (`get_latest_version`).
+const NODE_POLL_BUCKET_FILE: &str = "github_poll_bucket_node";
+
+/// On-disk bucket file for the supervisor-side installer (`get_latest_release`).
+/// Independent from the node bucket so the node cannot starve the installer.
+const INSTALL_POLL_BUCKET_FILE: &str = "github_poll_bucket_install";
 
 /// Token-bucket state persisted across processes.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -628,8 +633,8 @@ fn github_poll_bucket_step(
     )
 }
 
-fn read_github_poll_bucket_at(dir: &std::path::Path) -> BucketRead {
-    match fs::read_to_string(dir.join(GITHUB_POLL_BUCKET_FILE)) {
+fn read_github_poll_bucket_at(dir: &std::path::Path, file: &str) -> BucketRead {
+    match fs::read_to_string(dir.join(file)) {
         Ok(raw) => {
             let mut it = raw.split_whitespace();
             match (
@@ -655,18 +660,18 @@ fn read_github_poll_bucket_at(dir: &std::path::Path) -> BucketRead {
     }
 }
 
-fn write_github_poll_bucket_at(dir: &std::path::Path, bucket: &GithubPollBucket) {
+fn write_github_poll_bucket_at(dir: &std::path::Path, file: &str, bucket: &GithubPollBucket) {
     let _mkdir = fs::create_dir_all(dir);
     let _write = fs::write(
-        dir.join(GITHUB_POLL_BUCKET_FILE),
+        dir.join(file),
         format!("{} {}", bucket.tokens, bucket.updated_unix),
     );
 }
 
-/// Try to consume one GitHub-poll token from the on-disk bucket in `dir`.
+/// Try to consume one token from the named on-disk bucket in `dir`.
 /// Returns `true` if a poll is permitted (token spent), `false` if rate-limited.
-pub(crate) fn try_consume_github_poll_at(dir: &std::path::Path, now_unix: u64) -> bool {
-    let prev = match read_github_poll_bucket_at(dir) {
+pub(crate) fn try_consume_github_poll_at(dir: &std::path::Path, file: &str, now_unix: u64) -> bool {
+    let prev = match read_github_poll_bucket_at(dir, file) {
         BucketRead::Present(s) => Some(s),
         BucketRead::Missing => None,
         BucketRead::Corrupt => {
@@ -676,6 +681,7 @@ pub(crate) fn try_consume_github_poll_at(dir: &std::path::Path, now_unix: u64) -
             // state. This makes a corrupt/torn bucket fail closed.
             write_github_poll_bucket_at(
                 dir,
+                file,
                 &GithubPollBucket {
                     tokens: 0.0,
                     updated_unix: now_unix,
@@ -690,20 +696,29 @@ pub(crate) fn try_consume_github_poll_at(dir: &std::path::Path, now_unix: u64) -
         GITHUB_POLL_BUCKET_CAPACITY,
         GITHUB_POLL_REFILL_SECS,
     );
-    write_github_poll_bucket_at(dir, &next);
+    write_github_poll_bucket_at(dir, file, &next);
     allowed
 }
 
-/// Try to consume one GitHub-poll token from the global persistent bucket.
-///
-/// Returns `false` (deny) when the state directory cannot be resolved — with
-/// nowhere to persist the bucket we cannot bound a loop, so denying is the safe
-/// choice (mirrors [`should_attempt_update`]'s `unwrap_or(false)`).
-pub(crate) fn try_consume_github_poll() -> bool {
+fn try_consume_poll_bucket(file: &str) -> bool {
+    // Deny when the state directory cannot be resolved — with nowhere to persist
+    // the bucket we cannot bound a loop, so denying is the safe choice (mirrors
+    // [`should_attempt_update`]'s `unwrap_or(false)`).
     match state_dir() {
-        Some(dir) => try_consume_github_poll_at(&dir, now_unix()),
+        Some(dir) => try_consume_github_poll_at(&dir, file, now_unix()),
         None => false,
     }
+}
+
+/// Try to consume one token from the NODE poll bucket (`get_latest_version`).
+pub(crate) fn try_consume_node_poll() -> bool {
+    try_consume_poll_bucket(NODE_POLL_BUCKET_FILE)
+}
+
+/// Try to consume one token from the INSTALL poll bucket (`get_latest_release`).
+/// Independent of the node bucket so the node can never starve the installer.
+pub(crate) fn try_consume_install_poll() -> bool {
+    try_consume_poll_bucket(INSTALL_POLL_BUCKET_FILE)
 }
 
 /// Check if we should attempt an update based on failure history.
@@ -1254,12 +1269,12 @@ mod tests {
         let cap = GITHUB_POLL_BUCKET_CAPACITY as u64;
         for i in 0..cap {
             assert!(
-                try_consume_github_poll_at(dir, now),
+                try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, now),
                 "poll {i} within capacity must be allowed"
             );
         }
         assert!(
-            !try_consume_github_poll_at(dir, now),
+            !try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, now),
             "poll beyond capacity at the same instant must be denied"
         );
     }
@@ -1273,25 +1288,28 @@ mod tests {
 
         let cap = GITHUB_POLL_BUCKET_CAPACITY as u64;
         for _ in 0..cap {
-            assert!(try_consume_github_poll_at(dir, now));
+            assert!(try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, now));
         }
-        assert!(!try_consume_github_poll_at(dir, now), "drained");
+        assert!(
+            !try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, now),
+            "drained"
+        );
 
         // Half a refill interval: still not enough for a whole token.
         now += (GITHUB_POLL_REFILL_SECS as u64) / 2;
         assert!(
-            !try_consume_github_poll_at(dir, now),
+            !try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, now),
             "half a refill interval is < 1 token"
         );
 
         // A full refill interval from the last write: exactly one token back.
         now += GITHUB_POLL_REFILL_SECS as u64;
         assert!(
-            try_consume_github_poll_at(dir, now),
+            try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, now),
             "one refill interval should grant exactly one token"
         );
         assert!(
-            !try_consume_github_poll_at(dir, now),
+            !try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, now),
             "only one token should have refilled"
         );
     }
@@ -1307,6 +1325,7 @@ mod tests {
         // Seed an empty bucket, then jump far into the future.
         write_github_poll_bucket_at(
             dir,
+            NODE_POLL_BUCKET_FILE,
             &GithubPollBucket {
                 tokens: 0.0,
                 updated_unix: now,
@@ -1316,10 +1335,14 @@ mod tests {
 
         let cap = GITHUB_POLL_BUCKET_CAPACITY as u64;
         for _ in 0..cap {
-            assert!(try_consume_github_poll_at(dir, far_future));
+            assert!(try_consume_github_poll_at(
+                dir,
+                NODE_POLL_BUCKET_FILE,
+                far_future
+            ));
         }
         assert!(
-            !try_consume_github_poll_at(dir, far_future),
+            !try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, far_future),
             "refill must be capped at CAPACITY regardless of idle time"
         );
     }
@@ -1330,10 +1353,10 @@ mod tests {
         // cannot be used to reset the limiter to full and bypass it.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        std::fs::write(dir.join(GITHUB_POLL_BUCKET_FILE), "not-a-bucket").unwrap();
+        std::fs::write(dir.join(NODE_POLL_BUCKET_FILE), "not-a-bucket").unwrap();
 
         assert!(
-            !try_consume_github_poll_at(dir, 4_000_000),
+            !try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, 4_000_000),
             "corrupt bucket must deny the poll"
         );
 
@@ -1341,11 +1364,12 @@ mod tests {
         // interval later is allowed again (never a free token from the corrupt
         // state).
         assert!(matches!(
-            read_github_poll_bucket_at(dir),
+            read_github_poll_bucket_at(dir, NODE_POLL_BUCKET_FILE),
             BucketRead::Present(_)
         ));
         assert!(try_consume_github_poll_at(
             dir,
+            NODE_POLL_BUCKET_FILE,
             4_000_000 + GITHUB_POLL_REFILL_SECS as u64
         ));
     }
@@ -1357,9 +1381,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         for bad in ["NaN 100", "inf 100", "-1 100", "5", "5 notanint"] {
-            std::fs::write(dir.join(GITHUB_POLL_BUCKET_FILE), bad).unwrap();
+            std::fs::write(dir.join(NODE_POLL_BUCKET_FILE), bad).unwrap();
             assert_eq!(
-                read_github_poll_bucket_at(dir),
+                read_github_poll_bucket_at(dir, NODE_POLL_BUCKET_FILE),
                 BucketRead::Corrupt,
                 "{bad:?} must read as corrupt"
             );
@@ -1403,23 +1427,31 @@ mod tests {
 
         let cap = GITHUB_POLL_BUCKET_CAPACITY as u64;
         for _ in 0..cap {
-            assert!(try_consume_github_poll_at(dir, t));
+            assert!(try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, t));
         }
-        assert!(!try_consume_github_poll_at(dir, t), "drained at T");
+        assert!(
+            !try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, t),
+            "drained at T"
+        );
 
         // Clock dips back a full refill interval.
         assert!(
-            !try_consume_github_poll_at(dir, t - GITHUB_POLL_REFILL_SECS as u64),
+            !try_consume_github_poll_at(
+                dir,
+                NODE_POLL_BUCKET_FILE,
+                t - GITHUB_POLL_REFILL_SECS as u64
+            ),
             "still empty during the backwards dip"
         );
         // Clock returns to T: must NOT have been credited a token by the dip.
         assert!(
-            !try_consume_github_poll_at(dir, t),
+            !try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, t),
             "returning to T must not grant credit for pre-dip time"
         );
         // A genuine refill interval PAST the high-water mark does grant one token.
         assert!(try_consume_github_poll_at(
             dir,
+            NODE_POLL_BUCKET_FILE,
             t + GITHUB_POLL_REFILL_SECS as u64
         ));
     }
@@ -1431,9 +1463,12 @@ mod tests {
         // a fresh node could never detect an update.
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        assert_eq!(read_github_poll_bucket_at(dir), BucketRead::Missing);
+        assert_eq!(
+            read_github_poll_bucket_at(dir, NODE_POLL_BUCKET_FILE),
+            BucketRead::Missing
+        );
         assert!(
-            try_consume_github_poll_at(dir, 6_000_000),
+            try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, 6_000_000),
             "first poll on a fresh node must be allowed"
         );
     }
@@ -1450,8 +1485,55 @@ mod tests {
             .split_once("reqwest::Client::builder()")
             .expect("client builder not found");
         assert!(
-            head.contains("try_consume_github_poll()"),
+            head.contains("try_consume_node_poll()"),
             "get_latest_version must consume a rate-limit token before hitting GitHub"
+        );
+    }
+
+    #[test]
+    fn test_node_and_install_buckets_are_independent() {
+        // Codex P1: the node and installer must NOT share a bucket. Draining the
+        // node bucket completely must leave the install bucket untouched, so the
+        // node (which always polls first in a restart cycle) can never starve the
+        // supervisor-side installer of the token it needs to actually update.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = 7_500_000u64;
+
+        // Drain the node bucket to empty.
+        let cap = GITHUB_POLL_BUCKET_CAPACITY as u64;
+        for _ in 0..cap {
+            assert!(try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, now));
+        }
+        assert!(
+            !try_consume_github_poll_at(dir, NODE_POLL_BUCKET_FILE, now),
+            "node bucket drained"
+        );
+
+        // The install bucket is still full — the installer is not starved.
+        for _ in 0..cap {
+            assert!(
+                try_consume_github_poll_at(dir, INSTALL_POLL_BUCKET_FILE, now),
+                "install bucket must be unaffected by node-bucket drain"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_latest_release_consults_install_bucket() {
+        // Source pin: the supervisor-side installer fetch must gate on the
+        // SEPARATE install bucket (not the node bucket), so the node cannot
+        // starve it (#4073 Codex P1).
+        let src = include_str!("update.rs");
+        let (_, body) = src
+            .split_once("async fn get_latest_release(")
+            .expect("get_latest_release definition not found");
+        let (head, _) = body
+            .split_once("reqwest::Client::builder()")
+            .expect("client builder not found");
+        assert!(
+            head.contains("try_consume_install_poll()"),
+            "get_latest_release must consume an INSTALL-bucket token before hitting GitHub"
         );
     }
 

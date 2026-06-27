@@ -1044,18 +1044,20 @@ impl Checksums {
 }
 
 async fn get_latest_release(force: bool, quiet: bool) -> Result<Release> {
-    // Global persistent rate limit (#4073): this is the supervisor-side choke
-    // point — the on-crash / on-update `freenet update` one-shot reaches GitHub
-    // through here, and shares the same on-disk token bucket as the node's
-    // in-process `get_latest_version`. Because each `freenet update` is a fresh
-    // process, an in-memory limiter would reset on every restart and not bound a
-    // loop at all; the on-disk bucket holds the limit across restarts.
+    // Persistent rate limit (#4073): this is the supervisor-side choke point —
+    // the on-crash / on-update `freenet update` one-shot reaches GitHub through
+    // here. It uses its OWN on-disk token bucket (the INSTALL bucket), separate
+    // from the node's `get_latest_version` (NODE bucket), so the node — which
+    // always runs first in a restart cycle — can never spend the installer's
+    // tokens and starve a legitimate update. Because each `freenet update` is a
+    // fresh process, an in-memory limiter would reset on every restart and not
+    // bound a loop; the on-disk bucket holds the limit across restarts.
     //
     // `--force` (an explicit operator action) bypasses the limiter. An automated,
     // token-denied poll exits EXIT_CODE_ALREADY_UP_TO_DATE so the supervisor
     // treats it as "nothing to do" and backs off, rather than as a failure that
     // would count toward any lockout.
-    if !force && !super::auto_update::try_consume_github_poll() {
+    if !force && !super::auto_update::try_consume_install_poll() {
         if !quiet {
             eprintln!(
                 "Update check rate-limited (too many recent GitHub polls); skipping this cycle. \
