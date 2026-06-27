@@ -126,6 +126,17 @@ impl NodeProcess {
     ) -> anyhow::Result<Self> {
         let child = Command::new(freenet_bin())
             .arg("network")
+            // This spawns the REAL release-style `freenet` binary as a separate
+            // process. Unlike in-process `#[freenet_test]` nodes (which run from
+            // the cargo `deps/` harness and are auto-suppressed by
+            // `running_under_cargo_test()`), this subprocess runs from
+            // `target/<profile>/freenet` with no `--id`, so neither test signal
+            // fires and telemetry would default ON — POSTing release-tagged
+            // events to the production OTLP collector (#4366 contamination
+            // class). Pin it OFF via the same env the binary reads for the
+            // `telemetry-enabled` flag (config.rs: env = "FREENET_TELEMETRY_ENABLED"),
+            // which is also how freenet-test-network disables it for spawned nodes.
+            .env("FREENET_TELEMETRY_ENABLED", "false")
             .args(["--ws-api-address", "127.0.0.1"])
             .args(["--ws-api-port", &ws_port.to_string()])
             .args(["--network-address", "127.0.0.1"])

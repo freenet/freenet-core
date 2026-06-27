@@ -34,8 +34,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
 
       - name: Compile for x86_64-unknown-linux-musl
-        # Only build freenet and fdev - cdylib crates (contracts) don't support musl
-        run: cargo build --release --target x86_64-unknown-linux-musl -p freenet -p fdev
+        # Build `freenet` and `fdev` in SEPARATE cargo invocations. fdev depends
+        # on `freenet` with `features = ["testing"]`; a combined
+        # `-p freenet -p fdev` build lets Cargo resolver-v2 feature unification
+        # turn `testing` ON for the shipped freenet binary. That silently disabled
+        # telemetry on every release node from 0.2.81 onward (the guard in
+        # crates/core/src/tracing/telemetry.rs used to key suppression on
+        # `cfg!(feature = "testing")`) and pulled in parking_lot/deadlock_detection
+        # overhead. Building freenet first and alone keeps `testing` off the
+        # shipped asset. cdylib crates (contracts) don't support musl, so we still
+        # only build these two crates.
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl -p freenet
+          cargo build --release --target x86_64-unknown-linux-musl -p fdev
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v7
@@ -71,8 +82,13 @@ jobs:
           sudo apt-get install -y musl-tools musl-dev
 
       - name: Compile for aarch64-unknown-linux-musl
-        # Only build freenet and fdev - cdylib crates (contracts) don't support musl
-        run: cargo build --release --target aarch64-unknown-linux-musl -p freenet -p fdev
+        # Separate freenet/fdev invocations to stop fdev's `freenet/testing`
+        # leaking onto the shipped freenet binary (see x86_64 step for the full
+        # rationale — the 0.2.81 telemetry blackout). cdylib crates (contracts)
+        # don't support musl, so we still only build these two crates.
+        run: |
+          cargo build --release --target aarch64-unknown-linux-musl -p freenet
+          cargo build --release --target aarch64-unknown-linux-musl -p fdev
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v7
@@ -109,7 +125,13 @@ jobs:
           # Without this, the binary links to /opt/homebrew/opt/xz/lib/liblzma.5.dylib
           # which doesn't exist on fresh macOS installations
           LZMA_API_STATIC: "1"
-        run: cargo build --release
+        # Build freenet and fdev in SEPARATE cargo invocations (was a bare
+        # `cargo build --release`, which builds the whole workspace incl. fdev and
+        # so unifies fdev's `freenet/testing` onto the shipped freenet binary —
+        # the 0.2.81 telemetry blackout; see x86_64-linux step for full rationale).
+        run: |
+          cargo build --release -p freenet
+          cargo build --release -p fdev
 
       - name: Ad-hoc sign binaries
         run: |
@@ -153,7 +175,12 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
           # Force static linking of liblzma to avoid dependency on Homebrew's xz
           LZMA_API_STATIC: "1"
-        run: cargo build --release --target x86_64-apple-darwin -p freenet -p fdev
+        # Separate freenet/fdev invocations so fdev's `freenet/testing` cannot
+        # leak onto the shipped freenet binary (the 0.2.81 telemetry blackout;
+        # see x86_64-linux step for full rationale).
+        run: |
+          cargo build --release --target x86_64-apple-darwin -p freenet
+          cargo build --release --target x86_64-apple-darwin -p fdev
 
       - name: Ad-hoc sign binaries
         run: |
@@ -192,7 +219,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Compile for x86_64-pc-windows-msvc
-        run: cargo build --release
+        # Build freenet and fdev in SEPARATE cargo invocations (was a bare
+        # `cargo build --release`, which builds the whole workspace incl. fdev and
+        # so unifies fdev's `freenet/testing` onto the shipped freenet binary —
+        # the 0.2.81 telemetry blackout; see x86_64-linux step for full rationale).
+        run: |
+          cargo build --release -p freenet
+          cargo build --release -p fdev
 
       - name: Smoke test
         run: |
