@@ -59,6 +59,12 @@ impl std::fmt::Display for RequestId {
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
+// Field is `pub(crate)` rather than private because the sibling module
+// `client_events::combinator` reads `client_id.0` for tracing fields. Before
+// this type was split out of `client_events.rs`, `combinator` was a child of
+// the module that defined `ClientId` and could see the private field; as a
+// sibling it cannot. `pub(crate)` restores exactly that crate-internal access
+// with no widening beyond the crate boundary.
 pub struct ClientId(pub(crate) usize);
 
 impl From<ClientId> for usize {
