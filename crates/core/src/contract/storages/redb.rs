@@ -263,6 +263,30 @@ impl ReDb {
         f(&txn).map_err(Self::route_redb_error)
     }
 
+    /// Commit a write transaction, routing a poison error to the #4604 recovery
+    /// path. The FIRST backend I/O failure usually surfaces HERE (redb reports it as
+    /// `CommitError::Storage(StorageError::Io)`), on the very op that poisons the
+    /// handle — so catching it at commit triggers the restart immediately instead of
+    /// waiting for the next `begin_write` to trip `PreviousIo`. Unlike the read path,
+    /// commit/begin errors come straight from redb and are never the synthetic
+    /// `Io(InvalidData)` of a malformed row, so it is safe to match `Io` here via
+    /// [`storage_error_is_poison`].
+    fn commit_guarded(txn: WriteTransaction) -> Result<(), redb::Error> {
+        match txn.commit() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let redb::CommitError::Storage(s) = &e {
+                    if storage_error_is_poison(s) {
+                        #[cfg(test)]
+                        POISON_RECOVERY_TRIGGERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        crate::node::abort_process_on_redb_poison(&e.to_string());
+                    }
+                }
+                Err(e.into())
+            }
+        }
+    }
+
     pub async fn new(data_dir: &Path) -> Result<Self, redb::Error> {
         let db_path = data_dir.join("db");
         tracing::info!(
@@ -477,7 +501,7 @@ impl ReDb {
             let mut tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
             tbl.insert(key.as_bytes(), metadata.to_bytes().as_slice())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Get hosting metadata for a contract.
@@ -501,7 +525,7 @@ impl ReDb {
             let mut tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
             tbl.remove(key.as_bytes())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Load all hosting metadata from the database.
@@ -551,7 +575,7 @@ impl ReDb {
             let mut tbl = txn.open_table(STATE_TABLE)?;
             tbl.insert(key.as_bytes(), state.as_ref())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Atomically update a contract's state, failing if no prior state exists.
@@ -576,7 +600,7 @@ impl ReDb {
             }
             tbl.insert(key.as_bytes(), state.as_ref())?;
         }
-        txn.commit()?;
+        Self::commit_guarded(txn)?;
         Ok(true)
     }
 
@@ -623,7 +647,7 @@ impl ReDb {
             let mut tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
             tbl.insert(instance_id.as_ref(), code_hash.as_ref())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Get the CodeHash for a ContractInstanceId
@@ -658,7 +682,7 @@ impl ReDb {
             let mut tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
             tbl.remove(instance_id.as_ref())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Load all contract index entries
@@ -711,7 +735,7 @@ impl ReDb {
             let mut tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
             tbl.insert(key_bytes.as_slice(), code_hash.as_ref())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Get the CodeHash for a DelegateKey
@@ -751,7 +775,7 @@ impl ReDb {
             let mut tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
             tbl.remove(key_bytes.as_slice())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Load all delegate index entries
@@ -807,7 +831,7 @@ impl ReDb {
             let mut tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
             tbl.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Get the secret key hashes for a DelegateKey
@@ -853,7 +877,7 @@ impl ReDb {
             let mut tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
             tbl.remove(key_bytes.as_slice())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Load all secrets index entries
@@ -924,7 +948,7 @@ impl ReDb {
             let mut tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
             tbl.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Get the secret key hashes for a `(DelegateKey, UserId)` pair.
@@ -977,7 +1001,7 @@ impl ReDb {
             let mut tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
             tbl.remove(key_bytes.as_slice())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Load all per-user secrets index entries as
@@ -1055,7 +1079,7 @@ impl ReDb {
             let mut tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
             tbl.insert(instance_id.as_ref(), &[kind_byte][..])?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Remove a persisted broken-invariant flag. Paired with
@@ -1071,7 +1095,7 @@ impl ReDb {
             let mut tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
             tbl.remove(instance_id.as_ref())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     /// Load all persisted broken-invariant flags. Malformed rows (wrong
@@ -1145,7 +1169,7 @@ impl StateStorage for ReDb {
             tbl.insert(key.as_bytes(), metadata.to_bytes().as_slice())?;
         }
 
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
@@ -1168,7 +1192,7 @@ impl StateStorage for ReDb {
             let mut tbl = txn.open_table(CONTRACT_PARAMS_TABLE)?;
             tbl.insert(key.as_bytes(), params.as_ref())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 
     async fn get_params<'a>(
@@ -1200,7 +1224,7 @@ impl StateStorage for ReDb {
             let mut tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
             tbl.remove(key.as_bytes())?;
         }
-        txn.commit().map_err(Into::into)
+        Self::commit_guarded(txn)
     }
 }
 
@@ -1811,20 +1835,28 @@ mod tests {
             "benign not-found / normal ops must NOT take the poison-recovery path"
         );
 
-        // Poison the backend; the next write fails (I/O), and redb latches its
-        // in-memory poison flag (io_failed) — set on ANY backend read/write error.
+        // Poison the backend; the write that triggers the FIRST backend I/O error
+        // (usually at commit) must take the recovery path on the very op that
+        // poisons the handle — not wait for a later op. redb also latches its
+        // in-memory poison flag (io_failed) here, set on ANY backend read/write error.
         backend.start_failing();
+        POISON_RECOVERY_TRIGGERED.store(0, Ordering::SeqCst);
         assert!(
             db.store_state_sync(&key, WrappedState::new(vec![4, 5, 6]))
                 .is_err(),
             "the injected I/O failure must surface as an error"
         );
+        assert!(
+            POISON_RECOVERY_TRIGGERED.load(Ordering::SeqCst) >= 1,
+            "the poisoning write (commit-time I/O error) must take the recovery path \
+             on the same op, not only on a later one"
+        );
 
-        // The database is now poisoned. redb's poison flag is checked by every
+        // The database stays poisoned: redb's poison flag is checked by every
         // `begin_write` (the node writes hosting metadata on essentially every
         // contract op), so the next write returns PreviousIo, which the begin_write
-        // wrapper routes to the recovery (exit-for-restart) path instead of the old
-        // fail-forever behaviour.
+        // wrapper also routes to the recovery (exit-for-restart) path instead of the
+        // old fail-forever behaviour.
         POISON_RECOVERY_TRIGGERED.store(0, Ordering::SeqCst);
         assert!(
             db.store_state_sync(&key, WrappedState::new(vec![7, 8, 9]))
