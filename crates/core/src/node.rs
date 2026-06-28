@@ -1865,30 +1865,33 @@ where
             // depends on the ACTIVE eviction policy, because the gate is only
             // sound if it predicts what eviction will actually do:
             //
-            //  * Interest-tiered eviction ACTIVE
-            //    (FREENET_MODULE_CACHE_INTEREST_TIERED): eviction reclaims COLD
-            //    (no-interest) entries first, so admitting while the cache is full
-            //    of cold modules merely evicts cold ones — no thrash. Here we gate
-            //    on INTERESTED (hot) occupancy. This is the fix: the cache is an
-            //    LRU that fills to ~100% with cold modules even on an idle node,
-            //    so the old raw gate refused migration ~permanently on the small-
-            //    cache majority for no real reason (live 0.2.86: 340/635 small
-            //    nodes refused, all at interested-occ ~0% vs raw ~98%).
+            //  * Interest-tiered eviction ACTIVE (the DEFAULT since the canary
+            //    validation on 2026-06-28; FREENET_MODULE_CACHE_INTEREST_TIERED
+            //    unset or truthy): eviction reclaims COLD (no-interest) entries
+            //    first, so admitting while the cache is full of cold modules
+            //    merely evicts cold ones — no thrash. Here we gate on INTERESTED
+            //    (hot) occupancy. This is the fix: the cache is an LRU that fills
+            //    to ~100% with cold modules even on an idle node, so the old raw
+            //    gate refused migration ~permanently on the small-cache majority
+            //    for no real reason (live 0.2.86: 340/635 small nodes refused, all
+            //    at interested-occ ~0% vs raw ~98%).
             //
-            //  * Plain byte-LRU (DEFAULT): eviction reclaims the absolute LRU
-            //    entry regardless of interest, so admitting into a full cache can
-            //    evict a HOT module and recompile it — exactly the #4534 thrash.
-            //    Cold-evictable headroom is NOT guaranteed to be reclaimed, so the
-            //    interested-occupancy assumption does not hold (Codex review).
-            //    Here we keep gating on RAW occupancy: identical to #4534's
-            //    shipped behavior, so thrash protection is preserved unchanged.
+            //  * Plain byte-LRU (operator opt-out, FREENET_MODULE_CACHE_INTEREST_TIERED=0):
+            //    eviction reclaims the absolute LRU entry regardless of interest,
+            //    so admitting into a full cache can evict a HOT module and
+            //    recompile it — exactly the #4534 thrash. Cold-evictable headroom
+            //    is NOT guaranteed to be reclaimed, so the interested-occupancy
+            //    assumption does not hold (Codex review). Here we keep gating on
+            //    RAW occupancy: identical to #4534's shipped behavior, so thrash
+            //    protection is preserved unchanged.
             //
             // Preserving #4534 thrash protection is the load-bearing invariant, so
             // the gate matches the active policy rather than always trusting the
-            // interested signal. To deliver the over-refusal fix to the default
-            // majority, enable interest-tiered eviction (the gate then activates
-            // the interested signal and is sound); the recovered/recoverable
-            // counter below quantifies the benefit that flip would unlock.
+            // interested signal. With interest-tiered eviction now the default the
+            // over-refusal fix reaches the small-cache majority; an operator who
+            // forces plain byte-LRU keeps the raw gate. The recovered/recoverable
+            // counter below tallies admissions the interested gate recovers
+            // (default) or would recover (opt-out).
             //
             // This gates ONLY the directed-subscribe placement nudge; the node's
             // own local client subscribes/GETs are never gated here. The hint is
@@ -2104,9 +2107,9 @@ struct MigrationAdmission {
 /// comment in `handle_pure_network_message_v1`):
 /// - interest-tiered eviction active → cold entries are reclaimed first, so the
 ///   INTERESTED (hot) occupancy is the right thrash signal (the #4534 fix);
-/// - plain byte-LRU (default) → eviction is interest-blind, so cold-evictable
-///   headroom is not guaranteed to be reclaimed; gating on RAW occupancy keeps
-///   #4534's shipped thrash protection unchanged.
+/// - plain byte-LRU (operator opt-out) → eviction is interest-blind, so
+///   cold-evictable headroom is not guaranteed to be reclaimed; gating on RAW
+///   occupancy keeps #4534's shipped thrash protection unchanged.
 ///
 /// `interest_tiered` is the live eviction policy (the gate passes
 /// [`crate::wasm_runtime::interest_tiered_enabled`]); injected as a parameter so
@@ -2175,11 +2178,11 @@ mod migration_admission_tests {
     ///   on interested occupancy and ADMITS — the over-budget bytes are
     ///   cold-evictable, so admitting only evicts a cold module (no thrash). This
     ///   is the recovered admission.
-    /// - Under plain byte-LRU (`interest_tiered = false`, the DEFAULT) eviction is
-    ///   interest-blind, so cold-evictable headroom is NOT guaranteed to be
-    ///   reclaimed; the gate keys on raw occupancy and REFUSES, exactly as the
-    ///   shipped #4534 gate did — preserving thrash protection on default nodes
-    ///   (Codex review).
+    /// - Under plain byte-LRU (`interest_tiered = false`, the operator opt-out)
+    ///   eviction is interest-blind, so cold-evictable headroom is NOT guaranteed
+    ///   to be reclaimed; the gate keys on raw occupancy and REFUSES, exactly as
+    ///   the shipped #4534 gate did — preserving thrash protection on opted-out
+    ///   nodes (Codex review).
     ///
     /// Drives the exact composition the live gate uses, so a regression that
     /// keyed the tiered branch on raw occupancy (the bug this fixes) would flip
@@ -2199,8 +2202,9 @@ mod migration_admission_tests {
              evicts only a cold module (no thrash)"
         );
 
-        // Plain LRU (default) → raw signal → REFUSE (preserve #4534 on default
-        // nodes; cold-evictable headroom is not guaranteed to be reclaimed).
+        // Plain LRU (operator opt-out) → raw signal → REFUSE (preserve #4534 on
+        // opted-out nodes; cold-evictable headroom is not guaranteed to be
+        // reclaimed).
         let plain = migration_admission_decision(&cold_filled, false);
         assert!(!plain.interest_tiered);
         assert_eq!(
