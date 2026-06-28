@@ -2017,6 +2017,32 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "subscribe_hint_acted".to_string(),
                     serde_json::json!(snapshot.subscribe_hint_acted),
                 );
+                // Per-gate refusal + directed-subscribe outcome breakdown (#4534
+                // diagnostics).
+                obj.insert(
+                    "subscribe_hint_refused_version".to_string(),
+                    serde_json::json!(snapshot.subscribe_hint_refused_version),
+                );
+                obj.insert(
+                    "subscribe_hint_refused_already_hosting".to_string(),
+                    serde_json::json!(snapshot.subscribe_hint_refused_already_hosting),
+                );
+                obj.insert(
+                    "subscribe_hint_refused_holder".to_string(),
+                    serde_json::json!(snapshot.subscribe_hint_refused_holder),
+                );
+                obj.insert(
+                    "subscribe_hint_refused_cache".to_string(),
+                    serde_json::json!(snapshot.subscribe_hint_refused_cache),
+                );
+                obj.insert(
+                    "subscribe_hint_acted_succeeded".to_string(),
+                    serde_json::json!(snapshot.subscribe_hint_acted_succeeded),
+                );
+                obj.insert(
+                    "subscribe_hint_acted_failed".to_string(),
+                    serde_json::json!(snapshot.subscribe_hint_acted_failed),
+                );
                 // Interest-weighted (two-tier) module-cache SHADOW gauges
                 // (#4441/#4534). Inserted here (not as inline `json!` keys) to
                 // keep the macro under its recursion limit, same as the
@@ -2039,8 +2065,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     ),
                 );
                 obj.insert(
-                    "migration_admission_would_change_total".to_string(),
-                    serde_json::json!(snapshot.migration_admission_would_change_total),
+                    "migration_admission_recovered_total".to_string(),
+                    serde_json::json!(snapshot.migration_admission_recovered_total),
                 );
                 // Renewal-terminus short-circuit counter (#4440 proposal 1).
                 obj.insert(
@@ -2232,7 +2258,7 @@ mod tests {
         info.contract_module_cache_cold_evictable_bytes = Some(101);
         info.contract_module_cache_interested_bytes = Some(103);
         info.contract_module_cache_evictions_would_reclassify_total = Some(107);
-        info.migration_admission_would_change_total = Some(109);
+        info.migration_admission_recovered_total = Some(109);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("contract_module_cache_cold_evictable_bytes", 101),
@@ -2241,7 +2267,7 @@ mod tests {
                 "contract_module_cache_evictions_would_reclassify_total",
                 107,
             ),
-            ("migration_admission_would_change_total", 109),
+            ("migration_admission_recovered_total", 109),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
@@ -2298,6 +2324,12 @@ mod tests {
         info.subscribe_hint_received = Some(13);
         info.subscribe_hint_acted = Some(7);
         info.renewal_terminus_satisfied = Some(9);
+        info.subscribe_hint_refused_version = Some(21);
+        info.subscribe_hint_refused_already_hosting = Some(22);
+        info.subscribe_hint_refused_holder = Some(23);
+        info.subscribe_hint_refused_cache = Some(24);
+        info.subscribe_hint_acted_succeeded = Some(25);
+        info.subscribe_hint_acted_failed = Some(26);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosted_contracts_count", 5u64),
@@ -2305,6 +2337,12 @@ mod tests {
             ("subscribe_hint_received", 13),
             ("subscribe_hint_acted", 7),
             ("renewal_terminus_satisfied", 9),
+            ("subscribe_hint_refused_version", 21),
+            ("subscribe_hint_refused_already_hosting", 22),
+            ("subscribe_hint_refused_holder", 23),
+            ("subscribe_hint_refused_cache", 24),
+            ("subscribe_hint_acted_succeeded", 25),
+            ("subscribe_hint_acted_failed", 26),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

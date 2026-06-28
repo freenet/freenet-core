@@ -466,11 +466,16 @@ fn test_subscribe_msg_response_hop_count_roundtrip() {
 }
 
 /// Pin: the inbound `SubscribeHint` arm in `node.rs` MUST consult the
-/// backpressure-aware migration-admission gate (`migration_admission_allowed`)
-/// BEFORE calling `start_directed_subscribe`. Without this gate the node accepts
-/// unbounded placement migration, overruns the module cache, and reproduces the
-/// #4534 "contract queue full" outage / gateway OOM. Anchored from this side so
-/// removing or reordering the gate trips the build.
+/// backpressure-aware migration-admission gate (`migration_admission_decision`,
+/// which keys on INTERESTED module-cache occupancy) BEFORE calling
+/// `start_directed_subscribe`, AND must force a fresh interest-shadow recompute
+/// (`refresh_interest_gauges_now`) BEFORE that gate so the gate reads the
+/// cache's current hot occupancy rather than a throttled (≤10s-stale) gauge that
+/// a burst of hints could over-admit against. Without the gate the node accepts
+/// unbounded placement migration and reproduces the #4534 "contract queue full"
+/// outage / gateway OOM; without the pre-gate refresh a burst silently bypasses
+/// the gate. Anchored from this side so removing or reordering either step trips
+/// the build.
 #[test]
 fn subscribe_hint_arm_gates_migration_on_cache_backpressure() {
     const SOURCE: &str = include_str!("../../node.rs");
@@ -485,13 +490,24 @@ fn subscribe_hint_arm_gates_migration_on_cache_backpressure() {
         + branch_start;
     let window = &SOURCE[branch_start..window_end];
 
-    let gate = window.find("migration_admission_allowed(").expect(
-        "SubscribeHint arm must call `migration_admission_allowed` to gate \
+    let refresh = window.find("refresh_interest_gauges_now(").expect(
+        "SubscribeHint arm must force a fresh gauges-only interest recompute \
+         (`refresh_interest_gauges_now`) so the gate reads current hot occupancy, \
+         not a stale-low throttled gauge a burst could over-admit against (#4534)",
+    );
+    let gate = window.find("migration_admission_decision(").expect(
+        "SubscribeHint arm must call `migration_admission_decision` to gate \
          placement migration on module-cache backpressure (#4534)",
     );
     let subscribe = window
         .find("start_directed_subscribe(")
         .expect("SubscribeHint arm must call `start_directed_subscribe` to act on the hint");
+    assert!(
+        refresh < gate,
+        "the interest-shadow refresh must run BEFORE migration_admission_decision, \
+         else the gate reads a stale hot-occupancy gauge and a burst of hints can \
+         over-admit past the ceiling (#4534)"
+    );
     assert!(
         gate < subscribe,
         "the migration-admission gate must run BEFORE start_directed_subscribe, \

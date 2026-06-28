@@ -1810,6 +1810,10 @@ where
                     "Ignoring inbound SubscribeHint: own version is below the \
                      SubscribeHint re-enable floor (pre-floor peer, wire-compat)"
                 );
+                op_manager
+                    .ring
+                    .placement_migration_metrics()
+                    .record_refused_version_floor();
                 return Ok(());
             }
             // Directed-subscribe placement (#4404): a holder is nudging us to
@@ -1823,6 +1827,10 @@ where
                     ?source_addr,
                     "Received SubscribeHint for an already-hosted contract — ignoring"
                 );
+                op_manager
+                    .ring
+                    .placement_migration_metrics()
+                    .record_refused_already_hosting();
                 return Ok(());
             }
             // `hint.holder` is network-sourced. A legitimate sender always sets
@@ -1844,46 +1852,121 @@ where
                     ?source_addr,
                     "Received SubscribeHint whose holder is not the sender — ignoring"
                 );
+                op_manager
+                    .ring
+                    .placement_migration_metrics()
+                    .record_refused_holder_mismatch();
                 return Ok(());
             }
             // Backpressure-aware migration admission (#4534): refuse to take on
-            // a NEW migrated contract when the contract module cache is already
-            // at/above its occupancy ceiling. Accepting more would push the
-            // hosted working set past cache capacity, forcing recompile-on-
-            // access thrash that fills the fair queue ("contract queue full")
-            // and OOMs memory-bound gateways. This gates ONLY the directed-
-            // subscribe placement nudge; the node's own local client
-            // subscribes/GETs are never gated here. The hint is dropped silently
-            // and the holder re-proposes it on its next migration trigger once
-            // headroom returns.
-            // Read the per-node module-cache occupancy off the same `Ring` the
+            // a NEW migrated contract when the contract module cache lacks the
+            // headroom to host it without recompile thrash (which fills the fair
+            // queue / OOMs memory-bound gateways). The signal the gate keys on
+            // depends on the ACTIVE eviction policy, because the gate is only
+            // sound if it predicts what eviction will actually do:
+            //
+            //  * Interest-tiered eviction ACTIVE
+            //    (FREENET_MODULE_CACHE_INTEREST_TIERED): eviction reclaims COLD
+            //    (no-interest) entries first, so admitting while the cache is full
+            //    of cold modules merely evicts cold ones — no thrash. Here we gate
+            //    on INTERESTED (hot) occupancy. This is the fix: the cache is an
+            //    LRU that fills to ~100% with cold modules even on an idle node,
+            //    so the old raw gate refused migration ~permanently on the small-
+            //    cache majority for no real reason (live 0.2.86: 340/635 small
+            //    nodes refused, all at interested-occ ~0% vs raw ~98%).
+            //
+            //  * Plain byte-LRU (DEFAULT): eviction reclaims the absolute LRU
+            //    entry regardless of interest, so admitting into a full cache can
+            //    evict a HOT module and recompile it — exactly the #4534 thrash.
+            //    Cold-evictable headroom is NOT guaranteed to be reclaimed, so the
+            //    interested-occupancy assumption does not hold (Codex review).
+            //    Here we keep gating on RAW occupancy: identical to #4534's
+            //    shipped behavior, so thrash protection is preserved unchanged.
+            //
+            // Preserving #4534 thrash protection is the load-bearing invariant, so
+            // the gate matches the active policy rather than always trusting the
+            // interested signal. To deliver the over-refusal fix to the default
+            // majority, enable interest-tiered eviction (the gate then activates
+            // the interested signal and is sound); the recovered/recoverable
+            // counter below quantifies the benefit that flip would unlock.
+            //
+            // This gates ONLY the directed-subscribe placement nudge; the node's
+            // own local client subscribes/GETs are never gated here. The hint is
+            // dropped silently and the holder re-proposes it on its next migration
+            // trigger once headroom returns.
+            // Read the per-node module-cache metrics off the same `Ring` the
             // caches publish into (a process-global until #4488).
             let module_cache_metrics = op_manager.ring.module_cache_metrics();
-            let contract_cache_occupancy =
-                crate::wasm_runtime::contract_cache_occupancy_pct(&module_cache_metrics);
-            // SHADOW (always-on, behavior-neutral): record when this refuse/admit
-            // decision WOULD flip under a "admit if cold-evictable cache can make
-            // room" gate. This does NOT change the gate below — it only feeds the
-            // `migration_admission_would_change_total` counter so the later #4534
-            // admission change can rest on production data (#4441/#4534).
-            if crate::wasm_runtime::migration_admission_would_change_now(
-                &module_cache_metrics,
-                MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT,
-            ) {
-                module_cache_metrics.record_migration_admission_would_change();
+            let interest_tiered = crate::wasm_runtime::interest_tiered_enabled();
+            // Force a fresh interested/cold recompute BEFORE reading the gauge —
+            // but ONLY when the gate actually reads the interested gauge (tiered
+            // eviction active). The interested-bytes split is otherwise throttled
+            // to ≤ once per INTEREST_SHADOW_REFRESH_INTERVAL (10 s) on cache
+            // touches, and on an idle node only refreshes at the 5-min
+            // router-snapshot cadence; a burst of SubscribeHints would otherwise
+            // be gated against a stale-low hot-occupancy reading and over-admit,
+            // re-opening the #4534 thrash window (Codex review). The refresh is an
+            // O(entries) scan under the cache mutex, so under plain LRU — where the
+            // gate decision uses RAW occupancy (already fresh, O(1) per
+            // insert/remove) and never reads the interested gauge — we skip it to
+            // avoid paying that per-hint cost for nothing (Codex review). The
+            // refresh makes the gauge reflect the cache's CURRENT resident hot set
+            // at decision time (no-op before the runtime pool is built). It cannot
+            // see migrations still in-flight (admitted but not yet
+            // hosted/compiled), so a tight burst can still overshoot by ~one
+            // migration-completion latency before completed migrations push the hot
+            // set to the ceiling — a bounded, self-correcting residual, not the
+            // unbounded 10-s-stale window. Uses the GAUGES-ONLY refresher: it must
+            // NOT bump the throttle-sampled would-reclassify counter (a burst would
+            // inflate it by hint volume) nor reset that throttle (Codex review).
+            if interest_tiered {
+                module_cache_metrics.refresh_interest_gauges_now();
             }
-            if !migration_admission_allowed(contract_cache_occupancy) {
+            // Recovered/recoverable measurement (#4534): bump BEFORE and
+            // independent of the gate decision below. Counts inbound hints the raw
+            // gate refuses but the interested gate would admit — actually RECOVERED
+            // when interest-tiered eviction is active, or RECOVERABLE (the benefit
+            // a tiered-eviction flip would unlock) when it is not. Kept
+            // UNCONDITIONAL so plain-LRU nodes still record the recoverable benefit
+            // — exactly the data that justifies flipping the eviction policy. This
+            // read is cheap (O(1) atomics, no cache mutex / no scan), so unlike the
+            // refresh above it costs nothing per hint; under plain LRU it reads the
+            // throttled (≤10s-stale) interested gauge, which is fine for a coarse
+            // benefit metric.
+            if crate::wasm_runtime::migration_admission_recovered_now(
+                &module_cache_metrics,
+                MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_INTERESTED_OCCUPANCY_PCT,
+            ) {
+                module_cache_metrics.record_migration_admission_recovered();
+            }
+            let admission = migration_admission_decision(&module_cache_metrics, interest_tiered);
+            if !admission.admit {
                 tracing::debug!(
                     key = %hint.key,
                     holder = %hint.holder,
                     ?source_addr,
-                    occupancy_pct = ?contract_cache_occupancy,
-                    ceiling_pct = MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT,
+                    gate_signal = if admission.interest_tiered {
+                        "interested"
+                    } else {
+                        "raw"
+                    },
+                    occupancy_pct = ?admission.occupancy_pct,
+                    interested_occupancy_pct = ?crate::wasm_runtime::contract_cache_interested_occupancy_pct(
+                        &module_cache_metrics
+                    ),
+                    raw_occupancy_pct = ?crate::wasm_runtime::contract_cache_occupancy_pct(
+                        &module_cache_metrics
+                    ),
+                    ceiling_pct = MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_INTERESTED_OCCUPANCY_PCT,
                     "Refusing inbound SubscribeHint: contract module cache at/above \
                      the migration-admission occupancy ceiling — deferring placement \
-                     migration to bound the hosted working set and avoid cache thrash \
-                     (#4534)"
+                     migration to bound the hosted working set and avoid recompile \
+                     thrash (#4534)"
                 );
+                op_manager
+                    .ring
+                    .placement_migration_metrics()
+                    .record_refused_cache_admission();
                 return Ok(());
             }
             tracing::debug!(
@@ -1964,45 +2047,95 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
 /// Maximum contract-module-cache occupancy (percent of budget) at which this
 /// node still accepts an inbound placement-migration `SubscribeHint` (#4534).
 ///
-/// Above this ceiling, inbound hints are refused so the hosted working set
-/// cannot grow past cache capacity and thrash (module recompile-on-access),
-/// which had filled the contract fair queue and produced client-facing
-/// "contract queue full" outages and gateway OOMs on 0.2.80. The ~10% headroom
-/// below 100% is reserved for the node's own locally-requested contracts, whose
-/// directed subscribes are NOT gated here. Refusal is silent and best-effort:
-/// the holder re-proposes the migration on its next trigger, so placement
-/// migration resumes automatically once occupancy falls back below the ceiling.
+/// The ceiling is applied to whichever occupancy signal
+/// [`migration_admission_decision`] selects for the active eviction policy
+/// (INTERESTED occupancy under interest-tiered eviction, RAW occupancy under
+/// plain byte-LRU). The ~10% headroom below 100% is reserved for the node's own
+/// locally-requested contracts, whose directed subscribes are NOT gated here.
+/// Refusal is silent and best-effort: the holder re-proposes the migration on
+/// its next trigger, so placement migration resumes automatically once occupancy
+/// falls back below the ceiling.
 ///
-/// Recovery is real but NOT guaranteed: occupancy only drops when cold modules
-/// age out of the LRU faster than new ones compile (the recent distinct-module
-/// byte-sum falls below the ceiling). On a node whose hosted working set
-/// genuinely exceeds the cache budget — the exact #4534 scenario — occupancy
-/// stays pinned near 100% and migration is refused INDEFINITELY by design. That
-/// is the correct conservative behavior (it stops the thrash), but it means this
-/// gate is a stopgap, not a complete fix: on such a node the operator must raise
-/// `FREENET_MODULE_CACHE_BUDGET_BYTES` to actually re-enable placement. #4534
-/// stays open for the cache-sizing / offload-compilation / interest-weighted-
-/// retention directions; this constant implements only the "couple migration
-/// acceptance to cache headroom" one.
-const MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT: u64 = 90;
+/// Under interest-tiered eviction the signal is the HOT (interested) working set,
+/// which is self-limiting: as admitted migrations complete and compile in, the
+/// hot set grows until it reaches the ceiling and the node sheds further load —
+/// the #4534 thrash boundary, applied to the set that actually causes thrash. The
+/// gate forces a fresh hot-occupancy read at decision time
+/// (`refresh_interest_gauges_now`), so the only slack is migrations admitted but
+/// not yet hosted/compiled: a tight burst can overshoot by ~one migration-
+/// completion latency before completed migrations pull the gauge to the ceiling.
+/// That residual is bounded and self-correcting (and the producer side of the
+/// migration storm is bounded separately, #4440/#4145); accounting for in-flight,
+/// not-yet-compiled migrations would need a reserved-bytes counter with its own
+/// leak/TTL risk and is deliberately left as a follow-up.
+const MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_INTERESTED_OCCUPANCY_PCT: u64 = 90;
 
-/// Whether to accept an inbound placement-migration hint given the current
-/// contract-module-cache occupancy. `None` (budget gauge not yet published — no
-/// runtime pool built) admits, since there is no pressure signal to act on.
+/// Whether to accept an inbound placement-migration hint given the selected
+/// contract-module-cache occupancy signal. `None` (budget gauge not yet published
+/// — no runtime pool built) admits, since there is no pressure signal to act on.
 ///
 /// Split out as a pure function so the threshold logic is unit-testable without
 /// constructing an `OpManager` or touching the global cache gauges (#4534).
-fn migration_admission_allowed(contract_cache_occupancy_pct: Option<u64>) -> bool {
-    match contract_cache_occupancy_pct {
-        Some(pct) => pct < MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT,
+fn migration_admission_allowed(occupancy_pct: Option<u64>) -> bool {
+    match occupancy_pct {
+        Some(pct) => pct < MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_INTERESTED_OCCUPANCY_PCT,
         None => true,
+    }
+}
+
+/// Outcome of the placement-migration admission gate for the current contract-
+/// cache state. Carries the occupancy value the decision was based on and which
+/// signal was used, both for the refuse-path log.
+struct MigrationAdmission {
+    /// Whether to admit the migration hint.
+    admit: bool,
+    /// Occupancy percent the decision was based on (the selected signal), or
+    /// `None` when the budget gauge is unpublished.
+    occupancy_pct: Option<u64>,
+    /// `true` when interest-tiered eviction is active and the gate used INTERESTED
+    /// occupancy; `false` when it fell back to RAW occupancy under plain LRU.
+    interest_tiered: bool,
+}
+
+/// The placement-migration admission decision for the current contract-cache
+/// state, keyed on the signal that matches the ACTIVE eviction policy.
+///
+/// Soundness depends on predicting what eviction will actually do (see the gate
+/// comment in `handle_pure_network_message_v1`):
+/// - interest-tiered eviction active → cold entries are reclaimed first, so the
+///   INTERESTED (hot) occupancy is the right thrash signal (the #4534 fix);
+/// - plain byte-LRU (default) → eviction is interest-blind, so cold-evictable
+///   headroom is not guaranteed to be reclaimed; gating on RAW occupancy keeps
+///   #4534's shipped thrash protection unchanged.
+///
+/// `interest_tiered` is the live eviction policy (the gate passes
+/// [`crate::wasm_runtime::interest_tiered_enabled`]); injected as a parameter so
+/// the unit tests can pin BOTH policies deterministically without touching the
+/// process environment (`gate_*` tests).
+fn migration_admission_decision(
+    metrics: &crate::wasm_runtime::ModuleCacheMetrics,
+    interest_tiered: bool,
+) -> MigrationAdmission {
+    let occupancy_pct = if interest_tiered {
+        crate::wasm_runtime::contract_cache_interested_occupancy_pct(metrics)
+    } else {
+        crate::wasm_runtime::contract_cache_occupancy_pct(metrics)
+    };
+    MigrationAdmission {
+        admit: migration_admission_allowed(occupancy_pct),
+        occupancy_pct,
+        interest_tiered,
     }
 }
 
 #[cfg(test)]
 mod migration_admission_tests {
     use super::{
-        MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT, migration_admission_allowed,
+        MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_INTERESTED_OCCUPANCY_PCT,
+        migration_admission_allowed, migration_admission_decision,
+    };
+    use crate::wasm_runtime::{
+        ModuleCacheMetrics, contract_cache_interested_occupancy_pct, contract_cache_occupancy_pct,
     };
 
     /// No runtime pool / budget gauge yet → no pressure signal → admit.
@@ -2017,7 +2150,7 @@ mod migration_admission_tests {
     fn admits_below_occupancy_ceiling() {
         assert!(migration_admission_allowed(Some(0)));
         assert!(migration_admission_allowed(Some(
-            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT - 1
+            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_INTERESTED_OCCUPANCY_PCT - 1
         )));
     }
 
@@ -2026,12 +2159,110 @@ mod migration_admission_tests {
     #[test]
     fn refuses_at_or_above_occupancy_ceiling() {
         assert!(!migration_admission_allowed(Some(
-            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT
+            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_INTERESTED_OCCUPANCY_PCT
         )));
         assert!(!migration_admission_allowed(Some(
-            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT + 5
+            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_INTERESTED_OCCUPANCY_PCT + 5
         )));
         assert!(!migration_admission_allowed(Some(150)));
+    }
+
+    /// THE FIX (#4534), and its eviction-policy dependency: a cache that is
+    /// LRU-full of COLD modules (raw occupancy 98%) but whose HOT/interested
+    /// working set is ~empty (0%).
+    ///
+    /// - Under interest-tiered eviction (`interest_tiered = true`) the gate keys
+    ///   on interested occupancy and ADMITS — the over-budget bytes are
+    ///   cold-evictable, so admitting only evicts a cold module (no thrash). This
+    ///   is the recovered admission.
+    /// - Under plain byte-LRU (`interest_tiered = false`, the DEFAULT) eviction is
+    ///   interest-blind, so cold-evictable headroom is NOT guaranteed to be
+    ///   reclaimed; the gate keys on raw occupancy and REFUSES, exactly as the
+    ///   shipped #4534 gate did — preserving thrash protection on default nodes
+    ///   (Codex review).
+    ///
+    /// Drives the exact composition the live gate uses, so a regression that
+    /// keyed the tiered branch on raw occupancy (the bug this fixes) would flip
+    /// the admit assertion and fail.
+    #[test]
+    fn gate_admits_cold_filled_only_under_tiered_eviction() {
+        // raw 980/1000 = 98%, interested 0/1000 = 0%.
+        let cold_filled = ModuleCacheMetrics::with_contract_gauges_for_test(980, 1000, 0);
+
+        // Tiered eviction active → interested signal → ADMIT (the fix).
+        let tiered = migration_admission_decision(&cold_filled, true);
+        assert!(tiered.interest_tiered);
+        assert_eq!(tiered.occupancy_pct, Some(0), "hot set is empty");
+        assert!(
+            tiered.admit,
+            "under tiered eviction a cold-filled cache must ADMIT — admitting \
+             evicts only a cold module (no thrash)"
+        );
+
+        // Plain LRU (default) → raw signal → REFUSE (preserve #4534 on default
+        // nodes; cold-evictable headroom is not guaranteed to be reclaimed).
+        let plain = migration_admission_decision(&cold_filled, false);
+        assert!(!plain.interest_tiered);
+        assert_eq!(
+            plain.occupancy_pct,
+            Some(98),
+            "raw occupancy under plain LRU"
+        );
+        assert!(
+            !plain.admit,
+            "under plain byte-LRU the gate must keep refusing at raw 98% — \
+             admitting could evict a hot module and re-open the #4534 thrash"
+        );
+
+        // Witness the divergence directly via the occupancy helpers.
+        assert_eq!(
+            contract_cache_interested_occupancy_pct(&cold_filled),
+            Some(0)
+        );
+        assert_eq!(contract_cache_occupancy_pct(&cold_filled), Some(98));
+    }
+
+    /// Thrash protection preserved under tiered eviction (#4534): raw occupancy
+    /// 98% AND the HOT/interested set is also near budget (95%) → REFUSE.
+    /// Admitting here would force recompile thrash even with cold-first eviction.
+    #[test]
+    fn gate_refuses_when_hot_set_near_budget_under_tiered() {
+        // raw 980/1000 = 98%, interested 950/1000 = 95%.
+        let hot = ModuleCacheMetrics::with_contract_gauges_for_test(980, 1000, 950);
+        let d = migration_admission_decision(&hot, true);
+        assert_eq!(d.occupancy_pct, Some(95));
+        assert!(
+            !d.admit,
+            "a genuinely hot working set near budget must REFUSE (thrash risk)"
+        );
+    }
+
+    /// Boundary (tiered eviction): interested occupancy exactly at the ceiling
+    /// refuses; one below admits. `None` (unpublished budget) admits under both
+    /// policies.
+    #[test]
+    fn gate_boundary_and_unpublished_budget() {
+        // interested exactly at the ceiling → refuse.
+        let at_ceiling = ModuleCacheMetrics::with_contract_gauges_for_test(1000, 1000, 900);
+        assert_eq!(
+            contract_cache_interested_occupancy_pct(&at_ceiling),
+            Some(MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_INTERESTED_OCCUPANCY_PCT)
+        );
+        assert!(!migration_admission_decision(&at_ceiling, true).admit);
+
+        // interested one below the ceiling → admit (even with raw at 100%).
+        let below = ModuleCacheMetrics::with_contract_gauges_for_test(1000, 1000, 890);
+        assert_eq!(contract_cache_interested_occupancy_pct(&below), Some(89));
+        assert!(migration_admission_decision(&below, true).admit);
+
+        // Unpublished budget gauge → no pressure signal → admit under either
+        // eviction policy.
+        let fresh = ModuleCacheMetrics::new();
+        for tiered in [true, false] {
+            let d = migration_admission_decision(&fresh, tiered);
+            assert_eq!(d.occupancy_pct, None);
+            assert!(d.admit);
+        }
     }
 }
 

@@ -1456,16 +1456,16 @@ impl Ring {
             // Interest-weighted (two-tier) module-cache SHADOW gauges
             // (#4441/#4534): always-on, independent of the
             // FREENET_MODULE_CACHE_INTEREST_TIERED feature flag. They quantify
-            // what the two-tier policy WOULD reclaim/reclassify and how many
-            // migration-admission decisions WOULD change, so flipping the flag
-            // (and the later #4534 admission change) can rest on production data.
+            // what the two-tier policy WOULD reclaim/reclassify; the
+            // migration-admission counter now records actual admissions the
+            // interested-occupancy gate (#4534) RECOVERS versus the old raw gate.
             snapshot.contract_module_cache_cold_evictable_bytes =
                 Some(mc.contract_cold_evictable_bytes);
             snapshot.contract_module_cache_interested_bytes = Some(mc.contract_interested_bytes);
             snapshot.contract_module_cache_evictions_would_reclassify_total =
                 Some(mc.contract_evictions_would_reclassify_total);
-            snapshot.migration_admission_would_change_total =
-                Some(mc.migration_admission_would_change_total);
+            snapshot.migration_admission_recovered_total =
+                Some(mc.migration_admission_recovered_total);
 
             // UPDATE-broadcast stream-assembly failure gauge (#4440): the exact
             // signal that flagged the v0.2.73 incident. The broadcast queue
@@ -1534,6 +1534,15 @@ impl Ring {
             snapshot.subscribe_hint_received = Some(pm.received);
             snapshot.subscribe_hint_acted = Some(pm.acted);
             snapshot.renewal_terminus_satisfied = Some(pm.renewal_terminus_satisfied);
+            // Per-gate refusal + directed-subscribe outcome breakdown (#4534
+            // diagnostics).
+            snapshot.subscribe_hint_refused_version = Some(pm.received_refused_version_floor);
+            snapshot.subscribe_hint_refused_already_hosting =
+                Some(pm.received_refused_already_hosting);
+            snapshot.subscribe_hint_refused_holder = Some(pm.received_refused_holder_mismatch);
+            snapshot.subscribe_hint_refused_cache = Some(pm.received_refused_cache_admission);
+            snapshot.subscribe_hint_acted_succeeded = Some(pm.acted_succeeded);
+            snapshot.subscribe_hint_acted_failed = Some(pm.acted_failed);
 
             tracing::info!(
                 failure_events = snapshot.failure_events,

@@ -109,7 +109,7 @@ const EVICTION_WARN_THRESHOLD: u64 = 16;
 /// The `interest` predicate can flip for an already-cached contract WITHOUT any
 /// cache mutation — e.g. a client disconnects or a downstream lease expires —
 /// so recomputing the split only on insert/remove would leave the gauges (and
-/// the `migration_admission_would_change` floor) stale on a read-mostly cache
+/// the interested-occupancy admission floor) stale on a read-mostly cache
 /// (Codex review). Refreshing on `get` fixes that, but a full O(entries) scan on
 /// every hot lookup is too expensive; the gauges are consumed only at the 5-min
 /// snapshot cadence and at admission-gate time, so bounding the recompute to at
@@ -468,12 +468,30 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
     /// two-tier policy would more often help), which is what the flip decision
     /// needs — not a forensic eviction ledger.
     fn record_interest_shadow(&self) {
-        let Some(metrics) = &self.metrics else {
-            return;
-        };
-        if self.interest.is_none() {
-            return;
+        // Divergence-now: plain LRU would evict the (interested) absolute-LRU
+        // entry while a cold entry exists; two-tier would spare it and evict the
+        // cold one instead. Bumped only on the throttled / per-snapshot cadence
+        // (this method's callers), NOT on the gate's per-hint gauge refresh
+        // (which uses `force_refresh_interest_gauges_only`) — so a burst of
+        // SubscribeHints cannot inflate the counter by hint volume (Codex review).
+        if let Some(true) = self.recompute_interest_split() {
+            if let Some(metrics) = &self.metrics {
+                metrics.add_would_reclassify(self.label, 1);
+            }
         }
+    }
+
+    /// Recompute the cold-evictable / interested byte split and STORE it into the
+    /// gauges, returning `Some(diverged)` — whether the next plain-LRU eviction
+    /// would pick an INTERESTED entry while a COLD one exists (the would-reclassify
+    /// signal). Does the O(entries) scan and the gauge store but has NO counter
+    /// side effects and does NOT touch the throttle window, so callers choose
+    /// whether to bump the monotonic divergence counter. `None` when this cache
+    /// has no metrics sink or no interest predicate (nothing to publish).
+    fn recompute_interest_split(&self) -> Option<bool> {
+        let metrics = self.metrics.as_ref()?;
+        // No interest predicate (delegate / test caches) → nothing to classify.
+        self.interest.as_ref()?;
         let mut cold_evictable_bytes: u64 = 0;
         let mut interested_bytes: u64 = 0;
         let mut any_cold = false;
@@ -492,12 +510,7 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
             lru_is_interested = interested;
         }
         metrics.record_interest_shadow(self.label, cold_evictable_bytes, interested_bytes);
-        // Divergence-now: plain LRU would evict the (interested) absolute-LRU
-        // entry while a cold entry exists; two-tier would spare it and evict the
-        // cold one instead.
-        if lru_is_interested && any_cold {
-            metrics.add_would_reclassify(self.label, 1);
-        }
+        Some(lru_is_interested && any_cold)
     }
 
     /// Track eviction volume and emit a RATE-LIMITED operator warning when the
@@ -592,6 +605,18 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
         self.record_interest_shadow();
     }
 
+    /// Recompute + store the interest gauges ONLY: no would-reclassify counter
+    /// bump and no throttle-window reset. Used by the migration-admission gate,
+    /// which needs a fresh hot-occupancy read per inbound `SubscribeHint` but must
+    /// NOT (a) inflate the throttle-sampled divergence counter by hint volume, nor
+    /// (b) reset the throttle that governs that counter's sampling — either would
+    /// corrupt the divergence signal under a migration burst (Codex review).
+    /// Takes `&self` (the scan and gauge store need no mutation); reached via
+    /// [`ModuleCacheMetrics::refresh_interest_gauges_now`].
+    pub(crate) fn force_refresh_interest_gauges_only(&self) {
+        self.recompute_interest_split();
+    }
+
     /// Mark the interest-shadow throttle as DUE, so the next get/insert/remove
     /// will recompute the gauges regardless of how recently one fired. Test-only,
     /// used to exercise the throttled refresh path deterministically.
@@ -655,22 +680,25 @@ struct CacheGauges {
 pub(crate) struct ModuleCacheMetrics {
     contract: CacheGauges,
     delegate: CacheGauges,
-    /// SHADOW (always-on, flag-independent): lifetime count of placement-
-    /// migration admission decisions where the current ≥90%-occupancy refuse
-    /// gate (#4534) and a hypothetical "admit if there are enough cold-evictable
-    /// bytes to make room" gate WOULD DISAGREE — i.e. the current gate refuses
-    /// but the cold tier could be reclaimed to fit the migration. Published by
-    /// the admission gate at `node.rs` (which has no per-cache handle), so it
-    /// lives at the node level rather than under a cache label. Monotonic; the
-    /// collector differences it across the cadence. The gate's BEHAVIOR is
-    /// unchanged in this PR — this only measures the would-be delta (#4534 is a
-    /// later, data-gated change).
+    /// RECOVERED / RECOVERABLE admissions counter (#4534): lifetime count of
+    /// inbound placement-migration `SubscribeHint`s that the raw-occupancy gate
+    /// refuses but the interested-occupancy gate would admit — a cache LRU-full of
+    /// cold (evictable) modules while its hot/interested working set is well under
+    /// the ceiling. Published by the admission gate at `node.rs` (which has no
+    /// per-cache handle), so it lives at the node level rather than under a cache
+    /// label. Monotonic; the collector differences it across the cadence.
     ///
-    /// UPPER BOUND: the modeled cold-aware gate ignores the bytes the INCOMING
-    /// contract would add once it compiles, so it admits in a superset of the
-    /// cases a real gate would — this counter over-counts the eventual flip rate.
-    /// See [`migration_admission_would_change`] for the full rationale.
-    migration_admission_would_change_total: AtomicU64,
+    /// The live gate keys on the active eviction policy, so the meaning is:
+    /// - interest-tiered eviction ACTIVE → the gate actually admits these, so this
+    ///   is an EXACT tally of RECOVERED admissions (neither the gate nor this
+    ///   model reserves cache room for the incoming contract's own bytes, so the
+    ///   modeled admit condition is byte-for-byte the gate's);
+    /// - plain byte-LRU (DEFAULT) → the gate still refuses on raw occupancy, so
+    ///   this is the count that WOULD be recovered if interest-tiered eviction
+    ///   were enabled — i.e. the data that quantifies the benefit of that flip.
+    ///
+    /// See [`migration_admission_recovered`] for the full rationale.
+    migration_admission_recovered_total: AtomicU64,
     /// Hook that forces a fresh recompute of the contract cache's interest split
     /// (cold-evictable / interested bytes) ON DEMAND. Set once by
     /// `RuntimePool::new` to a closure that locks the contract `ModuleCache` and
@@ -685,6 +713,14 @@ pub(crate) struct ModuleCacheMetrics {
     /// occupancy gauge and the live admission gate stay on the lock-free atomics;
     /// only this O(entries) split is refreshed here, once per snapshot.
     interest_shadow_refresher: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
+    /// Like [`Self::interest_shadow_refresher`] but GAUGES-ONLY: it recomputes and
+    /// stores the interest split WITHOUT bumping the would-reclassify counter or
+    /// resetting the throttle window. Set once by `RuntimePool::new` to a closure
+    /// that calls `force_refresh_interest_gauges_only`. Invoked by the migration-
+    /// admission gate before reading the hot-occupancy gauge, so a burst of
+    /// `SubscribeHint`s gets a fresh read per hint without inflating the
+    /// throttle-sampled divergence counter (Codex review).
+    interest_gauges_refresher: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A point-in-time read of [`ModuleCacheMetrics`] for telemetry emission.
@@ -705,10 +741,10 @@ pub(crate) struct ModuleCacheMetricsSnapshot {
     pub contract_cold_evictable_bytes: u64,
     pub contract_interested_bytes: u64,
     pub contract_evictions_would_reclassify_total: u64,
-    /// SHADOW (always-on): node-level would-change count for the migration
-    /// admission gate (#4534). See
-    /// [`ModuleCacheMetrics::migration_admission_would_change_total`].
-    pub migration_admission_would_change_total: u64,
+    /// Node-level recovered-admissions count for the migration admission gate
+    /// (#4534). See
+    /// [`ModuleCacheMetrics::migration_admission_recovered_total`].
+    pub migration_admission_recovered_total: u64,
 }
 
 impl ModuleCacheMetrics {
@@ -718,8 +754,9 @@ impl ModuleCacheMetrics {
         Self {
             contract: CacheGauges::default(),
             delegate: CacheGauges::default(),
-            migration_admission_would_change_total: AtomicU64::new(0),
+            migration_admission_recovered_total: AtomicU64::new(0),
             interest_shadow_refresher: std::sync::OnceLock::new(),
+            interest_gauges_refresher: std::sync::OnceLock::new(),
         }
     }
 
@@ -745,6 +782,27 @@ impl ModuleCacheMetrics {
     /// test/tool binaries with no WASM runtime.
     pub(crate) fn refresh_interest_shadow_now(&self) {
         if let Some(refresher) = self.interest_shadow_refresher.get() {
+            refresher();
+        }
+    }
+
+    /// Install the on-demand GAUGES-ONLY interest refresher (see the field docs).
+    /// Called once by `RuntimePool::new`; a second call is ignored.
+    pub(crate) fn set_interest_gauges_refresher(&self, refresher: Arc<dyn Fn() + Send + Sync>) {
+        if self.interest_gauges_refresher.set(refresher).is_err() {
+            tracing::debug!(
+                "module-cache interest-gauges refresher already set; ignoring re-registration"
+            );
+        }
+    }
+
+    /// Force a GAUGES-ONLY recompute of the contract cache's interest split, if a
+    /// refresher has been installed: updates the cold/interested gauges WITHOUT
+    /// bumping the would-reclassify counter or resetting the throttle. Invoked by
+    /// the migration-admission gate before reading the hot-occupancy gauge. No-op
+    /// before the runtime pool is built (early startup / test binaries).
+    pub(crate) fn refresh_interest_gauges_now(&self) {
+        if let Some(refresher) = self.interest_gauges_refresher.get() {
             refresher();
         }
     }
@@ -806,11 +864,12 @@ impl ModuleCacheMetrics {
         }
     }
 
-    /// Record one placement-migration admission decision where the current gate
-    /// and the cold-evictable-aware gate WOULD disagree (#4534 shadow). Called
-    /// from the admission gate; does NOT change the gate's behavior. Monotonic.
-    pub(crate) fn record_migration_admission_would_change(&self) {
-        self.migration_admission_would_change_total
+    /// Record one inbound placement-migration `SubscribeHint` that the old
+    /// raw-occupancy gate would have refused but the current interested-
+    /// occupancy gate admits (#4534 recovered admission). Called from the
+    /// admission gate before/independent of the admit decision. Monotonic.
+    pub(crate) fn record_migration_admission_recovered(&self) {
+        self.migration_admission_recovered_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -844,10 +903,33 @@ impl ModuleCacheMetrics {
                 .contract
                 .evictions_would_reclassify_total
                 .load(Ordering::Relaxed),
-            migration_admission_would_change_total: self
-                .migration_admission_would_change_total
+            migration_admission_recovered_total: self
+                .migration_admission_recovered_total
                 .load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+impl ModuleCacheMetrics {
+    /// Test-only: build a sink with the contract cache's total, budget, and
+    /// interested gauges pre-set, so admission-gate tests in OTHER modules (e.g.
+    /// `node.rs`) can exercise the occupancy helpers without constructing a real
+    /// `ModuleCache`/`RuntimePool`. Cold-evictable bytes are derived as
+    /// `total - interested` to keep the split self-consistent.
+    pub(crate) fn with_contract_gauges_for_test(
+        total_bytes: u64,
+        budget_bytes: u64,
+        interested_bytes: u64,
+    ) -> Self {
+        let m = Self::new();
+        m.record_occupancy("contract", 0, total_bytes as usize, budget_bytes as usize);
+        m.record_interest_shadow(
+            "contract",
+            total_bytes.saturating_sub(interested_bytes),
+            interested_bytes,
+        );
+        m
     }
 }
 
@@ -884,6 +966,47 @@ pub(crate) fn contract_cache_occupancy_pct(metrics: &ModuleCacheMetrics) -> Opti
     )
 }
 
+/// Contract-module-cache INTERESTED (hot working-set) occupancy as a percentage
+/// of the configured byte budget — the signal the placement-migration admission
+/// gate (#4534) actually gates on (see the gate at `node.rs`).
+///
+/// Mirrors [`contract_cache_occupancy_pct`] but over `contract_interested_bytes`
+/// (resident modules the node still has a client/downstream interest in) instead
+/// of `contract_total_bytes` (every resident module, including cold evictable
+/// ones). Same `None`-on-zero-budget semantics: `None` when the budget gauge has
+/// not been published yet (no WASM runtime pool built), which callers treat as
+/// "no pressure signal".
+///
+/// Why the gate uses THIS rather than raw occupancy: the module cache is an LRU
+/// that, in steady state, fills to ~100% with cold modules a node executed once
+/// and never reclaims until something needs the room. Raw occupancy is therefore
+/// ~98% on the small-cache majority even when the hot set is near-zero, which
+/// made the raw-occupancy gate refuse migration ~permanently for no real reason.
+/// The thrash #4534 guards against (recompile-on-access) only happens when the
+/// HOT/interested working set exceeds the budget — admitting a migration while
+/// there is cold-evictable headroom merely evicts a cold module, no recompile
+/// thrash. Gating on interested occupancy refuses exactly when there is real
+/// thrash risk and admits otherwise.
+///
+/// Freshness: the underlying `contract_interested_bytes` gauge is recomputed on
+/// the throttled cache get/insert/remove paths (≤ once per
+/// [`INTEREST_SHADOW_REFRESH_INTERVAL`] = 10 s) and on demand before each 5-min
+/// `router_snapshot`, so a bare read can be up to ~10 s stale (longer on an idle
+/// node). The migration-admission gate therefore calls
+/// [`ModuleCacheMetrics::refresh_interest_gauges_now`] IMMEDIATELY before reading
+/// this, so at gate time the value reflects the cache's CURRENT resident hot set
+/// — important so a burst of `SubscribeHint`s cannot be admitted against a
+/// stale-low reading. The only residual lag is migrations that are admitted but
+/// not yet hosted/compiled (they have not consumed cache yet), which the gate
+/// accounts for as they complete.
+pub(crate) fn contract_cache_interested_occupancy_pct(metrics: &ModuleCacheMetrics) -> Option<u64> {
+    let snapshot = metrics.snapshot();
+    occupancy_pct(
+        snapshot.contract_interested_bytes,
+        snapshot.contract_budget_bytes,
+    )
+}
+
 /// Pure occupancy-percent computation, split out so the threshold arithmetic is
 /// unit-testable without touching the process-global gauges. `None` when
 /// `budget_bytes == 0` (gauge uninitialized): with no known budget there is no
@@ -897,34 +1020,31 @@ fn occupancy_pct(total_bytes: u64, budget_bytes: u64) -> Option<u64> {
     Some(total_bytes.saturating_mul(100) / budget_bytes)
 }
 
-/// SHADOW (always-on, behavior-neutral): would the current ≥`ceiling_pct`-
-/// occupancy migration-admission refuse (#4534) flip to ADMIT under a
-/// hypothetical "admit if there's enough cold-evictable cache to make room"
-/// gate? Returns `true` only when the two gates DISAGREE for this snapshot:
-/// the current gate refuses (occupancy at/above the ceiling) **and** the
-/// cold-aware gate would admit because dropping all cold-evictable bytes would
-/// pull occupancy below the ceiling (i.e. the protected interested floor alone
-/// fits under it).
+/// RECOVERED / RECOVERABLE ADMISSION (#4534): would a raw-occupancy gate REFUSE
+/// this snapshot while an interested-occupancy gate ADMITS it? Returns `true`
+/// only when the two disagree in that direction: raw occupancy is at/above
+/// `ceiling_pct` (raw gate refuses) **and** the interested (hot) occupancy is
+/// below `ceiling_pct` (interested gate admits because the over-budget bytes are
+/// all cold-evictable, so — under cold-first eviction — admitting only evicts a
+/// cold module, no recompile thrash).
 ///
-/// Pure (snapshot in, bool out) so it is unit-testable and so the live gate at
-/// `node.rs` can call it without changing its own behavior — it only feeds the
-/// `migration_admission_would_change_total` shadow counter. `None` budget means
-/// no pressure signal, so the gates cannot disagree (current gate already
-/// admits): returns `false`.
+/// Pure (snapshot fields in, bool out) so it is unit-testable and so the live
+/// gate at `node.rs` can call it to bump the
+/// `migration_admission_recovered_total` counter. `None` budget means no
+/// pressure signal, so neither gate refuses and there is nothing to recover:
+/// returns `false`.
 ///
-/// # This is an UPPER BOUND on the real gate's flip rate
+/// # Exactness depends on the active eviction policy
 ///
-/// The hypothetical cold-aware gate modeled here checks only whether the
-/// *interested floor* fits under the ceiling — it does NOT account for the bytes
-/// the INCOMING migrated contract would itself add to the cache once it compiles.
-/// A real "admit if cold-evictable can make room" gate would have to leave room
-/// for the newcomer too, so it would admit in a STRICT SUBSET of the cases this
-/// function flags. Therefore the resulting `migration_admission_would_change_total`
-/// counter OVER-counts: it is an upper bound on how often the eventual #4534
-/// admission change would actually flip a decision. That is the safe direction
-/// for a shadow metric used to size a future change (it never hides flip
-/// pressure), and it is called out in the field rustdoc and the PR body.
-fn migration_admission_would_change(
+/// The interested-occupancy admit condition modeled here (`interested < ceiling`)
+/// is byte-for-byte the interested-gate's admit condition — neither reserves
+/// cache room for the incoming contract's own bytes. When interest-tiered
+/// eviction is ACTIVE the live gate uses exactly that condition, so this is an
+/// EXACT tally of RECOVERED admissions. When the cache evicts with plain LRU
+/// (the default) the live gate still refuses on raw occupancy, so this is the
+/// RECOVERABLE count — what a tiered-eviction flip would unlock — rather than
+/// admissions that happened. Either way it never over-counts the recoverable set.
+fn migration_admission_recovered(
     total_bytes: u64,
     interested_bytes: u64,
     budget_bytes: u64,
@@ -933,28 +1053,29 @@ fn migration_admission_would_change(
     let Some(occupancy) = occupancy_pct(total_bytes, budget_bytes) else {
         return false;
     };
-    let current_refuses = occupancy >= ceiling_pct;
-    // The cold-aware gate keeps only the interested floor; everything else is
-    // cold-evictable. It would admit when that floor's occupancy is below the
-    // ceiling — i.e. there is enough cold cache to reclaim to make room.
-    let cold_aware_admits = match occupancy_pct(interested_bytes, budget_bytes) {
-        Some(floor_pct) => floor_pct < ceiling_pct,
+    let old_raw_gate_refused = occupancy >= ceiling_pct;
+    // The current gate admits when the interested (hot) occupancy is below the
+    // ceiling — i.e. the over-budget bytes are all cold-evictable, so there is
+    // enough cold cache to reclaim to make room without recompile thrash.
+    let new_interested_gate_admits = match occupancy_pct(interested_bytes, budget_bytes) {
+        Some(interested_pct) => interested_pct < ceiling_pct,
         None => false,
     };
-    current_refuses && cold_aware_admits
+    old_raw_gate_refused && new_interested_gate_admits
 }
 
-/// Snapshot-driven wrapper over [`migration_admission_would_change`] for the
-/// live admission gate. Reads the contract cache's total / interested bytes and
-/// budget from `metrics` and reports whether the current ≥`ceiling_pct` refuse
-/// would flip to admit under the cold-evictable-aware policy. Behavior-neutral —
-/// callers use this ONLY to bump the shadow counter, never to gate.
-pub(crate) fn migration_admission_would_change_now(
+/// Snapshot-driven wrapper over [`migration_admission_recovered`] for the live
+/// admission gate. Reads the contract cache's total / interested bytes and budget
+/// from `metrics` and reports whether the old raw-occupancy gate would have
+/// refused a hint the current interested-occupancy gate admits — i.e. a recovered
+/// admission. The gate calls this to bump `migration_admission_recovered_total`
+/// before and independent of its own admit decision.
+pub(crate) fn migration_admission_recovered_now(
     metrics: &ModuleCacheMetrics,
     ceiling_pct: u64,
 ) -> bool {
     let s = metrics.snapshot();
-    migration_admission_would_change(
+    migration_admission_recovered(
         s.contract_total_bytes,
         s.contract_interested_bytes,
         s.contract_budget_bytes,
@@ -1891,12 +2012,16 @@ mod tests {
     /// Env READ-PATH: `with_label_and_interest` consults `interest_tiered_enabled()`
     /// (the live env var) to decide whether the two-tier policy is active. With the
     /// var set truthy the constructed contract cache is tiered; unset it is not.
-    /// Serialized via a process-wide guard and the prior value is restored, since
-    /// the environment is process-global.
+    /// The prior value is restored at the end. Cross-test isolation comes from
+    /// `cargo nextest` (CI runs each test in its own process); the local guard
+    /// below only serializes this test against its own re-entry.
     #[test]
     fn interest_tiered_enabled_reads_env_at_construction() {
         use std::sync::Mutex as StdMutex;
-        // Serialize against any other test that might touch this same env var.
+        // Serialize this test against its own re-entry. NOTE: this is function-
+        // local, so it does NOT serialize against other env-mutating tests in the
+        // same binary — the real cross-test isolation is nextest's per-process
+        // model (see the SAFETY note on the first `set_var` below).
         static ENV_GUARD: StdMutex<()> = StdMutex::new(());
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -1904,7 +2029,14 @@ mod tests {
         let interested = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let pred = || interest_over(interested.clone());
 
-        // SAFETY: single-threaded within this serialized test; restored below.
+        // SAFETY: `set_var`/`remove_var` are unsound only under CONCURRENT env
+        // access. CI runs these lib tests under `cargo nextest`, which executes
+        // each test in its own process, so nothing else mutates `environ` while
+        // this test runs; the prior value is restored at the end. (The
+        // function-local `ENV_GUARD` only serializes this test against its own
+        // re-entry, NOT against other env-mutating tests in the binary, so under
+        // a plain multi-threaded `cargo test` this is best-effort — nextest's
+        // per-process isolation is the real guarantee.)
         unsafe { std::env::set_var(INTEREST_TIERED_ENV, "true") };
         let on =
             ModuleCache::<u64, ()>::with_label_and_interest(10, "contract", None, Some(pred()));
@@ -1913,6 +2045,8 @@ mod tests {
             "flag set truthy → tiered policy active"
         );
 
+        // SAFETY: as on the first `set_var` above — nextest runs this test in its
+        // own process (no concurrent env mutation); value restored at the end.
         unsafe { std::env::remove_var(INTEREST_TIERED_ENV) };
         let off =
             ModuleCache::<u64, ()>::with_label_and_interest(10, "contract", None, Some(pred()));
@@ -1922,6 +2056,8 @@ mod tests {
         );
 
         // A predicate-less cache is never tiered regardless of the env.
+        // SAFETY: as on the first `set_var` above — nextest per-process isolation;
+        // value restored at the end.
         unsafe { std::env::set_var(INTEREST_TIERED_ENV, "true") };
         let none: ModuleCache<u64, ()> =
             ModuleCache::with_label_and_interest(10, "contract", None, None);
@@ -1932,7 +2068,11 @@ mod tests {
 
         // Restore the prior environment.
         match prev {
+            // SAFETY: as on the first `set_var` above — nextest per-process
+            // isolation; this restores the original value.
             Some(v) => unsafe { std::env::set_var(INTEREST_TIERED_ENV, v) },
+            // SAFETY: as on the first `set_var` above — nextest per-process
+            // isolation; this restores the original (unset) value.
             None => unsafe { std::env::remove_var(INTEREST_TIERED_ENV) },
         }
     }
@@ -2354,37 +2494,57 @@ mod tests {
         assert_eq!(s.contract_interested_bytes, 0);
     }
 
-    /// `migration_admission_would_change`: the gates disagree ONLY when the
-    /// current gate refuses (occupancy ≥ ceiling) AND dropping all cold-evictable
-    /// bytes would pull the interested floor below the ceiling.
+    /// `contract_cache_interested_occupancy_pct`: interested bytes over budget,
+    /// `None` on an unpublished (zero) budget, and independent of raw occupancy.
     #[test]
-    fn migration_admission_would_change_logic() {
-        const CEIL: u64 = 90;
-        // Over the ceiling but the interested floor alone is well under it →
-        // cold-aware gate would admit → the gates DISAGREE.
-        assert!(migration_admission_would_change(
-            /* total */ 950, /* interested */ 100, /* budget */ 1000, CEIL
-        ));
-        // Over the ceiling AND the interested floor alone is still over it →
-        // even the cold-aware gate refuses → the gates AGREE.
-        assert!(!migration_admission_would_change(950, 950, 1000, CEIL));
-        // Under the ceiling → current gate already admits → no disagreement.
-        assert!(!migration_admission_would_change(500, 100, 1000, CEIL));
-        // Budget uninitialized → no pressure signal → no disagreement.
-        assert!(!migration_admission_would_change(950, 100, 0, CEIL));
-        // Exactly at the ceiling counts as a refuse; floor under it → disagree.
-        assert!(migration_admission_would_change(900, 100, 1000, CEIL));
+    fn contract_cache_interested_occupancy_pct_reads_interested_over_budget() {
+        // raw occupancy 98% (980/1000) but only 30% of budget is hot (300/1000).
+        let m = ModuleCacheMetrics::with_contract_gauges_for_test(980, 1000, 300);
+        assert_eq!(contract_cache_interested_occupancy_pct(&m), Some(30));
+        // The raw gauge is independent and much higher — this is the whole point.
+        assert_eq!(contract_cache_occupancy_pct(&m), Some(98));
+
+        // No interest at all → 0% even though the cache is nearly full of cold.
+        let cold = ModuleCacheMetrics::with_contract_gauges_for_test(980, 1000, 0);
+        assert_eq!(contract_cache_interested_occupancy_pct(&cold), Some(0));
+
+        // Unpublished budget gauge → None (no pressure signal), same as the raw
+        // helper.
+        let fresh = ModuleCacheMetrics::new();
+        assert_eq!(contract_cache_interested_occupancy_pct(&fresh), None);
     }
 
-    /// The node-level migration-admission would-change counter is monotonic and
+    /// `migration_admission_recovered`: flags exactly the snapshots the old
+    /// raw-occupancy gate refused but the new interested-occupancy gate admits.
+    #[test]
+    fn migration_admission_recovered_logic() {
+        const CEIL: u64 = 90;
+        // Raw over the ceiling but the interested set alone is well under it →
+        // old gate refused, new gate admits → RECOVERED.
+        assert!(migration_admission_recovered(
+            /* total */ 950, /* interested */ 100, /* budget */ 1000, CEIL
+        ));
+        // Raw over the ceiling AND the interested set is still over it → both
+        // gates refuse → not recovered (thrash protection preserved).
+        assert!(!migration_admission_recovered(950, 950, 1000, CEIL));
+        // Raw under the ceiling → old gate already admitted → nothing to recover.
+        assert!(!migration_admission_recovered(500, 100, 1000, CEIL));
+        // Budget uninitialized → no pressure signal → nothing to recover.
+        assert!(!migration_admission_recovered(950, 100, 0, CEIL));
+        // Raw exactly at the ceiling counts as the old refuse; interested under
+        // it → recovered.
+        assert!(migration_admission_recovered(900, 100, 1000, CEIL));
+    }
+
+    /// The node-level migration-admission recovered counter is monotonic and
     /// surfaces in the snapshot.
     #[test]
-    fn migration_admission_would_change_counter_accumulates() {
+    fn migration_admission_recovered_counter_accumulates() {
         let m = ModuleCacheMetrics::new();
-        assert_eq!(m.snapshot().migration_admission_would_change_total, 0);
-        m.record_migration_admission_would_change();
-        m.record_migration_admission_would_change();
-        assert_eq!(m.snapshot().migration_admission_would_change_total, 2);
+        assert_eq!(m.snapshot().migration_admission_recovered_total, 0);
+        m.record_migration_admission_recovered();
+        m.record_migration_admission_recovered();
+        assert_eq!(m.snapshot().migration_admission_recovered_total, 2);
     }
 
     /// The on-demand interest-shadow refresher (the headline Arc-cycle fix):
