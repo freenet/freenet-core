@@ -752,14 +752,28 @@ impl RelayState {
                     self.request.uphill_budget = self.request.uphill_budget.saturating_sub(1);
                     actions.forward = Some((peer, fwd_req));
                 } else {
-                    // Terminus, at capacity, no uphill peers left: last resort is
-                    // the transient over-cap bootstrap reserve before rejecting.
-                    self.reserve_or_reject(
-                        ctx,
-                        joiner_known.as_ref(),
-                        &mut actions,
-                        "no uphill peers available",
+                    // Terminus, at capacity, no UNVISITED uphill peer to forward
+                    // to. This is NOT the cold-start dead zone the reserve targets:
+                    // "no uphill peer" means this relay simply has no unvisited
+                    // uphill neighbour right now (common in small / sparse networks
+                    // where the joiner exhausts the local neighbourhood after only
+                    // a couple of hops), not that the joiner has genuinely traversed
+                    // a saturated network. Admitting an over-cap reserve here
+                    // over-connects small topologies for no dead-zone reason — a
+                    // single such admission collapses sparse small-world relay
+                    // paths. The genuine dead zone — a joiner that has spent its
+                    // whole uphill budget bouncing across saturated acceptors — is
+                    // handled by the reserve in the `uphill budget exhausted` branch
+                    // below. Here we simply reject so the CONNECT's own retry/backoff
+                    // can re-probe.
+                    tracing::info!(
+                        target = %self.request.desired_location,
+                        ttl = self.request.ttl,
+                        uphill_budget = self.request.uphill_budget,
+                        visited = ?self.request.visited,
+                        "connect: at terminus, cannot accept, no uphill peers available — rejecting"
                     );
+                    actions.rejected = true;
                 }
             } else {
                 // Terminus, at capacity, uphill budget or TTL exhausted: last
@@ -2417,7 +2431,12 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 2,
                 visited: VisitedPeers::default(),
-                uphill_budget: DEFAULT_UPHILL_BUDGET,
+                // Uphill budget fully spent: the joiner has genuinely traversed a
+                // saturated region (the real cold-start dead zone). This is the
+                // branch the bootstrap reserve serves; "no unvisited uphill peer"
+                // (budget still > 0) is a sparse/small-net signal that rejects
+                // instead — see `handle_request`.
+                uphill_budget: 0,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -2428,7 +2447,7 @@ mod tests {
     }
 
     /// #4362: at a terminus where the joiner has exhausted every normal acceptor
-    /// (normal accept refused, no uphill peer), the relay accepts into the
+    /// (normal accept refused, uphill budget spent), the relay accepts into the
     /// transient over-capacity bootstrap reserve instead of rejecting.
     #[test]
     fn relay_accepts_into_bootstrap_reserve_at_exhausted_terminus() {
@@ -2490,6 +2509,46 @@ mod tests {
         assert!(
             actions.rejected,
             "reserve unavailable must fall back to the original reject path"
+        );
+        assert!(!state.accepted_locally);
+    }
+
+    /// #4362: at a terminus where the joiner still has uphill budget but there is
+    /// simply no UNVISITED uphill peer to forward to (the sparse/small-network
+    /// case), the relay must REJECT — it must NOT admit a bootstrap-reserve
+    /// over-cap connection. The reserve is only for genuine traversal exhaustion
+    /// (uphill budget spent); admitting on a mere local out-of-peers densifies
+    /// small topologies and breaks sparse small-world routing.
+    #[test]
+    fn relay_rejects_at_terminus_when_no_uphill_peer_but_budget_remains() {
+        let self_loc = make_peer(4302);
+        let joiner = make_peer(5302);
+        let mut state = exhausted_terminus_state(&joiner);
+        // Budget still available, but no uphill hop will be offered below.
+        state.request.uphill_budget = DEFAULT_UPHILL_BUDGET;
+
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .next_hop(None)
+            .uphill_hop(None)
+            // Even though the reserve WOULD accept, the no-uphill-peer branch must
+            // not consult it.
+            .bootstrap_reserve_accept(true);
+        let actions = state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        );
+
+        assert!(
+            actions.accept.is_none(),
+            "no-uphill-peer (budget remaining) must not admit a bootstrap reserve"
+        );
+        assert!(
+            actions.rejected,
+            "no-uphill-peer (budget remaining) must reject, not reserve"
         );
         assert!(!state.accepted_locally);
     }

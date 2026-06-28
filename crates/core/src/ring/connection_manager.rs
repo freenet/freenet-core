@@ -782,6 +782,32 @@ impl ConnectionManager {
             .filter(|(_, (_, created))| now.duration_since(*created) <= PENDING_RESERVATION_TTL)
             .count();
 
+        // SATURATION GATE (#4362): the reserve exists ONLY to break the cold-start
+        // dead zone — where a joiner has exhausted every acceptor because they are
+        // all genuinely AT CAPACITY (saturated gateways/peers terminus-rejecting
+        // with nowhere left to route). If this node still has normal capacity
+        // (speculative open + reserved < max_connections), the normal accept path
+        // (`should_accept`) rejected this joiner for TOPOLOGY reasons (Kleinberg
+        // gap filter / already-connected), NOT for saturation. Admitting here would
+        // densify the topology BELOW max_connections with exactly the connections
+        // `should_accept` deliberately declined — over-connecting sparse networks
+        // and breaking small-world routing. Decline so the joiner keeps routing to
+        // a better-positioned, genuinely-saturated acceptor. This also guarantees
+        // every reserve admission is a true OVER-cap connection, so the
+        // over-capacity topology prune can reclaim it deterministically.
+        if open.saturating_add(reserved_before) < self.max_connections {
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                open,
+                reserved_before,
+                max_connections = self.max_connections,
+                "should_accept_bootstrap_reserve: node has spare normal capacity \
+                 (rejected for topology, not saturation); declining reserve"
+            );
+            return false;
+        }
+
         let reserve = self.bootstrap_reserve();
         let ceiling = self.max_connections.saturating_add(reserve);
         // Use the speculative total (open + live reservations) for the
