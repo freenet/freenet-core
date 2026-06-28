@@ -43,6 +43,30 @@ pub(crate) fn state_hash(state: &WrappedState) -> u64 {
     hasher.finish()
 }
 
+/// A cheap, cloneable handle to a [`StateStore`]'s state-change detector, for
+/// the contract-state write paths that BYPASS `StateStore` and must still
+/// invalidate it — specifically the V2 delegate writes
+/// (`put_contract_state_sync` / `update_contract_state_sync`), which write
+/// through the raw `Storage` and never call `StateStore::{store,update}`.
+///
+/// Obtained via [`StateStore::change_detector`] and wired into the runtime's
+/// `state_write_callback`. Cloning shares the underlying cache (moka is
+/// internally `Arc`), so an invalidation through the handle is observed by every
+/// executor reading the detector.
+#[derive(Clone)]
+pub(crate) struct StateChangeDetector {
+    cache: MokaCache<ContractKey, u64>,
+}
+
+impl StateChangeDetector {
+    /// Invalidate the detector entry for `key` after a state write made outside
+    /// `StateStore`. Mirrors the invalidation `StateStore::{store,update,delete}`
+    /// do for in-store writes; see [`StateStore::state_hash_cache`].
+    pub(crate) fn invalidate(&self, key: &ContractKey) {
+        self.cache.invalidate(key);
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum StateStoreError {
     #[error(transparent)]
@@ -120,12 +144,18 @@ pub struct StateStore<S: StateStorage> {
     ///
     ///   the entry is either ABSENT or equal to `state_hash(state on disk)`.
     ///
-    /// It is maintained by exactly two kinds of operation, both of which funnel
-    /// through this `StateStore`, the single chokepoint for every contract-state
-    /// write:
-    ///   * any write — [`store`](Self::store), [`update`](Self::update),
-    ///     [`delete`](Self::delete) — INVALIDATES the entry, so a changed state
-    ///     can never be served against a stale hash.
+    /// It is maintained by three kinds of operation:
+    ///   * any write through this `StateStore` — [`store`](Self::store),
+    ///     [`update`](Self::update), [`delete`](Self::delete) — INVALIDATES the
+    ///     entry, so a changed state can never be served against a stale hash.
+    ///   * V2 delegate state writes (`put_contract_state_sync` /
+    ///     `update_contract_state_sync`) write directly through the raw
+    ///     `Storage`, BYPASSING `StateStore`, so they invalidate the entry via a
+    ///     [`StateChangeDetector`] handle wired into the runtime's
+    ///     `state_write_callback` (see `Runtime::set_state_write_callback` and
+    ///     the callback installers in `executor/runtime.rs`). Without this a V2
+    ///     write would leave a stale detector hash → stale summary/delta →
+    ///     divergence (caught by Codex review).
     ///   * the summarize/delta slow path re-POPULATES it after loading the
     ///     current state (via [`cache_state_hash`](Self::cache_state_hash)).
     ///
@@ -199,6 +229,15 @@ where
         MokaCache::builder()
             .max_capacity(STATE_HASH_CACHE_CAPACITY)
             .build()
+    }
+
+    /// A cloneable handle to this store's state-change detector, for the V2
+    /// delegate write path which bypasses `StateStore` (see
+    /// [`StateChangeDetector`]). Wired into the runtime's `state_write_callback`.
+    pub(crate) fn change_detector(&self) -> StateChangeDetector {
+        StateChangeDetector {
+            cache: self.state_hash_cache.clone(),
+        }
     }
 
     /// Cheap read of the change-detector: the hash of `key`'s currently-stored
@@ -1141,6 +1180,30 @@ mod tests {
             store.cached_state_hash(&key),
             None,
             "delete() must invalidate the detector"
+        );
+    }
+
+    /// The V2-bypass handle ([`StateChangeDetector`]) invalidates the same
+    /// detector the summarize/delta fast path reads. This is the mechanism the
+    /// runtime's `state_write_callback` uses so V2 delegate writes — which
+    /// bypass `StateStore` — cannot leave a stale detector hash.
+    #[tokio::test]
+    async fn change_detector_handle_invalidates_cached_hash() {
+        let mock_storage = MockStateStorage::new();
+        let store = StateStore::new_uncached(mock_storage);
+        let key = make_test_key();
+
+        store.cache_state_hash(key, 7);
+        assert_eq!(store.cached_state_hash(&key), Some(7));
+
+        // A write through the bypass handle must clear the entry, exactly like an
+        // in-store write (store/update/delete) does.
+        let detector = store.change_detector();
+        detector.invalidate(&key);
+        assert_eq!(
+            store.cached_state_hash(&key),
+            None,
+            "change_detector().invalidate must clear the detector the fast path reads"
         );
     }
 
