@@ -91,7 +91,7 @@ If you ran any client that explicitly constructed `RegisterDelegate {
 cipher: custom, .. }` against a freenet-core ≤ 0.2.60 node, restore
 the secrets dir from a pre-upgrade backup, decrypt with the custom
 cipher manually (the on-disk format is documented in
-`crates/core/src/wasm_runtime/secrets_store.rs::decrypt_secret_blob`),
+`crates/core/src/wasm_runtime/secrets_store/store.rs::decrypt_secret_blob`),
 and re-upload via the post-#4146 client API. The HKDF derivation will
 produce a new DEK and the secrets will be re-encrypted under it on
 first write.
