@@ -1,4 +1,7 @@
 use core::future::Future;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use freenet_stdlib::prelude::*;
 use moka::sync::Cache as MokaCache;
 
@@ -13,6 +16,67 @@ use moka::sync::Cache as MokaCache;
 /// remaining large enough for legitimate use cases (web apps, documents, datasets). A contract
 /// whose `validate_state` returns `Valid` for arbitrarily large state cannot bypass this limit.
 pub(crate) const MAX_STATE_SIZE: usize = 50 * 1024 * 1024; // 50 MiB
+
+/// Maximum number of per-contract state-hash entries retained for the cheap
+/// summarize/delta change-detector (see [`StateStore::cached_state_hash`]).
+///
+/// Bounded so the detector can never grow without limit on a node that hosts
+/// many contracts (contract count is influenced by external actors via PUT, so
+/// per the channel/collection-bounding rules it must be capped). Each entry is
+/// only ~40 bytes (key + `u64`), so this ceiling is well under 5 MiB. A miss
+/// simply falls back to loading and hashing the state, so the cap only trades a
+/// little extra work for a hard memory ceiling — never correctness.
+const STATE_HASH_CACHE_CAPACITY: u64 = 100_000;
+
+/// Hash a contract state's bytes into the `u64` change-detector key shared by
+/// the summarize and delta caches.
+///
+/// Centralised so the hash recorded at write time (well — at the slow-path
+/// populate; see [`StateStore::cache_state_hash`]) and the hash recomputed when
+/// summarizing/delta-ing a loaded state are ALWAYS computed identically. If
+/// these ever diverged, a fast-path cache key would never match its slow-path
+/// counterpart and the optimization would silently disable itself (a perf bug,
+/// not a correctness one — but worth ruling out).
+pub(crate) fn state_hash(state: &WrappedState) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    state.as_ref().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A cheap, cloneable handle that drops a [`StateStore`]'s cached view of a
+/// contract, for the write paths that BYPASS `StateStore` and write straight to
+/// the raw `Storage` — specifically the V2 delegate writes
+/// (`put_contract_state_sync` / `update_contract_state_sync`), which never call
+/// `StateStore::{store,update}`.
+///
+/// It invalidates BOTH read-caches the store keeps for a key:
+///   * the moka state-bytes cache (`state_mem_cache`) — otherwise a later
+///     `StateStore::get` would serve the OLD bytes the bypass write replaced,
+///     and the summarize/delta slow path would re-certify the stale hash;
+///   * the change-detector hash (`state_hash_cache`) — otherwise the fast path
+///     would serve a stale summary/delta.
+///
+/// Obtained via [`StateStore::cache_invalidator`] and wired into the runtime's
+/// `state_write_callback`. Cloning shares the underlying caches (moka is
+/// internally `Arc`), so an invalidation is observed by every executor.
+#[derive(Clone)]
+pub(crate) struct StateCacheInvalidator {
+    state_cache: Option<MokaCache<ContractKey, WrappedState>>,
+    hash_cache: MokaCache<ContractKey, u64>,
+}
+
+impl StateCacheInvalidator {
+    /// Drop the store's cached state bytes AND change-detector hash for `key`
+    /// after a state write made outside `StateStore`, so the next read reloads
+    /// the fresh bytes from storage. Mirrors what
+    /// `StateStore::{store,update,delete}` do for in-store writes.
+    pub(crate) fn invalidate(&self, key: &ContractKey) {
+        if let Some(state_cache) = &self.state_cache {
+            state_cache.invalidate(key);
+        }
+        self.hash_cache.invalidate(key);
+    }
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum StateStoreError {
@@ -48,6 +112,17 @@ pub trait StateStorage {
     type Error;
     /// Store state for a contract. Takes `&self` because implementations
     /// (like ReDb) handle internal locking for concurrent access.
+    ///
+    /// CHANGE-DETECTOR INVARIANT (future writers): a contract-state write made
+    /// DIRECTLY through this trait, bypassing the [`StateStore`] wrapper that
+    /// owns the summarize/delta change-detector, MUST invalidate that detector
+    /// via [`StateCacheInvalidator`] (and the moka state-bytes cache) — e.g.
+    /// via the runtime's `state_write_callback`. Otherwise the summarize/delta
+    /// fast path can serve a STALE summary/delta against the new state → peer
+    /// state divergence (#4621). Writes that go through `StateStore::{store,
+    /// update, delete}` already do this; raw-`Storage` writers (V2 delegate
+    /// `store_state_sync`/`update_state_sync`, and any new bypass writer such as
+    /// the #4592 live-import work) must not skip it.
     fn store(
         &self,
         key: ContractKey,
@@ -70,6 +145,11 @@ pub trait StateStorage {
     ) -> impl Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a;
     /// Remove all persisted data for a contract (state and parameters).
     /// Idempotent: removing a contract that is not stored is not an error.
+    ///
+    /// CHANGE-DETECTOR INVARIANT: a removal made DIRECTLY through this trait
+    /// (bypassing [`StateStore::delete`]) must also invalidate the
+    /// summarize/delta change-detector via [`StateCacheInvalidator`], or the
+    /// fast path could keep certifying a hash for state that is now gone (#4621).
     fn remove(&self, key: &ContractKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
@@ -81,6 +161,44 @@ pub trait StateStorage {
 #[derive(Clone)]
 pub struct StateStore<S: StateStorage> {
     state_mem_cache: Option<MokaCache<ContractKey, WrappedState>>,
+    /// Cheap per-contract state-change detector for the read-only summarize and
+    /// delta WASM caches (the `bridged_summarize_contract_state` /
+    /// `bridged_get_contract_state_delta` hot path).
+    ///
+    /// Maps a contract to the `u64` hash of its CURRENTLY-stored state, or holds
+    /// no entry when unknown. The invariant that makes this safe to read on the
+    /// summarize/delta fast path WITHOUT reloading and rehashing the full state:
+    ///
+    ///   the entry is either ABSENT or equal to `state_hash(state on disk)`.
+    ///
+    /// It is maintained by three kinds of operation:
+    ///   * any write through this `StateStore` — [`store`](Self::store),
+    ///     [`update`](Self::update), [`delete`](Self::delete) — INVALIDATES the
+    ///     entry, so a changed state can never be served against a stale hash.
+    ///   * V2 delegate state writes (`put_contract_state_sync` /
+    ///     `update_contract_state_sync`) write directly through the raw
+    ///     `Storage`, BYPASSING `StateStore`, so they invalidate this entry (and
+    ///     the moka state-bytes cache) via a [`StateCacheInvalidator`] handle
+    ///     wired into the runtime's `state_write_callback` (see
+    ///     `Runtime::set_state_write_callback` and the callback installers in
+    ///     `executor/runtime.rs`). Without this a V2 write would leave a stale
+    ///     detector hash → stale summary/delta → divergence (caught by Codex
+    ///     review).
+    ///   * the summarize/delta slow path re-POPULATES it after loading the
+    ///     current state (via [`cache_state_hash`](Self::cache_state_hash)).
+    ///
+    /// Because all contract-state writes and all summarize/delta reads are
+    /// serialized through the single `&mut RuntimePool` contract-handling loop,
+    /// no write can interleave between the slow path's load and its populate, so
+    /// the populated hash always matches the state that produced the cached
+    /// summary/delta. Shared across pool executors (moka is internally `Arc`),
+    /// so a populate on one checked-out executor is visible to the next.
+    ///
+    /// Kept separate from `state_mem_cache` (and intentionally always on, even
+    /// in `new_uncached` deterministic mode) because it only governs WHETHER the
+    /// fast path is taken — both paths produce byte-identical summaries/deltas,
+    /// so it cannot perturb simulation output or event-trace determinism.
+    state_hash_cache: MokaCache<ContractKey, u64>,
     store: S,
 }
 
@@ -113,6 +231,7 @@ where
             .build();
         Ok(Self {
             state_mem_cache: Some(cache),
+            state_hash_cache: Self::build_state_hash_cache(),
             store,
         })
     }
@@ -126,8 +245,50 @@ where
     pub fn new_uncached(store: S) -> Self {
         Self {
             state_mem_cache: None,
+            state_hash_cache: Self::build_state_hash_cache(),
             store,
         }
+    }
+
+    /// Build the bounded state-change-detector cache (see the
+    /// [`state_hash_cache`](Self::state_hash_cache) field docs). Entry-count
+    /// bounded via the default weigher.
+    fn build_state_hash_cache() -> MokaCache<ContractKey, u64> {
+        MokaCache::builder()
+            .max_capacity(STATE_HASH_CACHE_CAPACITY)
+            .build()
+    }
+
+    /// A cloneable handle that drops this store's cached view of a contract, for
+    /// the V2 delegate write path which bypasses `StateStore` (see
+    /// [`StateCacheInvalidator`]). Wired into the runtime's
+    /// `state_write_callback`.
+    pub(crate) fn cache_invalidator(&self) -> StateCacheInvalidator {
+        StateCacheInvalidator {
+            state_cache: self.state_mem_cache.clone(),
+            hash_cache: self.state_hash_cache.clone(),
+        }
+    }
+
+    /// Cheap read of the change-detector: the hash of `key`'s currently-stored
+    /// state, or `None` if not currently known (never written/populated, or
+    /// evicted, or invalidated by a write since the last populate).
+    ///
+    /// A `Some(h)` return guarantees the on-disk state hashes to `h` (see the
+    /// field invariant), so a caller holding a cached summary/delta keyed on `h`
+    /// may return it WITHOUT reloading or rehashing the state.
+    pub fn cached_state_hash(&self, key: &ContractKey) -> Option<u64> {
+        self.state_hash_cache.get(key)
+    }
+
+    /// Record the hash of `key`'s currently-stored state so the next
+    /// summarize/delta of an UNCHANGED state takes the fast path.
+    ///
+    /// MUST only be called with a hash freshly computed from the state that is
+    /// currently on disk (i.e. the slow path's just-loaded state), so the field
+    /// invariant — entry equals `state_hash(state on disk)` — is preserved.
+    pub fn cache_state_hash(&self, key: ContractKey, hash: u64) {
+        self.state_hash_cache.insert(key, hash);
     }
 
     pub async fn update(
@@ -171,6 +332,11 @@ where
             .await
             .map_err(Into::into)?;
 
+        // The state changed: drop any stale change-detector hash so the
+        // summarize/delta fast path can never serve a cached summary/delta for
+        // the previous state. The slow path repopulates it on the next read.
+        self.state_hash_cache.invalidate(key);
+
         if let Some(cache) = &self.state_mem_cache {
             cache.insert(*key, state);
         }
@@ -210,6 +376,20 @@ where
             .store(key, state.clone())
             .await
             .map_err(Into::into)?;
+
+        // The state is now committed to disk. Drop any stale cached view of it
+        // IMMEDIATELY — before store_params, which can fail and early-return via
+        // `?` (the partial-failure window noted above). If we deferred the
+        // invalidation to after store_params, an overwrite whose params write
+        // failed would leave the moka state cache and the change-detector
+        // holding the OLD state, and the summarize/delta fast path could serve a
+        // stale result (Codex review P2). The success path re-warms the state
+        // cache below.
+        self.state_hash_cache.invalidate(&key);
+        if let Some(cache) = &self.state_mem_cache {
+            cache.invalidate(&key);
+        }
+
         self.store
             .store_params(key, params.clone())
             .await
@@ -239,6 +419,10 @@ where
         if let Some(cache) = &self.state_mem_cache {
             cache.invalidate(key);
         }
+        // The state is gone: drop the change-detector hash so a later
+        // summarize/delta can't fast-path against it (it must fall through to
+        // the slow path, which now reports the contract as absent).
+        self.state_hash_cache.invalidate(key);
         self.store.remove(key).await.map_err(Into::into)?;
         Ok(())
     }
@@ -958,5 +1142,208 @@ mod tests {
             .delete(&key)
             .await
             .expect("delete of a never-stored contract should be Ok");
+    }
+
+    // ============ State-change detector (summarize/delta fast path) ============
+
+    /// `state_hash` distinguishes different state bytes and is stable for equal
+    /// bytes. This is the property the whole change-detector rests on.
+    #[test]
+    fn state_hash_distinguishes_different_states_and_is_stable() {
+        let a = make_test_state(&[1, 2, 3]);
+        let a_again = make_test_state(&[1, 2, 3]);
+        let b = make_test_state(&[1, 2, 4]);
+
+        assert_eq!(
+            state_hash(&a),
+            state_hash(&a_again),
+            "equal state bytes must hash equally"
+        );
+        assert_ne!(
+            state_hash(&a),
+            state_hash(&b),
+            "different state bytes must (with overwhelming probability) hash differently"
+        );
+    }
+
+    /// CORRECTNESS of the detector primitive: a fresh store has no detector
+    /// entry; a populate makes it readable; and EVERY write path
+    /// (store/update/delete) invalidates it so a changed state can never be
+    /// served against a stale hash. This is the invariant the no-divergence
+    /// guarantee depends on.
+    #[tokio::test]
+    async fn state_hash_cache_invalidated_by_every_write_path() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new_uncached(mock_storage);
+        let key = make_test_key();
+        let params = Parameters::from(vec![1, 2, 3]);
+        let state_a = make_test_state(&[1, 2, 3]);
+        let state_b = make_test_state(&[4, 5, 6]);
+
+        // Never populated → absent.
+        assert_eq!(store.cached_state_hash(&key), None);
+
+        // Initial store (PUT) writes state → detector must be absent (a write
+        // invalidates; the summarize slow path repopulates on next read).
+        store
+            .store(key, state_a.clone(), params.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.cached_state_hash(&key),
+            None,
+            "store() must leave the detector absent so the next summarize recomputes"
+        );
+
+        // Simulate the summarize slow path populating it.
+        let h_a = state_hash(&state_a);
+        store.cache_state_hash(key, h_a);
+        assert_eq!(store.cached_state_hash(&key), Some(h_a));
+
+        // UPDATE writes new state → detector invalidated (the critical guard:
+        // without this, a stale hash would serve a stale summary/delta).
+        store.update(&key, state_b.clone()).await.unwrap();
+        assert_eq!(
+            store.cached_state_hash(&key),
+            None,
+            "update() must invalidate the detector"
+        );
+
+        // Repopulate with the new state's hash; it differs from the old one.
+        let h_b = state_hash(&state_b);
+        assert_ne!(h_a, h_b);
+        store.cache_state_hash(key, h_b);
+        assert_eq!(store.cached_state_hash(&key), Some(h_b));
+
+        // delete() removes the state → detector invalidated.
+        store.delete(&key).await.unwrap();
+        assert_eq!(
+            store.cached_state_hash(&key),
+            None,
+            "delete() must invalidate the detector"
+        );
+    }
+
+    /// The V2-bypass handle ([`StateCacheInvalidator`]) clears the same
+    /// change-detector the summarize/delta fast path reads.
+    #[tokio::test]
+    async fn cache_invalidator_clears_detector_hash() {
+        let mock_storage = MockStateStorage::new();
+        let store = StateStore::new_uncached(mock_storage);
+        let key = make_test_key();
+
+        store.cache_state_hash(key, 7);
+        assert_eq!(store.cached_state_hash(&key), Some(7));
+
+        // A write through the bypass handle must clear the entry, exactly like an
+        // in-store write (store/update/delete) does.
+        let invalidator = store.cache_invalidator();
+        invalidator.invalidate(&key);
+        assert_eq!(
+            store.cached_state_hash(&key),
+            None,
+            "cache_invalidator().invalidate must clear the detector the fast path reads"
+        );
+    }
+
+    /// CORRECTNESS of the V2-bypass fix: a write that lands in the backing store
+    /// WITHOUT going through `StateStore` (as V2 delegate writes do) would
+    /// otherwise be masked by the moka state cache — `get` would keep returning
+    /// the stale cached bytes. The [`StateCacheInvalidator`] must drop BOTH the
+    /// state-bytes cache and the detector so the next read reloads fresh bytes.
+    #[tokio::test]
+    async fn cache_invalidator_drops_stale_state_bytes_from_moka() {
+        // Cached store: the moka state-bytes cache is what masks bypass writes.
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new(mock_storage.clone(), 10_000).unwrap();
+        let key = make_test_key();
+        let params = Parameters::from(vec![1, 2, 3]);
+        let state_a = make_test_state(&[1, 2, 3]);
+        let state_b = make_test_state(&[4, 5, 6, 7]);
+
+        // Normal PUT populates the moka cache with A.
+        store.store(key, state_a.clone(), params).await.unwrap();
+        assert_eq!(store.get(&key).await.unwrap(), state_a);
+        // Pretend the summarize slow path recorded A's hash.
+        store.cache_state_hash(key, state_hash(&state_a));
+
+        // Simulate a V2 delegate write: B lands in the BACKING store directly,
+        // bypassing StateStore (so moka still holds A).
+        mock_storage.seed_state(key, state_b.clone());
+
+        // Without invalidation, the moka cache masks the bypass write.
+        assert_eq!(
+            store.get(&key).await.unwrap(),
+            state_a,
+            "moka cache masks the bypass write until invalidated (the bug)"
+        );
+
+        // The callback-wired invalidator must drop BOTH caches.
+        store.cache_invalidator().invalidate(&key);
+        assert_eq!(
+            store.cached_state_hash(&key),
+            None,
+            "detector hash must be cleared"
+        );
+        assert_eq!(
+            store.get(&key).await.unwrap(),
+            state_b,
+            "after invalidation, get must reload the fresh bypass-written bytes"
+        );
+    }
+
+    /// Codex P2: if `store()` overwrites an existing contract and `store_params`
+    /// fails AFTER the state write commits, the caches must NOT keep serving the
+    /// old state (the summarize/delta fast path would diverge). Both the
+    /// detector hash and the moka state cache must be invalidated as soon as the
+    /// state write commits, regardless of the params write outcome.
+    #[tokio::test]
+    async fn store_invalidates_caches_even_when_params_write_fails() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new(mock_storage.clone(), 10_000).unwrap();
+        let key = make_test_key();
+        let params = Parameters::from(vec![1, 2, 3]);
+        let state_a = make_test_state(&[1, 2, 3]);
+        let state_b = make_test_state(&[4, 5, 6, 7]);
+
+        // Initial successful store of A (warms moka) + populate the detector.
+        store
+            .store(key, state_a.clone(), params.clone())
+            .await
+            .unwrap();
+        store.cache_state_hash(key, state_hash(&state_a));
+        assert_eq!(store.cached_state_hash(&key), Some(state_hash(&state_a)));
+
+        // Overwrite with B, but make the params write fail AFTER the state write
+        // has already committed B to the backing store.
+        mock_storage.fail_next_store_params(1);
+        let res = store.store(key, state_b.clone(), params).await;
+        assert!(res.is_err(), "store must surface the params write failure");
+
+        // B is on disk now, so the caches must not still serve A: the detector is
+        // cleared and get() reloads the fresh bytes.
+        assert_eq!(
+            store.cached_state_hash(&key),
+            None,
+            "detector must be cleared once the state write commits"
+        );
+        assert_eq!(
+            store.get(&key).await.unwrap(),
+            state_b,
+            "get must reload the committed state after a params-write failure"
+        );
+    }
+
+    /// The detector is present in cached mode too (it is independent of the moka
+    /// state cache, so it works after restart / on disk-only states).
+    #[tokio::test]
+    async fn state_hash_cache_present_in_cached_mode() {
+        let mock_storage = MockStateStorage::new();
+        let store = StateStore::new(mock_storage, 10_000).unwrap();
+        let key = make_test_key();
+
+        assert_eq!(store.cached_state_hash(&key), None);
+        store.cache_state_hash(key, 42);
+        assert_eq!(store.cached_state_hash(&key), Some(42));
     }
 }

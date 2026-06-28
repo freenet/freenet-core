@@ -380,6 +380,29 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
         .await
     }
 
+    /// Like [`new_mock_wasm`](Self::new_mock_wasm) but with an UNCACHED
+    /// `StateStore`, so every state load hits the backing storage (and is
+    /// therefore observable via `MockStateStorage::get_count`). Used by the
+    /// summarize/delta change-detector tests to prove the fast path skips the
+    /// state load+hash entirely on an unchanged contract — with the moka state
+    /// cache on, a load would be served from memory and the `get_count` probe
+    /// could not distinguish fast path from slow path.
+    #[cfg(test)]
+    pub async fn new_mock_wasm_uncached(
+        _identifier: &str,
+        shared_storage: MockStateStorage,
+    ) -> anyhow::Result<Self> {
+        let state_store = crate::wasm_runtime::StateStore::new_uncached(shared_storage);
+
+        let runtime = MockWasmRuntime {
+            contract_store: InMemoryContractStore::default(),
+            validate_overrides: HashMap::new(),
+            update_overrides: HashMap::new(),
+        };
+
+        Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await
+    }
+
     /// Mutable access to the inner `MockWasmRuntime` so tests can install
     /// per-contract `validate_overrides` / `update_overrides` after the
     /// executor is wrapped in a handler. The `runtime` field is private to

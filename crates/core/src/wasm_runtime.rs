@@ -59,7 +59,7 @@ pub use secrets_store::{
 #[allow(unused_imports)]
 pub(crate) use simulation_runtime::{InMemoryContractStore, SimulationStores};
 pub use state_store::StateStore;
-pub(crate) use state_store::{MAX_STATE_SIZE, StateStorage, StateStoreError};
+pub(crate) use state_store::{MAX_STATE_SIZE, StateStorage, StateStoreError, state_hash};
 
 /// Rename a code-hash-named WASM file from the legacy all-lowercase Base58
 /// name to the canonical mixed-case name (issue #4214).

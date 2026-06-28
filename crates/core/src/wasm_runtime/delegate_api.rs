@@ -218,7 +218,7 @@ mod tests {
 
     use crate::contract::storages::Storage;
     use crate::util::tests::get_temp_dir;
-    use crate::wasm_runtime::StateStorage;
+    use crate::wasm_runtime::{StateStorage, StateStore};
     use freenet_stdlib::prelude::*;
 
     fn make_contract_key(seed: u8) -> (ContractKey, ContractInstanceId, CodeHash) {
@@ -793,6 +793,136 @@ mod tests {
         assert_eq!(
             calls[0].1, 3,
             "callback must receive the on-disk state byte count (vec![40, 50, 60] = 3 bytes)"
+        );
+    }
+
+    /// END-TO-END: a REAL V2 delegate PUT, driven through the PRODUCTION
+    /// `StateStore::cache_invalidator()` wired as the `state_write_callback`,
+    /// must CLEAR the summarize/delta change-detector for the written contract
+    /// (so the next summarize/delta recomputes fresh) AND drop the moka
+    /// state-bytes cache (so a read-after-write observes the new bytes).
+    ///
+    /// This closes the wrong-key / wrong-store-instance seam that the
+    /// source-pin (`v2_delegate_state_write_paths_invoke_callback_with_state_size`)
+    /// and the observer-only unit tests cannot catch: it drives the actual
+    /// production invalidator from a real `put_contract_state_sync` and asserts
+    /// the effect on the actual detector the fast path reads. If the callback
+    /// were ever wired to a different `StateStore` instance, or invalidated a
+    /// mis-derived key, the detector assertion below would fail.
+    #[tokio::test]
+    async fn test_v2_put_through_production_invalidator_clears_detector() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(123, &[1, 2, 3]).await;
+
+        // Build a StateStore over the SAME backing storage the V2 write path
+        // writes through. In production the V2 delegate write bypasses StateStore
+        // entirely (it writes straight to the raw `Storage`); the ONLY thing that
+        // keeps StateStore's caches coherent is the `state_write_callback` this
+        // test installs. Cached mode mirrors `Executor::from_config`.
+        let state_store = StateStore::new(env_holder.db.clone(), 10_000_000).unwrap();
+
+        // Resolve the contract key EXACTLY as the V2 write path does
+        // (`resolve_contract_key` → `code_hash_from_id` → `from_id_and_code`),
+        // so the detector is keyed under the SAME ContractKey the callback will
+        // invalidate. This is what closes the wrong-key seam.
+        let code_hash = env_holder
+            .contract_store
+            .code_hash_from_id(&contract_id)
+            .expect("contract code must be indexed");
+        let key = ContractKey::from_id_and_code(contract_id, code_hash);
+
+        // Warm BOTH StateStore caches against the OLD state, exactly as a prior
+        // read + summarize slow-path would: the moka state-bytes cache via get()
+        // and the change-detector hash via cache_state_hash().
+        let old_state = state_store.get(&key).await.expect("initial state present");
+        assert_eq!(old_state.as_ref(), &[1, 2, 3]);
+        state_store.cache_state_hash(key, crate::wasm_runtime::state_hash(&old_state));
+        assert!(
+            state_store.cached_state_hash(&key).is_some(),
+            "detector must be populated before the write"
+        );
+
+        // Wire the PRODUCTION invalidator as the callback — the exact shape used
+        // in `Executor::from_config` / `from_config_with_shared_modules`.
+        let invalidator = state_store.cache_invalidator();
+        let cb: super::super::runtime::StateWriteCallback =
+            std::sync::Arc::new(move |k: &ContractKey, _size: usize| {
+                invalidator.invalidate(k);
+            });
+
+        {
+            // SAFETY: `env_holder` is alive for the duration of this test. The
+            // env is scoped so it (and its borrow) drop before the async get()
+            // below — DelegateCallEnv is not Send, so it must not be held across
+            // an await on the default multi-thread test runtime.
+            let env = unsafe { env_holder.make_env_with_callback(cb) };
+            env.put_contract_state_sync(&contract_id, vec![4, 5, 6])
+                .expect("V2 PUT should succeed");
+        }
+
+        // Detector cleared → the next summarize/delta recomputes against the
+        // fresh state instead of serving a stale cached summary/delta.
+        assert_eq!(
+            state_store.cached_state_hash(&key),
+            None,
+            "a real V2 PUT through the production invalidator must clear the \
+             change-detector so the next summarize/delta is fresh"
+        );
+        // moka state-bytes cache dropped → a read-after-write observes the
+        // freshly-written bytes rather than the stale cached copy (the
+        // pre-existing read-after-write staleness this callback also fixes).
+        assert_eq!(
+            state_store.get(&key).await.expect("state present").as_ref(),
+            &[4, 5, 6],
+            "after the V2 PUT, get() must reload the freshly-written bytes"
+        );
+    }
+
+    /// UPDATE sibling of `test_v2_put_through_production_invalidator_clears_detector`:
+    /// a REAL V2 delegate UPDATE through the production invalidator must clear
+    /// the detector and unmask the new state bytes, same as PUT.
+    #[tokio::test]
+    async fn test_v2_update_through_production_invalidator_clears_detector() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(124, &[10, 20, 30]).await;
+
+        let state_store = StateStore::new(env_holder.db.clone(), 10_000_000).unwrap();
+
+        let code_hash = env_holder
+            .contract_store
+            .code_hash_from_id(&contract_id)
+            .expect("contract code must be indexed");
+        let key = ContractKey::from_id_and_code(contract_id, code_hash);
+
+        let old_state = state_store.get(&key).await.expect("initial state present");
+        assert_eq!(old_state.as_ref(), &[10, 20, 30]);
+        state_store.cache_state_hash(key, crate::wasm_runtime::state_hash(&old_state));
+        assert!(state_store.cached_state_hash(&key).is_some());
+
+        let invalidator = state_store.cache_invalidator();
+        let cb: super::super::runtime::StateWriteCallback =
+            std::sync::Arc::new(move |k: &ContractKey, _size: usize| {
+                invalidator.invalidate(k);
+            });
+
+        {
+            // SAFETY: see the PUT sibling test above (scoped to drop before the
+            // async get()).
+            let env = unsafe { env_holder.make_env_with_callback(cb) };
+            env.update_contract_state_sync(&contract_id, vec![40, 50, 60])
+                .expect("V2 UPDATE should succeed");
+        }
+
+        assert_eq!(
+            state_store.cached_state_hash(&key),
+            None,
+            "a real V2 UPDATE through the production invalidator must clear the \
+             change-detector so the next summarize/delta is fresh"
+        );
+        assert_eq!(
+            state_store.get(&key).await.expect("state present").as_ref(),
+            &[40, 50, 60],
+            "after the V2 UPDATE, get() must reload the freshly-written bytes"
         );
     }
 

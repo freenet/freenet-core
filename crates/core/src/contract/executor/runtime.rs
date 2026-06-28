@@ -346,18 +346,27 @@ impl Executor<Runtime> {
         let mut rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
         // Enable V2 delegate contract access by providing the state store DB
         rt.set_state_store_db(state_store.storage());
-        // V2 delegate state writes bypass the executor's
-        // `state_store.{store,update}` chokepoints, so install a callback
-        // that mirrors the bump+refresh+report side effects via
-        // `Ring::commit_state_write`. Without this, V2 delegate PUT/UPDATE
-        // would leave the EvictContract re-host race open AND undercount
-        // StateBytesWritten in the governance meter.
-        if let Some(op_manager_ref) = &op_manager {
-            let op_manager_clone = op_manager_ref.clone();
-            rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
-                op_manager_clone.ring.commit_state_write(key, state_size);
-            }));
-        }
+        // V2 delegate state writes (put/update_contract_state_sync) write
+        // directly through the raw `Storage`, bypassing the executor's
+        // `state_store.{store,update}` chokepoints. The callback restores the
+        // side effects those chokepoints perform on every write:
+        //   1. Drop StateStore's cached view of the contract — ALWAYS. The
+        //      bypass write doesn't touch the moka state-bytes cache OR the
+        //      change-detector, so without this a later read would serve the OLD
+        //      bytes from moka and the summarize/delta fast path could serve a
+        //      STALE summary/delta → state divergence (Codex review).
+        //   2. Bump+refresh+report via `Ring::commit_state_write` — only when an
+        //      op_manager is present (it owns the ring/governance state).
+        //      Without this, V2 PUT/UPDATE would leave the EvictContract re-host
+        //      race open AND undercount StateBytesWritten in the meter.
+        let cache_invalidator = state_store.cache_invalidator();
+        let op_manager_for_cb = op_manager.clone();
+        rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
+            cache_invalidator.invalidate(key);
+            if let Some(op_manager) = &op_manager_for_cb {
+                op_manager.ring.commit_state_write(key, state_size);
+            }
+        }));
         Executor::new(
             state_store,
             move || {
@@ -428,16 +437,22 @@ impl Executor<Runtime> {
         )
         .unwrap();
         rt.set_state_store_db(db);
-        // V2 delegate state writes bypass the executor chokepoints — install
-        // the commit_state_write callback so the bump+refresh+report side
-        // effects are still applied. See `from_config` and
+        // V2 delegate state writes bypass the executor chokepoints — install the
+        // callback that (1) ALWAYS drops StateStore's cached view of the contract
+        // (both the moka state-bytes cache and the change-detector; a stale
+        // cached state or detector hash after a V2 write would serve a stale
+        // summary/delta → divergence; Codex review) and (2) mirrors the
+        // bump+refresh+report side effects via `Ring::commit_state_write` when an
+        // op_manager is present. See `from_config` and
         // `Runtime::set_state_write_callback`.
-        if let Some(op_manager_ref) = &op_manager {
-            let op_manager_clone = op_manager_ref.clone();
-            rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
-                op_manager_clone.ring.commit_state_write(key, state_size);
-            }));
-        }
+        let cache_invalidator = shared_state_store.cache_invalidator();
+        let op_manager_for_cb = op_manager.clone();
+        rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
+            cache_invalidator.invalidate(key);
+            if let Some(op_manager) = &op_manager_for_cb {
+                op_manager.ring.commit_state_write(key, state_size);
+            }
+        }));
         Executor::new(
             shared_state_store,
             || Ok(()),
@@ -1736,6 +1751,26 @@ mod state_write_attribution_pin_tests {
              into store_state_sync would not compile, but a refactor \
              that moves state into an intermediate first could regress \
              this silently."
+        );
+    }
+
+    #[test]
+    fn v2_delegate_callback_installers_invalidate_state_caches() {
+        // V2 delegate state writes (put/update_contract_state_sync) bypass
+        // `StateStore::{store,update}`, so both `state_write_callback` installers
+        // (in `from_config` and `from_config_with_shared_modules`) MUST drop
+        // StateStore's cached view of the contract (moka state cache + change
+        // detector). Dropping this would let a V2 write leave a stale cached
+        // state/detector hash and the summarize/delta fast path serve a STALE
+        // summary/delta → state divergence (Codex review).
+        let count = count_call_sites(RUNTIME_SRC, "cache_invalidator.invalidate(");
+        assert_eq!(
+            count, 2,
+            "expected exactly 2 `cache_invalidator.invalidate(` calls in \
+             runtime.rs (one per V2 state_write_callback installer); found \
+             {count}. If a callback installer stopped invalidating StateStore's \
+             caches, a V2 delegate state write would leave stale cached state \
+             and the summarize/delta fast path could serve a stale result."
         );
     }
 }

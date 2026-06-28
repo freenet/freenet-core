@@ -213,6 +213,25 @@ impl Executor<MockRuntime, MockStateStorage> {
         // Use fully in-memory storage with no caching for deterministic simulation:
         // - InMemoryContractStore: no disk I/O, no background threads
         // - StateStore::new_uncached: bypasses moka cache (non-deterministic TinyLFU)
+        //
+        // DETERMINISM NOTE (#4621): `new_uncached` still keeps the
+        // summarize/delta change-detector (`StateStore::state_hash_cache`, a
+        // moka cache) ON — it is the ONE moka cache `new_uncached` does not
+        // disable. That is determinism-SAFE here, on two independent grounds:
+        //   1. The detector only governs WHICH path (fast vs slow) a
+        //      summarize/delta takes; BOTH paths produce byte-identical
+        //      summaries/deltas, so it cannot perturb simulation output or the
+        //      event trace regardless of path selection.
+        //   2. Path selection itself is also stable at simulation scale: the
+        //      detector's only non-determinism source is TinyLFU EVICTION, but
+        //      its capacity (STATE_HASH_CACHE_CAPACITY = 100k) is never reached
+        //      by a sim's distinct-contract count, so no eviction happens and a
+        //      populated entry stays populated.
+        // No sim/conformance/turmoil test asserts on state-LOAD or WASM-CALL
+        // counts (only on output bytes), so even (1) alone suffices; (2) makes
+        // the optimization's load/WASM-skip behavior deterministic too. If a
+        // future test ever asserts on those counts at >100k distinct contracts,
+        // make the detector non-evicting in uncached mode instead.
         let contract_store = InMemoryContractStore::new();
         let state_store = StateStore::new_uncached(shared_storage);
         tracing::debug!("created fully in-memory uncached executor for deterministic simulation");
