@@ -360,13 +360,24 @@ where
             .store(key, state.clone())
             .await
             .map_err(Into::into)?;
+
+        // The state is now committed to disk. Drop any stale cached view of it
+        // IMMEDIATELY — before store_params, which can fail and early-return via
+        // `?` (the partial-failure window noted above). If we deferred the
+        // invalidation to after store_params, an overwrite whose params write
+        // failed would leave the moka state cache and the change-detector
+        // holding the OLD state, and the summarize/delta fast path could serve a
+        // stale result (Codex review P2). The success path re-warms the state
+        // cache below.
+        self.state_hash_cache.invalidate(&key);
+        if let Some(cache) = &self.state_mem_cache {
+            cache.invalidate(&key);
+        }
+
         self.store
             .store_params(key, params.clone())
             .await
             .map_err(Into::into)?;
-
-        // The state changed: drop any stale change-detector hash (see `update`).
-        self.state_hash_cache.invalidate(&key);
 
         if let Some(cache) = &self.state_mem_cache {
             cache.insert(key, state);
@@ -1262,6 +1273,48 @@ mod tests {
             store.get(&key).await.unwrap(),
             state_b,
             "after invalidation, get must reload the fresh bypass-written bytes"
+        );
+    }
+
+    /// Codex P2: if `store()` overwrites an existing contract and `store_params`
+    /// fails AFTER the state write commits, the caches must NOT keep serving the
+    /// old state (the summarize/delta fast path would diverge). Both the
+    /// detector hash and the moka state cache must be invalidated as soon as the
+    /// state write commits, regardless of the params write outcome.
+    #[tokio::test]
+    async fn store_invalidates_caches_even_when_params_write_fails() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new(mock_storage.clone(), 10_000).unwrap();
+        let key = make_test_key();
+        let params = Parameters::from(vec![1, 2, 3]);
+        let state_a = make_test_state(&[1, 2, 3]);
+        let state_b = make_test_state(&[4, 5, 6, 7]);
+
+        // Initial successful store of A (warms moka) + populate the detector.
+        store
+            .store(key, state_a.clone(), params.clone())
+            .await
+            .unwrap();
+        store.cache_state_hash(key, state_hash(&state_a));
+        assert_eq!(store.cached_state_hash(&key), Some(state_hash(&state_a)));
+
+        // Overwrite with B, but make the params write fail AFTER the state write
+        // has already committed B to the backing store.
+        mock_storage.fail_next_store_params(1);
+        let res = store.store(key, state_b.clone(), params).await;
+        assert!(res.is_err(), "store must surface the params write failure");
+
+        // B is on disk now, so the caches must not still serve A: the detector is
+        // cleared and get() reloads the fresh bytes.
+        assert_eq!(
+            store.cached_state_hash(&key),
+            None,
+            "detector must be cleared once the state write commits"
+        );
+        assert_eq!(
+            store.get(&key).await.unwrap(),
+            state_b,
+            "get must reload the committed state after a params-write failure"
         );
     }
 
