@@ -751,31 +751,43 @@ pub(in crate::node) struct P2pConnManager {
 /// Minimum negotiated protocol version a peer must report before we send it a
 /// [`SubscribeHint`](crate::message::NetMessageV1::SubscribeHint).
 ///
-/// RE-ENABLED at `(0, 2, 80)` after the #4145 event-loop fix (#4499) made the
-/// migration load-safe. 0.2.80 is the first release that ships SubscribeHint with
-/// that fix, so the floor follows the standard "set to the first-shipping release
-/// version, then FREEZE" rule. The gate (`remote.is_some_and(|v| v >= floor)`,
-/// fail-closed on unknown) sends a hint only to peers on `>= 0.2.80`, so the
-/// migration activates among upgraded peers and ramps with fleet upgrade rather
-/// than switching on everywhere at once.
+/// DISABLED at `(0, 3, 0)` — above every shipped 0.2.x release — so the
+/// SubscribeHint placement migration is OFF for the entire live network. The
+/// gate (`remote.is_some_and(|v| v >= floor)`, fail-closed on unknown) can
+/// never be satisfied by any 0.2.x peer, so no node sends or acts on hints.
 ///
-/// History: the migration first shipped in v0.2.73, where the placement-migration
-/// path (directed subscribes plus the `ConsiderContractMigration` emits) amplified
-/// the #4145/#4231 broadcast-backpressure surface and drove a network-wide
-/// UPDATE-broadcast degradation. v0.2.74 disabled it by raising this floor to
-/// `(0, 3, 0)`, above every shipped 0.2.x peer. It was re-enabled at `(0, 2, 80)`
-/// only after #4145 was fixed (#4499), validated at incident-scale fan-out, and
-/// the broadcast-assembly-failure telemetry (#4498) was deployed.
+/// WHY DISABLED — the #4404 placement migration is net-negative in production.
+/// It imposes real, measurable cost: it drives the #4610 full-state summarize
+/// storm, the #4440 subscription-renewal load, and #4534 module-cache thrash —
+/// while delivering NO measurable placement benefit. Production telemetry over
+/// the re-enabled window showed `hosted_key_distance` FLAT (placement did not
+/// tighten at all) and the inbound-hint act-rate collapsed to ~0.05%
+/// (received-but-not-acted), so the network paid the storm / renewal / thrash
+/// cost for essentially zero migrations. Disabling removes that cost with no
+/// placement regression. Authorized by Ian + overseer (2026-06).
 ///
-/// Wire-compat contract: a peer is only sent SubscribeHint if its negotiated
-/// version is `>=` this floor; older peers cannot deserialize the wire variant and
-/// would drop the connection. None (unknown, e.g. joiner->gateway) is treated as
-/// unsupported.
+/// REVERSIBLE — this is a single const. Lowering the floor (e.g. back to a
+/// shipped 0.2.x version) re-enables BOTH the SEND gate
+/// (`select_migration_target` → `peer_supports_subscribe_hint`) and the RECEIVE
+/// gate (`node.rs` inbound `SubscribeHint` handler, which gates on this node's
+/// own version) together.
 ///
-/// DO NOT bump this floor on later releases. Once shipped in 0.2.80, peers running
-/// 0.2.80+ can deserialize the variant, so the floor must stay at 0.2.80 forever;
-/// raising it would silently stop sending hints to fully-capable peers. (This is
-/// why there is no `floor` vs `CARGO_PKG_VERSION` unit test; see docs/RELEASING.md.)
+/// BAR FOR RE-ENABLING — do NOT lower this floor on the strength of a passing
+/// simulation test alone. A sim can show hints flowing, but the production
+/// failure was precisely that hints flowed, cost a lot, and moved placement
+/// nowhere. Any future re-enable MUST be gated on a CANARY showing
+/// `hosted_key_distance` measurably TIGHTENING under the migration (i.e. real
+/// placement benefit on real peers), with the #4610 / #4440 / #4534 costs
+/// bounded — not just a green test. If you cannot show placement improving on
+/// production peers, leave it off. This is a deliberate re-disable, NOT a stale
+/// "forgot to lower the floor" — do not reflex-revert it.
+///
+/// Wire-compat note: a peer is only sent SubscribeHint if its negotiated
+/// version is `>=` this floor; older peers cannot deserialize the wire variant
+/// and would drop the connection. With the floor parked above every 0.2.x
+/// release this is moot today, but if the floor is ever lowered to re-enable,
+/// pick a value no lower than the first release that can deserialize the variant
+/// (0.2.73). None (unknown, e.g. joiner->gateway) is treated as unsupported.
 ///
 /// This is a single non-cfg constant: deliberately NOT lowered under any test
 /// feature, because `testing` is pulled into the SHIPPED release binary (`fdev`
@@ -784,30 +796,34 @@ pub(in crate::node) struct P2pConnManager {
 /// so a cfg-gated test floor would defeat the wire-compat gate in production.
 /// Simulation tests that want the cascade lower the floor per-node at runtime via
 /// `NodeConfig::subscribe_hint_floor_override` (set by
-/// `SimNetwork::enable_placement_migration`), which never touches production.
+/// `SimNetwork::enable_placement_migration`), which never touches production — so
+/// the migration-on sim tests still run the cascade with this production floor
+/// parked.
 ///
 /// `pub(crate)` so the INBOUND `SubscribeHint` receive handler in
 /// [`crate::node`] can share the same floor: the send-side gate alone is not
-/// enough, because a 0.2.74 node would otherwise still ACT on hints sent by a
-/// pre-floor 0.2.73 peer and keep the (deactivated) migration load alive during
-/// the staggered rollout.
+/// enough, because a node would otherwise still ACT on hints sent by a peer and
+/// keep the (disabled) migration load alive.
 ///
-/// Set to `(0, 2, 80)`: the first release that ships SubscribeHint together with
-/// the #4145 event-loop fix (#4499) that makes the migration load-safe. The
-/// migration is RE-ENABLED at this floor, and the value is now FROZEN per the
-/// general wire-gated-floor rule in `docs/RELEASING.md` (do NOT bump it on later
-/// releases). Only peer pairs both on `>= 0.2.80` exchange hints, so activation
-/// ramps with fleet upgrade rather than switching on everywhere at once.
-pub(crate) const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 2, 80);
+/// History: the migration first shipped in v0.2.73, where the placement-migration
+/// path (directed subscribes plus the `ConsiderContractMigration` emits) amplified
+/// the #4145/#4231 broadcast-backpressure surface and drove a network-wide
+/// UPDATE-broadcast degradation. v0.2.74 disabled it by parking this floor at
+/// `(0, 3, 0)`. It was RE-ENABLED at `(0, 2, 80)` (#4511) after #4145 was fixed
+/// (#4499) and validated at incident-scale fan-out — but production telemetry then
+/// showed it net-negative (the storm / renewal / thrash costs above, with flat
+/// `hosted_key_distance` and a ~0.05% act-rate), so it is RE-DISABLED here by
+/// parking the floor at `(0, 3, 0)` again.
+pub(crate) const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 3, 0);
 
 /// This node's own crate version as a `(major, minor, patch)` tuple, parsed at
 /// compile time from `CARGO_PKG_VERSION`.
 ///
 /// Used by the INBOUND `SubscribeHint` receive gate (see [`crate::node`]) to ask
 /// "is the placement migration active for a node running THIS version?" via
-/// [`version_supports_subscribe_hint`]. With the floor at `(0, 2, 80)`, a node on
-/// `>= 0.2.80` acts on inbound hints and a pre-floor node ignores them; the send
-/// and receive sides share this floor so they activate together.
+/// [`version_supports_subscribe_hint`]. With the floor parked at `(0, 3, 0)` the
+/// migration is DISABLED, so no shipped 0.2.x node acts on inbound hints; the
+/// send and receive sides share this floor so they enable/disable together.
 pub(crate) const fn own_crate_version() -> (u8, u8, u16) {
     parse_crate_version(env!("CARGO_PKG_VERSION"))
 }
@@ -3468,12 +3484,12 @@ mod tests {
             assert!(!version_supports_subscribe_hint(None, (0, 0, 0)));
         }
 
-        // Superseded: the placement migration was RE-ENABLED at `(0, 2, 80)` by
-        // PR #4511 (#4145 fixed in #4499). This test pinned the v0.2.74
-        // deactivation (dormant for every 0.2.x peer) and now documents that
-        // prior behavior; its asserts no longer hold against the lowered floor.
-        // Replaced by `placement_migration_active_at_reenable_floor` below.
-        #[ignore]
+        /// The placement migration is DISABLED for every shipped 0.2.x peer: the
+        /// floor is parked at `(0, 3, 0)`, so no 0.2.x version — and no unknown
+        /// version — is ever sent or acts on a hint. Re-disabled because the
+        /// migration is net-negative in production (#4610 / #4440 / #4534 costs
+        /// with flat `hosted_key_distance` and a ~0.05% act-rate, i.e. no
+        /// placement benefit). See the `SUBSCRIBE_HINT_MIN_VERSION` doc comment.
         #[test]
         fn placement_migration_deactivated_for_all_0_2_x() {
             assert!(!version_supports_subscribe_hint(
@@ -3491,33 +3507,29 @@ mod tests {
         }
 
         /// Pin the PRODUCTION constant (not the local `FLOOR`): the placement
-        /// migration is RE-ENABLED at `(0, 2, 80)` (#4499 made it load-safe), so
-        /// peers at or above that floor participate while pre-floor 0.2.x peers
-        /// and unknown versions stay gated off (wire-compat with the staggered
-        /// rollout). An accidental change to the floor moves the activation set
-        /// and trips the pinned value below. See docs/RELEASING.md and issues
-        /// #4145 / #4499.
+        /// migration is DISABLED by parking the floor at `(0, 3, 0)`, above every
+        /// shipped 0.2.x release, because it is net-negative in production
+        /// (#4610 / #4440 / #4534 costs, flat `hosted_key_distance`, ~0.05%
+        /// act-rate). The `!supported(0,2,255)` + `supported(0,3,0)` pair pins the
+        /// floor to EXACTLY `(0, 3, 0)`: lowering it (a re-enable) trips these
+        /// asserts — the intended tripwire, since re-enabling must be a deliberate,
+        /// canary-gated change (see docs/RELEASING.md and the const doc comment).
+        /// See issues #4404 / #4610 / #4440.
         #[test]
-        fn placement_migration_active_at_reenable_floor() {
-            // The `supported(0,2,80)` + `!supported(0,2,79)` pair below pins the
-            // floor to exactly `(0, 2, 80)`: an accidental change moves the
-            // activation set and trips these asserts.
-            // At or above the floor: active.
-            assert!(version_supports_subscribe_hint(
-                Some((0, 2, 80)),
-                SUBSCRIBE_HINT_MIN_VERSION
-            ));
-            assert!(version_supports_subscribe_hint(
+        fn placement_migration_disabled_above_all_0_2_x() {
+            // Highest possible 0.2.x patch is still below the floor: disabled.
+            assert!(!version_supports_subscribe_hint(
                 Some((0, 2, 255)),
                 SUBSCRIBE_HINT_MIN_VERSION
             ));
-            // Below the floor: still gated off.
             assert!(!version_supports_subscribe_hint(
-                Some((0, 2, 79)),
+                Some((0, 2, 80)),
                 SUBSCRIBE_HINT_MIN_VERSION
             ));
-            assert!(!version_supports_subscribe_hint(
-                Some((0, 2, 73)),
+            // Exactly at the disabled floor `(0, 3, 0)` qualifies — this pins the
+            // floor value so an accidental lowering trips the assert above.
+            assert!(version_supports_subscribe_hint(
+                Some((0, 3, 0)),
                 SUBSCRIBE_HINT_MIN_VERSION
             ));
             // Unknown version fails closed.
@@ -3525,6 +3537,27 @@ mod tests {
                 None,
                 SUBSCRIBE_HINT_MIN_VERSION
             ));
+        }
+
+        /// Regression pin for the deliberate re-disable: the production floor MUST
+        /// stay at the disabled value `(0, 3, 0)` (above every shipped 0.2.x
+        /// release). The #4404 placement migration is net-negative in production
+        /// (#4610 / #4440 / #4534 costs with no placement benefit — flat
+        /// `hosted_key_distance`, ~0.05% act-rate), so it is intentionally OFF.
+        /// This direct equality is the loudest tripwire against a reflex-revert to
+        /// `(0, 2, 80)` (the prior re-enable value): re-enabling must be a
+        /// deliberate, canary-gated change (see docs/RELEASING.md and the const
+        /// doc comment), NOT an accidental edit. See #4404 / #4610 / #4440.
+        #[test]
+        fn subscribe_hint_floor_is_parked_at_disabled_value() {
+            assert_eq!(
+                SUBSCRIBE_HINT_MIN_VERSION,
+                (0, 3, 0),
+                "SubscribeHint placement migration must stay DISABLED — the floor \
+                 must remain parked at (0, 3, 0). Lowering it re-enables a \
+                 net-negative migration and must only be done via a deliberate, \
+                 canary-gated change."
+            );
         }
     }
 

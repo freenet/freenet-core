@@ -92,28 +92,38 @@ Current wire-gated floors:
 - `SUBSCRIBE_HINT_MIN_VERSION` in `crates/core/src/node/network_bridge/p2p_protoc.rs`
   (SubscribeHint placement migration, #4404).
 
-  Set to **`(0, 2, 80)`** and FROZEN. 0.2.80 is the first release that ships
-  SubscribeHint together with the #4145 event-loop fix (#4499) that makes the
-  migration load-safe, so this floor now follows the general "set to the
-  first-shipping release version, then freeze" rule above. The SEND gate emits a
-  hint only to peers reported at `>= 0.2.80`; the inbound-hint RECEIVE gate (in
-  `node.rs`) acts on a hint only if THIS node is itself `>= 0.2.80` (a proxy: the
-  per-connection sender version is not exposed at the receive handler, so the
-  load-bearing receiver gates on its own version, which guarantees the node that
-  takes on migration load always has the #4145 fix). Because pre-0.2.80 releases
-  have parked floors and emit no hints, in practice hints flow only between
-  `>= 0.2.80` peers, so activation ramps with fleet upgrade rather than switching
-  on everywhere at once. **DO NOT bump this floor on later releases** (raising it
-  above the first-shipping version would silently stop sending to fully-capable
-  peers).
+  **DISABLED — parked at `(0, 3, 0)`**, above every shipped 0.2.x release, so the
+  migration is OFF for the entire live network. The SEND gate emits a hint only to
+  peers reported at `>= (0, 3, 0)` (none today); the inbound-hint RECEIVE gate (in
+  `node.rs`) acts on a hint only if THIS node is itself `>= (0, 3, 0)` (none
+  today). With the floor above all 0.2.x peers, no node sends or acts on hints.
+
+  This is a DELIBERATE re-disable, NOT a "freeze at the first-shipping version"
+  floor — the #4404 placement migration is net-negative in production. It drives
+  the #4610 full-state summarize storm, the #4440 subscription-renewal load, and
+  #4534 module-cache thrash, while delivering NO measurable placement benefit:
+  production telemetry over the re-enabled window showed `hosted_key_distance` FLAT
+  (placement did not tighten) and the inbound-hint act-rate collapsed to ~0.05%
+  (received-but-not-acted). The network paid the storm / renewal / thrash cost for
+  essentially zero migrations, so disabling removes that cost with no placement
+  regression. Authorized by Ian + overseer (2026-06).
+
+  **REVERSIBLE, but gated.** Lowering the floor (e.g. back to a shipped 0.2.x
+  version) re-enables both gates together. Do NOT lower it on the strength of a
+  passing simulation test alone — a sim can show hints flowing, but the production
+  failure was exactly that hints flowed, cost a lot, and moved placement nowhere.
+  Any future re-enable MUST be gated on a CANARY showing `hosted_key_distance`
+  measurably TIGHTENING under the migration (real placement benefit on real
+  peers), with the #4610 / #4440 / #4534 costs bounded — not just a green test. If
+  you cannot show placement improving on production peers, leave it off.
 
   History: the migration first shipped in v0.2.73 and its directed-subscribe /
   hint-broadcast load drove a network-wide UPDATE-broadcast degradation by
   amplifying the latent #4145 event-loop wedge. v0.2.74 disabled it by parking
-  this floor at `(0, 3, 0)`, above all live peers. It was re-enabled at
-  `(0, 2, 80)` only after #4145 was fixed (#4499), the fix was validated at
-  incident-scale fan-out, and the broadcast-assembly-failure telemetry (#4498)
-  was deployed to record a baseline and watch the rollout.
+  this floor at `(0, 3, 0)`. It was re-enabled at `(0, 2, 80)` (#4511) after #4145
+  was fixed (#4499) and validated at incident-scale fan-out — but production
+  telemetry then showed it net-negative (the costs above), so it is RE-DISABLED by
+  parking the floor at `(0, 3, 0)` again (#4404 / #4610 / #4440).
 
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.

@@ -1774,19 +1774,22 @@ where
                 .ring
                 .placement_migration_metrics()
                 .record_received();
-            // Placement-migration version gate. The migration is re-enabled at
-            // floor `(0, 2, 80)` (#4499 made it load-safe). The SEND side
+            // Placement-migration version gate. The migration is DISABLED in
+            // production: the floor is parked at `(0, 3, 0)`, above every shipped
+            // 0.2.x release, because it is net-negative (#4610 / #4440 / #4534
+            // costs with no placement benefit — see the `SUBSCRIBE_HINT_MIN_VERSION`
+            // doc comment). The SEND side
             // (`p2p_protoc::peer_supports_subscribe_hint`) gates emission on the
-            // remote peer's version; the RECEIVE path must gate too, so a node on
-            // an older release does not ACT on a hint from an upgraded peer and
-            // keep migration load alive on a peer that predates the load-safe fix.
+            // remote peer's version; the RECEIVE path gates too, so a node does not
+            // ACT on a hint even if some peer were to emit one.
             //
             // The symmetric (sender-version) gate is not cleanly reachable here:
             // the per-connection remote version lives in `P2pConnManager.connections`
             // and is not exposed through the `NetworkBridge` trait, so use this
-            // node's OWN version against the SAME floor the send side uses. A node
-            // on `>= 0.2.80` acts on inbound hints; a pre-floor node ignores them.
-            // Lowering the floor (sim override) re-activates both sides together.
+            // node's OWN version against the SAME floor the send side uses. With the
+            // floor at `(0, 3, 0)` no shipped 0.2.x node acts on inbound hints.
+            // Lowering the floor (sim override, or a deliberate canary-gated
+            // re-enable) re-activates both sides together.
             //
             // Read the floor via `subscribe_hint_floor_override().unwrap_or(...)`,
             // identical to the send side, so a simulation that opts into the
@@ -3479,23 +3482,24 @@ mod tests {
 
     // Tests for the INBOUND `SubscribeHint` receive gate.
     //
-    // The placement migration is RE-ENABLED at floor `(0, 2, 80)` (#4499 made it
-    // load-safe). The receive handler shares this floor with the send side, so a
-    // node acts on an inbound hint only when both it and the producing peer are at
-    // or above the floor; it still ignores hints from pre-floor peers, which
-    // preserves wire-compat during the staggered rollout.
+    // The placement migration is DISABLED: the floor is parked at `(0, 3, 0)`,
+    // above every shipped 0.2.x release, because it is net-negative in production
+    // (#4610 / #4440 / #4534 costs with no placement benefit — see the
+    // `SUBSCRIBE_HINT_MIN_VERSION` doc comment). The receive handler shares this
+    // floor with the send side, so no shipped 0.2.x node acts on an inbound hint.
+    // Lowering the floor (sim override, or a deliberate canary-gated re-enable)
+    // re-activates both sides together.
     mod inbound_subscribe_hint_gate {
         use crate::node::network_bridge::p2p_protoc::{
             SUBSCRIBE_HINT_MIN_VERSION, own_crate_version, version_supports_subscribe_hint,
         };
 
-        // Superseded: the placement migration was RE-ENABLED at `(0, 2, 80)` by
-        // PR #4511 (#4145 fixed in #4499). This test pinned the v0.2.74
-        // deactivation (own version below the parked floor, so all inbound hints
-        // ignored) and now documents that prior behavior; its `own < floor`
-        // assert no longer holds once the crate reaches the floor. Replaced by
-        // `receive_gate_active_at_reenable_floor` below.
-        #[ignore]
+        /// The placement migration is DISABLED: the floor is parked at `(0, 3, 0)`,
+        /// above every shipped 0.2.x release (including this crate's own version),
+        /// so the receive gate IGNORES every inbound hint. Re-disabled because the
+        /// migration is net-negative in production (#4610 / #4440 / #4534 costs
+        /// with no placement benefit). See the `SUBSCRIBE_HINT_MIN_VERSION` doc
+        /// comment.
         #[test]
         fn receive_gate_ignores_hint_while_deactivated() {
             let own = own_crate_version();
@@ -3515,36 +3519,33 @@ mod tests {
             ));
         }
 
-        /// At the re-enable floor the receive gate ACTS on hints from peers at or
-        /// above the floor and IGNORES hints from pre-floor peers (wire-compat).
+        /// With the floor parked at `(0, 3, 0)` the receive gate IGNORES hints
+        /// from every shipped 0.2.x peer (the migration is disabled). The
+        /// `!supported(0,2,255)` + `supported(0,3,0)` pair pins the floor to
+        /// EXACTLY `(0, 3, 0)`: lowering it (a re-enable) trips these asserts —
+        /// the intended tripwire, since re-enabling must be a deliberate,
+        /// canary-gated change (see docs/RELEASING.md and the const doc comment).
         /// Uses explicit versions rather than `own_crate_version` so the assertion
-        /// is stable across the 0.2.79 -> 0.2.80 boundary (the crate is still
-        /// 0.2.79 until the re-enable release bumps it to the floor version).
+        /// is stable across release bumps. See issues #4404 / #4610 / #4440.
         #[test]
-        fn receive_gate_active_at_reenable_floor() {
-            // The `supported(0,2,80)` + `!supported(0,2,79)` pair pins the floor
-            // to exactly `(0, 2, 80)`; an accidental change trips these asserts.
-            // Peers at or above the floor are acted on.
-            assert!(version_supports_subscribe_hint(
+        fn receive_gate_disabled_above_all_0_2_x() {
+            // Highest possible 0.2.x patch is still below the floor: ignored.
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 255)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(!version_supports_subscribe_hint(
                 Some((0, 2, 80)),
                 SUBSCRIBE_HINT_MIN_VERSION
             ));
+            // Exactly at the disabled floor `(0, 3, 0)` qualifies — this pins the
+            // floor value so an accidental lowering trips the assert above.
             assert!(version_supports_subscribe_hint(
                 Some((0, 3, 0)),
                 SUBSCRIBE_HINT_MIN_VERSION
             ));
-            // Pre-floor peers are still ignored: older 0.2.x peers, and the
-            // original 0.2.73 sender from the staggered rollout.
-            assert!(!version_supports_subscribe_hint(
-                Some((0, 2, 79)),
-                SUBSCRIBE_HINT_MIN_VERSION
-            ));
-            assert!(!version_supports_subscribe_hint(
-                Some((0, 2, 73)),
-                SUBSCRIBE_HINT_MIN_VERSION
-            ));
-            // Unknown remote version fails closed (the migration's send/receive
-            // gate must never act on a peer whose version we could not determine).
+            // Unknown remote version fails closed (the gate must never act on a
+            // peer whose version we could not determine).
             assert!(!version_supports_subscribe_hint(
                 None,
                 SUBSCRIBE_HINT_MIN_VERSION
