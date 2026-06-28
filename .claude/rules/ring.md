@@ -162,14 +162,26 @@ WHEN exchanging peer lists in sync protocols (e.g., interest sync):
 WHEN summarizing contracts in the InterestSync heartbeat handlers
 (handle_interest_sync_message: Interests / Summaries / ChangeInterests):
   → ONLY call get_contract_summary for contracts we host OR actively serve
-    (is_hosting_contract || contract_in_use) — go through
-    summary_if_hosted_or_in_use, never a bare get_contract_summary.
+    AND for which we actually hold state:
+    (is_hosting_contract || contract_in_use) && contract_state_present — go
+    through summary_if_hosted_or_in_use, never a bare get_contract_summary. The
+    same composed predicate gates the broadcast path
+    (should_broadcast_contract, broadcast_queue.rs).
   → A node carries phantom peer-interest in contracts it neither hosts nor
     serves (placement-migration after-effect, #4404). Summarizing those issues a
     GetSummaryQuery round-trip on the serial contract_handling loop that returns
     "state not found" every heartbeat — the #4473/#4145 summarize storm
     (~40/sec vs <10 real updates/hr) that wedged gateways. The ResyncRequest arm
     is exempt: it is state-gated and not heartbeat-driven.
+  → #4610: the (is_hosting || in_use) gate ALONE is NOT sufficient. The inbound
+    relay-SUBSCRIBE / placement path marks a contract is_hosting/in_use WITHOUT
+    its state ever being fetched/stored, so phantom (interested-but-stateless)
+    contracts still passed and re-drove the storm (~70-80/sec on 0.2.84/0.2.85).
+    contract_state_present (a cheap on-disk STATE-store existence check, NOT the
+    in-memory hosting cache) is the term that excludes them. It MUST read the
+    state store so an evicted-but-on-disk contract (state present, not in the
+    hosting cache, still in_use) keeps summarizing — keying on is_hosting_contract
+    there would wrongly drop it.
 ```
 
 ### Cleanup Exemptions Must Be Time-Bounded

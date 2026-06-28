@@ -2752,23 +2752,30 @@ async fn get_contract_summary(
 /// real GET/PUT/UPDATE on relays; feeding the #4145 notification-channel
 /// saturation on gateways). #4473.
 ///
-/// Gating on `is_hosting_contract || contract_in_use` is correct, not just a
-/// heuristic:
-/// - Phantom contracts (the storm) are neither hosted nor in use, so they are
-///   skipped — empirically ~95% of the storm on technic.
-/// - A contract we hold state for but evicted from the hosting cache is only
-///   reachable while NOT in use (`evict_over_budget` retains `contract_in_use`
-///   entries), and `reclaim_evicted_contract` deletes its state once not in use.
-///   So a skipped contract has no live subscriber depending on its interest-sync
-///   heal, and (outside a brief pending-reclamation window) no state to advertise.
-/// - The moment a contract gains a live subscriber it is `contract_in_use`, so
-///   we resume summarizing and healing it — no loss of proactive repair for any
-///   contract a peer is actually subscribed to.
+/// Gating on `(is_hosting_contract || contract_in_use)` alone proved
+/// insufficient (#4610): the inbound relay-SUBSCRIBE / placement-migration path
+/// marks a contract `is_hosting`/`contract_in_use` (a downstream subscriber
+/// renewal) WITHOUT its state ever being fetched and stored, so ~655 "phantom"
+/// (interested-but-stateless) contracts still passed the gate and drove the
+/// `summarize_contract_state` storm back to ~70-80/sec (#4440 root cause). The
+/// gate therefore ALSO requires `contract_state_present` — actual state in the
+/// on-disk store — which is the only signal that distinguishes a phantom from a
+/// contract we can really summarize:
+/// - Phantom contracts (the storm) have no stored state, so they are skipped.
+/// - An evicted-but-in-use contract keeps its state ON DISK
+///   (`evict_over_budget` retains `contract_in_use` entries, and
+///   `reclaim_evicted_contract` only deletes state once NOT in use), so
+///   `contract_state_present` is true and it KEEPS summarizing — which is why
+///   the gate reads the state store, not the in-memory hosting cache.
+/// - The moment a contract's state is fetched/stored it summarizes again — no
+///   loss of proactive repair for any contract we genuinely hold.
 async fn summary_if_hosted_or_in_use(
     op_manager: &Arc<OpManager>,
     key: &freenet_stdlib::prelude::ContractKey,
 ) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
-    if op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key) {
+    if (op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key))
+        && op_manager.ring.contract_state_present(key)
+    {
         // Periodic interest-sync summarize: best-effort background work, so it
         // yields the contract loop to client/relay traffic (#4534 / #4473).
         get_contract_summary(op_manager, key, crate::contract::Priority::Background).await
@@ -3187,6 +3194,14 @@ mod tests {
             helper_src.contains("contract_in_use"),
             "summary_if_hosted_or_in_use must ALSO gate on contract_in_use so an \
              evicted-but-in-use stateful contract keeps its interest-sync heal"
+        );
+        assert!(
+            helper_src.contains("contract_state_present"),
+            "summary_if_hosted_or_in_use must ALSO gate on contract_state_present \
+             (actual state in the on-disk store) so a phantom \
+             (interested-but-stateless) contract is NOT summarized every heartbeat \
+             — the #4610 storm. Must read the state store, not the in-memory \
+             hosting cache, so an evicted-but-on-disk contract still summarizes."
         );
 
         // Slice the periodic arms = handler start .. the ResyncRequest arm.

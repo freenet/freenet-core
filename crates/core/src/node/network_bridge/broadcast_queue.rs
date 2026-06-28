@@ -130,19 +130,28 @@ impl BroadcastStreamMetrics {
 /// #4475 rollout (#4473). With no local state there is nothing to broadcast to
 /// the peer, so skipping is the correct behavior, not just a throttle.
 ///
-/// Gating on `is_hosting_contract || contract_in_use` is correct, not merely a
-/// heuristic — same reasoning as #4475: a phantom contract is neither hosted
-/// nor in use (skipped); a contract whose state we evicted from the hosting
-/// cache is only reachable while NOT in use, and has no live subscriber whose
-/// broadcast we'd be dropping; the moment a contract gains a live subscriber it
-/// is `contract_in_use`, so we resume broadcasting it.
+/// Gating on `(is_hosting_contract || contract_in_use)` alone proved
+/// insufficient (#4610): the inbound relay-SUBSCRIBE / placement-migration path
+/// marks a contract hosted / in-use (a downstream subscriber renewal) WITHOUT
+/// its state ever being fetched and stored, so "phantom"
+/// (interested-but-stateless) contracts still passed this gate and drove the
+/// residual `summarize_contract_state` storm. The gate therefore ALSO requires
+/// `contract_state_present` — actual state in the on-disk store:
+/// - a phantom contract has no stored state, so it is skipped (nothing to
+///   broadcast);
+/// - an evicted-but-in-use contract keeps its state ON DISK (the hosting cache
+///   evicts but `reclaim_evicted_contract` only deletes state once NOT in use),
+///   so `contract_state_present` is true and we keep broadcasting it — which is
+///   why the gate reads the state store, not the in-memory hosting cache.
 ///
-/// NOTE: it is surprising the broadcast path runs at all for a contract we hold
-/// no state for — that points at a routing/subscription leak upstream of
-/// `broadcast_state_to_peers` (tracked separately on #4473). This gate stops the
-/// storm symptom; it does not fix that upstream question.
+/// NOTE: it is surprising the broadcast/interest path runs at all for a contract
+/// we hold no state for — that points at a routing/subscription leak upstream
+/// (the inbound relay-SUBSCRIBE registering downstream-subscriber + interest
+/// without state, tracked separately on #4440/#4610). This gate stops the storm
+/// symptom; it does not fix that upstream question.
 pub(super) fn should_broadcast_contract(op_manager: &Arc<OpManager>, key: &ContractKey) -> bool {
-    op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key)
+    (op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key))
+        && op_manager.ring.contract_state_present(key)
 }
 
 // The `BroadcastQueue` struct (constants, types, impl) is only used in the
@@ -1234,6 +1243,15 @@ mod tests {
             helper_src.contains("contract_in_use"),
             "should_broadcast_contract must ALSO gate on contract_in_use so an \
              evicted-but-in-use stateful contract keeps being broadcast"
+        );
+        assert!(
+            helper_src.contains("contract_state_present"),
+            "should_broadcast_contract must ALSO gate on contract_state_present \
+             (actual state in the on-disk store) so a phantom \
+             (interested-but-stateless) contract is NOT broadcast/summarized every \
+             heartbeat — the #4610 storm. Must read the state store, not the \
+             in-memory hosting cache, so an evicted-but-on-disk contract still \
+             broadcasts."
         );
 
         // 2. `broadcast_to_single_peer` must call the gate BEFORE the expensive

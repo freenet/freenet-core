@@ -2297,6 +2297,16 @@ impl Ring {
         self.hosting_manager.is_hosting_contract(key)
     }
 
+    /// Whether this node has stored state on disk for this contract (see
+    /// [`HostingManager::contract_state_present`]). Used by the #4610
+    /// summarize/broadcast gates to skip phantom (interested-but-stateless)
+    /// contracts while still serving evicted-but-in-use ones whose state
+    /// remains on disk.
+    #[inline]
+    pub fn contract_state_present(&self, key: &ContractKey) -> bool {
+        self.hosting_manager.contract_state_present(key)
+    }
+
     /// Set the storage reference for hosting metadata persistence.
     ///
     /// Must be called after executor creation. This enables automatic
