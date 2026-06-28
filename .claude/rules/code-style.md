@@ -337,7 +337,7 @@ Canonical examples:
 
 - `crates/core/src/config/secret.rs::generate_cipher_key` — generates
   the per-node XChaCha20-Poly1305 cipher seeded at first start.
-- `crates/core/src/wasm_runtime/secrets_store.rs::store_secret` —
+- `crates/core/src/wasm_runtime/secrets_store/store.rs::store_secret` —
   generates a fresh per-write AEAD nonce.
 
 Do not add new `OsRng` call sites outside of crypto key/nonce

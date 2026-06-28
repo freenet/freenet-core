@@ -3,7 +3,7 @@
 //!
 //! The KEK is a 32-byte secret used as the master key from which every
 //! per-delegate DEK (Data Encryption Key) is derived via HKDF-SHA256.
-//! See `wasm_runtime/secrets_store.rs::derive_delegate_dek`.
+//! See `wasm_runtime/secrets_store/store.rs::derive_delegate_dek`.
 //!
 //! ## Backends
 //!
