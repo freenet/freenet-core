@@ -1209,9 +1209,12 @@ mod tests {
         let (_, after_fn_start) = src
             .split_once("fn open_permission_page_in_browser(url: &str) {")
             .expect("open_permission_page_in_browser definition not found");
-        // Restrict the search window to the function body: it ends at the next
-        // top-level `#[cfg(test)]` item (the `impl DashboardPrompter` test
-        // constructor that immediately follows the function).
+        // Restrict the search window to the function body, which ends at the
+        // next top-level `#[cfg(test)]` item. This ASSUMES
+        // `open_permission_page_in_browser` is immediately followed by the
+        // `#[cfg(test)] impl DashboardPrompter` test constructor: if non-test
+        // code is inserted between them, the window widens to include it and
+        // this assertion would also scan that code. Keep them adjacent.
         let body = after_fn_start
             .split_once("\n#[cfg(test)]")
             .map(|(b, _)| b)
