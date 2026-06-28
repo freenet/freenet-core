@@ -808,6 +808,12 @@ async fn serve_dual_stack(
             aborts.push(serve_with_listener(primary, router, pre_bound).await?);
         }
     }
+    // The primary client-API socket is now bound (a primary bind failure is
+    // fatal above, so reaching here means we own the port). That is the
+    // authoritative "node recovered the port" signal: clear any stuck-wrapper
+    // banner a now-dead supervising wrapper left behind so a freshly-recovered
+    // node does not keep showing it (#4288).
+    crate::service_status::clear_stuck_status_on_startup();
     Ok(())
 }
 

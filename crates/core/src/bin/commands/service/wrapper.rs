@@ -1,6 +1,14 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+// The stuck-wrapper status schema, file name, and read/write/clear helpers live
+// in the `freenet` library (`service_status`) so the wrapper (writer) and the
+// homepage banner + node-startup clear (readers) share one definition and can't
+// drift. See `crate::service_status` for the rationale.
+use freenet::service_status::{
+    StuckWrapperStatus, clear_stuck_status_file, write_stuck_status_file,
+};
+
 #[cfg(target_os = "macos")]
 use super::launch_at_login::macos_launch_at_login_startup;
 #[cfg(target_os = "macos")]
@@ -83,15 +91,6 @@ fn spawn_first_run_dashboard_opener(log_dir: &Path) {
 /// couple of backoff intervals (tens of seconds, not the ~50-failure give-up
 /// horizon) yet high enough to avoid crying wolf on transient blips.
 pub(super) const WRAPPER_STUCK_NOTIFY_THRESHOLD: u32 = 3;
-
-/// File name (under the log directory) where the wrapper records a stuck-loop
-/// status (failure count + last error). This is groundwork: the homepage
-/// banner reader is not yet wired (tracked as a follow-up to #4382), so the
-/// operator-facing signals delivered today are the cross-platform log line and
-/// the macOS osascript notification. The file lets a future banner surface the
-/// stuck state even when the served node is a stale orphan (dovetails with the
-/// #4289 version-mismatch banner).
-pub(super) const STUCK_STATUS_FILE_NAME: &str = "wrapper-stuck-status.json";
 
 /// File name (under the log directory) where the wrapper persists a
 /// *cross-process* identical-failure streak (#4382). The dominant #3967
@@ -1415,90 +1414,6 @@ pub(super) fn log_wrapper_event(log_dir: &Path, message: &str) {
 
     // Clean up old log files (best-effort, don't let cleanup failure block anything)
     cleanup_old_wrapper_logs(log_dir);
-}
-
-/// Status the wrapper writes to `STUCK_STATUS_FILE_NAME` once a repeated,
-/// identical failure has crossed `WRAPPER_STUCK_NOTIFY_THRESHOLD` (#4382).
-///
-/// Serialized as JSON so a future homepage reader can render an operator
-/// banner even when the served node is a stale orphan answering on the port.
-/// The reader is not yet wired (follow-up to #4382); today's delivered signals
-/// are the log line and the macOS osascript notification.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(super) struct StuckWrapperStatus {
-    /// Child exit code that keeps repeating.
-    pub(super) exit_code: i32,
-    /// Whether the repeated failure was detected as a port conflict.
-    pub(super) is_port_conflict: bool,
-    /// How many consecutive identical failures have occurred.
-    pub(super) failure_count: u32,
-    /// Human-readable last-error summary (exit code + cause).
-    pub(super) last_error: String,
-    /// One-line recovery hint for the operator.
-    pub(super) recovery_hint: String,
-}
-
-impl StuckWrapperStatus {
-    pub(super) fn new(exit_code: i32, is_port_conflict: bool, failure_count: u32) -> Self {
-        let cause = if is_port_conflict {
-            // exit 43 / "address already in use" against a held port is the
-            // #3967 stale-orphan signature.
-            format!("exit {exit_code} — the dashboard port is held by another process")
-        } else {
-            format!("exit {exit_code}")
-        };
-        let last_error =
-            format!("Node failed {failure_count} times in a row with the same cause: {cause}.");
-        let recovery_hint = if is_port_conflict {
-            "The background service looks stuck on an old process holding the port. \
-             Recover with: freenet service stop && freenet service start \
-             (or kill the stale 'freenet network' process holding the dashboard port)."
-                .to_string()
-        } else {
-            "The background service is repeatedly crashing on startup. \
-             Recover with: freenet service stop && freenet service start, \
-             then check the wrapper logs for the underlying error."
-                .to_string()
-        };
-        Self {
-            exit_code,
-            is_port_conflict,
-            failure_count,
-            last_error,
-            recovery_hint,
-        }
-    }
-
-    /// Single log line summarizing the stuck condition.
-    pub(super) fn log_line(&self) -> String {
-        format!(
-            "Wrapper appears stuck: {} {}",
-            self.last_error, self.recovery_hint
-        )
-    }
-}
-
-/// Write the stuck status to `STUCK_STATUS_FILE_NAME` under the log directory.
-/// Best-effort: a write failure must never block the wrapper loop.
-pub(super) fn write_stuck_status_file(log_dir: &Path, status: &StuckWrapperStatus) {
-    let path = log_dir.join(STUCK_STATUS_FILE_NAME);
-    match serde_json::to_string_pretty(status) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                eprintln!("Failed to write stuck-status file {}: {e}", path.display());
-            }
-        }
-        Err(e) => eprintln!("Failed to serialize stuck-status: {e}"),
-    }
-}
-
-/// Remove the stuck status file (best-effort) once the wrapper recovers, so a
-/// stale banner doesn't linger. A missing file is not an error.
-pub(super) fn clear_stuck_status_file(log_dir: &Path) {
-    let path = log_dir.join(STUCK_STATUS_FILE_NAME);
-    if path.exists() {
-        drop(std::fs::remove_file(&path));
-    }
 }
 
 /// Persisted, *cross-process* identical-failure streak (#4382).

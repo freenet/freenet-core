@@ -1,5 +1,33 @@
 use super::*;
 
+/// Build the service-wrapper "stuck" banner shown at the very top of the
+/// homepage when the supervising wrapper has published a stuck-status file
+/// (#4288, the homepage-banner half of #4382).
+///
+/// This is the cross-platform surface for surfacing a wedged wrapper: Linux has
+/// no `osascript` notification, and even on macOS the banner reaches an operator
+/// who is looking at the (stale) dashboard rather than at Notification Center.
+/// It works in the dominant stale-orphan wedge because the orphan node serving
+/// this page reads the same status file the wrapper wrote.
+///
+/// Kept a pure function of the parsed status (no filesystem access) so it is
+/// unit-testable; `homepage_html` does the `get_log_dir()` read and passes the
+/// result here. Returns an empty string when there is no stuck status, so the
+/// template slot collapses to nothing.
+pub fn build_wrapper_stuck_banner(status: Option<&StuckWrapperStatus>) -> String {
+    let Some(status) = status else {
+        return String::new();
+    };
+    format!(
+        r#"<div class="wrapper-stuck-banner" role="alert">
+            <span class="wrapper-stuck-icon">&#x26A0;</span>
+            <span><strong>Service may be stuck.</strong> {last_error} {recovery_hint}</span>
+        </div>"#,
+        last_error = html_escape(&status.last_error),
+        recovery_hint = html_escape(&status.recovery_hint),
+    )
+}
+
 pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
     let Some(snap) = snap else {
         return r#"<div class="card">

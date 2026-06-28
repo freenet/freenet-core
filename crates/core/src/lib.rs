@@ -48,6 +48,11 @@ mod governance;
 #[cfg_attr(test, allow(dead_code))]
 pub mod tracing;
 
+/// Cross-process stuck-wrapper status the service wrapper publishes for the
+/// local homepage (#4288). Shared so the writer (binary's wrapper command) and
+/// the readers (homepage banner + node-startup clear) agree on the schema.
+pub mod service_status;
+
 /// Code for communicating with other peers over UDP, handles hole-punching, error handling, etc.
 pub mod transport;
 

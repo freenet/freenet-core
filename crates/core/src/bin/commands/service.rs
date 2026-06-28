@@ -2913,41 +2913,11 @@ echo "RC=$?"
         assert!(state.last_failure_signature.is_none());
     }
 
-    #[test]
-    fn test_stuck_status_file_roundtrip_and_clear() {
-        let tmp = tempfile::tempdir().unwrap();
-        let status = StuckWrapperStatus::new(43, true, WRAPPER_STUCK_NOTIFY_THRESHOLD);
-        write_stuck_status_file(tmp.path(), &status);
-
-        let path = tmp.path().join(STUCK_STATUS_FILE_NAME);
-        assert!(path.exists(), "status file must be written");
-        let json = std::fs::read_to_string(&path).unwrap();
-        let parsed: StuckWrapperStatus = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, status);
-        assert_eq!(parsed.failure_count, WRAPPER_STUCK_NOTIFY_THRESHOLD);
-        assert!(parsed.is_port_conflict);
-        assert!(
-            parsed.recovery_hint.contains("freenet service stop"),
-            "hint must give the recovery command"
-        );
-
-        // Clearing removes the file; clearing again (missing file) is a no-op.
-        clear_stuck_status_file(tmp.path());
-        assert!(!path.exists(), "status file must be cleared on recovery");
-        clear_stuck_status_file(tmp.path());
-    }
-
-    #[test]
-    fn test_stuck_status_messages_differ_by_cause() {
-        let port = StuckWrapperStatus::new(43, true, 3);
-        assert!(port.last_error.contains("port"));
-        assert!(port.recovery_hint.contains("port"));
-
-        let crash = StuckWrapperStatus::new(101, false, 3);
-        assert!(!crash.is_port_conflict);
-        assert!(crash.last_error.contains("exit 101"));
-        assert!(crash.recovery_hint.contains("crashing"));
-    }
+    // StuckWrapperStatus itself (schema, recovery-hint copy, file round-trip,
+    // missing/malformed reads) is now defined and unit-tested in the shared
+    // `freenet::service_status` library module, since the homepage banner reader
+    // and node-startup clear also consume it. See those tests for the
+    // round-trip + cause-specific message coverage that used to live here.
 
     #[test]
     fn test_applescript_escape_quotes_and_backslashes() {

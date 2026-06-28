@@ -15,12 +15,15 @@ use axum::response::{Html, IntoResponse};
 // Re-exported so child submodules can reach them via `use super::*;`.
 // Safe to re-export at pub(super) because they are pub in their origin.
 pub(super) use crate::node::network_status::{self, format_ago, format_duration, html_escape};
+// Stuck-wrapper status the supervising wrapper publishes for the homepage
+// banner (#4288). Shared with the wrapper writer via `crate::service_status`.
+pub(super) use crate::service_status::{StuckWrapperStatus, read_stuck_status_file};
 pub(super) use std::fmt::Write;
 
 use assets::{CSS, JS};
 use cards::{
     build_ban_list_card, build_contracts_card, build_governance_card, build_ops_card,
-    build_peers_card, build_status_card, build_transfer_card,
+    build_peers_card, build_status_card, build_transfer_card, build_wrapper_stuck_banner,
 };
 use favicon::build_favicon_data_uri;
 use peer_detail::peer_detail_html;
@@ -113,6 +116,17 @@ fn homepage_html() -> String {
 
     let favicon = build_favicon_data_uri(&snap);
 
+    // Service-wrapper stuck banner (#4288): the supervising wrapper writes a
+    // status file into the log directory when it is wedged (e.g. a stale orphan
+    // holding the port). Surface it as a top-of-page banner — the cross-platform
+    // signal that also reaches a stale orphan serving this very page. Best-effort
+    // read on the homepage hot path; a missing/unparseable file → no banner.
+    let wrapper_stuck_banner = {
+        let status =
+            crate::tracing::tracer::get_log_dir().and_then(|dir| read_stuck_status_file(&dir));
+        build_wrapper_stuck_banner(status.as_ref())
+    };
+
     let status_card = build_status_card(&snap);
     let peers_card = build_peers_card(&snap);
     let governance_card = build_governance_card(&snap);
@@ -169,6 +183,7 @@ fn homepage_html() -> String {
         peer_copy_btn = peer_copy_btn,
         pub_key = html_escape(pub_key),
         pub_copy_btn = pub_copy_btn,
+        wrapper_stuck_banner = wrapper_stuck_banner,
         status_card = status_card,
         peers_card = peers_card,
         transfer_card = transfer_card,
@@ -186,8 +201,8 @@ mod tests {
     use super::assets::JS;
     use super::cards::{
         build_ban_list_card, build_contracts_card, build_governance_card, build_ops_card,
-        build_peers_card, build_ring_svg, build_status_card, build_transfer_card, format_bytes,
-        format_last_evaluated,
+        build_peers_card, build_ring_svg, build_status_card, build_transfer_card,
+        build_wrapper_stuck_banner, format_bytes, format_last_evaluated,
     };
     use super::estimator::{
         RegKind, build_estimator_chart, build_estimator_chart_or_placeholder,
@@ -352,6 +367,97 @@ mod tests {
         assert!(
             slot.contains("hidden"),
             "version mismatch banner must be hidden by default, got: {slot}"
+        );
+    }
+
+    // ── Service-wrapper stuck banner (#4288) ───────────────────────────────
+
+    #[test]
+    fn wrapper_stuck_banner_absent_when_no_status() {
+        assert_eq!(
+            build_wrapper_stuck_banner(None),
+            "",
+            "no stuck status must collapse the banner slot to nothing"
+        );
+    }
+
+    #[test]
+    fn wrapper_stuck_banner_surfaces_recovery_command() {
+        let status = StuckWrapperStatus::new(43, true, 3);
+        let banner = build_wrapper_stuck_banner(Some(&status));
+        assert!(
+            banner.contains("wrapper-stuck-banner"),
+            "must render the banner element"
+        );
+        assert!(
+            banner.contains("Service may be stuck"),
+            "must lead with the operator-facing headline"
+        );
+        // The whole point of #4288: the surfaced banner carries the concrete
+        // recovery command, not just a generic 'something is wrong'.
+        assert!(
+            banner.contains("freenet service stop &amp;&amp; freenet service start"),
+            "banner must include the concrete recovery command, got: {banner}"
+        );
+        assert!(
+            banner.contains("dashboard port is held"),
+            "banner must explain the port-conflict cause"
+        );
+    }
+
+    #[test]
+    fn wrapper_stuck_banner_escapes_html() {
+        // A status whose strings contain HTML metacharacters must be escaped so
+        // a hostile/garbled last-error string can't inject markup into the page.
+        let status = StuckWrapperStatus {
+            exit_code: 1,
+            is_port_conflict: false,
+            failure_count: 3,
+            last_error: "<script>alert('x')</script>".to_string(),
+            recovery_hint: "run a && b".to_string(),
+        };
+        let banner = build_wrapper_stuck_banner(Some(&status));
+        assert!(
+            !banner.contains("<script>"),
+            "raw script tag must not survive into the banner: {banner}"
+        );
+        assert!(
+            banner.contains("&lt;script&gt;"),
+            "the error text must appear HTML-escaped: {banner}"
+        );
+        assert!(
+            banner.contains("a &amp;&amp; b"),
+            "ampersands in the recovery hint must be escaped: {banner}"
+        );
+    }
+
+    /// End-to-end for #4288's acceptance criterion: after N consecutive
+    /// port-conflict failures the wrapper writes a stuck-status file, and the
+    /// homepage turns that file into an operator banner carrying the recovery
+    /// command — the cross-platform surface, exercised here without a real node.
+    #[test]
+    fn stuck_status_file_surfaces_as_homepage_banner() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The wrapper crosses its threshold (3 identical port-conflict failures)
+        // and publishes the status file.
+        let written = StuckWrapperStatus::new(43, true, 3);
+        crate::service_status::write_stuck_status_file(tmp.path(), &written);
+
+        // The homepage reads it back and renders the banner.
+        let read_back = read_stuck_status_file(tmp.path()).expect("status must round-trip");
+        let banner = build_wrapper_stuck_banner(Some(&read_back));
+        assert!(
+            banner.contains("Service may be stuck")
+                && banner.contains("freenet service stop &amp;&amp; freenet service start"),
+            "operator must be surfaced the stuck state + recovery command, got: {banner}"
+        );
+
+        // And once it clears (e.g. recovery), the banner disappears.
+        crate::service_status::clear_stuck_status_file(tmp.path());
+        assert_eq!(
+            build_wrapper_stuck_banner(read_stuck_status_file(tmp.path()).as_ref()),
+            "",
+            "cleared status must remove the banner"
         );
     }
 

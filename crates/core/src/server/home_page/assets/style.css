@@ -437,6 +437,26 @@ main {
   background: rgba(220, 38, 38, 0.1);
   border-bottom-color: rgba(220, 38, 38, 0.4);
 }
+.wrapper-stuck-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  background: rgba(248, 113, 113, 0.15);
+  border-bottom: 2px solid rgba(248, 113, 113, 0.6);
+  color: #f87171;
+  padding: 0.7rem 1.5rem;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+.wrapper-stuck-icon {
+  font-size: 1.1rem;
+  flex-shrink: 0;
+}
+[data-theme='light'] .wrapper-stuck-banner {
+  color: #b91c1c;
+  background: rgba(220, 38, 38, 0.1);
+  border-bottom-color: rgba(220, 38, 38, 0.5);
+}
 .attempts {
   color: var(--text-muted);
   font-size: 0.8rem;
