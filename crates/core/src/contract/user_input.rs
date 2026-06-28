@@ -1,3 +1,4 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,6 +8,16 @@ use tokio::sync::{broadcast, oneshot};
 
 /// Timeout for user input prompts. After this duration, the request is auto-denied.
 pub(crate) const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Minimum interval between browser-opens for no-tab prompts (#3820).
+///
+/// A burst of prompts arriving with no dashboard tab connected (e.g. a
+/// background script firing many delegate ops) would otherwise open one browser
+/// tab per prompt — up to `MAX_PENDING_PROMPTS` tabs at once. This caps it to
+/// one tab per window. Prompts suppressed by the cooldown fall back to the
+/// pre-existing behaviour (auto-deny after [`USER_INPUT_TIMEOUT`]), so the
+/// cooldown never leaves a prompt worse off than before this feature existed.
+const NO_TAB_OPEN_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// Maximum message length for display. Prevents abuse from untrusted delegates.
 const MAX_MESSAGE_LEN: usize = 2048;
@@ -174,23 +185,27 @@ pub(crate) type NoTabNotifier = Arc<dyn Fn(&str) + Send + Sync>;
 /// user's browser so background / API-triggered prompts stay actionable (#3820).
 pub struct DashboardPrompter {
     pending: PendingPrompts,
-    /// Loopback authority of the local dashboard HTTP server,
-    /// `127.0.0.1:<ws-api-port>`. Used to build the permission-page URL opened
-    /// when no tab is connected (#3820).
+    /// HTTP authority (`host:port`) of the local dashboard server, derived from
+    /// the ws-api bind address (see [`dashboard_authority`]). Used to build the
+    /// permission-page URL opened when no tab is connected (#3820).
     dashboard_authority: String,
     /// Invoked with the permission-page URL when a prompt has no connected tab.
     notify_no_tab: NoTabNotifier,
+    /// Timestamp of the last no-tab browser-open, for the
+    /// [`NO_TAB_OPEN_COOLDOWN`] rate limit. `None` until the first open.
+    last_no_tab_open: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl DashboardPrompter {
     /// Build a prompter that opens the user's browser when no dashboard tab is
-    /// connected. `ws_api_port` is the local HTTP/WS API port the dashboard is
-    /// served on (`config.ws_api.port`).
-    pub fn new(pending: PendingPrompts, ws_api_port: u16) -> Self {
+    /// connected. `ws_api_addr` is the address the local HTTP/WS API dashboard
+    /// is served on (`config.ws_api.address` + `config.ws_api.port`).
+    pub fn new(pending: PendingPrompts, ws_api_addr: SocketAddr) -> Self {
         Self {
             pending,
-            dashboard_authority: format!("127.0.0.1:{ws_api_port}"),
+            dashboard_authority: dashboard_authority(ws_api_addr),
             notify_no_tab: Arc::new(open_permission_page_in_browser),
+            last_no_tab_open: std::sync::Mutex::new(None),
         }
     }
 
@@ -200,11 +215,55 @@ impl DashboardPrompter {
     /// ([`prompt_events()`]`.receiver_count()`); each connected gateway tab
     /// holds exactly one. Zero means every tab is closed, so the prompt would
     /// silently auto-deny after [`USER_INPUT_TIMEOUT`] unless we surface it.
+    ///
+    /// Rate-limited by [`NO_TAB_OPEN_COOLDOWN`] so a burst of no-tab prompts
+    /// opens one tab per window rather than one per prompt.
     fn maybe_alert_no_tab(&self, nonce: &str, subscriber_count: usize) {
-        if subscriber_count == 0 {
-            let url = format!("http://{}/permission/{nonce}", self.dashboard_authority);
-            (self.notify_no_tab)(&url);
+        if subscriber_count != 0 || !self.no_tab_cooldown_elapsed() {
+            return;
         }
+        let url = format!("http://{}/permission/{nonce}", self.dashboard_authority);
+        (self.notify_no_tab)(&url);
+    }
+
+    /// Returns `true` and records "now" when at least [`NO_TAB_OPEN_COOLDOWN`]
+    /// has passed since the last no-tab browser-open (or there was none yet);
+    /// returns `false` without updating when still inside the cooldown window.
+    fn no_tab_cooldown_elapsed(&self) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut last = self
+            .last_no_tab_open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match *last {
+            Some(prev) if now.duration_since(prev) < NO_TAB_OPEN_COOLDOWN => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// Build the HTTP authority (`host:port`) for the local dashboard URL from the
+/// ws-api bind address (#3820).
+///
+/// The dashboard server binds an explicit loopback companion socket for
+/// wildcard / loopback binds (see `server::companion_bind_addr`), so `127.0.0.1`
+/// is reachable and is the stable choice there. A bind to a *specific* interface
+/// address has no loopback companion — only that address is served — so the URL
+/// must target it directly, or the browser-open would hit a refused endpoint.
+/// IPv6 literals are bracketed per the URL authority grammar.
+fn dashboard_authority(bind: SocketAddr) -> String {
+    let ip = bind.ip();
+    let host = if ip.is_unspecified() || ip.is_loopback() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        ip
+    };
+    match host {
+        IpAddr::V4(v4) => format!("{v4}:{}", bind.port()),
+        IpAddr::V6(v6) => format!("[{v6}]:{}", bind.port()),
     }
 }
 
@@ -265,13 +324,14 @@ impl DashboardPrompter {
     /// the decision logic without spawning a real browser.
     fn with_notifier(
         pending: PendingPrompts,
-        ws_api_port: u16,
+        ws_api_addr: SocketAddr,
         notify_no_tab: NoTabNotifier,
     ) -> Self {
         Self {
             pending,
-            dashboard_authority: format!("127.0.0.1:{ws_api_port}"),
+            dashboard_authority: dashboard_authority(ws_api_addr),
             notify_no_tab,
+            last_no_tab_open: std::sync::Mutex::new(None),
         }
     }
 }
@@ -501,7 +561,13 @@ mod tests {
     /// that exercise the no-tab decision itself use
     /// [`DashboardPrompter::with_notifier`] with a recording stub instead.
     fn noop_prompter(pending: PendingPrompts) -> DashboardPrompter {
-        DashboardPrompter::with_notifier(pending, 7509, Arc::new(|_| {}))
+        DashboardPrompter::with_notifier(pending, test_ws_addr(), Arc::new(|_| {}))
+    }
+
+    /// Default ws-api bind address used by the prompter tests (loopback:7509),
+    /// which `dashboard_authority` maps to the `127.0.0.1:7509` URL authority.
+    fn test_ws_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7509)
     }
 
     #[tokio::test]
@@ -984,7 +1050,8 @@ mod tests {
             let opened = opened.clone();
             Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
         };
-        let prompter = DashboardPrompter::with_notifier(Arc::new(DashMap::new()), 7509, recorder);
+        let prompter =
+            DashboardPrompter::with_notifier(Arc::new(DashMap::new()), test_ws_addr(), recorder);
 
         // A tab is connected (>= 1 subscriber): do not open the browser.
         prompter.maybe_alert_no_tab("nonce-with-tab", 1);
@@ -1013,12 +1080,98 @@ mod tests {
             let opened = opened.clone();
             Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
         };
-        let prompter = DashboardPrompter::with_notifier(Arc::new(DashMap::new()), 41234, recorder);
+        let prompter = DashboardPrompter::with_notifier(
+            Arc::new(DashMap::new()),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41234),
+            recorder,
+        );
 
         prompter.maybe_alert_no_tab("abc", 0);
         assert_eq!(
             opened.lock().unwrap().as_slice(),
             ["http://127.0.0.1:41234/permission/abc"]
+        );
+    }
+
+    // A burst of no-tab prompts within NO_TAB_OPEN_COOLDOWN must open only one
+    // browser tab, not one per prompt (which could reach MAX_PENDING_PROMPTS
+    // tabs). Suppressed prompts fall back to the pre-existing auto-deny, so the
+    // cooldown never makes a prompt worse off. After the window elapses, the
+    // next no-tab prompt opens again.
+    #[tokio::test(start_paused = true)]
+    async fn maybe_alert_no_tab_cooldown_suppresses_burst() {
+        use std::sync::Mutex;
+
+        let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder: NoTabNotifier = {
+            let opened = opened.clone();
+            Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
+        };
+        let prompter =
+            DashboardPrompter::with_notifier(Arc::new(DashMap::new()), test_ws_addr(), recorder);
+
+        // First no-tab prompt opens a tab; the burst that follows (no virtual
+        // time elapsed) is suppressed.
+        prompter.maybe_alert_no_tab("a", 0);
+        prompter.maybe_alert_no_tab("b", 0);
+        prompter.maybe_alert_no_tab("c", 0);
+        assert_eq!(
+            opened.lock().unwrap().len(),
+            1,
+            "a burst within the cooldown window must open only one tab"
+        );
+
+        // Once the cooldown elapses, the next no-tab prompt opens again.
+        tokio::time::advance(NO_TAB_OPEN_COOLDOWN + Duration::from_millis(1)).await;
+        prompter.maybe_alert_no_tab("d", 0);
+        assert_eq!(
+            opened.lock().unwrap().len(),
+            2,
+            "a no-tab prompt after the cooldown window must open a tab"
+        );
+    }
+
+    // #3820 (codex review): the dashboard URL must target the address the
+    // ws-api server actually serves. Wildcard / loopback binds get a loopback
+    // companion socket, so 127.0.0.1 is reachable and preferred; a specific
+    // interface bind has no companion, so the URL must target that address
+    // (with IPv6 literals bracketed).
+    #[test]
+    fn dashboard_authority_maps_bind_address_to_reachable_url_host() {
+        use std::net::Ipv6Addr;
+
+        // IPv6 wildcard is the default ws-api-address.
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7509)),
+            "127.0.0.1:7509"
+        );
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509)),
+            "127.0.0.1:7509"
+        );
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7509)),
+            "127.0.0.1:7509"
+        );
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 7509)),
+            "127.0.0.1:7509"
+        );
+        // A specific interface bind has no loopback companion: target it.
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+                8000
+            )),
+            "192.168.1.5:8000"
+        );
+        // IPv6 literals must be bracketed in the URL authority.
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                8000
+            )),
+            "[2001:db8::1]:8000"
         );
     }
 
