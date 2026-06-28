@@ -810,6 +810,7 @@ impl NodeP2P {
                     contract_handler,
                     crate::contract::user_input::DashboardPrompter::new(
                         crate::contract::user_input::pending_prompts(),
+                        config.config.ws_api.port,
                     ),
                 )
                 .await;

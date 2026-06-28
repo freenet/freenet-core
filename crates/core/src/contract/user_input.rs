@@ -153,19 +153,126 @@ pub(crate) fn emit_prompt_event(event: PromptEvent) {
     drop(prompt_events().send(event));
 }
 
+/// Action invoked to surface a permission prompt to the user when no dashboard
+/// tab is connected to display it. Receives the standalone permission-page URL.
+///
+/// In production this opens the user's default browser (see
+/// [`open_permission_page_in_browser`]); tests substitute a recording stub so
+/// the decision logic can be exercised without spawning a real browser.
+pub(crate) type NoTabNotifier = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Opens the user's browser to the permission page on the local dashboard,
 /// then waits for the user to click a button. The HTTP POST handler sends
 /// the response back via a oneshot channel.
 ///
 /// Works from systemd user services because the node serves HTTP (already
 /// running) and the shell page's JS handles browser notification + opening.
+///
+/// When a prompt arrives and no dashboard tab is connected to display it, the
+/// prompt would otherwise silently auto-deny after [`USER_INPUT_TIMEOUT`]; in
+/// that case the prompter opens the standalone permission page directly in the
+/// user's browser so background / API-triggered prompts stay actionable (#3820).
 pub struct DashboardPrompter {
     pending: PendingPrompts,
+    /// Loopback authority of the local dashboard HTTP server,
+    /// `127.0.0.1:<ws-api-port>`. Used to build the permission-page URL opened
+    /// when no tab is connected (#3820).
+    dashboard_authority: String,
+    /// Invoked with the permission-page URL when a prompt has no connected tab.
+    notify_no_tab: NoTabNotifier,
 }
 
 impl DashboardPrompter {
-    pub fn new(pending: PendingPrompts) -> Self {
-        Self { pending }
+    /// Build a prompter that opens the user's browser when no dashboard tab is
+    /// connected. `ws_api_port` is the local HTTP/WS API port the dashboard is
+    /// served on (`config.ws_api.port`).
+    pub fn new(pending: PendingPrompts, ws_api_port: u16) -> Self {
+        Self {
+            pending,
+            dashboard_authority: format!("127.0.0.1:{ws_api_port}"),
+            notify_no_tab: Arc::new(open_permission_page_in_browser),
+        }
+    }
+
+    /// Alert the user out-of-band when a freshly-created prompt has no dashboard
+    /// tab to display it. `subscriber_count` is the number of live SSE
+    /// subscribers to the prompt-event broadcast
+    /// ([`prompt_events()`]`.receiver_count()`); each connected gateway tab
+    /// holds exactly one. Zero means every tab is closed, so the prompt would
+    /// silently auto-deny after [`USER_INPUT_TIMEOUT`] unless we surface it.
+    fn maybe_alert_no_tab(&self, nonce: &str, subscriber_count: usize) {
+        if subscriber_count == 0 {
+            let url = format!("http://{}/permission/{nonce}", self.dashboard_authority);
+            (self.notify_no_tab)(&url);
+        }
+    }
+}
+
+/// Open the standalone permission page in the user's default browser.
+///
+/// Used by [`DashboardPrompter`] when a permission prompt arrives with no
+/// dashboard tab connected to display it (#3820). Mirrors the binary-side
+/// `commands::open_url_in_browser`:
+///
+/// * On Windows it goes through `ShellExecuteW` (not `cmd /c start`) because the
+///   service wrapper detaches the console via `FreeConsole()` at startup, after
+///   which a spawned `cmd.exe` has no console and fails silently.
+/// * On macOS/Linux it spawns `open` / `xdg-open` with all three standard
+///   handles nulled. The node may run as a systemd / Windows service with no
+///   valid inherited stdio; an un-nulled `Command::spawn()` then fails with
+///   "The handle is invalid" (os error 6). See the `open_log_file` fix (#3933).
+///
+/// Best effort: when no browser can be opened (headless service, no
+/// `DISPLAY`/`WAYLAND_DISPLAY`) the spawn fails harmlessly and the prompt's
+/// existing [`USER_INPUT_TIMEOUT`] still governs.
+fn open_permission_page_in_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+        let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
+
+        unsafe {
+            winapi::um::shellapi::ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                url_wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                winapi::um::winuser::SW_SHOWNORMAL,
+            );
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut cmd = std::process::Command::new("open");
+        #[cfg(not(target_os = "macos"))]
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        drop(cmd.spawn());
+    }
+}
+
+#[cfg(test)]
+impl DashboardPrompter {
+    /// Construct a prompter with a custom no-tab notifier so tests can assert
+    /// the decision logic without spawning a real browser.
+    fn with_notifier(
+        pending: PendingPrompts,
+        ws_api_port: u16,
+        notify_no_tab: NoTabNotifier,
+    ) -> Self {
+        Self {
+            pending,
+            dashboard_authority: format!("127.0.0.1:{ws_api_port}"),
+            notify_no_tab,
+        }
     }
 }
 
@@ -228,6 +335,16 @@ impl UserInputPrompter for DashboardPrompter {
             delegate_key: stored_delegate_key,
             caller: stored_caller,
         }));
+
+        // #3820: if no dashboard tab is connected to display this prompt, the
+        // user would never see it and it would silently auto-deny after
+        // USER_INPUT_TIMEOUT. A connected gateway tab subscribes to the
+        // prompt-event broadcast (one receiver per SSE connection), so zero
+        // receivers means every tab is closed -- open the standalone permission
+        // page in the user's browser so the prompt stays actionable. On a
+        // headless service (no DISPLAY/WAYLAND_DISPLAY) the browser-open is a
+        // harmless no-op and the existing timeout still governs.
+        self.maybe_alert_no_tab(&nonce, prompt_events().receiver_count());
 
         // Log at debug, not info -- nonce is the sole auth token for this prompt
         tracing::debug!(
@@ -378,6 +495,15 @@ mod tests {
         CallerIdentity::WebApp(s.to_string())
     }
 
+    /// A prompter whose no-tab notifier is a no-op, so calling `prompt()` in a
+    /// test never spawns a real browser (the global prompt-event broadcast is
+    /// shared across tests, so `receiver_count()` can read zero here). Tests
+    /// that exercise the no-tab decision itself use
+    /// [`DashboardPrompter::with_notifier`] with a recording stub instead.
+    fn noop_prompter(pending: PendingPrompts) -> DashboardPrompter {
+        DashboardPrompter::with_notifier(pending, 7509, Arc::new(|_| {}))
+    }
+
     #[tokio::test]
     async fn test_auto_approve_returns_first_response() {
         let req = make_test_request("Allow this?", vec!["Allow", "Deny"]);
@@ -436,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_prompter_max_pending() {
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
 
         for i in 0..MAX_PENDING_PROMPTS {
             let (tx, _rx) = oneshot::channel();
@@ -619,7 +745,7 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_prompter_populates_webapp_caller() {
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
 
         let req = make_test_request("Approve?", vec!["Allow", "Deny"]);
         let pending_clone = pending.clone();
@@ -655,7 +781,7 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_prompter_records_none_caller() {
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
 
         let req = make_test_request("Approve?", vec!["Allow"]);
         let pending_clone = pending.clone();
@@ -683,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_prompter_happy_path() {
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
 
         let req = make_test_request("Allow signing?", vec!["Allow", "Deny"]);
 
@@ -727,7 +853,7 @@ mod tests {
         let mut rx = prompt_events().subscribe();
 
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
         let req = make_test_request("lifecycle?", vec!["Allow", "Deny"]);
 
         let pending_clone = pending.clone();
@@ -790,7 +916,7 @@ mod tests {
         let mut rx = prompt_events().subscribe();
 
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
         let req = make_test_request("timeout?", vec!["Allow"]);
 
         let handle = tokio::spawn(async move {
@@ -839,5 +965,98 @@ mod tests {
             saw_removed,
             "prompter timeout must emit PromptEvent::Removed"
         );
+    }
+
+    // #3820: when a permission prompt is created and no dashboard tab is
+    // connected to display it (zero SSE subscribers), the prompter must open
+    // the standalone permission page in the user's browser so the prompt stays
+    // actionable instead of silently auto-denying after the timeout. When a tab
+    // IS connected it receives the prompt via SSE and the browser must NOT be
+    // opened. We drive `maybe_alert_no_tab` directly with a recording notifier
+    // because the prompt-event broadcast is a process-global shared across
+    // tests, so its live `receiver_count()` isn't deterministic here.
+    #[test]
+    fn maybe_alert_no_tab_opens_browser_only_when_no_subscribers() {
+        use std::sync::Mutex;
+
+        let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder: NoTabNotifier = {
+            let opened = opened.clone();
+            Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
+        };
+        let prompter = DashboardPrompter::with_notifier(Arc::new(DashMap::new()), 7509, recorder);
+
+        // A tab is connected (>= 1 subscriber): do not open the browser.
+        prompter.maybe_alert_no_tab("nonce-with-tab", 1);
+        assert!(
+            opened.lock().unwrap().is_empty(),
+            "browser must not open when a dashboard tab is connected"
+        );
+
+        // No tab connected (0 subscribers): open the standalone permission page.
+        prompter.maybe_alert_no_tab("nonce-no-tab", 0);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            ["http://127.0.0.1:7509/permission/nonce-no-tab"],
+            "browser must open exactly the standalone permission page for the prompt"
+        );
+    }
+
+    // The permission-page URL must use the configured ws-api port, not a
+    // hardcoded 7509 — a node on a custom port still opens the right dashboard.
+    #[test]
+    fn maybe_alert_no_tab_url_uses_configured_port() {
+        use std::sync::Mutex;
+
+        let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder: NoTabNotifier = {
+            let opened = opened.clone();
+            Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
+        };
+        let prompter = DashboardPrompter::with_notifier(Arc::new(DashMap::new()), 41234, recorder);
+
+        prompter.maybe_alert_no_tab("abc", 0);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            ["http://127.0.0.1:41234/permission/abc"]
+        );
+    }
+
+    /// Source-level regression pin for the #3933 null-stdio rule applied to the
+    /// #3820 browser-open helper.
+    ///
+    /// `open_permission_page_in_browser` is reachable from the contract
+    /// executor task, which on Windows can run with no valid console (service /
+    /// autostart) after `FreeConsole()`. The macOS/Linux `Command::spawn` for
+    /// `open` / `xdg-open` MUST null all three standard handles or `spawn()`
+    /// fails with "The handle is invalid" (os error 6) and the browser silently
+    /// never opens. The failure is Windows-only and needs a detached console,
+    /// so it can't be exercised portably; pin the source-level invariant
+    /// instead. See #3933 / #3820.
+    #[test]
+    fn open_permission_page_spawn_must_null_all_three_standard_handles() {
+        // The real definition appears earlier in the file than this test's
+        // string literal of the same signature, so `split_once` anchors on it.
+        let src = include_str!("user_input.rs");
+        let (_, after_fn_start) = src
+            .split_once("fn open_permission_page_in_browser(url: &str) {")
+            .expect("open_permission_page_in_browser definition not found");
+        // Restrict the search window to the function body: it ends at the next
+        // top-level `#[cfg(test)]` item (the `impl DashboardPrompter` test
+        // constructor that immediately follows the function).
+        let body = after_fn_start
+            .split_once("\n#[cfg(test)]")
+            .map(|(b, _)| b)
+            .unwrap_or(after_fn_start);
+        for handle in ["stdin", "stdout", "stderr"] {
+            let pattern = format!(".{handle}(std::process::Stdio::null())");
+            assert!(
+                body.contains(&pattern),
+                "open_permission_page_in_browser must call `{pattern}` — without \
+                 it, a Windows service/autostart node fails `Command::spawn()` \
+                 with os error 6 (handle invalid after FreeConsole) and the \
+                 permission page silently never opens. See #3933 / #3820."
+            );
+        }
     }
 }
