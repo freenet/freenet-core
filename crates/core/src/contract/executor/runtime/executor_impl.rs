@@ -1069,6 +1069,14 @@ where
         // freshly-loaded state (see `StateStore::state_hash_cache`), so a hit
         // proves the state is byte-identical to the one that produced the cached
         // summary — the summary is therefore fresh, never stale.
+        //
+        // SERIALIZATION INVARIANT: the no-stale-populate guarantee depends on
+        // ALL summarize/delta reads (this one) AND ALL contract-state writes
+        // running on the single `&mut RuntimePool` contract-handling loop, so no
+        // write can land between the slow path's state load and its detector
+        // populate. Any off-loop work that holds an executor (e.g. the hosted
+        // secret export) MUST stay read-only w.r.t. contract state, or it could
+        // populate the detector against a state a concurrent write has changed.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
             if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
                 if *cached_hash == detector_hash {
@@ -1149,6 +1157,12 @@ where
         // `get_state_delta`. The detector guarantees the state is unchanged, so a
         // cached delta computed against the same peer-summary is fresh — a stale
         // delta would diverge the peer just like a stale summary.
+        //
+        // SERIALIZATION INVARIANT: as in `bridged_summarize_contract_state`, the
+        // no-stale-populate guarantee depends on all summarize/delta reads and
+        // all contract-state writes running on the single `&mut RuntimePool`
+        // loop; off-loop work holding an executor must stay read-only w.r.t.
+        // contract state.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
             let cache_key = (key, detector_hash, summary_hash);
             if let Some(cached_delta) = self.delta_cache.get(&cache_key) {

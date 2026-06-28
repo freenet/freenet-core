@@ -112,6 +112,17 @@ pub trait StateStorage {
     type Error;
     /// Store state for a contract. Takes `&self` because implementations
     /// (like ReDb) handle internal locking for concurrent access.
+    ///
+    /// CHANGE-DETECTOR INVARIANT (future writers): a contract-state write made
+    /// DIRECTLY through this trait, bypassing the [`StateStore`] wrapper that
+    /// owns the summarize/delta change-detector, MUST invalidate that detector
+    /// via [`StateCacheInvalidator`] (and the moka state-bytes cache) — e.g.
+    /// via the runtime's `state_write_callback`. Otherwise the summarize/delta
+    /// fast path can serve a STALE summary/delta against the new state → peer
+    /// state divergence (#4621). Writes that go through `StateStore::{store,
+    /// update, delete}` already do this; raw-`Storage` writers (V2 delegate
+    /// `store_state_sync`/`update_state_sync`, and any new bypass writer such as
+    /// the #4592 live-import work) must not skip it.
     fn store(
         &self,
         key: ContractKey,
@@ -134,6 +145,11 @@ pub trait StateStorage {
     ) -> impl Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a;
     /// Remove all persisted data for a contract (state and parameters).
     /// Idempotent: removing a contract that is not stored is not an error.
+    ///
+    /// CHANGE-DETECTOR INVARIANT: a removal made DIRECTLY through this trait
+    /// (bypassing [`StateStore::delete`]) must also invalidate the
+    /// summarize/delta change-detector via [`StateCacheInvalidator`], or the
+    /// fast path could keep certifying a hash for state that is now gone (#4621).
     fn remove(&self, key: &ContractKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 

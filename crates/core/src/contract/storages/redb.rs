@@ -406,6 +406,16 @@ impl ReDb {
     ///
     /// Used by V2 delegate host functions that need synchronous writes during
     /// WASM `process()` execution. Hosting metadata integration is a follow-up.
+    ///
+    /// CHANGE-DETECTOR INVARIANT (future writers, read before using this): any
+    /// contract-state write that BYPASSES `StateStore` (as this raw sync write
+    /// does) MUST invalidate `StateStore`'s change-detector via
+    /// `StateCacheInvalidator` (and the moka state-bytes cache), or the
+    /// summarize/delta fast path can serve a STALE summary/delta against the
+    /// new state → peer state divergence (#4621). The V2 delegate callers
+    /// (`put_contract_state_sync` / `update_contract_state_sync`) do this via
+    /// the runtime's `state_write_callback`. A new caller of this method (e.g.
+    /// the #4592 live-import work) must wire the same invalidation.
     pub fn store_state_sync(
         &self,
         key: &ContractKey,
@@ -426,6 +436,11 @@ impl ReDb {
     /// Used by V2 delegate UPDATE host function.
     ///
     /// **Does not update hosting metadata** (same caveat as `store_state_sync`).
+    ///
+    /// CHANGE-DETECTOR INVARIANT: like `store_state_sync`, this bypasses
+    /// `StateStore`, so any caller MUST invalidate the `StateStore`
+    /// change-detector via `StateCacheInvalidator` or summarize/delta can serve
+    /// a stale result → peer state divergence (#4621). See `store_state_sync`.
     pub fn update_state_sync(
         &self,
         key: &ContractKey,

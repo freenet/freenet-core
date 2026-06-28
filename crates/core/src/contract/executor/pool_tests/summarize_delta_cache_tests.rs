@@ -289,6 +289,28 @@ async fn delta_unchanged_skips_state_load() {
         gets_after_first,
         "repeated unchanged delta must not reload the state (fast path)"
     );
+
+    // After an UPDATE the detector is invalidated → the next delta against the
+    // SAME peer summary must reload the changed state (symmetry with
+    // `summarize_unchanged_skips_state_load`).
+    let new_state = WrappedState::new(vec![9, 8, 7, 6, 5, 4]);
+    exec.upsert_contract_state(
+        key,
+        Either::Left(new_state.clone()),
+        RelatedContracts::default(),
+        None,
+    )
+    .await
+    .expect("UPDATE");
+    let gets_before_post_update = storage.get_count();
+    let _ = exec
+        .get_contract_state_delta(key, peer_summary.clone())
+        .await
+        .expect("delta after update");
+    assert!(
+        storage.get_count() > gets_before_post_update,
+        "delta after an update must reload the changed state"
+    );
 }
 
 // =========================================================================
