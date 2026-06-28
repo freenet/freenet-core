@@ -160,6 +160,29 @@ fn transaction_error_is_poison(e: &TransactionError) -> bool {
     matches!(e, TransactionError::Storage(s) if storage_error_is_poison(s))
 }
 
+/// True if the umbrella [`redb::Error`] signals a poisoned database. Used to catch
+/// poison that surfaces on the READ path AFTER `begin_read` has already succeeded
+/// (redb's `begin_read` does not check the poison flag, so a poisoned read fails
+/// later at `open_table` / `get` / iteration as a `StorageError` flattened into this
+/// umbrella type).
+///
+/// IMPORTANT — this deliberately does NOT match `redb::Error::Io`, unlike
+/// [`storage_error_is_poison`]. Several read methods in this file SYNTHESIZE
+/// `redb::Error::Io(ErrorKind::InvalidData)` for a benign malformed-data row (e.g. a
+/// wrong-length `CodeHash`). Treating that as poison would exit-and-restart the node
+/// on a single bad row → a crash loop. A genuine backend I/O poison is safe to skip
+/// here regardless: redb latches its poison flag on the first backend `Io`, so the
+/// very next backend read returns `PreviousIo` (caught here) and the next
+/// `begin_write` returns `PreviousIo` (caught by [`storage_error_is_poison`]). So
+/// `PreviousIo` (plus the unambiguous `LockPoisoned` / `DatabaseClosed`) is the
+/// precise, false-positive-free read-path signal.
+fn redb_error_is_poison(e: &redb::Error) -> bool {
+    matches!(
+        e,
+        redb::Error::PreviousIo | redb::Error::LockPoisoned(_) | redb::Error::DatabaseClosed
+    )
+}
+
 /// Test-only observable proof that the storage layer routed a detected poison to
 /// the recovery (process-exit) path. The real handler ([`abort_process_on_redb_poison`])
 /// exits the process, which a unit test cannot observe; this counter lets the test
@@ -210,6 +233,34 @@ impl ReDb {
             crate::node::abort_process_on_redb_poison(&e.to_string());
         }
         e
+    }
+
+    /// Umbrella-error counterpart of [`ReDb::route_txn_error`], for poison that
+    /// surfaces on the read path AFTER `begin_read` succeeded (at `open_table` /
+    /// `get` / iteration). Returns the error untouched.
+    fn route_redb_error(e: redb::Error) -> redb::Error {
+        if redb_error_is_poison(&e) {
+            #[cfg(test)]
+            POISON_RECOVERY_TRIGGERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::node::abort_process_on_redb_poison(&e.to_string());
+        }
+        e
+    }
+
+    /// Run a read-transaction body, routing ANY poison error to the #4604 recovery
+    /// path — not just a poison at `begin_read`, but one that surfaces later at
+    /// `open_table` / `get` / iteration (redb's `begin_read` does not check the
+    /// poison flag, so a poisoned read can fail mid-transaction). This gives
+    /// read-only workloads the same prompt exit-for-restart that `begin_write`
+    /// already gives write workloads, instead of failing every read until the next
+    /// write happens to hit `begin_write`.
+    fn read_guarded<T>(
+        &self,
+        f: impl FnOnce(&ReadTransaction) -> Result<T, redb::Error>,
+    ) -> Result<T, redb::Error> {
+        // begin_read already routes a poison at transaction start.
+        let txn = self.begin_read()?;
+        f(&txn).map_err(Self::route_redb_error)
     }
 
     pub async fn new(data_dir: &Path) -> Result<Self, redb::Error> {
@@ -434,12 +485,13 @@ impl ReDb {
         &self,
         key: &ContractKey,
     ) -> Result<Option<HostingMetadata>, redb::Error> {
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
-        match tbl.get(key.as_bytes())? {
-            Some(v) => Ok(HostingMetadata::from_bytes(v.value())),
-            None => Ok(None),
-        }
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
+            Ok(match tbl.get(key.as_bytes())? {
+                Some(v) => HostingMetadata::from_bytes(v.value()),
+                None => None,
+            })
+        })
     }
 
     /// Remove hosting metadata for a contract.
@@ -458,27 +510,26 @@ impl ReDb {
     pub fn load_all_hosting_metadata(
         &self,
     ) -> Result<Vec<(Vec<u8>, HostingMetadata)>, redb::Error> {
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
 
-        let mut result = Vec::new();
-        for entry in tbl.iter()? {
-            let (key, value) = entry?;
-            if let Some(metadata) = HostingMetadata::from_bytes(value.value()) {
-                result.push((key.value().to_vec(), metadata));
+            let mut result = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                if let Some(metadata) = HostingMetadata::from_bytes(value.value()) {
+                    result.push((key.value().to_vec(), metadata));
+                }
             }
-        }
-        Ok(result)
+            Ok(result)
+        })
     }
 
     /// Get the size of a contract's state (for populating hosting cache).
     pub fn get_state_size(&self, key: &ContractKey) -> Result<Option<u64>, redb::Error> {
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(STATE_TABLE)?;
-        match tbl.get(key.as_bytes())? {
-            Some(v) => Ok(Some(v.value().len() as u64)),
-            None => Ok(None),
-        }
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(STATE_TABLE)?;
+            Ok(tbl.get(key.as_bytes())?.map(|v| v.value().len() as u64))
+        })
     }
 
     /// Store a contract's state synchronously.
@@ -535,29 +586,27 @@ impl ReDb {
     /// Used by V2 delegate host functions that need synchronous access during
     /// WASM `process()` execution.
     pub fn get_state_sync(&self, key: &ContractKey) -> Result<Option<WrappedState>, redb::Error> {
-        let txn = self.begin_read()?;
-        let val = {
+        self.read_guarded(|txn| {
             let tbl = txn.open_table(STATE_TABLE)?;
-            tbl.get(key.as_bytes())?
-        };
-        match val {
-            Some(v) => Ok(Some(WrappedState::new(v.value().to_vec()))),
-            None => Ok(None),
-        }
+            Ok(tbl
+                .get(key.as_bytes())?
+                .map(|v| WrappedState::new(v.value().to_vec())))
+        })
     }
 
     /// Iterate all contract keys that have stored state.
     /// Returns the raw key bytes - caller must reconstruct ContractKey.
     pub fn iter_all_state_keys(&self) -> Result<Vec<Vec<u8>>, redb::Error> {
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(STATE_TABLE)?;
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(STATE_TABLE)?;
 
-        let mut result = Vec::new();
-        for entry in tbl.iter()? {
-            let (key, _) = entry?;
-            result.push(key.value().to_vec());
-        }
-        Ok(result)
+            let mut result = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, _) = entry?;
+                result.push(key.value().to_vec());
+            }
+            Ok(result)
+        })
     }
 
     // ==================== Contract Index Methods ====================
@@ -582,20 +631,21 @@ impl ReDb {
         &self,
         instance_id: &ContractInstanceId,
     ) -> Result<Option<CodeHash>, redb::Error> {
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
-        match tbl.get(instance_id.as_ref())? {
-            Some(v) => {
-                let bytes: [u8; 32] = v.value().try_into().map_err(|_| {
-                    redb::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Invalid CodeHash length",
-                    ))
-                })?;
-                Ok(Some(CodeHash::from(&bytes)))
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
+            match tbl.get(instance_id.as_ref())? {
+                Some(v) => {
+                    let bytes: [u8; 32] = v.value().try_into().map_err(|_| {
+                        redb::Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid CodeHash length",
+                        ))
+                    })?;
+                    Ok(Some(CodeHash::from(&bytes)))
+                }
+                None => Ok(None),
             }
-            None => Ok(None),
-        }
+        })
     }
 
     /// Remove a contract index entry
@@ -615,30 +665,31 @@ impl ReDb {
     pub fn load_all_contract_index(
         &self,
     ) -> Result<Vec<(ContractInstanceId, CodeHash)>, redb::Error> {
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(CONTRACT_INDEX_TABLE)?;
 
-        let mut result = Vec::new();
-        for entry in tbl.iter()? {
-            let (key, value) = entry?;
-            let key_bytes: [u8; 32] = key.value().try_into().map_err(|_| {
-                redb::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid ContractInstanceId length",
-                ))
-            })?;
-            let value_bytes: [u8; 32] = value.value().try_into().map_err(|_| {
-                redb::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid CodeHash length",
-                ))
-            })?;
-            result.push((
-                ContractInstanceId::new(key_bytes),
-                CodeHash::from(&value_bytes),
-            ));
-        }
-        Ok(result)
+            let mut result = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                let key_bytes: [u8; 32] = key.value().try_into().map_err(|_| {
+                    redb::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid ContractInstanceId length",
+                    ))
+                })?;
+                let value_bytes: [u8; 32] = value.value().try_into().map_err(|_| {
+                    redb::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid CodeHash length",
+                    ))
+                })?;
+                result.push((
+                    ContractInstanceId::new(key_bytes),
+                    CodeHash::from(&value_bytes),
+                ));
+            }
+            Ok(result)
+        })
     }
 
     // ==================== Delegate Index Methods ====================
@@ -672,20 +723,21 @@ impl ReDb {
         key_bytes[..32].copy_from_slice(delegate_key.as_ref());
         key_bytes[32..].copy_from_slice(delegate_key.code_hash().as_ref());
 
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
-        match tbl.get(key_bytes.as_slice())? {
-            Some(v) => {
-                let bytes: [u8; 32] = v.value().try_into().map_err(|_| {
-                    redb::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Invalid CodeHash length",
-                    ))
-                })?;
-                Ok(Some(CodeHash::from(&bytes)))
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
+            match tbl.get(key_bytes.as_slice())? {
+                Some(v) => {
+                    let bytes: [u8; 32] = v.value().try_into().map_err(|_| {
+                        redb::Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid CodeHash length",
+                        ))
+                    })?;
+                    Ok(Some(CodeHash::from(&bytes)))
+                }
+                None => Ok(None),
             }
-            None => Ok(None),
-        }
+        })
     }
 
     /// Remove a delegate index entry
@@ -704,30 +756,31 @@ impl ReDb {
 
     /// Load all delegate index entries
     pub fn load_all_delegate_index(&self) -> Result<Vec<(DelegateKey, CodeHash)>, redb::Error> {
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_INDEX_TABLE)?;
 
-        let mut result = Vec::new();
-        for entry in tbl.iter()? {
-            let (key, value) = entry?;
-            let key_bytes = key.value();
-            if key_bytes.len() != 64 {
-                continue; // Skip malformed entries
+            let mut result = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                let key_bytes = key.value();
+                if key_bytes.len() != 64 {
+                    continue; // Skip malformed entries
+                }
+                let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
+                let code_hash_bytes: [u8; 32] = key_bytes[32..].try_into().unwrap();
+                let value_bytes: [u8; 32] = value.value().try_into().map_err(|_| {
+                    redb::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid CodeHash length",
+                    ))
+                })?;
+
+                let delegate_key =
+                    DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
+                result.push((delegate_key, CodeHash::from(&value_bytes)));
             }
-            let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
-            let code_hash_bytes: [u8; 32] = key_bytes[32..].try_into().unwrap();
-            let value_bytes: [u8; 32] = value.value().try_into().map_err(|_| {
-                redb::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid CodeHash length",
-                ))
-            })?;
-
-            let delegate_key =
-                DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
-            result.push((delegate_key, CodeHash::from(&value_bytes)));
-        }
-        Ok(result)
+            Ok(result)
+        })
     }
 
     // ==================== Secrets Index Methods ====================
@@ -766,26 +819,27 @@ impl ReDb {
         key_bytes[..32].copy_from_slice(delegate_key.as_ref());
         key_bytes[32..].copy_from_slice(delegate_key.code_hash().as_ref());
 
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
-        match tbl.get(key_bytes.as_slice())? {
-            Some(v) => {
-                let value = v.value();
-                if value.len() % 32 != 0 {
-                    return Err(redb::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Invalid secrets index value length",
-                    )));
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
+            match tbl.get(key_bytes.as_slice())? {
+                Some(v) => {
+                    let value = v.value();
+                    if value.len() % 32 != 0 {
+                        return Err(redb::Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid secrets index value length",
+                        )));
+                    }
+                    let mut result = Vec::with_capacity(value.len() / 32);
+                    for chunk in value.chunks(32) {
+                        let arr: [u8; 32] = chunk.try_into().unwrap();
+                        result.push(arr);
+                    }
+                    Ok(Some(result))
                 }
-                let mut result = Vec::with_capacity(value.len() / 32);
-                for chunk in value.chunks(32) {
-                    let arr: [u8; 32] = chunk.try_into().unwrap();
-                    result.push(arr);
-                }
-                Ok(Some(result))
+                None => Ok(None),
             }
-            None => Ok(None),
-        }
+        })
     }
 
     /// Remove a secrets index entry
@@ -805,34 +859,35 @@ impl ReDb {
     /// Load all secrets index entries
     #[allow(clippy::type_complexity)]
     pub fn load_all_secrets_index(&self) -> Result<Vec<(DelegateKey, Vec<[u8; 32]>)>, redb::Error> {
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(SECRETS_INDEX_TABLE)?;
 
-        let mut result = Vec::new();
-        for entry in tbl.iter()? {
-            let (key, value) = entry?;
-            let key_bytes = key.value();
-            if key_bytes.len() != 64 {
-                continue; // Skip malformed entries
-            }
-            let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
-            let code_hash_bytes: [u8; 32] = key_bytes[32..].try_into().unwrap();
+            let mut result = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                let key_bytes = key.value();
+                if key_bytes.len() != 64 {
+                    continue; // Skip malformed entries
+                }
+                let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
+                let code_hash_bytes: [u8; 32] = key_bytes[32..].try_into().unwrap();
 
-            let value_bytes = value.value();
-            if value_bytes.len() % 32 != 0 {
-                continue; // Skip malformed entries
-            }
-            let mut secret_keys = Vec::with_capacity(value_bytes.len() / 32);
-            for chunk in value_bytes.chunks(32) {
-                let arr: [u8; 32] = chunk.try_into().unwrap();
-                secret_keys.push(arr);
-            }
+                let value_bytes = value.value();
+                if value_bytes.len() % 32 != 0 {
+                    continue; // Skip malformed entries
+                }
+                let mut secret_keys = Vec::with_capacity(value_bytes.len() / 32);
+                for chunk in value_bytes.chunks(32) {
+                    let arr: [u8; 32] = chunk.try_into().unwrap();
+                    secret_keys.push(arr);
+                }
 
-            let delegate_key =
-                DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
-            result.push((delegate_key, secret_keys));
-        }
-        Ok(result)
+                let delegate_key =
+                    DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
+                result.push((delegate_key, secret_keys));
+            }
+            Ok(result)
+        })
     }
 
     // ============== Per-User Secrets Index Methods (P1 of #4381) ==============
@@ -885,26 +940,27 @@ impl ReDb {
     ) -> Result<Option<Vec<[u8; 32]>>, redb::Error> {
         let key_bytes = Self::user_index_key(delegate_key, user_id);
 
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
-        match tbl.get(key_bytes.as_slice())? {
-            Some(v) => {
-                let value = v.value();
-                if value.len() % 32 != 0 {
-                    return Err(redb::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Invalid user secrets index value length",
-                    )));
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
+            match tbl.get(key_bytes.as_slice())? {
+                Some(v) => {
+                    let value = v.value();
+                    if value.len() % 32 != 0 {
+                        return Err(redb::Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid user secrets index value length",
+                        )));
+                    }
+                    let mut result = Vec::with_capacity(value.len() / 32);
+                    for chunk in value.chunks(32) {
+                        let arr: [u8; 32] = chunk.try_into().unwrap();
+                        result.push(arr);
+                    }
+                    Ok(Some(result))
                 }
-                let mut result = Vec::with_capacity(value.len() / 32);
-                for chunk in value.chunks(32) {
-                    let arr: [u8; 32] = chunk.try_into().unwrap();
-                    result.push(arr);
-                }
-                Ok(Some(result))
+                None => Ok(None),
             }
-            None => Ok(None),
-        }
+        })
     }
 
     /// Remove a per-user secrets index entry. Called by the inactive-user TTL
@@ -930,7 +986,7 @@ impl ReDb {
     pub fn load_all_user_secrets_index(
         &self,
     ) -> Result<Vec<((DelegateKey, [u8; 32]), Vec<[u8; 32]>)>, redb::Error> {
-        let txn = self.begin_read()?;
+        self.read_guarded(|txn| {
         let tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
 
         let mut result = Vec::new();
@@ -977,6 +1033,7 @@ impl ReDb {
             result.push(((delegate_key, user_id_bytes), secret_keys));
         }
         Ok(result)
+        })
     }
 
     // ==================== Broken Invariants Methods ====================
@@ -1022,33 +1079,34 @@ impl ReDb {
     /// than failing the entire load — a corrupted entry should not block
     /// startup, and the worst case is we lose a flag and re-detect it.
     pub fn load_all_broken_invariants(&self) -> Result<Vec<(ContractInstanceId, u8)>, redb::Error> {
-        let txn = self.begin_read()?;
-        let tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
 
-        let mut result = Vec::new();
-        for entry in tbl.iter()? {
-            let (key, value) = entry?;
-            let key_bytes: [u8; 32] = match key.value().try_into() {
-                Ok(b) => b,
-                Err(_) => {
+            let mut result = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                let key_bytes: [u8; 32] = match key.value().try_into() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        tracing::warn!(
+                            len = key.value().len(),
+                            "Skipping malformed broken-invariants row (key length)"
+                        );
+                        continue;
+                    }
+                };
+                let v = value.value();
+                if v.len() != 1 {
                     tracing::warn!(
-                        len = key.value().len(),
-                        "Skipping malformed broken-invariants row (key length)"
+                        len = v.len(),
+                        "Skipping malformed broken-invariants row (value length)"
                     );
                     continue;
                 }
-            };
-            let v = value.value();
-            if v.len() != 1 {
-                tracing::warn!(
-                    len = v.len(),
-                    "Skipping malformed broken-invariants row (value length)"
-                );
-                continue;
+                result.push((ContractInstanceId::new(key_bytes), v[0]));
             }
-            result.push((ContractInstanceId::new(key_bytes), v[0]));
-        }
-        Ok(result)
+            Ok(result)
+        })
     }
 }
 
@@ -1091,17 +1149,12 @@ impl StateStorage for ReDb {
     }
 
     async fn get(&self, key: &ContractKey) -> Result<Option<WrappedState>, Self::Error> {
-        let txn = self.begin_read()?;
-
-        let val = {
+        self.read_guarded(|txn| {
             let tbl = txn.open_table(STATE_TABLE)?;
-            tbl.get(key.as_bytes())?
-        };
-
-        match val {
-            Some(v) => Ok(Some(WrappedState::new(v.value().to_vec()))),
-            None => Ok(None),
-        }
+            Ok(tbl
+                .get(key.as_bytes())?
+                .map(|v| WrappedState::new(v.value().to_vec())))
+        })
     }
 
     async fn store_params(
@@ -1122,17 +1175,12 @@ impl StateStorage for ReDb {
         &'a self,
         key: &'a ContractKey,
     ) -> Result<Option<Parameters<'static>>, Self::Error> {
-        let txn = self.begin_read()?;
-
-        let val = {
+        self.read_guarded(|txn| {
             let tbl = txn.open_table(CONTRACT_PARAMS_TABLE)?;
-            tbl.get(key.as_bytes())?
-        };
-
-        match val {
-            Some(v) => Ok(Some(Parameters::from(v.value().to_vec()))),
-            None => Ok(None),
-        }
+            Ok(tbl
+                .get(key.as_bytes())?
+                .map(|v| Parameters::from(v.value().to_vec())))
+        })
     }
 
     async fn remove(&self, key: &ContractKey) -> Result<(), Self::Error> {
@@ -1715,6 +1763,26 @@ mod tests {
         assert!(
             transaction_error_is_poison(&begin_err),
             "PreviousIo from a poisoned database's begin_write must classify as poison"
+        );
+
+        // The umbrella read-path classifier must also flag the real PreviousIo...
+        let umbrella: redb::Error = begin_err.into();
+        assert!(
+            redb_error_is_poison(&umbrella),
+            "PreviousIo must classify as poison on the umbrella read path too"
+        );
+
+        // ...but must NOT flag the synthetic `Io(InvalidData)` that several read
+        // methods produce for a benign malformed-data row. Misclassifying it would
+        // exit-and-restart the node on a single bad row (a crash loop) — the
+        // false-positive this asymmetry exists to prevent (#4604).
+        let malformed_row = redb::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid CodeHash length",
+        ));
+        assert!(
+            !redb_error_is_poison(&malformed_row),
+            "a synthetic Io(InvalidData) malformed-row error must NOT be treated as poison"
         );
     }
 
