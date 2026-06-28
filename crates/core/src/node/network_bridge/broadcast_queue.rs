@@ -134,15 +134,15 @@ impl BroadcastStreamMetrics {
 /// insufficient (#4610): the inbound relay-SUBSCRIBE / placement-migration path
 /// marks a contract hosted / in-use (a downstream subscriber renewal) WITHOUT
 /// its state ever being fetched and stored, so "phantom"
-/// (interested-but-stateless) contracts still passed this gate and drove the
-/// residual `summarize_contract_state` storm. The gate therefore ALSO requires
-/// `contract_state_present` — actual state in the on-disk store:
-/// - a phantom contract has no stored state, so it is skipped (nothing to
-///   broadcast);
-/// - an evicted-but-in-use contract keeps its state ON DISK (the hosting cache
-///   evicts but `reclaim_evicted_contract` only deletes state once NOT in use),
-///   so `contract_state_present` is true and we keep broadcasting it — which is
-///   why the gate reads the state store, not the in-memory hosting cache.
+/// (interested-but-stateless) contracts still passed and drove the residual
+/// `summarize_contract_state` storm. The fix delegates to the single composed
+/// predicate `Ring::should_summarize_or_broadcast` —
+/// `(is_hosting_contract || contract_in_use) && contract_state_present` — which
+/// is shared with `node.rs::summary_if_hosted_or_in_use` so the two paths cannot
+/// drift. The `contract_state_present` term reads the on-disk STATE store (NOT
+/// the in-memory hosting cache), so a phantom with no stored state is skipped
+/// while an evicted-but-in-use contract whose state is still on disk keeps
+/// broadcasting. See `HostingManager::should_summarize_or_broadcast`.
 ///
 /// NOTE: it is surprising the broadcast/interest path runs at all for a contract
 /// we hold no state for — that points at a routing/subscription leak upstream
@@ -150,8 +150,7 @@ impl BroadcastStreamMetrics {
 /// without state, tracked separately on #4440/#4610). This gate stops the storm
 /// symptom; it does not fix that upstream question.
 pub(super) fn should_broadcast_contract(op_manager: &Arc<OpManager>, key: &ContractKey) -> bool {
-    (op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key))
-        && op_manager.ring.contract_state_present(key)
+    op_manager.ring.should_summarize_or_broadcast(key)
 }
 
 // The `BroadcastQueue` struct (constants, types, impl) is only used in the
@@ -1224,9 +1223,15 @@ mod tests {
     fn broadcast_single_peer_gates_summarize_on_hosted_or_in_use_pin() {
         let src = include_str!("broadcast_queue.rs");
 
-        // 1. The gate helper must check BOTH predicates: gating on hosting alone
-        //    wrongly drops the broadcast for an evicted-but-in-use stateful
-        //    contract (the #4475 Codex-P1 lesson, applied to this path).
+        // 1. The gate helper must delegate to the SINGLE composed predicate
+        //    `Ring::should_summarize_or_broadcast` =
+        //    `(is_hosting_contract || contract_in_use) && contract_state_present`,
+        //    shared with node.rs::summary_if_hosted_or_in_use. The composition
+        //    (incl. the load-bearing `&&` vs `||` that keeps phantom stateless
+        //    contracts out — #4610) is behaviourally verified by
+        //    `summarize_gate_skips_stateless_phantom_keeps_stateful_4610` in
+        //    ring/hosting.rs. Here we only pin the delegation, so a future edit
+        //    cannot re-inline a partial (is_hosting || in_use) gate.
         let helper_start = src
             .find("pub(super) fn should_broadcast_contract(")
             .expect("should_broadcast_contract helper not found");
@@ -1236,22 +1241,11 @@ mod tests {
                 .expect("should_broadcast_contract body end not found");
         let helper_src = &src[helper_start..helper_end];
         assert!(
-            helper_src.contains("is_hosting_contract"),
-            "should_broadcast_contract must gate on is_hosting_contract"
-        );
-        assert!(
-            helper_src.contains("contract_in_use"),
-            "should_broadcast_contract must ALSO gate on contract_in_use so an \
-             evicted-but-in-use stateful contract keeps being broadcast"
-        );
-        assert!(
-            helper_src.contains("contract_state_present"),
-            "should_broadcast_contract must ALSO gate on contract_state_present \
-             (actual state in the on-disk store) so a phantom \
-             (interested-but-stateless) contract is NOT broadcast/summarized every \
-             heartbeat — the #4610 storm. Must read the state store, not the \
-             in-memory hosting cache, so an evicted-but-on-disk contract still \
-             broadcasts."
+            helper_src.contains("should_summarize_or_broadcast"),
+            "should_broadcast_contract must delegate to the composed \
+             should_summarize_or_broadcast predicate (single source of truth, \
+             #4610), not re-inline a partial (is_hosting || in_use) gate that \
+             would re-admit phantom stateless contracts"
         );
 
         // 2. `broadcast_to_single_peer` must call the gate BEFORE the expensive

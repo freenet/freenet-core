@@ -2773,9 +2773,7 @@ async fn summary_if_hosted_or_in_use(
     op_manager: &Arc<OpManager>,
     key: &freenet_stdlib::prelude::ContractKey,
 ) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
-    if (op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key))
-        && op_manager.ring.contract_state_present(key)
-    {
+    if op_manager.ring.should_summarize_or_broadcast(key) {
         // Periodic interest-sync summarize: best-effort background work, so it
         // yields the contract loop to client/relay traffic (#4534 / #4473).
         get_contract_summary(op_manager, key, crate::contract::Priority::Background).await
@@ -3173,9 +3171,14 @@ mod tests {
     fn interest_sync_periodic_arms_summarize_only_hosted_or_in_use_pin() {
         let src = include_str!("node.rs");
 
-        // The helper must gate the expensive call on BOTH the hosting check and
-        // the in-use check: gating on hosting alone wrongly drops the proactive
-        // heal for an evicted-but-in-use stateful contract (Codex P1 on #4475).
+        // The helper must gate the expensive call on the SINGLE composed
+        // predicate `Ring::should_summarize_or_broadcast`, which is
+        // `(is_hosting_contract || contract_in_use) && contract_state_present`.
+        // The composition (incl. the load-bearing `&&` vs `||` — an `||` would
+        // let a phantom pass and re-open the #4610 storm) is behaviourally
+        // verified by `summarize_gate_skips_stateless_phantom_keeps_stateful_4610`
+        // in ring/hosting.rs. Here we only pin that the helper DELEGATES to it
+        // rather than re-inlining a partial gate.
         let helper_start = src
             .find("async fn summary_if_hosted_or_in_use(")
             .expect("summary_if_hosted_or_in_use helper not found");
@@ -3187,21 +3190,11 @@ mod tests {
                 .expect("summary_if_hosted_or_in_use body end not found");
         let helper_src = &src[helper_start..helper_end];
         assert!(
-            helper_src.contains("is_hosting_contract"),
-            "summary_if_hosted_or_in_use must gate on is_hosting_contract"
-        );
-        assert!(
-            helper_src.contains("contract_in_use"),
-            "summary_if_hosted_or_in_use must ALSO gate on contract_in_use so an \
-             evicted-but-in-use stateful contract keeps its interest-sync heal"
-        );
-        assert!(
-            helper_src.contains("contract_state_present"),
-            "summary_if_hosted_or_in_use must ALSO gate on contract_state_present \
-             (actual state in the on-disk store) so a phantom \
-             (interested-but-stateless) contract is NOT summarized every heartbeat \
-             — the #4610 storm. Must read the state store, not the in-memory \
-             hosting cache, so an evicted-but-on-disk contract still summarizes."
+            helper_src.contains("should_summarize_or_broadcast"),
+            "summary_if_hosted_or_in_use must gate on the composed \
+             should_summarize_or_broadcast predicate (single source of truth, \
+             #4610), not re-inline a partial (is_hosting || in_use) gate that \
+             would re-admit phantom stateless contracts"
         );
 
         // Slice the periodic arms = handler start .. the ResyncRequest arm.
