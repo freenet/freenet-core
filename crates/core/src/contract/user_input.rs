@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -248,22 +248,37 @@ impl DashboardPrompter {
 /// Build the HTTP authority (`host:port`) for the local dashboard URL from the
 /// ws-api bind address (#3820).
 ///
-/// The dashboard server binds an explicit loopback companion socket for
-/// wildcard / loopback binds (see `server::companion_bind_addr`), so `127.0.0.1`
-/// is reachable and is the stable choice there. A bind to a *specific* interface
-/// address has no loopback companion — only that address is served — so the URL
-/// must target it directly, or the browser-open would hit a refused endpoint.
-/// IPv6 literals are bracketed per the URL authority grammar.
+/// The URL must target the *primary* listener, which is always bound (a primary
+/// bind failure is fatal). The cross-family companion socket that
+/// `server::serve_dual_stack` adds for wildcard / loopback binds is best-effort
+/// — it may fail to bind (e.g. the other IP family is disabled) with the node
+/// still serving on the primary — so the URL must never assume it exists.
+///
+/// Therefore a wildcard bind maps to the loopback of its *own* family (always
+/// served by the primary), and a loopback or specific bind is used as-is. IPv6
+/// literals are bracketed per the URL authority grammar.
 fn dashboard_authority(bind: SocketAddr) -> String {
-    let ip = bind.ip();
-    let host = if ip.is_unspecified() || ip.is_loopback() {
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    } else {
-        ip
-    };
-    match host {
-        IpAddr::V4(v4) => format!("{v4}:{}", bind.port()),
-        IpAddr::V6(v6) => format!("[{v6}]:{}", bind.port()),
+    let port = bind.port();
+    // Enumerate both families explicitly (no `_` arm) so a future `IpAddr`
+    // variant fails to compile here rather than silently taking a default
+    // path — same discipline as `server::companion_bind_addr`.
+    match bind.ip() {
+        IpAddr::V4(v4) => {
+            let host = if v4.is_unspecified() {
+                Ipv4Addr::LOCALHOST
+            } else {
+                v4
+            };
+            format!("{host}:{port}")
+        }
+        IpAddr::V6(v6) => {
+            let host = if v6.is_unspecified() {
+                Ipv6Addr::LOCALHOST
+            } else {
+                v6
+            };
+            format!("[{host}]:{port}")
+        }
     }
 }
 
@@ -1131,33 +1146,33 @@ mod tests {
         );
     }
 
-    // #3820 (codex review): the dashboard URL must target the address the
-    // ws-api server actually serves. Wildcard / loopback binds get a loopback
-    // companion socket, so 127.0.0.1 is reachable and preferred; a specific
-    // interface bind has no companion, so the URL must target that address
-    // (with IPv6 literals bracketed).
+    // #3820 (codex review): the dashboard URL must target the always-bound
+    // primary listener, never the best-effort cross-family companion. A
+    // wildcard bind maps to the loopback of its OWN family; a loopback or
+    // specific bind is used as-is, with IPv6 literals bracketed.
     #[test]
     fn dashboard_authority_maps_bind_address_to_reachable_url_host() {
-        use std::net::Ipv6Addr;
-
-        // IPv6 wildcard is the default ws-api-address.
+        // IPv6 wildcard (the default ws-api-address): primary is IPv6, so use
+        // the IPv6 loopback rather than the best-effort IPv4 companion.
         assert_eq!(
             dashboard_authority(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7509)),
-            "127.0.0.1:7509"
+            "[::1]:7509"
         );
+        // IPv4 wildcard: primary is IPv4.
         assert_eq!(
             dashboard_authority(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509)),
             "127.0.0.1:7509"
         );
+        // Explicit loopback binds are served on exactly that address.
         assert_eq!(
             dashboard_authority(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7509)),
             "127.0.0.1:7509"
         );
         assert_eq!(
             dashboard_authority(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 7509)),
-            "127.0.0.1:7509"
+            "[::1]:7509"
         );
-        // A specific interface bind has no loopback companion: target it.
+        // A specific interface bind has no companion: target it.
         assert_eq!(
             dashboard_authority(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
