@@ -2297,6 +2297,16 @@ impl Ring {
         self.hosting_manager.is_hosting_contract(key)
     }
 
+    /// The composed #4610 summarize/broadcast gate (see
+    /// [`HostingManager::should_summarize_or_broadcast`]):
+    /// `(is_hosting_contract || contract_in_use) && contract_state_present`.
+    /// Skips phantom (interested-but-stateless) contracts while still serving
+    /// evicted-but-in-use ones whose state remains on disk.
+    #[inline]
+    pub fn should_summarize_or_broadcast(&self, key: &ContractKey) -> bool {
+        self.hosting_manager.should_summarize_or_broadcast(key)
+    }
+
     /// Set the storage reference for hosting metadata persistence.
     ///
     /// Must be called after executor creation. This enables automatic

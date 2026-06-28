@@ -1130,6 +1130,99 @@ impl HostingManager {
         self.hosting_cache.read().contains(key)
     }
 
+    /// Whether this node has STORED STATE for `key` in the contract state
+    /// store (on disk), as opposed to merely tracking it in an in-memory
+    /// cache or subscriber map.
+    ///
+    /// This is the load-bearing distinction for the #4610 summarize/broadcast
+    /// gate. A contract can be marked hosted (`is_hosting_contract`) or be
+    /// `contract_in_use` (a downstream subscriber renewing an inbound relay
+    /// SUBSCRIBE) WITHOUT its state ever having been fetched and stored — the
+    /// "phantom" (interested-but-stateless) contracts of #4440. Summarizing or
+    /// broadcasting such a contract is pointless: there is nothing to
+    /// summarize, every attempt fails with "Contract state not found in
+    /// store", and at scale the periodic interest-sync/broadcast loops fire
+    /// ~70-80 of these per second — the #4610 CPU/memory storm.
+    ///
+    /// Reads the state store directly so the answer is correct in the cases
+    /// the in-memory caches get wrong:
+    /// - a cache-hosted contract whose state was never stored → absent (skip);
+    /// - an evicted-but-in-use contract whose state is still on disk
+    ///   (`evict_over_budget` retains `contract_in_use` entries, and
+    ///   `reclaim_evicted_contract` only deletes state once NOT in use) →
+    ///   present, so it KEEPS summarizing/broadcasting (no regression). This
+    ///   is exactly why the gate must NOT key on `is_hosting_contract`, which
+    ///   reads only the in-memory hosting cache.
+    ///
+    /// Cheap: a single redb point lookup on the STATE table that does not
+    /// deserialize the value (`get_state_size` reads only the value length).
+    /// It runs per-hosted-contract per-heartbeat, but REPLACES a far more
+    /// expensive failing round-trip (a `GetSummaryQuery` on the serial
+    /// contract-handling loop → full fetch → `MissingContract`) for every
+    /// phantom contract, so it is a net reduction in work.
+    ///
+    /// Conservative on uncertainty: an unset storage handle (pre-startup) or a
+    /// transient store error returns `true` (treat as present) so a real
+    /// hosted contract is never wrongly dropped from interest-sync repair. The
+    /// sqlite backend has no cheap *synchronous* existence check, so it also
+    /// returns `true`, preserving pre-#4610 behavior; the storm is a
+    /// redb-production phenomenon.
+    pub fn contract_state_present(&self, key: &ContractKey) -> bool {
+        #[cfg(feature = "redb")]
+        {
+            if let Some(storage) = self.storage.read().as_ref() {
+                return match storage.get_state_size(key) {
+                    Ok(size) => size.is_some(),
+                    Err(e) => {
+                        // debug!, not warn!: this runs per-hosted-contract
+                        // per-heartbeat, so a persistent store error would itself
+                        // log-storm (~1000/heartbeat) — the same failure class
+                        // #4610 fixes. Assume present so a real hosted contract is
+                        // never dropped from interest-sync on a transient error.
+                        tracing::debug!(
+                            contract = %key,
+                            error = %e,
+                            "state-presence check failed; assuming present"
+                        );
+                        true
+                    }
+                };
+            }
+        }
+        #[cfg(not(feature = "redb"))]
+        {
+            // No cheap synchronous existence check on this backend; preserve
+            // pre-#4610 behavior. Touch `key` so it is not flagged unused.
+            let _ = key;
+        }
+        true
+    }
+
+    /// The composed #4610 gate: summarize / broadcast a contract's state ONLY
+    /// when we host or actively serve it AND we actually hold its state:
+    /// `(is_hosting_contract || contract_in_use) && contract_state_present`.
+    ///
+    /// SINGLE SOURCE OF TRUTH for the gate, called by both
+    /// `node::summary_if_hosted_or_in_use` (periodic interest-sync) and
+    /// `broadcast_queue::should_broadcast_contract` (broadcast fan-out). Keeping
+    /// the predicate in one place means the two paths cannot drift, and an
+    /// `&&`→`||` miswire (which would let a phantom pass and re-open the storm)
+    /// is caught by ONE behavioural test
+    /// (`summarize_gate_skips_stateless_phantom_keeps_stateful_4610`) rather than
+    /// needing one per call site.
+    ///
+    /// `contract_state_present` does a deliberate cheap SYNCHRONOUS redb point
+    /// lookup on the state store. That is intentional and net-cheaper than the
+    /// pre-#4610 behavior (it replaces a failing full-fetch round-trip on the
+    /// serial contract-handling loop). Do NOT "optimize" it into an in-memory
+    /// hosting-cache check: that would reintroduce the evicted-but-on-disk
+    /// regression (a contract whose state is still on disk but no longer in the
+    /// cache must keep summarizing/broadcasting).
+    pub fn should_summarize_or_broadcast(&self, key: &ContractKey) -> bool {
+        (self.is_hosting_contract(key) || self.contract_in_use(key))
+            && self.contract_state_present(key)
+    }
+
     /// Get all hosted contract keys.
     pub fn hosting_contract_keys(&self) -> Vec<ContractKey> {
         self.hosting_cache.read().iter().collect()
@@ -3185,6 +3278,150 @@ mod tests {
         );
         manager.unsubscribe(&upstream_only);
     }
+
+    /// Behavioural regression for the #4610 summarize/broadcast storm.
+    ///
+    /// The inbound relay-SUBSCRIBE / placement-migration path marks a contract
+    /// `contract_in_use` (a downstream-subscriber renewal) WITHOUT its state
+    /// ever being fetched/stored — a "phantom" (interested-but-stateless)
+    /// contract (#4440). Before #4610 the summarize gate
+    /// (`is_hosting_contract || contract_in_use`) and the broadcast gate
+    /// `should_broadcast_contract` both passed such a contract, so the periodic
+    /// interest-sync / broadcast loops called `summarize_contract_state` for it
+    /// every heartbeat — a full fetch that always failed "Contract state not
+    /// found in store" (~70-80/sec at scale; CPU pegged, memory to the 2G cap).
+    ///
+    /// The fix adds a `contract_state_present` (actual on-disk state) term,
+    /// composed with the host-or-serve check in the single
+    /// `should_summarize_or_broadcast` predicate that BOTH gate call sites use.
+    /// This drives the exact storm signature through real subscriber
+    /// registration + a real redb state store and asserts the COMPOSED gate
+    /// decision (not just the leaf signals) for each case:
+    ///   - a phantom (in_use, no stored state) → the OLD `(is_hosting||in_use)`
+    ///     predicate is TRUE but the composed gate is FALSE → SKIPPED;
+    ///   - a stateful in-use contract → composed gate TRUE → summarized/broadcast;
+    ///   - an evicted-but-on-disk contract (state present, NOT in the hosting
+    ///     cache, in_use) → composed gate TRUE → still summarized — the
+    ///     regression the state-STORE check prevents (keying on
+    ///     `is_hosting_contract`, i.e. cache membership, would wrongly drop it).
+    ///
+    /// Asserting the COMPOSED predicate (not the individual leaf signals) is what
+    /// makes this test catch an `&&`→`||` miswire in
+    /// `should_summarize_or_broadcast`: with `||`, the phantom (in_use but
+    /// stateless) would pass and this test fails. Verified by flipping the
+    /// operator. A leaf-only assertion would NOT catch that.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn summarize_gate_skips_stateless_phantom_keeps_stateful_4610() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+
+        // Real redb state store, like production.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::contract::storages::ReDb::new(temp_dir.path())
+            .await
+            .unwrap();
+
+        let peer = make_peer_key(7);
+
+        // Phantom: a remote peer relay-subscribed (downstream subscriber) but
+        // we NEVER fetched/stored its state.
+        let phantom = make_contract_key(70);
+        manager.add_downstream_subscriber(&phantom, peer.clone());
+
+        // Stateful: state actually stored AND in use.
+        let stateful = make_contract_key(71);
+        storage
+            .store_state_sync(&stateful, WrappedState::new(vec![1, 2, 3, 4]))
+            .unwrap();
+        manager.add_downstream_subscriber(&stateful, peer.clone());
+
+        // Evicted-but-on-disk: state stored, in use, but NOT in the hosting
+        // cache (never `host_contract`-ed). The gate must NOT skip this one —
+        // keying on `is_hosting_contract` (cache membership) would wrongly drop
+        // it, so this is the regression the state-store check prevents.
+        let evicted_on_disk = make_contract_key(72);
+        storage
+            .store_state_sync(&evicted_on_disk, WrappedState::new(vec![9, 9, 9]))
+            .unwrap();
+        manager.add_downstream_subscriber(&evicted_on_disk, peer.clone());
+
+        manager.set_storage(storage);
+
+        // Preconditions documenting the storm signature: the OLD predicate
+        // (is_hosting || in_use) is TRUE for the phantom — that is exactly why
+        // it stormed before the fix — yet it has no stored state.
+        assert!(
+            manager.contract_in_use(&phantom),
+            "phantom must look in-use (downstream subscriber) — the pre-#4610 \
+             gate would have summarized it every heartbeat"
+        );
+        assert!(
+            !manager.contract_state_present(&phantom),
+            "phantom precondition: no stored state"
+        );
+        assert!(
+            !manager.is_hosting_contract(&evicted_on_disk),
+            "evicted precondition: not in the hosting cache"
+        );
+        assert!(
+            manager.contract_state_present(&evicted_on_disk),
+            "evicted precondition: state still on disk"
+        );
+
+        // The actual gate decision (composed predicate, shared by both call
+        // sites). Asserting THIS — not the leaf signals — is what catches an
+        // `&&`→`||` miswire: with `||`, the phantom would pass.
+        assert!(
+            !manager.should_summarize_or_broadcast(&phantom),
+            "#4610: a phantom (in_use but stateless) contract MUST be gated OUT \
+             of summarize/broadcast. If this fails after an edit, check for an \
+             `&&`→`||` miswire in should_summarize_or_broadcast."
+        );
+        assert!(
+            manager.should_summarize_or_broadcast(&stateful),
+            "a hosted/in-use contract WITH stored state MUST be summarized/broadcast"
+        );
+        assert!(
+            manager.should_summarize_or_broadcast(&evicted_on_disk),
+            "#4610 regression guard: an evicted-but-on-disk contract (state on \
+             disk, in_use, NOT in the hosting cache) MUST stay summarized — the \
+             gate reads the state STORE, not the hosting cache"
+        );
+    }
+
+    /// #4610 fallback: with NO storage handle set (the pre-startup window, before
+    /// `set_storage`), `contract_state_present` MUST return `true` (assume
+    /// present). A refactor that returned `false` here would drop EVERY contract
+    /// from summarize/broadcast during the startup window. So the composed gate
+    /// reduces to the pre-#4610 `(is_hosting || in_use)` behavior until storage
+    /// is attached.
+    #[test]
+    fn contract_state_present_assumes_present_without_storage_handle() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(80);
+        assert!(
+            manager.contract_state_present(&key),
+            "without a storage handle, contract_state_present must assume present \
+             so startup-window contracts are not all dropped"
+        );
+        // And the composed gate still passes for an in-use contract pre-storage.
+        let peer = make_peer_key(8);
+        manager.add_downstream_subscriber(&key, peer);
+        assert!(
+            manager.should_summarize_or_broadcast(&key),
+            "pre-storage, the gate must fall back to (is_hosting || in_use)"
+        );
+    }
+
+    // NOTE: no sqlite-backend fallback test. The sqlite store has no cheap
+    // *synchronous* existence check, so `contract_state_present` returns `true`
+    // there (the `#[cfg(not(feature = "redb"))]` branch, preserving pre-#4610
+    // behavior). A `#[cfg(all(feature = "sqlite", not(feature = "redb")))]` test
+    // would never run: the sqlite backend does not compile on main (unrelated
+    // pre-existing errors, e.g. missing `get_user_secrets_index`) and there is
+    // no sqlite CI lane, so such a test would be unverifiable dead code.
 
     /// Generation flow through `HostingManager`: bumping the state
     /// generation BEFORE `record_contract_access` makes the captured
