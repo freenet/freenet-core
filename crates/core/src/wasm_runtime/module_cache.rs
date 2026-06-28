@@ -61,11 +61,12 @@ use lru::LruCache;
 /// lock-order hazard (see `HostingManager::contract_in_use` rustdoc).
 pub(crate) type InterestPredicate<K> = Arc<dyn Fn(&K) -> bool + Send + Sync>;
 
-/// Environment variable that enables the interest-weighted (two-tier) eviction
-/// policy for the contract module cache. Default OFF — with the flag unset (or
-/// any value other than a recognized truthy string) eviction is EXACTLY the
-/// pre-existing pure byte-LRU, so this whole change is inert until an operator
-/// opts in. Mirrors the `FREENET_MODULE_CACHE_BUDGET_BYTES` env pattern.
+/// Environment variable that controls the interest-weighted (two-tier) eviction
+/// policy for the contract module cache. Default ON (canary-validated
+/// 2026-06-28) — with the flag unset, or set to any value other than a
+/// recognized falsy string, the two-tier policy is active. Set it to an explicit
+/// falsy value (`0`, `false`, `no`, `off`, or empty) to force the pre-existing
+/// pure byte-LRU. Mirrors the `FREENET_MODULE_CACHE_BUDGET_BYTES` env pattern.
 ///
 /// When ON, an over-budget eviction first reclaims cold (no-interest) LRU
 /// entries; only if the interested set ALONE still exceeds the byte budget does
@@ -78,18 +79,21 @@ pub(crate) type InterestPredicate<K> = Arc<dyn Fn(&K) -> bool + Send + Sync>;
 /// take effect — there is no live re-read.
 pub(crate) const INTEREST_TIERED_ENV: &str = "FREENET_MODULE_CACHE_INTEREST_TIERED";
 
-/// Parse the [`INTEREST_TIERED_ENV`] flag value into a bool. Recognizes the
-/// usual truthy spellings; anything else (including unset) is `false`, so the
-/// safe default is pure byte-LRU. Split out as a pure function so the parsing is
-/// unit-testable without touching the process environment.
+/// Parse the [`INTEREST_TIERED_ENV`] flag value into a bool. Interest-tiered
+/// eviction is ON by default (canary-validated 2026-06-28): an unset value, or
+/// any value that is not a recognized falsy spelling, returns `true`. Only the
+/// explicit falsy spellings (`0`, `false`, `no`, `off`, or an empty/whitespace
+/// value) return `false`, so an operator can still force pure byte-LRU. Split
+/// out as a pure function so the parsing is unit-testable without touching the
+/// process environment.
 fn parse_interest_tiered_flag(value: Option<&str>) -> bool {
-    matches!(
+    !matches!(
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("1" | "true" | "yes" | "on")
+        Some("0" | "false" | "no" | "off" | "")
     )
 }
 
-/// Read [`INTEREST_TIERED_ENV`] from the process environment (default OFF).
+/// Read [`INTEREST_TIERED_ENV`] from the process environment (default ON).
 pub(crate) fn interest_tiered_enabled() -> bool {
     parse_interest_tiered_flag(std::env::var(INTEREST_TIERED_ENV).ok().as_deref())
 }
@@ -162,11 +166,12 @@ pub(crate) struct ModuleCache<K: Hash + Eq, V> {
     /// See [`InterestPredicate`].
     interest: Option<InterestPredicate<K>>,
     /// Whether the interest-weighted (two-tier) eviction policy is ACTIVE.
-    /// `true` only when both the [`INTEREST_TIERED_ENV`] flag is set AND an
-    /// `interest` predicate is present. With it `false`, eviction is exactly the
-    /// pre-existing pure byte-LRU — the shadow metrics are still computed (they
-    /// only need the predicate), but they do not change eviction behavior. This
-    /// is what makes the change inert by default and safe to merge.
+    /// `true` when the [`INTEREST_TIERED_ENV`] flag resolves truthy (its default
+    /// is ON, canary-validated 2026-06-28) AND an `interest` predicate is
+    /// present. With it `false` (operator forced the flag falsy, or no predicate
+    /// is wired), eviction is exactly the pre-existing pure byte-LRU — the shadow
+    /// metrics are still computed (they only need the predicate), but they do not
+    /// change eviction behavior.
     interest_tiered_active: bool,
     /// Last time a cache HIT recomputed the interest shadow gauges, throttled to
     /// [`INTEREST_SHADOW_REFRESH_INTERVAL`]. `None` until the first throttled
@@ -211,9 +216,9 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
     /// (and reads the [`INTEREST_TIERED_ENV`] flag) so the contract cache can
     /// participate in interest-weighted (two-tier) eviction.
     ///
-    /// The two-tier policy is ACTIVE only when the flag is set AND `interest` is
-    /// `Some`. When `interest` is `Some` but the flag is unset, eviction stays
-    /// pure byte-LRU (today's behavior) while the always-on shadow metrics are
+    /// The two-tier policy is ACTIVE when the flag resolves truthy (default ON)
+    /// AND `interest` is `Some`. When `interest` is `Some` but the flag is forced
+    /// falsy, eviction stays pure byte-LRU while the always-on shadow metrics are
     /// still computed from the predicate. When `interest` is `None`, this is
     /// identical to [`Self::with_label`].
     pub(crate) fn with_label_and_interest(
@@ -393,14 +398,14 @@ impl<K: Hash + Eq + Clone, V> ModuleCache<K, V> {
     ///
     /// # Two policies, one strict byte budget
     ///
-    /// - **Pure byte-LRU (default / flag OFF):** evict the absolute LRU entry
+    /// - **Pure byte-LRU (flag forced OFF):** evict the absolute LRU entry
     ///   each step. EXACTLY the historical behavior — byte- AND cost-identical
     ///   (no interest predicate is consulted on this path at all, so it stays
     ///   O(evictions) under the shared module-cache mutex). The interest *shadow*
     ///   accounting that estimates what two-tier WOULD do lives entirely in the
     ///   throttled `record_interest_shadow` refresh, never in this hot loop
     ///   (Codex review: don't scan on every default eviction).
-    /// - **Interest-weighted two-tier (flag ON + predicate present):** evict the
+    /// - **Interest-weighted two-tier (default; flag ON + predicate present):** evict the
     ///   LRU *cold* (no-interest) entry each step; only once NO cold entry
     ///   remains (the interested set alone still exceeds the budget) does it fall
     ///   back to evicting the LRU interested entry. No contract is pinned
@@ -689,13 +694,14 @@ pub(crate) struct ModuleCacheMetrics {
     /// label. Monotonic; the collector differences it across the cadence.
     ///
     /// The live gate keys on the active eviction policy, so the meaning is:
-    /// - interest-tiered eviction ACTIVE → the gate actually admits these, so this
-    ///   is an EXACT tally of RECOVERED admissions (neither the gate nor this
-    ///   model reserves cache room for the incoming contract's own bytes, so the
-    ///   modeled admit condition is byte-for-byte the gate's);
-    /// - plain byte-LRU (DEFAULT) → the gate still refuses on raw occupancy, so
-    ///   this is the count that WOULD be recovered if interest-tiered eviction
-    ///   were enabled — i.e. the data that quantifies the benefit of that flip.
+    /// - interest-tiered eviction ACTIVE (the default) → the gate actually admits
+    ///   these, so this is an EXACT tally of RECOVERED admissions (neither the
+    ///   gate nor this model reserves cache room for the incoming contract's own
+    ///   bytes, so the modeled admit condition is byte-for-byte the gate's);
+    /// - plain byte-LRU (operator opt-out) → the gate still refuses on raw
+    ///   occupancy, so this is the count that WOULD be recovered if interest-tiered
+    ///   eviction were enabled — i.e. the data that quantifies the benefit of the
+    ///   default.
     ///
     /// See [`migration_admission_recovered`] for the full rationale.
     migration_admission_recovered_total: AtomicU64,
@@ -1041,9 +1047,10 @@ fn occupancy_pct(total_bytes: u64, budget_bytes: u64) -> Option<u64> {
 /// cache room for the incoming contract's own bytes. When interest-tiered
 /// eviction is ACTIVE the live gate uses exactly that condition, so this is an
 /// EXACT tally of RECOVERED admissions. When the cache evicts with plain LRU
-/// (the default) the live gate still refuses on raw occupancy, so this is the
-/// RECOVERABLE count — what a tiered-eviction flip would unlock — rather than
-/// admissions that happened. Either way it never over-counts the recoverable set.
+/// (the operator opt-out) the live gate still refuses on raw occupancy, so this
+/// is the RECOVERABLE count — what re-enabling tiered eviction would unlock —
+/// rather than admissions that happened. Either way it never over-counts the
+/// recoverable set.
 fn migration_admission_recovered(
     total_bytes: u64,
     interested_bytes: u64,
@@ -1990,31 +1997,43 @@ mod tests {
         Arc::new(move |k: &u64| set.lock().unwrap().contains(k))
     }
 
-    /// Flag parsing: only the recognized truthy spellings enable the policy;
-    /// everything else (including unset) is the safe default OFF.
+    /// Flag parsing: interest-tiered eviction is ON by default. Unset enables it,
+    /// as does any unrecognized value; only the explicit falsy spellings (and an
+    /// empty/whitespace value) force plain byte-LRU so an operator can opt out.
     #[test]
-    fn interest_tiered_flag_parses_truthy_only() {
+    fn interest_tiered_flag_defaults_on_unless_explicitly_disabled() {
+        // Explicit falsy spellings (and empty/whitespace) force plain byte-LRU.
+        for v in ["0", "false", "FALSE", " no ", "Off", "oFF", "", "   "] {
+            assert!(
+                !parse_interest_tiered_flag(Some(v)),
+                "{v:?} must disable the policy (force plain byte-LRU)"
+            );
+        }
+        // Truthy spellings keep it on.
         for v in ["1", "true", "TRUE", " yes ", "On", "oN"] {
             assert!(parse_interest_tiered_flag(Some(v)), "{v:?} must be truthy");
         }
-        for v in ["0", "false", "no", "off", "", "2", "enable", "y"] {
+        // Anything unrecognized is NOT an explicit opt-out, so it stays ON.
+        for v in ["2", "enable", "y"] {
             assert!(
-                !parse_interest_tiered_flag(Some(v)),
-                "{v:?} must NOT enable the policy"
+                parse_interest_tiered_flag(Some(v)),
+                "{v:?} is not an explicit opt-out → tiered eviction stays ON (default)"
             );
         }
+        // The headline change: unset now defaults the policy ON.
         assert!(
-            !parse_interest_tiered_flag(None),
-            "unset env must default OFF (pure byte-LRU)"
+            parse_interest_tiered_flag(None),
+            "unset env must default ON (interest-tiered eviction)"
         );
     }
 
     /// Env READ-PATH: `with_label_and_interest` consults `interest_tiered_enabled()`
     /// (the live env var) to decide whether the two-tier policy is active. With the
-    /// var set truthy the constructed contract cache is tiered; unset it is not.
-    /// The prior value is restored at the end. Cross-test isolation comes from
-    /// `cargo nextest` (CI runs each test in its own process); the local guard
-    /// below only serializes this test against its own re-entry.
+    /// var set truthy — OR unset, the default — the constructed contract cache is
+    /// tiered; an explicit falsy value forces it off. The prior value is restored
+    /// at the end. Cross-test isolation comes from `cargo nextest` (CI runs each
+    /// test in its own process); the local guard below only serializes this test
+    /// against its own re-entry.
     #[test]
     fn interest_tiered_enabled_reads_env_at_construction() {
         use std::sync::Mutex as StdMutex;
@@ -2048,11 +2067,22 @@ mod tests {
         // SAFETY: as on the first `set_var` above — nextest runs this test in its
         // own process (no concurrent env mutation); value restored at the end.
         unsafe { std::env::remove_var(INTEREST_TIERED_ENV) };
-        let off =
+        let default_on =
             ModuleCache::<u64, ()>::with_label_and_interest(10, "contract", None, Some(pred()));
         assert!(
-            !off.interest_tiered_active(),
-            "flag unset → tiered policy inactive (safe default)"
+            default_on.interest_tiered_active(),
+            "flag unset → tiered policy active by default (canary-validated 2026-06-28)"
+        );
+
+        // Explicit opt-out: an operator can still force plain byte-LRU.
+        // SAFETY: as on the first `set_var` above — nextest per-process isolation;
+        // value restored at the end.
+        unsafe { std::env::set_var(INTEREST_TIERED_ENV, "0") };
+        let opted_out =
+            ModuleCache::<u64, ()>::with_label_and_interest(10, "contract", None, Some(pred()));
+        assert!(
+            !opted_out.interest_tiered_active(),
+            "explicit falsy flag → tiered policy disabled (plain byte-LRU)"
         );
 
         // A predicate-less cache is never tiered regardless of the env.
