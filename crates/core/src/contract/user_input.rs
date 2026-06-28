@@ -1,3 +1,4 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,6 +8,16 @@ use tokio::sync::{broadcast, oneshot};
 
 /// Timeout for user input prompts. After this duration, the request is auto-denied.
 pub(crate) const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Minimum interval between browser-opens for no-tab prompts (#3820).
+///
+/// A burst of prompts arriving with no dashboard tab connected (e.g. a
+/// background script firing many delegate ops) would otherwise open one browser
+/// tab per prompt — up to `MAX_PENDING_PROMPTS` tabs at once. This caps it to
+/// one tab per window. Prompts suppressed by the cooldown fall back to the
+/// pre-existing behaviour (auto-deny after [`USER_INPUT_TIMEOUT`]), so the
+/// cooldown never leaves a prompt worse off than before this feature existed.
+const NO_TAB_OPEN_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// Maximum message length for display. Prevents abuse from untrusted delegates.
 const MAX_MESSAGE_LEN: usize = 2048;
@@ -153,19 +164,190 @@ pub(crate) fn emit_prompt_event(event: PromptEvent) {
     drop(prompt_events().send(event));
 }
 
+/// Action invoked to surface a permission prompt to the user when no dashboard
+/// tab is connected to display it. Receives the standalone permission-page URL.
+///
+/// In production this opens the user's default browser (see
+/// [`open_permission_page_in_browser`]); tests substitute a recording stub so
+/// the decision logic can be exercised without spawning a real browser.
+pub(crate) type NoTabNotifier = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Opens the user's browser to the permission page on the local dashboard,
 /// then waits for the user to click a button. The HTTP POST handler sends
 /// the response back via a oneshot channel.
 ///
 /// Works from systemd user services because the node serves HTTP (already
 /// running) and the shell page's JS handles browser notification + opening.
+///
+/// When a prompt arrives and no dashboard tab is connected to display it, the
+/// prompt would otherwise silently auto-deny after [`USER_INPUT_TIMEOUT`]; in
+/// that case the prompter opens the standalone permission page directly in the
+/// user's browser so background / API-triggered prompts stay actionable (#3820).
 pub struct DashboardPrompter {
     pending: PendingPrompts,
+    /// HTTP authority (`host:port`) of the local dashboard server, derived from
+    /// the ws-api bind address (see [`dashboard_authority`]). Used to build the
+    /// permission-page URL opened when no tab is connected (#3820).
+    dashboard_authority: String,
+    /// Invoked with the permission-page URL when a prompt has no connected tab.
+    notify_no_tab: NoTabNotifier,
+    /// Timestamp of the last no-tab browser-open, for the
+    /// [`NO_TAB_OPEN_COOLDOWN`] rate limit. `None` until the first open.
+    last_no_tab_open: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl DashboardPrompter {
-    pub fn new(pending: PendingPrompts) -> Self {
-        Self { pending }
+    /// Build a prompter that opens the user's browser when no dashboard tab is
+    /// connected. `ws_api_addr` is the address the local HTTP/WS API dashboard
+    /// is served on (`config.ws_api.address` + `config.ws_api.port`).
+    pub fn new(pending: PendingPrompts, ws_api_addr: SocketAddr) -> Self {
+        Self {
+            pending,
+            dashboard_authority: dashboard_authority(ws_api_addr),
+            notify_no_tab: Arc::new(open_permission_page_in_browser),
+            last_no_tab_open: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Alert the user out-of-band when a freshly-created prompt has no dashboard
+    /// tab to display it. `subscriber_count` is the number of live SSE
+    /// subscribers to the prompt-event broadcast
+    /// ([`prompt_events()`]`.receiver_count()`); each connected gateway tab
+    /// holds exactly one. Zero means every tab is closed, so the prompt would
+    /// silently auto-deny after [`USER_INPUT_TIMEOUT`] unless we surface it.
+    ///
+    /// Rate-limited by [`NO_TAB_OPEN_COOLDOWN`] so a burst of no-tab prompts
+    /// opens one tab per window rather than one per prompt.
+    fn maybe_alert_no_tab(&self, nonce: &str, subscriber_count: usize) {
+        if subscriber_count != 0 || !self.no_tab_cooldown_elapsed() {
+            return;
+        }
+        let url = format!("http://{}/permission/{nonce}", self.dashboard_authority);
+        (self.notify_no_tab)(&url);
+    }
+
+    /// Returns `true` and records "now" when at least [`NO_TAB_OPEN_COOLDOWN`]
+    /// has passed since the last no-tab browser-open (or there was none yet);
+    /// returns `false` without updating when still inside the cooldown window.
+    fn no_tab_cooldown_elapsed(&self) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut last = self
+            .last_no_tab_open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match *last {
+            Some(prev) if now.duration_since(prev) < NO_TAB_OPEN_COOLDOWN => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// Build the HTTP authority (`host:port`) for the local dashboard URL from the
+/// ws-api bind address (#3820).
+///
+/// The URL must target the *primary* listener, which is always bound (a primary
+/// bind failure is fatal). The cross-family companion socket that
+/// `server::serve_dual_stack` adds for wildcard / loopback binds is best-effort
+/// — it may fail to bind (e.g. the other IP family is disabled) with the node
+/// still serving on the primary — so the URL must never assume it exists.
+///
+/// Therefore a wildcard bind maps to the loopback of its *own* family (always
+/// served by the primary), and a loopback or specific bind is used as-is. IPv6
+/// literals are bracketed per the URL authority grammar.
+fn dashboard_authority(bind: SocketAddr) -> String {
+    let port = bind.port();
+    // Enumerate both families explicitly (no `_` arm) so a future `IpAddr`
+    // variant fails to compile here rather than silently taking a default
+    // path — same discipline as `server::companion_bind_addr`.
+    match bind.ip() {
+        IpAddr::V4(v4) => {
+            let host = if v4.is_unspecified() {
+                Ipv4Addr::LOCALHOST
+            } else {
+                v4
+            };
+            format!("{host}:{port}")
+        }
+        IpAddr::V6(v6) => {
+            let host = if v6.is_unspecified() {
+                Ipv6Addr::LOCALHOST
+            } else {
+                v6
+            };
+            format!("[{host}]:{port}")
+        }
+    }
+}
+
+/// Open the standalone permission page in the user's default browser.
+///
+/// Used by [`DashboardPrompter`] when a permission prompt arrives with no
+/// dashboard tab connected to display it (#3820). Mirrors the binary-side
+/// `commands::open_url_in_browser`:
+///
+/// * On Windows it goes through `ShellExecuteW` (not `cmd /c start`) because the
+///   service wrapper detaches the console via `FreeConsole()` at startup, after
+///   which a spawned `cmd.exe` has no console and fails silently.
+/// * On macOS/Linux it spawns `open` / `xdg-open` with all three standard
+///   handles nulled. The node may run as a systemd / Windows service with no
+///   valid inherited stdio; an un-nulled `Command::spawn()` then fails with
+///   "The handle is invalid" (os error 6). See the `open_log_file` fix (#3933).
+///
+/// Best effort: when no browser can be opened (headless service, no
+/// `DISPLAY`/`WAYLAND_DISPLAY`) the spawn fails harmlessly and the prompt's
+/// existing [`USER_INPUT_TIMEOUT`] still governs.
+fn open_permission_page_in_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+        let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
+
+        unsafe {
+            winapi::um::shellapi::ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                url_wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                winapi::um::winuser::SW_SHOWNORMAL,
+            );
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut cmd = std::process::Command::new("open");
+        #[cfg(not(target_os = "macos"))]
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        drop(cmd.spawn());
+    }
+}
+
+#[cfg(test)]
+impl DashboardPrompter {
+    /// Construct a prompter with a custom no-tab notifier so tests can assert
+    /// the decision logic without spawning a real browser.
+    fn with_notifier(
+        pending: PendingPrompts,
+        ws_api_addr: SocketAddr,
+        notify_no_tab: NoTabNotifier,
+    ) -> Self {
+        Self {
+            pending,
+            dashboard_authority: dashboard_authority(ws_api_addr),
+            notify_no_tab,
+            last_no_tab_open: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -228,6 +410,16 @@ impl UserInputPrompter for DashboardPrompter {
             delegate_key: stored_delegate_key,
             caller: stored_caller,
         }));
+
+        // #3820: if no dashboard tab is connected to display this prompt, the
+        // user would never see it and it would silently auto-deny after
+        // USER_INPUT_TIMEOUT. A connected gateway tab subscribes to the
+        // prompt-event broadcast (one receiver per SSE connection), so zero
+        // receivers means every tab is closed -- open the standalone permission
+        // page in the user's browser so the prompt stays actionable. On a
+        // headless service (no DISPLAY/WAYLAND_DISPLAY) the browser-open is a
+        // harmless no-op and the existing timeout still governs.
+        self.maybe_alert_no_tab(&nonce, prompt_events().receiver_count());
 
         // Log at debug, not info -- nonce is the sole auth token for this prompt
         tracing::debug!(
@@ -378,6 +570,21 @@ mod tests {
         CallerIdentity::WebApp(s.to_string())
     }
 
+    /// A prompter whose no-tab notifier is a no-op, so calling `prompt()` in a
+    /// test never spawns a real browser (the global prompt-event broadcast is
+    /// shared across tests, so `receiver_count()` can read zero here). Tests
+    /// that exercise the no-tab decision itself use
+    /// [`DashboardPrompter::with_notifier`] with a recording stub instead.
+    fn noop_prompter(pending: PendingPrompts) -> DashboardPrompter {
+        DashboardPrompter::with_notifier(pending, test_ws_addr(), Arc::new(|_| {}))
+    }
+
+    /// Default ws-api bind address used by the prompter tests (loopback:7509),
+    /// which `dashboard_authority` maps to the `127.0.0.1:7509` URL authority.
+    fn test_ws_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7509)
+    }
+
     #[tokio::test]
     async fn test_auto_approve_returns_first_response() {
         let req = make_test_request("Allow this?", vec!["Allow", "Deny"]);
@@ -436,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_prompter_max_pending() {
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
 
         for i in 0..MAX_PENDING_PROMPTS {
             let (tx, _rx) = oneshot::channel();
@@ -619,7 +826,7 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_prompter_populates_webapp_caller() {
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
 
         let req = make_test_request("Approve?", vec!["Allow", "Deny"]);
         let pending_clone = pending.clone();
@@ -655,7 +862,7 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_prompter_records_none_caller() {
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
 
         let req = make_test_request("Approve?", vec!["Allow"]);
         let pending_clone = pending.clone();
@@ -683,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn test_dashboard_prompter_happy_path() {
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
 
         let req = make_test_request("Allow signing?", vec!["Allow", "Deny"]);
 
@@ -727,7 +934,7 @@ mod tests {
         let mut rx = prompt_events().subscribe();
 
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
         let req = make_test_request("lifecycle?", vec!["Allow", "Deny"]);
 
         let pending_clone = pending.clone();
@@ -790,7 +997,7 @@ mod tests {
         let mut rx = prompt_events().subscribe();
 
         let pending: PendingPrompts = Arc::new(DashMap::new());
-        let prompter = DashboardPrompter::new(pending.clone());
+        let prompter = noop_prompter(pending.clone());
         let req = make_test_request("timeout?", vec!["Allow"]);
 
         let handle = tokio::spawn(async move {
@@ -839,5 +1046,188 @@ mod tests {
             saw_removed,
             "prompter timeout must emit PromptEvent::Removed"
         );
+    }
+
+    // #3820: when a permission prompt is created and no dashboard tab is
+    // connected to display it (zero SSE subscribers), the prompter must open
+    // the standalone permission page in the user's browser so the prompt stays
+    // actionable instead of silently auto-denying after the timeout. When a tab
+    // IS connected it receives the prompt via SSE and the browser must NOT be
+    // opened. We drive `maybe_alert_no_tab` directly with a recording notifier
+    // because the prompt-event broadcast is a process-global shared across
+    // tests, so its live `receiver_count()` isn't deterministic here.
+    #[test]
+    fn maybe_alert_no_tab_opens_browser_only_when_no_subscribers() {
+        use std::sync::Mutex;
+
+        let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder: NoTabNotifier = {
+            let opened = opened.clone();
+            Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
+        };
+        let prompter =
+            DashboardPrompter::with_notifier(Arc::new(DashMap::new()), test_ws_addr(), recorder);
+
+        // A tab is connected (>= 1 subscriber): do not open the browser.
+        prompter.maybe_alert_no_tab("nonce-with-tab", 1);
+        assert!(
+            opened.lock().unwrap().is_empty(),
+            "browser must not open when a dashboard tab is connected"
+        );
+
+        // No tab connected (0 subscribers): open the standalone permission page.
+        prompter.maybe_alert_no_tab("nonce-no-tab", 0);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            ["http://127.0.0.1:7509/permission/nonce-no-tab"],
+            "browser must open exactly the standalone permission page for the prompt"
+        );
+    }
+
+    // The permission-page URL must use the configured ws-api port, not a
+    // hardcoded 7509 — a node on a custom port still opens the right dashboard.
+    #[test]
+    fn maybe_alert_no_tab_url_uses_configured_port() {
+        use std::sync::Mutex;
+
+        let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder: NoTabNotifier = {
+            let opened = opened.clone();
+            Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
+        };
+        let prompter = DashboardPrompter::with_notifier(
+            Arc::new(DashMap::new()),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41234),
+            recorder,
+        );
+
+        prompter.maybe_alert_no_tab("abc", 0);
+        assert_eq!(
+            opened.lock().unwrap().as_slice(),
+            ["http://127.0.0.1:41234/permission/abc"]
+        );
+    }
+
+    // A burst of no-tab prompts within NO_TAB_OPEN_COOLDOWN must open only one
+    // browser tab, not one per prompt (which could reach MAX_PENDING_PROMPTS
+    // tabs). Suppressed prompts fall back to the pre-existing auto-deny, so the
+    // cooldown never makes a prompt worse off. After the window elapses, the
+    // next no-tab prompt opens again.
+    #[tokio::test(start_paused = true)]
+    async fn maybe_alert_no_tab_cooldown_suppresses_burst() {
+        use std::sync::Mutex;
+
+        let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder: NoTabNotifier = {
+            let opened = opened.clone();
+            Arc::new(move |url: &str| opened.lock().unwrap().push(url.to_string()))
+        };
+        let prompter =
+            DashboardPrompter::with_notifier(Arc::new(DashMap::new()), test_ws_addr(), recorder);
+
+        // First no-tab prompt opens a tab; the burst that follows (no virtual
+        // time elapsed) is suppressed.
+        prompter.maybe_alert_no_tab("a", 0);
+        prompter.maybe_alert_no_tab("b", 0);
+        prompter.maybe_alert_no_tab("c", 0);
+        assert_eq!(
+            opened.lock().unwrap().len(),
+            1,
+            "a burst within the cooldown window must open only one tab"
+        );
+
+        // Once the cooldown elapses, the next no-tab prompt opens again.
+        tokio::time::advance(NO_TAB_OPEN_COOLDOWN + Duration::from_millis(1)).await;
+        prompter.maybe_alert_no_tab("d", 0);
+        assert_eq!(
+            opened.lock().unwrap().len(),
+            2,
+            "a no-tab prompt after the cooldown window must open a tab"
+        );
+    }
+
+    // #3820 (codex review): the dashboard URL must target the always-bound
+    // primary listener, never the best-effort cross-family companion. A
+    // wildcard bind maps to the loopback of its OWN family; a loopback or
+    // specific bind is used as-is, with IPv6 literals bracketed.
+    #[test]
+    fn dashboard_authority_maps_bind_address_to_reachable_url_host() {
+        // IPv6 wildcard (the default ws-api-address): primary is IPv6, so use
+        // the IPv6 loopback rather than the best-effort IPv4 companion.
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7509)),
+            "[::1]:7509"
+        );
+        // IPv4 wildcard: primary is IPv4.
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509)),
+            "127.0.0.1:7509"
+        );
+        // Explicit loopback binds are served on exactly that address.
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7509)),
+            "127.0.0.1:7509"
+        );
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 7509)),
+            "[::1]:7509"
+        );
+        // A specific interface bind has no companion: target it.
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+                8000
+            )),
+            "192.168.1.5:8000"
+        );
+        // IPv6 literals must be bracketed in the URL authority.
+        assert_eq!(
+            dashboard_authority(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                8000
+            )),
+            "[2001:db8::1]:8000"
+        );
+    }
+
+    /// Source-level regression pin for the #3933 null-stdio rule applied to the
+    /// #3820 browser-open helper.
+    ///
+    /// `open_permission_page_in_browser` is reachable from the contract
+    /// executor task, which on Windows can run with no valid console (service /
+    /// autostart) after `FreeConsole()`. The macOS/Linux `Command::spawn` for
+    /// `open` / `xdg-open` MUST null all three standard handles or `spawn()`
+    /// fails with "The handle is invalid" (os error 6) and the browser silently
+    /// never opens. The failure is Windows-only and needs a detached console,
+    /// so it can't be exercised portably; pin the source-level invariant
+    /// instead. See #3933 / #3820.
+    #[test]
+    fn open_permission_page_spawn_must_null_all_three_standard_handles() {
+        // The real definition appears earlier in the file than this test's
+        // string literal of the same signature, so `split_once` anchors on it.
+        let src = include_str!("user_input.rs");
+        let (_, after_fn_start) = src
+            .split_once("fn open_permission_page_in_browser(url: &str) {")
+            .expect("open_permission_page_in_browser definition not found");
+        // Restrict the search window to the function body, which ends at the
+        // next top-level `#[cfg(test)]` item. This ASSUMES
+        // `open_permission_page_in_browser` is immediately followed by the
+        // `#[cfg(test)] impl DashboardPrompter` test constructor: if non-test
+        // code is inserted between them, the window widens to include it and
+        // this assertion would also scan that code. Keep them adjacent.
+        let body = after_fn_start
+            .split_once("\n#[cfg(test)]")
+            .map(|(b, _)| b)
+            .unwrap_or(after_fn_start);
+        for handle in ["stdin", "stdout", "stderr"] {
+            let pattern = format!(".{handle}(std::process::Stdio::null())");
+            assert!(
+                body.contains(&pattern),
+                "open_permission_page_in_browser must call `{pattern}` — without \
+                 it, a Windows service/autostart node fails `Command::spawn()` \
+                 with os error 6 (handle invalid after FreeConsole) and the \
+                 permission page silently never opens. See #3933 / #3820."
+            );
+        }
     }
 }
