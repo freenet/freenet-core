@@ -1011,52 +1011,52 @@ impl ReDb {
         &self,
     ) -> Result<Vec<((DelegateKey, [u8; 32]), Vec<[u8; 32]>)>, redb::Error> {
         self.read_guarded(|txn| {
-        let tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
+            let tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
 
-        let mut result = Vec::new();
-        for entry in tbl.iter()? {
-            let (key, value) = entry?;
-            let key_bytes = key.value();
-            if key_bytes.len() != 96 {
-                // Skip malformed entries. The write path always emits a
-                // 96-byte composite key (DelegateKey(64) || UserId(32)); a
-                // wrong length means an externally-corrupted or
-                // future-format row. Drop it rather than panic on the
-                // fixed-size `try_into`s below, and warn so the corruption
-                // is visible in monitoring.
-                tracing::warn!(
-                    len = key_bytes.len(),
-                    "Skipping malformed user-secrets-index row (key length != 96)"
-                );
-                continue;
-            }
-            let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
-            let code_hash_bytes: [u8; 32] = key_bytes[32..64].try_into().unwrap();
-            let user_id_bytes: [u8; 32] = key_bytes[64..].try_into().unwrap();
+            let mut result = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                let key_bytes = key.value();
+                if key_bytes.len() != 96 {
+                    // Skip malformed entries. The write path always emits a
+                    // 96-byte composite key (DelegateKey(64) || UserId(32)); a
+                    // wrong length means an externally-corrupted or
+                    // future-format row. Drop it rather than panic on the
+                    // fixed-size `try_into`s below, and warn so the corruption
+                    // is visible in monitoring.
+                    tracing::warn!(
+                        len = key_bytes.len(),
+                        "Skipping malformed user-secrets-index row (key length != 96)"
+                    );
+                    continue;
+                }
+                let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
+                let code_hash_bytes: [u8; 32] = key_bytes[32..64].try_into().unwrap();
+                let user_id_bytes: [u8; 32] = key_bytes[64..].try_into().unwrap();
 
-            let value_bytes = value.value();
-            if value_bytes.len() % 32 != 0 {
-                // Skip malformed entries. The value is a concatenation of
-                // 32-byte secret-key hashes, so a length not divisible by
-                // 32 is corruption. Warn and drop rather than splitting a
-                // partial hash.
-                tracing::warn!(
-                    len = value_bytes.len(),
-                    "Skipping malformed user-secrets-index row (value length not a multiple of 32)"
-                );
-                continue;
-            }
-            let mut secret_keys = Vec::with_capacity(value_bytes.len() / 32);
-            for chunk in value_bytes.chunks(32) {
-                let arr: [u8; 32] = chunk.try_into().unwrap();
-                secret_keys.push(arr);
-            }
+                let value_bytes = value.value();
+                if value_bytes.len() % 32 != 0 {
+                    // Skip malformed entries. The value is a concatenation of
+                    // 32-byte secret-key hashes, so a length not divisible by
+                    // 32 is corruption. Warn and drop rather than splitting a
+                    // partial hash.
+                    tracing::warn!(
+                        len = value_bytes.len(),
+                        "Skipping malformed user-secrets-index row (value length not a multiple of 32)"
+                    );
+                    continue;
+                }
+                let mut secret_keys = Vec::with_capacity(value_bytes.len() / 32);
+                for chunk in value_bytes.chunks(32) {
+                    let arr: [u8; 32] = chunk.try_into().unwrap();
+                    secret_keys.push(arr);
+                }
 
-            let delegate_key =
-                DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
-            result.push(((delegate_key, user_id_bytes), secret_keys));
-        }
-        Ok(result)
+                let delegate_key =
+                    DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
+                result.push(((delegate_key, user_id_bytes), secret_keys));
+            }
+            Ok(result)
         })
     }
 
@@ -1867,6 +1867,28 @@ mod tests {
             POISON_RECOVERY_TRIGGERED.load(Ordering::SeqCst) >= 1,
             "a poisoned database write must take the recovery (exit-for-restart) path \
              rather than failing forever"
+        );
+
+        // Read path: redb's `begin_read` does not check the poison flag, so a poison
+        // surfaces inside the read body (at open_table/get/iter) as a `PreviousIo`.
+        // Feed `read_guarded` a real `PreviousIo` (obtained from the now-poisoned
+        // handle's begin_write) to prove the read path routes to recovery too, not
+        // just the write path. (A poisoned read served from cache would succeed and
+        // is not a failure; this exercises the failing-read body deterministically.)
+        let previous_io: redb::Error = match db.begin_write() {
+            Ok(_) => panic!("database should still be poisoned"),
+            Err(e) => e.into(),
+        };
+        assert!(
+            redb_error_is_poison(&previous_io),
+            "a poisoned handle's PreviousIo must classify as poison on the read path"
+        );
+        POISON_RECOVERY_TRIGGERED.store(0, Ordering::SeqCst);
+        let routed: Result<(), redb::Error> = db.read_guarded(|_txn| Err(previous_io));
+        assert!(routed.is_err());
+        assert!(
+            POISON_RECOVERY_TRIGGERED.load(Ordering::SeqCst) >= 1,
+            "read_guarded must route a poison surfacing inside the read body to recovery"
         );
     }
 }
