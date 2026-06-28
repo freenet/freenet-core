@@ -359,6 +359,19 @@ impl RuntimePool {
                 }
             }
         }));
+        // Companion GAUGES-ONLY refresher used by the migration-admission gate:
+        // recomputes the interest split for a fresh hot-occupancy read per inbound
+        // SubscribeHint WITHOUT bumping the throttle-sampled would-reclassify
+        // counter or resetting the throttle (Codex review). Same Weak-handle
+        // cycle-break rationale as the snapshot refresher above.
+        let gauges_refresher_cache = Arc::downgrade(&shared_contract_modules);
+        module_cache_metrics.set_interest_gauges_refresher(Arc::new(move || {
+            if let Some(cache) = gauges_refresher_cache.upgrade() {
+                if let Ok(cache) = cache.lock() {
+                    cache.force_refresh_interest_gauges_only();
+                }
+            }
+        }));
         // Shared delegate-context cache so a prompt round-trip routed to a
         // different pool executor still finds its `ctx.write()` blob.
         let shared_delegate_contexts = crate::wasm_runtime::new_delegate_context_cache();

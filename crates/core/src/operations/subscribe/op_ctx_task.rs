@@ -198,8 +198,13 @@ pub(crate) fn start_directed_subscribe(
         // into `result_router_tx` that no client consumes (skewing stats and
         // occupying router capacity during a migration cascade). Best-effort:
         // a failed directed subscribe is retried on the next migration trigger.
+        // #4534 diagnostics: record the directed-subscribe outcome so post-release
+        // telemetry can tell whether acted-on migrations actually host the
+        // contract. Timeout / infrastructure error fold into `failed`.
+        let placement_metrics = op_manager.ring.placement_migration_metrics();
         match outcome {
             DriverOutcome::Publish(Ok(_)) | DriverOutcome::SkipAlreadyDelivered => {
+                placement_metrics.record_acted_succeeded();
                 tracing::debug!(
                     tx = %directed_tx,
                     contract = %instance_id,
@@ -207,6 +212,7 @@ pub(crate) fn start_directed_subscribe(
                 );
             }
             DriverOutcome::Publish(Err(e)) => {
+                placement_metrics.record_acted_failed();
                 tracing::debug!(
                     tx = %directed_tx,
                     contract = %instance_id,
@@ -215,6 +221,7 @@ pub(crate) fn start_directed_subscribe(
                 );
             }
             DriverOutcome::InfrastructureError(err) => {
+                placement_metrics.record_acted_failed();
                 tracing::debug!(
                     tx = %directed_tx,
                     contract = %instance_id,

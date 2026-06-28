@@ -22,7 +22,7 @@ Driver entry points:
 | GET | `get/op_ctx_task.rs::start_client_get`, `start_relay_get`, `start_sub_op_get`, `start_targeted_sub_op_get` |
 | PUT | `put/op_ctx_task.rs::start_client_put`, `start_relay_put`, `start_relay_put_streaming` |
 | UPDATE | `update/op_ctx_task.rs::start_client_update`, `start_relay_request_update`, `start_relay_broadcast_to`, `start_relay_request_update_streaming`, `start_relay_broadcast_to_streaming` |
-| SUBSCRIBE | `subscribe/op_ctx_task.rs::start_client_subscribe`, `start_directed_subscribe` (SubscribeHint placement nudge, #4404 — the inbound-hint receive arm in `node.rs` now refuses it above the module-cache occupancy ceiling, `migration_admission_allowed`, #4534), `run_executor_subscribe`, `run_renewal_subscribe`, `start_relay_subscribe`; `subscribe.rs::handle_unsubscribe_inbound` for `Unsubscribe` |
+| SUBSCRIBE | `subscribe/op_ctx_task.rs::start_client_subscribe`, `start_directed_subscribe` (SubscribeHint placement nudge, #4404 — the inbound-hint receive arm in `node.rs` now refuses it above the module-cache INTERESTED-occupancy ceiling via `migration_admission_decision`, #4534), `run_executor_subscribe`, `run_renewal_subscribe`, `start_relay_subscribe`; `subscribe.rs::handle_unsubscribe_inbound` for `Unsubscribe` |
 
 The shared retry-loop driver lives in `op_ctx.rs` (`RetryDriver` trait
 + `drive_retry_loop`). UPDATE is fire-and-forget (no retry loop, no

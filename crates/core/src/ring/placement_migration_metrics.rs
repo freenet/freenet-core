@@ -8,10 +8,13 @@
 //! `router_snapshot` gauge cadence — no new per-message events:
 //!
 //! 1. [`PlacementMigrationMetrics`] — cumulative `AtomicU64` counters
-//!    (`sent` / `received` / `acted` / `renewal_terminus_satisfied`) incremented
-//!    at the migration sites and the renewal driver, read once per snapshot.
-//!    Lets us trend whether the migration is firing and at what rate, and how
-//!    often a subscription-root renewal short-circuits (#4440 proposal 1).
+//!    (`sent` / `received` / `acted` / `renewal_terminus_satisfied`, plus the
+//!    #4534 diagnostic breakdowns: per-gate refusal reasons and directed-
+//!    subscribe success/failure) incremented at the migration sites, the renewal
+//!    driver, and the SubscribeHint admission gates, read once per snapshot. Lets
+//!    us trend whether the migration is firing and at what rate, why inbound
+//!    hints are refused, whether acted migrations succeed, and how often a
+//!    subscription-root renewal short-circuits (#4440 proposal 1).
 //! 2. [`placement_quality`] — a pure function over this node's ring location and
 //!    the locations of the contracts it hosts. Produces the host-to-hosted-key
 //!    ring-distance distribution (median / p90 / fraction within 0.1 / min /
@@ -19,14 +22,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Three cumulative lifetime counters tracking placement-migration activity.
+/// Cumulative lifetime counters tracking placement-migration activity.
 ///
 /// Constructed once per node in `Ring::new` and shared via `Arc`: the migration
-/// SEND site (`p2p_protoc::migration::consider_contract_migration`) and the two
-/// RECEIVE sites (`node::process_message`) reach it through `op_manager.ring`,
-/// while `emit_router_snapshot_telemetry` reads it. Counters are monotonic
-/// lifetime totals — the collector differences them across the snapshot cadence
-/// to derive a rate. Cheap `Relaxed` atomics; never blocks.
+/// SEND site (`p2p_protoc::migration::consider_contract_migration`), the
+/// RECEIVE/admission-gate sites (`node::process_message`), and the directed-
+/// subscribe driver (`operations::subscribe::op_ctx_task`) reach it through
+/// `op_manager.ring`, while `emit_router_snapshot_telemetry` reads it. Counters
+/// are monotonic lifetime totals — the collector differences them across the
+/// snapshot cadence to derive a rate. Cheap `Relaxed` atomics; never blocks.
 #[derive(Debug, Default)]
 pub(crate) struct PlacementMigrationMetrics {
     /// Incremented each time this node dispatches a `SubscribeHint` nudge to a
@@ -46,6 +50,23 @@ pub(crate) struct PlacementMigrationMetrics {
     /// instead satisfies its renewal locally and sends no wire request; this
     /// counter trends how much renewal traffic that removes.
     renewal_terminus_satisfied: AtomicU64,
+    /// Per-gate refusal counters (#4534 diagnostics): which admission gate dropped
+    /// an inbound `SubscribeHint`. Each is incremented at the matching
+    /// `return Ok(())` in the SubscribeHint receive arm, so together they
+    /// partition `received - acted` by reason and let us see, post-release, why
+    /// hints are being refused (e.g. cache-admission vs already-hosting). Surfaced
+    /// only in the existing 5-min `router_snapshot` — no per-event volume.
+    received_refused_version_floor: AtomicU64,
+    received_refused_already_hosting: AtomicU64,
+    received_refused_holder_mismatch: AtomicU64,
+    received_refused_cache_admission: AtomicU64,
+    /// Directed-subscribe outcome counters (#4534 diagnostics): of the hints this
+    /// node ACTED on, how many directed subscribes completed vs failed
+    /// (timeout / infrastructure error folded into failed). Incremented in the
+    /// outcome match of `start_directed_subscribe`; lets us tell whether acted
+    /// migrations actually succeed in hosting the contract.
+    acted_succeeded: AtomicU64,
+    acted_failed: AtomicU64,
 }
 
 /// A point-in-time read of [`PlacementMigrationMetrics`] for telemetry emission.
@@ -55,6 +76,12 @@ pub(crate) struct PlacementMigrationSnapshot {
     pub received: u64,
     pub acted: u64,
     pub renewal_terminus_satisfied: u64,
+    pub received_refused_version_floor: u64,
+    pub received_refused_already_hosting: u64,
+    pub received_refused_holder_mismatch: u64,
+    pub received_refused_cache_admission: u64,
+    pub acted_succeeded: u64,
+    pub acted_failed: u64,
 }
 
 impl PlacementMigrationMetrics {
@@ -86,6 +113,52 @@ impl PlacementMigrationMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record that an inbound `SubscribeHint` was refused because this node's
+    /// version is below the SubscribeHint re-enable floor (#4534 diagnostics).
+    #[inline]
+    pub(crate) fn record_refused_version_floor(&self) {
+        self.received_refused_version_floor
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an inbound `SubscribeHint` was refused because this node
+    /// already hosts the contract (#4534 diagnostics).
+    #[inline]
+    pub(crate) fn record_refused_already_hosting(&self) {
+        self.received_refused_already_hosting
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an inbound `SubscribeHint` was refused because the hint's
+    /// holder is not the sender (#4534 diagnostics).
+    #[inline]
+    pub(crate) fn record_refused_holder_mismatch(&self) {
+        self.received_refused_holder_mismatch
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an inbound `SubscribeHint` was refused by the module-cache
+    /// admission gate (occupancy at/above the ceiling) (#4534 diagnostics).
+    #[inline]
+    pub(crate) fn record_refused_cache_admission(&self) {
+        self.received_refused_cache_admission
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an acted-on directed subscribe completed (now hosting) (#4534
+    /// diagnostics).
+    #[inline]
+    pub(crate) fn record_acted_succeeded(&self) {
+        self.acted_succeeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an acted-on directed subscribe failed (error / infra / timeout)
+    /// (#4534 diagnostics).
+    #[inline]
+    pub(crate) fn record_acted_failed(&self) {
+        self.acted_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read all counters for telemetry.
     pub(crate) fn snapshot(&self) -> PlacementMigrationSnapshot {
         PlacementMigrationSnapshot {
@@ -93,6 +166,20 @@ impl PlacementMigrationMetrics {
             received: self.received.load(Ordering::Relaxed),
             acted: self.acted.load(Ordering::Relaxed),
             renewal_terminus_satisfied: self.renewal_terminus_satisfied.load(Ordering::Relaxed),
+            received_refused_version_floor: self
+                .received_refused_version_floor
+                .load(Ordering::Relaxed),
+            received_refused_already_hosting: self
+                .received_refused_already_hosting
+                .load(Ordering::Relaxed),
+            received_refused_holder_mismatch: self
+                .received_refused_holder_mismatch
+                .load(Ordering::Relaxed),
+            received_refused_cache_admission: self
+                .received_refused_cache_admission
+                .load(Ordering::Relaxed),
+            acted_succeeded: self.acted_succeeded.load(Ordering::Relaxed),
+            acted_failed: self.acted_failed.load(Ordering::Relaxed),
         }
     }
 }
@@ -315,12 +402,46 @@ mod tests {
         );
     }
 
-    /// Source-pin the three migration counter sites so a refactor that drops a
+    /// The #4534 diagnostic counters (per-gate refusals + directed-subscribe
+    /// outcomes) each accumulate independently and surface in the snapshot.
+    #[test]
+    fn diagnostic_counters_increment_independently() {
+        let m = PlacementMigrationMetrics::default();
+        m.record_refused_version_floor();
+        m.record_refused_already_hosting();
+        m.record_refused_already_hosting();
+        m.record_refused_holder_mismatch();
+        m.record_refused_holder_mismatch();
+        m.record_refused_holder_mismatch();
+        m.record_refused_cache_admission();
+        m.record_acted_succeeded();
+        m.record_acted_failed();
+        m.record_acted_failed();
+
+        let s = m.snapshot();
+        assert_eq!(s.received_refused_version_floor, 1, "refused_version_floor");
+        assert_eq!(
+            s.received_refused_already_hosting, 2,
+            "refused_already_hosting"
+        );
+        assert_eq!(
+            s.received_refused_holder_mismatch, 3,
+            "refused_holder_mismatch"
+        );
+        assert_eq!(
+            s.received_refused_cache_admission, 1,
+            "refused_cache_admission"
+        );
+        assert_eq!(s.acted_succeeded, 1, "acted_succeeded");
+        assert_eq!(s.acted_failed, 2, "acted_failed");
+    }
+
+    /// Source-pin the migration counter sites so a refactor that drops a
     /// `record_*` call (or moves an `acted` increment onto a gated branch) fails
-    /// the build. The three sites live in different files and on different
-    /// control-flow branches, so an integration test would need a full multi-node
-    /// migration to exercise them; pinning the call sites in source is the cheap,
-    /// deterministic guard (same approach as
+    /// the build. The sites live in different files and on different control-flow
+    /// branches, so an integration test would need a full multi-node migration to
+    /// exercise them; pinning the call sites in source is the cheap, deterministic
+    /// guard (same approach as
     /// `refresh_router_records_health_on_startup_and_in_loop` in `ring.rs`).
     #[test]
     fn migration_counter_sites_present() {
@@ -375,6 +496,37 @@ mod tests {
             acted_at > act_log_at,
             "`record_acted()` must sit on the act branch (after the directed-subscribe \
              log), so gated/dropped hints are not counted as acted"
+        );
+
+        // REFUSAL breakdown (#4534 diagnostics): each per-gate refusal counter is
+        // incremented exactly once, at its matching `return Ok(())` in the arm.
+        for method in [
+            ".record_refused_version_floor()",
+            ".record_refused_already_hosting()",
+            ".record_refused_holder_mismatch()",
+            ".record_refused_cache_admission()",
+        ] {
+            assert_eq!(
+                arm.matches(method).count(),
+                1,
+                "the SubscribeHint arm must call `{method}` exactly once (at its refusal gate)"
+            );
+        }
+
+        // DIRECTED-SUBSCRIBE OUTCOME breakdown (#4534 diagnostics): the outcome
+        // match in `start_directed_subscribe` records success once and failure on
+        // BOTH the Publish(Err) and InfrastructureError arms.
+        let directed_src = include_str!("../operations/subscribe/op_ctx_task.rs");
+        assert_eq!(
+            directed_src.matches(".record_acted_succeeded()").count(),
+            1,
+            "start_directed_subscribe must record `acted_succeeded` exactly once"
+        );
+        assert_eq!(
+            directed_src.matches(".record_acted_failed()").count(),
+            2,
+            "start_directed_subscribe must record `acted_failed` on BOTH the error \
+             and infrastructure-error outcome arms"
         );
     }
 }
