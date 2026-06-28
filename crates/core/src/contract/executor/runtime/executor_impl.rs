@@ -1060,6 +1060,25 @@ where
         &mut self,
         key: ContractKey,
     ) -> Result<StateSummary<'static>, ExecutorError> {
+        // Fast path (the hot path on a busy node — tens/sec over MB-scale
+        // states): if the state store holds a cheap change-detector hash for
+        // this contract's CURRENT state AND we already have a summary cached
+        // against that exact hash, return it WITHOUT loading the full state,
+        // hashing it, or running the WASM `summarize_state`. The detector hash is
+        // invalidated by every state write and (re)populated only from a
+        // freshly-loaded state (see `StateStore::state_hash_cache`), so a hit
+        // proves the state is byte-identical to the one that produced the cached
+        // summary — the summary is therefore fresh, never stale.
+        if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
+            if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
+                if *cached_hash == detector_hash {
+                    return Ok(cached_summary.clone());
+                }
+            }
+        }
+
+        // Slow path: state changed, never summarized, or detector cold (after
+        // restart / eviction). Load the state and recompute as before.
         let (state, _) = self.bridged_fetch_contract(key, false).await?;
 
         let state = state.ok_or_else(|| {
@@ -1069,14 +1088,17 @@ where
             })
         })?;
 
-        // Check summary cache: if state hash matches, return cached summary
-        let state_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            state.as_ref().hash(&mut hasher);
-            hasher.finish()
-        };
+        let state_hash = crate::wasm_runtime::state_hash(&state);
 
+        // Repopulate the change-detector so the NEXT summarize of an unchanged
+        // state takes the fast path. Safe under the serialized contract loop: no
+        // write can interleave between the load above and here, so this hash
+        // matches the state currently on disk.
+        self.state_store.cache_state_hash(key, state_hash);
+
+        // The summary may already be cached under this exact hash even when the
+        // detector was cold (the summary cache is per-executor; the detector is
+        // shared). Reuse it to skip the WASM call.
         if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
             if *cached_hash == state_hash {
                 return Ok(cached_summary.clone());
@@ -1109,6 +1131,33 @@ where
         key: ContractKey,
         their_summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ExecutorError> {
+        // Hash the peer's summary up front — it's a small digest, so this is
+        // cheap (unlike the full state). Only the STATE component of the cache
+        // key gets the cheap change-detector treatment below.
+        let summary_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            their_summary.as_ref().hash(&mut h);
+            h.finish()
+        };
+
+        // Fast path: this runs per-subscriber during broadcast fan-out, so it is
+        // potentially even hotter than summarize. If the state store holds a
+        // change-detector hash for this contract's CURRENT state AND we already
+        // cached the delta for that exact (state, their_summary) pair, return it
+        // WITHOUT loading or hashing the full state, or running the WASM
+        // `get_state_delta`. The detector guarantees the state is unchanged, so a
+        // cached delta computed against the same peer-summary is fresh — a stale
+        // delta would diverge the peer just like a stale summary.
+        if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
+            let cache_key = (key, detector_hash, summary_hash);
+            if let Some(cached_delta) = self.delta_cache.get(&cache_key) {
+                return Ok(cached_delta.clone());
+            }
+        }
+
+        // Slow path: state changed, this peer-summary not seen for the current
+        // state, or detector cold. Load the state and recompute as before.
         let (state, _) = self.bridged_fetch_contract(key, false).await?;
 
         let state = state.ok_or_else(|| {
@@ -1118,15 +1167,12 @@ where
             })
         })?;
 
-        // Check delta cache: if (state_hash, their_summary_hash) matches, return cached delta
-        let (state_hash, summary_hash) = {
-            use std::hash::{Hash, Hasher};
-            let mut h1 = std::collections::hash_map::DefaultHasher::new();
-            state.as_ref().hash(&mut h1);
-            let mut h2 = std::collections::hash_map::DefaultHasher::new();
-            their_summary.as_ref().hash(&mut h2);
-            (h1.finish(), h2.finish())
-        };
+        let state_hash = crate::wasm_runtime::state_hash(&state);
+
+        // Repopulate the change-detector so the next delta/summarize of an
+        // unchanged state takes the fast path. Safe under the serialized contract
+        // loop (see `bridged_summarize_contract_state`).
+        self.state_store.cache_state_hash(key, state_hash);
 
         let cache_key = (key, state_hash, summary_hash);
         if let Some(cached_delta) = self.delta_cache.get(&cache_key) {
