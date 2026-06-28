@@ -249,6 +249,12 @@ jobs:
       - name: Rule #6 linter self-test
         run: python3 .github/scripts/check_blocking_sends.py --self-test
 
+      # Self-test the rules #1/#2/#3 linter (cfg-test-aware banned-pattern
+      # checker). Exercises prod-code violations (must flag) and test-scoped
+      # uses (must NOT flag, including the #4616 moved-test-module case).
+      - name: Rules #1/#2/#3 linter self-test
+        run: python3 .github/scripts/check_banned_patterns.py --self-test
+
       - name: Check for banned patterns in new code
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -256,35 +262,22 @@ jobs:
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
 
-          # Get added lines in crates/core/ .rs files only (line starts with +, skip +++ headers)
-          ADDED=$(git diff "$BASE"..."$HEAD" -- 'crates/core/src/**/*.rs' \
-            | grep '^+' | grep -v '^+++' || true)
-
           ERRORS=""
 
-          # Strip Rust line comments before matching — avoids false positives from
-          # "// don't use std::time::Instant::now()" style comments and TODOs.
-          STRIPPED=$(echo "$ADDED" | sed 's|//.*||' || true)
-
-          # 1. std::time::Instant::now() — must use TimeSource
-          if echo "$STRIPPED" | grep -qE 'std::time::Instant::now\(\)'; then
+          # 1/2/3. std::time::Instant::now(), rand::thread_rng()/rand::random(),
+          # tokio::net::UdpSocket — must use TimeSource / GlobalRng / Socket trait.
+          # Implemented as a Python linter (check_banned_patterns.py) so it can
+          # resolve each flagged line to its position in the HEAD file and check
+          # whether the line is inside a #[cfg(test)]-gated scope. Test-scoped uses
+          # are EXEMPT (tests legitimately use real clocks/RNG/sockets). Production
+          # enforcement is UNCHANGED — a non-test line that adds any of the banned
+          # patterns is still a hard failure. The linter has its own --self-test
+          # (run as the "Rules #1/#2/#3 linter self-test" step above).
+          # See .github/scripts/check_banned_patterns.py and
+          # .claude/rules/testing.md for details.
+          if ! BANNED_OUT=$(python3 .github/scripts/check_banned_patterns.py "$BASE" "$HEAD"); then
             ERRORS="$ERRORS
-          ERROR: std::time::Instant::now() used in crates/core/ — use TimeSource trait instead
-          $(echo "$ADDED" | grep -n 'std::time::Instant::now()')"
-          fi
-
-          # 2. rand::thread_rng() or rand::random() — must use GlobalRng
-          if echo "$STRIPPED" | grep -qE 'rand::(thread_rng|random)\(\)'; then
-            ERRORS="$ERRORS
-          ERROR: rand::thread_rng()/rand::random() used in crates/core/ — use GlobalRng instead
-          $(echo "$ADDED" | grep -nE 'rand::(thread_rng|random)\(\)')"
-          fi
-
-          # 3. tokio::net::UdpSocket — must use Socket trait
-          if echo "$STRIPPED" | grep -qE 'tokio::net::UdpSocket'; then
-            ERRORS="$ERRORS
-          ERROR: tokio::net::UdpSocket used in crates/core/ — use Socket trait instead
-          $(echo "$ADDED" | grep -n 'tokio::net::UdpSocket')"
+          $BANNED_OUT"
           fi
 
           # 6. Blocking .send(...).await on an event-loop-reachable bounded
