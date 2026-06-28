@@ -139,6 +139,83 @@ pub fn enable_fast_crash_exit_code() {
     EMIT_FAST_CRASH_EXIT_CODE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// When `true`, the contract storage layer (redb) reacting to a *poisoned*
+/// database — one left unusable by a transient underlying I/O error — exits the
+/// process so a supervisor restart hands the node a fresh, un-poisoned database
+/// handle (#4604). Off by default so simulation / integration tests and library
+/// embedders never have a storage error kill their host process; only the real
+/// `freenet` binary opts in via [`enable_abort_on_redb_poison`].
+static ABORT_ON_REDB_POISON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Process-start instant, captured the first time [`enable_abort_on_redb_poison`]
+/// is called (at node entry). Used to pick the poison exit code: a poison that
+/// occurs within [`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`] of start is treated as a
+/// *fast crash* so a node whose database re-poisons on every boot (persistent
+/// disk / RAM corruption) is bounded by the supervisor's crash-loop protection
+/// instead of restart-looping forever (#4604, #4591, #4588).
+static REDB_POISON_PROCESS_START: std::sync::OnceLock<std::time::Instant> =
+    std::sync::OnceLock::new();
+
+/// Enable the #4604 redb-poison fast-exit. Once the contract storage layer detects
+/// that the redb database is poisoned (a transient I/O error left redb returning
+/// "Previous I/O error occurred. Please close and re-open the database." from every
+/// transaction), the process exits so the service manager restarts it with a fresh
+/// handle and the health / auto-update hooks fire — instead of the node staying
+/// "running" while 100% of contract operations fail forever. Call once from the
+/// production node entry point. See [`ABORT_ON_REDB_POISON`].
+pub fn enable_abort_on_redb_poison() {
+    REDB_POISON_PROCESS_START.get_or_init(std::time::Instant::now);
+    ABORT_ON_REDB_POISON.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// React to a detected redb poison (#4604): exit the process so a supervised
+/// restart gives the node a fresh database handle. No-op when the fast-exit is not
+/// enabled (tests / embedders), so the caller simply propagates the underlying
+/// error as before.
+///
+/// The exit code reuses the SAME [`fatal_listener_exit_code`] decision as the
+/// #4549 / #4551 fatal-listener path, so the poison exit integrates with the
+/// existing crash-loop protection without adding a second policy:
+/// - poison after a healthy uptime (>= [`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`]) →
+///   [`FATAL_LISTENER_EXIT_CODE`] (42): burst-exempt, fires the `freenet update`
+///   self-heal hook. A genuinely transient I/O blip (the #4604 case: a node that
+///   ran healthily for hours) restarts cleanly without tripping `StartLimitBurst`.
+/// - poison within the healthy-uptime window, when the supervisor understands it →
+///   [`FAST_CRASH_EXIT_CODE`] (45): a *counted* failure. A database that re-poisons
+///   on every boot (persistent corruption) trips `StartLimitBurst` and is counted
+///   by the #4591 auto-rollback probation, so the unit is stopped / rolled back
+///   instead of looping forever.
+pub(crate) fn abort_process_on_redb_poison(reason: &str) {
+    if !ABORT_ON_REDB_POISON.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let uptime = REDB_POISON_PROCESS_START
+        .get()
+        .map(std::time::Instant::elapsed)
+        .unwrap_or_default();
+    let exit_code = fatal_listener_exit_code(
+        uptime,
+        EMIT_FAST_CRASH_EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    eprintln!(
+        "CRITICAL: contract storage (redb) is poisoned by an I/O error and cannot \
+         recover in-process: {reason}. Exiting with code {exit_code} so the service \
+         manager restarts the node with a fresh database handle (#4604)."
+    );
+    tracing::error!(
+        error = %reason,
+        exit_code,
+        uptime_secs = uptime.as_secs(),
+        fast_crash = exit_code == FAST_CRASH_EXIT_CODE,
+        "redb storage poisoned; forcing process exit for a supervised restart with a \
+         fresh database handle (#4604). A persistent-corruption re-poison within the \
+         healthy-uptime window exits with the counted fast-crash code so the \
+         crash-loop protection bounds the restart loop instead of looping forever."
+    );
+    std::process::exit(exit_code);
+}
+
 /// When `true`, a fatal (non-graceful) exit of the network event listener aborts
 /// the whole process with [`FATAL_LISTENER_EXIT_CODE`] instead of unwinding through
 /// the normal teardown/return path (#4549).
@@ -1051,6 +1128,54 @@ mod tests {
         assert_eq!(
             fatal_listener_exit_code(MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT, false),
             FATAL_LISTENER_EXIT_CODE,
+        );
+    }
+
+    /// #4604: the redb-poison fast-exit reuses [`fatal_listener_exit_code`], so it
+    /// inherits the crash-loop protection exactly:
+    /// - A poison after a *healthy* uptime exits 42 (burst-exempt, fires the
+    ///   auto-update hook): a one-off transient I/O blip restarts cleanly.
+    /// - A poison *within* the healthy window, under a supervisor that understands
+    ///   it, exits the COUNTED code 45 — so a database that re-poisons on every boot
+    ///   (persistent disk / RAM corruption) trips `StartLimitBurst` and the #4591
+    ///   auto-rollback probation count, bounding the restart loop instead of looping
+    ///   forever. This is the interaction required by issue #4604.
+    #[test]
+    fn redb_poison_exit_reuses_crash_loop_bounded_codes() {
+        // Persistent corruption that re-poisons immediately on boot → counted code
+        // so the supervisor's crash-loop protection eventually stops / rolls back.
+        for secs in [0u64, 1, 30, 59] {
+            assert_eq!(
+                fatal_listener_exit_code(Duration::from_secs(secs), true),
+                FAST_CRASH_EXIT_CODE,
+                "a redb re-poison {secs}s after boot must use the COUNTED fast-crash \
+                 code so a corrupt node does not restart-loop forever (#4604/#4591)"
+            );
+        }
+        // A genuinely transient poison after a healthy run → burst-exempt update
+        // code so the restart self-heals and is never rate-limited.
+        assert_eq!(
+            fatal_listener_exit_code(MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT, true),
+            FATAL_LISTENER_EXIT_CODE,
+            "a transient poison after a healthy uptime restarts via the burst-exempt \
+             update code (the #4604 real-world case: ran healthily for hours)"
+        );
+        // Both codes are ones the supervisor already handles (declared in the
+        // generated systemd unit), so no new exit-code contract is introduced.
+        assert_eq!(FATAL_LISTENER_EXIT_CODE, 42);
+        assert_eq!(FAST_CRASH_EXIT_CODE, 45);
+    }
+
+    /// The redb-poison fast-exit must be OFF by default so simulation / integration
+    /// tests and library embedders never have a storage error kill their process.
+    /// Only the real binary opts in via [`enable_abort_on_redb_poison`].
+    #[test]
+    fn redb_poison_abort_is_opt_in() {
+        // NOTE: deliberately does NOT call `enable_abort_on_redb_poison()` (a
+        // process-global flip would affect other tests in the same binary).
+        assert!(
+            !ABORT_ON_REDB_POISON.load(std::sync::atomic::Ordering::Relaxed),
+            "redb-poison fast-exit must be opt-in (off unless the binary enables it)"
         );
     }
 
