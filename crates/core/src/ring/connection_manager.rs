@@ -54,6 +54,23 @@ const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 /// score is too noisy to be useful.
 const KLEINBERG_FILTER_MIN_CONNECTIONS: usize = 3;
 
+/// Fraction of `max_connections` reserved as a small, TRANSIENT over-capacity
+/// headroom for accepting bootstrap joiners that have exhausted every normal
+/// acceptor (terminus + at-capacity + uphill-exhausted). See
+/// [`ConnectionManager::should_accept_bootstrap_reserve`] and issue #4362.
+///
+/// The reserve is intentionally small: it only has to break the cold-start
+/// dead zone (saturated gateways terminus-reject joiners with nowhere left to
+/// go), not raise the steady-state connection ceiling. The over-commit is made
+/// temporary by the over-capacity topology prune (`adjust_topology` returns
+/// `RemoveConnections` whenever `connection_count > max_connections`), which
+/// settles the node back to `<= max_connections`.
+///
+/// Derived (never hardcoded) per the ring.md "thresholds must derive from
+/// configuration" rule: `BOOTSTRAP_RESERVE = max(1, round(max_connections *
+/// BOOTSTRAP_RESERVE_FRACTION))`.
+const BOOTSTRAP_RESERVE_FRACTION: f64 = 0.1;
+
 /// Maximum number of concurrent CONNECT operations a gateway will route simultaneously.
 /// This prevents thundering-herd scenarios where many joiners hit the same gateway at once.
 /// The value 8 balances throughput (parallel joins) against overload protection. Non-gateways
@@ -703,6 +720,164 @@ impl ConnectionManager {
         accepted
     }
 
+    /// Size of the transient over-capacity bootstrap reserve, derived from
+    /// `max_connections` (see [`BOOTSTRAP_RESERVE_FRACTION`]). Always at least 1
+    /// so the reserve is meaningful even for very small `max_connections`.
+    pub(crate) fn bootstrap_reserve(&self) -> usize {
+        ((self.max_connections as f64 * BOOTSTRAP_RESERVE_FRACTION).round() as usize).max(1)
+    }
+
+    /// Last-resort acceptance for a bootstrap joiner that has exhausted every
+    /// normal acceptor (it reached a terminus that is at capacity AND uphill
+    /// routing is exhausted — see `connect.rs::RelayState::handle_request`).
+    ///
+    /// Instead of rejecting such a joiner (which, when its whole reachable
+    /// neighborhood is saturated during cold start, dead-ends the join and
+    /// produces the #4362 acceptance collapse), accept it into a small,
+    /// TRANSIENT over-capacity reserve: up to `max_connections +
+    /// bootstrap_reserve()` total (open + reserved).
+    ///
+    /// This mirrors the speculative-state discipline of [`Self::should_accept`]:
+    /// the same self / already-connected guards apply, the same
+    /// `pending_reservations` + `record_pending_location` machinery reserves the
+    /// spot (so the ring.md cross-map cleanup invariant is preserved), and the
+    /// joiner is tagged `transient` so (a) the promotion-path resource caps know
+    /// this connection is allowed to use the reserve headroom and (b) it is
+    /// bounded by the transient TTL/budget if the handshake never completes.
+    ///
+    /// Deterministic: NO RNG (unlike `should_accept`'s sliding Kleinberg floor).
+    /// The blocklist guard lives one layer up in
+    /// `connect.rs::RelayEnv::should_accept_bootstrap_reserve`, alongside the
+    /// blocklist guard for the normal accept path.
+    pub fn should_accept_bootstrap_reserve(&self, location: Location, addr: SocketAddr) -> bool {
+        // Don't accept connections from ourselves.
+        if let Some(own_addr) = self.get_own_addr() {
+            if own_addr == addr {
+                tracing::warn!(
+                    addr = %addr,
+                    peer_location = %location,
+                    "should_accept_bootstrap_reserve: rejecting self-connection attempt"
+                );
+                return false;
+            }
+        }
+
+        // Already connected or pending with this peer: reject so the CONNECT
+        // keeps routing to discover new peers (same rationale as should_accept).
+        if self.location_for_peer.read().get(&addr).is_some() {
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                "should_accept_bootstrap_reserve: peer already pending/connected; rejecting"
+            );
+            return false;
+        }
+
+        let open = self.connection_count();
+        let now = Instant::now();
+        let reserved_before = self
+            .pending_reservations
+            .read()
+            .iter()
+            .filter(|(_, (_, created))| now.duration_since(*created) <= PENDING_RESERVATION_TTL)
+            .count();
+
+        let reserve = self.bootstrap_reserve();
+        let ceiling = self.max_connections.saturating_add(reserve);
+        // Use the speculative total (open + live reservations) for the
+        // over-commit guard, exactly as should_accept does for max_connections.
+        let total_conn = match reserved_before
+            .checked_add(1)
+            .and_then(|v| v.checked_add(open))
+        {
+            Some(val) => val,
+            None => {
+                tracing::error!(
+                    addr = %addr,
+                    peer_location = %location,
+                    reserved_before,
+                    open,
+                    "should_accept_bootstrap_reserve: connection counters would overflow; rejecting"
+                );
+                return false;
+            }
+        };
+        if total_conn > ceiling {
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                open,
+                reserved_before,
+                ceiling,
+                "should_accept_bootstrap_reserve: reserve exhausted; rejecting"
+            );
+            return false;
+        }
+
+        // Tag the peer transient FIRST. The transient tag (plus the pending
+        // reservation below) is the signal the promotion-path caps use to grant
+        // the reserve headroom, and the transient TTL/budget bounds the
+        // over-commit. If the transient budget is exhausted, decline the reserve
+        // rather than leave a reservation that could never claim the headroom at
+        // promotion. (transient_budget defaults to 2048, so this is not a
+        // practical limit; it just keeps the bookkeeping honest.)
+        if !self.try_register_transient(addr, Some(location)) {
+            tracing::debug!(
+                addr = %addr,
+                peer_location = %location,
+                "should_accept_bootstrap_reserve: transient budget exhausted; declining"
+            );
+            return false;
+        }
+        // Reserve the over-cap spot using the SAME machinery as should_accept
+        // (pending_reservations + record_pending_location) so the ring.md
+        // cross-map cleanup invariant continues to hold.
+        {
+            let mut pending = self.pending_reservations.write();
+            pending.insert(addr, (location, Instant::now()));
+        }
+        self.record_pending_location(addr, location);
+        tracing::info!(
+            addr = %addr,
+            peer_location = %location,
+            open,
+            reserved_before,
+            ceiling,
+            "should_accept_bootstrap_reserve: accepting into transient over-cap reserve (#4362)"
+        );
+        true
+    }
+
+    /// Whether a live (non-stale) pending reservation exists for `addr`.
+    ///
+    /// Used by the promotion paths to recognise a bootstrap-reserve admission
+    /// (transient tag + pending reservation) so the resource cap grants the
+    /// reserve headroom only to genuine reserve accepts, not to ordinary
+    /// unsolicited transient connections.
+    pub(crate) fn has_pending_reservation(&self, addr: SocketAddr) -> bool {
+        let now = Instant::now();
+        self.pending_reservations
+            .read()
+            .get(&addr)
+            .is_some_and(|(_, created)| now.duration_since(*created) <= PENDING_RESERVATION_TTL)
+    }
+
+    /// Compute the connection-count ceiling for a promotion of `addr`.
+    ///
+    /// Returns `max_connections + bootstrap_reserve()` when `allow_reserve` is
+    /// set (the caller has determined this is a bootstrap-reserve admission —
+    /// see [`Self::should_accept_bootstrap_reserve`]), otherwise the plain
+    /// `max_connections`. Centralises the reserve-aware cap so the three
+    /// promotion sites stay consistent.
+    pub(crate) fn promotion_cap(&self, allow_reserve: bool) -> usize {
+        if allow_reserve {
+            self.max_connections
+                .saturating_add(self.bootstrap_reserve())
+        } else {
+            self.max_connections
+        }
+    }
+
     /// Compute the Kleinberg gap score for a candidate connection.
     ///
     /// Measures how much the candidate improves the 1/d distance distribution by
@@ -1135,11 +1310,13 @@ impl ConnectionManager {
         addr: SocketAddr,
         pub_key: TransportPublicKey,
         was_reserved: bool,
+        allow_reserve: bool,
     ) -> bool {
         tracing::info!(
             addr = %addr,
             peer_location = %loc,
             was_reserved = %was_reserved,
+            allow_reserve = %allow_reserve,
             "Adding connection to ring topology"
         );
         // Verify we're not adding a connection to ourselves (if we know our own address)
@@ -1152,11 +1329,18 @@ impl ConnectionManager {
         drop(lop);
 
         // Enforce the global cap when adding a new peer (relocations reuse the existing slot).
-        if previous_location.is_none() && self.connection_count() >= self.max_connections {
+        // Bootstrap-reserve admissions (`allow_reserve`) may use the small
+        // transient over-capacity headroom (#4362); everything else is capped at
+        // max_connections. The over-commit is pruned back by the over-capacity
+        // topology path (`adjust_topology` -> RemoveConnections when over max).
+        let cap = self.promotion_cap(allow_reserve);
+        if previous_location.is_none() && self.connection_count() >= cap {
             tracing::warn!(
                 addr = %addr,
                 peer_location = %loc,
                 max = self.max_connections,
+                cap,
+                allow_reserve,
                 "add_connection: rejecting new connection to enforce cap"
             );
             // Roll back bookkeeping since we're refusing the connection.
@@ -2087,7 +2271,7 @@ mod tests {
         for i in 0..KLEINBERG_FILTER_MIN_CONNECTIONS {
             let addr = make_addr(8001 + i as u16);
             let loc = Location::new(0.05 * (i + 1) as f64);
-            cm.add_connection(loc, addr, keypair.public().clone(), true);
+            cm.add_connection(loc, addr, keypair.public().clone(), true, false);
         }
         assert_eq!(cm.connection_count(), 3);
 
@@ -2110,7 +2294,7 @@ mod tests {
         for i in 3..9 {
             let addr = make_addr(8001 + i as u16);
             let loc = Location::new(0.05 * (i + 1) as f64);
-            cm.add_connection(loc, addr, keypair.public().clone(), true);
+            cm.add_connection(loc, addr, keypair.public().clone(), true, false);
         }
         assert_eq!(cm.connection_count(), 9);
 
@@ -2159,7 +2343,7 @@ mod tests {
         for i in 0..2 {
             let addr = make_addr(8001 + i as u16);
             let loc = Location::new(0.1 * (i + 1) as f64);
-            cm.add_connection(loc, addr, keypair.public().clone(), true);
+            cm.add_connection(loc, addr, keypair.public().clone(), true, false);
         }
 
         // With open=2 < KLEINBERG_FILTER_MIN_CONNECTIONS=3, should unconditionally accept
@@ -2180,24 +2364,162 @@ mod tests {
         let addr1 = make_addr(8001);
         let loc1 = Location::new(0.1);
         assert!(cm.should_accept(loc1, addr1));
-        cm.add_connection(loc1, addr1, keypair.public().clone(), true);
+        cm.add_connection(loc1, addr1, keypair.public().clone(), true, false);
 
         // Accept and add second connection (open=2, next attempt: 0+1+2=3 < 4)
         let addr2 = make_addr(8002);
         let loc2 = Location::new(0.2);
         assert!(cm.should_accept(loc2, addr2));
-        cm.add_connection(loc2, addr2, keypair.public().clone(), true);
+        cm.add_connection(loc2, addr2, keypair.public().clone(), true, false);
 
         // Accept and add third connection (open=3, next attempt: 0+1+3=4 >= 4)
         let addr3 = make_addr(8003);
         let loc3 = Location::new(0.3);
         assert!(cm.should_accept(loc3, addr3));
-        cm.add_connection(loc3, addr3, keypair.public().clone(), true);
+        cm.add_connection(loc3, addr3, keypair.public().clone(), true, false);
 
         // Fourth connection should be rejected (open=3, total_conn=4 >= max=4)
         let addr4 = make_addr(8004);
         let loc4 = Location::new(0.4);
         assert!(!cm.should_accept(loc4, addr4));
+    }
+
+    // ============ bootstrap over-capacity reserve tests (#4362) ============
+
+    /// Fill `cm` to exactly `count` open ring connections, returning the addrs.
+    fn fill_connections(cm: &ConnectionManager, count: usize) -> Vec<SocketAddr> {
+        let keypair = TransportKeypair::new();
+        let mut addrs = Vec::new();
+        for i in 0..count {
+            let addr = make_addr(9000 + i as u16);
+            let loc = Location::new((i as f64 + 0.5) / (count as f64 + 1.0));
+            assert!(
+                cm.add_connection(loc, addr, keypair.public().clone(), false, false),
+                "setup: add_connection {i} should succeed under cap"
+            );
+            addrs.push(addr);
+        }
+        assert_eq!(cm.connection_count(), count);
+        addrs
+    }
+
+    #[test]
+    fn test_bootstrap_reserve_value_derives_from_max() {
+        // round(max * 0.1), at least 1.
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, true);
+        assert_eq!(cm.bootstrap_reserve(), 1); // round(1.0)
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 50, true);
+        assert_eq!(cm.bootstrap_reserve(), 5); // round(5.0)
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 4, true);
+        assert_eq!(cm.bootstrap_reserve(), 1); // max(1, round(0.4)=0)
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 12, true);
+        assert_eq!(cm.bootstrap_reserve(), 1); // round(1.2)
+    }
+
+    #[test]
+    fn test_promotion_cap_reserve_aware() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 12, true);
+        assert_eq!(cm.promotion_cap(false), 12);
+        assert_eq!(cm.promotion_cap(true), 12 + cm.bootstrap_reserve());
+    }
+
+    #[test]
+    fn test_bootstrap_reserve_accepts_at_max_with_free_reserve() {
+        // At max, the normal accept path rejects but the reserve accepts.
+        let cm = make_connection_manager(Some(make_addr(8000)), 4, 10, true);
+        let _ = fill_connections(&cm, 10);
+        assert_eq!(cm.bootstrap_reserve(), 1);
+
+        let addr = make_addr(9500);
+        let loc = Location::new(0.42);
+        // Normal acceptance is refused (total_conn = 0 + 1 + 10 >= max).
+        assert!(!cm.should_accept(loc, addr));
+        // Reserve acceptance succeeds (ceiling = max + reserve = 11; total = 11).
+        assert!(cm.should_accept_bootstrap_reserve(loc, addr));
+        // It reserved the spot and tagged the peer transient.
+        assert!(cm.has_pending_reservation(addr));
+        assert!(cm.is_transient(addr));
+    }
+
+    #[test]
+    fn test_bootstrap_reserve_rejects_when_reserve_exhausted() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 4, 10, true);
+        let _ = fill_connections(&cm, 10);
+        assert_eq!(cm.bootstrap_reserve(), 1);
+
+        // First reserve accept consumes the single reserve slot.
+        let addr1 = make_addr(9600);
+        assert!(cm.should_accept_bootstrap_reserve(Location::new(0.31), addr1));
+
+        // Second reserve accept: open=10, reserved_before=1, total=12 > ceiling 11.
+        let addr2 = make_addr(9601);
+        assert!(!cm.should_accept_bootstrap_reserve(Location::new(0.32), addr2));
+        assert!(!cm.has_pending_reservation(addr2));
+        assert!(!cm.is_transient(addr2));
+    }
+
+    #[test]
+    fn test_bootstrap_reserve_rejects_self_and_duplicate() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 4, 10, true);
+        let _ = fill_connections(&cm, 10);
+
+        // Self-connection: always refused.
+        assert!(!cm.should_accept_bootstrap_reserve(Location::new(0.5), make_addr(8000)));
+
+        // Already-connected / pending peer: refused so CONNECT keeps routing.
+        let keypair = TransportKeypair::new();
+        let dup = make_addr(9700);
+        cm.add_connection(
+            Location::new(0.22),
+            dup,
+            keypair.public().clone(),
+            false,
+            true,
+        );
+        assert!(!cm.should_accept_bootstrap_reserve(Location::new(0.22), dup));
+    }
+
+    #[test]
+    fn test_bootstrap_reserve_is_deterministic_at_boundary() {
+        // The reserve decision is a pure function of connection counts (no RNG):
+        // two managers in identical state must reach identical verdicts, and the
+        // boundary (total == ceiling accept, total == ceiling + 1 reject) is exact.
+        for _ in 0..8 {
+            let cm = make_connection_manager(Some(make_addr(8000)), 4, 10, true);
+            let _ = fill_connections(&cm, 10); // open == max == 10, reserve == 1
+            let addr = make_addr(9800);
+            // total = 0 + 1 + 10 == 11 == ceiling -> accept, every time.
+            assert!(cm.should_accept_bootstrap_reserve(Location::new(0.4), addr));
+        }
+    }
+
+    #[test]
+    fn test_add_connection_respects_reserve_flag() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 4, 10, true);
+        let keypair = TransportKeypair::new();
+        let _ = fill_connections(&cm, 10);
+
+        // Over-cap promotion WITHOUT the reserve flag is refused.
+        let addr = make_addr(9900);
+        let loc = Location::new(0.37);
+        assert!(!cm.add_connection(loc, addr, keypair.public().clone(), false, false));
+        assert_eq!(cm.connection_count(), 10);
+
+        // WITH the reserve flag it is admitted into the +1 headroom.
+        assert!(cm.add_connection(loc, addr, keypair.public().clone(), false, true));
+        assert_eq!(cm.connection_count(), 11);
+
+        // The reserve is now exhausted: a further over-cap promotion is refused
+        // even with the reserve flag (cap = max + reserve = 11, count = 11).
+        let addr2 = make_addr(9901);
+        assert!(!cm.add_connection(
+            Location::new(0.38),
+            addr2,
+            keypair.public().clone(),
+            false,
+            true
+        ));
+        assert_eq!(cm.connection_count(), 11);
     }
 
     #[test]
@@ -2210,7 +2532,7 @@ mod tests {
 
         // Accept and add connection
         assert!(cm.should_accept(loc, addr));
-        cm.add_connection(loc, addr, keypair.public().clone(), true);
+        cm.add_connection(loc, addr, keypair.public().clone(), true, false);
 
         // Same peer should return false — reject to route uphill for diversity
         assert!(!cm.should_accept(loc, addr));
@@ -2227,7 +2549,7 @@ mod tests {
         let loc = Location::new(0.5);
 
         assert_eq!(cm.connection_count(), 0);
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        cm.add_connection(loc, addr, keypair.public().clone(), false, false);
         assert_eq!(cm.connection_count(), 1);
     }
 
@@ -2239,7 +2561,7 @@ mod tests {
         let addr = make_addr(8001);
         let loc = Location::new(0.5);
 
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        cm.add_connection(loc, addr, keypair.public().clone(), false, false);
         assert_eq!(cm.connection_count(), 1);
 
         let pruned_loc = cm.prune_alive_connection(addr);
@@ -2545,7 +2867,7 @@ mod tests {
         let loc = Location::new(0.5);
 
         // Add initial connection
-        cm.add_connection(loc, old_addr, keypair.public().clone(), false);
+        cm.add_connection(loc, old_addr, keypair.public().clone(), false, false);
         assert_eq!(cm.connection_count(), 1);
 
         // Update peer identity
@@ -2567,7 +2889,7 @@ mod tests {
         let addr = make_addr(8001);
         let loc = Location::new(0.5);
 
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        cm.add_connection(loc, addr, keypair.public().clone(), false, false);
 
         // Same address should return false
         let updated = cm.update_peer_identity(addr, addr, keypair.public().clone());
@@ -2597,7 +2919,7 @@ mod tests {
         let loc = Location::new(0.5);
 
         // Add connection (this sets connected_since and init_peer)
-        cm.add_connection(loc, old_addr, keypair.public().clone(), false);
+        cm.add_connection(loc, old_addr, keypair.public().clone(), false, false);
 
         // Record some health events on old address
         cm.peer_health.lock().record_success(old_addr);
@@ -2666,7 +2988,7 @@ mod tests {
         // Add a connection
         let addr = make_addr(8001);
         let loc = Location::new(0.5);
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        cm.add_connection(loc, addr, keypair.public().clone(), false, false);
 
         let empty_set: HashSet<SocketAddr> = HashSet::new();
         let result = cm.routing(Location::new(0.5), None, &empty_set, &router);
@@ -2681,7 +3003,7 @@ mod tests {
 
         let addr = make_addr(8001);
         let loc = Location::new(0.5);
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        cm.add_connection(loc, addr, keypair.public().clone(), false, false);
 
         // Request from the same address should not route back to itself
         let empty_set: HashSet<SocketAddr> = HashSet::new();
@@ -2697,7 +3019,7 @@ mod tests {
 
         let addr = make_addr(8001);
         let loc = Location::new(0.5);
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        cm.add_connection(loc, addr, keypair.public().clone(), false, false);
 
         // Put peer in skip list
         let mut skip_list = HashSet::new();
@@ -2715,7 +3037,7 @@ mod tests {
 
         let addr = make_addr(8001);
         let loc = Location::new(0.5);
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        cm.add_connection(loc, addr, keypair.public().clone(), false, false);
 
         // Mark as transient
         cm.try_register_transient(addr, Some(loc));
@@ -2766,7 +3088,7 @@ mod tests {
         let own_loc = Location::new(0.5);
 
         // This should panic in debug mode due to the debug_assert
-        cm.add_connection(own_loc, own_addr, keypair.public().clone(), false);
+        cm.add_connection(own_loc, own_addr, keypair.public().clone(), false, false);
     }
 
     /// Test that routing_candidates() respects requester parameter
@@ -2796,15 +3118,28 @@ mod tests {
             requester_addr,
             keypair.public().clone(),
             false,
+            false,
         );
 
         let peer2_addr = make_addr(8002);
         let peer2_loc = Location::new(0.5);
-        cm.add_connection(peer2_loc, peer2_addr, keypair.public().clone(), false);
+        cm.add_connection(
+            peer2_loc,
+            peer2_addr,
+            keypair.public().clone(),
+            false,
+            false,
+        );
 
         let peer3_addr = make_addr(8003);
         let peer3_loc = Location::new(0.7);
-        cm.add_connection(peer3_loc, peer3_addr, keypair.public().clone(), false);
+        cm.add_connection(
+            peer3_loc,
+            peer3_addr,
+            keypair.public().clone(),
+            false,
+            false,
+        );
 
         // Get routing candidates with requester specified
         let empty_set: HashSet<SocketAddr> = HashSet::new();
@@ -2894,8 +3229,8 @@ mod tests {
         let loc1 = Location::new(0.3);
         let loc2 = Location::new(0.7);
 
-        cm.add_connection(loc1, addr1, keypair.public().clone(), false);
-        cm.add_connection(loc2, addr2, keypair.public().clone(), false);
+        cm.add_connection(loc1, addr1, keypair.public().clone(), false, false);
+        cm.add_connection(loc2, addr2, keypair.public().clone(), false, false);
 
         let connections = cm.get_connections_by_location();
         assert_eq!(connections.len(), 2);
@@ -2920,7 +3255,7 @@ mod tests {
         assert!(cm.has_connection_or_pending(addr));
 
         // After adding, should still return true
-        cm.add_connection(loc, addr, keypair.public().clone(), true);
+        cm.add_connection(loc, addr, keypair.public().clone(), true, false);
         assert!(cm.has_connection_or_pending(addr));
     }
 
@@ -3147,7 +3482,7 @@ mod tests {
         let loc = Location::new(0.1);
 
         // Add an established connection
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        cm.add_connection(loc, addr, keypair.public().clone(), false, false);
         assert!(
             cm.has_connection_or_pending(addr),
             "has_connection_or_pending should always see established connections"
@@ -3295,6 +3630,7 @@ mod tests {
             existing_addr,
             keypair.public().clone(),
             false,
+            false,
         );
         assert_eq!(cm.connection_count(), 1);
 
@@ -3354,6 +3690,7 @@ mod tests {
             existing_addr,
             keypair.public().clone(),
             false,
+            false,
         );
 
         // should_accept with open > 0 creates entries in both data structures
@@ -3385,7 +3722,7 @@ mod tests {
         let addr = make_addr(8001);
         let loc = Location::new(0.3);
 
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        cm.add_connection(loc, addr, keypair.public().clone(), false, false);
         assert!(cm.location_for_peer.read().contains_key(&addr));
 
         let removed = cm.cleanup_stale_reservations();
@@ -3418,7 +3755,7 @@ mod tests {
         assert!(!cm.is_in_ring(addr));
 
         // Step 3: CONNECT succeeds — add_connection should work
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
+        cm.add_connection(loc, addr, keypair.public().clone(), false, false);
         assert!(cm.is_in_ring(addr));
         assert_eq!(cm.connection_count(), 1);
     }
@@ -3437,6 +3774,7 @@ mod tests {
             Location::new(0.1),
             existing_addr,
             keypair.public().clone(),
+            false,
             false,
         );
 
@@ -3527,13 +3865,25 @@ mod tests {
         // Add 1 connection — still not ready
         let peer1 = TransportKeypair::new();
         let addr1 = make_addr(9001);
-        cm.add_connection(Location::new(0.3), addr1, peer1.public().clone(), false);
+        cm.add_connection(
+            Location::new(0.3),
+            addr1,
+            peer1.public().clone(),
+            false,
+            false,
+        );
         assert!(!cm.is_self_ready());
 
         // Add 2nd connection — now ready
         let peer2 = TransportKeypair::new();
         let addr2 = make_addr(9002);
-        cm.add_connection(Location::new(0.7), addr2, peer2.public().clone(), false);
+        cm.add_connection(
+            Location::new(0.7),
+            addr2,
+            peer2.public().clone(),
+            false,
+            false,
+        );
         assert!(cm.is_self_ready());
     }
 
@@ -3552,11 +3902,23 @@ mod tests {
         // Add two peers
         let peer1 = TransportKeypair::new();
         let addr1 = make_addr(9001);
-        cm.add_connection(Location::new(0.3), addr1, peer1.public().clone(), false);
+        cm.add_connection(
+            Location::new(0.3),
+            addr1,
+            peer1.public().clone(),
+            false,
+            false,
+        );
 
         let peer2 = TransportKeypair::new();
         let addr2 = make_addr(9002);
-        cm.add_connection(Location::new(0.7), addr2, peer2.public().clone(), false);
+        cm.add_connection(
+            Location::new(0.7),
+            addr2,
+            peer2.public().clone(),
+            false,
+            false,
+        );
 
         // Neither peer is ready — fallback returns all not-ready peers rather than
         // empty (to prevent EmptyRing failures, see #3356).
@@ -3589,7 +3951,13 @@ mod tests {
 
         let peer1 = TransportKeypair::new();
         let addr1 = make_addr(9001);
-        cm.add_connection(Location::new(0.3), addr1, peer1.public().clone(), false);
+        cm.add_connection(
+            Location::new(0.3),
+            addr1,
+            peer1.public().clone(),
+            false,
+            false,
+        );
         cm.mark_peer_ready(addr1);
         assert!(cm.is_peer_ready(addr1));
 
@@ -3606,7 +3974,13 @@ mod tests {
         let cm = make_connection_manager_with_readiness(Some(make_addr(8000)), 1, 10, false, 2);
         let peer = TransportKeypair::new();
         let addr = make_addr(9001);
-        cm.add_connection(Location::new(0.3), addr, peer.public().clone(), false);
+        cm.add_connection(
+            Location::new(0.3),
+            addr,
+            peer.public().clone(),
+            false,
+            false,
+        );
 
         // Peer not in ready_peers and connection is fresh — not ready
         assert!(!cm.is_peer_ready(addr));
@@ -3626,7 +4000,13 @@ mod tests {
         let cm = make_connection_manager_with_readiness(Some(make_addr(8000)), 1, 10, false, 2);
         let peer = TransportKeypair::new();
         let addr = make_addr(9001);
-        cm.add_connection(Location::new(0.3), addr, peer.public().clone(), false);
+        cm.add_connection(
+            Location::new(0.3),
+            addr,
+            peer.public().clone(),
+            false,
+            false,
+        );
 
         // Advance only 30s — not enough for the 60s timeout
         tokio::time::advance(Duration::from_secs(30)).await;
@@ -3643,7 +4023,13 @@ mod tests {
         let cm = make_connection_manager_with_readiness(Some(own_addr), 1, 10, false, 2);
         let peer = TransportKeypair::new();
         let addr = make_addr(9001);
-        cm.add_connection(Location::new(0.3), addr, peer.public().clone(), false);
+        cm.add_connection(
+            Location::new(0.3),
+            addr,
+            peer.public().clone(),
+            false,
+            false,
+        );
 
         // Verify connected_since was populated
         assert!(
@@ -3719,7 +4105,13 @@ mod tests {
                         // connections_by_location(W)
                         1 => {
                             let keypair = TransportKeypair::new();
-                            cm.add_connection(loc, addr, keypair.public().clone(), rng.random());
+                            cm.add_connection(
+                                loc,
+                                addr,
+                                keypair.public().clone(),
+                                rng.random(),
+                                false,
+                            );
                         }
                         // prune_alive_connection: acquires location_for_peer(W),
                         // connections_by_location(W)
@@ -3902,7 +4294,13 @@ mod tests {
                         // add_connection (interacts with all three maps)
                         4 => {
                             let keypair = TransportKeypair::new();
-                            cm.add_connection(loc, addr, keypair.public().clone(), rng.random());
+                            cm.add_connection(
+                                loc,
+                                addr,
+                                keypair.public().clone(),
+                                rng.random(),
+                                false,
+                            );
                         }
                         // clear_pending_reservations_for (#3319 isolation recovery)
                         5 => {

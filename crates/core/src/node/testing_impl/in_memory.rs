@@ -556,7 +556,10 @@ async fn apply_preseeded_connections(
         // `add_connection` is idempotent-ish: the CM dedups by addr, so a
         // double-injection is harmless. The bool return signals "just crossed
         // the readiness threshold", which we don't need here.
-        let _ = op_manager.ring.add_connection(loc, peer_id, false).await;
+        let _ = op_manager
+            .ring
+            .add_connection(loc, peer_id, false, false)
+            .await;
         tracing::debug!(
             "preseed_connections: injected direct connection {} -> {peer} (@ {loc})",
             op_manager

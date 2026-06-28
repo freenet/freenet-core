@@ -2377,12 +2377,19 @@ impl Ring {
     /// (i.e., we just became ready to accept non-CONNECT operations).
     /// Returns `false` if the connection was rejected (e.g., capacity cap) or we
     /// were already ready.
-    pub async fn add_connection(&self, loc: Location, peer: PeerId, was_reserved: bool) -> bool {
+    pub async fn add_connection(
+        &self,
+        loc: Location,
+        peer: PeerId,
+        was_reserved: bool,
+        allow_reserve: bool,
+    ) -> bool {
         tracing::info!(
             peer = %peer,
             peer_location = %loc,
             this = ?self.connection_manager.get_own_addr(),
             was_reserved = %was_reserved,
+            allow_reserve = %allow_reserve,
             "Adding connection to peer"
         );
         let min_ready = self.connection_manager.min_ready_connections;
@@ -2390,9 +2397,9 @@ impl Ring {
 
         let addr = peer.socket_addr();
         let pub_key = peer.pub_key().clone();
-        let added = self
-            .connection_manager
-            .add_connection(loc, addr, pub_key, was_reserved);
+        let added =
+            self.connection_manager
+                .add_connection(loc, addr, pub_key, was_reserved, allow_reserve);
         if !added {
             tracing::warn!(
                 peer = %peer,
@@ -5089,7 +5096,7 @@ mod resource_meter_bridge_tests {
             // neighbor location (adjust_topology keys neighbors by location).
             let loc = Location::new((i as f64 + 0.5) / n as f64);
             let keypair = TransportKeypair::new();
-            assert!(cm.add_connection(loc, addr, keypair.public().clone(), false));
+            assert!(cm.add_connection(loc, addr, keypair.public().clone(), false, false));
             addrs.push(addr);
         }
         addrs

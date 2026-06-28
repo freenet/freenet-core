@@ -291,6 +291,13 @@ impl P2pConnManager {
                 "connect_peer: reusing existing transport / promoting transient if present"
             );
             let connection_manager = &self.bridge.op_manager.ring.connection_manager;
+            // A bootstrap-reserve admission (#4362) is a transient tag PLUS a live
+            // pending reservation (should_accept_bootstrap_reserve sets both).
+            // Capture it before drop_transient/add_connection consume either, so
+            // the over-capacity headroom is granted only to genuine reserve
+            // accepts, not to ordinary unsolicited transients.
+            let allow_reserve = connection_manager.is_transient(peer_addr)
+                && connection_manager.has_pending_reservation(peer_addr);
             let was_transient = connection_manager.drop_transient(peer_addr);
 
             // Promote if: (a) was tracked as transient, OR (b) not already in ring.
@@ -309,14 +316,18 @@ impl P2pConnManager {
                 // accepted at the protocol level (the CONNECT terminus handler in connect.rs) and NAT traversal
                 // already succeeded. Re-evaluating the probabilistic Kleinberg filter
                 // would discard hard-won connections for no capacity reason (#3545).
-                // Only enforce the hard max_connections cap as a resource safety limit.
+                // Only enforce the hard cap as a resource safety limit; bootstrap-
+                // reserve admissions may use the small transient over-cap headroom.
                 let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections {
+                let cap = connection_manager.promotion_cap(allow_reserve);
+                if current >= cap {
                     tracing::warn!(
                         tx = %tx,
                         %peer,
                         current_connections = current,
                         max_connections = connection_manager.max_connections,
+                        cap,
+                        allow_reserve,
                         %loc,
                         transient_expired,
                         "connect_peer: rejecting transient promotion to enforce cap"
@@ -339,7 +350,12 @@ impl P2pConnManager {
                     .bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, PeerId::new(peer.pub_key().clone(), peer_addr), true)
+                    .add_connection(
+                        loc,
+                        PeerId::new(peer.pub_key().clone(), peer_addr),
+                        true,
+                        allow_reserve,
+                    )
                     .await;
                 tracing::info!(
                     tx = %tx,
@@ -1128,6 +1144,15 @@ impl P2pConnManager {
             tracing::info!(peer_id = ?peer_id, %peer_addr, is_transient, "handle_successful_connection: inserted new connection entry");
             crate::node::network_status::record_peer_connected(peer_addr, None, None);
             if promote_to_ring {
+                // A bootstrap-reserve admission (#4362) is a connection_manager
+                // transient tag PLUS a live pending reservation
+                // (should_accept_bootstrap_reserve sets both). Capture it before
+                // prune_in_transit_connection consumes the reservation, so the
+                // over-cap headroom is granted only to genuine reserve accepts —
+                // ordinary unsolicited transients hold no reservation, and normal
+                // should_accept admissions hold no transient tag.
+                let allow_reserve = connection_manager.is_transient(peer_addr)
+                    && connection_manager.has_pending_reservation(peer_addr);
                 // Only prune reservation when promoting to ring - transient connections
                 // don't go through should_accept() so they have no reservation to prune
                 let pending_loc = connection_manager.prune_in_transit_connection(peer_addr);
@@ -1147,13 +1172,17 @@ impl P2pConnManager {
                 // establishment (NAT traversal) already succeeded. Re-evaluating
                 // the probabilistic Kleinberg filter would discard hard-won
                 // connections for no capacity reason (#3545).
-                // Only enforce the hard max_connections cap below.
+                // Only enforce the hard cap below; bootstrap-reserve admissions
+                // may use the small transient over-cap headroom (#4362).
                 let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections {
+                let cap = connection_manager.promotion_cap(allow_reserve);
+                if current >= cap {
                     tracing::warn!(
                         %peer_addr,
                         current_connections = current,
                         max_connections = connection_manager.max_connections,
+                        cap,
+                        allow_reserve,
                         %loc,
                         "handle_successful_connection: rejecting new connection to enforce cap"
                     );
@@ -1169,7 +1198,12 @@ impl P2pConnManager {
                     .bridge
                     .op_manager
                     .ring
-                    .add_connection(loc, PeerId::new(peer.pub_key().clone(), peer_addr), true)
+                    .add_connection(
+                        loc,
+                        PeerId::new(peer.pub_key().clone(), peer_addr),
+                        true,
+                        allow_reserve,
+                    )
                     .await;
                 let pkl = crate::ring::PeerKeyLocation::new(peer.pub_key().clone(), peer_addr);
                 crate::node::network_status::record_peer_connected(

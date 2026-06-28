@@ -357,6 +357,15 @@ pub(crate) trait RelayContext {
     /// address must be known before acceptance decisions can be made.
     fn should_accept(&self, joiner: &KnownPeerKeyLocation) -> bool;
 
+    /// Last-resort acceptance into the small transient over-capacity bootstrap
+    /// reserve (#4362). Only consulted at a terminus where the joiner has
+    /// exhausted every normal acceptor (at capacity AND uphill routing
+    /// exhausted) — i.e. immediately before this relay would otherwise reject.
+    /// Accepting here breaks the cold-start acceptance collapse where saturated
+    /// gateways dead-end joiners with nowhere left to route. Deterministic (no
+    /// RNG); the over-commit is pruned back by the topology maintenance loop.
+    fn should_accept_bootstrap_reserve(&self, joiner: &KnownPeerKeyLocation) -> bool;
+
     /// Choose the next hop for the request, avoiding peers already visited.
     fn select_next_hop(
         &self,
@@ -743,24 +752,24 @@ impl RelayState {
                     self.request.uphill_budget = self.request.uphill_budget.saturating_sub(1);
                     actions.forward = Some((peer, fwd_req));
                 } else {
-                    tracing::info!(
-                        target = %self.request.desired_location,
-                        ttl = self.request.ttl,
-                        uphill_budget = self.request.uphill_budget,
-                        visited = ?self.request.visited,
-                        "connect: at terminus, cannot accept, no uphill peers available — rejecting"
+                    // Terminus, at capacity, no uphill peers left: last resort is
+                    // the transient over-cap bootstrap reserve before rejecting.
+                    self.reserve_or_reject(
+                        ctx,
+                        joiner_known.as_ref(),
+                        &mut actions,
+                        "no uphill peers available",
                     );
-                    actions.rejected = true;
                 }
             } else {
-                tracing::info!(
-                    target = %self.request.desired_location,
-                    ttl = self.request.ttl,
-                    uphill_budget = self.request.uphill_budget,
-                    visited = ?self.request.visited,
-                    "connect: at terminus, cannot accept, uphill budget or TTL exhausted — rejecting"
+                // Terminus, at capacity, uphill budget or TTL exhausted: last
+                // resort is the transient over-cap bootstrap reserve.
+                self.reserve_or_reject(
+                    ctx,
+                    joiner_known.as_ref(),
+                    &mut actions,
+                    "uphill budget or TTL exhausted",
                 );
-                actions.rejected = true;
             }
         } else if is_terminus && self.forwarded_to.is_some() {
             tracing::debug!(
@@ -771,6 +780,55 @@ impl RelayState {
         }
 
         actions
+    }
+
+    /// At a terminus where the joiner has exhausted every normal acceptor
+    /// (at capacity AND uphill routing exhausted), attempt the transient
+    /// over-capacity bootstrap reserve (#4362) before rejecting.
+    ///
+    /// On acceptance this mirrors the terminus-accept block: it marks the
+    /// joiner accepted locally and sets `actions.accept` (an [`AcceptOutcome`]
+    /// that promotes the transient connection on the consume side), so NO new
+    /// emission path is introduced — the same `actions.accept` consumers in the
+    /// relay driver handle promotion. Otherwise it sets `actions.rejected`.
+    fn reserve_or_reject<C: RelayContext>(
+        &mut self,
+        ctx: &C,
+        joiner_known: Option<&KnownPeerKeyLocation>,
+        actions: &mut RelayActions,
+        reason: &'static str,
+    ) {
+        if let Some(joiner) = joiner_known {
+            if ctx.should_accept_bootstrap_reserve(joiner) {
+                self.accepted_locally = true;
+                // Acceptor doesn't know its own external address; first relay
+                // fills it in from the packet source (same as terminus accept).
+                let self_loc = ctx.self_location();
+                let acceptor = PeerKeyLocation::with_unknown_addr(self_loc.pub_key().clone());
+                actions.accept = Some(AcceptOutcome {
+                    response: ConnectResponse { acceptor },
+                    joiner: self.request.joiner.clone(),
+                });
+                tracing::info!(
+                    acceptor_pub_key = %self_loc.pub_key(),
+                    joiner_pub_key = %self.request.joiner.pub_key(),
+                    acceptor_loc = ?self_loc.location(),
+                    joiner_loc = ?self.request.joiner.location(),
+                    reason,
+                    "connect: bootstrap-reserve acceptance at terminus (over-cap transient, #4362)"
+                );
+                return;
+            }
+        }
+        tracing::info!(
+            target = %self.request.desired_location,
+            ttl = self.request.ttl,
+            uphill_budget = self.request.uphill_budget,
+            visited = ?self.request.visited,
+            reason,
+            "connect: at terminus, cannot accept, bootstrap reserve unavailable — rejecting"
+        );
+        actions.rejected = true;
     }
 }
 
@@ -814,6 +872,27 @@ impl RelayContext for RelayEnv<'_> {
             .ring
             .connection_manager
             .should_accept(location, addr)
+    }
+
+    fn should_accept_bootstrap_reserve(&self, joiner: &KnownPeerKeyLocation) -> bool {
+        let addr = joiner.socket_addr();
+        let location = joiner.location();
+
+        // Mirror should_accept: never relax the blocklist for the reserve path.
+        if let Some(blocked) = &self.op_manager.blocked_addresses {
+            if blocked.contains(&addr) {
+                tracing::info!(
+                    joiner_addr = %addr,
+                    "connect: rejecting bootstrap-reserve join from blocked peer at routing level"
+                );
+                return false;
+            }
+        }
+
+        self.op_manager
+            .ring
+            .connection_manager
+            .should_accept_bootstrap_reserve(location, addr)
     }
 
     fn select_next_hop(
@@ -2055,6 +2134,7 @@ mod tests {
     struct TestRelayContext {
         self_loc: PeerKeyLocation,
         accept: bool,
+        bootstrap_reserve_accept: bool,
         next_hop: Option<PeerKeyLocation>,
         uphill_hop: Option<PeerKeyLocation>,
     }
@@ -2064,6 +2144,7 @@ mod tests {
             Self {
                 self_loc,
                 accept: true,
+                bootstrap_reserve_accept: false,
                 next_hop: None,
                 uphill_hop: None,
             }
@@ -2071,6 +2152,11 @@ mod tests {
 
         fn accept(mut self, accept: bool) -> Self {
             self.accept = accept;
+            self
+        }
+
+        fn bootstrap_reserve_accept(mut self, accept: bool) -> Self {
+            self.bootstrap_reserve_accept = accept;
             self
         }
 
@@ -2092,6 +2178,10 @@ mod tests {
 
         fn should_accept(&self, _joiner: &KnownPeerKeyLocation) -> bool {
             self.accept
+        }
+
+        fn should_accept_bootstrap_reserve(&self, _joiner: &KnownPeerKeyLocation) -> bool {
+            self.bootstrap_reserve_accept
         }
 
         fn select_next_hop(
@@ -2317,6 +2407,91 @@ mod tests {
                 .visited
                 .probably_visited(joiner.socket_addr().expect("test peer must have address"))
         );
+    }
+
+    fn exhausted_terminus_state(joiner: &PeerKeyLocation) -> RelayState {
+        RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 2,
+                visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        }
+    }
+
+    /// #4362: at a terminus where the joiner has exhausted every normal acceptor
+    /// (normal accept refused, no uphill peer), the relay accepts into the
+    /// transient over-capacity bootstrap reserve instead of rejecting.
+    #[test]
+    fn relay_accepts_into_bootstrap_reserve_at_exhausted_terminus() {
+        let self_loc = make_peer(4300);
+        let joiner = make_peer(5300);
+        let mut state = exhausted_terminus_state(&joiner);
+
+        let ctx = TestRelayContext::new(self_loc.clone())
+            .accept(false)
+            .next_hop(None)
+            .uphill_hop(None)
+            .bootstrap_reserve_accept(true);
+        let actions = state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        );
+
+        assert!(
+            !actions.rejected,
+            "should accept into the bootstrap reserve, not reject"
+        );
+        let accept = actions
+            .accept
+            .expect("expected a bootstrap-reserve AcceptOutcome");
+        assert_eq!(
+            accept.response.acceptor.pub_key(),
+            self_loc.pub_key(),
+            "acceptor pub_key should come from self_location"
+        );
+        assert_eq!(accept.joiner.pub_key(), joiner.pub_key());
+        assert!(state.accepted_locally);
+    }
+
+    /// #4362: when the bootstrap reserve is unavailable (exhausted/declined),
+    /// the same exhausted-terminus path still rejects — no behavior change.
+    #[test]
+    fn relay_rejects_at_exhausted_terminus_when_reserve_unavailable() {
+        let self_loc = make_peer(4301);
+        let joiner = make_peer(5301);
+        let mut state = exhausted_terminus_state(&joiner);
+
+        let ctx = TestRelayContext::new(self_loc)
+            .accept(false)
+            .next_hop(None)
+            .uphill_hop(None)
+            .bootstrap_reserve_accept(false);
+        let actions = state.handle_request(
+            &ctx,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        );
+
+        assert!(actions.accept.is_none());
+        assert!(
+            actions.rejected,
+            "reserve unavailable must fall back to the original reject path"
+        );
+        assert!(!state.accepted_locally);
     }
 
     /// Test the terminus-only acceptance behavior: relays should NOT accept when they can
