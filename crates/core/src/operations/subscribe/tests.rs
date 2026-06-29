@@ -6,6 +6,41 @@
 
 use super::*;
 
+/// Source-grep pin (#4361 / #4365): `prepare_initial_request` must
+/// consult `bootstrap_gateway_target` before giving up, so a
+/// freshly-bootstrapped node (empty ring) routes its initial
+/// Subscribe::Request via a configured gateway instead of failing flat
+/// with `NoHostingPeers`. The ring-connection fallback above scans only
+/// promoted ring peers (`get_connections_by_location`), which an
+/// empty-ring node has none of, even though it holds a live transient
+/// gateway connection.
+#[test]
+fn prepare_initial_request_uses_bootstrap_gateway_fallback() {
+    const SOURCE: &str = include_str!("../subscribe.rs");
+    let fn_start = SOURCE
+        .find("pub(super) async fn prepare_initial_request(")
+        .expect("prepare_initial_request must exist in subscribe.rs");
+    let fn_end = SOURCE[fn_start..]
+        .find("\nasync fn complete_local_subscription(")
+        .map(|off| fn_start + off)
+        .expect("complete_local_subscription anchor must follow prepare_initial_request");
+    let body = &SOURCE[fn_start..fn_end];
+    assert!(
+        body.contains("bootstrap_gateway_target("),
+        "prepare_initial_request must fall back to bootstrap_gateway_target \
+         on an empty ring before returning NoHostingPeers (#4361 / #4365)"
+    );
+    // The exclusion predicate must respect the request's visited bloom (which
+    // already marks own_addr) — not a no-op that could re-pick a visited peer.
+    assert!(
+        body.contains(
+            "bootstrap_gateway_target(op_manager, |addr| visited.probably_visited(addr))"
+        ),
+        "prepare_initial_request must exclude visited peers when selecting the \
+         bootstrap gateway (#4361 / #4365)"
+    );
+}
+
 /// Pin: `handle_unsubscribe_inbound` preserves the four behavioral
 /// branches inherited from the legacy
 /// `process_message::Unsubscribe` arm, plus the counter-symmetry

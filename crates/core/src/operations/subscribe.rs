@@ -19,6 +19,7 @@ use either::Either;
 
 pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
 use super::OpError;
+use super::bootstrap::bootstrap_gateway_target;
 use crate::ring::PeerKeyLocation;
 use crate::tracing::NetEventLog;
 use crate::{
@@ -276,9 +277,28 @@ pub(super) async fn prepare_initial_request(
                     target
                 }
                 None => {
-                    // Truly no connections available - fall back to local completion only if isolated.
-                    // This handles the case of a standalone node or when we're the only node with the contract.
-                    if let Some(key) = super::has_contract(op_manager, instance_id).await? {
+                    // Bootstrap fallback (#4361 / #4365): the ring-connection
+                    // scan above sees only promoted ring peers
+                    // (`get_connections_by_location`), so an empty-ring node
+                    // finds nothing here even though it holds a live transient
+                    // gateway connection. Route the initial request via a
+                    // configured gateway so a freshly-bootstrapped node can
+                    // still join the subscription tree, before falling back to
+                    // local completion / NoHostingPeers.
+                    if let Some((gateway, gateway_addr)) =
+                        bootstrap_gateway_target(op_manager, |addr| visited.probably_visited(addr))
+                    {
+                        tracing::info!(
+                            tx = %id,
+                            contract = %instance_id,
+                            gateway = %gateway_addr,
+                            phase = "bootstrap_gateway",
+                            "subscribe: ring empty — routing initial request via configured gateway"
+                        );
+                        gateway
+                    } else if let Some(key) = super::has_contract(op_manager, instance_id).await? {
+                        // No gateway either - fall back to local completion only if isolated.
+                        // This handles a standalone node or when we're the only node with the contract.
                         tracing::info!(
                             tx = %id,
                             contract = %key,
@@ -286,9 +306,10 @@ pub(super) async fn prepare_initial_request(
                             "Contract available locally and no network connections, completing subscription locally"
                         );
                         return Ok(InitialRequest::LocallyComplete { key });
+                    } else {
+                        tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
+                        return Ok(InitialRequest::NoHostingPeers);
                     }
-                    tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
-                    return Ok(InitialRequest::NoHostingPeers);
                 }
             }
         };

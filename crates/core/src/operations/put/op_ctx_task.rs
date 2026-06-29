@@ -34,6 +34,7 @@ use crate::node::NetworkBridge;
 use crate::node::OpManager;
 use crate::node::WaiterReply;
 use crate::operations::OpError;
+use crate::operations::bootstrap::bootstrap_gateway_target;
 use crate::operations::op_ctx::{
     AdvanceOutcome, AttemptOutcome, OpCtx, RetryDriver, RetryLoopOutcome, drive_retry_loop,
 };
@@ -215,7 +216,22 @@ async fn drive_client_put_inner(
     }
 
     // Pre-select initial target for the driver's retry state. The actual
-    // routing decision is made by process_message, not the driver.
+    // routing decision is made by the relay driver (`start_relay_put`),
+    // not here.
+    //
+    // Bootstrap note (#4361 / #4365): on an empty ring this stays
+    // `own_location()` — the bootstrap gateway fallback is applied at the
+    // relay's next-hop selection, NOT here. Unlike GET (whose client
+    // driver re-picks the wire target per attempt and therefore had to
+    // carry `tried` into each attempt's visited bloom for gateway
+    // failover, see `carry_tried_into_visited`), PUT's `current_target` is
+    // only driver-side telemetry / retry bookkeeping: the request value
+    // carries the contract (not a target), the relay decides the next hop,
+    // and the terminal reply returns via the originator-loopback bypass on
+    // `pending_op_results[tx]` — none of which read `current_target`. So a
+    // self-vs-gateway divergence here is cosmetic, not a routing bug.
+    // (Multi-gateway failover across PUT retries is intentionally not
+    // implemented; see the design doc's out-of-scope notes.)
     let initial_target = op_manager
         .ring
         .closest_potentially_hosting(&key, tried.as_slice());
@@ -1305,24 +1321,61 @@ where
             (peer, addr)
         }
         None => {
-            // No next hop — this node is the final destination.
-            tracing::info!(
-                tx = %incoming_tx,
-                contract = %key,
-                phase = "relay_put_complete",
-                "PUT relay: no next hop, finalizing at this node"
-            );
-            // Same arm as above: this node IS the storer.
-            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-            return relay_put_finalize_local(
-                op_manager,
-                incoming_tx,
-                key,
-                merged_value,
-                upstream_addr,
-                hop_count,
-            )
-            .await;
+            // Bootstrap fallback (#4361 / #4365): with an empty ring,
+            // forward via a configured gateway instead of finalizing
+            // locally. Without this, a freshly-bootstrapped node's PUT is
+            // stored locally (Step 1 above) and finalized here, so the
+            // client gets a success while the contract never reaches the
+            // network — the PUT analog of GET's empty-ring blind spot.
+            // Bypasses the #4363 terminus guard on purpose: an empty ring
+            // has no overshoot to guard against, we only need to reach the
+            // network. The local replica is already stored, so the
+            // originator keeps it AND the gateway relays the PUT toward the
+            // contract location. Respects `new_skip_list` (self + upstream).
+            //
+            // Intentional asymmetry with `drive_relay_put_streaming` (which
+            // gates the gateway fallback on `htl > 0`): this arm is also
+            // reached when `htl == 0` (next_hop is forced None then), so it
+            // can forward to a gateway at htl 0. Benign — the contract is
+            // already stored locally (no false success), it is a single
+            // bounded next-hop (no fan-out), the gateway forwards at
+            // `htl - 1 == 0` and finalizes on its populated ring (better
+            // placement than this empty-ring node), and the originator
+            // loopback always starts at max_htl so it never hits htl 0 here.
+            // Do not "harmonize" the two paths — there is no correctness gain.
+            match bootstrap_gateway_target(op_manager, |addr| new_skip_list.contains(&addr)) {
+                Some((gateway, gateway_addr)) => {
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        gateway = %gateway_addr,
+                        phase = "relay_put_bootstrap_gateway",
+                        "PUT relay: ring empty — forwarding to configured gateway"
+                    );
+                    (gateway, gateway_addr)
+                }
+                None => {
+                    // No next hop and no configured gateway — genuinely
+                    // isolated, so this node is the final destination.
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        phase = "relay_put_complete",
+                        "PUT relay: no next hop, finalizing at this node"
+                    );
+                    // Same arm as above: this node IS the storer.
+                    let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                    return relay_put_finalize_local(
+                        op_manager,
+                        incoming_tx,
+                        key,
+                        merged_value,
+                        upstream_addr,
+                        hop_count,
+                    )
+                    .await;
+                }
+            }
         }
     };
 
@@ -2404,6 +2457,32 @@ where
         None
     };
 
+    // Bootstrap fallback (#4361 / #4365), streaming path: with an empty
+    // ring `closest_potentially_hosting` yields nothing, so route via a
+    // configured gateway instead of finalizing locally and reporting a
+    // false success. Computed here, before the terminus guard, and fed
+    // into the guard's `None` arm below so it bypasses the guard — an
+    // empty ring has no overshoot to reason about, and the stream is
+    // assembled and stored locally in step 5/6 regardless, so the
+    // originator keeps its replica while the gateway relays onward.
+    let bootstrap_gateway = if next_hop.is_none() && htl > 0 {
+        match bootstrap_gateway_target(op_manager, |addr| new_skip_list.contains(&addr)) {
+            Some((gateway, gateway_addr)) => {
+                tracing::info!(
+                    tx = %incoming_tx,
+                    contract = %contract_key,
+                    gateway = %gateway_addr,
+                    phase = "relay_put_streaming_bootstrap_gateway",
+                    "PUT streaming relay: ring empty — forwarding to configured gateway"
+                );
+                Some(gateway)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // Greedy-routing terminus guard (#4363), streaming path. Mirrors the
     // non-streaming `drive_relay_put` guard: finalize here only when the
     // chain has descended to this node AND the next hop would climb back
@@ -2450,7 +2529,9 @@ where
                 Some(peer)
             }
         }
-        None => None,
+        // Empty ring: no ring candidate to run the terminus guard against,
+        // so take the bootstrap gateway fallback computed above (#4361 / #4365).
+        None => bootstrap_gateway,
     };
 
     let next_hop_addr = next_hop.as_ref().and_then(|p| p.socket_addr());
@@ -3198,6 +3279,50 @@ mod tests {
              caps by name in the selection so future readers see the \
              split — bare integer literals are forbidden here."
         );
+    }
+
+    /// Source-grep pin (#4361 / #4365): both relay PUT drivers must
+    /// consult `bootstrap_gateway_target` when
+    /// `closest_potentially_hosting` yields no next hop, so a
+    /// freshly-bootstrapped node (empty ring) forwards the PUT through a
+    /// configured gateway instead of finalizing locally and reporting a
+    /// false success to the client. Dropping either call site silently
+    /// reintroduces the empty-ring silent-store bug that GET fixed in
+    /// #4364.
+    #[test]
+    fn relay_put_drivers_use_bootstrap_gateway_fallback() {
+        let src = include_str!("op_ctx_task.rs");
+        for entry in [
+            "async fn drive_relay_put<CB>",
+            "async fn drive_relay_put_streaming<CB>",
+        ] {
+            let start = src
+                .find(entry)
+                .unwrap_or_else(|| panic!("{entry} must exist"));
+            // Body spans from the fn signature to the start of the next
+            // top-level `async fn`. The call site lives in the empty-ring
+            // branch of the next-hop selection, which can sit far from the
+            // signature, so scan the whole body rather than a fixed window.
+            let after_sig = start + entry.len();
+            let body_end = src[after_sig..]
+                .find("\nasync fn ")
+                .map(|off| after_sig + off)
+                .unwrap_or(src.len());
+            let body = &src[start..body_end];
+            assert!(
+                body.contains("bootstrap_gateway_target("),
+                "{entry} must fall back to bootstrap_gateway_target on an \
+                 empty ring instead of finalizing locally (#4361 / #4365)"
+            );
+            // The exclusion predicate must be the relay skip list (self +
+            // upstream + already-tried), not a no-op — otherwise the fallback
+            // could re-pick self/upstream and bounce the PUT.
+            assert!(
+                body.contains("bootstrap_gateway_target(op_manager, |addr| new_skip_list.contains"),
+                "{entry} must exclude the relay skip list when selecting the \
+                 bootstrap gateway (#4361 / #4365)"
+            );
+        }
     }
 
     /// `start_client_put` must call `admit_client_op()` before the
