@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rule-lint #1/#2/#3: ban NEW use of std::time::Instant::now(),
 rand::thread_rng()/rand::random(), and tokio::net::UdpSocket in
-production code under crates/core/src/**/*.rs.
+production code under crates/core/src/ (top-level files and all subdirs).
 
 These patterns break deterministic simulation testing (DST):
   #1. std::time::Instant::now()  — use TimeSource instead
@@ -309,10 +309,21 @@ def find_violations_in_file(
     build_test_scope_map). A line IS flagged if:
       - It is in added_linenos (added by the PR), AND
       - It matches a banned pattern after comment-stripping, AND
-      - It is NOT test-scoped.
+      - It is NOT test-scoped, AND
+      - Neither the line itself nor the line directly above it carries a
+        ``// rule-lint: ok`` annotation (for intentional documented exceptions).
+
+    The ``// rule-lint: ok`` annotation is for the rare case of a legitimate
+    production use that must bypass the ban — e.g., the one
+    ``tokio::net::UdpSocket`` import in transport.rs that the ``Socket`` trait
+    itself wraps. The annotation MUST include a reason:
+    ``// rule-lint: ok — <reason>``. New uses require maintainer sign-off;
+    this is not a general escape hatch.
     """
     is_test = build_test_scope_map(file_lines)
     violations = []
+
+    rule_lint_ok_re = re.compile(r"//\s*rule-lint:\s*ok")
 
     for lineno in sorted(added_linenos):
         idx = lineno - 1  # 0-based
@@ -323,6 +334,14 @@ def find_violations_in_file(
 
         # Test-scoped lines are legitimately allowed to use real clocks/RNG/sockets.
         if is_test[idx]:
+            continue
+
+        # A ``// rule-lint: ok`` annotation on the flagged line itself or on
+        # the line directly above it suppresses the violation for documented
+        # intentional exceptions (e.g., the one legitimate
+        # tokio::net::UdpSocket import that the Socket trait wraps).
+        prev_line = file_lines[idx - 1] if idx > 0 else ""
+        if rule_lint_ok_re.search(raw) or rule_lint_ok_re.search(prev_line):
             continue
 
         for rule_num, rule_desc, pattern in BANNED_PATTERNS:
@@ -523,6 +542,59 @@ async fn integration_test() {
         {3},
         False,
     ),
+    # -----------------------------------------------------------------------
+    # Fixtures for issue #4632: pathspec now covers top-level src files too
+    # -----------------------------------------------------------------------
+    # A prod banned pattern in a top-level-style file (simulating transport.rs,
+    # node.rs, etc.) MUST flag — this is the class of bug #4632 was missing.
+    (
+        "top-level-file prod Instant::now — MUST flag (issue #4632 regression guard)",
+        """\
+fn prod_fn() {
+    let t = std::time::Instant::now();
+    println!("{:?}", t);
+}
+""",
+        {2},
+        True,  # pathspec fix means this now reaches the linter and MUST flag
+    ),
+    # A banned pattern annotated with ``// rule-lint: ok`` on the SAME line
+    # must NOT flag — covers the intentional transport.rs UdpSocket import.
+    (
+        "banned pattern with // rule-lint: ok on same line — must NOT flag",
+        """\
+use tokio::net::UdpSocket; // rule-lint: ok — intentional low-level construction site
+""",
+        {1},
+        False,
+    ),
+    # A banned pattern with ``// rule-lint: ok`` on the line ABOVE must NOT flag.
+    (
+        "banned pattern with // rule-lint: ok on previous line — must NOT flag",
+        """\
+// rule-lint: ok — intentional documented exception
+use tokio::net::UdpSocket;
+""",
+        {2},
+        False,
+    ),
+    # cfg(test) exemption still works after pathspec broadening (regression guard
+    # for the #4622 exemption not being broken by this PR's changes).
+    (
+        "cfg(test) exemption still works — regression guard for #4622",
+        """\
+fn prod_fn() {}
+
+#[cfg(test)]
+mod tests {
+    fn test_fn() {
+        let _t = std::time::Instant::now();
+    }
+}
+""",
+        {6},
+        False,  # inside cfg(test) — must NOT flag
+    ),
 ]
 
 
@@ -572,6 +644,11 @@ def main(argv: list[str]) -> int:
             "diff",
             rng,
             "--",
+            # Both globs are needed: git's ** does NOT match files directly under
+            # crates/core/src/ (node.rs, transport.rs, etc.) — only files in
+            # subdirectories. Adding the bare *.rs glob covers the top-level files.
+            # See issue #4632.
+            "crates/core/src/*.rs",
             "crates/core/src/**/*.rs",
         ],
         capture_output=True,

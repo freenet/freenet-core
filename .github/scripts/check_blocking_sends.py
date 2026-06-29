@@ -530,6 +530,11 @@ def main(argv) -> int:
             "diff",
             rng,
             "--",
+            # Both globs are needed: git's ** does NOT match files directly under
+            # crates/core/src/ (node.rs, transport.rs, etc.) — only files in
+            # subdirectories. Adding the bare *.rs glob covers the top-level files.
+            # See issue #4632.
+            "crates/core/src/*.rs",
             "crates/core/src/**/*.rs",
         ],
         capture_output=True,
