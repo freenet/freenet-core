@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::{borrow::Cow, io, net::SocketAddr};
 
 use futures::Future;
-use tokio::net::UdpSocket;
+// This is the one legitimate tokio::net::UdpSocket import in crates/core/src/:
+// transport.rs is the module that implements the Socket trait abstraction over
+// UdpSocket. New code outside this file must use the Socket trait instead.
+use tokio::net::UdpSocket; // rule-lint: ok — Socket trait implementation site
 
 // =============================================================================
 // Auto-update version mismatch detection

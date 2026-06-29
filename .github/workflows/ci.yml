@@ -314,7 +314,10 @@ jobs:
             | grep '^+' | grep -v '^+++' || true)
           ALL_ADDED_STRIPPED=$(echo "$ALL_ADDED" | sed 's|//.*||' || true)
 
-          REMOVED=$(git diff "$BASE"..."$HEAD" -- 'crates/core/src/**/*.rs' 'crates/core/tests/**/*.rs' \
+          # Both *.rs and **/*.rs are needed: git's ** does NOT match files
+          # directly under crates/core/src/ — only nested files. The bare *.rs
+          # glob covers top-level files (node.rs, transport.rs, etc.). See #4632.
+          REMOVED=$(git diff "$BASE"..."$HEAD" -- 'crates/core/src/*.rs' 'crates/core/src/**/*.rs' 'crates/core/tests/**/*.rs' \
             | grep '^-' | grep -v '^---' || true)
           REMOVED_STRIPPED=$(echo "$REMOVED" | sed 's|//.*||' || true)
           # The test-exempt label allows mechanical refactors (e.g., retiring a
