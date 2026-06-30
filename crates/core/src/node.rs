@@ -1767,6 +1767,32 @@ where
             return Ok(());
         }
         NetMessageV1::SubscribeHint(hint) => {
+            // Disabled 0.2.88: over-aggressive migration storm (#4630-adjacent).
+            // do NOT re-enable aggressive placement migration; see
+            // .claude/rules/hosting-invariants.md (anti-pattern: holding-driven
+            // placement push). A PRODUCTION node (no floor override) ignores
+            // inbound hints entirely so a fresh 0.2.88 node is never pulled into
+            // the storm by a not-yet-upgraded 0.2.87 neighbor that still emits
+            // hints. A SIMULATION node (override present) defers to the
+            // version-floor check below, preserving the migration-mechanism
+            // tests. Early-return BEFORE any telemetry so a disabled production
+            // node reports no placement-migration activity at all, matching the
+            // pre-0.2.80 "migration off" baseline; the debug log still surfaces
+            // residual inbound hint volume for operators.
+            if !crate::node::network_bridge::p2p_protoc::placement_migration_enabled(
+                op_manager
+                    .ring
+                    .connection_manager
+                    .subscribe_hint_floor_override(),
+            ) {
+                tracing::debug!(
+                    key = %hint.key,
+                    ?source_addr,
+                    "Ignoring inbound SubscribeHint: placement migration disabled \
+                     (0.2.88 kill switch)"
+                );
+                return Ok(());
+            }
             // Placement-migration telemetry (#4404 follow-up): count every inbound
             // hint, before any admission gate, so `received` is the true arrival
             // rate and `received - acted` is the gated/dropped fraction.

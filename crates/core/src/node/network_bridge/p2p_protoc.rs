@@ -800,6 +800,64 @@ pub(in crate::node) struct P2pConnManager {
 /// ramps with fleet upgrade rather than switching on everywhere at once.
 pub(crate) const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 2, 80);
 
+/// Production kill switch for SubscribeHint placement migration (the #4404
+/// directed-subscribe mechanism), gating BOTH the emit sides and the
+/// inbound-act site.
+///
+/// Disabled 0.2.88: over-aggressive migration storm (#4630-adjacent). do NOT
+/// re-enable aggressive placement migration; see
+/// `.claude/rules/hosting-invariants.md` (anti-pattern: holding-driven placement
+/// push). 0.2.87 fresh nodes pulled ~1000 contracts with no locality pattern,
+/// saturating bandwidth. Migration was re-enabled in v0.2.80 (#4404 / #4511) and
+/// then amplified by the v0.2.87 admission-gate loosening (#4625 / #4628).
+///
+/// When `false`, a PRODUCTION node neither EMITS SubscribeHint nudges
+/// (`consider_contract_migration` / `consider_migration_for_new_peer` in
+/// `p2p_protoc/migration.rs`) nor ACTS on inbound hints (the `SubscribeHint`
+/// receive handler in `crate::node` early-returns), so a fresh upgraded node is
+/// protected from the storm even when a not-yet-upgraded 0.2.87 neighbor still
+/// emits hints.
+///
+/// This const is consulted ONLY for production nodes; see
+/// [`placement_migration_enabled`] for how simulation nodes are carved out so
+/// the existing per-node floor-override test mechanism still drives migration
+/// on/off (preserving coverage of the mechanism for the eventual re-enable).
+///
+/// `SUBSCRIBE_HINT_MIN_VERSION` is deliberately left untouched: disabling
+/// emission only NARROWS what is sent (strictly fewer SubscribeHint messages on
+/// the wire), so the kill switch is wire-safe and the frozen-floor doctrine above
+/// is preserved. Re-enabling is a placement-migration-surface change that needs
+/// Ian (@sanity) sign-off and the staged re-enable plan (#4440).
+pub(crate) const PLACEMENT_MIGRATION_ENABLED: bool = false;
+
+/// Whether SubscribeHint placement migration runs on this node at all.
+///
+/// `floor_override` is this node's per-node `subscribe_hint_floor_override`. It
+/// is the seam that distinguishes a SIMULATION node from a PRODUCTION one:
+///
+/// * Production nodes NEVER set the override (`None`, see `NodeConfig` /
+///   `ConnectionManager` defaults), so the [`PLACEMENT_MIGRATION_ENABLED`] kill
+///   switch decides. In 0.2.88 that means migration is OFF.
+/// * Simulation nodes ALWAYS set the override (`Some(..)`): the harness defaults
+///   it to an unreachable floor (migration off) and `enable_placement_migration`
+///   lowers it to `(0,0,0)` (migration on) — see `SimNetwork`. When the override
+///   is present we return `true` here so the kill switch does NOT blanket-block;
+///   the downstream version-floor checks (which read the same override) then
+///   drive migration on/off exactly as before this hotfix, keeping the
+///   simulation tests of the mechanism (`test_contract_migrates_*`,
+///   `test_placement_migration_at_scale_*`, the fanout-liveness scenarios) intact.
+///
+/// Read through this function (not the `const` directly) at the guard sites so
+/// the `if !placement_migration_enabled(..) { return; }` early-returns stay
+/// opaque to rustc's `unreachable_code` analysis: a bare comparison against a
+/// compile-time-`false` const would mark the rest of each guarded body
+/// unreachable and fail the `-D warnings` build. See [`PLACEMENT_MIGRATION_ENABLED`].
+pub(crate) fn placement_migration_enabled(floor_override: Option<(u8, u8, u16)>) -> bool {
+    // Simulation node (override present) → defer to the floor checks; production
+    // node (override absent) → the kill switch decides.
+    floor_override.is_some() || PLACEMENT_MIGRATION_ENABLED
+}
+
 /// This node's own crate version as a `(major, minor, patch)` tuple, parsed at
 /// compile time from `CARGO_PKG_VERSION`.
 ///
@@ -3472,7 +3530,10 @@ mod tests {
         // PR #4511 (#4145 fixed in #4499). This test pinned the v0.2.74
         // deactivation (dormant for every 0.2.x peer) and now documents that
         // prior behavior; its asserts no longer hold against the lowered floor.
-        // Replaced by `placement_migration_active_at_reenable_floor` below.
+        // The wire floor is pinned by `subscribe_hint_wire_floor_frozen_at_0_2_80`
+        // below. Note (0.2.88): migration is again disabled for all production
+        // peers, but now by the `PLACEMENT_MIGRATION_ENABLED` kill switch rather
+        // than the wire floor (see `placement_migration_disabled_by_flag`).
         #[ignore]
         #[test]
         fn placement_migration_deactivated_for_all_0_2_x() {
@@ -3490,19 +3551,25 @@ mod tests {
             ));
         }
 
-        /// Pin the PRODUCTION constant (not the local `FLOOR`): the placement
-        /// migration is RE-ENABLED at `(0, 2, 80)` (#4499 made it load-safe), so
-        /// peers at or above that floor participate while pre-floor 0.2.x peers
-        /// and unknown versions stay gated off (wire-compat with the staggered
-        /// rollout). An accidental change to the floor moves the activation set
-        /// and trips the pinned value below. See docs/RELEASING.md and issues
-        /// #4145 / #4499.
+        /// Pin the PRODUCTION wire-compat floor (not the local `FLOOR`) at
+        /// exactly `(0, 2, 80)`. This guards the WIRE GATE only: which peer
+        /// versions may exchange the `SubscribeHint` wire variant without a
+        /// deserialization break (the frozen-floor doctrine). It does NOT mean
+        /// placement migration is active: as of 0.2.88 migration is disabled for
+        /// PRODUCTION nodes by `PLACEMENT_MIGRATION_ENABLED` regardless of version
+        /// (simulations still drive it via the floor override — see
+        /// `placement_migration_disabled_by_flag` and the emit/act source-scrape
+        /// pins). The floor is left untouched on purpose so re-enabling later is a
+        /// one-line flag flip rather than a wire change. An accidental change to
+        /// the floor moves the wire-eligibility set and trips the pinned value
+        /// below. See docs/RELEASING.md and issues #4145 / #4499.
         #[test]
-        fn placement_migration_active_at_reenable_floor() {
+        fn subscribe_hint_wire_floor_frozen_at_0_2_80() {
             // The `supported(0,2,80)` + `!supported(0,2,79)` pair below pins the
             // floor to exactly `(0, 2, 80)`: an accidental change moves the
-            // activation set and trips these asserts.
-            // At or above the floor: active.
+            // wire-eligibility set and trips these asserts.
+            // At or above the floor: wire-eligible (migration still gated off by
+            // the kill switch).
             assert!(version_supports_subscribe_hint(
                 Some((0, 2, 80)),
                 SUBSCRIBE_HINT_MIN_VERSION
@@ -4983,6 +5050,122 @@ mod tests {
             include_str!("p2p_protoc/connection_lifecycle.rs"),
         ]
         .join("\n")
+    }
+
+    /// Kill-switch value pin: SubscribeHint placement migration is OFF for
+    /// PRODUCTION nodes in 0.2.88, while SIMULATION nodes still drive it via the
+    /// floor override.
+    ///
+    /// A production node never sets `subscribe_hint_floor_override` (the gate
+    /// argument is `None`), so `placement_migration_enabled(None)` MUST be
+    /// `false` until the staged re-enable plan (#4440) flips
+    /// `PLACEMENT_MIGRATION_ENABLED` back with Ian (@sanity) sign-off. Re-enabling
+    /// without that review reopens the over-aggressive migration storm (0.2.87:
+    /// fresh nodes pull ~1000 contracts, saturating bandwidth). A simulation node
+    /// always sets the override (the gate argument is `Some(..)`), so the kill
+    /// switch must NOT blanket-block it — the downstream floor checks decide,
+    /// keeping the migration-mechanism tests working. Paired with the two
+    /// source-scrape pins below (which prove every site early-returns on this
+    /// gate), this pins the production-off / simulation-defer split.
+    #[test]
+    fn placement_migration_disabled_by_flag() {
+        // Production node: no floor override → kill switch decides → OFF.
+        assert!(
+            !super::placement_migration_enabled(None),
+            "production nodes (no subscribe_hint_floor_override) must have placement \
+             migration OFF (PLACEMENT_MIGRATION_ENABLED == false, 0.2.88 \
+             migration-storm hotfix). Flipping it on re-enables the SubscribeHint \
+             placement-migration storm; that is a placement-migration-surface change \
+             requiring Ian (@sanity) sign-off and the #4440 staged re-enable plan."
+        );
+        // Simulation node: override present → defer to the floor checks (the kill
+        // switch must not blanket-block, or the migration-mechanism sim tests
+        // would silently pass vacuously / fail).
+        assert!(
+            super::placement_migration_enabled(Some(super::SUBSCRIBE_HINT_MIN_VERSION)),
+            "a simulation node (subscribe_hint_floor_override present) must NOT be \
+             blanket-blocked by the production kill switch — migration on/off is \
+             decided by the floor override so test coverage of the mechanism is \
+             preserved"
+        );
+        assert!(super::placement_migration_enabled(Some((0, 0, 0))));
+    }
+
+    /// Source-scrape pin: BOTH SubscribeHint emit sites are gated by the kill
+    /// switch. `consider_contract_migration` and `consider_migration_for_new_peer`
+    /// (in `p2p_protoc/migration.rs`, included by `production_src()`) MUST each
+    /// early-return on `!placement_migration_enabled()` BEFORE any nudge work, so
+    /// a disabled node emits zero SubscribeHint messages. There is no lightweight
+    /// `P2pConnManager` harness in this crate (the emit path needs a full bridge +
+    /// op_manager + ring), so this pins the guard at the source level, matching
+    /// the existing source-scrape pins in this module. Removing either guard
+    /// re-opens the storm source (a node nudging every closer neighbor for each
+    /// hosted contract on every new connection) and trips this pin.
+    #[test]
+    fn placement_migration_emit_sites_gated_by_flag() {
+        let src = production_src();
+        let guard = "if !placement_migration_enabled(";
+        for (func, work_anchor) in [
+            (
+                "fn consider_contract_migration(",
+                "select_migration_target(",
+            ),
+            (
+                "fn consider_migration_for_new_peer(",
+                "hosting_contract_keys(",
+            ),
+        ] {
+            let start = src
+                .find(func)
+                .unwrap_or_else(|| panic!("emit site `{func}` not found in production source"));
+            let body = &src[start..];
+            let guard_at = body.find(guard).unwrap_or_else(|| {
+                panic!(
+                    "emit site `{func}` MUST early-return on `{guard}` (0.2.88 kill \
+                     switch) before emitting any SubscribeHint nudge"
+                )
+            });
+            let work_at = body.find(work_anchor).unwrap_or_else(|| {
+                panic!("expected `{work_anchor}` in `{func}` body (anchor moved?)")
+            });
+            assert!(
+                guard_at < work_at,
+                "emit site `{func}`: the `{guard}` kill-switch guard must come BEFORE \
+                 `{work_anchor}` so no nudge work runs while migration is disabled"
+            );
+        }
+    }
+
+    /// Source-scrape pin: the inbound SubscribeHint act site is gated by the kill
+    /// switch. The `SubscribeHint` receive handler in `node.rs` MUST early-return
+    /// on `!placement_migration_enabled()` before it starts a directed subscribe,
+    /// so a fresh 0.2.88 node ignores hints from a not-yet-upgraded 0.2.87
+    /// neighbor and is never pulled into the storm. The handler needs a full
+    /// `OpManager` to run, so (like the emit pin above) this pins the guard at the
+    /// source level. The guard must precede `start_directed_subscribe(`; removing
+    /// it would let a disabled node act on hints and trips this pin.
+    #[test]
+    fn placement_migration_inbound_act_gated_by_flag() {
+        let node_src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/node.rs"),
+        )
+        .expect("read crates/core/src/node.rs");
+        let handler_at = node_src
+            .find("NetMessageV1::SubscribeHint(hint) =>")
+            .expect("SubscribeHint inbound handler arm not found in node.rs");
+        let body = &node_src[handler_at..];
+        let guard_at = body.find("placement_migration_enabled(").expect(
+            "inbound SubscribeHint handler MUST gate on placement_migration_enabled(..) \
+             (0.2.88 kill switch) before acting on a hint",
+        );
+        let act_at = body.find("start_directed_subscribe(").expect(
+            "expected start_directed_subscribe( in the SubscribeHint handler (anchor moved?)",
+        );
+        assert!(
+            guard_at < act_at,
+            "the placement_migration_enabled() kill-switch guard must come BEFORE \
+             start_directed_subscribe() so a disabled node never acts on an inbound hint"
+        );
     }
 
     /// Source-scrape pin: SITE 1. The ConnectPeer enqueue in the

@@ -104,6 +104,21 @@ impl P2pConnManager {
     /// Migration is reconsidered on the next hosting/peer event, so a dropped
     /// hint is self-healing.
     pub(super) fn consider_contract_migration(&self, key: freenet_stdlib::prelude::ContractKey) {
+        // Disabled 0.2.88: over-aggressive migration storm (#4630-adjacent). do
+        // NOT re-enable aggressive placement migration; see
+        // .claude/rules/hosting-invariants.md (anti-pattern: holding-driven
+        // placement push). Production nodes (no floor override) emit nothing
+        // while the kill switch is off; simulations (override present) defer to
+        // the floor checks below, preserving the migration-mechanism tests.
+        if !placement_migration_enabled(
+            self.bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .subscribe_hint_floor_override(),
+        ) {
+            return;
+        }
         if !self.bridge.op_manager.ring.is_hosting_contract(&key) {
             return;
         }
@@ -172,6 +187,22 @@ impl P2pConnManager {
     /// [`MIGRATION_SCAN_CAP_PER_NEW_PEER`] so we never do an unbounded inline
     /// scan + nudge fan-out from the event loop (channel-safety).
     pub(super) fn consider_migration_for_new_peer(&self, peer_addr: SocketAddr) {
+        // Disabled 0.2.88: over-aggressive migration storm (#4630-adjacent). do
+        // NOT re-enable aggressive placement migration; see
+        // .claude/rules/hosting-invariants.md (anti-pattern: holding-driven
+        // placement push). Gaining a neighbor must NOT nudge it for our hosted
+        // contracts while the kill switch is off (this is the storm source).
+        // Production nodes (no floor override) early-return; simulations
+        // (override present) defer to the floor checks, preserving test coverage.
+        if !placement_migration_enabled(
+            self.bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .subscribe_hint_floor_override(),
+        ) {
+            return;
+        }
         let new_peer_loc = self
             .connections
             .get(&peer_addr)
