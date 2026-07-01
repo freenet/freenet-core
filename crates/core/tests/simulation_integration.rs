@@ -12238,3 +12238,64 @@ fn test_scripted_node_crash_mid_run() {
         );
     }
 }
+
+/// Error-path coverage for the controllable-clock harness: scheduling
+/// `SimOperation::AdvanceHostingClock` WITHOUT first calling
+/// `enable_hosting_time_control()` must degrade gracefully — the runner logs a
+/// warning and the advance is a no-op, rather than panicking or wedging. This
+/// exercises the "no controllable hosting clock was enabled" branch of the
+/// special-op dispatch.
+#[test]
+fn test_advance_hosting_clock_without_control_is_graceful_noop() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const NETWORK: &str = "advance-clock-no-control";
+    const SEED: u64 = 0x4642_A002_CAFE;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let contract = SimOperation::create_test_contract(31);
+    let state = SimOperation::create_test_state(31);
+
+    // NOTE: enable_hosting_time_control() is deliberately NOT called here.
+    let sim = rt.block_on(async { SimNetwork::new(NETWORK, 1, 1, 7, 3, 10, 2, SEED).await });
+
+    let operations = vec![
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state.clone(),
+                subscribe: true,
+            },
+        ),
+        // No controllable clock is enabled → this must be a graceful no-op.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: Duration::from_secs(30 * 60),
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(20),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation must complete gracefully even when AdvanceHostingClock is scheduled \
+         without a controllable clock enabled: {:?}",
+        result.turmoil_result.err()
+    );
+    // The gateway still hosts its PUT — the no-op advance changed nothing.
+    assert!(
+        result.is_node_hosting(&gateway, &contract.key()),
+        "gateway should still host its PUT contract"
+    );
+}
