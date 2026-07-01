@@ -1451,6 +1451,15 @@ async fn lookup_stored_key(
 /// touch unrelated code paths.
 const MAX_RETRIES: usize = 3;
 
+/// Maximum advertised hosts a relay forwards to, once its single greedy
+/// routing hop is exhausted, before giving up (hosting redesign piece C,
+/// invariant 5). Bounded small so the terminal consult adds at most a couple
+/// of extra forwards per relay on the NotFound return path — see the consult
+/// site in `drive_relay_get_inner` for why this does not re-introduce the
+/// per-hop fan-out amplification (local-lookup-gated, advertised-only,
+/// bubble-up halts at the first Found).
+const MAX_TERMINAL_CONSULT_HOSTS: usize = 2;
+
 /// Pure selection core for the bootstrap gateway fallback (#4361).
 ///
 /// Returns the first configured gateway that is not this node and not
@@ -2787,6 +2796,32 @@ where
 
     let mut retries: usize = 0;
 
+    // Terminal advertisement consult (hosting redesign piece C, invariant 5).
+    // Lazily built the first time location routing is exhausted; each entry
+    // is an advertised host to forward to (off the direct routing path).
+    let mut local_fallback = local_fallback;
+    let mut consult_targets: Option<std::vec::IntoIter<(PeerKeyLocation, SocketAddr)>> = None;
+    // True while the current attempt targets a consulted advertised host (so
+    // its Found reply is attributed to the consult telemetry, not routing).
+    // Assigned by every non-returning arm of the peer-selection match below.
+    let mut consult_active: bool;
+    // True when the most recent forward on `incoming_tx` produced NO reply
+    // (timeout or send-failure). In that state the awaited peer may still send
+    // a LATE reply on the reused tx, which would satisfy a freshly-registered
+    // consult waiter and bubble a false result — so we do NOT consult after a
+    // failed forward (Codex P2). Reset by any forward that received a reply.
+    let mut last_forward_failed = false;
+    // True once at least one location-routing forward has happened. When
+    // `relay_advance_to_next_peer` returns None on the FIRST iteration (no
+    // routing candidate at all), consulting is a no-op — every advertised host
+    // is either a visited connection (excluded) or a not-ready/transient one
+    // that k_closest deliberately skips — so we skip the consult there for
+    // counter accuracy and parity with SUBSCRIBE's `candidates.is_empty()`
+    // branch. The consult's value is reaching an unvisited advertised neighbor
+    // the single greedy forward (MAX_RELAY_RETRIES) skipped, which requires a
+    // routing forward to have occurred.
+    let mut did_forward = false;
+
     loop {
         // Pick next downstream peer.
         let (peer, peer_addr) = match relay_advance_to_next_peer(
@@ -2796,10 +2831,16 @@ where
             &mut retries,
             &new_visited,
         ) {
-            Some(p) => p,
+            Some(p) => {
+                consult_active = false;
+                did_forward = true;
+                p
+            }
             None => {
-                // Exhausted: serve local fallback if available, else NotFound.
-                if let Some((key, state, contract)) = local_fallback {
+                // Location routing exhausted → this relay is a terminus for
+                // the key. Prefer any (stale) local fallback we already hold —
+                // existing behavior, not a dead-end.
+                if let Some((key, state, contract)) = local_fallback.take() {
                     tracing::info!(
                         tx = %incoming_tx,
                         %instance_id,
@@ -2829,7 +2870,94 @@ where
                     .await;
                     cache_contract_locally(op_manager, key, state, contract, false).await;
                     send_result?;
+                    return Ok(());
+                }
+
+                // This relay has exhausted its single greedy routing forward
+                // (MAX_RELAY_RETRIES = 1) without finding the contract, and
+                // holds no local copy. Before declaring a findability
+                // dead-end, consult the host advertisements our neighbors
+                // broadcast for this key (invariant 5) and try the closest
+                // UNVISITED advertised hosts the retry cap skipped — the "one
+                // hop off the routing path" case.
+                //
+                // `consult_advertised_hosts` returns ONLY peers that already
+                // advertised hosting — nothing is pushed or cached, so this is
+                // not the speculative-pre-replication anti-pattern. Each
+                // candidate is marked tried + visited so the existing dedup
+                // prevents loops, and the forward below carries HTL-1.
+                //
+                // This does NOT re-introduce the removed 3^HTL per-hop retry
+                // fan-out: a *local* lookup gates the forward, so a
+                // truly-absent contract (no neighbor advertised it) triggers
+                // ZERO extra network forwards; and each relay adds at most
+                // MAX_TERMINAL_CONSULT_HOSTS forwards, only on the NotFound
+                // return path. It can fire at an intermediate relay (not only
+                // the deepest terminus), which is intended: the advertised host
+                // is a neighbor of THIS relay, invisible to the deeper terminus.
+                //
+                // LOAD-BEARING assumption: "an advertised host almost always
+                // HAS the contract, so the bubble-up halts at the first Found."
+                // The rare exception is a host that evicted the contract but
+                // whose removal-announce (`on_contract_unhosted`) was lost while
+                // it is still a ring connection — the consult can then turn it
+                // into a re-routing relay (branching 1 → toward relay fan-out).
+                // That branching is bounded and does NOT recreate the 3^HTL
+                // tx-minting bug: (a) HTL-1 caps depth; (b) the visited bloom is
+                // carried on the forward so no peer is re-probed; (c) the
+                // consult only targets CURRENTLY-CONNECTED advertised peers; and
+                // (d) eviction retracts the advertisement, so the window is
+                // small and self-closing. If a future change weakens any of
+                // these, re-evaluate this site.
+                //
+                // Only consult when the previous forward received a reply; a
+                // timed-out / send-failed forward may still reply late on the
+                // reused tx and satisfy the consult waiter (Codex P2). And only
+                // consult when a routing forward actually happened
+                // (`did_forward`) — a no-candidate terminus consult is a no-op
+                // (parity with SUBSCRIBE). Either way, skip the consult and
+                // report NotFound — the same outcome as before the consult.
+                let consult_candidate = if last_forward_failed || !did_forward {
+                    None
                 } else {
+                    let targets = consult_targets.get_or_insert_with(|| {
+                        let tried_snapshot = tried.clone();
+                        let visited_snapshot = new_visited.clone();
+                        crate::operations::consult_advertised_hosts(
+                            op_manager,
+                            &instance_id,
+                            MAX_TERMINAL_CONSULT_HOSTS,
+                            move |addr| {
+                                tried_snapshot.contains(&addr)
+                                    || visited_snapshot.probably_visited(addr)
+                            },
+                        )
+                        .into_iter()
+                    });
+                    targets.next()
+                };
+                if let Some((consult_peer, consult_addr)) = consult_candidate {
+                    tried.push(consult_addr);
+                    new_visited.mark_visited(consult_addr);
+                    consult_active = true;
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        %instance_id,
+                        target = %consult_addr,
+                        "GET relay: terminus consulting advertised host off routing path"
+                    );
+                    (consult_peer, consult_addr)
+                } else {
+                    // Dead-end confirmed: no usable advertised host (or every
+                    // advertised host was already tried / also failed). Record
+                    // a still-not-found outcome only if a consult actually ran
+                    // (`consult_targets` was built) — not when it was skipped
+                    // after a failed forward. A resolved consult would have
+                    // returned from the Found arm above, so this is reached
+                    // only when no consult forward succeeded.
+                    if consult_targets.is_some() {
+                        crate::operations::record_terminal_consult_outcome(false);
+                    }
                     tracing::warn!(
                         tx = %incoming_tx,
                         %instance_id,
@@ -2860,8 +2988,8 @@ where
                         hop_count,
                     )
                     .await;
+                    return Ok(());
                 }
-                return Ok(());
             }
         };
 
@@ -2990,6 +3118,9 @@ where
                     crate::router::RouteOutcome::Failure,
                     crate::node::network_status::OpType::Get,
                 );
+                // No reply received — the awaited peer may reply late on the
+                // reused tx, so do NOT consult after this (Codex P2).
+                last_forward_failed = true;
                 // Continue loop to try next peer.
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -3008,13 +3139,32 @@ where
                     crate::router::RouteOutcome::Failure,
                     crate::node::network_status::OpType::Get,
                 );
+                // Timed out with no reply — the peer may reply late on the
+                // reused tx, so do NOT consult after this (Codex P2).
+                last_forward_failed = true;
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
         };
 
+        // A reply was received on `incoming_tx` (the only path past the
+        // `round_trip` match), so the awaited peer will not reply late — it is
+        // safe to consult after this attempt (Codex P2). Reset regardless of
+        // how the reply classifies below.
+        last_forward_failed = false;
+
         // Classify the reply.
-        match classify(reply) {
+        let attempt_outcome = classify(reply);
+        // Terminal-consult telemetry is NOT recorded here: attributing a Found
+        // reply from a consulted host at classify time would be premature,
+        // because delivery of that Found can still fail by a fallible
+        // side-effect below — `send_result?` for InlineFound, `claim_or_wait`
+        // for Streaming (the #4345 "classify terminal before a fallible side
+        // effect" anti-pattern). `resolved_found` is instead recorded inside
+        // the InlineFound / Streaming arms AFTER that side-effect succeeds, so
+        // a send/claim failure correctly leaves the op to record
+        // still-not-found at the exhaustion arm.
+        match attempt_outcome {
             AttemptOutcome::Terminal(Terminal::InlineFound {
                 key,
                 state,
@@ -3079,6 +3229,13 @@ where
                 // cache).
                 cache_contract_locally(op_manager, key, state, contract, false).await;
                 send_result?;
+                // Delivery succeeded (`send_result?` did not return): a
+                // consulted advertised host closed the dead-end. Record now,
+                // AFTER the fallible upstream forward, not at classify time.
+                // This arm returns, so exactly one consult outcome is recorded.
+                if consult_active {
+                    crate::operations::record_terminal_consult_outcome(true);
+                }
                 return Ok(());
             }
             AttemptOutcome::Terminal(Terminal::Streaming {
@@ -3156,6 +3313,14 @@ where
                     }
                 };
 
+                // NOTE: the terminal-consult `resolved_found` for a streaming
+                // reply is recorded only AFTER the payload is actually
+                // delivered — the loopback cache (below) or the remote
+                // `pipe_stream` success (Step 3). Recording here, right after
+                // the claim, would be a false positive: assembly, the header
+                // send, and the pipe can all still fail without the requester
+                // receiving the Found result.
+
                 // ── Step 2: Loopback safety net. If upstream IS us
                 //    (originator-loopback edge — rare), assemble + cache
                 //    locally instead of piping to self. This branch is
@@ -3183,6 +3348,12 @@ where
                                         false,
                                     )
                                     .await;
+                                    // Loopback delivery succeeded (state cached
+                                    // locally): a consulted advertised host
+                                    // closed the dead-end.
+                                    if consult_active {
+                                        crate::operations::record_terminal_consult_outcome(true);
+                                    }
                                 } else {
                                     tracing::warn!(
                                         tx = %incoming_tx,
@@ -3270,6 +3441,14 @@ where
                          time out cleanly rather than sending a contradictory NotFound"
                     );
                     return Ok(());
+                }
+
+                // Remote delivery committed: the ResponseStreaming header went
+                // upstream and `pipe_stream` started successfully. A consulted
+                // advertised host closed the dead-end — record now, AFTER the
+                // fallible header send + pipe, not at claim time.
+                if consult_active {
+                    crate::operations::record_terminal_consult_outcome(true);
                 }
 
                 // ── Step 4: Record the relay route event for the downstream
@@ -4642,6 +4821,67 @@ mod tests {
         );
     }
 
+    /// Piece C (invariant 5): the relay terminus must consult neighbor host
+    /// advertisements BEFORE declaring a NotFound dead-end. The consult call
+    /// must appear before `relay_send_not_found` in source order so the
+    /// advertised-host forward is attempted first.
+    #[test]
+    fn relay_terminus_consults_advertised_hosts_before_not_found() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        let consult_pos = body.find("consult_advertised_hosts").expect(
+            "drive_relay_get_inner must consult advertised hosts at the routing \
+             terminus (hosting redesign piece C, invariant 5)",
+        );
+        // Anchor on the exhaustion dead-end marker (unique to the consult's
+        // else branch); the driver has an earlier HTL-exhaustion NotFound, so
+        // a bare `relay_send_not_found` anchor would match the wrong site.
+        let deadend_pos = body
+            .find("Dead-end confirmed")
+            .expect("consult exhaustion branch must confirm the dead-end before NotFound");
+        assert!(
+            consult_pos < deadend_pos,
+            "the terminal advertisement consult must run BEFORE the NotFound \
+             send so an off-path advertised host gets a chance to answer"
+        );
+        assert!(
+            body.contains("relay_send_not_found"),
+            "drive_relay_get_inner must still send NotFound on a true dead-end"
+        );
+        // The consult outcome must be recorded so the telemetry measures
+        // whether the consult closes dead-ends.
+        assert!(
+            body.contains("record_terminal_consult_outcome"),
+            "drive_relay_get_inner must record the terminal consult outcome"
+        );
+    }
+
+    /// Piece C P2 (Codex): the consult reuses `incoming_tx`, so it must NOT run
+    /// after a forward that got NO reply (timeout / send-failure) — a late
+    /// reply from the timed-out peer could satisfy the consult waiter and
+    /// bubble a false NotFound. Pin that both failure arms flag
+    /// `last_forward_failed` and the consult is gated on it.
+    #[test]
+    fn consult_skipped_after_failed_forward() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        // Both no-reply arms set the guard.
+        assert!(
+            body.matches("last_forward_failed = true").count() >= 2,
+            "both the send-failure and timeout arms must set last_forward_failed = true"
+        );
+        // A received reply clears it.
+        assert!(
+            body.contains("last_forward_failed = false"),
+            "a received reply must reset last_forward_failed so the consult can run"
+        );
+        // The consult is gated on the guard.
+        assert!(
+            body.contains("if last_forward_failed"),
+            "the consult must be gated on !last_forward_failed (skip after a no-reply forward)"
+        );
+    }
+
     /// T6 (superseded): Originally required `relay_send_forwarding_ack`
     /// to be emitted before the downstream send. That ack collided with
     /// the upstream relay driver's capacity-1 `pending_op_results`
@@ -4847,47 +5087,36 @@ mod tests {
     fn exhaustion_branches_on_local_fallback_presence() {
         let src = production_source();
         let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
-        // The None arm of the `match relay_advance_to_next_peer(...)` is the
-        // exhaustion branch. It must contain both `local_fallback` disposition
-        // AND both Found and NotFound sends.
-        let none_arm = body
-            .find("None => {")
-            .expect("exhaustion arm (`None => {{`) must exist");
-        // Clip to the matching close; the next `Some(p) => {` arm may precede
-        // or follow, so take the whole match body from None onward up to the
-        // end of the outer function block.
-        let tail = &body[none_arm..];
-        // Bound at the `return Ok(());` that ends the exhaustion branch.
-        let clip = tail
-            .find("return Ok(());")
-            .expect("exhaustion branch must end with `return Ok(());`");
-        let arm = &tail[..clip + "return Ok(());".len()];
+        // The exhaustion (terminus) path disposes of the request in this order:
+        //   1. serve a local stale-cache fallback if present (Found, R10);
+        //   2. else consult neighbor host advertisements (piece C) and forward
+        //      to an advertised off-path host;
+        //   3. else send NotFound upstream.
+        // Assert all three dispositions exist in that source order.
         assert!(
-            arm.contains("if let Some((key, state, contract)) = local_fallback"),
+            body.contains("local_fallback.take()"),
             "Exhaustion arm must branch on `local_fallback`; otherwise the \
              stale-cache fallback semantic (R3d → R10) is lost."
         );
+        let fallback_pos = body
+            .find("serving local fallback")
+            .expect("exhaustion must serve the stale local copy when `local_fallback` is Some");
+        let consult_pos = body.find("consult_advertised_hosts").expect(
+            "exhaustion must consult advertised hosts before NotFound (piece C, invariant 5)",
+        );
+        let not_found_pos = body
+            .find("all peers exhausted — sending NotFound upstream")
+            .expect("exhaustion must send NotFound when there is no fallback or advertised host");
         assert!(
-            arm.contains("relay_send_found"),
-            "Exhaustion arm must call `relay_send_found` when `local_fallback` \
-             is Some — the stale-cache relay serves what it has after all \
-             downstream peers NotFound."
+            fallback_pos < consult_pos && consult_pos < not_found_pos,
+            "Exhaustion order must be: serve local fallback (Found) → consult \
+             advertised hosts → NotFound. Got fallback={fallback_pos}, \
+             consult={consult_pos}, not_found={not_found_pos}."
         );
         assert!(
-            arm.contains("relay_send_not_found"),
-            "Exhaustion arm must call `relay_send_not_found` when \
-             `local_fallback` is None — the non-caching relay bubbles \
-             NotFound upstream."
-        );
-        // Ordering: the `else` branch (NotFound) must follow the `if Some`
-        // branch (Found).
-        let found_pos = arm.find("relay_send_found").unwrap();
-        let not_found_pos = arm.find("relay_send_not_found").unwrap();
-        assert!(
-            found_pos < not_found_pos,
-            "Fallback-Found must precede NotFound in the exhaustion arm \
-             source order; a reversal would mean NotFound always runs first \
-             and the fallback path is dead code."
+            body.contains("relay_send_found") && body.contains("relay_send_not_found"),
+            "Exhaustion arm must be able to send both Found (fallback) and \
+             NotFound (true dead-end)."
         );
     }
 
@@ -5315,10 +5544,11 @@ mod tests {
             .find("let reply = match round_trip {")
             .expect("round_trip match must exist");
         let tail = &body[round_trip..];
-        // Clip at the end of the match (next `match classify(reply)`).
+        // Clip at the end of the match (the `classify(reply)` call that
+        // follows it — now bound to `let attempt_outcome = classify(reply);`).
         let clip = tail
-            .find("match classify(reply)")
-            .expect("classify match must follow round_trip match");
+            .find("classify(reply)")
+            .expect("classify call must follow round_trip match");
         let match_body = &tail[..clip];
         // Channel-error arm: `Ok(Err(err)) => { ... continue; }`.
         let err_arm = match_body

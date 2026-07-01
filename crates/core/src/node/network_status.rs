@@ -166,6 +166,28 @@ pub struct NetworkStatus {
     pub op_stats: OperationStats,
     /// NAT traversal counters.
     pub nat_stats: NatStats,
+    /// Terminal advertisement-consult counters (hosting redesign piece C).
+    pub terminal_consult_stats: TerminalConsultStats,
+}
+
+/// Per-node counters for the terminal advertisement consult (invariant 5:
+/// "findability is routing + on-demand advertisement").
+///
+/// A GET/SUBSCRIBE that routes to a terminus (closest peer it can reach,
+/// can't route closer) consults the host-advertisements its neighbors sent
+/// before returning NotFound. These scalars measure whether that consult
+/// actually closes dead-ends. Per-node aggregate only — no per-contract
+/// breakdown.
+#[derive(Default)]
+pub struct TerminalConsultStats {
+    /// A terminus consulted its neighbor advertisements (one per terminus).
+    pub attempts: u64,
+    /// The consult found at least one advertised host to forward to.
+    pub hits: u64,
+    /// A consult forward resolved the request to Found/Subscribed.
+    pub resolved_found: u64,
+    /// A consult ran but the request still ended NotFound.
+    pub still_not_found: u64,
 }
 
 /// A connected peer with metadata.
@@ -307,6 +329,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         external_address: None,
         op_stats: OperationStats::default(),
         nat_stats: NatStats::default(),
+        terminal_consult_stats: TerminalConsultStats::default(),
     };
     match NETWORK_STATUS.get() {
         // Already initialized: overwrite the existing tracker in place so
@@ -457,6 +480,46 @@ pub fn record_update_received() {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             s.op_stats.updates_received = s.op_stats.updates_received.saturating_add(1);
+        }
+    }
+}
+
+/// Record that a routing terminus consulted its neighbor advertisements
+/// (hosting redesign piece C). One increment per terminus, regardless of
+/// how many advertised hosts it then tries.
+pub fn record_terminal_consult_attempt() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.terminal_consult_stats.attempts = s.terminal_consult_stats.attempts.saturating_add(1);
+        }
+    }
+}
+
+/// Record that a consult found at least one advertised host to forward to.
+pub fn record_terminal_consult_hit() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.terminal_consult_stats.hits = s.terminal_consult_stats.hits.saturating_add(1);
+        }
+    }
+}
+
+/// Record that a consult forward resolved the request to Found/Subscribed.
+pub fn record_terminal_consult_resolved_found() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.terminal_consult_stats.resolved_found =
+                s.terminal_consult_stats.resolved_found.saturating_add(1);
+        }
+    }
+}
+
+/// Record that a consult ran but the request still ended NotFound.
+pub fn record_terminal_consult_still_not_found() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.terminal_consult_stats.still_not_found =
+                s.terminal_consult_stats.still_not_found.saturating_add(1);
         }
     }
 }

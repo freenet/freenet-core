@@ -50,6 +50,11 @@ use super::{
     complete_local_subscription, prepare_initial_request, register_downstream_subscriber,
 };
 
+/// Advertised hosts a SUBSCRIBE terminus forwards to before giving up
+/// (hosting redesign piece C, invariant 5). The relay is single-shot, so
+/// the consult likewise forwards to just the closest advertised host.
+const TERMINAL_CONSULT_HOSTS: usize = 1;
+
 /// Start a client-initiated subscribe, returning as soon as the task has
 /// been spawned (mirrors legacy `subscribe_with_id` timing).
 ///
@@ -1737,15 +1742,17 @@ async fn drive_relay_subscribe(
             .k_closest_potentially_hosting(&instance_id, &new_visited, MAX_BREADTH);
 
     if candidates.is_empty() {
+        // True no-candidate terminus: every connection is already in the
+        // visited set (otherwise `k_closest` would have returned it), so a
+        // consult here would be a no-op — any advertised host is a visited
+        // connection the consult's skip-list excludes. Report NotFound.
         tracing::warn!(
             tx = %incoming_tx,
             contract = %instance_id,
             phase = "relay_subscribe_not_found",
             "SUBSCRIBE relay: no closer peers to forward"
         );
-        // No-candidates exhaustion: this relay is reporting its own
-        // exhaustion of downstream candidates. hop_count = max_htl - htl
-        // (the forward depth of THIS relay).
+        // No-candidates exhaustion: hop_count = max_htl - htl (this relay's depth).
         let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
         if let Some(event) = crate::tracing::NetEventLog::subscribe_not_found(
             &incoming_tx,
@@ -1770,32 +1777,185 @@ async fn drive_relay_subscribe(
     }
 
     let next_hop = candidates.remove(0);
-    let next_addr = match next_hop.socket_addr() {
-        Some(addr) => addr,
-        None => {
-            tracing::error!(
-                tx = %incoming_tx,
-                %instance_id,
-                target_pub_key = %next_hop.pub_key(),
-                "SUBSCRIBE relay: next hop has no socket address"
-            );
-            // Forward-failure at THIS relay; same depth as no-candidates.
-            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-            return relay_subscribe_send_response(
-                op_manager,
-                incoming_tx,
-                instance_id,
-                SubscribeMsgResult::NotFound,
-                upstream_addr,
-                hop_count,
-            )
-            .await;
-        }
+    let Some(next_addr) = next_hop.socket_addr() else {
+        tracing::error!(
+            tx = %incoming_tx,
+            %instance_id,
+            target_pub_key = %next_hop.pub_key(),
+            "SUBSCRIBE relay: next hop has no socket address"
+        );
+        // Forward-failure at THIS relay; same depth as no-candidates.
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+        return relay_subscribe_send_response(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            SubscribeMsgResult::NotFound,
+            upstream_addr,
+            hop_count,
+        )
+        .await;
     };
     new_visited.mark_visited(next_addr);
 
-    // ── Step 3: Forward downstream, await Response ───────────────────────
+    // ── Step 3: Forward the single greedy routing hop, await Response ─────
+    let outcome = relay_subscribe_forward_once(
+        op_manager,
+        incoming_tx,
+        instance_id,
+        htl,
+        &new_visited,
+        is_renewal,
+        next_hop,
+        next_addr,
+        upstream_addr,
+    )
+    .await;
+
+    // ── Step 4: Terminal advertisement consult (piece C, invariant 5) ─────
+    // Like GET, the SUBSCRIBE relay forwards a SINGLE greedy hop toward the
+    // key and does NOT retry its other neighbors (the same fan-out cap that
+    // GET enforces with MAX_RELAY_RETRIES=1). If that hop returns NotFound,
+    // the closest advertised host may be a neighbor the cap skipped — one hop
+    // off the routing path. Before declaring a dead-end, consult the host
+    // advertisements our neighbors broadcast and try that host.
+    //
+    // Bounded and NOT the removed per-hop fan-out: forwards ONLY to an
+    // already-advertised host (nothing pushed/cached), a local lookup gates
+    // it so a truly-absent contract triggers zero extra forward, and it is a
+    // single extra forward whose Subscribed reply ends the search.
+    // `consult_outcome`: None = no consult ran; Some(true) = a consulted host
+    // returned Subscribed; Some(false) = a consult ran but did not subscribe.
+    // The terminal-consult telemetry is recorded AFTER the upstream send
+    // succeeds (below), never here — a consult that subscribed but whose
+    // fire-and-forget reply then fails leaves the requester to time out, so it
+    // did NOT close the dead-end (Codex P2 — record after delivery).
+    let (result, bubble_hop_count, consult_outcome): (SubscribeMsgResult, usize, Option<bool>) =
+        match outcome {
+            SubscribeForwardOutcome::Subscribed { key, hop_count } => {
+                (SubscribeMsgResult::Subscribed { key }, hop_count, None)
+            }
+            SubscribeForwardOutcome::NotFound { hop_count } => {
+                let visited_snapshot = new_visited.clone();
+                let consult = crate::operations::consult_advertised_hosts(
+                    op_manager,
+                    &instance_id,
+                    TERMINAL_CONSULT_HOSTS,
+                    move |addr| visited_snapshot.probably_visited(addr),
+                );
+                match consult.into_iter().next() {
+                    Some((consult_hop, consult_addr)) => {
+                        new_visited.mark_visited(consult_addr);
+                        tracing::debug!(
+                            tx = %incoming_tx,
+                            %instance_id,
+                            target = %consult_addr,
+                            "SUBSCRIBE relay: consulting advertised host off routing path after \
+                             downstream NotFound"
+                        );
+                        let consult_outcome = relay_subscribe_forward_once(
+                            op_manager,
+                            incoming_tx,
+                            instance_id,
+                            htl,
+                            &new_visited,
+                            is_renewal,
+                            consult_hop,
+                            consult_addr,
+                            upstream_addr,
+                        )
+                        .await;
+                        match consult_outcome {
+                            SubscribeForwardOutcome::Subscribed { key, hop_count } => (
+                                SubscribeMsgResult::Subscribed { key },
+                                hop_count,
+                                Some(true),
+                            ),
+                            SubscribeForwardOutcome::NotFound { hop_count }
+                            | SubscribeForwardOutcome::Failed { hop_count } => {
+                                (SubscribeMsgResult::NotFound, hop_count, Some(false))
+                            }
+                        }
+                    }
+                    None => {
+                        // No advertised host to try: the downstream NotFound stands.
+                        (SubscribeMsgResult::NotFound, hop_count, Some(false))
+                    }
+                }
+            }
+            SubscribeForwardOutcome::Failed { hop_count } => {
+                // The greedy routing forward received NO reply (timeout / send
+                // failure / unexpected variant). Consulting would install a new
+                // waiter on the reused tx that a late reply from the timed-out
+                // peer could satisfy (Codex P2), so bubble NotFound WITHOUT
+                // consulting — the same outcome as before the consult existed.
+                (SubscribeMsgResult::NotFound, hop_count, None)
+            }
+        };
+
+    let send_result = relay_subscribe_send_response(
+        op_manager,
+        incoming_tx,
+        instance_id,
+        result,
+        upstream_addr,
+        bubble_hop_count,
+    )
+    .await;
+
+    // Record the terminal-consult outcome only AFTER the upstream response
+    // send: a consult that subscribed but whose reply failed to send did NOT
+    // close the dead-end for the requester (it will time out), so it counts as
+    // still-not-found (Codex P2).
+    if let Some(consult_resolved) = consult_outcome {
+        crate::operations::record_terminal_consult_outcome(consult_resolved && send_result.is_ok());
+    }
+
+    send_result
+}
+
+/// Outcome of a single SUBSCRIBE relay forward, normalized so the driver can
+/// decide whether to fall back to the terminal advertisement consult
+/// (hosting redesign piece C).
+enum SubscribeForwardOutcome {
+    /// Downstream (or a consulted host) subscribed us; the requester was
+    /// already registered as a downstream subscriber.
+    Subscribed {
+        key: freenet_stdlib::prelude::ContractKey,
+        hop_count: usize,
+    },
+    /// Downstream cleanly answered NotFound (a reply WAS received). Safe to
+    /// fall back to the terminal advertisement consult on the reused tx.
+    NotFound { hop_count: usize },
+    /// The forward received NO reply (timeout / send-failure) or an
+    /// unexpected variant. The awaited peer may reply late on the reused tx,
+    /// so the caller MUST bubble NotFound WITHOUT consulting (Codex P2).
+    Failed { hop_count: usize },
+}
+
+/// Forward a `SubscribeMsg::Request` to a single target, await the reply, and
+/// classify it into [`SubscribeForwardOutcome`]. Registers the requester as a
+/// downstream subscriber on a Subscribed reply (mirroring legacy
+/// `subscribe.rs:1690`; does NOT call `ring.subscribe` /
+/// `announce_contract_hosted` — a relay is not itself a subscriber, which
+/// prevents the #3763 storm) and feeds the router the observed outcome. Does
+/// NOT bubble upstream — the caller owns that and may retry via the consult
+/// on a NotFound.
+#[allow(clippy::too_many_arguments)]
+async fn relay_subscribe_forward_once(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    instance_id: ContractInstanceId,
+    htl: usize,
+    new_visited: &VisitedPeers,
+    is_renewal: bool,
+    next_hop: PeerKeyLocation,
+    next_addr: std::net::SocketAddr,
+    upstream_addr: std::net::SocketAddr,
+) -> SubscribeForwardOutcome {
     let new_htl = htl.saturating_sub(1);
+    // Forward-failure / unexpected-variant depth for THIS relay.
+    let our_depth = op_manager.ring.max_hops_to_live.saturating_sub(htl);
 
     if let Some(event) = crate::tracing::NetEventLog::subscribe_request(
         &incoming_tx,
@@ -1823,7 +1983,7 @@ async fn drive_relay_subscribe(
         id: incoming_tx,
         instance_id,
         htl: new_htl,
-        visited: new_visited,
+        visited: new_visited.clone(),
         is_renewal,
     });
 
@@ -1832,8 +1992,8 @@ async fn drive_relay_subscribe(
         tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(next_addr, forward)).await;
 
     // Release the pending_op_results slot installed by send_to_and_await.
-    // Mirrors PUT/GET relay — the upstream fire-and-forget reply below
-    // would otherwise leak a slot entry per driver run.
+    // Mirrors PUT/GET relay — the upstream fire-and-forget reply would
+    // otherwise leak a slot entry per driver run.
     op_manager.release_pending_op_slot(incoming_tx).await;
 
     let reply = match round_trip {
@@ -1848,22 +2008,15 @@ async fn drive_relay_subscribe(
             );
             crate::operations::record_relay_route_event(
                 op_manager,
-                next_hop.clone(),
+                next_hop,
                 crate::ring::Location::from(&instance_id),
                 crate::router::RouteOutcome::Failure,
                 crate::node::network_status::OpType::Subscribe,
             );
-            // Forward failure at THIS relay: report our own depth.
-            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-            return relay_subscribe_send_response(
-                op_manager,
-                incoming_tx,
-                instance_id,
-                SubscribeMsgResult::NotFound,
-                upstream_addr,
-                hop_count,
-            )
-            .await;
+            // No reply — do NOT consult on the reused tx (Codex P2).
+            return SubscribeForwardOutcome::Failed {
+                hop_count: our_depth,
+            };
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -1875,48 +2028,24 @@ async fn drive_relay_subscribe(
             );
             crate::operations::record_relay_route_event(
                 op_manager,
-                next_hop.clone(),
+                next_hop,
                 crate::ring::Location::from(&instance_id),
                 crate::router::RouteOutcome::Failure,
                 crate::node::network_status::OpType::Subscribe,
             );
-            // Same as send-failure arm.
-            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-            return relay_subscribe_send_response(
-                op_manager,
-                incoming_tx,
-                instance_id,
-                SubscribeMsgResult::NotFound,
-                upstream_addr,
-                hop_count,
-            )
-            .await;
+            // Timed out with no reply — do NOT consult on the reused tx (Codex P2).
+            return SubscribeForwardOutcome::Failed {
+                hop_count: our_depth,
+            };
         }
     };
 
-    // ── Step 4: Classify reply, register requester if Subscribed, bubble up ──
-    //
-    // Feed the relay's downstream-peer choice into the local Router so
-    // future routing decisions are informed by relay-observed outcomes
-    // (see operations.rs::record_relay_route_event).
-    //
-    // `bubble_hop_count` is the wire `hop_count` to forward upstream:
-    // - downstream Subscribed/NotFound: preserve the downstream's value
-    //   (relays do NOT increment on the return path);
-    // - unexpected variant: fall back to this relay's own depth
-    //   (`max_htl - htl`) — we know nothing about what produced `other`.
-    let (result, bubble_hop_count) = match reply {
+    match reply {
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
             result: SubscribeMsgResult::Subscribed { key },
             hop_count: downstream_hop_count,
             ..
         })) => {
-            // Relay-side Subscribed registration — mirror legacy
-            // subscribe.rs:1690 arm. DO NOT call ring.subscribe /
-            // announce_contract_hosted here; a relay is not itself a
-            // subscriber. See subscribe.rs:1655–1688 for the full
-            // reasoning (prevents the #3763 subscription storm feedback
-            // loop).
             register_downstream_subscriber(
                 op_manager,
                 &key,
@@ -1936,61 +2065,59 @@ async fn drive_relay_subscribe(
             );
             crate::operations::record_relay_route_event(
                 op_manager,
-                next_hop.clone(),
+                next_hop,
                 crate::ring::Location::from(&key),
                 crate::router::RouteOutcome::SuccessUntimed,
                 crate::node::network_status::OpType::Subscribe,
             );
-            (SubscribeMsgResult::Subscribed { key }, downstream_hop_count)
+            SubscribeForwardOutcome::Subscribed {
+                key,
+                hop_count: downstream_hop_count,
+            }
         }
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
             result: SubscribeMsgResult::NotFound,
             hop_count: downstream_hop_count,
             ..
         })) => {
-            // Downstream peer correctly answered NotFound. The peer
-            // behaved well at the protocol level — it just doesn't host
-            // this contract. Record SuccessUntimed so the model treats
-            // this peer as healthy. See `record_relay_route_event` rustdoc.
+            // Downstream peer correctly answered NotFound. The peer behaved
+            // well at the protocol level — it just doesn't host this contract.
+            // Record SuccessUntimed so the model treats it as healthy.
             tracing::debug!(
                 tx = %incoming_tx,
                 %instance_id,
                 phase = "relay_subscribe_bubble_not_found",
-                "SUBSCRIBE relay: downstream NotFound; bubbling upstream"
+                "SUBSCRIBE relay: downstream NotFound"
             );
             crate::operations::record_relay_route_event(
                 op_manager,
-                next_hop.clone(),
+                next_hop,
                 crate::ring::Location::from(&instance_id),
                 crate::router::RouteOutcome::SuccessUntimed,
                 crate::node::network_status::OpType::Subscribe,
             );
-            (SubscribeMsgResult::NotFound, downstream_hop_count)
+            SubscribeForwardOutcome::NotFound {
+                hop_count: downstream_hop_count,
+            }
         }
         other => {
-            // Unexpected reply variant: unclear whether it's a local
-            // bug or peer misbehaviour. Do NOT record a route event;
-            // the helper invariant is one event per unambiguous attribution.
+            // Unexpected reply variant: unclear whether it's a local bug or
+            // peer misbehaviour. Do NOT record a route event; the helper
+            // invariant is one event per unambiguous attribution.
             tracing::warn!(
                 tx = %incoming_tx,
                 %instance_id,
                 reply_variant = ?std::mem::discriminant(&other),
                 "SUBSCRIBE relay: unexpected reply variant; treating as NotFound"
             );
-            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-            (SubscribeMsgResult::NotFound, hop_count)
+            // Anomalous reply — treat as Failed so we do NOT consult on the
+            // reused tx (only a CLEAN downstream NotFound is safe to fall back
+            // from). Codex P2.
+            SubscribeForwardOutcome::Failed {
+                hop_count: our_depth,
+            }
         }
-    };
-
-    relay_subscribe_send_response(
-        op_manager,
-        incoming_tx,
-        instance_id,
-        result,
-        upstream_addr,
-        bubble_hop_count,
-    )
-    .await
+    }
 }
 
 /// Send `SubscribeMsg::Response` upstream (fire-and-forget: upstream
@@ -2668,6 +2795,83 @@ mod tests {
         assert!(
             driver_src.contains("ctx.send_to_and_await("),
             "drive_relay_subscribe must forward downstream via send_to_and_await"
+        );
+    }
+
+    /// Piece C (invariant 5): after the SUBSCRIBE relay's single greedy
+    /// routing forward returns NotFound, it must consult neighbor host
+    /// advertisements and try an off-path advertised host BEFORE bubbling the
+    /// dead-end upstream. The consult must fire AFTER a forward (not in the
+    /// no-candidates branch, where it would be a no-op — every connection is
+    /// already visited there), and must record the outcome.
+    #[test]
+    fn relay_subscribe_terminus_consults_advertised_hosts() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        // Clip the driver + the extracted forward helper (both precede
+        // `relay_subscribe_send_response`).
+        let region_end = src[driver_start..]
+            .find("\nasync fn relay_subscribe_send_response(")
+            .expect("driver body end not found")
+            + driver_start;
+        let region = &src[driver_start..region_end];
+        let forward_pos = region
+            .find("relay_subscribe_forward_once(")
+            .expect("drive_relay_subscribe must forward via relay_subscribe_forward_once");
+        let consult_pos = region.find("consult_advertised_hosts").expect(
+            "drive_relay_subscribe must consult advertised hosts (hosting redesign \
+             piece C, invariant 5)",
+        );
+        assert!(
+            forward_pos < consult_pos,
+            "the consult must fire AFTER the greedy routing forward (as a NotFound \
+             fallback), not in the no-candidates branch where it would be a no-op"
+        );
+        assert!(
+            region.contains("SubscribeForwardOutcome::NotFound"),
+            "the consult must be gated on the forward returning NotFound"
+        );
+        assert!(
+            region.contains("record_terminal_consult_outcome"),
+            "drive_relay_subscribe must record the terminal consult outcome"
+        );
+    }
+
+    /// Piece C P2 (Codex): the consult reuses `incoming_tx`, so it must run
+    /// ONLY after a CLEAN downstream NotFound — never after a forward that got
+    /// no reply (timeout / send-failure), whose late reply could satisfy the
+    /// consult waiter. Pin that timeout/send-failure map to a distinct
+    /// `Failed` outcome that bubbles NotFound without consulting.
+    #[test]
+    fn relay_subscribe_consult_skipped_after_failed_forward() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let end = src[start..]
+            .find("\nasync fn relay_subscribe_send_response(")
+            .expect("region end not found")
+            + start;
+        let region = &src[start..end];
+        // The forward helper distinguishes a no-reply Failed outcome.
+        assert!(
+            region.contains("SubscribeForwardOutcome::Failed"),
+            "relay_subscribe_forward_once must return a distinct Failed outcome for \
+             timeout / send-failure so the consult is not reached on the reused tx"
+        );
+        // The top-level Failed arm bubbles NotFound WITHOUT calling the consult.
+        let outer_failed = region
+            .find("SubscribeForwardOutcome::Failed { hop_count } => {")
+            .expect("driver must handle the top-level Failed outcome explicitly");
+        let consult_pos = region
+            .find("consult_advertised_hosts")
+            .expect("driver must consult on the clean-NotFound path");
+        assert!(
+            outer_failed > consult_pos,
+            "the top-level Failed arm must come after (be separate from) the \
+             NotFound consult arm — Failed must not consult"
         );
     }
 
