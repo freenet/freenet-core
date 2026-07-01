@@ -7,6 +7,20 @@ use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
 const MAX_METADATA_SIZE: u64 = 1024;
+
+/// Loose upper bound on the packed website payload (100 MiB). This is a sanity
+/// ceiling only and is never actually the binding limit: a publish is bound
+/// first by the node's `MAX_STATE_SIZE` (50 MiB, in
+/// `crates/core/src/wasm_runtime/state_store.rs`) and by the stdlib WebSocket
+/// transport cap (`MAX_TOTAL_CHUNKS * CHUNK_SIZE` = 64 MiB), both well below
+/// this value, so state this large can never reach the contract.
+///
+/// WARNING: do NOT casually change this value. It is compiled into
+/// `crates/fdev/resources/website_contract.wasm`, and changing the WASM changes
+/// every website contract key (the key is derived from the code hash). Editing
+/// it therefore requires rebuilding that committed WASM binary AND a
+/// contract-key migration for every existing website. Adjust the binding
+/// limits (above) instead.
 const MAX_WEB_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Metadata for a website container state, serialized as CBOR.
