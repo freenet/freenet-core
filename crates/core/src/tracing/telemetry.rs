@@ -539,6 +539,27 @@ impl TelemetryWorker {
         }
     }
 
+    /// Sample this node's OWN resource utilization (memory RSS + ceiling, CPU
+    /// time, cumulative bandwidth) into a `resource_utilization` telemetry
+    /// event, attributed to this node's peer id.
+    ///
+    /// Foundational piece (A1) of the demand-driven hosting redesign
+    /// (freenet/freenet-core#4642): the capability-relative hosting budget and
+    /// eviction policy (pieces A2/A3) must be validated against a node's real
+    /// scarcest-resource headroom, which was previously not observable at all.
+    /// Sampled from cheap process-local sources — see
+    /// [`crate::node::resource_metrics`]; nothing crosses the peer wire.
+    fn resource_utilization_telemetry(&self) -> TelemetryEvent {
+        TelemetryEvent {
+            timestamp: current_timestamp_ms(),
+            peer_id: self.local_peer_id.clone(),
+            transaction_id: String::new(), // Node-wide, not tied to a transaction.
+            event_type: "resource_utilization".to_string(),
+            event_data: crate::node::resource_metrics::sample().to_telemetry_value(),
+            priority: EventPriority::Operational,
+        }
+    }
+
     /// Wrap a transport-layer transfer event into a `TelemetryEvent`,
     /// stamped with this node's own peer id. The transport layer has
     /// no peer-identity context of its own, so before #4345 these
@@ -603,6 +624,13 @@ impl TelemetryWorker {
                     }
                 },
                 _ = batch_interval.tick() => {
+                    // Emit this node's own resource-utilization sample (#4642
+                    // A1) on the batch cadence, so a peer's memory/CPU/bandwidth
+                    // headroom is observable on the telemetry stream the
+                    // dashboard consumes. Cheap process-local sources; buffered
+                    // like any other event, then flushed below.
+                    let resource_event = self.resource_utilization_telemetry();
+                    self.handle_event(resource_event).await;
                     self.flush().await;
                 },
                 _ = transport_snapshot_interval.tick() => {
@@ -2570,6 +2598,50 @@ mod tests {
             "transport snapshots must be attributed to the emitting \
              node's own peer id (#4345)"
         );
+    }
+
+    #[test]
+    fn test_resource_utilization_carries_local_peer_id() {
+        // #4642 A1: node self-resource-utilization events must be attributed
+        // to the emitting node's own peer id, tagged with the stable
+        // `resource_utilization` event_type at Operational priority, and carry
+        // the sampled axes as a per-node aggregate-scalar object (never a
+        // per-contract / per-request map). Same attribution contract as the
+        // transport_snapshot / transfer siblings above.
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (_transfer_tx, transfer_rx) = mpsc::channel(1);
+        let worker = TelemetryWorker::new(
+            "http://localhost:4318".to_string(),
+            cmd_rx,
+            0,
+            transfer_rx,
+            "resource-peer-id".to_string(),
+        );
+        let event = worker.resource_utilization_telemetry();
+        assert_eq!(event.event_type, "resource_utilization");
+        assert_eq!(
+            event.peer_id, "resource-peer-id",
+            "resource-utilization events must be attributed to the emitting \
+             node's own peer id"
+        );
+        assert_eq!(
+            event.priority,
+            EventPriority::Operational,
+            "resource-utilization is operational telemetry, not shadow"
+        );
+        let obj = event
+            .event_data
+            .as_object()
+            .expect("resource_utilization event_data must be a JSON object");
+        for key in [
+            "memory_rss_bytes",
+            "memory_limit_bytes",
+            "cpu_time_seconds",
+            "cumulative_bytes_sent",
+            "cumulative_bytes_received",
+        ] {
+            assert!(obj.contains_key(key), "event_data missing key `{key}`");
+        }
     }
 
     #[tokio::test]

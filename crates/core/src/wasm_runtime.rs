@@ -28,7 +28,7 @@ pub use module_cache::default_module_cache_budget_bytes;
 pub(crate) use module_cache::{
     DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, InterestPredicate, ModuleCache, ModuleCacheMetrics,
     contract_cache_interested_occupancy_pct, contract_cache_occupancy_pct, interest_tiered_enabled,
-    migration_admission_recovered_now,
+    migration_admission_recovered_now, read_total_ram_bytes,
 };
 // Clamp bounds are referenced only by the config-default round-trip test, which
 // asserts the resolved default lands within [MIN, MAX] without hardcoding the
