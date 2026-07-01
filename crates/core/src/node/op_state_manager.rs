@@ -1154,10 +1154,64 @@ impl OpManager {
     /// `expire_stale_downstream_subscribers` sweep, which also decrements the
     /// interest manager's `downstream_subscriber_count` and triggers upstream
     /// unsubscribe when appropriate.
-    pub(crate) fn on_ring_connection_lost(&self, pub_key: &TransportPublicKey) {
+    ///
+    /// # Event-driven re-subscribe (#4642 piece F)
+    ///
+    /// The deferred interest cleanup above is unchanged (it is the safety net for
+    /// a transient blip: if the peer reconnects within the grace period,
+    /// `on_ring_connection_established` cancels the removal). In addition, for
+    /// every contract where the dropped peer was our UPSTREAM in the subscription
+    /// tree, immediately route a fresh SUBSCRIBE toward the key. This bounds the
+    /// update gap by drop-detection latency instead of the periodic
+    /// renewal/lease cadence (~2-min renewal / 8-min lease — the ~minutes-long
+    /// stale window). It is safe under the hosting invariants (invariant 4,
+    /// self-healing re-rooting): it fires ONLY for real, active subscriptions,
+    /// is single-target (routes toward the key), and is rate-limited by the
+    /// periodic renewal path's shared dedup (`mark_subscription_pending`) and
+    /// backoff, so it can neither storm nor double-fire against the 30s recovery
+    /// loop. The periodic loop remains as the backstop for anything this misses.
+    pub(crate) fn on_ring_connection_lost(self: &Arc<Self>, pub_key: &TransportPublicKey) {
         self.neighbor_hosting.on_peer_disconnected(pub_key);
-        self.interest_manager
-            .schedule_deferred_removal(&PeerKey::from(pub_key.clone()));
+        let peer_key = PeerKey::from(pub_key.clone());
+        self.interest_manager.schedule_deferred_removal(&peer_key);
+
+        let open_conns = self.ring.open_connections();
+        let affected = self.interest_manager.upstream_contracts_for_peer(&peer_key);
+        tracing::debug!(
+            dropped_peer = %peer_key.0,
+            open_connections = open_conns,
+            upstream_contracts = affected.len(),
+            "piece-F: evaluating event-driven re-subscribe on upstream loss"
+        );
+
+        // No peers to route a fresh SUBSCRIBE through: skip (mirrors the periodic
+        // renewal loop's zero-connection gate, #3676, which prevents a doomed
+        // subscribe storm on an isolated node).
+        if open_conns == 0 {
+            return;
+        }
+
+        if affected.is_empty() {
+            return;
+        }
+
+        let own_addr = self.ring.connection_manager.get_own_addr();
+        for contract in affected {
+            if self
+                .ring
+                .try_spawn_event_driven_resubscribe(self.clone(), contract)
+            {
+                // Production per-node scalar (aggregate counter on this node).
+                crate::node::network_status::record_event_driven_resubscribe();
+                // Simulation-test observability (no-op in production — gated on a
+                // current network name, like the renewal-cycle counters). Lets a
+                // sim assert this node fired an event-driven re-subscribe promptly
+                // after the upstream drop, well before the lease-renewal window.
+                if let Some(addr) = own_addr {
+                    crate::ring::topology_registry::record_event_driven_resubscribe(addr);
+                }
+            }
+        }
     }
 }
 
@@ -3301,5 +3355,99 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(g);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod event_driven_resubscribe_wiring_tests {
+    //! Source-scrape pin for #4642 piece F: `OpManager::on_ring_connection_lost`
+    //! must wire the event-driven re-subscribe end to end.
+    //!
+    //! A behavioral test would need a live `OpManager` + `Ring` with an installed
+    //! upstream subscription and a real peer connection — scaffolding this suite
+    //! does not have (the same reason `ring.rs` pins the renewal ban-gate by
+    //! source-scrape rather than behavior). So this pins the drop handler's
+    //! wiring: the existing deferred-cleanup backstop stays, and the new path
+    //! selects upstream contracts, honours the zero-connection gate, delegates to
+    //! the bounded `try_spawn_event_driven_resubscribe`, and records BOTH the
+    //! production per-node scalar and the sim-observable per-node counter. The
+    //! selection, gating order, and shared-helper routing are covered
+    //! behaviorally/structurally by the tests in `ring/interest.rs`,
+    //! `node/network_status.rs`, and `ring.rs`.
+
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("op_state_manager.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("op_state_manager.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..].find('{').expect("fn sig must have body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while extracting {signature_prefix}");
+    }
+
+    #[test]
+    fn on_ring_connection_lost_wires_event_driven_resubscribe() {
+        let src = production_source();
+        let body = extract_fn_body(src, "fn on_ring_connection_lost(self: &Arc<Self>");
+
+        // Backstop preserved: deferred interest cleanup still scheduled.
+        assert!(
+            body.contains("schedule_deferred_removal"),
+            "on_ring_connection_lost must keep the deferred interest-removal \
+             backstop (transient-blip safety net)"
+        );
+
+        // New event-driven path: select upstream contracts, gate on connections,
+        // delegate to the bounded spawn helper.
+        let select = body
+            .find("upstream_contracts_for_peer")
+            .expect("must select the contracts whose upstream just dropped");
+        assert!(
+            body.contains("open_connections"),
+            "must honour the zero-connection gate (mirrors renewal loop #3676)"
+        );
+        let spawn = body.find("try_spawn_event_driven_resubscribe").expect(
+            "must delegate to the bounded try_spawn_event_driven_resubscribe \
+             (shared ban/backoff/dedup gates) — do NOT hand-inline the spawn",
+        );
+        assert!(
+            select < spawn,
+            "must select upstream contracts (offset {select}) before spawning \
+             re-subscribes (offset {spawn})"
+        );
+
+        // Both the production per-node scalar and the sim-observable per-node
+        // counter are recorded when a re-subscribe fires.
+        assert!(
+            body.contains("network_status::record_event_driven_resubscribe"),
+            "must record the production per-node scalar"
+        );
+        assert!(
+            body.contains("topology_registry::record_event_driven_resubscribe"),
+            "must record the sim-observable per-node counter"
+        );
     }
 }

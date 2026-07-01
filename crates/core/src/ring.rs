@@ -1928,6 +1928,185 @@ impl Ring {
     /// Interval for periodic GET subscription cache sweep.
     pub(crate) const GET_SUBSCRIPTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
+    /// Spawn the guarded per-contract subscription-renewal task.
+    ///
+    /// Shared by the periodic renewal loop (`recover_orphaned_subscriptions`)
+    /// and the event-driven upstream-loss re-subscribe path
+    /// (`try_spawn_event_driven_resubscribe`, #4642 piece F) so BOTH paths use
+    /// identical bounded machinery. The caller MUST have already reserved the
+    /// per-contract slot via `mark_subscription_pending` (returned `true`); this
+    /// task creates the `SubscriptionRecoveryGuard` that releases that slot (and
+    /// records success/backoff) even on panic or early shutdown, waits
+    /// `jitter_ms` (shutdown-aware), then drives `run_renewal_subscribe` under
+    /// the outer cancel deadline and emits the outcome telemetry.
+    ///
+    /// Do NOT hand-inline a copy of this body at a new call site (see the
+    /// "Manually-inlined originator side effects" rule in
+    /// `.claude/rules/bug-prevention-patterns.md`); both renewal entry points
+    /// are pinned to route through here by
+    /// `renewal_paths_route_through_shared_spawn_helper`.
+    fn spawn_guarded_renewal_task(
+        op_manager: Arc<OpManager>,
+        contract: ContractKey,
+        shutdown: CancellationToken,
+        jitter_ms: u64,
+    ) {
+        GlobalExecutor::spawn(async move {
+            // Guard ensures complete_subscription_request is called even on panic.
+            // Created BEFORE the jitter sleep so an early shutdown return below
+            // still clears the `mark_subscription_pending` flag set above — the
+            // guard's Drop marks the request failed (#4278).
+            let guard = SubscriptionRecoveryGuard::new(op_manager.clone(), contract);
+
+            // The jitter can be up to 15s; bail (dropping the guard, which
+            // completes the pending request as failed) before doing any
+            // renewal work if the node is shutting down (#4278).
+            if sleep_or_shutdown(
+                &shutdown,
+                tokio::time::sleep(Duration::from_millis(jitter_ms)),
+            )
+            .await
+            {
+                return;
+            }
+
+            let instance_id = *contract.id();
+            // Renewal driver: same machinery as
+            // client-initiated SUBSCRIBE, with delivery
+            // returned to this task instead of via
+            // `result_router_tx`. `is_renewal=true` so
+            // the responder skips sending state.
+            //
+            // Outer renewal cancel deadline: a pure backstop for a
+            // *genuinely wedged* driver. In normal operation the
+            // renewal driver self-terminates within
+            // `RENEWAL_TASK_BUDGET` (slow peer) and then runs its
+            // cleanup, so this deadline never fires.
+            //
+            // Issue #4350: the driver clamps each attempt's wait to
+            // the budget remaining until its own task deadline
+            // (`RENEWAL_TASK_BUDGET`, 20 s), so no attempt — first
+            // or retry — is still awaiting when this outer cancel
+            // fires; and the deadline is sized
+            // (`renewal_outer_cancel`, 55 s) to clear the driver's
+            // worst case (full-budget attempt + a fully
+            // backpressured `release_pending_op_slot` cleanup, up to
+            // `NOTIFICATION_SEND_TIMEOUT`). A task outliving the 30 s
+            // recovery interval is safe: `mark_subscription_pending`
+            // (released by `SubscriptionRecoveryGuard` on completion
+            // or cancel) blocks a second concurrent renewal for the
+            // same contract.
+            let renewal_tx =
+                crate::message::Transaction::new::<crate::operations::subscribe::SubscribeMsg>();
+            let renewal_deadline = Self::renewal_outer_cancel();
+            let outcome_enum = match tokio::time::timeout(
+                renewal_deadline,
+                crate::operations::subscribe::run_renewal_subscribe(
+                    op_manager.clone(),
+                    instance_id,
+                    renewal_tx,
+                ),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => crate::operations::subscribe::RenewalOutcome::Failed {
+                    reason: format!(
+                        "renewal task exceeded {}s cycle deadline",
+                        renewal_deadline.as_secs()
+                    ),
+                },
+            };
+
+            let (outcome, error_msg) = match outcome_enum {
+                crate::operations::subscribe::RenewalOutcome::Success => {
+                    tracing::info!(
+                        %contract,
+                        "Subscription renewal succeeded"
+                    );
+                    guard.complete(true);
+                    ("success", None)
+                }
+                crate::operations::subscribe::RenewalOutcome::ChannelCongestion => {
+                    // Channel congestion is a local resource issue, not a
+                    // protocol failure. Don't penalize with backoff — just
+                    // clear the pending mark so the contract is eligible on
+                    // the next cycle.
+                    tracing::warn!(
+                        %contract,
+                        "Subscription renewal skipped (channel full), will retry next cycle"
+                    );
+                    guard.complete(true);
+                    ("dropped_channel_full", None)
+                }
+                crate::operations::subscribe::RenewalOutcome::Failed { reason } => {
+                    tracing::debug!(
+                        %contract,
+                        error = %reason,
+                        "Subscription renewal failed (will retry with backoff)"
+                    );
+                    guard.complete(false);
+                    ("failed", Some(reason))
+                }
+            };
+
+            crate::tracing::telemetry::send_standalone_event(
+                "subscription_renewal_outcome",
+                serde_json::json!({
+                    "contract": contract.to_string(),
+                    "outcome": outcome,
+                    "error": error_msg,
+                }),
+            );
+        });
+    }
+
+    /// Event-driven re-subscribe for a single contract whose upstream peer just
+    /// dropped (#4642 piece F — demand-gated re-rooting, invariant 4).
+    ///
+    /// Applies the SAME bounding as the periodic renewal loop
+    /// (`recover_orphaned_subscriptions`) so the two paths can never storm or
+    /// double-fire against each other:
+    /// - ban gate (#4373): never re-register interest in a banned contract;
+    /// - `can_request_subscription` (exponential backoff on repeated failures);
+    /// - `mark_subscription_pending` (per-contract dedup — shared state with the
+    ///   periodic loop, so an in-flight renewal blocks this event-driven one and
+    ///   vice-versa).
+    ///
+    /// On passing all three gates it spawns the shared guarded renewal task with
+    /// a small jitter (0–1s, versus the loop's 0–15s spread) so the update gap is
+    /// bounded by drop-detection latency rather than the ~lease-renewal cadence
+    /// (2-min renewal / 8-min lease), while still de-synchronising a burst when a
+    /// high-degree upstream drops many of our subscriptions at once. The fresh
+    /// SUBSCRIBE routes greedily toward the key, so it re-roots keyward (gravity)
+    /// onto a live upstream rather than the dropped one.
+    ///
+    /// Returns `true` iff a re-subscribe was actually spawned (for the per-node
+    /// telemetry counter). The caller is responsible for the zero-connection gate
+    /// (mirrors the loop's #3676 gate) and for selecting only contracts where the
+    /// dropped peer was our upstream.
+    pub(crate) fn try_spawn_event_driven_resubscribe(
+        &self,
+        op_manager: Arc<OpManager>,
+        contract: ContractKey,
+    ) -> bool {
+        if self.contract_ban_list.is_banned(contract.id()) {
+            return false;
+        }
+        if !self.can_request_subscription(&contract) {
+            return false;
+        }
+        if !self.mark_subscription_pending(contract) {
+            return false;
+        }
+        // Small jitter (0–1s) to spread a burst when a high-degree upstream drops
+        // many of our subscriptions at once, while keeping the update gap far
+        // below the periodic renewal cadence.
+        let jitter_ms = GlobalRng::random_range(0u64..=1_000);
+        Self::spawn_guarded_renewal_task(op_manager, contract, self.shutdown_token(), jitter_ms);
+        true
+    }
+
     /// Periodically attempt to recover "orphaned hosters" - contracts we're hosting
     /// but don't have an upstream subscription for.
     ///
@@ -2164,120 +2343,12 @@ impl Ring {
                     // Spread tasks across the interval to avoid thundering-herd bursts.
                     let jitter_ms = GlobalRng::random_range(0u64..=15_000);
 
-                    let op_manager_clone = op_manager.clone();
-                    let contract_key = contract;
-                    let task_shutdown = shutdown.clone();
-
-                    GlobalExecutor::spawn(async move {
-                        // Guard ensures complete_subscription_request is called even on panic.
-                        // Created BEFORE the jitter sleep so an early shutdown return below
-                        // still clears the `mark_subscription_pending` flag set above — the
-                        // guard's Drop marks the request failed (#4278).
-                        let guard =
-                            SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);
-
-                        // The jitter can be up to 15s; bail (dropping the guard, which
-                        // completes the pending request as failed) before doing any
-                        // renewal work if the node is shutting down (#4278).
-                        if sleep_or_shutdown(
-                            &task_shutdown,
-                            tokio::time::sleep(Duration::from_millis(jitter_ms)),
-                        )
-                        .await
-                        {
-                            return;
-                        }
-
-                        let instance_id = *contract_key.id();
-                        // Renewal driver: same machinery as
-                        // client-initiated SUBSCRIBE, with delivery
-                        // returned to this task instead of via
-                        // `result_router_tx`. `is_renewal=true` so
-                        // the responder skips sending state.
-                        //
-                        // Outer renewal cancel deadline: a pure backstop for a
-                        // *genuinely wedged* driver. In normal operation the
-                        // renewal driver self-terminates within
-                        // `RENEWAL_TASK_BUDGET` (slow peer) and then runs its
-                        // cleanup, so this deadline never fires.
-                        //
-                        // Issue #4350: the driver clamps each attempt's wait to
-                        // the budget remaining until its own task deadline
-                        // (`RENEWAL_TASK_BUDGET`, 20 s), so no attempt — first
-                        // or retry — is still awaiting when this outer cancel
-                        // fires; and the deadline is sized
-                        // (`renewal_outer_cancel`, 55 s) to clear the driver's
-                        // worst case (full-budget attempt + a fully
-                        // backpressured `release_pending_op_slot` cleanup, up to
-                        // `NOTIFICATION_SEND_TIMEOUT`). A task outliving the 30 s
-                        // recovery interval is safe: `mark_subscription_pending`
-                        // (released by `SubscriptionRecoveryGuard` on completion
-                        // or cancel) blocks a second concurrent renewal for the
-                        // same contract.
-                        let renewal_tx = crate::message::Transaction::new::<
-                            crate::operations::subscribe::SubscribeMsg,
-                        >();
-                        let renewal_deadline = Self::renewal_outer_cancel();
-                        let outcome_enum = match tokio::time::timeout(
-                            renewal_deadline,
-                            crate::operations::subscribe::run_renewal_subscribe(
-                                op_manager_clone.clone(),
-                                instance_id,
-                                renewal_tx,
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(outcome) => outcome,
-                            Err(_) => crate::operations::subscribe::RenewalOutcome::Failed {
-                                reason: format!(
-                                    "renewal task exceeded {}s cycle deadline",
-                                    renewal_deadline.as_secs()
-                                ),
-                            },
-                        };
-
-                        let (outcome, error_msg) = match outcome_enum {
-                            crate::operations::subscribe::RenewalOutcome::Success => {
-                                tracing::info!(
-                                    %contract_key,
-                                    "Subscription renewal succeeded"
-                                );
-                                guard.complete(true);
-                                ("success", None)
-                            }
-                            crate::operations::subscribe::RenewalOutcome::ChannelCongestion => {
-                                // Channel congestion is a local resource issue, not a
-                                // protocol failure. Don't penalize with backoff — just
-                                // clear the pending mark so the contract is eligible on
-                                // the next cycle.
-                                tracing::warn!(
-                                    %contract_key,
-                                    "Subscription renewal skipped (channel full), will retry next cycle"
-                                );
-                                guard.complete(true);
-                                ("dropped_channel_full", None)
-                            }
-                            crate::operations::subscribe::RenewalOutcome::Failed { reason } => {
-                                tracing::debug!(
-                                    %contract_key,
-                                    error = %reason,
-                                    "Subscription renewal failed (will retry with backoff)"
-                                );
-                                guard.complete(false);
-                                ("failed", Some(reason))
-                            }
-                        };
-
-                        crate::tracing::telemetry::send_standalone_event(
-                            "subscription_renewal_outcome",
-                            serde_json::json!({
-                                "contract": contract_key.to_string(),
-                                "outcome": outcome,
-                                "error": error_msg,
-                            }),
-                        );
-                    });
+                    Self::spawn_guarded_renewal_task(
+                        op_manager.clone(),
+                        contract,
+                        shutdown.clone(),
+                        jitter_ms,
+                    );
                 }
             }
 
@@ -5991,9 +6062,9 @@ mod renewal_ban_gate_source_tests {
         );
 
         // The gate must precede the renewal spawn. Both `mark_subscription_pending`
-        // (which flips per-contract pending state) and `run_renewal_subscribe`
-        // (the outbound-egress driver) must only be reached for non-banned
-        // contracts.
+        // (which flips per-contract pending state) and the guarded-renewal spawn
+        // (which drives the outbound-egress `run_renewal_subscribe`) must only be
+        // reached for non-banned contracts.
         let mark_pending_pos = body
             .find("mark_subscription_pending(contract)")
             .expect("renewal loop must still call mark_subscription_pending");
@@ -6002,13 +6073,135 @@ mod renewal_ban_gate_source_tests {
             "ban gate (offset {gate_pos}) must run BEFORE \
              mark_subscription_pending (offset {mark_pending_pos})"
         );
+        // The outbound-egress `run_renewal_subscribe` now lives in the shared
+        // `spawn_guarded_renewal_task` helper (#4642 piece F); the loop reaches it
+        // only via that spawn call, which must still be gated behind the ban check.
         let spawn_pos = body
-            .find("run_renewal_subscribe(")
-            .expect("renewal loop must still spawn run_renewal_subscribe");
+            .find("spawn_guarded_renewal_task(")
+            .expect("renewal loop must still spawn via spawn_guarded_renewal_task");
         assert!(
             gate_pos < spawn_pos,
             "ban gate (offset {gate_pos}) must run BEFORE the \
-             run_renewal_subscribe outbound-egress spawn (offset {spawn_pos})"
+             spawn_guarded_renewal_task outbound-egress spawn (offset {spawn_pos})"
+        );
+        // And the egress driver itself must live in that helper, so the ban gate
+        // in the loop genuinely fronts the outbound SUBSCRIBE.
+        let helper_body = extract_fn_body(src, "fn spawn_guarded_renewal_task(");
+        assert!(
+            helper_body.contains("run_renewal_subscribe("),
+            "spawn_guarded_renewal_task must drive the outbound-egress \
+             run_renewal_subscribe"
+        );
+    }
+}
+
+#[cfg(test)]
+mod event_driven_resubscribe_source_tests {
+    //! Source-scrape pin for #4642 piece F (event-driven re-subscribe on
+    //! upstream loss). Two invariants the extraction must preserve:
+    //!
+    //! 1. BOTH renewal entry points — the periodic loop and the event-driven
+    //!    path — route through the shared `spawn_guarded_renewal_task` helper
+    //!    rather than hand-inlining `run_renewal_subscribe` (the
+    //!    "Manually-inlined originator side effects" anti-pattern). If a future
+    //!    refactor re-inlines the driver at either call site, this fails CI.
+    //! 2. The event-driven path applies the SAME bounding as the loop — ban gate,
+    //!    then `can_request_subscription` (backoff), then `mark_subscription_pending`
+    //!    (dedup) — BEFORE spawning, so it can neither storm nor double-fire
+    //!    against the 30s recovery loop.
+
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..].find('{').expect("fn sig must have body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while extracting {signature_prefix}");
+    }
+
+    #[test]
+    fn renewal_paths_route_through_shared_spawn_helper() {
+        let src = production_source();
+
+        // The periodic loop must delegate to the helper, not inline the driver.
+        let loop_body = extract_fn_body(
+            src,
+            "async fn recover_orphaned_subscriptions(ring: Arc<Self>",
+        );
+        assert!(
+            loop_body.contains("spawn_guarded_renewal_task("),
+            "the periodic renewal loop must spawn via spawn_guarded_renewal_task"
+        );
+        assert!(
+            !loop_body.contains("run_renewal_subscribe("),
+            "the periodic renewal loop must NOT hand-inline run_renewal_subscribe \
+             — it belongs in the shared spawn_guarded_renewal_task helper"
+        );
+
+        // The event-driven path must delegate to the helper, not inline the driver.
+        let event_body = extract_fn_body(src, "fn try_spawn_event_driven_resubscribe(");
+        assert!(
+            event_body.contains("spawn_guarded_renewal_task("),
+            "the event-driven re-subscribe path must spawn via \
+             spawn_guarded_renewal_task"
+        );
+        assert!(
+            !event_body.contains("run_renewal_subscribe("),
+            "the event-driven re-subscribe path must NOT hand-inline \
+             run_renewal_subscribe — use the shared helper"
+        );
+    }
+
+    #[test]
+    fn event_driven_resubscribe_applies_dedup_and_backoff_before_spawn() {
+        let src = production_source();
+        let body = extract_fn_body(src, "fn try_spawn_event_driven_resubscribe(");
+
+        let ban_pos = body
+            .find("contract_ban_list.is_banned")
+            .expect("event-driven re-subscribe must gate on the ban list (#4373)");
+        let can_request_pos = body
+            .find("can_request_subscription(&contract)")
+            .expect("event-driven re-subscribe must consult can_request_subscription (backoff)");
+        let mark_pending_pos = body
+            .find("mark_subscription_pending(contract)")
+            .expect("event-driven re-subscribe must dedup via mark_subscription_pending");
+        let spawn_pos = body
+            .find("spawn_guarded_renewal_task(")
+            .expect("event-driven re-subscribe must spawn the guarded renewal task");
+
+        assert!(
+            ban_pos < can_request_pos
+                && can_request_pos < mark_pending_pos
+                && mark_pending_pos < spawn_pos,
+            "event-driven re-subscribe must apply ban -> backoff -> dedup gates \
+             (offsets {ban_pos}, {can_request_pos}, {mark_pending_pos}) BEFORE \
+             spawning (offset {spawn_pos}) so it cannot storm or double-fire \
+             against the periodic renewal loop"
         );
     }
 }

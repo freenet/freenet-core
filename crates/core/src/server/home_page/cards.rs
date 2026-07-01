@@ -1338,12 +1338,21 @@ pub fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> S
             // which inflates the number and confuses users.
             let active = snap.contracts.len() as u32;
             let total_ops = ops.subscribes.0.saturating_add(ops.subscribes.1);
+            // Event-driven re-subscribes fired on upstream loss (#4642 piece F):
+            // self-healing re-rooting count, shown only once it has happened.
+            let rerooted = ops.event_driven_resubscribes;
+            let rerooted_line = if rerooted > 0 {
+                format!(r#"<div class="op-received">{rerooted} re-rooted</div>"#)
+            } else {
+                String::new()
+            };
             if total_ops > 0 {
                 format!(
                     r#"<div class="op-cell">
                         <div class="op-name">SUBSCRIBE</div>
                         <div class="op-count">{active} active</div>
                         <div class="op-received">{total_ops} ops</div>
+                        {rerooted_line}
                     </div>"#,
                 )
             } else {
@@ -1351,6 +1360,7 @@ pub fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> S
                     r#"<div class="op-cell">
                         <div class="op-name">SUBSCRIBE</div>
                         <div class="op-count">{active} active</div>
+                        {rerooted_line}
                     </div>"#,
                 )
             }
