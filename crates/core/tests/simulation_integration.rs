@@ -11105,6 +11105,9 @@ fn test_terminal_advertisement_consult_closes_get_dead_end() {
     // Migration OFF: isolate the consult as the ONLY mechanism that can carry
     // state to the requester (mirrors the negative control above).
     sim.disable_placement_migration();
+    // Opt into advertising the seeded host so the consult can find it (OFF by
+    // default; existing dead-end controls keep a seeded host un-advertised).
+    sim.enable_seeded_host_advertisements();
 
     let host_label = NodeLabel::node(NETWORK_NAME, 7);
     let requester_label = NodeLabel::node(NETWORK_NAME, 8);

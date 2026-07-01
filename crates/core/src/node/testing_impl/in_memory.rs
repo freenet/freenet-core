@@ -128,7 +128,13 @@ impl<ER> Builder<ER> {
         .await?;
 
         // Append contracts before starting
-        append_contracts(&op_manager, self.contracts, self.contract_subscribers).await?;
+        append_contracts(
+            &op_manager,
+            self.contracts,
+            self.contract_subscribers,
+            self.config.advertise_seeded_hosts,
+        )
+        .await?;
 
         // Inject any pre-formed ring connections (topology preseed, #4233) before
         // the event loop starts, so a wide direct star exists at t=0 without the
@@ -266,7 +272,13 @@ impl<ER> Builder<ER> {
         .await?;
 
         // Append contracts before starting
-        append_contracts(&op_manager, self.contracts, self.contract_subscribers).await?;
+        append_contracts(
+            &op_manager,
+            self.contracts,
+            self.contract_subscribers,
+            self.config.advertise_seeded_hosts,
+        )
+        .await?;
 
         // Inject any pre-formed ring connections (topology preseed, #4233) before
         // the event loop starts, so a wide direct star exists at t=0 without the
@@ -403,7 +415,13 @@ impl<ER> Builder<ER> {
         .await?;
 
         // Append contracts before starting
-        append_contracts(&op_manager, self.contracts, self.contract_subscribers).await?;
+        append_contracts(
+            &op_manager,
+            self.contracts,
+            self.contract_subscribers,
+            self.config.advertise_seeded_hosts,
+        )
+        .await?;
 
         // Inject any pre-formed ring connections (topology preseed, #4233) before
         // the event loop starts, so a wide direct star exists at t=0 without the
@@ -463,6 +481,7 @@ async fn append_contracts(
     op_manager: &Arc<OpManager>,
     contracts: Vec<(ContractContainer, WrappedState, bool)>,
     _contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
+    advertise_seeded_hosts: bool,
 ) -> anyhow::Result<()> {
     use crate::contract::ContractHandlerEvent;
     for (contract, state, subscription) in contracts {
@@ -487,17 +506,26 @@ async fn append_contracts(
                 .host_contract(key, state_size, crate::ring::AccessType::Put);
             // In the new lease-based model, register an active subscription
             op_manager.ring.subscribe(key);
-            // Register the contract in the neighbor-hosting advertised set so
-            // the connection-established HostingStateResponse exchange
-            // advertises it to neighbors. Without this, a startup-hosted
-            // contract (SeedHostedContract) leaves `my_contracts` empty and
-            // neighbors never learn this node hosts it — which the terminal
-            // advertisement consult (and UPDATE proximity forwarding) rely on.
-            // Mirrors the production announce that fires on first-time PUT/GET
-            // hosting; the returned announcement is dropped because the node
-            // has no ring connections yet at startup (the exchange runs later,
-            // on connection-established).
-            let _ = op_manager.neighbor_hosting.on_contract_hosted(&key);
+            // OPT-IN (default off): register the contract in the
+            // neighbor-hosting advertised set so the connection-established
+            // HostingStateResponse exchange advertises it to neighbors.
+            //
+            // Without this, a startup-hosted contract (SeedHostedContract)
+            // leaves `my_contracts` empty and neighbors never learn this node
+            // hosts it. That matches the harness's historical behavior, so it
+            // stays the default — existing tests (e.g. the migration dead-end
+            // controls) rely on a seeded host NOT advertising, which keeps a
+            // key-routed GET dead-ending. A test that needs the seeded host to
+            // genuinely advertise (so the terminal advertisement consult can
+            // reach it) opts in via
+            // `SimNetwork::enable_seeded_host_advertisements`.
+            //
+            // The returned announcement is dropped because the node has no ring
+            // connections yet at startup (the exchange runs later, on
+            // connection-established).
+            if advertise_seeded_hosts {
+                let _ = op_manager.neighbor_hosting.on_contract_hosted(&key);
+            }
         }
         // Note: contract_subscribers is ignored in the new model.
         // Neighbor hosting handles peer-to-peer awareness for update propagation.

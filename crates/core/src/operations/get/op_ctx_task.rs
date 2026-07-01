@@ -1451,11 +1451,13 @@ async fn lookup_stored_key(
 /// touch unrelated code paths.
 const MAX_RETRIES: usize = 3;
 
-/// Maximum advertised hosts a routing terminus forwards to before giving up
-/// (hosting redesign piece C, invariant 5). Bounded small so the terminal
-/// consult adds at most a couple of extra forwards at a leaf of routing —
-/// see the consult site in `drive_relay_get_inner` for why this does not
-/// re-introduce the per-hop fan-out amplification.
+/// Maximum advertised hosts a relay forwards to, once its single greedy
+/// routing hop is exhausted, before giving up (hosting redesign piece C,
+/// invariant 5). Bounded small so the terminal consult adds at most a couple
+/// of extra forwards per relay on the NotFound return path — see the consult
+/// site in `drive_relay_get_inner` for why this does not re-introduce the
+/// per-hop fan-out amplification (local-lookup-gated, advertised-only,
+/// bubble-up halts at the first Found).
 const MAX_TERMINAL_CONSULT_HOSTS: usize = 2;
 
 /// Pure selection core for the bootstrap gateway fallback (#4361).
@@ -2856,18 +2858,30 @@ where
                     return Ok(());
                 }
 
-                // No local copy and nothing closer to route to: before
-                // declaring a findability dead-end, consult the host
-                // advertisements our neighbors broadcast for this key
-                // (invariant 5). `consult_advertised_hosts` returns ONLY peers
-                // that already advertised hosting — nothing is pushed or
-                // cached, so this is not the speculative-pre-replication
-                // anti-pattern. Each candidate is marked tried + visited so
-                // the existing dedup prevents loops, and the forward below
-                // carries HTL-1. A terminus has zero closer peers, so these
-                // <=MAX_TERMINAL_CONSULT_HOSTS extra forwards do not compound
-                // across hops (unlike the removed per-hop retry fan-out that
-                // caused the 3^HTL amplification).
+                // This relay has exhausted its single greedy routing forward
+                // (MAX_RELAY_RETRIES = 1) without finding the contract, and
+                // holds no local copy. Before declaring a findability
+                // dead-end, consult the host advertisements our neighbors
+                // broadcast for this key (invariant 5) and try the closest
+                // UNVISITED advertised hosts the retry cap skipped — the "one
+                // hop off the routing path" case.
+                //
+                // `consult_advertised_hosts` returns ONLY peers that already
+                // advertised hosting — nothing is pushed or cached, so this is
+                // not the speculative-pre-replication anti-pattern. Each
+                // candidate is marked tried + visited so the existing dedup
+                // prevents loops, and the forward below carries HTL-1.
+                //
+                // This does NOT re-introduce the removed 3^HTL per-hop retry
+                // fan-out: a *local* lookup gates the forward, so a
+                // truly-absent contract (no neighbor advertised it) triggers
+                // ZERO extra network forwards; an advertised host almost
+                // always HAS the contract, so the bubble-up halts at the first
+                // Found; and each relay adds at most MAX_TERMINAL_CONSULT_HOSTS
+                // forwards, only on the NotFound return path. It can fire at an
+                // intermediate relay (not only the deepest terminus), which is
+                // intended: the advertised host is a neighbor of THIS relay,
+                // invisible to the deeper terminus.
                 let targets = consult_targets.get_or_insert_with(|| {
                     let tried_snapshot = tried.clone();
                     let visited_snapshot = new_visited.clone();

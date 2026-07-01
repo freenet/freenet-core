@@ -328,6 +328,19 @@ pub struct NodeConfig {
     /// `#[serde(skip)]`; never serialized.
     #[serde(skip)]
     pub(crate) subscribe_hint_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only harness flag: when set, a startup-hosted contract
+    /// (`SeedHostedContract`, i.e. `append_contracts` with `subscription =
+    /// true`) is registered in the neighbor-hosting advertised set so the
+    /// connection-established `HostingStateResponse` exchange advertises it to
+    /// neighbors. Defaults to `false` — the harness's historical behavior, so
+    /// a seeded host does NOT advertise and a key-routed GET to a
+    /// non-hosting region still dead-ends (the migration dead-end controls
+    /// depend on this). Opted into per-network via
+    /// `SimNetwork::enable_seeded_host_advertisements` for tests that exercise
+    /// the terminal advertisement consult. Not cfg-gated for the same reason
+    /// as `subscribe_hint_floor_override`. `#[serde(skip)]`.
+    #[serde(skip)]
+    pub(crate) advertise_seeded_hosts: bool,
 }
 
 impl NodeConfig {
@@ -465,6 +478,7 @@ impl NodeConfig {
             },
             governance_config_override: None,
             subscribe_hint_floor_override: None,
+            advertise_seeded_hosts: false,
         })
     }
 
