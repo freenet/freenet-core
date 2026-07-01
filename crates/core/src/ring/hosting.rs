@@ -1600,7 +1600,22 @@ impl HostingManager {
         // Use HashSet for O(1) deduplication instead of O(n) Vec::contains
         let mut needs_renewal_set = HashSet::new();
 
-        // 1. Contracts with soon-to-expire subscriptions
+        // 1. Contracts with soon-to-expire subscriptions AND active demand.
+        //
+        //    The `contract_in_use` gate is load-bearing (demand-driven-hosting
+        //    design §5a / §7). A subscribed host renews toward its (computed)
+        //    upstream only while something still depends on it hosting the
+        //    contract: a local client, or a registered downstream subscriber.
+        //    Both are time-bounded (clients disconnect, downstream registrations
+        //    lease-expire), so when demand fades the peer stops renewing, its
+        //    lease lapses, and the chain collapses inward toward the key. Without
+        //    this gate every subscribed host self-renews forever regardless of
+        //    interest, so live subscriptions grow with accumulated cache rather
+        //    than active demand — the #3763 renewal storm. The eviction budget
+        //    (piece A) does NOT bound this: an in-use, actively-subscribed
+        //    contract is eviction-exempt AND self-renewing, so the storm set is
+        //    exactly the set the budget may not touch.
+        //
         // Collect and sort for deterministic iteration order
         let mut active_subs: Vec<_> = self
             .active_subscriptions
@@ -1610,7 +1625,11 @@ impl HostingManager {
         active_subs.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
 
         for (key, expires_at) in active_subs {
-            if expires_at <= renewal_threshold && expires_at > now {
+            // `contract_in_use` reads only the client-subscription and
+            // downstream-subscriber maps (never `hosting_cache`), and `active_subs`
+            // is already materialized above, so no active_subscriptions shard guard
+            // is held across this call.
+            if expires_at <= renewal_threshold && expires_at > now && self.contract_in_use(&key) {
                 needs_renewal_set.insert(key);
             }
         }
@@ -4810,24 +4829,32 @@ mod tests {
              bounded by active interest, not cache size (#3763 storm)"
         );
 
-        // Positive/negative control pair that pins the `expires_at > now`
-        // lower-bound guard in Branch 1 (line ~1368). Both contracts carry a
-        // backdated/forward-dated lease in `active_subscriptions`; the ONLY
-        // thing distinguishing them is which side of `now` the lease sits on.
+        // Branch-1 control set. All three carry a lease in `active_subscriptions`;
+        // what distinguishes them is (a) which side of `now` the lease sits on and
+        // (b) whether the contract has active downstream interest (the demand-
+        // driven-hosting §5a renewal gate).
         //
-        // - `within_window`: lease expires inside the renewal window but still
-        //   in the future (now < expires_at <= now + SUBSCRIPTION_RENEWAL_INTERVAL).
-        //   Branch 1 returns the lease key directly, so this contract MUST be
-        //   counted. Without it the expired-lease assertion alone is inert: a
-        //   fresh `subscribe()` lease is now + 8min (excluded by the window's
-        //   upper bound) and 0xE0 isn't in the 0..50 cache for Branch 2, so the
-        //   expired-lease guard could be deleted with the test still passing.
-        // - `expired`: lease is in the past. It must NOT be counted, otherwise
-        //   the renewal set would refill itself from stale leases (the AGENTS.md
+        // - `within_window`: lease expires inside the renewal window and in the
+        //   future, AND it has a downstream subscriber (active interest). Branch 1
+        //   returns it, so it MUST be counted — it pins the `expires_at > now`
+        //   lower-bound guard AND the `contract_in_use` gate together.
+        // - `no_interest`: an identical within-window lease but with NO client and
+        //   NO downstream subscriber. Under the interest gate it must NOT be
+        //   counted: an un-demanded subscription LAPSES instead of self-renewing.
+        //   This is the #3763 bound (renewal tracks active demand, not accumulated
+        //   leases) and is what collapses a chain once demand ends.
+        // - `expired`: lease is in the past. It must NOT be counted, otherwise the
+        //   renewal set would refill itself from stale leases (the AGENTS.md
         //   time-bounded GC rule — an expired lease grants no renewal exemption).
         let within_window = make_contract_key(0xA0);
         manager.subscribe(within_window);
+        manager.add_downstream_subscriber(&within_window, make_peer_key(0xA1));
         if let Some(mut lease) = manager.active_subscriptions.get_mut(&within_window) {
+            lease.expires_at = Instant::now() + Duration::from_secs(30);
+        }
+        let no_interest = make_contract_key(0xB0);
+        manager.subscribe(no_interest);
+        if let Some(mut lease) = manager.active_subscriptions.get_mut(&no_interest) {
             lease.expires_at = Instant::now() + Duration::from_secs(30);
         }
         let expired = make_contract_key(0xE0);
@@ -4839,8 +4866,14 @@ mod tests {
         let within_window_renewal = manager.contracts_needing_renewal();
         assert!(
             within_window_renewal.contains(&within_window),
-            "a lease expiring inside the renewal window but still in the future \
-             MUST be counted (Branch 1 `expires_at > now` lower-bound guard)"
+            "a within-window lease WITH active downstream interest MUST be counted \
+             (Branch 1 `expires_at > now` guard + `contract_in_use` gate)"
+        );
+        assert!(
+            !within_window_renewal.contains(&no_interest),
+            "a within-window lease with NO client and NO downstream subscriber must \
+             NOT be counted — an un-demanded subscription lapses instead of \
+             self-renewing (#3763 interest-gated renewal bound)"
         );
         assert!(
             !within_window_renewal.contains(&expired),

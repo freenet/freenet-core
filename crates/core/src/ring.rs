@@ -858,6 +858,51 @@ impl Ring {
         no_closer_routable_neighbor(my_distance, contract_location, neighbors)
     }
 
+    /// Compute the CURRENT upstream for a contract this peer hosts: among
+    /// `hosting_neighbors` (connected neighbors that have advertised hosting the
+    /// contract, from `NeighborHostingManager::neighbors_with_contract_id`), the
+    /// one CLOSEST to the contract's key that is STRICTLY closer to the key than
+    /// this peer. Returns `None` when no such neighbor exists — either because
+    /// this peer is the most-keyward host it can see (a terminus, design §5d-a)
+    /// or because closer neighbors exist but none host the contract (a stranded
+    /// host that must re-root, §5d-b); the caller distinguishes those via
+    /// `is_subscription_root`.
+    ///
+    /// This is the *computed upstream* of the demand-driven-hosting design (§4):
+    /// derived on demand from live neighbor-hosting advertisements + ring
+    /// distance, never a stored formation flag. "Strictly closer to the key"
+    /// makes the upstream relation a strict descent toward the key, so it is
+    /// **acyclic by construction** (§4 point 2); the deterministic peer-address
+    /// tiebreak makes equidistant hosts a total order (§6 point 2). Renewals sent
+    /// to this computed upstream therefore self-heal re-rooting for free (§5b):
+    /// when a closer host appears or the current upstream drops, the next
+    /// computation returns a different peer and the renewal simply follows it.
+    pub(crate) fn most_keyward_hosting_neighbor(
+        &self,
+        instance_id: &ContractInstanceId,
+        hosting_neighbors: &[TransportPublicKey],
+    ) -> Option<PeerKeyLocation> {
+        let contract_location = Location::from(instance_id);
+        let my_location = self.connection_manager.own_location().location()?;
+        let my_distance = my_location.distance(contract_location);
+
+        hosting_neighbors
+            .iter()
+            .filter_map(|pk| self.connection_manager.get_peer_by_pub_key(pk))
+            .filter_map(|pkl| {
+                let dist = pkl.location()?.distance(contract_location);
+                // Strictly closer to the key than us — the acyclicity guarantee.
+                (dist < my_distance).then_some((pkl, dist))
+            })
+            .min_by(|(a, ad), (b, bd)| {
+                ad.cmp(bd)
+                    // Deterministic tiebreak so equidistant hosts yield a total
+                    // order (§6 point 2); addressless peers sort last.
+                    .then_with(|| a.socket_addr().cmp(&b.socket_addr()))
+            })
+            .map(|(pkl, _)| pkl)
+    }
+
     /// Check if a contract-directed CONNECT is currently in backoff.
     fn is_in_contract_connect_backoff(&self, contract_key: &ContractKey) -> bool {
         let backoff = self.contract_connect_backoff.lock();
