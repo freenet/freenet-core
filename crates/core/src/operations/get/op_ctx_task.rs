@@ -2807,6 +2807,12 @@ where
     let mut consult_active: bool;
     // Guards against recording more than one terminal consult outcome.
     let mut consult_resolved_recorded = false;
+    // True when the most recent forward on `incoming_tx` produced NO reply
+    // (timeout or send-failure). In that state the awaited peer may still send
+    // a LATE reply on the reused tx, which would satisfy a freshly-registered
+    // consult waiter and bubble a false result — so we do NOT consult after a
+    // failed forward (Codex P2). Reset by any forward that received a reply.
+    let mut last_forward_failed = false;
 
     loop {
         // Pick next downstream peer.
@@ -2882,21 +2888,31 @@ where
                 // intermediate relay (not only the deepest terminus), which is
                 // intended: the advertised host is a neighbor of THIS relay,
                 // invisible to the deeper terminus.
-                let targets = consult_targets.get_or_insert_with(|| {
-                    let tried_snapshot = tried.clone();
-                    let visited_snapshot = new_visited.clone();
-                    crate::operations::consult_advertised_hosts(
-                        op_manager,
-                        &instance_id,
-                        MAX_TERMINAL_CONSULT_HOSTS,
-                        move |addr| {
-                            tried_snapshot.contains(&addr)
-                                || visited_snapshot.probably_visited(addr)
-                        },
-                    )
-                    .into_iter()
-                });
-                if let Some((consult_peer, consult_addr)) = targets.next() {
+                // Only consult when the previous forward received a reply; a
+                // timed-out / send-failed forward may still reply late on the
+                // reused tx and satisfy the consult waiter (Codex P2). In that
+                // case skip the consult entirely and report NotFound — the same
+                // outcome the relay produced before the consult existed.
+                let consult_candidate = if last_forward_failed {
+                    None
+                } else {
+                    let targets = consult_targets.get_or_insert_with(|| {
+                        let tried_snapshot = tried.clone();
+                        let visited_snapshot = new_visited.clone();
+                        crate::operations::consult_advertised_hosts(
+                            op_manager,
+                            &instance_id,
+                            MAX_TERMINAL_CONSULT_HOSTS,
+                            move |addr| {
+                                tried_snapshot.contains(&addr)
+                                    || visited_snapshot.probably_visited(addr)
+                            },
+                        )
+                        .into_iter()
+                    });
+                    targets.next()
+                };
+                if let Some((consult_peer, consult_addr)) = consult_candidate {
                     tried.push(consult_addr);
                     new_visited.mark_visited(consult_addr);
                     consult_active = true;
@@ -2909,8 +2925,11 @@ where
                     (consult_peer, consult_addr)
                 } else {
                     // Dead-end confirmed: no usable advertised host (or every
-                    // advertised host was already tried / also failed).
-                    if !consult_resolved_recorded {
+                    // advertised host was already tried / also failed). Record
+                    // a still-not-found outcome only if a consult actually ran
+                    // (`consult_targets` was built) — not when it was skipped
+                    // after a failed forward.
+                    if consult_targets.is_some() && !consult_resolved_recorded {
                         crate::operations::record_terminal_consult_outcome(false);
                     }
                     tracing::warn!(
@@ -3073,6 +3092,9 @@ where
                     crate::router::RouteOutcome::Failure,
                     crate::node::network_status::OpType::Get,
                 );
+                // No reply received — the awaited peer may reply late on the
+                // reused tx, so do NOT consult after this (Codex P2).
+                last_forward_failed = true;
                 // Continue loop to try next peer.
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -3091,10 +3113,19 @@ where
                     crate::router::RouteOutcome::Failure,
                     crate::node::network_status::OpType::Get,
                 );
+                // Timed out with no reply — the peer may reply late on the
+                // reused tx, so do NOT consult after this (Codex P2).
+                last_forward_failed = true;
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
         };
+
+        // A reply was received on `incoming_tx` (the only path past the
+        // `round_trip` match), so the awaited peer will not reply late — it is
+        // safe to consult after this attempt (Codex P2). Reset regardless of
+        // how the reply classifies below.
+        last_forward_failed = false;
 
         // Classify the reply.
         let attempt_outcome = classify(reply);
@@ -4773,6 +4804,32 @@ mod tests {
         assert!(
             body.contains("record_terminal_consult_outcome"),
             "drive_relay_get_inner must record the terminal consult outcome"
+        );
+    }
+
+    /// Piece C P2 (Codex): the consult reuses `incoming_tx`, so it must NOT run
+    /// after a forward that got NO reply (timeout / send-failure) — a late
+    /// reply from the timed-out peer could satisfy the consult waiter and
+    /// bubble a false NotFound. Pin that both failure arms flag
+    /// `last_forward_failed` and the consult is gated on it.
+    #[test]
+    fn consult_skipped_after_failed_forward() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        // Both no-reply arms set the guard.
+        assert!(
+            body.matches("last_forward_failed = true").count() >= 2,
+            "both the send-failure and timeout arms must set last_forward_failed = true"
+        );
+        // A received reply clears it.
+        assert!(
+            body.contains("last_forward_failed = false"),
+            "a received reply must reset last_forward_failed so the consult can run"
+        );
+        // The consult is gated on the guard.
+        assert!(
+            body.contains("if last_forward_failed"),
+            "the consult must be gated on !last_forward_failed (skip after a no-reply forward)"
         );
     }
 

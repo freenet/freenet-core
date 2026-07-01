@@ -1863,7 +1863,8 @@ async fn drive_relay_subscribe(
                             crate::operations::record_terminal_consult_outcome(true);
                             (SubscribeMsgResult::Subscribed { key }, hop_count)
                         }
-                        SubscribeForwardOutcome::NotFound { hop_count } => {
+                        SubscribeForwardOutcome::NotFound { hop_count }
+                        | SubscribeForwardOutcome::Failed { hop_count } => {
                             crate::operations::record_terminal_consult_outcome(false);
                             (SubscribeMsgResult::NotFound, hop_count)
                         }
@@ -1875,6 +1876,14 @@ async fn drive_relay_subscribe(
                     (SubscribeMsgResult::NotFound, hop_count)
                 }
             }
+        }
+        SubscribeForwardOutcome::Failed { hop_count } => {
+            // The greedy routing forward received NO reply (timeout / send
+            // failure / unexpected variant). Consulting would install a new
+            // waiter on the reused tx that a late reply from the timed-out peer
+            // could satisfy (Codex P2), so bubble NotFound WITHOUT consulting —
+            // the same outcome the relay produced before the consult existed.
+            (SubscribeMsgResult::NotFound, hop_count)
         }
     };
 
@@ -1899,9 +1908,13 @@ enum SubscribeForwardOutcome {
         key: freenet_stdlib::prelude::ContractKey,
         hop_count: usize,
     },
-    /// This forward did not subscribe — downstream answered NotFound, timed
-    /// out, failed to send, or replied with an unexpected variant.
+    /// Downstream cleanly answered NotFound (a reply WAS received). Safe to
+    /// fall back to the terminal advertisement consult on the reused tx.
     NotFound { hop_count: usize },
+    /// The forward received NO reply (timeout / send-failure) or an
+    /// unexpected variant. The awaited peer may reply late on the reused tx,
+    /// so the caller MUST bubble NotFound WITHOUT consulting (Codex P2).
+    Failed { hop_count: usize },
 }
 
 /// Forward a `SubscribeMsg::Request` to a single target, await the reply, and
@@ -1984,7 +1997,8 @@ async fn relay_subscribe_forward_once(
                 crate::router::RouteOutcome::Failure,
                 crate::node::network_status::OpType::Subscribe,
             );
-            return SubscribeForwardOutcome::NotFound {
+            // No reply — do NOT consult on the reused tx (Codex P2).
+            return SubscribeForwardOutcome::Failed {
                 hop_count: our_depth,
             };
         }
@@ -2003,7 +2017,8 @@ async fn relay_subscribe_forward_once(
                 crate::router::RouteOutcome::Failure,
                 crate::node::network_status::OpType::Subscribe,
             );
-            return SubscribeForwardOutcome::NotFound {
+            // Timed out with no reply — do NOT consult on the reused tx (Codex P2).
+            return SubscribeForwardOutcome::Failed {
                 hop_count: our_depth,
             };
         }
@@ -2079,7 +2094,10 @@ async fn relay_subscribe_forward_once(
                 reply_variant = ?std::mem::discriminant(&other),
                 "SUBSCRIBE relay: unexpected reply variant; treating as NotFound"
             );
-            SubscribeForwardOutcome::NotFound {
+            // Anomalous reply — treat as Failed so we do NOT consult on the
+            // reused tx (only a CLEAN downstream NotFound is safe to fall back
+            // from). Codex P2.
+            SubscribeForwardOutcome::Failed {
                 hop_count: our_depth,
             }
         }
@@ -2802,6 +2820,42 @@ mod tests {
         assert!(
             region.contains("record_terminal_consult_outcome"),
             "drive_relay_subscribe must record the terminal consult outcome"
+        );
+    }
+
+    /// Piece C P2 (Codex): the consult reuses `incoming_tx`, so it must run
+    /// ONLY after a CLEAN downstream NotFound — never after a forward that got
+    /// no reply (timeout / send-failure), whose late reply could satisfy the
+    /// consult waiter. Pin that timeout/send-failure map to a distinct
+    /// `Failed` outcome that bubbles NotFound without consulting.
+    #[test]
+    fn relay_subscribe_consult_skipped_after_failed_forward() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let end = src[start..]
+            .find("\nasync fn relay_subscribe_send_response(")
+            .expect("region end not found")
+            + start;
+        let region = &src[start..end];
+        // The forward helper distinguishes a no-reply Failed outcome.
+        assert!(
+            region.contains("SubscribeForwardOutcome::Failed"),
+            "relay_subscribe_forward_once must return a distinct Failed outcome for \
+             timeout / send-failure so the consult is not reached on the reused tx"
+        );
+        // The top-level Failed arm bubbles NotFound WITHOUT calling the consult.
+        let outer_failed = region
+            .find("SubscribeForwardOutcome::Failed { hop_count } => {")
+            .expect("driver must handle the top-level Failed outcome explicitly");
+        let consult_pos = region
+            .find("consult_advertised_hosts")
+            .expect("driver must consult on the clean-NotFound path");
+        assert!(
+            outer_failed > consult_pos,
+            "the top-level Failed arm must come after (be separate from) the \
+             NotFound consult arm — Failed must not consult"
         );
     }
 
