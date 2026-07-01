@@ -187,6 +187,12 @@ pub struct OperationStats {
     /// Count of broadcast updates received via subscription streaming.
     /// These are push-based and don't have success/failure semantics.
     pub updates_received: u32,
+    /// Count of event-driven re-subscribes this node fired because an UPSTREAM
+    /// peer dropped (#4642 piece F). Each is a fresh SUBSCRIBE routed toward the
+    /// key immediately on upstream-loss detection (after the shared
+    /// ban/backoff/dedup gates), rather than waiting for the periodic renewal
+    /// cycle — a per-node measure of how often self-healing re-rooting fired.
+    pub event_driven_resubscribes: u64,
 }
 
 /// Maximum number of recent NAT attempts to track for rolling trend.
@@ -457,6 +463,19 @@ pub fn record_update_received() {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             s.op_stats.updates_received = s.op_stats.updates_received.saturating_add(1);
+        }
+    }
+}
+
+/// Record an event-driven re-subscribe fired on upstream-peer loss (#4642
+/// piece F). Per-node aggregate scalar; incremented once per fresh SUBSCRIBE
+/// spawned by `OpManager::on_ring_connection_lost` for a contract whose upstream
+/// just dropped.
+pub fn record_event_driven_resubscribe() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.op_stats.event_driven_resubscribes =
+                s.op_stats.event_driven_resubscribes.saturating_add(1);
         }
     }
 }
@@ -795,6 +814,8 @@ pub struct OpStatsSnapshot {
     pub subscribes: (u32, u32),
     /// Broadcast updates received via subscription streaming.
     pub updates_received: u32,
+    /// Event-driven re-subscribes fired on upstream-peer loss (#4642 piece F).
+    pub event_driven_resubscribes: u64,
 }
 
 impl OpStatsSnapshot {
@@ -972,6 +993,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             updates: s.op_stats.updates,
             subscribes: s.op_stats.subscribes,
             updates_received: s.op_stats.updates_received,
+            event_driven_resubscribes: s.op_stats.event_driven_resubscribes,
         },
         nat_stats: NatStatsSnapshot {
             attempts: s.nat_stats.attempts,
@@ -1244,6 +1266,34 @@ mod tests {
         assert_eq!(snap.op_stats.puts, (1, 0));
         assert_eq!(snap.op_stats.subscribes, (1, 1));
         assert_eq!(snap.op_stats.updates, (2, 1));
+    }
+
+    #[test]
+    fn test_event_driven_resubscribe_recording() {
+        // #4642 piece F: the per-node event-driven re-subscribe scalar must
+        // accumulate through `record_event_driven_resubscribe()` and surface in
+        // the snapshot.
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31346, HashSet::new(), "0.1.148".to_string());
+
+        if let Some(status) = NETWORK_STATUS.get() {
+            let mut s = status.write().unwrap();
+            s.op_stats = OperationStats::default();
+        }
+
+        assert_eq!(
+            get_snapshot().unwrap().op_stats.event_driven_resubscribes,
+            0
+        );
+
+        record_event_driven_resubscribe();
+        record_event_driven_resubscribe();
+        record_event_driven_resubscribe();
+
+        assert_eq!(
+            get_snapshot().unwrap().op_stats.event_driven_resubscribes,
+            3
+        );
     }
 
     #[test]

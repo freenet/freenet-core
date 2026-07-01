@@ -526,6 +526,37 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .unwrap_or_default()
     }
 
+    /// Contracts for which `peer` is our UPSTREAM in the subscription tree.
+    ///
+    /// Piece F of the demand-driven hosting redesign (#4642): when an upstream
+    /// connection drops, these are exactly the subscriptions whose update flow
+    /// just broke and must be re-routed toward the key. A peer that was only a
+    /// downstream subscriber (`is_upstream == false` — updates flow FROM us TO
+    /// it) is excluded, because its drop does not interrupt our own updates.
+    ///
+    /// Snapshots the `peer_contracts` reverse-index entry and releases its shard
+    /// guard BEFORE touching `interested_peers`, so this never holds the
+    /// `peer_contracts` guard while acquiring an `interested_peers` shard — the
+    /// reverse of the `register_peer_interest` lock order (see the "Cross-DashMap
+    /// Lock Discipline" rule in `.claude/rules/ring.md`; same defensive shape as
+    /// `remove_all_peer_interests`).
+    pub fn upstream_contracts_for_peer(&self, peer: &PeerKey) -> Vec<ContractKey> {
+        let contracts: Vec<ContractKey> = self
+            .peer_contracts
+            .get(peer)
+            .map(|entry| entry.value().iter().cloned().collect())
+            .unwrap_or_default();
+        contracts
+            .into_iter()
+            .filter(|contract| {
+                self.interested_peers
+                    .get(contract)
+                    .and_then(|entry| entry.get(peer).map(|interest| interest.is_upstream))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     /// Get the peer's cached summary for a contract.
     pub fn get_peer_summary(
         &self,
@@ -2017,6 +2048,66 @@ mod tests {
         let contracts = manager.get_contracts_for_peer(&peer);
         assert_eq!(contracts.len(), 1);
         assert!(contracts.contains(&contract2));
+    }
+
+    #[test]
+    fn test_upstream_contracts_for_peer() {
+        // Piece F (#4642): `upstream_contracts_for_peer` must return only the
+        // contracts for which the given peer is our UPSTREAM (is_upstream=true),
+        // excluding downstream-only entries and entries for other peers.
+        let (manager, _time) = make_manager();
+        let up1 = make_contract_key(1);
+        let up2 = make_contract_key(2);
+        let down_only = make_contract_key(3);
+        let other_peers_upstream = make_contract_key(4);
+
+        let upstream_peer = make_peer_key(1);
+        let other_peer = make_peer_key(2);
+
+        // `upstream_peer` is our upstream for up1 and up2 (is_upstream=true)...
+        manager.register_peer_interest(&up1, upstream_peer.clone(), None, true);
+        manager.register_peer_interest(&up2, upstream_peer.clone(), None, true);
+        // ...but only a downstream subscriber for `down_only` (is_upstream=false).
+        manager.register_peer_interest(&down_only, upstream_peer.clone(), None, false);
+        // A different peer is the upstream for a fourth contract.
+        manager.register_peer_interest(&other_peers_upstream, other_peer.clone(), None, true);
+
+        let sort_by_id =
+            |v: &mut Vec<ContractKey>| v.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        let mut affected = manager.upstream_contracts_for_peer(&upstream_peer);
+        sort_by_id(&mut affected);
+        let mut expected = vec![up1, up2];
+        sort_by_id(&mut expected);
+        assert_eq!(
+            affected, expected,
+            "only the upstream_peer's is_upstream contracts should be affected"
+        );
+
+        // Downstream-only interest must NOT surface as an affected upstream.
+        assert!(!affected.contains(&down_only));
+
+        // The other peer's upstream contract is isolated to that peer.
+        assert_eq!(
+            manager.upstream_contracts_for_peer(&other_peer),
+            vec![other_peers_upstream]
+        );
+
+        // An unknown peer yields nothing.
+        assert!(
+            manager
+                .upstream_contracts_for_peer(&make_peer_key(9))
+                .is_empty()
+        );
+
+        // After the upstream peer's interest is removed (as on disconnect
+        // cleanup), it is no longer reported as an upstream.
+        manager.remove_peer_interest(&up1, &upstream_peer);
+        manager.remove_peer_interest(&up2, &upstream_peer);
+        assert!(
+            manager
+                .upstream_contracts_for_peer(&upstream_peer)
+                .is_empty()
+        );
     }
 
     #[test]
