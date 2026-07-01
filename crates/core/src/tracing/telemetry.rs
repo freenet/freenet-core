@@ -155,6 +155,21 @@ const MAX_BUFFER_SIZE: usize = 100;
 /// How often to send batched events (in seconds)
 const BATCH_INTERVAL_SECS: u64 = 10;
 
+/// Emit `resource_utilization` telemetry once every this many batch ticks.
+///
+/// The batch tick fires every [`BATCH_INTERVAL_SECS`] (10s), but resource
+/// utilization (memory RSS/ceiling, CPU time, cumulative bandwidth) is a
+/// slowly-changing, node-wide signal, so sampling it on every 10s tick is
+/// wasteful. Crucially, EVERY production peer reports telemetry to the central
+/// collector (nova) by default, so a 10s cadence multiplies collector load
+/// across the whole fleet for a signal that barely moves in 10s. Emitting once
+/// per 6 batch ticks (~60s) cuts that ~6x with no real signal loss.
+///
+/// Only `resource_utilization`'s cadence is throttled this way; every other
+/// telemetry event still batches and flushes on the normal [`BATCH_INTERVAL_SECS`]
+/// tick.
+const RESOURCE_TELEMETRY_BATCH_INTERVAL: u64 = 6;
+
 /// Maximum events per second (aggregate rate limiting across all priorities)
 const MAX_EVENTS_PER_SECOND: usize = 10;
 
@@ -493,6 +508,11 @@ struct TelemetryWorker {
     transfer_event_receiver: mpsc::Receiver<super::TransferEvent>,
     /// This node's own peer id — see `TelemetryReporter::local_peer_id`.
     local_peer_id: String,
+    /// Batch ticks counted since startup, used to throttle
+    /// `resource_utilization` emits to one per
+    /// [`RESOURCE_TELEMETRY_BATCH_INTERVAL`] ticks (~60s). Advanced by
+    /// [`Self::should_emit_resource_utilization`] on every batch tick.
+    resource_emit_batch_counter: u64,
 }
 
 impl TelemetryWorker {
@@ -519,6 +539,7 @@ impl TelemetryWorker {
             transport_snapshot_interval_secs,
             transfer_event_receiver,
             local_peer_id,
+            resource_emit_batch_counter: 0,
         }
     }
 
@@ -558,6 +579,24 @@ impl TelemetryWorker {
             event_data: crate::node::resource_metrics::sample().to_telemetry_value(),
             priority: EventPriority::Operational,
         }
+    }
+
+    /// Decide whether this batch tick should emit a `resource_utilization`
+    /// sample, advancing the internal batch-tick counter as a side effect.
+    ///
+    /// Returns `true` on the first tick (counter starts at 0, for prompt
+    /// startup visibility) and once every [`RESOURCE_TELEMETRY_BATCH_INTERVAL`]
+    /// ticks thereafter, so the sample lands on a ~60s cadence rather than on
+    /// every 10s batch tick — see [`RESOURCE_TELEMETRY_BATCH_INTERVAL`] for
+    /// why. Pulled out of [`Self::run`] so the reduced cadence is unit-testable
+    /// without driving the async interval/flush machinery (same approach as
+    /// [`Self::admit_event`]).
+    fn should_emit_resource_utilization(&mut self) -> bool {
+        let emit = self.resource_emit_batch_counter % RESOURCE_TELEMETRY_BATCH_INTERVAL == 0;
+        // wrapping_add so the counter can never panic on overflow; the modulo
+        // phase is irrelevant on the ~5.8-trillion-year horizon that would take.
+        self.resource_emit_batch_counter = self.resource_emit_batch_counter.wrapping_add(1);
+        emit
     }
 
     /// Wrap a transport-layer transfer event into a `TelemetryEvent`,
@@ -625,12 +664,21 @@ impl TelemetryWorker {
                 },
                 _ = batch_interval.tick() => {
                     // Emit this node's own resource-utilization sample (#4642
-                    // A1) on the batch cadence, so a peer's memory/CPU/bandwidth
-                    // headroom is observable on the telemetry stream the
-                    // dashboard consumes. Cheap process-local sources; buffered
-                    // like any other event, then flushed below.
-                    let resource_event = self.resource_utilization_telemetry();
-                    self.handle_event(resource_event).await;
+                    // A1) so a peer's memory/CPU/bandwidth headroom is
+                    // observable on the telemetry stream the dashboard consumes.
+                    // Throttled to a ~60s cadence (every
+                    // RESOURCE_TELEMETRY_BATCH_INTERVAL batch ticks), NOT every
+                    // 10s tick: it's a slowly-changing, node-wide signal and
+                    // every production peer reports to the central collector by
+                    // default, so a 10s cadence needlessly multiplies collector
+                    // load across the fleet. Cheap process-local sources;
+                    // buffered like any other event. The flush below still runs
+                    // on every batch tick — only the resource sample is
+                    // throttled, not the batch/flush cadence.
+                    if self.should_emit_resource_utilization() {
+                        let resource_event = self.resource_utilization_telemetry();
+                        self.handle_event(resource_event).await;
+                    }
                     self.flush().await;
                 },
                 _ = transport_snapshot_interval.tick() => {
@@ -2642,6 +2690,55 @@ mod tests {
         ] {
             assert!(obj.contains_key(key), "event_data missing key `{key}`");
         }
+    }
+
+    #[test]
+    fn test_resource_utilization_emits_once_per_six_batch_ticks() {
+        // #4642 A1 cadence: resource_utilization is a slowly-changing,
+        // node-wide signal that every peer reports to the central collector,
+        // so it emits on a reduced ~60s cadence (once every
+        // RESOURCE_TELEMETRY_BATCH_INTERVAL = 6 batch ticks of
+        // BATCH_INTERVAL_SECS = 10s each) rather than on every 10s batch tick.
+        // Guards against a regression that would restore the wasteful 10s
+        // cadence.
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (_transfer_tx, transfer_rx) = mpsc::channel(1);
+        let mut worker = TelemetryWorker::new(
+            "http://localhost:4318".to_string(),
+            cmd_rx,
+            0,
+            transfer_rx,
+            "cadence-peer-id".to_string(),
+        );
+
+        // The constant yields the intended ~60s cadence.
+        assert_eq!(
+            RESOURCE_TELEMETRY_BATCH_INTERVAL * BATCH_INTERVAL_SECS,
+            60,
+            "resource telemetry should emit ~once per 60s"
+        );
+
+        // Over two full cycles, only the ticks at multiples of the interval
+        // (0, 6, 12, ...) emit: exactly one emit per six batch ticks. The
+        // first tick emits for prompt startup visibility.
+        let total_ticks = RESOURCE_TELEMETRY_BATCH_INTERVAL * 2;
+        let mut emits = 0usize;
+        for tick in 0..total_ticks {
+            let emitted = worker.should_emit_resource_utilization();
+            let expected = tick % RESOURCE_TELEMETRY_BATCH_INTERVAL == 0;
+            assert_eq!(
+                emitted, expected,
+                "batch tick {tick}: resource_utilization emit should be {expected}"
+            );
+            if emitted {
+                emits += 1;
+            }
+        }
+        assert_eq!(
+            emits, 2,
+            "expected exactly one resource_utilization emit per \
+             {RESOURCE_TELEMETRY_BATCH_INTERVAL} batch ticks over two cycles"
+        );
     }
 
     #[tokio::test]
