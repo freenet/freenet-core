@@ -186,8 +186,12 @@ fn sign_webapp(
 /// Fail fast if a packed website state exceeds the node's contract-state limit.
 ///
 /// A node's state store rejects any state larger than [`MAX_CONTRACT_STATE_SIZE`]
-/// (50 MiB). Without this pre-flight check the oversized PUT is streamed all the
-/// way to the node and rejected during stream reassembly with a cryptic
+/// (50 MiB). Without this pre-flight check the oversized PUT is sent and rejected
+/// by the node either way, but with an opaque message: a state in the ~50-64 MiB
+/// range reassembles fine and is rejected by the node's own state-size check
+/// (`state size X bytes exceeds maximum allowed 52428800 bytes`), while a very
+/// large site (>64 MiB serialized) exceeds the WebSocket transport cap and is
+/// rejected during stream reassembly with a cryptic
 /// `stream reassembly error: total_chunks N exceeds maximum 256` message
 /// (issue #4653). Checking here lets us surface the actual size, the limit, and
 /// a concrete remediation hint before anything is sent.
@@ -346,8 +350,9 @@ pub async fn publish(
     let state: State = webapp.pack()?.into();
 
     // Pre-flight size check: reject an oversized site here with a clear,
-    // actionable error rather than letting the node reject it during stream
-    // reassembly with a cryptic chunk-count message (#4653).
+    // actionable error rather than letting the node reject it with an opaque
+    // message (its state-size limit for ~50-64 MiB, or a cryptic chunk-count
+    // stream-reassembly error for >64 MiB serialized) (#4653).
     ensure_state_within_limit(state.as_ref().len(), &directory)?;
 
     println!("Publishing website as contract {key} (version {version})");

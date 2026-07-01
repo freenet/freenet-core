@@ -25,8 +25,10 @@ use moka::sync::Cache as MokaCache;
 /// - The stdlib WebSocket transport cap, `MAX_TOTAL_CHUNKS * CHUNK_SIZE`
 ///   (256 * 256 KiB = 64 MiB, in `freenet_stdlib::client_api::streaming`), is the largest
 ///   streamed API message the node will reassemble. It must stay `>=` this constant so any state
-///   the node would accept can actually be transmitted; otherwise an accepted-size state fails
-///   during stream reassembly with a cryptic `total_chunks N exceeds maximum 256` error (#4653).
+///   the node would accept can actually be transmitted. A state between this constant and the
+///   transport cap (~50-64 MiB) still reassembles and is rejected here by the state-size check
+///   below; only a state larger than the transport cap fails earlier, during stream reassembly,
+///   with a cryptic `total_chunks N exceeds maximum 256` error (#4653).
 /// - The website contract's own `MAX_WEB_SIZE` (100 MiB, in `crates/website-contract/src/lib.rs`)
 ///   is a loose sanity bound that this constant and the transport cap both bind before it is ever
 ///   reached.
