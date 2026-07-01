@@ -193,6 +193,18 @@ pub(crate) struct RouterSnapshotInfo {
     pub delegate_module_cache_total_bytes: Option<u64>,
     pub delegate_module_cache_budget_bytes: Option<u64>,
     pub delegate_module_cache_evictions_total: Option<u64>,
+    /// Capability-relative hosting-budget gauges (#4642 A2), populated by `Ring`
+    /// from the `HostingManager` on the snapshot cadence. `hosting_budget_bytes`
+    /// is the RAM-scaled default (or operator override); `hosting_current_bytes`
+    /// is the tracked contract-state occupancy (occupancy/utilization ratio =
+    /// current / budget, headroom = 1 - that; derived by the collector);
+    /// `hosting_budget_evictions_total` is a monotonic counter the collector
+    /// differences to get a budget-triggered eviction rate. `None` until the ring
+    /// is built. Per-node aggregate scalars.
+    pub hosting_budget_bytes: Option<u64>,
+    pub hosting_current_bytes: Option<u64>,
+    pub hosting_contract_count: Option<u64>,
+    pub hosting_budget_evictions_total: Option<u64>,
     /// Interest-weighted (two-tier) module-cache SHADOW gauges (#4441/#4534),
     /// populated by `Ring` from the same per-node `ModuleCacheMetrics` `Arc`.
     /// These are ALWAYS ON, independent of the `FREENET_MODULE_CACHE_INTEREST_TIERED`
@@ -1087,6 +1099,12 @@ impl Router {
             delegate_module_cache_total_bytes: None,
             delegate_module_cache_budget_bytes: None,
             delegate_module_cache_evictions_total: None,
+            // Capability-relative hosting-budget gauges populated by Ring on the
+            // snapshot cadence (#4642 A2).
+            hosting_budget_bytes: None,
+            hosting_current_bytes: None,
+            hosting_contract_count: None,
+            hosting_budget_evictions_total: None,
             // Interest-weighted (two-tier) module-cache shadow gauges,
             // populated by Ring on the snapshot cadence (#4441/#4534).
             contract_module_cache_cold_evictable_bytes: None,
