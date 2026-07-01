@@ -3313,16 +3313,13 @@ where
                     }
                 };
 
-                // The claim succeeded, so delivery is now committed (loopback
-                // cache or upstream pipe below). A consulted advertised host
-                // that streams the contract has closed the dead-end — record
-                // here, AFTER the fallible `claim_or_wait`, not at classify
-                // time (a claim failure above `continue`s to the next
-                // candidate, so recording early would be a false positive).
-                // Every path from here returns, so exactly one outcome records.
-                if consult_active {
-                    crate::operations::record_terminal_consult_outcome(true);
-                }
+                // NOTE: the terminal-consult `resolved_found` for a streaming
+                // reply is recorded only AFTER the payload is actually
+                // delivered — the loopback cache (below) or the remote
+                // `pipe_stream` success (Step 3). Recording here, right after
+                // the claim, would be a false positive: assembly, the header
+                // send, and the pipe can all still fail without the requester
+                // receiving the Found result.
 
                 // ── Step 2: Loopback safety net. If upstream IS us
                 //    (originator-loopback edge — rare), assemble + cache
@@ -3351,6 +3348,12 @@ where
                                         false,
                                     )
                                     .await;
+                                    // Loopback delivery succeeded (state cached
+                                    // locally): a consulted advertised host
+                                    // closed the dead-end.
+                                    if consult_active {
+                                        crate::operations::record_terminal_consult_outcome(true);
+                                    }
                                 } else {
                                     tracing::warn!(
                                         tx = %incoming_tx,
@@ -3438,6 +3441,14 @@ where
                          time out cleanly rather than sending a contradictory NotFound"
                     );
                     return Ok(());
+                }
+
+                // Remote delivery committed: the ResponseStreaming header went
+                // upstream and `pipe_stream` started successfully. A consulted
+                // advertised host closed the dead-end — record now, AFTER the
+                // fallible header send + pipe, not at claim time.
+                if consult_active {
+                    crate::operations::record_terminal_consult_outcome(true);
                 }
 
                 // ── Step 4: Record the relay route event for the downstream

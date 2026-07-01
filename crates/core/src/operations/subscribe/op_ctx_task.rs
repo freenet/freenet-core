@@ -1824,70 +1824,76 @@ async fn drive_relay_subscribe(
     // already-advertised host (nothing pushed/cached), a local lookup gates
     // it so a truly-absent contract triggers zero extra forward, and it is a
     // single extra forward whose Subscribed reply ends the search.
-    let (result, bubble_hop_count) = match outcome {
-        SubscribeForwardOutcome::Subscribed { key, hop_count } => {
-            (SubscribeMsgResult::Subscribed { key }, hop_count)
-        }
-        SubscribeForwardOutcome::NotFound { hop_count } => {
-            let visited_snapshot = new_visited.clone();
-            let consult = crate::operations::consult_advertised_hosts(
-                op_manager,
-                &instance_id,
-                TERMINAL_CONSULT_HOSTS,
-                move |addr| visited_snapshot.probably_visited(addr),
-            );
-            match consult.into_iter().next() {
-                Some((consult_hop, consult_addr)) => {
-                    new_visited.mark_visited(consult_addr);
-                    tracing::debug!(
-                        tx = %incoming_tx,
-                        %instance_id,
-                        target = %consult_addr,
-                        "SUBSCRIBE relay: consulting advertised host off routing path after \
-                         downstream NotFound"
-                    );
-                    let consult_outcome = relay_subscribe_forward_once(
-                        op_manager,
-                        incoming_tx,
-                        instance_id,
-                        htl,
-                        &new_visited,
-                        is_renewal,
-                        consult_hop,
-                        consult_addr,
-                        upstream_addr,
-                    )
-                    .await;
-                    match consult_outcome {
-                        SubscribeForwardOutcome::Subscribed { key, hop_count } => {
-                            crate::operations::record_terminal_consult_outcome(true);
-                            (SubscribeMsgResult::Subscribed { key }, hop_count)
-                        }
-                        SubscribeForwardOutcome::NotFound { hop_count }
-                        | SubscribeForwardOutcome::Failed { hop_count } => {
-                            crate::operations::record_terminal_consult_outcome(false);
-                            (SubscribeMsgResult::NotFound, hop_count)
+    // `consult_outcome`: None = no consult ran; Some(true) = a consulted host
+    // returned Subscribed; Some(false) = a consult ran but did not subscribe.
+    // The terminal-consult telemetry is recorded AFTER the upstream send
+    // succeeds (below), never here — a consult that subscribed but whose
+    // fire-and-forget reply then fails leaves the requester to time out, so it
+    // did NOT close the dead-end (Codex P2 — record after delivery).
+    let (result, bubble_hop_count, consult_outcome): (SubscribeMsgResult, usize, Option<bool>) =
+        match outcome {
+            SubscribeForwardOutcome::Subscribed { key, hop_count } => {
+                (SubscribeMsgResult::Subscribed { key }, hop_count, None)
+            }
+            SubscribeForwardOutcome::NotFound { hop_count } => {
+                let visited_snapshot = new_visited.clone();
+                let consult = crate::operations::consult_advertised_hosts(
+                    op_manager,
+                    &instance_id,
+                    TERMINAL_CONSULT_HOSTS,
+                    move |addr| visited_snapshot.probably_visited(addr),
+                );
+                match consult.into_iter().next() {
+                    Some((consult_hop, consult_addr)) => {
+                        new_visited.mark_visited(consult_addr);
+                        tracing::debug!(
+                            tx = %incoming_tx,
+                            %instance_id,
+                            target = %consult_addr,
+                            "SUBSCRIBE relay: consulting advertised host off routing path after \
+                             downstream NotFound"
+                        );
+                        let consult_outcome = relay_subscribe_forward_once(
+                            op_manager,
+                            incoming_tx,
+                            instance_id,
+                            htl,
+                            &new_visited,
+                            is_renewal,
+                            consult_hop,
+                            consult_addr,
+                            upstream_addr,
+                        )
+                        .await;
+                        match consult_outcome {
+                            SubscribeForwardOutcome::Subscribed { key, hop_count } => (
+                                SubscribeMsgResult::Subscribed { key },
+                                hop_count,
+                                Some(true),
+                            ),
+                            SubscribeForwardOutcome::NotFound { hop_count }
+                            | SubscribeForwardOutcome::Failed { hop_count } => {
+                                (SubscribeMsgResult::NotFound, hop_count, Some(false))
+                            }
                         }
                     }
-                }
-                None => {
-                    // No advertised host to try: the downstream NotFound stands.
-                    crate::operations::record_terminal_consult_outcome(false);
-                    (SubscribeMsgResult::NotFound, hop_count)
+                    None => {
+                        // No advertised host to try: the downstream NotFound stands.
+                        (SubscribeMsgResult::NotFound, hop_count, Some(false))
+                    }
                 }
             }
-        }
-        SubscribeForwardOutcome::Failed { hop_count } => {
-            // The greedy routing forward received NO reply (timeout / send
-            // failure / unexpected variant). Consulting would install a new
-            // waiter on the reused tx that a late reply from the timed-out peer
-            // could satisfy (Codex P2), so bubble NotFound WITHOUT consulting —
-            // the same outcome the relay produced before the consult existed.
-            (SubscribeMsgResult::NotFound, hop_count)
-        }
-    };
+            SubscribeForwardOutcome::Failed { hop_count } => {
+                // The greedy routing forward received NO reply (timeout / send
+                // failure / unexpected variant). Consulting would install a new
+                // waiter on the reused tx that a late reply from the timed-out
+                // peer could satisfy (Codex P2), so bubble NotFound WITHOUT
+                // consulting — the same outcome as before the consult existed.
+                (SubscribeMsgResult::NotFound, hop_count, None)
+            }
+        };
 
-    relay_subscribe_send_response(
+    let send_result = relay_subscribe_send_response(
         op_manager,
         incoming_tx,
         instance_id,
@@ -1895,7 +1901,17 @@ async fn drive_relay_subscribe(
         upstream_addr,
         bubble_hop_count,
     )
-    .await
+    .await;
+
+    // Record the terminal-consult outcome only AFTER the upstream response
+    // send: a consult that subscribed but whose reply failed to send did NOT
+    // close the dead-end for the requester (it will time out), so it counts as
+    // still-not-found (Codex P2).
+    if let Some(consult_resolved) = consult_outcome {
+        crate::operations::record_terminal_consult_outcome(consult_resolved && send_result.is_ok());
+    }
+
+    send_result
 }
 
 /// Outcome of a single SUBSCRIBE relay forward, normalized so the driver can
