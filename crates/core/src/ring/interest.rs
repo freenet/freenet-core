@@ -798,6 +798,29 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .unwrap_or(false)
     }
 
+    /// Count contracts backed by *real demand*: a local client subscription or
+    /// a downstream subscriber. This deliberately EXCLUDES the cache-only
+    /// `hosting` reason, so it does not grow with the hosting cache.
+    ///
+    /// This is the denominator for the #3763 no-storm invariant: renewal /
+    /// subscription volume must scale with active demand, not with cache size.
+    /// `LocalInterest::is_interested()` (which folds in `hosting`) is the wrong
+    /// signal for that check — see the sim assertions in
+    /// `simulation_integration.rs` and the unit test
+    /// `test_contracts_needing_renewal_bounded_by_active_interest`.
+    ///
+    /// Test/sim-only accessor (reached via `Ring::active_demand_count`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn active_demand_count(&self) -> usize {
+        self.local_interests
+            .iter()
+            .filter(|entry| {
+                let li = entry.value();
+                li.local_client_count > 0 || li.downstream_subscriber_count > 0
+            })
+            .count()
+    }
+
     /// Remove local interest entry if no longer interested.
     pub fn cleanup_local_interest(&self, contract: &ContractKey) {
         if let Some(entry) = self.local_interests.get(contract) {
