@@ -1564,13 +1564,16 @@ impl HostingManager {
     }
 
     /// Mark a subscription request as in-flight.
-    /// Returns false if already pending.
+    ///
+    /// Returns `true` iff this call reserved the slot (the contract was not
+    /// already pending). `DashSet::insert` returns `true` only when the key was
+    /// newly inserted, so the reservation is ATOMIC: if two tasks race for the
+    /// same contract, exactly one gets `true`. This matters since #4642 piece F
+    /// added a second concurrent caller (`on_ring_connection_lost` on the
+    /// event-loop task) alongside the periodic renewal loop — a non-atomic
+    /// check-then-insert here would let both pass and double-fire a re-subscribe.
     pub fn mark_subscription_pending(&self, contract: ContractKey) -> bool {
-        if self.pending_subscription_requests.contains(&contract) {
-            return false;
-        }
-        self.pending_subscription_requests.insert(contract);
-        true
+        self.pending_subscription_requests.insert(contract)
     }
 
     /// Mark a subscription request as completed.
@@ -2655,6 +2658,53 @@ mod tests {
 
         // Now in backoff - can't request immediately
         assert!(!manager.can_request_subscription(&contract));
+    }
+
+    /// #4642 piece F: `mark_subscription_pending` must be an ATOMIC reservation.
+    ///
+    /// Before piece F the only caller was the single sequential periodic renewal
+    /// loop, so a non-atomic check-then-insert never raced. Piece F added a
+    /// second concurrent caller (`on_ring_connection_lost` on the event-loop
+    /// task); if the reservation were non-atomic, two tasks racing for the same
+    /// contract could both observe "not pending", both insert, and both spawn a
+    /// re-subscribe — the double-fire the design forbids. This hammers the same
+    /// key from many threads and asserts EXACTLY ONE reservation wins.
+    #[test]
+    fn mark_subscription_pending_reserves_atomically_under_contention() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let manager = Arc::new(HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES));
+        let contract = make_contract_key(7);
+        let winners = Arc::new(AtomicUsize::new(0));
+
+        const THREADS: usize = 32;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let manager = manager.clone();
+                let winners = winners.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    // Line every thread up so they contend on the same instant.
+                    barrier.wait();
+                    if manager.mark_subscription_pending(contract) {
+                        winners.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            winners.load(Ordering::Relaxed),
+            1,
+            "exactly one thread must win the pending reservation; more than one \
+             means the reservation is non-atomic and the event-driven and \
+             periodic paths can double-fire a re-subscribe"
+        );
     }
 
     #[test]

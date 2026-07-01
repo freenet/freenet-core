@@ -26,7 +26,7 @@ use tracing::Instrument;
 
 use crate::{
     client_events::HostResult,
-    config::GlobalExecutor,
+    config::{GlobalExecutor, GlobalRng},
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
     message::{InterestMessage, MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction},
     operations::{
@@ -1175,32 +1175,53 @@ impl OpManager {
         let peer_key = PeerKey::from(pub_key.clone());
         self.interest_manager.schedule_deferred_removal(&peer_key);
 
-        let open_conns = self.ring.open_connections();
-        let affected = self.interest_manager.upstream_contracts_for_peer(&peer_key);
-        tracing::debug!(
-            dropped_peer = %peer_key.0,
-            open_connections = open_conns,
-            upstream_contracts = affected.len(),
-            "piece-F: evaluating event-driven re-subscribe on upstream loss"
-        );
-
-        // No peers to route a fresh SUBSCRIBE through: skip (mirrors the periodic
-        // renewal loop's zero-connection gate, #3676, which prevents a doomed
-        // subscribe storm on an isolated node).
-        if open_conns == 0 {
+        // No peers to route a fresh SUBSCRIBE through: skip BEFORE the interest
+        // scan (mirrors the periodic renewal loop's zero-connection gate, #3676,
+        // which prevents a doomed subscribe storm on an isolated node).
+        if self.ring.open_connections() == 0 {
             return;
         }
 
+        let mut affected = self.interest_manager.upstream_contracts_for_peer(&peer_key);
         if affected.is_empty() {
             return;
         }
 
+        // Bound the per-drop burst the SAME way the periodic renewal loop does
+        // (#4601 cap + channel backpressure, #3676): a high-degree upstream can
+        // be the upstream for many of our contracts, and firing a fresh SUBSCRIBE
+        // for every one at once (only 0-1s jitter) would flood the notification
+        // channel and starve the periodic loop this path shares dedup/backoff
+        // state with. Shuffle so we don't always starve the same tail, cap the
+        // spawns to `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL`, and stop early if the
+        // channel is congested. Any contract skipped here is still recovered by
+        // the periodic renewal loop (the backstop), so capping the burst never
+        // drops a subscription — it only smooths the spike.
+        GlobalRng::shuffle(&mut affected);
+        tracing::debug!(
+            dropped_peer = %peer_key.0,
+            upstream_contracts = affected.len(),
+            "piece-F: evaluating event-driven re-subscribe on upstream loss"
+        );
+
+        let sender = self.to_event_listener.notifications_sender();
+        let channel_max = sender.max_capacity();
         let own_addr = self.ring.connection_manager.get_own_addr();
+        let mut fired = 0usize;
         for contract in affected {
+            if fired >= crate::ring::Ring::MAX_RECOVERY_ATTEMPTS_PER_INTERVAL {
+                break;
+            }
+            // Stop spawning if the notification channel is >75% full, mirroring
+            // the periodic loop's `RENEWAL_STOP_CAPACITY_FRACTION` gate.
+            if sender.capacity() < channel_max / crate::ring::Ring::RENEWAL_STOP_CAPACITY_FRACTION {
+                break;
+            }
             if self
                 .ring
                 .try_spawn_event_driven_resubscribe(self.clone(), contract)
             {
+                fired += 1;
                 // Production per-node scalar (aggregate counter on this node).
                 crate::node::network_status::record_event_driven_resubscribe();
                 // Simulation-test observability (no-op in production — gated on a
@@ -3420,23 +3441,45 @@ mod event_driven_resubscribe_wiring_tests {
              backstop (transient-blip safety net)"
         );
 
-        // New event-driven path: select upstream contracts, gate on connections,
+        // New event-driven path: gate on connections, select upstream contracts,
         // delegate to the bounded spawn helper.
+        //
+        // Pin the ACTUAL zero-connection gate `open_connections() == 0`, not just
+        // the substring `open_connections` (which also appears elsewhere): the
+        // #3676 storm gate is the one storm-safety invariant unique to this
+        // caller, and it must run BEFORE the spawn.
+        let gate = body.find("open_connections() == 0").expect(
+            "must honour the zero-connection storm gate `open_connections() == 0` \
+             (mirrors renewal loop #3676)",
+        );
         let select = body
             .find("upstream_contracts_for_peer")
             .expect("must select the contracts whose upstream just dropped");
-        assert!(
-            body.contains("open_connections"),
-            "must honour the zero-connection gate (mirrors renewal loop #3676)"
-        );
         let spawn = body.find("try_spawn_event_driven_resubscribe").expect(
             "must delegate to the bounded try_spawn_event_driven_resubscribe \
              (shared ban/backoff/dedup gates) — do NOT hand-inline the spawn",
         );
         assert!(
-            select < spawn,
-            "must select upstream contracts (offset {select}) before spawning \
-             re-subscribes (offset {spawn})"
+            gate < spawn && select < spawn,
+            "the zero-connection gate (offset {gate}) and upstream selection \
+             (offset {select}) must both run before spawning re-subscribes \
+             (offset {spawn})"
+        );
+
+        // Fan-out cap: a high-degree upstream drop must NOT spawn an unbounded
+        // burst of re-subscribes. The per-drop burst is capped by the same
+        // `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL` the periodic renewal loop uses,
+        // plus the channel-backpressure short-circuit.
+        assert!(
+            body.contains("MAX_RECOVERY_ATTEMPTS_PER_INTERVAL"),
+            "must cap the per-drop re-subscribe burst by \
+             MAX_RECOVERY_ATTEMPTS_PER_INTERVAL (uncapped fan-out is a subscribe \
+             storm on high-degree upstream loss)"
+        );
+        assert!(
+            body.contains("RENEWAL_STOP_CAPACITY_FRACTION"),
+            "must stop early when the notification channel is congested \
+             (channel-backpressure short-circuit, mirrors the renewal loop)"
         );
 
         // Both the production per-node scalar and the sim-observable per-node
