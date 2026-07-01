@@ -1221,7 +1221,14 @@ fn budget_for_ram(total_ram: usize) -> usize {
 ///
 /// Never panics; any failure (missing file, parse error, non-positive sysconf)
 /// yields `None` for that source and falls back.
-fn read_total_ram_bytes() -> Option<usize> {
+///
+/// `pub(crate)` because the demand-driven hosting redesign reuses this exact
+/// "memory the node may use" ceiling in two places beyond the module-cache
+/// budget: the resource-utilization telemetry sample (piece A1,
+/// `node::resource_metrics`) and — later — the capability-relative hosting
+/// budget (piece A2). Keeping a single source avoids two drifting notions of
+/// "how much memory does this node have". See `docs/design/hosting-eviction.md`.
+pub(crate) fn read_total_ram_bytes() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
         let phys = read_proc_meminfo_total_bytes();

@@ -53,28 +53,6 @@ mod connection_lifecycle;
 mod dispatch;
 mod migration;
 
-/// Returns the process RSS (Resident Set Size) in bytes by reading /proc/self/statm.
-/// Returns None on non-Linux platforms or if the read fails.
-fn get_rss_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        // SAFETY: `sysconf(_SC_PAGESIZE)` is a POSIX-defined, signal-safe
-        // call that reads a system constant and has no preconditions.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page_size > 0 {
-            Some(rss_pages * page_size as u64)
-        } else {
-            None
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
 /// Represents the different ways the event loop can exit.
 ///
 /// This enum is used instead of string-based error matching to provide
@@ -2445,7 +2423,8 @@ impl P2pConnManager {
                                     let pending_ops = op_manager.pending_op_counts();
                                     let contract_waiters_count =
                                         op_manager.contract_waiters_count();
-                                    let memory_rss_bytes = get_rss_bytes();
+                                    let memory_rss_bytes =
+                                        crate::node::resource_metrics::rss_bytes();
                                     tracing::info!(
                                         pending_connect = pending_ops[0],
                                         pending_put = pending_ops[1],

@@ -78,6 +78,7 @@ pub(crate) mod network_status;
 mod op_state_manager;
 mod p2p_impl;
 mod request_router;
+pub(crate) mod resource_metrics;
 pub(crate) mod testing_impl;
 
 pub(crate) use p2p_impl::abort_process_on_redb_poison;
