@@ -11211,6 +11211,139 @@ fn test_terminal_advertisement_consult_closes_get_dead_end() {
     );
 }
 
+/// SUBSCRIBE counterpart of `test_terminal_advertisement_consult_closes_get_dead_end`:
+/// a SUBSCRIBE whose only host sits one hop OFF the routing path must resolve
+/// via the terminal advertisement consult instead of dead-ending with NotFound.
+///
+/// Same topology and isolation as the GET test (dense non-hosting cluster on
+/// the key, one advertised host just outside it, far requester, migration
+/// disabled, seeded-host advertising opted in). The SUBSCRIBE relay is
+/// single-shot: it forwards one greedy hop toward the key, and — on a CLEAN
+/// downstream NotFound — consults the host advertisements and forwards the
+/// SUBSCRIBE to the off-path advertised host, which answers Subscribed.
+///
+/// Proof is `terminal_consult_resolved_found() > 0` (recorded ONLY when a
+/// consulted host returns Subscribed); with migration off it is unambiguous
+/// that the consult (not routing or migration) closed the subscribe dead-end.
+#[test_log::test]
+fn test_terminal_advertisement_consult_closes_subscribe_dead_end() {
+    use freenet::config::GlobalTestMetrics;
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    // Seed + placement chosen so the requester's upstream SUBSCRIBE routes into
+    // the non-hosting cluster and dead-ends at a relay whose off-path neighbor
+    // is the advertised host. Deterministic under the turmoil runner.
+    const SEED: u64 = 0xC0FF_EEC0_0008;
+    const NETWORK_NAME: &str = "terminal-consult-subscribe-deadend";
+    setup_deterministic_state(SEED);
+    GlobalTestMetrics::reset();
+
+    let contract = SimOperation::create_test_contract(0xC0);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+
+    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    let host_loc = wrap(key_loc + 0.05);
+    let requester_loc = wrap(key_loc - 0.60);
+    let mut node_locations = cluster.clone();
+    node_locations.push(host_loc); // node_no 7
+    node_locations.push(requester_loc); // node_no 8
+    let num_nodes = node_locations.len();
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,
+            num_nodes,
+            10,
+            7,
+            8,
+            3,
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+    sim.disable_placement_migration();
+    sim.enable_seeded_host_advertisements();
+
+    let host_label = NodeLabel::node(NETWORK_NAME, 7);
+    let requester_label = NodeLabel::node(NETWORK_NAME, 8);
+
+    let operations = vec![
+        ScheduledOperation::new(
+            host_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![11, 22, 33, 44],
+            },
+        ),
+        // Seed the requester too: a bare SUBSCRIBE for an absent contract fails
+        // the local RegisterSubscriberListener gate and never starts the
+        // network subscribe. With the contract present, the SUBSCRIBE passes
+        // that gate and routes UPSTREAM toward the key to build the
+        // subscription tree — and since the requester is far from the key, it
+        // dead-ends at the non-hosting cluster, exactly where the terminal
+        // consult applies.
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![11, 22, 33, 44],
+            },
+        ),
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    assert!(
+        result.is_node_hosting(&host_label, &contract_key),
+        "host should still host the seeded contract after the simulation"
+    );
+
+    let attempts = GlobalTestMetrics::terminal_consult_attempts();
+    let hits = GlobalTestMetrics::terminal_consult_hits();
+    let resolved_found = GlobalTestMetrics::terminal_consult_resolved_found();
+    tracing::info!(
+        attempts,
+        hits,
+        resolved_found,
+        still_not_found = GlobalTestMetrics::terminal_consult_still_not_found(),
+        "terminal consult telemetry (subscribe)"
+    );
+
+    // With migration off, `resolved_found > 0` is recorded ONLY when a
+    // consulted advertised host answers Subscribed — the unambiguous proof
+    // that the SUBSCRIBE terminal consult (not routing or migration) closed
+    // the dead-end.
+    assert!(
+        resolved_found > 0,
+        "terminal consult should have resolved the SUBSCRIBE to Subscribed via an \
+         advertised off-path host (attempts={attempts}, hits={hits}, \
+         resolved_found={resolved_found})"
+    );
+}
+
 /// Reproduction + regression test for the placement-migration renewal storm
 /// (#4440, the storm symptom of the #4404 placement work).
 ///

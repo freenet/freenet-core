@@ -2805,14 +2805,22 @@ where
     // its Found reply is attributed to the consult telemetry, not routing).
     // Assigned by every non-returning arm of the peer-selection match below.
     let mut consult_active: bool;
-    // Guards against recording more than one terminal consult outcome.
-    let mut consult_resolved_recorded = false;
     // True when the most recent forward on `incoming_tx` produced NO reply
     // (timeout or send-failure). In that state the awaited peer may still send
     // a LATE reply on the reused tx, which would satisfy a freshly-registered
     // consult waiter and bubble a false result — so we do NOT consult after a
     // failed forward (Codex P2). Reset by any forward that received a reply.
     let mut last_forward_failed = false;
+    // True once at least one location-routing forward has happened. When
+    // `relay_advance_to_next_peer` returns None on the FIRST iteration (no
+    // routing candidate at all), consulting is a no-op — every advertised host
+    // is either a visited connection (excluded) or a not-ready/transient one
+    // that k_closest deliberately skips — so we skip the consult there for
+    // counter accuracy and parity with SUBSCRIBE's `candidates.is_empty()`
+    // branch. The consult's value is reaching an unvisited advertised neighbor
+    // the single greedy forward (MAX_RELAY_RETRIES) skipped, which requires a
+    // routing forward to have occurred.
+    let mut did_forward = false;
 
     loop {
         // Pick next downstream peer.
@@ -2825,6 +2833,7 @@ where
         ) {
             Some(p) => {
                 consult_active = false;
+                did_forward = true;
                 p
             }
             None => {
@@ -2881,19 +2890,34 @@ where
                 // This does NOT re-introduce the removed 3^HTL per-hop retry
                 // fan-out: a *local* lookup gates the forward, so a
                 // truly-absent contract (no neighbor advertised it) triggers
-                // ZERO extra network forwards; an advertised host almost
-                // always HAS the contract, so the bubble-up halts at the first
-                // Found; and each relay adds at most MAX_TERMINAL_CONSULT_HOSTS
-                // forwards, only on the NotFound return path. It can fire at an
-                // intermediate relay (not only the deepest terminus), which is
-                // intended: the advertised host is a neighbor of THIS relay,
-                // invisible to the deeper terminus.
+                // ZERO extra network forwards; and each relay adds at most
+                // MAX_TERMINAL_CONSULT_HOSTS forwards, only on the NotFound
+                // return path. It can fire at an intermediate relay (not only
+                // the deepest terminus), which is intended: the advertised host
+                // is a neighbor of THIS relay, invisible to the deeper terminus.
+                //
+                // LOAD-BEARING assumption: "an advertised host almost always
+                // HAS the contract, so the bubble-up halts at the first Found."
+                // The rare exception is a host that evicted the contract but
+                // whose removal-announce (`on_contract_unhosted`) was lost while
+                // it is still a ring connection — the consult can then turn it
+                // into a re-routing relay (branching 1 → toward relay fan-out).
+                // That branching is bounded and does NOT recreate the 3^HTL
+                // tx-minting bug: (a) HTL-1 caps depth; (b) the visited bloom is
+                // carried on the forward so no peer is re-probed; (c) the
+                // consult only targets CURRENTLY-CONNECTED advertised peers; and
+                // (d) eviction retracts the advertisement, so the window is
+                // small and self-closing. If a future change weakens any of
+                // these, re-evaluate this site.
+                //
                 // Only consult when the previous forward received a reply; a
                 // timed-out / send-failed forward may still reply late on the
-                // reused tx and satisfy the consult waiter (Codex P2). In that
-                // case skip the consult entirely and report NotFound — the same
-                // outcome the relay produced before the consult existed.
-                let consult_candidate = if last_forward_failed {
+                // reused tx and satisfy the consult waiter (Codex P2). And only
+                // consult when a routing forward actually happened
+                // (`did_forward`) — a no-candidate terminus consult is a no-op
+                // (parity with SUBSCRIBE). Either way, skip the consult and
+                // report NotFound — the same outcome as before the consult.
+                let consult_candidate = if last_forward_failed || !did_forward {
                     None
                 } else {
                     let targets = consult_targets.get_or_insert_with(|| {
@@ -2928,8 +2952,10 @@ where
                     // advertised host was already tried / also failed). Record
                     // a still-not-found outcome only if a consult actually ran
                     // (`consult_targets` was built) — not when it was skipped
-                    // after a failed forward.
-                    if consult_targets.is_some() && !consult_resolved_recorded {
+                    // after a failed forward. A resolved consult would have
+                    // returned from the Found arm above, so this is reached
+                    // only when no consult forward succeeded.
+                    if consult_targets.is_some() {
                         crate::operations::record_terminal_consult_outcome(false);
                     }
                     tracing::warn!(
@@ -3129,21 +3155,15 @@ where
 
         // Classify the reply.
         let attempt_outcome = classify(reply);
-        // Terminal-consult telemetry: attribute a Found reply from a
-        // consulted advertised host as a closed dead-end. Guarded so a rare
-        // stream-claim failure on a consult candidate (which retries the next
-        // candidate) can't double-count. NotFound/Retry falls through and the
-        // exhaustion arm records the still-not-found outcome.
-        if consult_active
-            && !consult_resolved_recorded
-            && matches!(
-                attempt_outcome,
-                AttemptOutcome::Terminal(Terminal::InlineFound { .. } | Terminal::Streaming { .. })
-            )
-        {
-            crate::operations::record_terminal_consult_outcome(true);
-            consult_resolved_recorded = true;
-        }
+        // Terminal-consult telemetry is NOT recorded here: attributing a Found
+        // reply from a consulted host at classify time would be premature,
+        // because delivery of that Found can still fail by a fallible
+        // side-effect below — `send_result?` for InlineFound, `claim_or_wait`
+        // for Streaming (the #4345 "classify terminal before a fallible side
+        // effect" anti-pattern). `resolved_found` is instead recorded inside
+        // the InlineFound / Streaming arms AFTER that side-effect succeeds, so
+        // a send/claim failure correctly leaves the op to record
+        // still-not-found at the exhaustion arm.
         match attempt_outcome {
             AttemptOutcome::Terminal(Terminal::InlineFound {
                 key,
@@ -3209,6 +3229,13 @@ where
                 // cache).
                 cache_contract_locally(op_manager, key, state, contract, false).await;
                 send_result?;
+                // Delivery succeeded (`send_result?` did not return): a
+                // consulted advertised host closed the dead-end. Record now,
+                // AFTER the fallible upstream forward, not at classify time.
+                // This arm returns, so exactly one consult outcome is recorded.
+                if consult_active {
+                    crate::operations::record_terminal_consult_outcome(true);
+                }
                 return Ok(());
             }
             AttemptOutcome::Terminal(Terminal::Streaming {
@@ -3285,6 +3312,17 @@ where
                         continue;
                     }
                 };
+
+                // The claim succeeded, so delivery is now committed (loopback
+                // cache or upstream pipe below). A consulted advertised host
+                // that streams the contract has closed the dead-end — record
+                // here, AFTER the fallible `claim_or_wait`, not at classify
+                // time (a claim failure above `continue`s to the next
+                // candidate, so recording early would be a false positive).
+                // Every path from here returns, so exactly one outcome records.
+                if consult_active {
+                    crate::operations::record_terminal_consult_outcome(true);
+                }
 
                 // ── Step 2: Loopback safety net. If upstream IS us
                 //    (originator-loopback edge — rare), assemble + cache
