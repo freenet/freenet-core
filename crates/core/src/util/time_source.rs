@@ -222,11 +222,18 @@ impl TimeSource for MockTimeSource {
     }
 }
 
-/// A shared mock time source for testing components that need external time control.
+/// A shared, externally-controllable mock time source.
 ///
-/// Unlike `MockTimeSource`, this variant uses `Arc<Mutex<Instant>>` internally,
+/// Unlike `MockTimeSource`, this variant uses `Arc<Mutex<Duration>>` internally,
 /// allowing multiple clones to share the same underlying time. This enables tests
 /// to advance time after creating a component that holds a clone of the time source.
+///
+/// Available in all builds (not just `#[cfg(test)]`) because the simulation
+/// harness owns one to drive deterministic TTL/eviction: it is injected into a
+/// node's `HostingManager` via `NodeConfig::hosting_time_source_override`, and
+/// advanced from the sim's controlled-event dispatch (see
+/// `SimOperation::AdvanceHostingClock`). Production never constructs one — it
+/// always uses [`InstantTimeSrc`].
 ///
 /// # Example
 /// ```ignore
@@ -239,14 +246,6 @@ impl TimeSource for MockTimeSource {
 /// // Component now sees the advanced time
 /// component.do_something_time_dependent();
 /// ```
-/// A shared, externally-controllable time source.
-///
-/// Available in all builds (not just `#[cfg(test)]`) because the simulation
-/// harness owns one to drive deterministic TTL/eviction: it is injected into a
-/// node's `HostingManager` via `NodeConfig::hosting_time_source_override`, and
-/// advanced from the sim's controlled-event dispatch (see
-/// `SimOperation::AdvanceHostingClock`). Production never constructs one — it
-/// always uses [`InstantTimeSrc`].
 #[derive(Clone, Debug)]
 pub struct SharedMockTimeSource {
     /// The epoch when time started (used as baseline for elapsed calculations)
