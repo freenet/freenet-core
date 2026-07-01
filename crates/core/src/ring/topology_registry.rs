@@ -226,10 +226,13 @@ pub struct RenewalMetrics {
     /// Event-driven re-subscribes this node fired because an UPSTREAM peer
     /// dropped (#4642 piece F). Each increment is one `run_renewal_subscribe`
     /// spawned immediately on upstream-loss detection (after passing the shared
-    /// ban / backoff / dedup gates), rather than waiting for the periodic
-    /// renewal cycle. A `run_simulation_direct` test asserts this rises promptly
-    /// after crashing a node's upstream — the deterministic proof that recovery
-    /// is event-driven, not lease-timer-driven.
+    /// ban / backoff / dedup gates and the per-drop burst cap), rather than
+    /// waiting for the periodic renewal cycle. Exposed per-node (gated on a
+    /// simulation network name, no-op in production) so a simulation harness can
+    /// observe event-driven recovery. NOTE: a reliable behavioral sim that
+    /// crashes a *known* upstream and asserts this rises is currently blocked on
+    /// harness support — see the #4642 piece F PR discussion — so the wiring is
+    /// pinned by source-scrape tests instead.
     pub event_driven_resubscribes: u64,
 }
 

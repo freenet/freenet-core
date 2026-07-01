@@ -1225,9 +1225,10 @@ impl OpManager {
                 // Production per-node scalar (aggregate counter on this node).
                 crate::node::network_status::record_event_driven_resubscribe();
                 // Simulation-test observability (no-op in production — gated on a
-                // current network name, like the renewal-cycle counters). Lets a
-                // sim assert this node fired an event-driven re-subscribe promptly
-                // after the upstream drop, well before the lease-renewal window.
+                // current network name, like the renewal-cycle counters). Records
+                // per-node so a simulation harness can observe event-driven
+                // re-subscribes; no behavioral sim consumes it yet (see #4642
+                // piece F PR — a reliable one is blocked on harness support).
                 if let Some(addr) = own_addr {
                     crate::ring::topology_registry::record_event_driven_resubscribe(addr);
                 }
