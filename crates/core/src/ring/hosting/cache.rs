@@ -1,21 +1,38 @@
 //! Unified hosting cache for contract state caching.
 //!
-//! This module implements a byte-budget aware LRU cache with TTL protection for hosted contracts.
-//! It unifies the previously separate `SeedingCache` (now called hosting cache) and `GetSubscriptionCache` into a single
-//! source of truth for which contracts a peer is hosting.
+//! This module implements a byte-budget aware, **demand-ordered** ("fuel
+//! gauge") cache with TTL protection for hosted contracts. It unifies the
+//! previously separate `SeedingCache` (now called hosting cache) and
+//! `GetSubscriptionCache` into a single source of truth for which contracts a
+//! peer is hosting.
 //!
 //! # Design Principles
 //!
 //! 1. **Single source of truth**: All hosted contracts are tracked in one cache
-//! 2. **Resource-aware eviction**: Byte-budget LRU with TTL protection
+//! 2. **Demand-ordered eviction (Greedy-Dual)**: when over budget,
+//!    the contract with the lowest `keep_score` is evicted, where
+//!    `keep_score = eviction_floor + predicted_demand`. The `eviction_floor` is
+//!    a per-peer running value that ratchets up to the `keep_score` of each
+//!    evicted contract (Greedy-Dual aging, measured in cache-contention, not
+//!    wall-clock). A read (GET/SUBSCRIBE) refreshes a contract's `keep_score`
+//!    to the current frontier, so repeatedly-requested contracts float above
+//!    never-requested ones. See piece A3 of the demand-driven hosting redesign
+//!    (freenet/freenet-core#4642) and `docs/design/hosting-eviction.md`.
 //! 3. **Subscription renewal**: All hosted contracts get subscription renewal
 //! 4. **Access type tracking**: Records how contract was accessed (GET/PUT/SUBSCRIBE)
+//!
+//! `predicted_demand` is supplied by the caller (`HostingManager`, which owns
+//! the proximity-prior estimator and the peer's own ring location — see
+//! [`super::demand`]). The cache itself is location-agnostic: it only orders by
+//! the demand scalar it is handed, so this module stays unit-testable without a
+//! ring.
 
 use freenet_stdlib::prelude::ContractKey;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
 
+use super::demand::NEUTRAL_DEMAND;
 use crate::util::time_source::TimeSource;
 use crate::wasm_runtime::read_total_ram_bytes;
 
@@ -122,6 +139,15 @@ pub(crate) struct HostingCacheStats {
     /// over budget. The collector differences it across the cadence to derive a
     /// budget-triggered eviction rate.
     pub budget_evictions_total: u64,
+    /// Monotonic count of over-budget evictions whose victim had been READ
+    /// (GET/SUBSCRIBE) more than once during its residency (`read_count >= 2`,
+    /// i.e. genuine repeat demand, not a one-off seed). Under a well-calibrated
+    /// demand-ordered policy this stays near zero — evicting a repeatedly-requested
+    /// contract is the #4338 miscalibration symptom (a real-demand contract
+    /// evicted ahead of junk). A rising rate here (differenced against
+    /// [`Self::budget_evictions_total`]) is the alarm that the demand estimate
+    /// is mis-ordering the working set.
+    pub evictions_of_recently_read_total: u64,
 }
 
 /// Multiplier for TTL relative to subscription renewal interval.
@@ -163,6 +189,13 @@ pub struct RecordAccessResult {
     /// deletion-time guard in `RuntimePool::remove_contract` can detect
     /// a re-host that occurred between eviction and disk reclamation.
     pub evicted: Vec<(ContractKey, u64)>,
+    /// Observed read-rate training sample (reads/second) for the accessed
+    /// contract, or `None` when no meaningful rate is available (a seed/PUT, a
+    /// brand-new entry, or a read with zero residency). `HostingManager` pairs
+    /// this with the contract's ring distance and feeds it to the proximity
+    /// prior (`super::demand::ProximityPrior`). Purely a training signal — it
+    /// never affects THIS access's `keep_score`.
+    pub observed_read_rate: Option<f64>,
 }
 
 /// Metadata about a hosted contract.
@@ -170,8 +203,48 @@ pub struct RecordAccessResult {
 pub struct HostedContract {
     /// Size of the contract state in bytes
     pub size_bytes: u64,
-    /// Last time this contract was accessed (via GET/PUT/SUBSCRIBE)
+    /// Last time this contract was accessed (via GET/PUT/SUBSCRIBE). Drives the
+    /// TTL gate (an entry is not eviction-eligible until `min_ttl` since this).
     pub last_accessed: Instant,
+    /// Monotonic access sequence number stamped on every access (insert / read /
+    /// seed / touch). Used as the eviction tiebreak when two entries have equal
+    /// `keep_score`: the lower sequence (least-recently-accessed) evicts first —
+    /// LRU as a tiebreaker. A dedicated counter, not `last_accessed`, so the
+    /// ordering is exact even when several accesses share a mock-clock instant.
+    pub last_access_seq: u64,
+    /// Demand-ordered (Greedy-Dual) priority: `eviction_floor + predicted_demand` captured at the
+    /// last read-demand refresh (or at insert). The over-budget walk evicts the
+    /// entry with the lowest `keep_score` (ties broken by `last_accessed`). A
+    /// read (GET/SUBSCRIBE) recomputes this against the CURRENT `eviction_floor`,
+    /// so recently-requested contracts sit at the frontier while never-requested
+    /// ones fall behind as the floor ratchets up. See the module docs.
+    pub keep_score: f64,
+    /// Per-contract read-demand estimate (reads/second) from the proximity-prior
+    /// estimator, supplied by the caller at insert / read-refresh. Stored so a
+    /// `touch` (which has no estimator access) can recompute `keep_score` from
+    /// the current floor without recomputing the prior. For A3 this is the
+    /// proximity prior only; A4 blends it toward the contract's own observed
+    /// read rate.
+    pub predicted_demand: f64,
+    /// Number of read accesses (GET/SUBSCRIBE, including `touch`) observed over
+    /// this entry's residency. A PUT is a SEED, not a read, so it does not
+    /// increment this. Drives (a) the observed-rate training sample fed back to
+    /// the proximity prior (`read_count / residency`) and (b) the
+    /// `evictions_of_recently_read` miscalibration counter (`>= 2` = genuine
+    /// repeat demand).
+    ///
+    /// Note: a single client GET of a hosted-but-stale contract can bump this
+    /// twice — once via `touch` (the pre-decision TTL refresh in the client GET
+    /// handler) and once via the network refetch's `record_access(Get)`. This is
+    /// a bounded (2x) over-count on the stale-refetch path only; it slightly
+    /// inflates the trained rate and can make `evictions_of_recently_read` fire
+    /// for a contract read just once. Both are soft, directional signals, so the
+    /// inaccuracy is accepted rather than deduplicated (which would require
+    /// threading GET-request identity through both paths).
+    pub read_count: u32,
+    /// When this entry was first inserted. Used with `read_count` to derive an
+    /// observed read-rate training sample for the proximity prior.
+    pub inserted_at: Instant,
     /// Type of the last access
     pub access_type: AccessType,
     /// Whether a local client (HTTP/WebSocket) accessed this contract.
@@ -194,22 +267,27 @@ pub struct HostedContract {
     /// `None` means the entry has never been abandoned, or has been
     /// re-accessed since its last abandonment.
     ///
-    /// The abandonment hook moves the entry to the FRONT of the LRU order
-    /// so that under disk pressure it is evicted before older-but-still-
-    /// active entries. Once past TTL, `evict_over_budget` walks the LRU
-    /// front-first as before — abandoned entries simply sit at the front.
-    /// Refreshing the entry via `record_access` clears this field and
-    /// moves the entry back to the LRU tail.
+    /// The abandonment hook drops the entry's `keep_score` to the current
+    /// `eviction_floor` (stripping its demand credit) so that under budget
+    /// pressure it is evicted before still-active entries, whose `keep_score` is
+    /// `floor + demand >= floor`. With strictly positive demand it sorts strictly
+    /// below them; when demand is zero (a far contract under a trained prior) it
+    /// ties an active entry at the floor, and the least-recently-accessed
+    /// tiebreak (`last_access_seq`) still tends to evict the abandoned entry
+    /// first (it has not been read since it lost its subscribers). Once past TTL,
+    /// `evict_over_budget` picks the lowest `keep_score` first. Refreshing the
+    /// entry via a read (`record_access` / `touch`) clears this field and
+    /// restores its `keep_score` to `floor + predicted_demand`.
     ///
     /// Idle contracts with no subscribers but recent demand are NOT
-    /// affected: they keep their natural LRU position. Only entries that
-    /// were actively in use and then lost all in-use signals get bumped
-    /// to the priority bucket, since their `last_accessed` would otherwise
-    /// keep them at the LRU tail despite no longer mattering.
+    /// affected: they keep their earned `keep_score`. Only entries that
+    /// were actively in use and then lost all in-use signals get their
+    /// demand credit stripped, since their recency would otherwise keep
+    /// them ahead despite no longer mattering.
     ///
     /// The timestamp itself is written but not read by eviction logic
-    /// (eviction priority comes purely from LRU position, which
-    /// `record_abandonment` adjusts as a side effect). It is retained
+    /// (eviction priority comes from `keep_score`, which `record_abandonment`
+    /// adjusts as a side effect). It is retained
     /// for the governance dashboard (PR #4270) so an operator can see
     /// how long ago a flagged contract was last actively used. A future
     /// refactor that removes the field can do so only after the
@@ -227,7 +305,9 @@ pub struct HostedContract {
 ///   in tracked contract **state** bytes only; WASM code blobs and database
 ///   overhead are not counted against it.
 /// - TTL protection: Contracts can't be evicted until min_ttl has passed
-/// - LRU ordering: Oldest contracts evicted first when over budget
+/// - Demand-ordered eviction (Greedy-Dual): when over budget the
+///   contract with the lowest `keep_score` is evicted first (ties broken by
+///   least-recently-read), NOT purely the oldest. See the module docs.
 ///
 /// # Subscription Renewal
 ///
@@ -240,15 +320,31 @@ pub struct HostingCache<T: TimeSource> {
     current_bytes: u64,
     /// Minimum time since last access before eviction is allowed
     min_ttl: Duration,
-    /// LRU order - front is oldest, back is newest
-    lru_order: VecDeque<ContractKey>,
-    /// Contract metadata indexed by key
+    /// Contract metadata indexed by key. Eviction order is derived from each
+    /// entry's `keep_score` (then `last_accessed`), not from a separate LRU
+    /// list, so there is no second structure to keep in sync.
     contracts: HashMap<ContractKey, HostedContract>,
+    /// Monotonic access counter. Incremented on every access (insert / read /
+    /// seed / touch) and stamped onto the entry's `last_access_seq`, giving an
+    /// exact least-recently-accessed tiebreak for eviction that is independent
+    /// of mock-clock granularity.
+    access_seq: u64,
+    /// Greedy-Dual aging value. Monotonically non-decreasing:
+    /// each over-budget eviction ratchets it up to the evicted contract's
+    /// `keep_score`. A read refreshes the read contract's `keep_score` to
+    /// `eviction_floor + predicted_demand`, so the floor is the moving frontier
+    /// that separates still-wanted contracts from stale ones. Measured in
+    /// cache-contention units, not wall-clock.
+    eviction_floor: f64,
     /// Monotonic count of contracts evicted because the cache was over budget.
     /// Only `evict_over_budget` increments it, so it counts budget-triggered
     /// evictions specifically (not TTL sweeps that found nothing over budget).
     /// Exposed via [`HostingCache::stats`] for per-node telemetry.
     budget_evictions_total: u64,
+    /// Monotonic count of over-budget evictions whose victim had `read_count >= 2`
+    /// (genuine repeat demand). The #4338 miscalibration signal — see
+    /// [`HostingCacheStats::evictions_of_recently_read_total`].
+    evictions_of_recently_read_total: u64,
     /// Time source for testability
     time_source: T,
 }
@@ -260,23 +356,45 @@ impl<T: TimeSource> HostingCache<T> {
             budget_bytes,
             current_bytes: 0,
             min_ttl,
-            lru_order: VecDeque::new(),
             contracts: HashMap::new(),
+            access_seq: 0,
+            eviction_floor: 0.0,
             budget_evictions_total: 0,
+            evictions_of_recently_read_total: 0,
             time_source,
         }
     }
 
-    /// Evict past-TTL, non-retained contracts while the cache is over budget.
+    /// Next monotonic access sequence number, stamped onto an entry on every
+    /// access to give an exact least-recently-accessed eviction tiebreak.
+    fn next_seq(&mut self) -> u64 {
+        self.access_seq = self.access_seq.saturating_add(1);
+        self.access_seq
+    }
+
+    /// Evict past-TTL, non-retained contracts while the cache is over budget,
+    /// lowest `keep_score` first (Greedy-Dual, demand-ordered).
     ///
-    /// Walks `lru_order` front-first (oldest first). An entry is evicted when
-    /// it is past `min_ttl` since its last access AND `should_retain(key)` is
-    /// `false`. Eviction stops as soon as `current_bytes <= budget_bytes`.
-    /// Entries that are retained (in use) or still within `min_ttl` are kept
-    /// even if that leaves the cache over budget.
+    /// An entry is eligible for eviction when it is past `min_ttl` since its
+    /// last access AND `should_retain(key)` is `false`. Among eligible entries
+    /// the victim order is ascending `(keep_score, last_accessed)`: the least
+    /// demand-worthy contract goes first, and a least-recently-read tiebreak
+    /// resolves equal scores (so with uniform demand this degrades to LRU).
+    /// Each eviction ratchets `eviction_floor` up to the victim's `keep_score`
+    /// (Greedy-Dual aging). Eviction stops as soon as
+    /// `current_bytes <= budget_bytes`. Retained (in use) and still-within-TTL
+    /// entries are kept even if that leaves the cache over budget.
     ///
-    /// Uses a `retain()`-style walk so the LRU ordering of surviving entries
-    /// is preserved. Returns the evicted keys.
+    /// Returns the evicted `(key, write_generation)` pairs; the generation is
+    /// captured atomically under the cache's write lock so the `EvictContract`
+    /// deletion-time guard can detect a re-host that races with this eviction
+    /// (see `RuntimePool::remove_contract`).
+    ///
+    /// do NOT revert to byte-only LRU — see hosting-invariants (byte-only
+    /// eviction anti-pattern). Byte-only / recency-only eviction is demand-blind
+    /// and re-opens the #4338 miscalibration class (a repeatedly-requested
+    /// contract evicted ahead of never-requested junk). Eviction MUST order by
+    /// `keep_score` (demand-driven), with bytes only a tiebreak/ceiling.
     fn evict_over_budget<F>(&mut self, should_retain: &F) -> Vec<(ContractKey, u64)>
     where
         F: Fn(&ContractKey) -> bool,
@@ -286,35 +404,56 @@ impl<T: TimeSource> HostingCache<T> {
         }
 
         let now = self.time_source.now();
-        let mut evicted = Vec::new();
 
-        self.lru_order.retain(|key| {
-            if self.current_bytes <= self.budget_bytes {
-                return true; // back under budget, stop evicting
-            }
-            if let Some(entry) = self.contracts.get(key) {
+        // Collect eviction-eligible entries (past TTL, not retained) with their
+        // ordering keys, then evict lowest-priority first until back under
+        // budget. O(n log n) per over-budget event; n is the hosted-contract
+        // count (hundreds to ~1k), and this only runs when actually over budget.
+        let mut candidates: Vec<(ContractKey, f64, u64)> = self
+            .contracts
+            .iter()
+            .filter(|(key, entry)| {
                 let age = now.saturating_duration_since(entry.last_accessed);
-                if age >= self.min_ttl && !should_retain(key) {
-                    let size = entry.size_bytes;
-                    // Capture the generation atomically under the cache's
-                    // write lock so the `EvictContract` deletion-time
-                    // guard can detect a re-host that races with this
-                    // eviction. See `RuntimePool::remove_contract`.
-                    let generation = entry.write_generation;
-                    self.contracts.remove(key);
-                    self.current_bytes = self.current_bytes.saturating_sub(size);
-                    self.budget_evictions_total = self.budget_evictions_total.saturating_add(1);
-                    evicted.push((*key, generation));
-                    false
-                } else {
-                    // Retained (in use) or still within TTL — keep it even
-                    // if that leaves the cache over budget.
-                    true
-                }
-            } else {
-                false // orphaned LRU entry
-            }
+                age >= self.min_ttl && !should_retain(key)
+            })
+            .map(|(key, entry)| (*key, entry.keep_score, entry.last_access_seq))
+            .collect();
+
+        // Ascending by keep_score, then by access sequence (least recently
+        // accessed first), then by contract-key bytes as a final deterministic
+        // tiebreak. `total_cmp` gives a total order over f64 with no NaN
+        // surprises (keep_score is always finite here, but be defensive). The
+        // access sequence is already unique per live entry, so the key tiebreak
+        // only matters for the transient pre-`finalize_loading` seq-0 case; it
+        // orders on `as_bytes()` (the instance-id byte string) explicitly rather
+        // than relying on `ContractKey`'s deref-to-`[u8; N]` coercion.
+        candidates.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
         });
+
+        let mut evicted = Vec::new();
+        for (key, keep_score, _) in candidates {
+            if self.current_bytes <= self.budget_bytes {
+                break; // back under budget, stop evicting
+            }
+            if let Some(entry) = self.contracts.remove(&key) {
+                self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
+                self.budget_evictions_total = self.budget_evictions_total.saturating_add(1);
+                if entry.read_count >= 2 {
+                    self.evictions_of_recently_read_total =
+                        self.evictions_of_recently_read_total.saturating_add(1);
+                }
+                // Greedy-Dual aging: ratchet the floor up to the victim's score
+                // (never down — an entry whose stale score is below the current
+                // floor leaves the floor untouched).
+                if keep_score > self.eviction_floor {
+                    self.eviction_floor = keep_score;
+                }
+                evicted.push((key, entry.write_generation));
+            }
+        }
 
         evicted
     }
@@ -347,6 +486,11 @@ impl<T: TimeSource> HostingCache<T> {
     /// entry is later evicted, its `write_generation` snapshot travels
     /// with the `EvictContract` event and is compared against the
     /// then-current generation at deletion time.
+    // Neutral-demand convenience wrapper. Production always goes through
+    // `record_access_with_demand` (the `HostingManager` supplies the
+    // proximity-prior estimate), so in a non-test build this wrapper is unused;
+    // it is retained for callers/tests that have no demand estimate.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn record_access<F>(
         &mut self,
         key: ContractKey,
@@ -358,10 +502,54 @@ impl<T: TimeSource> HostingCache<T> {
     where
         F: Fn(&ContractKey) -> bool,
     {
+        // Neutral demand: with a uniform demand term for every contract,
+        // `keep_score` ordering degrades to the least-recently-read tiebreak
+        // (LRU). This wrapper is used by callers that have no demand estimate
+        // (and by the cache's own unit tests); `HostingManager` uses
+        // `record_access_with_demand` to supply the proximity-prior estimate.
+        self.record_access_with_demand(
+            key,
+            size_bytes,
+            access_type,
+            write_generation,
+            NEUTRAL_DEMAND,
+            should_retain,
+        )
+    }
+
+    /// Like [`record_access`](Self::record_access) but with an explicit
+    /// `predicted_demand` for the demand-ordered `keep_score`.
+    ///
+    /// Semantics by access kind:
+    /// - **New entry (any kind):** `keep_score = eviction_floor + predicted_demand`.
+    ///   A GET/SUBSCRIBE also counts as one read (`read_count = 1`); a PUT is a
+    ///   SEED (`read_count = 0`).
+    /// - **Existing entry, GET/SUBSCRIBE (read-demand):** refresh `keep_score`
+    ///   to the CURRENT `eviction_floor + predicted_demand` (float to the
+    ///   frontier), bump `read_count`, refresh recency, clear any abandonment.
+    ///   Returns an `observed_read_rate` training sample.
+    /// - **Existing entry, PUT (seed only):** refresh recency/size/generation
+    ///   and the stored `predicted_demand`, but do NOT refresh `keep_score` — a
+    ///   write is not read-demand, so it earns no frontier credit and cannot
+    ///   keep a contract alive against reads.
+    pub fn record_access_with_demand<F>(
+        &mut self,
+        key: ContractKey,
+        size_bytes: u64,
+        access_type: AccessType,
+        write_generation: u64,
+        predicted_demand: f64,
+        should_retain: F,
+    ) -> RecordAccessResult
+    where
+        F: Fn(&ContractKey) -> bool,
+    {
         let now = self.time_source.now();
+        let seq = self.next_seq();
+        let is_read = matches!(access_type, AccessType::Get | AccessType::Subscribe);
 
         if let Some(existing) = self.contracts.get_mut(&key) {
-            // Already cached - update size if changed and refresh position
+            // Already cached - update size if changed
             if existing.size_bytes != size_bytes {
                 // Adjust byte accounting: add new size, subtract old size
                 self.current_bytes = self
@@ -371,24 +559,33 @@ impl<T: TimeSource> HostingCache<T> {
                 existing.size_bytes = size_bytes;
             }
             existing.last_accessed = now;
+            existing.last_access_seq = seq;
             existing.access_type = access_type;
             // Refresh the generation snapshot: a re-access is a fresh
             // "I'm hosting this state" assertion, so its captured generation
             // should track the current state-write generation.
             existing.write_generation = write_generation;
-            // A re-access clears the abandoned bucket: the contract is
-            // back in active use, so the priority-eviction marker no
-            // longer applies and the entry returns to the LRU tail
-            // below.
-            existing.abandoned_at = None;
+            // Keep the stored demand estimate current so a later `touch`
+            // (which has no estimator access) refreshes against the latest prior.
+            existing.predicted_demand = predicted_demand;
 
-            // Move to back of LRU (most recently used)
-            self.lru_order.retain(|k| k != &key);
-            self.lru_order.push_back(key);
+            let observed_read_rate = if is_read {
+                // Read-demand: float this contract's keep_score to the frontier
+                // and count the read. A re-access clears the abandoned marker.
+                existing.read_count = existing.read_count.saturating_add(1);
+                existing.abandoned_at = None;
+                existing.keep_score = self.eviction_floor + predicted_demand;
+                Self::rate_sample(existing.read_count, now, existing.inserted_at)
+            } else {
+                // Seed (PUT) on an existing entry: no frontier credit, no read
+                // count. keep_score is intentionally left untouched.
+                None
+            };
 
             RecordAccessResult {
                 is_new: false,
                 evicted: Vec::new(),
+                observed_read_rate,
             }
         } else {
             // Not cached - insert the new entry first, then evict over-budget
@@ -397,6 +594,11 @@ impl<T: TimeSource> HostingCache<T> {
             let contract = HostedContract {
                 size_bytes,
                 last_accessed: now,
+                last_access_seq: seq,
+                keep_score: self.eviction_floor + predicted_demand,
+                predicted_demand,
+                read_count: if is_read { 1 } else { 0 },
+                inserted_at: now,
                 access_type,
                 local_client_access: false,
                 local_client_last_access: None,
@@ -404,7 +606,6 @@ impl<T: TimeSource> HostingCache<T> {
                 abandoned_at: None,
             };
             self.contracts.insert(key, contract);
-            self.lru_order.push_back(key);
             self.current_bytes = self.current_bytes.saturating_add(size_bytes);
 
             let evicted = self.evict_over_budget(&should_retain);
@@ -412,8 +613,24 @@ impl<T: TimeSource> HostingCache<T> {
             RecordAccessResult {
                 is_new: true,
                 evicted,
+                // Brand-new entry has zero residency -> no rate sample yet.
+                observed_read_rate: None,
             }
         }
+    }
+
+    /// Derive an observed read-rate (reads/second) sample from a contract's
+    /// read count and residency. `None` when residency is non-positive (no
+    /// elapsed time to divide by). Residency is floored at one second so a burst
+    /// of quick reads can't produce an unbounded spike that would dominate the
+    /// proximity-prior fit.
+    fn rate_sample(read_count: u32, now: Instant, inserted_at: Instant) -> Option<f64> {
+        let residency = now.saturating_duration_since(inserted_at);
+        if residency.is_zero() {
+            return None;
+        }
+        let residency_secs = residency.as_secs_f64().max(1.0);
+        Some(read_count as f64 / residency_secs)
     }
 
     /// Mark a contract as accessed by a local client (HTTP/WebSocket).
@@ -448,35 +665,53 @@ impl<T: TimeSource> HostingCache<T> {
             .unwrap_or(false)
     }
 
-    /// Touch/refresh a contract's timestamp without adding it if missing.
+    /// Touch/refresh a contract's demand without adding it if missing.
     ///
-    /// Called when a user GET serves a hosted contract from local cache.
-    /// This refreshes the TTL and LRU position so actively requested
-    /// contracts stay in the cache.
-    pub fn touch(&mut self, key: &ContractKey) {
+    /// Called when a user GET serves a hosted contract from local cache — the
+    /// dominant read path for hot contracts. This is read-demand: it refreshes
+    /// the TTL clock and floats the contract's `keep_score` back to the frontier
+    /// (`eviction_floor + predicted_demand`, using the demand estimate stored at
+    /// the last `record_access`), counts the read, and clears any abandonment —
+    /// so actively requested contracts stay in the cache.
+    ///
+    /// Returns the observed read-rate training sample (`read_count / residency`)
+    /// the same way `record_access_with_demand` does, so the caller
+    /// (`HostingManager::touch_hosting`) can feed the proximity prior from the
+    /// local-serve path too — otherwise the prior would train only on network
+    /// refetches and stay blind to the reads A3 is meant to model. `None` when
+    /// the contract is absent or residency is zero.
+    pub fn touch(&mut self, key: &ContractKey) -> Option<f64> {
+        let floor = self.eviction_floor;
+        let seq = self.next_seq();
+        let now = self.time_source.now();
         if let Some(existing) = self.contracts.get_mut(key) {
-            existing.last_accessed = self.time_source.now();
-            // A fresh touch is evidence of demand — clear any abandoned
-            // marker so the entry leaves the priority-eviction bucket.
+            existing.last_accessed = now;
+            existing.last_access_seq = seq;
+            existing.read_count = existing.read_count.saturating_add(1);
+            // A fresh touch is evidence of demand — clear any abandoned marker
+            // and refresh keep_score to the current frontier.
             existing.abandoned_at = None;
-            // Move to back of LRU
-            self.lru_order.retain(|k| k != key);
-            self.lru_order.push_back(*key);
+            existing.keep_score = floor + existing.predicted_demand;
+            Self::rate_sample(existing.read_count, now, existing.inserted_at)
+        } else {
+            None
         }
     }
 
-    /// Mark `key` as recently abandoned and move it to the front of the
-    /// LRU order so it is the first candidate for eviction under disk
-    /// pressure.
+    /// Mark `key` as recently abandoned and strip its demand credit so it is the
+    /// first candidate for eviction under budget pressure.
     ///
     /// Called by `HostingManager` when a contract transitions from "in
     /// use" (has subscribers / clients / downstream peers) to "no longer
     /// in use" — the moment its `contract_in_use` predicate flips from
-    /// `true` to `false`. The TTL gate in `evict_over_budget` still
-    /// applies: an abandoned entry within `min_ttl` of its last access is
-    /// not yet eligible. Once past TTL, abandoned entries are evicted
-    /// before older-but-still-active entries because they now sit at the
-    /// LRU front.
+    /// `true` to `false`. The entry's `keep_score` is dropped to the current
+    /// `eviction_floor` (zero demand credit), so among the credited band it
+    /// sorts first: a still-active entry keeps `floor + demand >= floor`, strictly
+    /// above when demand is positive, tying at the floor only when demand is zero
+    /// (there the least-recently-accessed tiebreak still favors evicting the
+    /// abandoned entry). The TTL gate in `evict_over_budget` still applies: an
+    /// abandoned entry within
+    /// `min_ttl` of its last access is not yet eligible.
     ///
     /// No-op when `key` is absent (already evicted). Idempotent: calling
     /// it on an already-abandoned entry leaves the existing marker (and
@@ -485,17 +720,17 @@ impl<T: TimeSource> HostingCache<T> {
     ///
     /// Network forgetfulness is explicitly preserved: this method does
     /// **not** evict the contract or shorten its TTL. It only changes the
-    /// eviction *order* used when the cache is genuinely over budget. A
-    /// contract that's abandoned but no longer than other entries' TTL
-    /// stays cached just like before.
+    /// eviction *priority* used when the cache is genuinely over budget. A
+    /// contract that's abandoned but under budget pressure stays cached.
     pub fn record_abandonment(&mut self, key: &ContractKey) {
+        let floor = self.eviction_floor;
         if let Some(existing) = self.contracts.get_mut(key) {
             if existing.abandoned_at.is_none() {
                 existing.abandoned_at = Some(self.time_source.now());
-                // Move to FRONT of LRU so the next over-budget walk
-                // evaluates this entry first.
-                self.lru_order.retain(|k| k != key);
-                self.lru_order.push_front(*key);
+                // Strip demand credit: drop keep_score to the frontier so the
+                // next over-budget walk evaluates this entry before any
+                // still-credited (floor + demand) entry.
+                existing.keep_score = floor;
             }
         }
     }
@@ -567,13 +802,34 @@ impl<T: TimeSource> HostingCache<T> {
             current_bytes: self.current_bytes,
             contract_count: self.contracts.len() as u64,
             budget_evictions_total: self.budget_evictions_total,
+            evictions_of_recently_read_total: self.evictions_of_recently_read_total,
         }
     }
 
-    /// Get all hosted contract keys in LRU order (oldest first).
+    /// Get all hosted contract keys in EVICTION order — the order the
+    /// over-budget walk would evict them: ascending `(keep_score,
+    /// last_accessed, key)`, i.e. the least demand-worthy (then
+    /// least-recently-read) contract first. With uniform demand this is LRU.
     #[cfg(test)]
-    pub fn keys_lru_order(&self) -> Vec<ContractKey> {
-        self.lru_order.iter().cloned().collect()
+    pub fn keys_eviction_order(&self) -> Vec<ContractKey> {
+        let mut entries: Vec<_> = self
+            .contracts
+            .iter()
+            .map(|(k, v)| (*k, v.keep_score, v.last_access_seq))
+            .collect();
+        entries.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+        });
+        entries.into_iter().map(|(k, _, _)| k).collect()
+    }
+
+    /// The current Greedy-Dual aging value (the eviction floor). Test-only
+    /// introspection for the eviction-floor ratchet.
+    #[cfg(test)]
+    pub fn eviction_floor(&self) -> f64 {
+        self.eviction_floor
     }
 
     /// Iterate over all hosted contract keys.
@@ -583,13 +839,12 @@ impl<T: TimeSource> HostingCache<T> {
 
     /// Sweep for contracts past TTL when the cache is over budget.
     ///
-    /// Only evicts when `current_bytes > budget_bytes`. Among over-budget
-    /// entries, contracts past `min_ttl` since their last access are evicted
-    /// (oldest first via LRU order) unless the `should_retain` predicate
-    /// returns `true` (e.g., contracts with active client subscriptions or
-    /// downstream subscribers).
+    /// Only evicts when `current_bytes > budget_bytes`. Among over-budget,
+    /// past-TTL, non-retained entries, the lowest `keep_score` is evicted first
+    /// (demand-ordered; ties broken by least-recently-read) unless
+    /// the `should_retain` predicate returns `true` (e.g., contracts with active
+    /// client subscriptions or downstream subscribers).
     ///
-    /// Uses `retain()` to preserve LRU ordering for non-evicted entries.
     /// Returns `(ContractKey, write_generation)` pairs for evicted contracts;
     /// the generation snapshot is carried through `EvictContract` so the
     /// deletion-time guard can detect a re-host race.
@@ -599,7 +854,7 @@ impl<T: TimeSource> HostingCache<T> {
     {
         // Over-budget eviction logic is shared with `record_access` via
         // `evict_over_budget`: it returns early when under budget, then
-        // evicts past-TTL, non-retained entries oldest-first.
+        // evicts past-TTL, non-retained entries lowest-keep_score-first.
         self.evict_over_budget(&should_retain)
     }
 
@@ -638,6 +893,20 @@ impl<T: TimeSource> HostingCache<T> {
         let contract = HostedContract {
             size_bytes,
             last_accessed,
+            // Assigned a proper order by `finalize_loading` once all entries are
+            // loaded (sorted by persisted recency). Temporary 0 until then.
+            last_access_seq: 0,
+            // Loaded entries start with the neutral demand estimate at the
+            // current floor; the first live access re-scores them against the
+            // proximity prior. `last_accessed` (from the persisted age) is the
+            // tiebreak, so among equal (neutral) scores the oldest evicts first —
+            // the same recency ordering the old LRU load path produced.
+            keep_score: self.eviction_floor + NEUTRAL_DEMAND,
+            predicted_demand: NEUTRAL_DEMAND,
+            // Reads observed this run start at zero; the persisted access_type
+            // reflects the last pre-restart access, not this run's read count.
+            read_count: 0,
+            inserted_at: now,
             access_type,
             local_client_access,
             local_client_last_access,
@@ -654,14 +923,17 @@ impl<T: TimeSource> HostingCache<T> {
 
         self.contracts.insert(key, contract);
         self.current_bytes = self.current_bytes.saturating_add(size_bytes);
-        // Note: LRU order will be sorted after all entries are loaded
     }
 
-    /// Sort the LRU order by last_accessed time after bulk loading.
+    /// Finalize bulk loading: assign each loaded entry an access sequence in
+    /// persisted-recency order (oldest last-access -> lowest sequence), so the
+    /// eviction tiebreak evicts the least-recently-accessed loaded contract
+    /// first — the same recency ordering the old LRU load path produced. The
+    /// running access counter is advanced past the assigned range so subsequent
+    /// live accesses keep sorting after loaded entries.
     ///
     /// Call this after `load_persisted_entry` calls are complete.
     pub fn finalize_loading(&mut self) {
-        // Build LRU order from contracts sorted by last_accessed (oldest first)
         let mut entries: Vec<_> = self
             .contracts
             .iter()
@@ -669,9 +941,11 @@ impl<T: TimeSource> HostingCache<T> {
             .collect();
         entries.sort_by_key(|(_, last_accessed)| *last_accessed);
 
-        self.lru_order.clear();
         for (key, _) in entries {
-            self.lru_order.push_back(key);
+            let seq = self.next_seq();
+            if let Some(entry) = self.contracts.get_mut(&key) {
+                entry.last_access_seq = seq;
+            }
         }
     }
 }
@@ -815,11 +1089,12 @@ mod tests {
         cache.record_access(key1, 100, AccessType::Get, 0, |_| false);
         cache.record_access(key2, 100, AccessType::Get, 0, |_| false);
 
-        // Access key1 again - should move it to back of LRU
+        // Access key1 again - a read refreshes its keep_score/recency, so it
+        // becomes the LAST eviction candidate; key2 is now first.
         cache.record_access(key1, 100, AccessType::Subscribe, 0, |_| false);
 
-        // LRU order should now be [key2, key1]
-        let order = cache.keys_lru_order();
+        // Eviction order (least-worthy first) should now be [key2, key1]
+        let order = cache.keys_eviction_order();
         assert_eq!(order, vec![key2, key1]);
 
         // Advance past TTL and add key3 - should evict key2 (now oldest)
@@ -1200,31 +1475,37 @@ mod tests {
         );
     }
 
-    // --- Recently-abandoned priority bucket (Phase 1) ---
+    // --- Recently-abandoned priority (demand-credit strip) ---
 
     #[test]
-    fn test_record_abandonment_moves_entry_to_lru_front() {
+    fn test_record_abandonment_moves_entry_to_eviction_front() {
         let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
 
+        // Equal (neutral) demand -> equal keep_score; eviction order is by
+        // access sequence: key1, key2, key3.
         cache.record_access(key1, 100, AccessType::Get, 0, |_| false);
         cache.record_access(key2, 100, AccessType::Get, 0, |_| false);
         cache.record_access(key3, 100, AccessType::Get, 0, |_| false);
+        assert_eq!(cache.keys_eviction_order(), vec![key1, key2, key3]);
 
-        // Insertion order without abandonment: key1, key2, key3.
-        assert_eq!(cache.keys_lru_order(), vec![key1, key2, key3]);
-
-        // Abandon key3 — the most recently used — and it should jump to
-        // the FRONT so disk-pressure eviction sees it first.
+        // Abandon key3 — the most recently used — and its keep_score drops to
+        // the floor (below the still-credited key1/key2), so it jumps to the
+        // FRONT of the eviction order so budget pressure sees it first.
         cache.record_abandonment(&key3);
-        assert_eq!(cache.keys_lru_order(), vec![key3, key1, key2]);
+        assert_eq!(cache.keys_eviction_order(), vec![key3, key1, key2]);
 
         let info = cache.get(&key3).unwrap();
         assert!(
             info.abandoned_at.is_some(),
             "Abandonment must record a timestamp"
+        );
+        assert_eq!(
+            info.keep_score,
+            cache.eviction_floor(),
+            "abandonment must strip demand credit to the floor"
         );
     }
 
@@ -1454,5 +1735,266 @@ mod tests {
             1,
             "counter must not advance with no budget pressure"
         );
+    }
+
+    // --- Demand-ordered (Greedy-Dual) eviction (A3) ---
+
+    /// `keep_score` is `eviction_floor + predicted_demand` on insert, and a read
+    /// refreshes it to the CURRENT floor + demand. Since the floor only rises,
+    /// a repeatedly-read contract's keep_score climbs while an untouched one's
+    /// stays put.
+    #[test]
+    fn fuel_gauge_keep_score_set_on_insert_and_refreshed_on_read() {
+        let (mut cache, _) = make_cache(10_000, Duration::from_secs(60));
+        let key = make_key(1);
+
+        // Insert at floor 0 with demand 3.0 -> keep_score 3.0.
+        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 3.0, |_| false);
+        assert_eq!(cache.get(&key).unwrap().keep_score, 3.0);
+        assert_eq!(cache.get(&key).unwrap().predicted_demand, 3.0);
+        assert_eq!(cache.get(&key).unwrap().read_count, 1);
+
+        // A read with a new demand estimate refreshes keep_score = floor + demand.
+        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 5.0, |_| false);
+        assert_eq!(cache.get(&key).unwrap().keep_score, 5.0);
+        assert_eq!(cache.get(&key).unwrap().read_count, 2);
+    }
+
+    /// Pure demand-ordering: a higher-demand contract survives even when a
+    /// lower-demand one was inserted MORE recently — demand beats recency.
+    #[test]
+    fn fuel_gauge_evicts_lowest_demand_not_lru() {
+        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let high = make_key(1);
+        let low = make_key(2);
+        let trigger = make_key(3);
+
+        // `high` inserted first (older) with strong demand; `low` inserted after
+        // with weak demand. A recency-only (LRU) policy would evict `high`.
+        cache.record_access_with_demand(high, 100, AccessType::Get, 0, 10.0, |_| false);
+        cache.record_access_with_demand(low, 100, AccessType::Get, 0, 1.0, |_| false);
+        assert_eq!(cache.current_bytes(), 200);
+
+        time.advance_time(Duration::from_secs(61));
+
+        // Over-budget insert must evict the LOWEST keep_score (`low`), not the
+        // oldest (`high`).
+        let result =
+            cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 1.0, |_| false);
+        assert_eq!(
+            result.evicted,
+            vec![(low, 0)],
+            "lowest-demand contract must evict, not the least-recently-used one"
+        );
+        assert!(cache.contains(&high), "high-demand contract must survive");
+        assert!(!cache.contains(&low));
+    }
+
+    /// The #4338 check at the cache level, written to actually DISCRIMINATE
+    /// demand-ordering from recency: a repeatedly-read HIGH-demand contract (a
+    /// River room) survives eviction against a NEWER low-demand junk contract
+    /// even though the room is past TTL and is the *least-recently-accessed* of
+    /// the two. Byte-LRU-with-TTL evicts the oldest past-TTL entry, so it would
+    /// evict the room here — this test fails under that policy and passes only
+    /// because eviction is ordered by `keep_score` (demand), not recency.
+    ///
+    /// Note the discrimination comes from NON-UNIFORM demand, not the floor
+    /// alone: with uniform demand `keep_score = eviction_floor_at_last_refresh +
+    /// constant` is monotone in refresh time (the floor only rises), i.e.
+    /// identical to LRU ordering. The Greedy-Dual floor supplies aging, but the
+    /// demand term is what lets an older contract outrank a newer one.
+    #[test]
+    fn fuel_gauge_keeps_repeatedly_read_contract_over_junk() {
+        // Budget for two 100-byte contracts.
+        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let room = make_key(1); // the "River room": repeatedly read, high demand
+        let junk = make_key(2); // never re-read, low demand, inserted LATER
+        let trigger = make_key(3);
+
+        // Seed the room with strong demand, then read it repeatedly (simulating
+        // recurring GETs). These reads are the room's LAST accesses.
+        cache.record_access_with_demand(room, 100, AccessType::Get, 0, 10.0, |_| false);
+        for _ in 0..3 {
+            time.advance_time(Duration::from_secs(5));
+            cache.touch(&room);
+        }
+
+        // Junk arrives AFTER the room's last read, so junk is the more-recently-
+        // accessed entry — and carries weak demand.
+        time.advance_time(Duration::from_secs(5));
+        cache.record_access_with_demand(junk, 100, AccessType::Get, 0, 1.0, |_| false);
+
+        // Advance so BOTH are past TTL and eviction-eligible; the room, last read
+        // 5s before junk, is the least-recently-accessed of the two.
+        time.advance_time(Duration::from_secs(61));
+
+        // Make the discrimination explicit and checked, not just asserted in
+        // prose: the room is LRU-older yet carries more demand credit.
+        let room_entry = cache.get(&room).expect("room hosted");
+        let junk_entry = cache.get(&junk).expect("junk hosted");
+        assert!(
+            room_entry.last_access_seq < junk_entry.last_access_seq,
+            "room must be the least-recently-accessed of the two, so recency \
+             alone (byte-LRU) would evict it first"
+        );
+        assert!(
+            room_entry.keep_score > junk_entry.keep_score,
+            "room must carry more demand credit than junk ({} vs {})",
+            room_entry.keep_score,
+            junk_entry.keep_score,
+        );
+
+        // Over-budget insert: the fuel gauge evicts the lowest keep_score (junk).
+        // Byte-LRU-with-TTL would instead evict the room (the oldest past-TTL
+        // entry) — so this assertion is what fails under a recency-only policy.
+        let result =
+            cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 1.0, |_| false);
+        assert_eq!(
+            result.evicted,
+            vec![(junk, 0)],
+            "low-demand junk must evict, NOT the older-but-high-demand room"
+        );
+        assert!(
+            cache.contains(&room),
+            "the repeatedly-read high-demand room survives even though it is the \
+             least-recently-accessed past-TTL entry (byte-LRU would have evicted it)"
+        );
+        assert!(!cache.contains(&junk));
+        // The room (read_count >= 2) was never a victim, so no repeat-demand
+        // eviction is recorded (junk, read once, does not count).
+        assert_eq!(
+            cache.stats().evictions_of_recently_read_total,
+            0,
+            "a repeatedly-read contract must never be evicted (no miscalibration)"
+        );
+    }
+
+    /// The `eviction_floor` ratchets up to each evicted contract's `keep_score`
+    /// and never decreases (Greedy-Dual aging).
+    #[test]
+    fn eviction_floor_ratchets_up_on_eviction() {
+        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        assert_eq!(cache.eviction_floor(), 0.0);
+
+        // Insert a demand-7 contract, let it age, then evict it via an
+        // over-budget insert; the floor must climb to 7.
+        let a = make_key(1);
+        cache.record_access_with_demand(a, 100, AccessType::Get, 0, 7.0, |_| false);
+        time.advance_time(Duration::from_secs(61));
+        let b = make_key(2);
+        let r = cache.record_access_with_demand(b, 100, AccessType::Get, 0, 2.0, |_| false);
+        assert_eq!(r.evicted, vec![(a, 0)]);
+        assert_eq!(
+            cache.eviction_floor(),
+            7.0,
+            "floor ratchets to evicted score"
+        );
+
+        // b's keep_score was floor(0)+2 = 2 at insert; a later eviction of a
+        // lower-scored victim must not drop the floor below 7.
+        time.advance_time(Duration::from_secs(61));
+        let c = make_key(3);
+        let r = cache.record_access_with_demand(c, 100, AccessType::Get, 0, 1.0, |_| false);
+        assert_eq!(r.evicted, vec![(b, 0)], "b (keep_score 2) evicts");
+        assert_eq!(
+            cache.eviction_floor(),
+            7.0,
+            "floor must not drop below its high-water mark"
+        );
+    }
+
+    /// A PUT is a SEED, not read-demand: on an existing entry it must NOT bump
+    /// `read_count` or refresh `keep_score` to the frontier, so a repeatedly-PUT
+    /// contract cannot outrank a repeatedly-GET one.
+    #[test]
+    fn put_seeds_but_earns_no_read_demand_credit() {
+        let (mut cache, _) = make_cache(10_000, Duration::from_secs(60));
+        let key = make_key(1);
+
+        // Seed via PUT: keep_score = floor(0) + demand, read_count 0.
+        cache.record_access_with_demand(key, 100, AccessType::Put, 0, 2.0, |_| false);
+        assert_eq!(cache.get(&key).unwrap().read_count, 0, "PUT is not a read");
+        let seed_score = cache.get(&key).unwrap().keep_score;
+        assert_eq!(seed_score, 2.0);
+
+        // Manually raise the floor by evicting something else would be indirect;
+        // instead assert that a re-PUT does NOT refresh keep_score or read_count.
+        cache.record_access_with_demand(key, 100, AccessType::Put, 0, 9.0, |_| false);
+        assert_eq!(
+            cache.get(&key).unwrap().read_count,
+            0,
+            "re-PUT must not count as a read"
+        );
+        assert_eq!(
+            cache.get(&key).unwrap().keep_score,
+            seed_score,
+            "re-PUT (seed) must not refresh keep_score to the frontier"
+        );
+
+        // A GET, by contrast, IS read-demand and refreshes both.
+        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 9.0, |_| false);
+        assert_eq!(cache.get(&key).unwrap().read_count, 1);
+        assert_eq!(cache.get(&key).unwrap().keep_score, 9.0);
+    }
+
+    /// The recently-read eviction counter fires only for victims with genuine
+    /// repeat demand (`read_count >= 2`), not one-off seeds.
+    #[test]
+    fn evictions_of_recently_read_counts_only_repeat_demand() {
+        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+
+        // A contract read twice (repeat demand), then forced out by junk.
+        let read_twice = make_key(1);
+        cache.record_access(read_twice, 100, AccessType::Get, 0, |_| false);
+        cache.touch(&read_twice); // second read -> read_count 2
+        time.advance_time(Duration::from_secs(61));
+        // Evict it by inserting a higher-demand junk (so read_twice is the victim).
+        let junk = make_key(2);
+        let r = cache.record_access_with_demand(junk, 100, AccessType::Get, 0, 5.0, |_| false);
+        assert_eq!(r.evicted, vec![(read_twice, 0)]);
+        assert_eq!(
+            cache.stats().evictions_of_recently_read_total,
+            1,
+            "evicting a twice-read contract is a miscalibration signal"
+        );
+
+        // Now evict the junk seed (read_count 1) -> must NOT increment.
+        time.advance_time(Duration::from_secs(61));
+        let seed = make_key(3);
+        // junk currently has demand 5 (>seed's), so make the new one higher.
+        let r = cache.record_access_with_demand(seed, 100, AccessType::Get, 0, 9.0, |_| false);
+        assert_eq!(r.evicted, vec![(junk, 0)], "junk (read once) evicts");
+        assert_eq!(
+            cache.stats().evictions_of_recently_read_total,
+            1,
+            "a one-off seed eviction must not count as recently-read"
+        );
+    }
+
+    /// A subscribed (retained) contract is exempt from eviction even when its
+    /// `keep_score` is the lowest and it is past TTL — the pin dominates demand
+    /// ordering.
+    #[test]
+    fn subscribe_pin_exempts_lowest_score_from_eviction() {
+        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let pinned = make_key(1); // lowest demand, but subscribed
+        let other = make_key(2);
+        let trigger = make_key(3);
+
+        cache.record_access_with_demand(pinned, 100, AccessType::Get, 0, 0.1, |_| false);
+        cache.record_access_with_demand(other, 100, AccessType::Get, 0, 5.0, |_| false);
+        time.advance_time(Duration::from_secs(61));
+
+        // Over budget: `pinned` has the lowest keep_score and would evict first,
+        // but should_retain protects it, so `other` is evicted instead.
+        let result = cache
+            .record_access_with_demand(trigger, 100, AccessType::Get, 0, 5.0, |k| *k == pinned);
+        assert_eq!(
+            result.evicted,
+            vec![(other, 0)],
+            "an active subscription pins the contract even at the lowest keep_score"
+        );
+        assert!(cache.contains(&pinned));
+        assert!(!cache.contains(&other));
     }
 }

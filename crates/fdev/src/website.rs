@@ -8,6 +8,7 @@ use anyhow::Context;
 use ciborium::ser::into_writer;
 use clap::Subcommand;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use freenet::dev_tool::MAX_CONTRACT_STATE_SIZE;
 use freenet::server::WebApp;
 use freenet_stdlib::client_api::{ContractRequest, ContractResponse, HostResponse};
 use freenet_stdlib::prelude::*;
@@ -182,6 +183,33 @@ fn sign_webapp(
     WebContainerMetadata { version, signature }
 }
 
+/// Fail fast if a packed website state exceeds the node's contract-state limit.
+///
+/// A node's state store rejects any state larger than [`MAX_CONTRACT_STATE_SIZE`]
+/// (50 MiB). Without this pre-flight check the oversized PUT is sent and rejected
+/// by the node either way, but with an opaque message: a state in the ~50-64 MiB
+/// range reassembles fine and is rejected by the node's own state-size check
+/// (`state size X bytes exceeds maximum allowed 52428800 bytes`), while a very
+/// large site (>64 MiB serialized) exceeds the WebSocket transport cap and is
+/// rejected during stream reassembly with a cryptic
+/// `stream reassembly error: total_chunks N exceeds maximum 256` message
+/// (issue #4653). Checking here lets us surface the actual size, the limit, and
+/// a concrete remediation hint before anything is sent.
+fn ensure_state_within_limit(state_len: usize, dir: &Path) -> anyhow::Result<()> {
+    if state_len > MAX_CONTRACT_STATE_SIZE {
+        let state_mib = state_len as f64 / (1024.0 * 1024.0);
+        let limit_mib = MAX_CONTRACT_STATE_SIZE / (1024 * 1024);
+        anyhow::bail!(
+            "Website is {state_mib:.1} MiB after compression, exceeding Freenet's \
+             {limit_mib} MiB contract-state limit. Reduce the size of {dir}: check for \
+             large media files, or an accidentally included node_modules/, .git/, or \
+             build/target/ directory.",
+            dir = dir.display(),
+        );
+    }
+    Ok(())
+}
+
 fn load_contract_wasm(custom_path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
     match custom_path {
         Some(path) => {
@@ -321,6 +349,12 @@ pub async fn publish(
     let webapp = WebApp::from_compressed(metadata_bytes, webapp_bytes)?;
     let state: State = webapp.pack()?.into();
 
+    // Pre-flight size check: reject an oversized site here with a clear,
+    // actionable error rather than letting the node reject it with an opaque
+    // message (its state-size limit for ~50-64 MiB, or a cryptic chunk-count
+    // stream-reassembly error for >64 MiB serialized) (#4653).
+    ensure_state_within_limit(state.as_ref().len(), &directory)?;
+
     println!("Publishing website as contract {key} (version {version})");
 
     let request = ContractRequest::Put {
@@ -429,6 +463,42 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Missing keys.signing_key"),
+        );
+    }
+
+    #[test]
+    fn test_ensure_state_within_limit() {
+        let dir = Path::new("/tmp/my-site");
+
+        // Just over the limit: rejected, and the error names both the actual
+        // size and the limit so the user can act on it.
+        let over = ensure_state_within_limit(MAX_CONTRACT_STATE_SIZE + 1, dir);
+        assert!(over.is_err(), "state over the limit must be rejected");
+        let msg = over.unwrap_err().to_string();
+        assert!(
+            msg.contains("50 MiB"),
+            "error should mention the 50 MiB limit: {msg}"
+        );
+        assert!(
+            msg.contains("50.0 MiB"),
+            "error should mention the actual size in MiB: {msg}"
+        );
+        assert!(
+            msg.contains("/tmp/my-site"),
+            "error should name the directory to trim: {msg}"
+        );
+
+        // Exactly at the limit: accepted (the limit is inclusive, matching the
+        // node's state store, which accepts state of exactly MAX_STATE_SIZE).
+        assert!(
+            ensure_state_within_limit(MAX_CONTRACT_STATE_SIZE, dir).is_ok(),
+            "state at exactly the limit must be accepted"
+        );
+
+        // A small state: accepted.
+        assert!(
+            ensure_state_within_limit(1024, dir).is_ok(),
+            "small state must be accepted"
         );
     }
 

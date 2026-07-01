@@ -1514,6 +1514,28 @@ impl SimNetwork {
         self
     }
 
+    /// Opt this simulation into advertising startup-hosted contracts
+    /// (`SeedHostedContract`) through the neighbor-hosting mesh, so the
+    /// terminal advertisement consult (hosting redesign piece C, invariant 5)
+    /// can find a seeded off-path host.
+    ///
+    /// OFF by default: a seeded host does NOT advertise (the harness's
+    /// historical behavior), so a key-routed GET to a non-hosting region still
+    /// dead-ends — which the migration dead-end controls rely on. A test that
+    /// exercises the consult opts in here. Patches the already-built
+    /// node/gateway configs, mirroring
+    /// [`enable_placement_migration`](Self::enable_placement_migration).
+    #[allow(dead_code)]
+    pub fn enable_seeded_host_advertisements(&mut self) -> &mut Self {
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.advertise_seeded_hosts = true;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.advertise_seeded_hosts = true;
+        }
+        self
+    }
+
     /// Force the placement-migration (`SubscribeHint`) cascade OFF for this
     /// simulation by pinning the per-node version floor to the unreachable
     /// [`Self::SIM_MIGRATION_DISABLED_FLOOR`].

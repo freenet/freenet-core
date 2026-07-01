@@ -8,7 +8,7 @@ A peer hosts the contracts it is most likely to be asked for, within a budget si
 - **Instrumentation is horizontal.** Every piece of this redesign ships with the telemetry needed to observe its OWN behavior in production. This is a PR acceptance criterion: a feature PR that adds a mechanism but no instrumentation for it gets bounced in review. Rationale: the behavior here is emergent and resource-dependent, so it cannot be fully tested pre-production — production telemetry IS the validation instrument, and it must grow WITH each piece rather than being deferred to a later "observability" PR. (This is why A1, telemetry, is the foundational sub-PR.)
 - **Telemetry shape: per-node aggregate scalars/rates only.** Emit resource/behavior metrics as per-node aggregate scalars and rates carried on the existing periodic snapshot. NEVER per-contract or per-request event streams — nova ingests the whole fleet, so a per-contract/per-request stream multiplied across every peer is an ingestion DoS on the collector.
 
-## Eviction (Greedy-Dual / "fuel gauge")
+## Eviction (Greedy-Dual, demand-ordered)
 - Each hosted contract X has `keep_score(X) = eviction_floor + predicted_demand(X)`, set on insert and refreshed on every read (GET/SUBSCRIBE).
 - `eviction_floor`: one per-peer running value; when over budget, evict the min keep_score and set `eviction_floor = keep_score(evicted)`. Greedy-Dual aging, measured in cache-contention, not wall-clock.
 - `predicted_demand(X)`: per-contract estimate of X's read-request rate at this peer. Seeded at a proximity prior; blended toward X's own observed read rate as evidence accrues (prior washes out with data). Only RATIOS matter (scale-invariant), so no absolute calibration needed.
@@ -24,7 +24,7 @@ A peer hosts the contracts it is most likely to be asked for, within a budget si
 - GET hosts-on-first and lets the gauge evict one-offs (demand-driven, so NOT the relay-caching anti-pattern; guard-comment the site). SUBSCRIBE builds a chain of demand-pinned hosts. An over-committed peer REFUSES new subscriptions.
 
 ## Sub-PRs (sequenced; share ring/hosting)
-A1 resource telemetry (this PR); A2 memory-capability budget (`read_total_ram_bytes` -> hosting budget); A3 fuel-gauge eviction policy; A4 blend.
+A1 resource telemetry (this PR); A2 memory-capability budget (`read_total_ram_bytes` -> hosting budget); A3 demand-ordered eviction policy; A4 blend.
 
 ## Validation
 Sim health metrics (subscribe/GET success, tree formation, time-to-first-op) + a check that a real-demand contract (e.g. a River room) is NOT evicted ahead of junk (the #4338 miscalibration test).

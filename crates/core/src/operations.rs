@@ -294,6 +294,127 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
     }
 }
 
+/// Terminal advertisement consult (hosting redesign piece C, invariant 5:
+/// "findability is routing + on-demand advertisement").
+///
+/// A GET/SUBSCRIBE routes toward a contract's key and reaches a *terminus*
+/// — the closest peer it can route to, from which `k_closest_potentially_
+/// hosting` yields no closer candidate. Location routing is purely
+/// distance-based, so it never selects a neighbor that happens to host the
+/// contract but sits *off* the direct routing path (farther from the key).
+/// Before the terminus gives up with NotFound, it consults the host
+/// advertisements its neighbors already broadcast (`NeighborHostingManager`)
+/// and forwards the request to an advertised host if one exists.
+///
+/// This is NOT speculative pre-replication (invariant 5 forbids that): it
+/// only ever forwards to a peer that *already advertised* hosting the
+/// contract. It pushes and caches nothing and manufactures no demand.
+///
+/// Returns up to `max_hosts` connected advertised hosts, closest-to-key
+/// first, each paired with its resolved socket address. `is_excluded`
+/// screens out peers already tried/visited plus this node and the upstream
+/// (so the consult can reuse the caller's existing visited/dedup state and
+/// cannot loop back). Records the per-node consult attempt (and a hit when
+/// at least one usable host is returned) on both the production
+/// `network_status` scalars and the simulation-visible `GlobalTestMetrics`.
+pub(crate) fn consult_advertised_hosts(
+    op_manager: &OpManager,
+    instance_id: &ContractInstanceId,
+    max_hosts: usize,
+    is_excluded: impl Fn(std::net::SocketAddr) -> bool,
+) -> Vec<(PeerKeyLocation, std::net::SocketAddr)> {
+    crate::config::GlobalTestMetrics::record_terminal_consult_attempt();
+    crate::node::network_status::record_terminal_consult_attempt();
+
+    // Resolve advertised neighbor pub keys to currently-connected peers.
+    let advertised: Vec<PeerKeyLocation> = op_manager
+        .neighbor_hosting
+        .neighbors_with_contract_id(instance_id)
+        .into_iter()
+        .filter_map(|pub_key| {
+            op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_pub_key(&pub_key)
+        })
+        .collect();
+
+    let hosts = rank_advertised_hosts(
+        Location::from(instance_id),
+        advertised,
+        max_hosts,
+        is_excluded,
+    );
+
+    if !hosts.is_empty() {
+        crate::config::GlobalTestMetrics::record_terminal_consult_hit();
+        crate::node::network_status::record_terminal_consult_hit();
+        tracing::debug!(
+            %instance_id,
+            advertised_hosts = hosts.len(),
+            "TERMINAL_CONSULT: found advertised host(s) off the routing path"
+        );
+    }
+
+    hosts
+}
+
+/// Pure ranking core of [`consult_advertised_hosts`], split out for unit
+/// testing. Filters `advertised` to peers with a routable address and a
+/// location that `is_excluded` does not reject, orders them closest-to-key
+/// first (deterministic address tie-break), and returns at most `max_hosts`.
+fn rank_advertised_hosts(
+    target: Location,
+    advertised: Vec<PeerKeyLocation>,
+    max_hosts: usize,
+    is_excluded: impl Fn(std::net::SocketAddr) -> bool,
+) -> Vec<(PeerKeyLocation, std::net::SocketAddr)> {
+    let mut candidates: Vec<(PeerKeyLocation, std::net::SocketAddr, Location)> = advertised
+        .into_iter()
+        .filter_map(|peer| {
+            // Need a routable address AND a location to rank by; an
+            // addressless advertised host cannot be a wire target.
+            let addr = peer.socket_addr()?;
+            let loc = peer.location()?;
+            if is_excluded(addr) {
+                return None;
+            }
+            Some((peer, addr, loc))
+        })
+        .collect();
+
+    // Deterministic ordering: closest to the key first, tie-break on addr so
+    // the pick is stable across runs (DashMap iteration is not).
+    candidates.sort_by(|(_, a_addr, a_loc), (_, b_addr, b_loc)| {
+        a_loc
+            .distance(target)
+            .partial_cmp(&b_loc.distance(target))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a_addr.cmp(b_addr))
+    });
+    candidates.truncate(max_hosts);
+
+    candidates
+        .into_iter()
+        .map(|(peer, addr, _loc)| (peer, addr))
+        .collect()
+}
+
+/// Record the terminal outcome of a consult that ran at a terminus:
+/// `resolved_found = true` when a consult forward closed the dead-end
+/// (Found/Subscribed), `false` when the request still ended NotFound.
+/// Mirrors to both the production `network_status` scalars and the
+/// simulation-visible `GlobalTestMetrics`.
+pub(crate) fn record_terminal_consult_outcome(resolved_found: bool) {
+    if resolved_found {
+        crate::config::GlobalTestMetrics::record_terminal_consult_resolved_found();
+        crate::node::network_status::record_terminal_consult_resolved_found();
+    } else {
+        crate::config::GlobalTestMetrics::record_terminal_consult_still_not_found();
+        crate::node::network_status::record_terminal_consult_still_not_found();
+    }
+}
+
 /// Reclaim the on-disk storage of a contract that was evicted from the
 /// hosting cache. Skips contracts that are still in use — an active client
 /// subscription or a downstream peer subscriber means something still
@@ -1208,5 +1329,111 @@ mod egress_banned_gate_tests {
             reject_if_contract_banned_on(&bl, &contract).is_ok(),
             "contract must pass the gate once its ban TTL has expired"
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_consult_tests {
+    //! Unit tests for the pure ranking core of the terminal advertisement
+    //! consult (hosting redesign piece C, invariant 5). The end-to-end
+    //! behaviour (a GET whose only host is one hop off the routing path)
+    //! is covered by the simulation test
+    //! `test_terminal_advertisement_consult_closes_get_dead_end`.
+    use super::rank_advertised_hosts;
+    use crate::ring::{Location, PeerKeyLocation};
+    use crate::transport::TransportKeypair;
+    use std::net::SocketAddr;
+
+    // Loopback addresses so `Location::from_address` differentiates by port
+    // (it masks the last IP byte for non-loopback addresses, which would
+    // collapse distinct hosts onto one ring location).
+    fn peer_at(addr: &str) -> PeerKeyLocation {
+        let addr: SocketAddr = addr.parse().unwrap();
+        PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr)
+    }
+
+    #[test]
+    fn ranks_closest_advertised_host_to_key_first() {
+        let a = peer_at("127.0.0.1:1000");
+        let b = peer_at("127.0.0.1:2000");
+        let c = peer_at("127.0.0.1:3000");
+        // Target = location of peer `b`'s address, so `b` is the closest
+        // advertised host and must rank first regardless of input order.
+        let target = b.location().unwrap();
+
+        let ranked =
+            rank_advertised_hosts(target, vec![a.clone(), b.clone(), c.clone()], 3, |_| false);
+
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(
+            ranked[0].0.pub_key(),
+            b.pub_key(),
+            "the advertised host closest to the key must be returned first"
+        );
+    }
+
+    #[test]
+    fn truncates_to_max_hosts() {
+        let peers = vec![
+            peer_at("127.0.0.1:1000"),
+            peer_at("127.0.0.1:2000"),
+            peer_at("127.0.0.1:3000"),
+        ];
+        let target = Location::from_address(&"127.0.0.1:9000".parse().unwrap());
+
+        let ranked = rank_advertised_hosts(target, peers, 2, |_| false);
+        assert_eq!(ranked.len(), 2, "must return at most max_hosts candidates");
+    }
+
+    #[test]
+    fn excludes_filtered_addresses() {
+        let keep = peer_at("127.0.0.1:1000");
+        let skip = peer_at("127.0.0.1:2000");
+        let skip_addr = skip.socket_addr().unwrap();
+        let target = Location::from_address(&"127.0.0.1:9000".parse().unwrap());
+
+        let ranked =
+            rank_advertised_hosts(target, vec![keep.clone(), skip.clone()], 5, move |addr| {
+                addr == skip_addr
+            });
+
+        assert_eq!(
+            ranked.len(),
+            1,
+            "the excluded (already-visited) host must be dropped"
+        );
+        assert_eq!(ranked[0].0.pub_key(), keep.pub_key());
+        assert!(
+            ranked.iter().all(|(_, addr)| *addr != skip_addr),
+            "the excluded address must never be returned as a forward target"
+        );
+    }
+
+    #[test]
+    fn empty_when_no_advertised_hosts() {
+        let target = Location::from_address(&"127.0.0.1:9000".parse().unwrap());
+        let ranked = rank_advertised_hosts(target, vec![], 2, |_| false);
+        assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn terminal_consult_metrics_reset_and_increment() {
+        use crate::config::GlobalTestMetrics;
+        GlobalTestMetrics::reset();
+        assert_eq!(GlobalTestMetrics::terminal_consult_attempts(), 0);
+        assert_eq!(GlobalTestMetrics::terminal_consult_hits(), 0);
+        assert_eq!(GlobalTestMetrics::terminal_consult_resolved_found(), 0);
+        assert_eq!(GlobalTestMetrics::terminal_consult_still_not_found(), 0);
+
+        GlobalTestMetrics::record_terminal_consult_attempt();
+        GlobalTestMetrics::record_terminal_consult_hit();
+        super::record_terminal_consult_outcome(true);
+        super::record_terminal_consult_outcome(false);
+
+        assert_eq!(GlobalTestMetrics::terminal_consult_attempts(), 1);
+        assert_eq!(GlobalTestMetrics::terminal_consult_hits(), 1);
+        assert_eq!(GlobalTestMetrics::terminal_consult_resolved_found(), 1);
+        assert_eq!(GlobalTestMetrics::terminal_consult_still_not_found(), 1);
+        GlobalTestMetrics::reset();
     }
 }

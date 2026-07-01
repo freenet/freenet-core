@@ -1485,6 +1485,25 @@ impl Ring {
             snapshot.hosting_contract_count = Some(hosting.contract_count);
             snapshot.hosting_budget_evictions_total = Some(hosting.budget_evictions_total);
 
+            // Demand-ordered eviction gauge (#4642 A3): the
+            // #4338 miscalibration signal (evictions of repeatedly-read
+            // contracts). Per-node aggregate scalar on the same cadence.
+            snapshot.hosting_evictions_of_recently_read_total =
+                Some(hosting.evictions_of_recently_read_total);
+            // Local-client GET hit-rate (#4642 A3): served-locally vs routed to
+            // the network. Driven by the real serve/forward decision in the
+            // client GET handler, so it is read from the manager counters (not
+            // cache membership).
+            snapshot.hosting_local_hits_total = Some(ring.hosting_manager.local_get_serves());
+            snapshot.hosting_local_misses_total = Some(ring.hosting_manager.local_get_forwards());
+
+            // Keep the hosting manager's copy of our own ring location current so
+            // the proximity-prior demand estimate (#4642 A3) can turn a contract
+            // key into a distance. Best-effort: only push a known location.
+            if let Some(own_loc) = ring.connection_manager.own_location().location() {
+                ring.hosting_manager.set_own_location(own_loc);
+            }
+
             // Interest-weighted (two-tier) module-cache SHADOW gauges
             // (#4441/#4534): always-on, independent of the
             // FREENET_MODULE_CACHE_INTEREST_TIERED feature flag. They quantify
@@ -2330,6 +2349,18 @@ impl Ring {
     /// and which contracts were evicted (if any).
     pub fn record_get_access(&self, key: ContractKey, size_bytes: u64) -> RecordAccessResult {
         self.host_contract(key, size_bytes, AccessType::Get)
+    }
+
+    /// Record that a local-client GET was answered from local hosted state
+    /// (a hit) — see [`HostingManager::record_local_get_serve`]. (#4642 A3)
+    pub fn record_get_served_locally(&self) {
+        self.hosting_manager.record_local_get_serve();
+    }
+
+    /// Record that a local-client GET was routed to the network (a forward/miss)
+    /// — see [`HostingManager::record_local_get_forward`]. (#4642 A3)
+    pub fn record_get_forwarded(&self) {
+        self.hosting_manager.record_local_get_forward();
     }
 
     /// Whether this node is hosting this contract (has it in cache).

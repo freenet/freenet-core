@@ -332,8 +332,20 @@ impl NeighborHostingManager {
     /// so callers can resolve to current addresses via ConnectionManager.
     /// Used by UPDATE operations to find additional targets beyond explicit subscribers.
     pub fn neighbors_with_contract(&self, contract_key: &ContractKey) -> Vec<TransportPublicKey> {
-        let contract_id = contract_key.id();
+        self.neighbors_with_contract_id(contract_key.id())
+    }
 
+    /// Same as [`Self::neighbors_with_contract`] but keyed by
+    /// [`ContractInstanceId`] directly.
+    ///
+    /// Relay operation drivers (GET / SUBSCRIBE) carry the `instance_id`
+    /// on the wire rather than a full `ContractKey`, so the terminal
+    /// advertisement consult (invariant 5: "findability is routing +
+    /// on-demand advertisement") looks up advertised hosts by id.
+    pub fn neighbors_with_contract_id(
+        &self,
+        contract_id: &ContractInstanceId,
+    ) -> Vec<TransportPublicKey> {
         let mut neighbors: Vec<TransportPublicKey> = self
             .neighbor_contracts
             .iter()
@@ -358,7 +370,7 @@ impl NeighborHostingManager {
 
         if !neighbors.is_empty() {
             debug!(
-                contract = %contract_key,
+                contract = %contract_id,
                 neighbor_count = neighbors.len(),
                 "NEIGHBOR_HOSTING: Found neighbors with contract"
             );
@@ -534,6 +546,40 @@ mod tests {
         let neighbors = manager.neighbors_with_contract(&key);
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0], neighbor);
+    }
+
+    #[test]
+    fn test_neighbors_with_contract_id_matches_key_lookup() {
+        // The terminal advertisement consult (piece C) looks up advertised
+        // hosts by ContractInstanceId; it must return the same neighbors as
+        // the ContractKey-keyed method.
+        let manager = NeighborHostingManager::new();
+        let key = test_contract_key();
+        let neighbor = make_pub_key(1);
+
+        assert!(manager.neighbors_with_contract_id(key.id()).is_empty());
+
+        manager.handle_message(
+            &neighbor,
+            NeighborHostingMessage::HostingAnnounce {
+                added: vec![*key.id()],
+                removed: vec![],
+                is_response: false,
+            },
+        );
+
+        let by_id = manager.neighbors_with_contract_id(key.id());
+        let by_key = manager.neighbors_with_contract(&key);
+        assert_eq!(by_id, by_key);
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0], neighbor);
+
+        // A contract no neighbor advertised yields no hosts.
+        assert!(
+            manager
+                .neighbors_with_contract_id(test_contract_key_2().id())
+                .is_empty()
+        );
     }
 
     #[test]

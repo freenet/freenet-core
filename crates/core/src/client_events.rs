@@ -948,6 +948,10 @@ async fn process_open_request(
                                 "Returning locally cached contract state"
                             );
 
+                            // #4642 A3 hit-rate instrumentation: this client GET
+                            // was answered from local hosted state (a hit).
+                            op_manager.ring.record_get_served_locally();
+
                             // Handle subscription for locally found contracts
                             if subscribe {
                                 if let Some(subscription_listener) = subscription_listener {
@@ -977,6 +981,11 @@ async fn process_open_request(
                                 contract,
                             })));
                         }
+
+                        // #4642 A3 hit-rate instrumentation: this client GET could
+                        // not be answered locally and is routed to the network
+                        // (a forward/miss).
+                        op_manager.ring.record_get_forwarded();
 
                         // Driver owns its routing state in task
                         // locals and calls notify_contract_handler
