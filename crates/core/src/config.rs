@@ -481,8 +481,22 @@ impl ConfigArgs {
                 self.network_api.location.get_or_insert(loc);
             }
             self.log_level.get_or_insert(cfg.log_level);
-            self.max_hosting_storage
-                .get_or_insert(cfg.max_hosting_storage);
+            // #4565 upgrade migration: a pre-A2 release auto-persisted the OLD
+            // flat 1 GiB default as `max-hosting-storage = 1073741824`. Treat
+            // that exact historical sentinel as auto-derived (NOT an explicit
+            // operator choice) so it RE-DERIVES from live RAM on upgrade —
+            // otherwise a small box that upgraded would keep the 1 GiB budget and
+            // stay on the #4565 OOM path. `skip_serializing_if` alone only stops
+            // NEW configs from pinning; it can't unpin the historical value.
+            // CLI/env explicit values are parsed into `self` BEFORE this file
+            // merge, so `--max-hosting-storage 1073741824` / the env var still
+            // wins; only a FILE value equal to the sentinel is re-derived. On a
+            // >=8 GiB box the re-derivation yields 1 GiB anyway; on a smaller box
+            // reducing it is the whole point.
+            if cfg.max_hosting_storage != crate::ring::LEGACY_FLAT_HOSTING_BUDGET_BYTES {
+                self.max_hosting_storage
+                    .get_or_insert(cfg.max_hosting_storage);
+            }
             self.per_user_secret_quota_bytes
                 .get_or_insert(cfg.per_user_secret_quota_bytes);
             self.per_user_inactive_ttl_secs
@@ -1090,9 +1104,19 @@ pub struct Config {
     /// 128 MiB, 1 GiB)`, so a memory-constrained host gets a proportionally
     /// smaller budget instead of the old flat 1 GiB (#4642 A2 / #4565). Set an
     /// explicit value to override the RAM-scaled default.
+    ///
+    /// `skip_serializing_if` drops this field from `config.toml` when it holds
+    /// the auto-derived default, so the budget RE-DERIVES from live RAM on every
+    /// boot instead of being pinned at first boot. Without this, a node that
+    /// first-booted on a large box would bake the large budget into `config.toml`
+    /// and keep it after moving to a smaller box / tighter cgroup — defeating the
+    /// #4565 OOM protection. An explicit operator value differs from the derived
+    /// default, so it is persisted and survives restarts. See
+    /// [`is_default_hosting_budget`].
     #[serde(
         default = "default_max_hosting_storage",
-        rename = "max-hosting-storage"
+        rename = "max-hosting-storage",
+        skip_serializing_if = "is_default_hosting_budget"
     )]
     pub max_hosting_storage: u64,
     /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
@@ -1187,6 +1211,20 @@ fn default_max_blocking_threads() -> usize {
 /// budget (addresses #4565); an explicit value always overrides it.
 fn default_max_hosting_storage() -> u64 {
     crate::ring::default_hosting_budget_bytes()
+}
+
+/// `skip_serializing_if` predicate for [`Config::max_hosting_storage`]: true
+/// when the resolved value equals the auto-derived RAM-scaled default, so it is
+/// omitted from `config.toml` and re-derived from live RAM on the next boot
+/// (#4565 first-boot-pinning fix — see the field docs).
+///
+/// Because the derived default is always clamped to `[128 MiB, 1 GiB]`, an
+/// explicit operator value OUTSIDE that range can never match and is always
+/// persisted. The one ambiguous case — an explicit value that happens to equal
+/// the current derived default — re-derives on a RAM change, which is the safe
+/// direction (toward the smaller, capability-relative budget) anyway.
+fn is_default_hosting_budget(v: &u64) -> bool {
+    *v == default_max_hosting_storage()
 }
 
 /// Default per-user secret-storage quota (4 MiB). Resolves to
@@ -3657,7 +3695,13 @@ mod tests {
     #[tokio::test]
     async fn max_hosting_storage_explicit_value_round_trips() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let custom = 256 * 1024 * 1024_u64;
+        // 2 GiB is deliberately ABOVE the auto-derived clamp ceiling (1 GiB), so
+        // an explicit operator value can never coincide with the RAM-scaled
+        // default and is therefore always persisted / honored across restarts —
+        // regardless of the CI host's real RAM (a 2 GiB runner's derived default
+        // is 256 MiB, which a 256 MiB test value would collide with once
+        // `skip_serializing_if` drops the auto-derived value; #4565 fix).
+        let custom = 2 * 1024 * 1024 * 1024_u64;
         let args = ConfigArgs {
             mode: Some(OperationMode::Local),
             config_paths: ConfigPathsArgs {
@@ -3671,11 +3715,126 @@ mod tests {
         let cfg = args.build().await.unwrap();
         assert_eq!(cfg.max_hosting_storage, custom);
 
-        // Round-trips through TOML serialization.
+        // An explicit override is persisted (NOT skipped) and round-trips.
         let serialized = toml::to_string(&cfg).unwrap();
-        assert!(serialized.contains("max-hosting-storage"));
+        assert!(
+            serialized.contains("max-hosting-storage"),
+            "an explicit operator value must be persisted, got:\n{serialized}"
+        );
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.max_hosting_storage, custom);
+    }
+
+    /// First-boot-pinning fix (#4565): a node that first-boots with the
+    /// auto-derived (RAM-scaled) budget must NOT bake it into `config.toml`, so a
+    /// later boot re-derives from live RAM. Concretely: (1) the auto-derived
+    /// value is omitted from the serialized config, and (2) a `config.toml`
+    /// without the key rebuilds to the live-RAM default rather than a pinned
+    /// value. Combined with the RAM-scaling proof in `cache.rs`
+    /// (`budget_for_ram_scales_and_clamps`), this means a node that first-boots on
+    /// a large box and restarts on a smaller box / tighter cgroup gets the
+    /// SMALLER budget, not the pinned old one.
+    #[tokio::test]
+    async fn auto_derived_hosting_budget_is_not_persisted_and_re_derives() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            // No explicit max_hosting_storage -> resolves to the auto-derived
+            // RAM-scaled default.
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert_eq!(
+            cfg.max_hosting_storage,
+            crate::ring::default_hosting_budget_bytes(),
+            "with no operator value, the budget must be the auto-derived default"
+        );
+
+        // (1) The auto-derived value must be OMITTED from config.toml, so nothing
+        // is pinned for the next boot to inherit.
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(
+            !serialized.contains("max-hosting-storage"),
+            "the auto-derived budget must not be pinned into config.toml, got:\n{serialized}"
+        );
+
+        // (2) A config.toml WITHOUT the key rebuilds to the live-RAM default
+        // (serde `default = default_max_hosting_storage`), i.e. it re-derives
+        // rather than reverting to a stale pinned value. On a smaller box the
+        // rebuilt value would be smaller; here (same host) it equals the current
+        // derived default.
+        let rebuilt: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            rebuilt.max_hosting_storage,
+            crate::ring::default_hosting_budget_bytes(),
+            "a config.toml without the key must re-derive the budget from live RAM"
+        );
+    }
+
+    /// #4565 upgrade migration: an existing `config.toml` from a pre-A2 release
+    /// pinned the OLD flat 1 GiB default as `max-hosting-storage = 1073741824`.
+    /// `skip_serializing_if` alone only stops NEW configs from pinning, so on
+    /// upgrade that historical value must be treated as auto-derived and
+    /// re-derived from live RAM — otherwise a small box that upgraded keeps the
+    /// 1 GiB budget and stays on the #4565 OOM path.
+    ///
+    /// `default_hosting_budget_bytes()` reads the test host's real RAM, so on a
+    /// >= 8 GiB host the re-derived value coincidentally equals 1 GiB. The
+    /// control case (b) — an explicit non-legacy value must survive — is what
+    /// makes this test meaningful regardless of host RAM; on a small /
+    /// cgroup-limited host, case (a) additionally fails without the migration.
+    #[tokio::test]
+    async fn legacy_pinned_hosting_budget_re_derives_but_explicit_survives() {
+        // (a) A legacy config.toml pinning the exact 1 GiB sentinel. Generate a
+        // valid config first (the auto value is skip-serialized), then inject the
+        // historical line to mimic the pre-A2 on-disk state, then rebuild as an
+        // "upgrade boot".
+        let legacy_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(legacy_dir.path()).build().await.unwrap();
+        let cfg_path = legacy_dir.path().join("config.toml");
+        let existing = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            !existing.contains("max-hosting-storage"),
+            "fresh build must not persist the auto-derived value, got:\n{existing}"
+        );
+        // Top-level key prepended before any table header (valid TOML).
+        std::fs::write(
+            &cfg_path,
+            format!("max-hosting-storage = 1073741824\n{existing}"),
+        )
+        .unwrap();
+        let upgraded = clap_bare_args(legacy_dir.path()).build().await.unwrap();
+        assert_eq!(
+            upgraded.max_hosting_storage,
+            crate::ring::default_hosting_budget_bytes(),
+            "a legacy auto-persisted 1 GiB default must re-derive from live RAM \
+             on upgrade, not stay pinned"
+        );
+
+        // (b) Control: an explicit NON-legacy persisted value (2 GiB, above the
+        // auto ceiling) is a real operator choice and MUST survive the upgrade.
+        // This proves the migration is value-specific (targets only the old
+        // default sentinel), not a blanket re-derivation — meaningful on any RAM.
+        let explicit_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(explicit_dir.path()).build().await.unwrap();
+        let cfg_path = explicit_dir.path().join("config.toml");
+        let existing = std::fs::read_to_string(&cfg_path).unwrap();
+        std::fs::write(
+            &cfg_path,
+            format!("max-hosting-storage = 2147483648\n{existing}"),
+        )
+        .unwrap();
+        let upgraded = clap_bare_args(explicit_dir.path()).build().await.unwrap();
+        assert_eq!(
+            upgraded.max_hosting_storage,
+            2 * 1024 * 1024 * 1024_u64,
+            "an explicit non-legacy persisted value must survive upgrade"
+        );
     }
 
     #[tokio::test]

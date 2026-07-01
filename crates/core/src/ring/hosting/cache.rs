@@ -36,6 +36,19 @@ pub const MIN_DEFAULT_HOSTING_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 /// small boxes) rather than a budget increase for anyone.
 pub const MAX_DEFAULT_HOSTING_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// The pre-A2 flat hosting budget (1 GiB) that older releases auto-persisted
+/// into `config.toml` as `max-hosting-storage = 1073741824`.
+///
+/// Used ONLY as the one-time upgrade-migration sentinel in
+/// `config::ConfigArgs::build`: a persisted value exactly equal to this is
+/// treated as the old auto-derived default (NOT an explicit operator choice) and
+/// re-derived from live RAM, so a small box that upgrades from a pre-A2 release
+/// stops carrying the pinned 1 GiB (#4565). Deliberately a SEPARATE constant
+/// from [`MAX_DEFAULT_HOSTING_BUDGET_BYTES`] even though they share a value
+/// today: the migration sentinel must stay 1 GiB even if the clamp ceiling
+/// later changes.
+pub const LEGACY_FLAT_HOSTING_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Fraction of total system RAM used to size the default hosting budget: 1/8.
 ///
 /// Mirrors the module cache's `DEFAULT_MODULE_CACHE_RAM_DIVISOR`. The divisor —
@@ -99,8 +112,9 @@ fn budget_for_ram(total_ram: u64) -> u64 {
 pub(crate) struct HostingCacheStats {
     /// Configured byte budget (the RAM-scaled default, or the operator override).
     pub budget_bytes: u64,
-    /// Current tracked contract-state bytes. Headroom ratio is
-    /// `current_bytes / budget_bytes`, derived by the collector.
+    /// Current tracked contract-state bytes. The occupancy (utilization) ratio
+    /// is `current_bytes / budget_bytes`; headroom is `1 - that`. The collector
+    /// derives whichever it wants from these two raw scalars.
     pub current_bytes: u64,
     /// Number of contracts currently in the hosting cache.
     pub contract_count: u64,

@@ -196,10 +196,11 @@ pub(crate) struct RouterSnapshotInfo {
     /// Capability-relative hosting-budget gauges (#4642 A2), populated by `Ring`
     /// from the `HostingManager` on the snapshot cadence. `hosting_budget_bytes`
     /// is the RAM-scaled default (or operator override); `hosting_current_bytes`
-    /// is the tracked contract-state occupancy (headroom ratio =
-    /// current / budget, derived by the collector); `hosting_budget_evictions_total`
-    /// is a monotonic counter the collector differences to get a budget-triggered
-    /// eviction rate. `None` until the ring is built. Per-node aggregate scalars.
+    /// is the tracked contract-state occupancy (occupancy/utilization ratio =
+    /// current / budget, headroom = 1 - that; derived by the collector);
+    /// `hosting_budget_evictions_total` is a monotonic counter the collector
+    /// differences to get a budget-triggered eviction rate. `None` until the ring
+    /// is built. Per-node aggregate scalars.
     pub hosting_budget_bytes: Option<u64>,
     pub hosting_current_bytes: Option<u64>,
     pub hosting_contract_count: Option<u64>,

@@ -88,6 +88,10 @@ pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
 pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
+/// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
+/// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
+/// instead of keeping the historically-pinned default (#4565).
+pub(crate) use hosting::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
 /// Single source of truth for the default hosted-contract-state budget.
 /// `config::default_max_hosting_storage()` resolves to this so the
 /// operator-facing default and the in-code fallback can never drift. The
@@ -1458,11 +1462,12 @@ impl Ring {
             snapshot.delegate_module_cache_evictions_total = Some(mc.delegate_evictions_total);
 
             // Capability-relative hosting-budget gauges (#4642 A2): the
-            // RAM-scaled budget, its current occupancy (headroom ratio =
-            // current / budget, derived by the collector), the hosted-contract
-            // count, and the monotonic budget-triggered eviction counter. These
-            // let us observe in production whether the RAM-scaled budget keeps a
-            // small box off the #4565 OOM path. Per-node aggregate scalars only.
+            // RAM-scaled budget, its current occupancy (occupancy/utilization
+            // ratio = current / budget, headroom = 1 - that; derived by the
+            // collector), the hosted-contract count, and the monotonic
+            // budget-triggered eviction counter. These let us observe in
+            // production whether the RAM-scaled budget keeps a small box off the
+            // #4565 OOM path. Per-node aggregate scalars only.
             let hosting = ring.hosting_manager.hosting_cache_stats();
             snapshot.hosting_budget_bytes = Some(hosting.budget_bytes);
             snapshot.hosting_current_bytes = Some(hosting.current_bytes);

@@ -33,6 +33,9 @@ mod cache;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
+/// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
+/// `config::ConfigArgs::build` (see the constant's docs).
+pub(crate) use cache::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
 /// Re-exported as the single source of truth for the default hosting storage
 /// budget. `config::default_max_hosting_storage()` resolves to this function so
 /// the operator-facing default and the in-code fallback can never drift. The
