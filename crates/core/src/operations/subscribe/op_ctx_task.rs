@@ -1905,18 +1905,30 @@ async fn drive_relay_subscribe(
     //   (relays do NOT increment on the return path);
     // - unexpected variant: fall back to this relay's own depth
     //   (`max_htl - htl`) — we know nothing about what produced `other`.
+    // If this hop routed a SUBSCRIBE to a downstream host and got `Subscribed`
+    // back, it becomes a HOST of the contract itself. There is no "forwarder
+    // that holds no state": a peer on a live subscription chain IS a subscribed
+    // host, kept fresh in the update mesh and findable by GETs that route to it.
+    // We register the downstream subscriber now, and AFTER bubbling the reply
+    // upstream we run `finalize_host_subscribe` (fetch state, subscribe,
+    // announce). Sequencing the host work after the upstream forward honours the
+    // forward-before-contract-handling invariant (operations.md): the body fetch
+    // is a sub-op GET on the serial contract-handling loop and must not sit on
+    // the upstream critical path. Renewal of the lease it installs is
+    // interest-gated (`HostingManager::contracts_needing_renewal`), so this
+    // cannot re-create the #3763 storm — the host is renewed only while it has a
+    // downstream subscriber, and the chain collapses when that demand fades.
+    let mut become_host: Option<(
+        freenet_stdlib::prelude::ContractKey,
+        std::net::SocketAddr,
+        PeerKeyLocation,
+    )> = None;
     let (result, bubble_hop_count) = match reply {
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
             result: SubscribeMsgResult::Subscribed { key },
             hop_count: downstream_hop_count,
             ..
         })) => {
-            // Relay-side Subscribed registration — mirror legacy
-            // subscribe.rs:1690 arm. DO NOT call ring.subscribe /
-            // announce_contract_hosted here; a relay is not itself a
-            // subscriber. See subscribe.rs:1655–1688 for the full
-            // reasoning (prevents the #3763 subscription storm feedback
-            // loop).
             register_downstream_subscriber(
                 op_manager,
                 &key,
@@ -1924,15 +1936,20 @@ async fn drive_relay_subscribe(
                 None,
                 Some(upstream_addr),
                 &incoming_tx,
-                " (driver relay registration on Response)",
+                " (driver host registration on Response)",
             )
             .await;
+
+            // The keyward responder (`next_addr`, resolved via `next_hop`) is
+            // our update source and the target for the body fetch — it just
+            // proved it holds the contract by answering `Subscribed`.
+            become_host = Some((key, next_addr, next_hop.clone()));
 
             tracing::info!(
                 tx = %incoming_tx,
                 contract = %key,
-                phase = "relay_subscribe_bubble",
-                "SUBSCRIBE relay: downstream Subscribed; bubbling upstream"
+                phase = "host_subscribe_bubble",
+                "SUBSCRIBE: downstream Subscribed; bubbling upstream, then hosting"
             );
             crate::operations::record_relay_route_event(
                 op_manager,
@@ -1982,7 +1999,8 @@ async fn drive_relay_subscribe(
         }
     };
 
-    relay_subscribe_send_response(
+    // Bubble the reply upstream FIRST (forward-before-contract-handling).
+    let send_result = relay_subscribe_send_response(
         op_manager,
         incoming_tx,
         instance_id,
@@ -1990,7 +2008,31 @@ async fn drive_relay_subscribe(
         upstream_addr,
         bubble_hop_count,
     )
-    .await
+    .await;
+
+    // Now that the reply is on its way upstream, become a real host for the
+    // contract when the reply was `Subscribed`: register the update source,
+    // install the interest-gated subscription lease, fetch fresh state, and
+    // announce hosting ONLY once the body is present (never advertise a copy we
+    // cannot serve fresh — hosting invariant 1). This runs inline in this
+    // per-transaction driver task, mirroring the originator's inline
+    // `finalize_originator_subscribe`; it never touches the node event loop, so
+    // only this task waits on the ~2 s body fetch. It is NOT a fire-and-forget
+    // spawn: keeping it in the already-tracked driver task avoids an unmonitored
+    // background task, and the driver's `RelaySubscribeInflightGuard` covers
+    // cleanup.
+    if let Some((key, responder_addr, responder)) = become_host {
+        super::finalize_host_subscribe(op_manager, key, responder_addr, Some(responder)).await;
+        // Simulation-test observability (no-op in production — see
+        // `topology_registry::record_chain_host_formed`): count chain hosts
+        // formed so the no-storm sim can show hosts ARE created while renewal
+        // stays bounded by active interest.
+        if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
+            crate::ring::topology_registry::record_chain_host_formed(addr);
+        }
+    }
+
+    send_result
 }
 
 /// Send `SubscribeMsg::Response` upstream (fire-and-forget: upstream
@@ -2756,13 +2798,21 @@ mod tests {
         );
     }
 
-    /// Pin: relay driver MUST NOT call `ring.subscribe` or
-    /// `announce_contract_hosted` on behalf of the relayed Subscribed
-    /// response. A relay is not itself a subscriber; doing so would
-    /// install a lease and trigger #3763 subscription-storm feedback
-    /// loops via the renewal cycle.
+    /// Pin: on a `Subscribed` reply the subscribe driver becomes a real HOST of
+    /// the contract — it captures the host intent (`become_host`) and runs the
+    /// shared host-formation sequence (`finalize_host_subscribe`, which installs
+    /// the interest-gated lease, fetches fresh state, and announces hosting).
+    ///
+    /// This is the piece-D model: a peer on a live subscription chain IS a
+    /// subscribed host, not a stateless forwarder. It REPLACES the old
+    /// "driver must NOT install a lease" pin, which encoded the hollow-chain
+    /// rule the redesign removed. The #3763 storm is now prevented precisely by
+    /// interest-gated renewal (`contracts_needing_renewal` section 1), not by
+    /// forbidding hosting — see `test_contracts_needing_renewal_bounded_by_active_interest`
+    /// and `test_subscription_lease_not_renewed_without_active_interest` in
+    /// `ring/hosting.rs`.
     #[test]
-    fn relay_subscribe_does_not_install_lease_on_relayed_response() {
+    fn subscribe_driver_becomes_host_on_subscribed_reply() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
             .find("async fn drive_relay_subscribe(")
@@ -2772,27 +2822,45 @@ mod tests {
             .expect("driver body end not found")
             + driver_start;
         let driver_src = &src[driver_start..driver_end];
-        // Strip line comments so doc strings that mention these call-sites
-        // as negative constraints do not trip the substring scan.
-        let stripped: String = driver_src
-            .lines()
-            .map(|line| match line.find("//") {
-                Some(idx) => &line[..idx],
-                None => line,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
         assert!(
-            !stripped.contains("ring.subscribe("),
-            "relay driver must NOT call ring.subscribe on relayed response"
+            driver_src.contains("become_host = Some("),
+            "driver must capture host intent on the Subscribed reply arm"
         );
         assert!(
-            !stripped.contains("complete_subscription_request"),
-            "relay driver must NOT call complete_subscription_request on relayed response"
+            driver_src.contains("finalize_host_subscribe("),
+            "driver must run the host-formation sequence (finalize_host_subscribe) \
+             so a chain peer becomes a subscribed host on a Subscribed reply"
         );
+    }
+
+    /// Pin (operations.md forward-before-contract-handling): the host-formation
+    /// work (`finalize_host_subscribe`, which enqueues a sub-op GET on the
+    /// serial contract-handling loop) MUST be sequenced AFTER the upstream
+    /// bubble (`relay_subscribe_send_response`). Reversing it would put the body
+    /// fetch on the upstream critical path across every chain hop (#4155).
+    #[test]
+    fn subscribe_driver_forwards_upstream_before_hosting() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let driver_end = src[driver_start..]
+            .find("\nasync fn relay_subscribe_send_response(")
+            .expect("driver body end not found")
+            + driver_start;
+        let driver_src = &src[driver_start..driver_end];
+        // The tail `relay_subscribe_send_response` (the bubble) is the LAST such
+        // call in the driver; the host formation must come after it.
+        let bubble_pos = driver_src
+            .rfind("relay_subscribe_send_response(")
+            .expect("driver must bubble via relay_subscribe_send_response");
+        let host_pos = driver_src
+            .find("finalize_host_subscribe(")
+            .expect("driver must call finalize_host_subscribe");
         assert!(
-            !stripped.contains("announce_contract_hosted"),
-            "relay driver must NOT call announce_contract_hosted on relayed response"
+            bubble_pos < host_pos,
+            "host formation (finalize_host_subscribe) must run AFTER the upstream \
+             bubble (relay_subscribe_send_response) — forward-before-contract-handling"
         );
     }
 

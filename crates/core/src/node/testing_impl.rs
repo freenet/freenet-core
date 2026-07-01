@@ -417,6 +417,7 @@ impl ControlledSimulationResult {
             |mut acc, m| {
                 acc.wire_attempts += m.wire_attempts;
                 acc.terminus_satisfied += m.terminus_satisfied;
+                acc.chain_hosts_formed += m.chain_hosts_formed;
                 // Per-node peak → aggregate as the max across peers.
                 acc.max_cycle_batch = acc.max_cycle_batch.max(m.max_cycle_batch);
                 acc
