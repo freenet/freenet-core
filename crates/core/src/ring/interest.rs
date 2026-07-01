@@ -2278,6 +2278,66 @@ mod tests {
         );
     }
 
+    /// `active_demand_count()` counts only contracts backed by REAL demand — a
+    /// local client subscription or a downstream subscriber — and EXCLUDES
+    /// cache-only `hosting` interest. This is the denominator for the #3763
+    /// no-storm invariant, so the exclusion of hosting-only contracts is the
+    /// load-bearing behavior and is asserted directly here (not just logged in
+    /// the sim harness).
+    #[test]
+    fn test_active_demand_count_excludes_cache_only_hosting() {
+        let (manager, _time) = make_manager();
+
+        assert_eq!(manager.active_demand_count(), 0, "empty manager → 0 demand");
+
+        // Cache-only hosting (no client, no downstream) is interest but NOT demand.
+        let hosting_only = make_contract_key(1);
+        manager.register_local_hosting(&hosting_only);
+        assert!(
+            manager.has_local_interest(&hosting_only),
+            "register_local_hosting creates local interest"
+        );
+        assert_eq!(
+            manager.active_demand_count(),
+            0,
+            "a hosting-only contract is interest but must NOT count as active demand"
+        );
+
+        // A local client subscription IS demand.
+        let client = make_contract_key(2);
+        manager.add_local_client(&client);
+        assert_eq!(
+            manager.active_demand_count(),
+            1,
+            "a local client subscription is active demand"
+        );
+
+        // A downstream subscriber IS demand.
+        let downstream = make_contract_key(3);
+        manager.add_downstream_subscriber(&downstream);
+        assert_eq!(
+            manager.active_demand_count(),
+            2,
+            "a downstream subscriber is active demand"
+        );
+
+        // Adding cache-only hosting on top of the client-demand contract must
+        // neither double-count it nor change the total.
+        manager.register_local_hosting(&client);
+        assert_eq!(
+            manager.active_demand_count(),
+            2,
+            "hosting layered on top of an already-demanded contract does not change the count"
+        );
+
+        // The hosting-only contract is still excluded alongside the demanded ones.
+        assert_eq!(
+            manager.active_demand_count(),
+            2,
+            "the hosting-only contract remains excluded"
+        );
+    }
+
     #[test]
     fn test_deferred_removal_executes_after_grace_period() {
         let (manager, time) = make_manager();
