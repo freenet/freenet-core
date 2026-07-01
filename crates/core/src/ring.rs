@@ -1837,7 +1837,10 @@ impl Ring {
     /// subscriptions before renewals can't keep up. The mid-cycle channel
     /// capacity check (RENEWAL_STOP_CAPACITY_FRACTION) provides backpressure
     /// if the network can't absorb this many.
-    const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 10;
+    // pub(crate) so the event-driven re-subscribe path
+    // (`OpManager::on_ring_connection_lost`, #4642 piece F) can apply the SAME
+    // per-burst cap the periodic renewal loop uses.
+    pub(crate) const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 10;
 
     /// Skip renewal cycle when channel remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 50% full).
@@ -1845,7 +1848,9 @@ impl Ring {
 
     /// Stop spawning mid-cycle when remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 75% full).
-    const RENEWAL_STOP_CAPACITY_FRACTION: usize = 4; // channel_max / 4
+    // pub(crate) so the event-driven re-subscribe path can apply the same
+    // channel-backpressure short-circuit (#4642 piece F).
+    pub(crate) const RENEWAL_STOP_CAPACITY_FRACTION: usize = 4; // channel_max / 4
 
     /// Interval for periodic subscription state telemetry snapshots.
     pub(crate) const SUBSCRIPTION_STATE_INTERVAL: Duration = Duration::from_secs(60);
