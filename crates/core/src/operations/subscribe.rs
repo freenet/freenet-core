@@ -435,39 +435,10 @@ pub(super) async fn fetch_contract_if_missing(
 ///
 /// Called from the task-per-tx SUBSCRIBE driver
 /// (`op_ctx_task::drive_client_subscribe_inner`) after a `Subscribed`
-/// reply arrives. Performs every side-effect the originator needs so the
-/// subscription is fully usable end-to-end:
-///
-/// 1. Register the responding peer as our upstream interest (so
-///    `send_unsubscribe_upstream` can find it on client disconnect — #3874).
-/// 2. Install the lease in `active_subscriptions`
-///    (`op_manager.ring.subscribe`).
-/// 3. Clear pending backoff state for this contract
-///    (`op_manager.ring.complete_subscription_request(..., true)`).
-/// 4. **Fetch the contract body locally if missing** (#4223). Without
-///    this, the peer registers as a subscriber but answers `NotFound`
-///    on GETs that route through it because the contract body never
-///    arrived.
-/// 5. **Announce that we host this contract to neighbors**, *only when
-///    the body is locally present after step 4*. Announcing without a
-///    body would tell neighbors to forward UPDATEs to a peer that
-///    cannot validate or store them. If the body lands later via the
-///    sub-op GET's own cache path, `get/op_ctx_task.rs` calls
-///    `announce_contract_hosted` there *on first-time cache* (gated
-///    on `is_new && put_persisted`). A niche case where the contract
-///    was previously hosted then evicted, the lease expires, and the
-///    re-subscribe fetch then times out, would not re-trigger the
-///    announce via that fallback — neighbors learn we host the
-///    contract again either through the next renewal cycle's
-///    finalization (if the body has arrived by then) or via UPDATE
-///    delivery + auto-fetch.
-/// 6. Register the contract in our local interest manager (so inbound
-///    `ChangeInterests` for this contract get processed) and broadcast
-///    a `ChangeInterests` so connected peers learn we became interested.
-///    Gated on `!is_renewal` — `add_local_client` is NOT idempotent
-///    (`ring::interest::Contract::add_client` increments
-///    `local_client_count` on every call); calling it on every renewal
-///    cycle (~2 minutes) would leak the gauge unboundedly.
+/// reply arrives. Runs the shared host-formation sequence
+/// (`finalize_host_subscribe`: register update source, install lease, clear
+/// backoff, fetch body, announce-if-present) and then the originator-only
+/// step 6: register local client interest and broadcast `ChangeInterests`.
 ///
 /// Latency note: because this function is awaited before the driver
 /// publishes `SubscribeResponse` to the client, a first-time subscribe
@@ -477,37 +448,91 @@ pub(super) async fn fetch_contract_if_missing(
 /// subscribe_success to the client until fetch_contract_if_missing
 /// completes"); the latency is the cost of the client knowing the
 /// subscriber can actually serve a follow-up GET.
-///
-/// See also: `crate::operations::complete_piggyback_subscription` —
-/// the GET-piggyback originator finalization path, which performs the
-/// same conceptual steps in a different order (it does NOT need the
-/// fetch step because the contract just arrived inside the GET
-/// response that carried the piggyback). Keep the two helpers in sync
-/// when adding new originator-side side effects.
 pub(super) async fn finalize_originator_subscribe(
     op_manager: &OpManager,
     key: ContractKey,
     upstream_addr: std::net::SocketAddr,
     is_renewal: bool,
-    // `Some(_)` marks a directed placement nudge (`SubscribeHint`) subscribe;
-    // `None` marks an ordinary subscribe. When `Some`, the body fetch is routed
-    // through the peer that accepted the subscription (`upstream_addr`) so it
-    // cannot dead-end the way a greedy GET would; when `None` the fetch is
-    // greedy. (The value is only used as the directed/ordinary marker — the
-    // actual fetch target is the responder, resolved below.)
+    directed_holder: Option<PeerKeyLocation>,
+) {
+    // Steps 1-5 (register the responder as our update source, install the
+    // lease, clear backoff, fetch the body, announce-if-present) are the
+    // host-formation sequence shared with the chain-host path; they live in
+    // `finalize_host_subscribe`. For the originator, the peer we subscribed to
+    // IS `upstream_addr`, so it is the responder.
+    finalize_host_subscribe(op_manager, key, upstream_addr, directed_holder).await;
+
+    // 6. Register local client interest (originator-only). Gated on
+    //    `!is_renewal` — `add_local_client` is NOT idempotent
+    //    (`ring::interest::Contract::add_client` increments `local_client_count`
+    //    on every call), so calling it on every ~2-minute renewal cycle would
+    //    leak the gauge unboundedly.
+    if !is_renewal {
+        let became_interested = op_manager.interest_manager.add_local_client(&key);
+        if became_interested {
+            super::broadcast_change_interests(op_manager, vec![key], vec![]).await;
+        }
+    }
+}
+
+/// Host-formation side-effect sequence shared by the originator and the
+/// chain-host subscribe paths, run after a `Subscribed` reply.
+///
+/// There is no "forwarder that holds no state": a peer on a live subscription
+/// chain IS a subscribed host — kept fresh in the contract's update mesh and
+/// findable by GETs that route to it. This helper is that host-formation
+/// sequence. The chain of hosts collapses inward once demand fades, because
+/// the lease installed in step 2 is renewed only while the contract is
+/// `contract_in_use` (see `HostingManager::contracts_needing_renewal` section
+/// 1); a host with no downstream interest stops being renewed and drops out of
+/// the mesh, which unwinds its upstream in turn.
+///
+/// Steps, in order:
+///
+/// 1. Register the RESPONDER (`responder_addr` — the peer that answered
+///    `Subscribed`; for a chain host this is the next hop toward the key) as
+///    our upstream interest, so UPDATEs propagate back to us and #3874
+///    unsubscribe-on-disconnect can find it.
+/// 2. Install/refresh the local subscription lease (`ring.subscribe`).
+/// 3. Clear pending subscribe backoff (`complete_subscription_request`).
+/// 4. **Fetch the contract body locally if missing** (#4223). Without this the
+///    peer registers as a subscriber but answers `NotFound` on GETs that route
+///    through it because the body never arrived.
+/// 5. **Announce hosting to neighbors, only when the body is present after step
+///    4.** Announcing without a body would advertise a copy we cannot serve or
+///    keep fresh (hosting invariant 1) and would tell neighbors to forward
+///    UPDATEs to a peer that cannot validate or store them. If the body lands
+///    later via the sub-op GET's own cache path, `get/op_ctx_task.rs` announces
+///    there on first-time cache.
+///
+/// See also `crate::operations::complete_piggyback_subscription` — the
+/// GET-piggyback finalization path, which performs the same conceptual steps in
+/// a different order (no fetch step: the body arrived inside the GET response).
+/// Keep the two in sync when adding host side effects.
+pub(super) async fn finalize_host_subscribe(
+    op_manager: &OpManager,
+    key: ContractKey,
+    responder_addr: std::net::SocketAddr,
+    // `Some(_)` routes the body fetch THROUGH the responder rather than greedily
+    // toward the key. The chain-host path always passes the responder here (it
+    // just answered `Subscribed`, so it holds the body and will not dead-end the
+    // fetch); the originator passes `Some` for a directed placement nudge and
+    // `None` for an ordinary greedy subscribe. The value is only a
+    // directed/ordinary marker — the actual fetch target is the responder,
+    // resolved below.
     directed_holder: Option<PeerKeyLocation>,
 ) {
     if let Some(pkl) = op_manager
         .ring
         .connection_manager
-        .get_peer_by_addr(upstream_addr)
+        .get_peer_by_addr(responder_addr)
     {
         let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
         let is_new = op_manager
             .interest_manager
             .register_peer_interest(&key, peer_key, None, true);
         if is_new {
-            // #4359 (MUST-FIX 1): this upstream peer is now a viable broadcast
+            // #4359 (MUST-FIX 1): this responder peer is now a viable broadcast
             // target. If a fresh-contract PUT gave up with no targets and is
             // stashed, flush it so the deferred state reaches the network.
             op_manager.flush_pending_broadcast_on_interest(&key).await;
@@ -517,30 +542,24 @@ pub(super) async fn finalize_originator_subscribe(
     op_manager.ring.subscribe(key);
     op_manager.ring.complete_subscription_request(&key, true);
 
-    // Fetch the contract body if we don't have it locally. The result
-    // gates the announce step: we only advertise hosting to neighbors
-    // when the body actually lands. On timeout (Ok(None)) or
-    // infrastructure failure (Err), the subscription is still finalized
-    // (lease installed, peer registered) — the contract may arrive
-    // later via UPDATE propagation or the sub-op GET completing past
-    // the 2 s wait window, at which point the GET driver's own
+    // Fetch the contract body if we don't have it locally. The result gates the
+    // announce step: we only advertise hosting to neighbors when the body
+    // actually lands. On timeout (Ok(None)) or infrastructure failure (Err), the
+    // subscription is still finalized (lease installed, responder registered) —
+    // the contract may arrive later via UPDATE propagation or the sub-op GET
+    // completing past the 2 s wait window, at which point the GET driver's own
     // `announce_contract_hosted` call fires.
     //
-    // For a directed (migration) subscribe, route the body fetch through the
-    // peer that ACTUALLY accepted the subscription (`upstream_addr`) — which
-    // holds the contract — rather than the original hint holder. In the common
-    // case the responder IS the hint holder; but if the hinted holder went away
-    // and the subscribe fell back to a greedy peer, the responder is that peer,
-    // so the targeted fetch still goes to a peer that has the body instead of
-    // the stale holder (which would dead-end the fetch). A greedy GET toward the
-    // key could dead-end at the same close non-hosting cluster the migration is
-    // resolving, hence the targeted fetch. `None` (ordinary subscribe) keeps the
-    // greedy fetch.
+    // The targeted fetch (when `directed_holder` is set) routes the body GET
+    // THROUGH the responder — which just proved it holds the contract by
+    // answering `Subscribed` — rather than greedily toward the key. A greedy GET
+    // could dead-end at a close non-hosting cluster, leaving this peer
+    // subscribed-but-bodyless. `None` keeps the greedy fetch.
     let directed_fetch_target = directed_holder.as_ref().and_then(|_| {
         op_manager
             .ring
             .connection_manager
-            .get_peer_by_addr(upstream_addr)
+            .get_peer_by_addr(responder_addr)
     });
     let have_body =
         match fetch_contract_if_missing(op_manager, *key.id(), directed_fetch_target).await {
@@ -573,13 +592,6 @@ pub(super) async fn finalize_originator_subscribe(
 
     if have_body {
         super::announce_contract_hosted(op_manager, &key).await;
-    }
-
-    if !is_renewal {
-        let became_interested = op_manager.interest_manager.add_local_client(&key);
-        if became_interested {
-            super::broadcast_change_interests(op_manager, vec![key], vec![]).await;
-        }
     }
 }
 
