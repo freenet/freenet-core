@@ -160,6 +160,14 @@ pub mod dev_tool {
         SecretStoreError, SecretsStore, StateStore, UserSecretContext,
     };
 
+    /// Maximum size (in bytes) of a single contract-state blob a node will
+    /// accept, re-exported for client-side pre-flight checks. This is the
+    /// binding publish limit; see
+    /// `wasm_runtime::state_store::MAX_STATE_SIZE` for the full limit
+    /// hierarchy. `fdev website publish` uses this to reject oversized sites
+    /// before sending a PUT (#4653).
+    pub use wasm_runtime::MAX_STATE_SIZE as MAX_CONTRACT_STATE_SIZE;
+
     // Re-export simulation types for test infrastructure
     pub use crate::simulation::{
         FaultConfig, FaultConfigBuilder, Partition, SimulationRng, TimeSource, VirtualTime,

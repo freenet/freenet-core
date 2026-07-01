@@ -15,7 +15,29 @@ use moka::sync::Cache as MokaCache;
 /// 50 MiB is conservative enough to prevent disk exhaustion by malicious contracts while
 /// remaining large enough for legitimate use cases (web apps, documents, datasets). A contract
 /// whose `validate_state` returns `Valid` for arbitrarily large state cannot bypass this limit.
-pub(crate) const MAX_STATE_SIZE: usize = 50 * 1024 * 1024; // 50 MiB
+///
+/// # Limit hierarchy (this is the binding one)
+///
+/// This is the *effective* publishable-state ceiling: the node rejects any PUT/UPDATE whose
+/// state exceeds it (see the `store`/`update` checks below). Two related ceilings exist and must
+/// never drop below it:
+///
+/// - The stdlib WebSocket transport cap, `MAX_TOTAL_CHUNKS * CHUNK_SIZE`
+///   (256 * 256 KiB = 64 MiB, in `freenet_stdlib::client_api::streaming`), is the largest
+///   streamed API message the node will reassemble. It must stay `>=` this constant so any state
+///   the node would accept can actually be transmitted. A state between this constant and the
+///   transport cap (~50-64 MiB) still reassembles and is rejected here by the state-size check
+///   below; only a state larger than the transport cap fails earlier, during stream reassembly,
+///   with a cryptic `total_chunks N exceeds maximum 256` error (#4653).
+/// - The website contract's own `MAX_WEB_SIZE` (100 MiB, in `crates/website-contract/src/lib.rs`)
+///   is a loose sanity bound that this constant and the transport cap both bind before it is ever
+///   reached.
+///
+/// `fdev website publish` enforces this limit client-side, via the public re-export
+/// `freenet::dev_tool::MAX_CONTRACT_STATE_SIZE`, so an oversized site fails fast with an
+/// actionable error instead of the reassembly failure above. Keep that re-export in sync with
+/// this constant.
+pub const MAX_STATE_SIZE: usize = 50 * 1024 * 1024; // 50 MiB
 
 /// Maximum number of per-contract state-hash entries retained for the cheap
 /// summarize/delta change-detector (see [`StateStore::cached_state_hash`]).
