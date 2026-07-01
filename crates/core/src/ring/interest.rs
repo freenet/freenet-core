@@ -2425,11 +2425,17 @@ mod tests {
             "hosting layered on top of an already-demanded contract does not change the count"
         );
 
-        // The hosting-only contract is still excluded alongside the demanded ones.
+        // The hosting-only contract is genuinely tracked as interest — the
+        // point is that interest (which includes hosting) and demand (which
+        // does not) are distinct: it is interested but excluded from demand.
+        assert!(
+            manager.has_local_interest(&hosting_only),
+            "the hosting-only contract is still tracked as local interest"
+        );
         assert_eq!(
             manager.active_demand_count(),
             2,
-            "the hosting-only contract remains excluded"
+            "...yet it is still excluded from the active-demand count"
         );
     }
 
