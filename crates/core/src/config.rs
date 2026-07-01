@@ -3246,6 +3246,11 @@ std::thread_local! {
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_NEIGHBOR_HOSTING_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_ANTI_STARVATION_TRIGGERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // Terminal advertisement consult (hosting redesign piece C, invariant 5).
+    static GLOBAL_TERMINAL_CONSULT_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_TERMINAL_CONSULT_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_TERMINAL_CONSULT_RESOLVED_FOUND: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_TERMINAL_CONSULT_STILL_NOT_FOUND: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Global test metrics for tracking events across the simulation network.
@@ -3280,6 +3285,10 @@ impl GlobalTestMetrics {
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
         GLOBAL_ANTI_STARVATION_TRIGGERS.with(|c| c.set(0));
+        GLOBAL_TERMINAL_CONSULT_ATTEMPTS.with(|c| c.set(0));
+        GLOBAL_TERMINAL_CONSULT_HITS.with(|c| c.set(0));
+        GLOBAL_TERMINAL_CONSULT_RESOLVED_FOUND.with(|c| c.set(0));
+        GLOBAL_TERMINAL_CONSULT_STILL_NOT_FOUND.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
@@ -3354,6 +3363,55 @@ impl GlobalTestMetrics {
 
     pub fn anti_starvation_triggers() -> u64 {
         GLOBAL_ANTI_STARVATION_TRIGGERS.with(|c| c.get())
+    }
+
+    // --- Terminal advertisement consult (hosting redesign piece C) ---
+    //
+    // Aggregate scalars measuring whether the terminal consult actually
+    // closes findability dead-ends (invariant 5). Thread-local, so under
+    // the single-threaded simulation runner they aggregate across all sim
+    // nodes and a test can assert the consult path fired. Production
+    // per-node scalars live in `node::network_status` (RwLock global).
+
+    /// A routing terminus consulted its neighbor host-advertisements for
+    /// the target key before giving up (one increment per terminus, not
+    /// per advertised host tried).
+    pub fn record_terminal_consult_attempt() {
+        GLOBAL_TERMINAL_CONSULT_ATTEMPTS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn terminal_consult_attempts() -> u64 {
+        GLOBAL_TERMINAL_CONSULT_ATTEMPTS.with(|c| c.get())
+    }
+
+    /// The consult found at least one advertised host to forward to
+    /// (a candidate off the direct routing path).
+    pub fn record_terminal_consult_hit() {
+        GLOBAL_TERMINAL_CONSULT_HITS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn terminal_consult_hits() -> u64 {
+        GLOBAL_TERMINAL_CONSULT_HITS.with(|c| c.get())
+    }
+
+    /// A consult forward resolved the request to Found/Subscribed —
+    /// a dead-end that the consult actually closed.
+    pub fn record_terminal_consult_resolved_found() {
+        GLOBAL_TERMINAL_CONSULT_RESOLVED_FOUND.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn terminal_consult_resolved_found() -> u64 {
+        GLOBAL_TERMINAL_CONSULT_RESOLVED_FOUND.with(|c| c.get())
+    }
+
+    /// A consult ran but the request still ended NotFound (no advertised
+    /// host, or every advertised host also failed).
+    pub fn record_terminal_consult_still_not_found() {
+        GLOBAL_TERMINAL_CONSULT_STILL_NOT_FOUND.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn terminal_consult_still_not_found() -> u64 {
+        GLOBAL_TERMINAL_CONSULT_STILL_NOT_FOUND.with(|c| c.get())
     }
 }
 

@@ -1451,6 +1451,13 @@ async fn lookup_stored_key(
 /// touch unrelated code paths.
 const MAX_RETRIES: usize = 3;
 
+/// Maximum advertised hosts a routing terminus forwards to before giving up
+/// (hosting redesign piece C, invariant 5). Bounded small so the terminal
+/// consult adds at most a couple of extra forwards at a leaf of routing —
+/// see the consult site in `drive_relay_get_inner` for why this does not
+/// re-introduce the per-hop fan-out amplification.
+const MAX_TERMINAL_CONSULT_HOSTS: usize = 2;
+
 /// Pure selection core for the bootstrap gateway fallback (#4361).
 ///
 /// Returns the first configured gateway that is not this node and not
@@ -2787,6 +2794,18 @@ where
 
     let mut retries: usize = 0;
 
+    // Terminal advertisement consult (hosting redesign piece C, invariant 5).
+    // Lazily built the first time location routing is exhausted; each entry
+    // is an advertised host to forward to (off the direct routing path).
+    let mut local_fallback = local_fallback;
+    let mut consult_targets: Option<std::vec::IntoIter<(PeerKeyLocation, SocketAddr)>> = None;
+    // True while the current attempt targets a consulted advertised host (so
+    // its Found reply is attributed to the consult telemetry, not routing).
+    // Assigned by every non-returning arm of the peer-selection match below.
+    let mut consult_active: bool;
+    // Guards against recording more than one terminal consult outcome.
+    let mut consult_resolved_recorded = false;
+
     loop {
         // Pick next downstream peer.
         let (peer, peer_addr) = match relay_advance_to_next_peer(
@@ -2796,10 +2815,15 @@ where
             &mut retries,
             &new_visited,
         ) {
-            Some(p) => p,
+            Some(p) => {
+                consult_active = false;
+                p
+            }
             None => {
-                // Exhausted: serve local fallback if available, else NotFound.
-                if let Some((key, state, contract)) = local_fallback {
+                // Location routing exhausted → this relay is a terminus for
+                // the key. Prefer any (stale) local fallback we already hold —
+                // existing behavior, not a dead-end.
+                if let Some((key, state, contract)) = local_fallback.take() {
                     tracing::info!(
                         tx = %incoming_tx,
                         %instance_id,
@@ -2829,7 +2853,52 @@ where
                     .await;
                     cache_contract_locally(op_manager, key, state, contract, false).await;
                     send_result?;
+                    return Ok(());
+                }
+
+                // No local copy and nothing closer to route to: before
+                // declaring a findability dead-end, consult the host
+                // advertisements our neighbors broadcast for this key
+                // (invariant 5). `consult_advertised_hosts` returns ONLY peers
+                // that already advertised hosting — nothing is pushed or
+                // cached, so this is not the speculative-pre-replication
+                // anti-pattern. Each candidate is marked tried + visited so
+                // the existing dedup prevents loops, and the forward below
+                // carries HTL-1. A terminus has zero closer peers, so these
+                // <=MAX_TERMINAL_CONSULT_HOSTS extra forwards do not compound
+                // across hops (unlike the removed per-hop retry fan-out that
+                // caused the 3^HTL amplification).
+                let targets = consult_targets.get_or_insert_with(|| {
+                    let tried_snapshot = tried.clone();
+                    let visited_snapshot = new_visited.clone();
+                    crate::operations::consult_advertised_hosts(
+                        op_manager,
+                        &instance_id,
+                        MAX_TERMINAL_CONSULT_HOSTS,
+                        move |addr| {
+                            tried_snapshot.contains(&addr)
+                                || visited_snapshot.probably_visited(addr)
+                        },
+                    )
+                    .into_iter()
+                });
+                if let Some((consult_peer, consult_addr)) = targets.next() {
+                    tried.push(consult_addr);
+                    new_visited.mark_visited(consult_addr);
+                    consult_active = true;
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        %instance_id,
+                        target = %consult_addr,
+                        "GET relay: terminus consulting advertised host off routing path"
+                    );
+                    (consult_peer, consult_addr)
                 } else {
+                    // Dead-end confirmed: no usable advertised host (or every
+                    // advertised host was already tried / also failed).
+                    if !consult_resolved_recorded {
+                        crate::operations::record_terminal_consult_outcome(false);
+                    }
                     tracing::warn!(
                         tx = %incoming_tx,
                         %instance_id,
@@ -2860,8 +2929,8 @@ where
                         hop_count,
                     )
                     .await;
+                    return Ok(());
                 }
-                return Ok(());
             }
         };
 
@@ -3014,7 +3083,23 @@ where
         };
 
         // Classify the reply.
-        match classify(reply) {
+        let attempt_outcome = classify(reply);
+        // Terminal-consult telemetry: attribute a Found reply from a
+        // consulted advertised host as a closed dead-end. Guarded so a rare
+        // stream-claim failure on a consult candidate (which retries the next
+        // candidate) can't double-count. NotFound/Retry falls through and the
+        // exhaustion arm records the still-not-found outcome.
+        if consult_active
+            && !consult_resolved_recorded
+            && matches!(
+                attempt_outcome,
+                AttemptOutcome::Terminal(Terminal::InlineFound { .. } | Terminal::Streaming { .. })
+            )
+        {
+            crate::operations::record_terminal_consult_outcome(true);
+            consult_resolved_recorded = true;
+        }
+        match attempt_outcome {
             AttemptOutcome::Terminal(Terminal::InlineFound {
                 key,
                 state,
@@ -4642,6 +4727,41 @@ mod tests {
         );
     }
 
+    /// Piece C (invariant 5): the relay terminus must consult neighbor host
+    /// advertisements BEFORE declaring a NotFound dead-end. The consult call
+    /// must appear before `relay_send_not_found` in source order so the
+    /// advertised-host forward is attempted first.
+    #[test]
+    fn relay_terminus_consults_advertised_hosts_before_not_found() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        let consult_pos = body.find("consult_advertised_hosts").expect(
+            "drive_relay_get_inner must consult advertised hosts at the routing \
+             terminus (hosting redesign piece C, invariant 5)",
+        );
+        // Anchor on the exhaustion dead-end marker (unique to the consult's
+        // else branch); the driver has an earlier HTL-exhaustion NotFound, so
+        // a bare `relay_send_not_found` anchor would match the wrong site.
+        let deadend_pos = body
+            .find("Dead-end confirmed")
+            .expect("consult exhaustion branch must confirm the dead-end before NotFound");
+        assert!(
+            consult_pos < deadend_pos,
+            "the terminal advertisement consult must run BEFORE the NotFound \
+             send so an off-path advertised host gets a chance to answer"
+        );
+        assert!(
+            body.contains("relay_send_not_found"),
+            "drive_relay_get_inner must still send NotFound on a true dead-end"
+        );
+        // The consult outcome must be recorded so the telemetry measures
+        // whether the consult closes dead-ends.
+        assert!(
+            body.contains("record_terminal_consult_outcome"),
+            "drive_relay_get_inner must record the terminal consult outcome"
+        );
+    }
+
     /// T6 (superseded): Originally required `relay_send_forwarding_ack`
     /// to be emitted before the downstream send. That ack collided with
     /// the upstream relay driver's capacity-1 `pending_op_results`
@@ -4847,47 +4967,36 @@ mod tests {
     fn exhaustion_branches_on_local_fallback_presence() {
         let src = production_source();
         let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
-        // The None arm of the `match relay_advance_to_next_peer(...)` is the
-        // exhaustion branch. It must contain both `local_fallback` disposition
-        // AND both Found and NotFound sends.
-        let none_arm = body
-            .find("None => {")
-            .expect("exhaustion arm (`None => {{`) must exist");
-        // Clip to the matching close; the next `Some(p) => {` arm may precede
-        // or follow, so take the whole match body from None onward up to the
-        // end of the outer function block.
-        let tail = &body[none_arm..];
-        // Bound at the `return Ok(());` that ends the exhaustion branch.
-        let clip = tail
-            .find("return Ok(());")
-            .expect("exhaustion branch must end with `return Ok(());`");
-        let arm = &tail[..clip + "return Ok(());".len()];
+        // The exhaustion (terminus) path disposes of the request in this order:
+        //   1. serve a local stale-cache fallback if present (Found, R10);
+        //   2. else consult neighbor host advertisements (piece C) and forward
+        //      to an advertised off-path host;
+        //   3. else send NotFound upstream.
+        // Assert all three dispositions exist in that source order.
         assert!(
-            arm.contains("if let Some((key, state, contract)) = local_fallback"),
+            body.contains("local_fallback.take()"),
             "Exhaustion arm must branch on `local_fallback`; otherwise the \
              stale-cache fallback semantic (R3d → R10) is lost."
         );
+        let fallback_pos = body
+            .find("serving local fallback")
+            .expect("exhaustion must serve the stale local copy when `local_fallback` is Some");
+        let consult_pos = body.find("consult_advertised_hosts").expect(
+            "exhaustion must consult advertised hosts before NotFound (piece C, invariant 5)",
+        );
+        let not_found_pos = body
+            .find("all peers exhausted — sending NotFound upstream")
+            .expect("exhaustion must send NotFound when there is no fallback or advertised host");
         assert!(
-            arm.contains("relay_send_found"),
-            "Exhaustion arm must call `relay_send_found` when `local_fallback` \
-             is Some — the stale-cache relay serves what it has after all \
-             downstream peers NotFound."
+            fallback_pos < consult_pos && consult_pos < not_found_pos,
+            "Exhaustion order must be: serve local fallback (Found) → consult \
+             advertised hosts → NotFound. Got fallback={fallback_pos}, \
+             consult={consult_pos}, not_found={not_found_pos}."
         );
         assert!(
-            arm.contains("relay_send_not_found"),
-            "Exhaustion arm must call `relay_send_not_found` when \
-             `local_fallback` is None — the non-caching relay bubbles \
-             NotFound upstream."
-        );
-        // Ordering: the `else` branch (NotFound) must follow the `if Some`
-        // branch (Found).
-        let found_pos = arm.find("relay_send_found").unwrap();
-        let not_found_pos = arm.find("relay_send_not_found").unwrap();
-        assert!(
-            found_pos < not_found_pos,
-            "Fallback-Found must precede NotFound in the exhaustion arm \
-             source order; a reversal would mean NotFound always runs first \
-             and the fallback path is dead code."
+            body.contains("relay_send_found") && body.contains("relay_send_not_found"),
+            "Exhaustion arm must be able to send both Found (fallback) and \
+             NotFound (true dead-end)."
         );
     }
 
@@ -5315,10 +5424,11 @@ mod tests {
             .find("let reply = match round_trip {")
             .expect("round_trip match must exist");
         let tail = &body[round_trip..];
-        // Clip at the end of the match (next `match classify(reply)`).
+        // Clip at the end of the match (the `classify(reply)` call that
+        // follows it — now bound to `let attempt_outcome = classify(reply);`).
         let clip = tail
-            .find("match classify(reply)")
-            .expect("classify match must follow round_trip match");
+            .find("classify(reply)")
+            .expect("classify call must follow round_trip match");
         let match_body = &tail[..clip];
         // Channel-error arm: `Ok(Err(err)) => { ... continue; }`.
         let err_arm = match_body

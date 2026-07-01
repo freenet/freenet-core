@@ -50,6 +50,11 @@ use super::{
     complete_local_subscription, prepare_initial_request, register_downstream_subscriber,
 };
 
+/// Advertised hosts a SUBSCRIBE terminus forwards to before giving up
+/// (hosting redesign piece C, invariant 5). The relay is single-shot, so
+/// the consult likewise forwards to just the closest advertised host.
+const TERMINAL_CONSULT_HOSTS: usize = 1;
+
 /// Start a client-initiated subscribe, returning as soon as the task has
 /// been spawned (mirrors legacy `subscribe_with_id` timing).
 ///
@@ -1736,40 +1741,74 @@ async fn drive_relay_subscribe(
             .ring
             .k_closest_potentially_hosting(&instance_id, &new_visited, MAX_BREADTH);
 
-    if candidates.is_empty() {
-        tracing::warn!(
-            tx = %incoming_tx,
-            contract = %instance_id,
-            phase = "relay_subscribe_not_found",
-            "SUBSCRIBE relay: no closer peers to forward"
-        );
-        // No-candidates exhaustion: this relay is reporting its own
-        // exhaustion of downstream candidates. hop_count = max_htl - htl
-        // (the forward depth of THIS relay).
-        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-        if let Some(event) = crate::tracing::NetEventLog::subscribe_not_found(
-            &incoming_tx,
-            &op_manager.ring,
-            instance_id,
-            Some(hop_count),
-        ) {
-            op_manager
-                .ring
-                .register_events(either::Either::Left(event))
-                .await;
-        }
-        return relay_subscribe_send_response(
+    // `consulted` marks that `next_hop` came from the terminal advertisement
+    // consult (invariant 5) rather than location routing, so the reply is
+    // attributed to the consult telemetry.
+    let mut consulted = false;
+    let next_hop = if !candidates.is_empty() {
+        candidates.remove(0)
+    } else {
+        // Terminus: location routing found no closer peer. Before declaring a
+        // findability dead-end, consult the host advertisements our neighbors
+        // broadcast for this key. `consult_advertised_hosts` returns ONLY a
+        // peer that already advertised hosting — nothing is pushed or cached,
+        // so this is not the speculative-pre-replication anti-pattern. The
+        // SUBSCRIBE relay is single-shot (forwards to one downstream peer),
+        // so the consult likewise forwards to the single closest advertised
+        // host; `new_visited` (self + upstream + traversed peers) is the skip
+        // list, so it cannot loop back, and the forward below carries HTL-1.
+        let visited_snapshot = new_visited.clone();
+        let consult = crate::operations::consult_advertised_hosts(
             op_manager,
-            incoming_tx,
-            instance_id,
-            SubscribeMsgResult::NotFound,
-            upstream_addr,
-            hop_count,
-        )
-        .await;
-    }
-
-    let next_hop = candidates.remove(0);
+            &instance_id,
+            TERMINAL_CONSULT_HOSTS,
+            move |addr| visited_snapshot.probably_visited(addr),
+        );
+        match consult.into_iter().next() {
+            Some((peer, _addr)) => {
+                consulted = true;
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    %instance_id,
+                    "SUBSCRIBE relay: terminus consulting advertised host off routing path"
+                );
+                peer
+            }
+            None => {
+                crate::operations::record_terminal_consult_outcome(false);
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    contract = %instance_id,
+                    phase = "relay_subscribe_not_found",
+                    "SUBSCRIBE relay: no closer peers to forward"
+                );
+                // No-candidates exhaustion: this relay is reporting its own
+                // exhaustion of downstream candidates. hop_count = max_htl - htl
+                // (the forward depth of THIS relay).
+                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                if let Some(event) = crate::tracing::NetEventLog::subscribe_not_found(
+                    &incoming_tx,
+                    &op_manager.ring,
+                    instance_id,
+                    Some(hop_count),
+                ) {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(event))
+                        .await;
+                }
+                return relay_subscribe_send_response(
+                    op_manager,
+                    incoming_tx,
+                    instance_id,
+                    SubscribeMsgResult::NotFound,
+                    upstream_addr,
+                    hop_count,
+                )
+                .await;
+            }
+        }
+    };
     let next_addr = match next_hop.socket_addr() {
         Some(addr) => addr,
         None => {
@@ -1779,6 +1818,11 @@ async fn drive_relay_subscribe(
                 target_pub_key = %next_hop.pub_key(),
                 "SUBSCRIBE relay: next hop has no socket address"
             );
+            // Consult candidates are pre-filtered to have a socket address, so
+            // this is unreachable for a consulted host; record defensively.
+            if consulted {
+                crate::operations::record_terminal_consult_outcome(false);
+            }
             // Forward-failure at THIS relay; same depth as no-candidates.
             let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
             return relay_subscribe_send_response(
@@ -1853,6 +1897,9 @@ async fn drive_relay_subscribe(
                 crate::router::RouteOutcome::Failure,
                 crate::node::network_status::OpType::Subscribe,
             );
+            if consulted {
+                crate::operations::record_terminal_consult_outcome(false);
+            }
             // Forward failure at THIS relay: report our own depth.
             let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
             return relay_subscribe_send_response(
@@ -1880,6 +1927,9 @@ async fn drive_relay_subscribe(
                 crate::router::RouteOutcome::Failure,
                 crate::node::network_status::OpType::Subscribe,
             );
+            if consulted {
+                crate::operations::record_terminal_consult_outcome(false);
+            }
             // Same as send-failure arm.
             let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
             return relay_subscribe_send_response(
@@ -1981,6 +2031,15 @@ async fn drive_relay_subscribe(
             (SubscribeMsgResult::NotFound, hop_count)
         }
     };
+
+    // Terminal-consult telemetry: a consulted forward that returned
+    // Subscribed closed the dead-end; anything else left it NotFound.
+    if consulted {
+        crate::operations::record_terminal_consult_outcome(matches!(
+            result,
+            SubscribeMsgResult::Subscribed { .. }
+        ));
+    }
 
     relay_subscribe_send_response(
         op_manager,
@@ -2668,6 +2727,37 @@ mod tests {
         assert!(
             driver_src.contains("ctx.send_to_and_await("),
             "drive_relay_subscribe must forward downstream via send_to_and_await"
+        );
+    }
+
+    /// Piece C (invariant 5): the SUBSCRIBE relay terminus must consult
+    /// neighbor host advertisements before declaring a NotFound dead-end, and
+    /// the consult must precede the no-candidates NotFound in source order.
+    #[test]
+    fn relay_subscribe_terminus_consults_advertised_hosts() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let driver_end = src[driver_start..]
+            .find("\nasync fn relay_subscribe_send_response(")
+            .expect("driver body end not found")
+            + driver_start;
+        let driver_src = &src[driver_start..driver_end];
+        let consult_pos = driver_src.find("consult_advertised_hosts").expect(
+            "drive_relay_subscribe must consult advertised hosts at the routing \
+             terminus (hosting redesign piece C, invariant 5)",
+        );
+        let empty_pos = driver_src
+            .find("candidates.is_empty()")
+            .expect("drive_relay_subscribe must still branch on empty candidates");
+        assert!(
+            consult_pos > empty_pos,
+            "the consult must live inside the no-closer-peers (terminus) branch"
+        );
+        assert!(
+            driver_src.contains("record_terminal_consult_outcome"),
+            "drive_relay_subscribe must record the terminal consult outcome"
         );
     }
 

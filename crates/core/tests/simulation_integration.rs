@@ -11023,6 +11023,191 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
     );
 }
 
+/// Terminal advertisement consult (hosting redesign piece C, invariant 5):
+/// a GET that routes to a terminus whose neighbor hosts the contract — one hop
+/// OFF the greedy routing path — must resolve via the consult instead of
+/// dead-ending with NotFound.
+///
+/// Setup (peer ring locations controlled via `new_with_node_locations`):
+///   - a dense cluster of non-hosting peers sits right on the contract's key;
+///   - exactly one host peer sits just OUTSIDE that cluster — farther from the
+///     key than every cluster peer (so greedy routing never selects it), but
+///     close enough in ring location to become a cluster peer's neighbor and
+///     advertise its hosting to it;
+///   - a far requester issues a GET.
+///
+/// Placement migration is disabled, so the ONLY mechanism that can carry the
+/// state to the requester is the terminal consult. GET is single-path greedy
+/// (relay `MAX_RELAY_RETRIES = 1`): a relay forwards to its single closest
+/// neighbor toward the key and bubbles NotFound without trying its other
+/// neighbors — so the advertised host, being a non-closest neighbor of the
+/// terminus, is exactly the "one hop off the routing path" case. WITHOUT the
+/// consult this dead-ends (proven by
+/// `test_get_dead_ends_at_close_cluster_without_migration`, whose host is too
+/// far to be a terminus neighbor); WITH it, the terminus consults the host
+/// advertisement it received and forwards there, closing the dead-end.
+///
+/// The proof is the consult telemetry: `terminal_consult_resolved_found() > 0`
+/// is recorded ONLY when a consulted advertised host returns Found, so with
+/// migration off it is unambiguous that the consult (not routing or migration)
+/// delivered the state.
+#[test_log::test]
+fn test_terminal_advertisement_consult_closes_get_dead_end() {
+    use freenet::config::GlobalTestMetrics;
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    // Seed + host offset chosen so the host lands as a non-closest neighbor of
+    // an outer cluster peer (advertises to it, but greedy routing never selects
+    // it). Deterministic under the direct/turmoil runner for this seed.
+    const SEED: u64 = 0xC0FF_EEC0_0004;
+    const NETWORK_NAME: &str = "terminal-consult-deadend";
+    setup_deterministic_state(SEED);
+    GlobalTestMetrics::reset();
+
+    let contract = SimOperation::create_test_contract(0xC0);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+
+    // Non-hosting cluster tightly around the key.
+    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    // Host sits just outside the cluster: farther from the key than every
+    // cluster peer (so greedy routing never selects it as a next hop), yet close
+    // enough in ring location to become a cluster peer's neighbor and advertise.
+    let host_loc = wrap(key_loc + 0.035);
+    // Requester on the OPPOSITE side of the key from the host, so its inbound
+    // path approaches the key from the far side and never passes near the host.
+    let requester_loc = wrap(key_loc - 0.60);
+    let mut node_locations = cluster.clone();
+    node_locations.push(host_loc); // regular-node order 6 -> node_no 7
+    node_locations.push(requester_loc); // regular-node order 7 -> node_no 8
+    let num_nodes = node_locations.len(); // 8
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,         // 1 gateway
+            num_nodes, // 8 regular nodes
+            10,        // ring_max_htl
+            7,         // rnd_if_htl_above
+            8,         // max_connections
+            3,         // min_connections
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+    // Migration OFF: isolate the consult as the ONLY mechanism that can carry
+    // state to the requester (mirrors the negative control above).
+    sim.disable_placement_migration();
+
+    let host_label = NodeLabel::node(NETWORK_NAME, 7);
+    let requester_label = NodeLabel::node(NETWORK_NAME, 8);
+
+    // Setup sanity: the host must be strictly FARTHER from the key than the
+    // closest cluster peer, so greedy routing lands on the cluster (terminus)
+    // and never picks the host directly. get_peer_locations() is [gw, node1..8].
+    let locs = sim.get_peer_locations();
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let host_dist = ring_dist(locs[7], key_loc);
+    let cluster_min = (1..=6)
+        .map(|i| ring_dist(locs[i], key_loc))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        cluster_min < host_dist,
+        "scenario setup wrong: a cluster peer must be closer to the key than the host \
+         (cluster_min={cluster_min}, host_dist={host_dist})"
+    );
+
+    let operations = vec![
+        // Only the host holds the contract (seeded into its store + Ring hosting
+        // manager + neighbor-hosting advertised set, no network propagation), so
+        // it advertises hosting to its neighbors but the state exists nowhere else.
+        ScheduledOperation::new(
+            host_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![11, 22, 33, 44],
+            },
+        ),
+        // The far requester asks for it (greedy GET toward the key).
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // The host still hosts the seeded contract.
+    assert!(
+        result.is_node_hosting(&host_label, &contract_key),
+        "host should still host the seeded contract after the simulation"
+    );
+
+    let attempts = GlobalTestMetrics::terminal_consult_attempts();
+    let hits = GlobalTestMetrics::terminal_consult_hits();
+    let resolved_found = GlobalTestMetrics::terminal_consult_resolved_found();
+    // With the consult succeeding, cluster relays on the Found return path
+    // opportunistically cache the state (normal GET relay caching, migration is
+    // OFF) — informational only; the clean proof is `resolved_found` below.
+    let cached_on_cluster: Vec<usize> = (1..=6usize)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(NETWORK_NAME, *n), &contract_key))
+        .collect();
+    tracing::info!(
+        attempts,
+        hits,
+        resolved_found,
+        still_not_found = GlobalTestMetrics::terminal_consult_still_not_found(),
+        ?cached_on_cluster,
+        "terminal consult telemetry"
+    );
+
+    let requester_has_state = result
+        .node_storages
+        .get(&requester_label)
+        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+
+    // CORE OF THE FIX: the consult carried the state from the off-path host to
+    // the requester. With migration disabled, `resolved_found > 0` is the
+    // unambiguous signal that the terminal advertisement consult (not routing,
+    // not migration) closed the dead-end — it is recorded ONLY when a consulted
+    // advertised host returns Found.
+    assert!(
+        resolved_found > 0,
+        "terminal consult should have resolved the GET to Found via an advertised \
+         off-path host (attempts={attempts}, hits={hits}, resolved_found={resolved_found}, \
+         requester_has_state={requester_has_state})"
+    );
+    assert!(
+        requester_has_state,
+        "requester GET should succeed via the terminal advertisement consult \
+         (resolved_found={resolved_found})"
+    );
+}
+
 /// Reproduction + regression test for the placement-migration renewal storm
 /// (#4440, the storm symptom of the #4404 placement work).
 ///

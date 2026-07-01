@@ -487,6 +487,17 @@ async fn append_contracts(
                 .host_contract(key, state_size, crate::ring::AccessType::Put);
             // In the new lease-based model, register an active subscription
             op_manager.ring.subscribe(key);
+            // Register the contract in the neighbor-hosting advertised set so
+            // the connection-established HostingStateResponse exchange
+            // advertises it to neighbors. Without this, a startup-hosted
+            // contract (SeedHostedContract) leaves `my_contracts` empty and
+            // neighbors never learn this node hosts it — which the terminal
+            // advertisement consult (and UPDATE proximity forwarding) rely on.
+            // Mirrors the production announce that fires on first-time PUT/GET
+            // hosting; the returned announcement is dropped because the node
+            // has no ring connections yet at startup (the exchange runs later,
+            // on connection-established).
+            let _ = op_manager.neighbor_hosting.on_contract_hosted(&key);
         }
         // Note: contract_subscribers is ignored in the new model.
         // Neighbor hosting handles peer-to-peer awareness for update propagation.
