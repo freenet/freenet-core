@@ -2002,11 +2002,14 @@ mod tests {
             "HostingManager::new should pass the budget through to the cache"
         );
 
-        // The default constructor still uses the in-code default.
+        // The default constructor uses the in-code default, which is now
+        // RAM-scaled (#4642 A2) rather than the fixed test constant — assert
+        // against the production default fn so this doesn't flake on a
+        // low-memory / cgroup-limited CI host (Codex #4644 review).
         let default_manager = HostingManager::default();
         assert_eq!(
             default_manager.hosting_budget_bytes(),
-            DEFAULT_HOSTING_BUDGET_BYTES
+            default_hosting_budget_bytes()
         );
     }
 
