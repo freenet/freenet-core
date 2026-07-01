@@ -24,6 +24,27 @@ pub trait TimeSource: std::fmt::Debug {
     }
 }
 
+/// A boxed, shareable time source. Production wires this as
+/// `Arc::new(InstantTimeSrc::new())`; simulation tests can inject a
+/// controllable [`SharedMockTimeSource`] instead so TTL/eviction decisions are
+/// deterministic. See `HostingManager::with_time_source` and
+/// `NodeConfig::hosting_time_source_override`.
+pub type DynTimeSource = Arc<dyn TimeSource + Send + Sync>;
+
+// Allow an `Arc`-wrapped time source (including the `dyn` form above) to be used
+// wherever a `TimeSource` is expected — e.g. as the generic parameter of
+// `HostingCache<T: TimeSource>`. Without this blanket impl the injected
+// `Arc<dyn TimeSource + Send + Sync>` could not drive the hosting cache.
+impl<T: TimeSource + ?Sized> TimeSource for Arc<T> {
+    fn now(&self) -> Instant {
+        (**self).now()
+    }
+
+    fn system_time_now(&self) -> SystemTime {
+        (**self).system_time_now()
+    }
+}
+
 /// A simple time source that returns the current time using `Instant::now()`.
 #[derive(Clone, Copy, Debug)]
 pub struct InstantTimeSrc(());
@@ -162,7 +183,6 @@ impl TimeSource for CachingSystemTimeSrc {
 }
 
 /// Fixed, deterministic base wall-clock time for all mock time sources.
-#[cfg(test)]
 fn mock_system_epoch() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
 }
@@ -219,7 +239,14 @@ impl TimeSource for MockTimeSource {
 /// // Component now sees the advanced time
 /// component.do_something_time_dependent();
 /// ```
-#[cfg(test)]
+/// A shared, externally-controllable time source.
+///
+/// Available in all builds (not just `#[cfg(test)]`) because the simulation
+/// harness owns one to drive deterministic TTL/eviction: it is injected into a
+/// node's `HostingManager` via `NodeConfig::hosting_time_source_override`, and
+/// advanced from the sim's controlled-event dispatch (see
+/// `SimOperation::AdvanceHostingClock`). Production never constructs one — it
+/// always uses [`InstantTimeSrc`].
 #[derive(Clone, Debug)]
 pub struct SharedMockTimeSource {
     /// The epoch when time started (used as baseline for elapsed calculations)
@@ -230,7 +257,6 @@ pub struct SharedMockTimeSource {
     system_time_epoch: SystemTime,
 }
 
-#[cfg(test)]
 impl SharedMockTimeSource {
     /// Create a new shared mock time source starting at zero elapsed time.
     pub fn new() -> Self {
@@ -266,14 +292,12 @@ impl SharedMockTimeSource {
     }
 }
 
-#[cfg(test)]
 impl Default for SharedMockTimeSource {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(test)]
 impl TimeSource for SharedMockTimeSource {
     fn now(&self) -> Instant {
         self.epoch + *self.elapsed.lock().unwrap()
@@ -284,7 +308,6 @@ impl TimeSource for SharedMockTimeSource {
     }
 }
 
-#[cfg(test)]
 impl crate::simulation::TimeSource for SharedMockTimeSource {
     fn now_nanos(&self) -> u64 {
         let elapsed = *self.elapsed.lock().unwrap();

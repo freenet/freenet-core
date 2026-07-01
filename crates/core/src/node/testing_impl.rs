@@ -210,6 +210,31 @@ pub enum SimOperation {
     /// every other `SimOperation` in the same node, so subscriptions
     /// issued earlier by this operation's node are the ones cleaned up.
     Disconnect,
+    /// Advance the sim's controllable hosting clock by `duration`, in-order
+    /// with the surrounding events.
+    ///
+    /// Requires [`SimNetwork::enable_hosting_time_control`]; the clock is shared
+    /// by every node, so the `node` on the [`ScheduledOperation`] is only a
+    /// sequencing placeholder (advancement is global). Use this to jump past the
+    /// hosting-cache TTL gate deterministically so a subsequent access triggers
+    /// demand-driven eviction — without running minutes of virtual time
+    /// (#4642 piece A). Handled specially by `run_controlled_simulation`
+    /// (it is not a client request).
+    AdvanceHostingClock {
+        /// How far to advance the shared hosting clock.
+        duration: Duration,
+    },
+    /// Crash the target node mid-run by blocking all its inbound/outbound
+    /// messages via the per-network fault injector, in-order with the
+    /// surrounding events.
+    ///
+    /// This is a SILENT crash (message-blocking, like the churn driver's
+    /// soft-crash): the node's transport is not torn down, so peers detect the
+    /// loss on their own routing-health cadence rather than an immediate
+    /// transport-close. It lets a test remove a specific peer at a scripted
+    /// point (e.g. to observe re-routing / re-subscription). Handled specially
+    /// by `run_controlled_simulation` (it is not a client request).
+    CrashNode,
 }
 
 impl SimOperation {
@@ -329,6 +354,18 @@ impl SimOperation {
                      by run_controlled_simulation before event dispatch"
                 )
             }
+            SimOperation::AdvanceHostingClock { .. } => {
+                panic!(
+                    "AdvanceHostingClock is not a client request — it must be handled \
+                     by run_controlled_simulation during event dispatch"
+                )
+            }
+            SimOperation::CrashNode => {
+                panic!(
+                    "CrashNode is not a client request — it must be handled \
+                     by run_controlled_simulation during event dispatch"
+                )
+            }
             SimOperation::Disconnect => ClientRequest::Disconnect { cause: None },
         }
     }
@@ -398,6 +435,56 @@ impl ControlledSimulationResult {
         self.node_rings
             .get(label)
             .is_some_and(|ring| ring.is_hosting_contract(key))
+    }
+
+    /// Number of contracts `label`'s node held in its hosting cache at the end
+    /// of the run (its "cache size"). Returns 0 if the node never published its
+    /// Ring. See [`Ring::hosting_contracts_count`](crate::ring::Ring::hosting_contracts_count).
+    pub fn node_hosting_count(&self, label: &NodeLabel) -> usize {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.hosting_contracts_count())
+            .unwrap_or(0)
+    }
+
+    /// Number of active network subscription leases `label`'s node held at the
+    /// end of the run. Returns 0 if the node never published its Ring. See
+    /// [`Ring::active_subscription_count`](crate::ring::Ring::active_subscription_count).
+    pub fn node_subscription_count(&self, label: &NodeLabel) -> usize {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.active_subscription_count())
+            .unwrap_or(0)
+    }
+
+    /// Number of contracts `label`'s node had *real demand* for (local client
+    /// or downstream subscriber, EXCLUDING cache-only hosting) at the end of the
+    /// run. Returns 0 if the node never published its Ring. This is the
+    /// denominator for the #3763 no-storm assertion — see
+    /// [`Ring::active_demand_count`](crate::ring::Ring::active_demand_count).
+    pub fn node_active_demand_count(&self, label: &NodeLabel) -> usize {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.active_demand_count())
+            .unwrap_or(0)
+    }
+
+    /// Number of upstream peers `label`'s node recorded for `key` (its parents
+    /// in the subscription tree) at the end of the run. Returns 0 if the node
+    /// never published its Ring. Used by re-subscribe tests (#4642 piece F) to
+    /// assert a KNOWN subscriber→upstream edge. See
+    /// [`Ring::upstream_interest_count`](crate::ring::Ring::upstream_interest_count).
+    pub fn node_upstream_count(&self, label: &NodeLabel, key: &ContractKey) -> usize {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.upstream_interest_count(key))
+            .unwrap_or(0)
+    }
+
+    /// Labels of every node whose live Ring was captured (started and published
+    /// its Ring). Handy for iterating per-node assertions.
+    pub fn captured_node_labels(&self) -> Vec<NodeLabel> {
+        self.node_rings.keys().cloned().collect()
     }
 
     /// Subscription-renewal metrics for the peer at `addr` (captured before the
@@ -1021,6 +1108,19 @@ pub struct SimNetwork {
     /// real production floor (#4601). Production is untouched: `NodeConfig::new`
     /// sets this to `None`, which resolves to the real `SUBSCRIBE_HINT_MIN_VERSION`.
     subscribe_hint_floor_override: Option<(u8, u8, u16)>,
+    /// Optional controllable hosting clock injected into every node's
+    /// `HostingManager` (via `NodeConfig::hosting_time_source_override`). When
+    /// set, hosting-cache TTL and subscription-lease eviction advance ONLY when
+    /// the sim advances this clock — either directly (`hosting_clock()`) or, for
+    /// mid-run control under the turmoil runner, via
+    /// `SimOperation::AdvanceHostingClock`. Enables deterministic eviction sims
+    /// (#4642 piece A). `None` → nodes use the default wall-clock time source.
+    hosting_clock: Option<crate::util::time_source::SharedMockTimeSource>,
+    /// Optional per-node hosting-cache byte budget (`max_hosting_storage`).
+    /// When set, every node this network builds is given this budget instead of
+    /// the capability-derived default, so a test can force cache pressure with a
+    /// tiny budget and observe demand-driven eviction (#4642 piece A).
+    hosting_budget_override: Option<u64>,
     /// Per-node capture slots for the live `Arc<Ring>`, populated by
     /// `run_controlled_simulation` so governance sim tests can read each
     /// node's `contract_ban_list` after the simulation completes. Keyed by
@@ -1195,6 +1295,8 @@ impl SimNetwork {
             // the 500-node nightly red. Defaulting to an unreachable floor keeps
             // migration genuinely opt-in, as the docs have always claimed.
             subscribe_hint_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            hosting_clock: None,
+            hosting_budget_override: None,
             shared_rings: HashMap::new(),
             node_port_override,
         };
@@ -1290,6 +1392,69 @@ impl SimNetwork {
     /// Enables the chaos driver which periodically crashes and restarts nodes.
     pub fn with_churn(&mut self, config: ChurnConfig) -> &mut Self {
         self.churn_config = Some(config);
+        self
+    }
+
+    /// Inject a controllable hosting clock into every node this network builds,
+    /// so hosting-cache TTL and subscription-lease eviction advance only when
+    /// the sim advances the clock. Returns a handle the test can advance
+    /// directly (e.g. before/after the run); for mid-run advancement under the
+    /// turmoil-based `run_controlled_simulation`, schedule
+    /// [`SimOperation::AdvanceHostingClock`] instead (the runner advances THIS
+    /// same clock in-order with the other events).
+    ///
+    /// Enables deterministic eviction/TTL simulations (#4642 piece A) that were
+    /// previously impossible because `HostingManager` hardcoded the wall clock.
+    /// Pair with [`with_hosting_budget`](Self::with_hosting_budget) to force
+    /// cache pressure. Idempotent: repeated calls reuse the existing clock.
+    pub fn enable_hosting_time_control(
+        &mut self,
+    ) -> crate::util::time_source::SharedMockTimeSource {
+        use crate::util::time_source::{DynTimeSource, SharedMockTimeSource};
+        let clock = self
+            .hosting_clock
+            .get_or_insert_with(SharedMockTimeSource::new)
+            .clone();
+        // `config_gateways` / `config_nodes` already ran during
+        // `SimNetwork::new()` with the override still `None`, so patch the
+        // already-built node/gateway configs here (mirrors
+        // `with_governance_config`). Without this the builders keep the
+        // production wall clock and the injection is silently a no-op.
+        let dyn_clock: DynTimeSource = std::sync::Arc::new(clock.clone());
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.hosting_time_source_override = Some(dyn_clock.clone());
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.hosting_time_source_override = Some(dyn_clock.clone());
+        }
+        clock
+    }
+
+    /// The controllable hosting clock, if [`enable_hosting_time_control`] was
+    /// called. Advancing it moves every node's hosting TTL/eviction clock
+    /// forward deterministically.
+    ///
+    /// [`enable_hosting_time_control`]: Self::enable_hosting_time_control
+    pub fn hosting_clock(&self) -> Option<crate::util::time_source::SharedMockTimeSource> {
+        self.hosting_clock.clone()
+    }
+
+    /// Set the per-node hosting-cache byte budget (`max_hosting_storage`) for
+    /// every node this network builds. A tiny budget forces cache pressure so a
+    /// test can observe demand-driven eviction of low-demand contracts
+    /// (#4642 piece A). Pair with [`enable_hosting_time_control`] so aged
+    /// entries actually cross the TTL gate.
+    ///
+    /// [`enable_hosting_time_control`]: Self::enable_hosting_time_control
+    pub fn with_hosting_budget(&mut self, budget_bytes: u64) -> &mut Self {
+        self.hosting_budget_override = Some(budget_bytes);
+        // Patch already-built configs (see `with_governance_config`).
+        for (builder, _) in self.gateways.iter_mut() {
+            std::sync::Arc::make_mut(&mut builder.config.config).max_hosting_storage = budget_bytes;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            std::sync::Arc::make_mut(&mut builder.config.config).max_hosting_storage = budget_bytes;
+        }
         self
     }
 
@@ -2005,6 +2170,13 @@ impl SimNetwork {
                 .unwrap();
             config.governance_config_override = self.governance_config_override.clone();
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
+            config.hosting_time_source_override = self
+                .hosting_clock
+                .clone()
+                .map(|c| std::sync::Arc::new(c) as crate::util::time_source::DynTimeSource);
+            if let Some(budget) = self.hosting_budget_override {
+                std::sync::Arc::make_mut(&mut config.config).max_hosting_storage = budget;
+            }
             config.key_pair = keypair;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.network_listener_port = port;
@@ -2097,6 +2269,13 @@ impl SimNetwork {
                 .unwrap();
             config.governance_config_override = self.governance_config_override.clone();
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
+            config.hosting_time_source_override = self
+                .hosting_clock
+                .clone()
+                .map(|c| std::sync::Arc::new(c) as crate::util::time_source::DynTimeSource);
+            if let Some(budget) = self.hosting_budget_override {
+                std::sync::Arc::make_mut(&mut config.config).max_hosting_storage = budget;
+            }
             for GatewayConfig {
                 peer_key_location,
                 location,
@@ -3947,7 +4126,13 @@ impl SimNetwork {
                 | SimOperation::Get { .. }
                 | SimOperation::Subscribe { .. }
                 | SimOperation::Update { .. }
-                | SimOperation::Disconnect => event_ops.push(scheduled_op),
+                | SimOperation::Disconnect
+                // AdvanceHostingClock / CrashNode also flow through the ordered
+                // event stream (so they fire in-sequence), but are routed to
+                // `special_ops` at numbering time rather than to a node's
+                // client-request generator.
+                | SimOperation::AdvanceHostingClock { .. }
+                | SimOperation::CrashNode => event_ops.push(scheduled_op),
             }
         }
 
@@ -3979,19 +4164,66 @@ impl SimNetwork {
             );
         }
 
+        // In-order special dispatch: an event that the controlled-event client
+        // performs itself (advance the shared hosting clock, or crash a node via
+        // the fault injector) instead of turning into a client request.
+        enum SpecialDispatch {
+            AdvanceHostingClock(Duration),
+            CrashNode(SocketAddr),
+        }
+
         // Build a map of label -> list of (event_id, operation)
         let mut operations_by_node: HashMap<NodeLabel, Vec<(EventId, SimOperation)>> =
             HashMap::new();
         let mut operation_sequence: Vec<(EventId, NodeLabel)> = Vec::new();
+        // Special ops (clock advance / crash) are dispatched in-order by the
+        // controlled-event client itself rather than being turned into a client
+        // request routed to a node. Keyed by their sequence event_id.
+        let mut special_ops: HashMap<EventId, SpecialDispatch> = HashMap::new();
 
         for (event_id, scheduled_op) in event_ops.into_iter().enumerate() {
             let event_id = event_id as EventId;
             operation_sequence.push((event_id, scheduled_op.node.clone()));
-            operations_by_node
-                .entry(scheduled_op.node)
-                .or_default()
-                .push((event_id, scheduled_op.operation));
+            match scheduled_op.operation {
+                SimOperation::AdvanceHostingClock { duration } => {
+                    special_ops.insert(event_id, SpecialDispatch::AdvanceHostingClock(duration));
+                }
+                SimOperation::CrashNode => {
+                    let addr = *self
+                        .node_addresses
+                        .get(&scheduled_op.node)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "CrashNode: node {:?} has no known address",
+                                scheduled_op.node
+                            )
+                        });
+                    special_ops.insert(event_id, SpecialDispatch::CrashNode(addr));
+                }
+                op @ (SimOperation::Put { .. }
+                | SimOperation::Get { .. }
+                | SimOperation::Subscribe { .. }
+                | SimOperation::Update { .. }
+                | SimOperation::Disconnect) => {
+                    operations_by_node
+                        .entry(scheduled_op.node)
+                        .or_default()
+                        .push((event_id, op));
+                }
+                // Seed ops were split out before the numbering loop (see the
+                // separation match above), so they never reach here.
+                SimOperation::SeedContract { .. } | SimOperation::SeedHostedContract { .. } => {
+                    unreachable!(
+                        "SeedContract/SeedHostedContract are separated out before numbering"
+                    )
+                }
+            }
         }
+
+        // Handle for the controllable hosting clock (if any), captured into the
+        // controlled-event client so `AdvanceHostingClock` can advance it
+        // in-order with the rest of the sequence.
+        let hosting_clock = self.hosting_clock.clone();
 
         // Collect storage handles for the result — cloning Arc-backed storage
         // gives tests access to the same data written during the simulation.
@@ -4234,6 +4466,10 @@ impl SimNetwork {
         // Build a map from NodeLabel to peer key for event triggering
         let label_to_key: HashMap<NodeLabel, _> = labels.into_iter().collect();
 
+        // Clone the network name for the client closure (the outer
+        // `network_name` is still needed after `sim.run()` for topology capture).
+        let network_name_for_client = network_name.clone();
+
         // Register the test client that triggers controlled events
         sim.client("test", async move {
             // Give nodes time to start and establish connections
@@ -4241,6 +4477,52 @@ impl SimNetwork {
 
             // Trigger events in the specified order
             for (event_id, node_label) in operation_sequence {
+                // Special in-order ops the client performs itself.
+                if let Some(special) = special_ops.get(&event_id) {
+                    match special {
+                        SpecialDispatch::AdvanceHostingClock(duration) => {
+                            match hosting_clock.as_ref() {
+                                Some(clock) => {
+                                    clock.advance_time(*duration);
+                                    tracing::info!(
+                                        event_id,
+                                        advance_ms = duration.as_millis() as u64,
+                                        "Advanced controlled hosting clock"
+                                    );
+                                }
+                                None => tracing::warn!(
+                                    event_id,
+                                    "AdvanceHostingClock scheduled but no controllable \
+                                     hosting clock was enabled (call \
+                                     enable_hosting_time_control)"
+                                ),
+                            }
+                        }
+                        SpecialDispatch::CrashNode(addr) => {
+                            if let Some(injector) = crate::node::network_bridge::get_fault_injector(
+                                &network_name_for_client,
+                            ) {
+                                injector.lock().unwrap().config.crash_node(*addr);
+                                tracing::info!(
+                                    event_id,
+                                    node = %node_label,
+                                    ?addr,
+                                    "Crashed node via fault injector (message-blocking)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    event_id,
+                                    node = %node_label,
+                                    "CrashNode scheduled but no fault injector registered"
+                                );
+                            }
+                        }
+                    }
+                    // Let the effect settle before the next event.
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+
                 if let Some(peer_key) = label_to_key.get(&node_label) {
                     tracing::info!(
                         event_id,
