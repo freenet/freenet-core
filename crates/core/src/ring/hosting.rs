@@ -33,7 +33,7 @@ mod cache;
 mod demand;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
-use crate::util::time_source::{InstantTimeSrc, TimeSource};
+use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
 pub(crate) use cache::HostingContractScore;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` (see the constant's docs).
@@ -230,7 +230,12 @@ pub(crate) struct HostingManager {
     /// Unified hosting cache with byte-budget demand-ordered eviction ("fuel
     /// gauge") and TTL protection. This is the single source of truth for which
     /// contracts we're hosting.
-    hosting_cache: RwLock<HostingCache<InstantTimeSrc>>,
+    ///
+    /// The cache's clock is the same injectable [`DynTimeSource`] as
+    /// `time_source` below, so subscription-lease time and cache-eviction TTL
+    /// share one clock. Production installs `Arc<InstantTimeSrc>`; sims can
+    /// inject a controllable clock (see `with_time_source`).
+    hosting_cache: RwLock<HostingCache<DynTimeSource>>,
 
     /// Proximity-prior demand estimator (A3, freenet/freenet-core#4642). Maps a
     /// contract's ring distance from this peer to a predicted read rate, used as
@@ -262,7 +267,11 @@ pub(crate) struct HostingManager {
     downstream_subscribers: DashMap<ContractKey, HashMap<PeerKey, Instant>>,
 
     /// Time source for downstream subscriber lease tracking.
-    time_source: InstantTimeSrc,
+    ///
+    /// Injectable (see `with_time_source`): production uses
+    /// `Arc<InstantTimeSrc>`; sims can inject a controllable clock so TTL /
+    /// eviction is deterministic. Shared (same `Arc`) with `hosting_cache`.
+    time_source: DynTimeSource,
 
     /// Contracts with subscription requests currently in-flight.
     pending_subscription_requests: DashSet<ContractKey>,
@@ -330,7 +339,21 @@ pub(crate) struct HostingManager {
 }
 
 impl HostingManager {
+    /// Construct a `HostingManager` on the production wall-clock time source
+    /// ([`InstantTimeSrc`]). Equivalent to
+    /// `with_time_source(budget_bytes, Arc::new(InstantTimeSrc::new()))`.
     pub fn new(budget_bytes: u64) -> Self {
+        Self::with_time_source(budget_bytes, std::sync::Arc::new(InstantTimeSrc::new()))
+    }
+
+    /// Construct a `HostingManager` on an explicit, injectable time source.
+    ///
+    /// Production calls [`new`](Self::new) (wall clock). Simulation tests inject
+    /// a controllable clock (e.g. `SharedMockTimeSource`) so subscription-lease
+    /// expiry and hosting-cache TTL/eviction advance deterministically under
+    /// test control rather than wall time. The same `Arc` drives both the
+    /// downstream-lease clock and the cache clock.
+    pub fn with_time_source(budget_bytes: u64, time_source: DynTimeSource) -> Self {
         let backoff_config =
             ExponentialBackoff::new(INITIAL_SUBSCRIPTION_BACKOFF, MAX_SUBSCRIPTION_BACKOFF);
         Self {
@@ -339,14 +362,14 @@ impl HostingManager {
             hosting_cache: RwLock::new(HostingCache::new(
                 budget_bytes,
                 DEFAULT_MIN_TTL,
-                InstantTimeSrc::new(),
+                time_source.clone(),
             )),
             demand_estimator: RwLock::new(ProximityPrior::new()),
             own_location: RwLock::new(None),
             local_get_serves: AtomicU64::new(0),
             local_get_forwards: AtomicU64::new(0),
             downstream_subscribers: DashMap::new(),
-            time_source: InstantTimeSrc::new(),
+            time_source,
             pending_subscription_requests: DashSet::new(),
             subscription_backoff: RwLock::new(TrackedBackoff::new(
                 backoff_config,
@@ -2185,6 +2208,44 @@ mod tests {
         assert!(manager.is_subscribed(&contract));
     }
 
+    /// The injected time source (`with_time_source`) drives the manager's
+    /// clock: subscription-lease expiry crosses `SUBSCRIPTION_LEASE_DURATION`
+    /// purely by advancing the injected clock, with no wall time passing. This
+    /// is the manager-level primitive that unblocks deterministic eviction/TTL
+    /// simulations (#4642 piece A) — production hardcoded `InstantTimeSrc`, so a
+    /// sim could not fast-forward the 8-minute gate.
+    #[tokio::test]
+    async fn test_with_time_source_lease_expiry_follows_injected_clock() {
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let clock = SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let contract = make_contract_key(1);
+
+        manager.subscribe(contract);
+        assert!(
+            manager.is_subscribed(&contract),
+            "a fresh lease should be active"
+        );
+
+        // Advance the injected clock to just before the lease boundary.
+        clock.advance_time(SUBSCRIPTION_LEASE_DURATION - Duration::from_secs(1));
+        assert!(
+            manager.is_subscribed(&contract),
+            "lease should still be active one second before expiry"
+        );
+
+        // Cross the lease boundary purely via the injected clock.
+        clock.advance_time(Duration::from_secs(2));
+        assert!(
+            !manager.is_subscribed(&contract),
+            "lease should expire once the injected clock passes SUBSCRIPTION_LEASE_DURATION"
+        );
+    }
+
     #[tokio::test]
     async fn test_new_uses_configured_budget() {
         let custom_budget = 256 * 1024 * 1024_u64;
@@ -2718,7 +2779,7 @@ mod tests {
             *cache = cache::HostingCache::new(
                 10_000,
                 std::time::Duration::ZERO,
-                crate::util::time_source::InstantTimeSrc::new(),
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }
         let evictable = make_contract_key(2);
@@ -3877,7 +3938,7 @@ mod tests {
             *cache = cache::HostingCache::new(
                 100,
                 std::time::Duration::ZERO,
-                crate::util::time_source::InstantTimeSrc::new(),
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }
 
@@ -3949,7 +4010,7 @@ mod tests {
             *cache = cache::HostingCache::new(
                 100,
                 std::time::Duration::ZERO,
-                crate::util::time_source::InstantTimeSrc::new(),
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }
 
@@ -4062,7 +4123,7 @@ mod tests {
             *cache = cache::HostingCache::new(
                 200, // room for ~2 contracts at 100 bytes
                 std::time::Duration::ZERO,
-                crate::util::time_source::InstantTimeSrc::new(),
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }
 
@@ -4556,7 +4617,7 @@ mod tests {
             *cache = cache::HostingCache::new(
                 200,                       // tiny budget: room for ~2 contracts at 100 bytes
                 std::time::Duration::ZERO, // no TTL protection
-                crate::util::time_source::InstantTimeSrc::new(),
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }
 

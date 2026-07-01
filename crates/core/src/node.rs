@@ -345,6 +345,21 @@ pub struct NodeConfig {
     /// as `subscribe_hint_floor_override`. `#[serde(skip)]`.
     #[serde(skip)]
     pub(crate) advertise_seeded_hosts: bool,
+    /// Test-only override for the hosting manager's time source.
+    ///
+    /// Lets simulation tests inject a controllable clock (e.g.
+    /// `SharedMockTimeSource`) so hosting-cache TTL and subscription-lease
+    /// eviction advance deterministically under test control instead of wall
+    /// time. `None` in production (and never serialized — `#[serde(skip)]`),
+    /// where the `Ring`'s default `Arc<InstantTimeSrc>` is used. Consumed at
+    /// `Ring::new` → `HostingManager::with_time_source`. See #4642 (piece A).
+    ///
+    /// Not cfg-gated for the same reason as `governance_config_override`:
+    /// `node::testing_impl` sets it and is compiled unconditionally, so the
+    /// field must exist in every build. The `Option` is simply always `None`
+    /// outside tests.
+    #[serde(skip)]
+    pub(crate) hosting_time_source_override: Option<crate::util::time_source::DynTimeSource>,
 }
 
 impl NodeConfig {
@@ -483,6 +498,7 @@ impl NodeConfig {
             governance_config_override: None,
             subscribe_hint_floor_override: None,
             advertise_seeded_hosts: false,
+            hosting_time_source_override: None,
         })
     }
 
