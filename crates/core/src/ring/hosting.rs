@@ -34,11 +34,18 @@ mod cache;
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
 /// Re-exported as the single source of truth for the default hosting storage
-/// budget. `config::default_max_hosting_storage()` resolves to this constant so
-/// the operator-facing default and the in-code fallback can never drift.
-pub(crate) use cache::DEFAULT_HOSTING_BUDGET_BYTES;
+/// budget. `config::default_max_hosting_storage()` resolves to this function so
+/// the operator-facing default and the in-code fallback can never drift. The
+/// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
+pub(crate) use cache::default_hosting_budget_bytes;
 pub use cache::{AccessType, RecordAccessResult};
-use cache::{DEFAULT_MIN_TTL, HostingCache};
+use cache::{DEFAULT_MIN_TTL, HostingCache, HostingCacheStats};
+/// Clamp bounds re-exported only for the config-default round-trip test, which
+/// asserts the resolved default lands within [MIN, MAX] without hardcoding the
+/// byte values. Gated to test builds so the re-export isn't an unused import
+/// under `-D warnings` in release.
+#[cfg(test)]
+pub(crate) use cache::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
 use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
@@ -1248,6 +1255,13 @@ impl HostingManager {
         self.hosting_cache.read().budget_bytes()
     }
 
+    /// Snapshot the hosting cache's aggregate resource gauges (budget, current
+    /// bytes, contract count, budget-triggered eviction count) under a single
+    /// read lock, for the per-node `RouterSnapshot` telemetry (A2).
+    pub(crate) fn hosting_cache_stats(&self) -> HostingCacheStats {
+        self.hosting_cache.read().stats()
+    }
+
     /// Check if we should continue hosting a contract.
     ///
     /// Returns true if:
@@ -1941,7 +1955,7 @@ impl HostingManager {
 
 impl Default for HostingManager {
     fn default() -> Self {
-        Self::new(DEFAULT_HOSTING_BUDGET_BYTES)
+        Self::new(default_hosting_budget_bytes())
     }
 }
 
@@ -1953,6 +1967,12 @@ impl Default for HostingManager {
 mod tests {
     use super::*;
     use freenet_stdlib::prelude::CodeHash;
+
+    /// Fixed 1 GiB budget for the behavioral tests below. The production default
+    /// is now RAM-scaled (capability-relative, #4642 A2); these tests
+    /// deliberately pin a large, deterministic budget so eviction is driven only
+    /// by the sizes they set, independent of the test host's real RAM.
+    const DEFAULT_HOSTING_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
     fn make_contract_key(seed: u8) -> ContractKey {
         ContractKey::from_id_and_code(

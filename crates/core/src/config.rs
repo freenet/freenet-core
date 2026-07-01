@@ -942,7 +942,7 @@ impl ConfigArgs {
                 .unwrap_or_else(default_max_blocking_threads),
             max_hosting_storage: self
                 .max_hosting_storage
-                .unwrap_or(crate::ring::DEFAULT_HOSTING_BUDGET_BYTES),
+                .unwrap_or_else(crate::ring::default_hosting_budget_bytes),
             per_user_secret_quota_bytes: self
                 .per_user_secret_quota_bytes
                 .unwrap_or(crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64),
@@ -1085,6 +1085,11 @@ pub struct Config {
     /// are evicted (least-valuable-first) and their on-disk state reclaimed.
     /// This bounds tracked contract state only — WASM code blobs and ReDb/
     /// SQLite database overhead are additional and not counted against it.
+    ///
+    /// The default is capability-relative (RAM-scaled): `clamp(total_ram / 8,
+    /// 128 MiB, 1 GiB)`, so a memory-constrained host gets a proportionally
+    /// smaller budget instead of the old flat 1 GiB (#4642 A2 / #4565). Set an
+    /// explicit value to override the RAM-scaled default.
     #[serde(
         default = "default_max_hosting_storage",
         rename = "max-hosting-storage"
@@ -1171,14 +1176,17 @@ fn default_max_blocking_threads() -> usize {
         .unwrap_or(8)
 }
 
-/// Default operator-facing budget for hosted contract state (1 GiB).
+/// Default operator-facing budget for hosted contract state (RAM-scaled).
 ///
-/// Resolves to [`crate::ring::DEFAULT_HOSTING_BUDGET_BYTES`], which is
-/// the single source of truth for this value — the in-code fallback used by the
-/// hosting cache and its tests. This indirection keeps the operator-facing
-/// default and the in-code default from ever drifting apart.
+/// Resolves to [`crate::ring::default_hosting_budget_bytes`], the single source
+/// of truth for this value — the RAM-scaled in-code default used by the hosting
+/// cache and its tests. This indirection keeps the operator-facing default and
+/// the in-code default from ever drifting apart. The default is capability-
+/// relative (`clamp(total_ram / 8, 128 MiB, 1 GiB)`, #4642 A2) rather than a
+/// flat constant, so a memory-constrained host gets a proportionally smaller
+/// budget (addresses #4565); an explicit value always overrides it.
 fn default_max_hosting_storage() -> u64 {
-    crate::ring::DEFAULT_HOSTING_BUDGET_BYTES
+    crate::ring::default_hosting_budget_bytes()
 }
 
 /// Default per-user secret-storage quota (4 MiB). Resolves to
@@ -3493,7 +3501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_hosting_storage_defaults_to_one_gib() {
+    async fn max_hosting_storage_defaults_to_ram_scaled_clamped() {
         let temp_dir = tempfile::tempdir().unwrap();
         let args = ConfigArgs {
             mode: Some(OperationMode::Local),
@@ -3505,16 +3513,23 @@ mod tests {
             ..Default::default()
         };
         let cfg = args.build().await.unwrap();
+        // The default is now capability-relative (RAM-scaled, #4642 A2), not a
+        // flat 1 GiB. It must resolve to the hosting cache's single-source-of-
+        // truth default and land within the documented clamp range on any host.
+        // Reference the constants rather than hardcoded byte values so this test
+        // never drifts from the clamp.
+        let min = crate::ring::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
+        let max = crate::ring::MAX_DEFAULT_HOSTING_BUDGET_BYTES;
         assert_eq!(
             cfg.max_hosting_storage,
-            crate::ring::DEFAULT_HOSTING_BUDGET_BYTES,
+            crate::ring::default_hosting_budget_bytes(),
             "default max_hosting_storage should resolve to the hosting cache's \
-             single-source-of-truth default budget"
+             single-source-of-truth RAM-scaled default budget"
         );
-        assert_eq!(
-            crate::ring::DEFAULT_HOSTING_BUDGET_BYTES,
-            1024 * 1024 * 1024,
-            "default hosting budget should be 1 GiB"
+        assert!(
+            (min..=max).contains(&cfg.max_hosting_storage),
+            "default budget {} must be within the [{min}, {max}] clamp",
+            cfg.max_hosting_storage
         );
     }
 

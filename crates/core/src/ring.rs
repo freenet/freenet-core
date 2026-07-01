@@ -90,9 +90,13 @@ mod hosting;
 pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
 /// Single source of truth for the default hosted-contract-state budget.
 /// `config::default_max_hosting_storage()` resolves to this so the
-/// operator-facing default and the in-code fallback can never drift.
-pub(crate) use hosting::DEFAULT_HOSTING_BUDGET_BYTES;
+/// operator-facing default and the in-code fallback can never drift. The
+/// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
+pub(crate) use hosting::default_hosting_budget_bytes;
 pub use hosting::{AccessType, RecordAccessResult};
+/// Clamp bounds re-exported only for the config-default round-trip test.
+#[cfg(test)]
+pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
 pub mod interest;
 mod live_tx;
 mod location;
@@ -1452,6 +1456,18 @@ impl Ring {
             snapshot.delegate_module_cache_total_bytes = Some(mc.delegate_total_bytes);
             snapshot.delegate_module_cache_budget_bytes = Some(mc.delegate_budget_bytes);
             snapshot.delegate_module_cache_evictions_total = Some(mc.delegate_evictions_total);
+
+            // Capability-relative hosting-budget gauges (#4642 A2): the
+            // RAM-scaled budget, its current occupancy (headroom ratio =
+            // current / budget, derived by the collector), the hosted-contract
+            // count, and the monotonic budget-triggered eviction counter. These
+            // let us observe in production whether the RAM-scaled budget keeps a
+            // small box off the #4565 OOM path. Per-node aggregate scalars only.
+            let hosting = ring.hosting_manager.hosting_cache_stats();
+            snapshot.hosting_budget_bytes = Some(hosting.budget_bytes);
+            snapshot.hosting_current_bytes = Some(hosting.current_bytes);
+            snapshot.hosting_contract_count = Some(hosting.contract_count);
+            snapshot.hosting_budget_evictions_total = Some(hosting.budget_evictions_total);
 
             // Interest-weighted (two-tier) module-cache SHADOW gauges
             // (#4441/#4534): always-on, independent of the

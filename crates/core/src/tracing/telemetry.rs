@@ -2101,6 +2101,28 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "renewal_terminus_satisfied".to_string(),
                     serde_json::json!(snapshot.renewal_terminus_satisfied),
                 );
+                // Capability-relative hosting-budget gauges (#4642 A2). Inserted
+                // here (not as inline `json!` keys) to keep the macro under its
+                // recursion limit, same as the gauges above — but this body is
+                // still hand-mirrored, so a new `RouterSnapshotInfo` field is
+                // invisible to the collector unless added here. Pinned by
+                // `router_snapshot_json_includes_hosting_budget_gauges`.
+                obj.insert(
+                    "hosting_budget_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_budget_bytes),
+                );
+                obj.insert(
+                    "hosting_current_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_current_bytes),
+                );
+                obj.insert(
+                    "hosting_contract_count".to_string(),
+                    serde_json::json!(snapshot.hosting_contract_count),
+                );
+                obj.insert(
+                    "hosting_budget_evictions_total".to_string(),
+                    serde_json::json!(snapshot.hosting_budget_evictions_total),
+                );
             }
             body
         }
@@ -2265,6 +2287,31 @@ mod tests {
             ("delegate_module_cache_total_bytes", 23),
             ("delegate_module_cache_budget_bytes", 29),
             ("delegate_module_cache_evictions_total", 31),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the capability-relative hosting-budget gauges (#4642 A2) must also
+    /// reach the hand-mirrored OTLP body — same footgun as the gauges above. A
+    /// silent drop would re-blind us to whether the RAM-scaled budget keeps a
+    /// small box off the #4565 OOM path (the whole point of instrumenting A2).
+    #[test]
+    fn router_snapshot_json_includes_hosting_budget_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_budget_bytes = Some(257);
+        info.hosting_current_bytes = Some(263);
+        info.hosting_contract_count = Some(269);
+        info.hosting_budget_evictions_total = Some(271);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hosting_budget_bytes", 257),
+            ("hosting_current_bytes", 263),
+            ("hosting_contract_count", 269),
+            ("hosting_budget_evictions_total", 271),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

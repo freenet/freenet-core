@@ -1111,9 +1111,10 @@ pub const MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 ///   canonical case: `total_ram / 8` is ~15 GiB, so the *only* thing capping
 ///   its default cache was this clamp, and 384 MiB was well below its working
 ///   set. 1.5 GiB holds ~1000 modules at the measured size — comfortably above
-///   a healthy gateway's hot set — and matches the 1 GiB default hosted-*state*
-///   budget (`ring::DEFAULT_HOSTING_BUDGET_BYTES`): a node allowed ~1 GiB of
-///   contract state should be able to cache the corresponding compiled code.
+///   a healthy gateway's hot set — and matches the ceiling of the RAM-scaled
+///   hosted-*state* budget (`ring::MAX_DEFAULT_HOSTING_BUDGET_BYTES`, 1 GiB):
+///   a node allowed ~1 GiB of contract state should be able to cache the
+///   corresponding compiled code.
 /// - **Too high → wasted memory on huge hosts.** Past ~1000 resident modules
 ///   the working-set benefit flattens while absolute memory cost keeps rising.
 ///   Without a ceiling, `total_ram / 8` would default a 125 GiB box to a

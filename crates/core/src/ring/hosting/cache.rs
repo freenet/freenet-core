@@ -17,17 +17,98 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::util::time_source::TimeSource;
+use crate::wasm_runtime::read_total_ram_bytes;
 
-/// Default hosting storage budget (1 GiB).
+/// Lower clamp for the RAM-scaled default hosting budget (128 MiB).
+///
+/// Even a genuinely tiny host should still be able to host a useful amount of
+/// contract state. The budget tracks on-disk **state** bytes (not RSS), so this
+/// floor is a disk allowance, not a memory reservation.
+pub const MIN_DEFAULT_HOSTING_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Upper clamp for the RAM-scaled default hosting budget (1 GiB).
+///
+/// Equal to the historical flat default, on purpose: a host with ample RAM
+/// (>= 8 GiB at the current divisor) resolves to exactly the previous 1 GiB
+/// budget and sees NO behavior change. Only memory-constrained hosts get a
+/// smaller, proportional budget. This makes the capability-relative default a
+/// pure "small boxes get less" change (addresses #4565, gateway RSS -> OOM on
+/// small boxes) rather than a budget increase for anyone.
+pub const MAX_DEFAULT_HOSTING_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Fraction of total system RAM used to size the default hosting budget: 1/8.
+///
+/// Mirrors the module cache's `DEFAULT_MODULE_CACHE_RAM_DIVISOR`. The divisor —
+/// NOT the `MAX` ceiling — is the small-box protection (#4441): the fix that
+/// replaced the flat budget must itself never OOM a small box, so the budget
+/// scales DOWN with RAM below the ceiling instead of being a fixed
+/// count/constant. 1/8 leaves the other 7/8 of RAM for the rest of the node
+/// (state store, module caches, transport buffers, WASM arenas, the OS).
+const DEFAULT_HOSTING_BUDGET_RAM_DIVISOR: u64 = 8;
+
+/// Fallback total-RAM estimate (1 GiB) when the OS query fails. Conservative:
+/// at 1 GiB the divisor yields 128 MiB (the floor), so an unknown-RAM host gets
+/// the smallest sane budget rather than the max.
+const FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Default hosting-storage budget, scaled to the memory the node may use.
+///
+/// Replaces the historical flat 1 GiB default. Returns
+/// `clamp(total_ram / DEFAULT_HOSTING_BUDGET_RAM_DIVISOR,
+/// MIN_DEFAULT_HOSTING_BUDGET_BYTES, MAX_DEFAULT_HOSTING_BUDGET_BYTES)`
+/// (currently `clamp(total_ram / 8, 128 MiB, 1 GiB)`), where `total_ram` is
+/// `min(host RAM, cgroup limit)` from the SAME single source
+/// [`crate::wasm_runtime::read_total_ram_bytes`] that sizes the module cache and
+/// the A1 resource-utilization telemetry — so the node has one notion of "how
+/// much memory do I have".
 ///
 /// This is the single source of truth for the default budget: the operator-
 /// facing `config::default_max_hosting_storage()` resolves to it (re-exported
-/// via `ring::hosting::DEFAULT_HOSTING_BUDGET_BYTES`).
+/// via `ring::hosting`). The operator override
+/// (`--max-hosting-storage` / `max_hosting_storage` config / env) always wins
+/// when explicitly set; only this DEFAULT is RAM-scaled.
 ///
 /// The budget tracks hosted contract **state** bytes only. WASM code blobs and
 /// ReDb/SQLite database overhead are additional and not counted against it, so
 /// this is not a hard bound on total on-disk usage.
-pub const DEFAULT_HOSTING_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+pub fn default_hosting_budget_bytes() -> u64 {
+    let total_ram = read_total_ram_bytes()
+        .map(|v| v as u64)
+        .unwrap_or(FALLBACK_TOTAL_RAM_BYTES);
+    budget_for_ram(total_ram)
+}
+
+/// Pure clamp math behind [`default_hosting_budget_bytes`], split out so the
+/// small-box / large-box boundary behavior is unit-testable without depending
+/// on the test host's real RAM. Returns the hosting-cache byte budget for a
+/// host with `total_ram` bytes of usable memory.
+fn budget_for_ram(total_ram: u64) -> u64 {
+    (total_ram / DEFAULT_HOSTING_BUDGET_RAM_DIVISOR).clamp(
+        MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+        MAX_DEFAULT_HOSTING_BUDGET_BYTES,
+    )
+}
+
+/// Point-in-time hosting-cache resource gauges for per-node telemetry.
+///
+/// Aggregate scalars only (never per-contract), emitted on the existing
+/// `RouterSnapshot` cadence so the capability-relative budget's behavior is
+/// observable in production (design principle: instrumentation is horizontal —
+/// see `docs/design/hosting-eviction.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostingCacheStats {
+    /// Configured byte budget (the RAM-scaled default, or the operator override).
+    pub budget_bytes: u64,
+    /// Current tracked contract-state bytes. Headroom ratio is
+    /// `current_bytes / budget_bytes`, derived by the collector.
+    pub current_bytes: u64,
+    /// Number of contracts currently in the hosting cache.
+    pub contract_count: u64,
+    /// Monotonic count of contracts evicted specifically because the cache was
+    /// over budget. The collector differences it across the cadence to derive a
+    /// budget-triggered eviction rate.
+    pub budget_evictions_total: u64,
+}
 
 /// Multiplier for TTL relative to subscription renewal interval.
 /// Gives this many renewal attempts before eviction if renewals keep failing.
@@ -149,6 +230,11 @@ pub struct HostingCache<T: TimeSource> {
     lru_order: VecDeque<ContractKey>,
     /// Contract metadata indexed by key
     contracts: HashMap<ContractKey, HostedContract>,
+    /// Monotonic count of contracts evicted because the cache was over budget.
+    /// Only `evict_over_budget` increments it, so it counts budget-triggered
+    /// evictions specifically (not TTL sweeps that found nothing over budget).
+    /// Exposed via [`HostingCache::stats`] for per-node telemetry.
+    budget_evictions_total: u64,
     /// Time source for testability
     time_source: T,
 }
@@ -162,6 +248,7 @@ impl<T: TimeSource> HostingCache<T> {
             min_ttl,
             lru_order: VecDeque::new(),
             contracts: HashMap::new(),
+            budget_evictions_total: 0,
             time_source,
         }
     }
@@ -202,6 +289,7 @@ impl<T: TimeSource> HostingCache<T> {
                     let generation = entry.write_generation;
                     self.contracts.remove(key);
                     self.current_bytes = self.current_bytes.saturating_sub(size);
+                    self.budget_evictions_total = self.budget_evictions_total.saturating_add(1);
                     evicted.push((*key, generation));
                     false
                 } else {
@@ -455,6 +543,17 @@ impl<T: TimeSource> HostingCache<T> {
     #[allow(dead_code)] // Public API for introspection
     pub fn budget_bytes(&self) -> u64 {
         self.budget_bytes
+    }
+
+    /// Snapshot the cache's aggregate resource gauges under a single read for
+    /// per-node telemetry. See [`HostingCacheStats`].
+    pub fn stats(&self) -> HostingCacheStats {
+        HostingCacheStats {
+            budget_bytes: self.budget_bytes,
+            current_bytes: self.current_bytes,
+            contract_count: self.contracts.len() as u64,
+            budget_evictions_total: self.budget_evictions_total,
+        }
     }
 
     /// Get all hosted contract keys in LRU order (oldest first).
@@ -1233,5 +1332,113 @@ mod tests {
         assert!(evicted.is_empty(), "no pressure → no eviction");
         assert!(cache.contains(&key1));
         assert!(cache.contains(&key2));
+    }
+
+    // --- Capability-relative default budget + telemetry (A2) ---
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// The default budget scales with the memory the node may use, clamped to a
+    /// sane floor/ceiling: `clamp(total_ram / 8, 128 MiB, 1 GiB)`.
+    #[test]
+    fn budget_for_ram_scales_and_clamps() {
+        // Tiny box: total_ram / 8 is below the floor -> clamped up to MIN.
+        assert_eq!(budget_for_ram(512 * MIB), MIN_DEFAULT_HOSTING_BUDGET_BYTES);
+        assert_eq!(budget_for_ram(GIB), MIN_DEFAULT_HOSTING_BUDGET_BYTES);
+
+        // Mid-range boxes scale linearly with RAM. The #4565 target: a 2 GiB VM
+        // gets 256 MiB, far below the old flat 1 GiB, so it stops accumulating
+        // hosted state toward OOM.
+        assert_eq!(budget_for_ram(2 * GIB), 256 * MIB);
+        assert_eq!(budget_for_ram(4 * GIB), 512 * MIB);
+
+        // Ample-RAM box (>= 8 GiB) hits the ceiling, which equals the historical
+        // flat default, so large gateways see NO change.
+        assert_eq!(budget_for_ram(8 * GIB), MAX_DEFAULT_HOSTING_BUDGET_BYTES);
+        assert_eq!(budget_for_ram(128 * GIB), MAX_DEFAULT_HOSTING_BUDGET_BYTES);
+    }
+
+    /// #4441 shape guard: the budget is RAM-SCALED, not a fixed count/constant.
+    /// The old fixed >1024-contract cap was removed because it thrashed/OOM'd;
+    /// the replacement budget must vary with RAM in the scaling band, and a
+    /// memory-constrained box must get strictly LESS than a large one (and less
+    /// than the old flat 1 GiB default).
+    #[test]
+    fn budget_for_ram_is_ram_scaled_not_fixed() {
+        let small = budget_for_ram(2 * GIB);
+        let large = budget_for_ram(6 * GIB);
+        assert!(
+            small < large,
+            "budget must vary with RAM within the band, got small={small} large={large}"
+        );
+        assert!(
+            small < MAX_DEFAULT_HOSTING_BUDGET_BYTES,
+            "a memory-constrained box must get less than the old flat 1 GiB default"
+        );
+        // Genuinely a function of RAM, not a constant: distinct in-band inputs
+        // give distinct budgets.
+        assert_ne!(budget_for_ram(2 * GIB), budget_for_ram(3 * GIB));
+        assert_ne!(budget_for_ram(3 * GIB), budget_for_ram(4 * GIB));
+    }
+
+    /// The real resolved default always lands within the documented clamp,
+    /// whatever RAM the test host has.
+    #[test]
+    fn default_hosting_budget_within_clamp() {
+        let b = default_hosting_budget_bytes();
+        assert!(
+            (MIN_DEFAULT_HOSTING_BUDGET_BYTES..=MAX_DEFAULT_HOSTING_BUDGET_BYTES).contains(&b),
+            "default {b} must be within [{}, {}]",
+            MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+            MAX_DEFAULT_HOSTING_BUDGET_BYTES,
+        );
+    }
+
+    /// The budget-triggered eviction counter increments once per over-budget
+    /// eviction and is surfaced via `stats()`; a TTL-protected or no-pressure
+    /// cache leaves it untouched. This is the telemetry A2 ships to observe its
+    /// own eviction rate.
+    #[test]
+    fn test_budget_eviction_counter_tracks_over_budget_evictions() {
+        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+        let key3 = make_key(3);
+
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| false);
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| false);
+        assert_eq!(cache.stats().budget_evictions_total, 0);
+
+        // Over budget but every entry is under TTL: no budget eviction yet.
+        cache.record_access(key3, 100, AccessType::Get, 0, |_| false);
+        assert_eq!(
+            cache.stats().budget_evictions_total,
+            0,
+            "TTL-protected entries must not count as budget evictions"
+        );
+
+        // Past TTL: a sweep now evicts the single over-budget entry.
+        time.advance_time(Duration::from_secs(61));
+        let evicted = cache.sweep_expired(|_| false);
+        assert_eq!(
+            evicted.len(),
+            1,
+            "one 100-byte entry brings 300 back to 200"
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.budget_evictions_total, 1);
+        assert_eq!(stats.current_bytes, 200);
+        assert_eq!(stats.contract_count, 2);
+        assert_eq!(stats.budget_bytes, 200);
+
+        // No pressure now (at budget): the counter is unchanged.
+        let evicted = cache.sweep_expired(|_| false);
+        assert!(evicted.is_empty(), "at budget -> no further eviction");
+        assert_eq!(
+            cache.stats().budget_evictions_total,
+            1,
+            "counter must not advance with no budget pressure"
+        );
     }
 }
