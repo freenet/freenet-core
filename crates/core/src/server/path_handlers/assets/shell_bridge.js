@@ -34,36 +34,139 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // independent barrier.
   var hostedNoToken = hostedMode === true && !userToken;
   if (hostedNoToken) {
-    var msg = document.createElement('div');
-    msg.setAttribute('role', 'alert');
-    msg.style.cssText =
-      'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;' +
-      'padding:2rem;font:16px/1.5 system-ui,sans-serif;color:#1a1a1a;' +
-      'background:#fff;text-align:center;box-sizing:border-box;';
+    // The token is missing for one of three reasons; tailor the guidance so
+    // the user can actually recover instead of hitting a dead end (#4645).
+    // `window.origin` serializes to the string "null" for an opaque
+    // (sandboxed) origin, which is the tell-tale of the DOMINANT case: this
+    // page was opened as a NEW TAB/WINDOW from inside a Freenet app (the
+    // browser's "open link in new tab", a middle-click, a right-click menu,
+    // window.open, or a target=_blank link). Such a context inherits the app
+    // iframe's sandbox, so it has an opaque origin, so localStorage throws and
+    // the per-user token can't be read. Re-opening the SAME address as a
+    // normal top-level tab gets a real origin and works. The other two cases
+    // (served over plain http, or storage genuinely disabled) can't be fixed
+    // by re-opening, so they get their own guidance.
+    var opaqueOrigin = window.origin === 'null';
+    var plaintext = location.protocol !== 'https:';
+    // Plaintext is the HARD blocker: over http the token is never minted or
+    // transmitted (SHELL_USER_TOKEN_JS refuses), so re-opening in a normal tab
+    // still fails until the connection is https. So when the page is served
+    // insecurely that guidance wins even if the tab is ALSO a sandboxed popup.
+    // Only a SECURE sandboxed tab is recoverable by re-opening, so that is the
+    // one case that gets the "open in a normal tab" copy-URL affordance.
+    var reopenCase = opaqueOrigin && !plaintext;
+    var panel = document.createElement('div');
+    panel.setAttribute('role', 'alert');
+    panel.style.cssText =
+      'position:fixed;inset:0;display:flex;align-items:center;' +
+      'justify-content:center;padding:2rem;box-sizing:border-box;' +
+      'font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;' +
+      'color:#1a1a1a;background:#fff;';
     var inner = document.createElement('div');
-    inner.style.maxWidth = '32rem';
+    inner.style.cssText = 'max-width:34rem;width:100%;text-align:left;';
     var h = document.createElement('h1');
     h.style.cssText = 'font-size:1.25rem;margin:0 0 0.75rem;';
-    h.textContent = 'Per-user isolation unavailable';
-    var p = document.createElement('p');
-    // Generic wording: the token may be missing because of a plaintext (http)
-    // connection OR because browser storage is unavailable. Both disable
-    // per-user isolation, so the app must not load in either case.
-    p.textContent =
-      'This hosted Freenet node requires HTTPS and browser storage for ' +
-      'per-user data isolation. Because that is unavailable here, the app ' +
-      'will not load. Reconnect using an https:// address in a browser with ' +
-      'storage enabled.';
+    var lead = document.createElement('p');
+    lead.style.cssText = 'margin:0 0 1rem;';
+    if (plaintext) {
+      h.textContent = 'Secure connection required';
+      lead.textContent =
+        'This hosted Freenet node needs an https:// connection to protect ' +
+        'your per-user access key, so the app won’t load over plain ' +
+        'http. Reconnect using the https:// address.';
+    } else if (opaqueOrigin) {
+      h.textContent = 'Open this app in a normal tab';
+      lead.textContent =
+        'This page opened in a new tab or window from inside a Freenet app ' +
+        '(for example via "open link in new tab", a middle-click, or a ' +
+        'right-click menu). Tabs opened that way run in a restricted mode ' +
+        'that can’t reach the access key this hosted node uses to keep ' +
+        'your data separate, so the app won’t load here.';
+    } else {
+      h.textContent = 'Browser storage required';
+      lead.textContent =
+        'This hosted Freenet node keeps a per-user access key in your ' +
+        'browser to keep your data separate, but storage is unavailable ' +
+        'here (it can be blocked in private-browsing mode or by browser ' +
+        'settings). Enable storage for this site, or use a different ' +
+        'browser, then reload.';
+    }
     inner.appendChild(h);
-    inner.appendChild(p);
-    msg.appendChild(inner);
+    inner.appendChild(lead);
+    // For the secure restricted-tab case, re-opening the same address in a
+    // normal tab is the fix, so surface the URL with a one-click copy. We
+    // deliberately do NOT offer a "retry" button that re-opens the app in a
+    // popup: a popup spawned from this (already sandboxed) context would
+    // inherit the sandbox again and hit the exact same dead end, so the user
+    // must open a fresh top-level tab themselves. (Gated on reopenCase, not
+    // opaqueOrigin, so an http+sandboxed page doesn't offer to re-open a URL
+    // that still can't mint a token — see the plaintext heading above.)
+    if (reopenCase) {
+      var howto = document.createElement('p');
+      howto.style.cssText = 'margin:0 0 0.5rem;';
+      howto.textContent =
+        'To continue, open this address in a normal browser tab ' +
+        '(one you start yourself, e.g. Ctrl/Cmd+T, then paste):';
+      inner.appendChild(howto);
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:0.5rem;flex-wrap:wrap;';
+      var field = document.createElement('input');
+      field.type = 'text';
+      field.readOnly = true;
+      field.value = location.href;
+      field.style.cssText =
+        'flex:1 1 16rem;min-width:0;padding:0.5rem 0.6rem;' +
+        'font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;' +
+        'border:1px solid #ccc;border-radius:6px;color:#1a1a1a;background:#fafafa;';
+      field.addEventListener('focus', function () {
+        field.select();
+      });
+      field.addEventListener('click', function () {
+        field.select();
+      });
+      var copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.textContent = 'Copy address';
+      copyBtn.style.cssText =
+        'padding:0.5rem 0.9rem;border:1px solid #2563eb;border-radius:6px;' +
+        'background:#2563eb;color:#fff;font:14px system-ui,sans-serif;' +
+        'cursor:pointer;';
+      var status = document.createElement('span');
+      status.setAttribute('role', 'status');
+      status.style.cssText = 'align-self:center;font-size:13px;color:#4b5563;';
+      copyBtn.addEventListener('click', function () {
+        function fallback() {
+          field.select();
+          status.textContent = 'Press Ctrl/Cmd+C to copy';
+        }
+        // navigator.clipboard is often unavailable or rejects in a sandboxed
+        // (opaque-origin) context, so always keep the select-and-Ctrl+C path.
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(location.href).then(
+            function () {
+              status.textContent = 'Copied';
+            },
+            function () {
+              fallback();
+            },
+          );
+        } else {
+          fallback();
+        }
+      });
+      row.appendChild(field);
+      row.appendChild(copyBtn);
+      inner.appendChild(row);
+      inner.appendChild(status);
+    }
+    panel.appendChild(inner);
     // Remove the (not-yet-loaded, data-src) iframe and show the message. The
     // iframe never had its .src set, so the app never started.
     if (iframe && iframe.parentNode) {
       iframe.parentNode.removeChild(iframe);
     }
-    document.body.appendChild(msg);
-    document.title = 'Freenet — isolation unavailable';
+    document.body.appendChild(panel);
+    document.title = 'Freenet: app not loaded here';
     // Keep listening for iframe messages purely so the WS-open handler can
     // return an 'error' to any app that somehow loaded; but we never set
     // iframe.src, so in practice nothing runs. Fall through to install the

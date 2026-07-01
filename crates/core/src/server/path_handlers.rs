@@ -3406,6 +3406,86 @@ mod tests {
         );
     }
 
+    /// Regression test for #4645: the hosted fail-closed page must give the
+    /// user an ACTIONABLE recovery path, not a dead end.
+    ///
+    /// The dominant real-world trigger is opening a Freenet app link as a NEW
+    /// TAB/WINDOW from inside the sandboxed app iframe (the browser's "open
+    /// link in new tab", a middle-click, a right-click menu, `window.open`, or
+    /// a `target=_blank` link). Such a context inherits the iframe sandbox, so
+    /// it has an opaque origin (`window.origin === 'null'`), so `localStorage`
+    /// throws and the per-user token can't be read — and the shell fails
+    /// closed. The pre-#4645 page only said "reconnect using https / enable
+    /// storage", which is useless for that case: the tab already IS https with
+    /// storage; the opaque origin is what blocks it. The page must instead
+    /// detect the opaque-origin case and tell the user to re-open the address
+    /// in a normal tab, surfacing the URL for one-click copy.
+    #[test]
+    fn fail_closed_page_gives_actionable_recovery_4645() {
+        // Detects the opaque-origin (sandboxed new-tab) case. The tell-tale is
+        // `window.origin` serializing to the string "null" for an opaque
+        // origin (confirmed empirically against try.freenet.org).
+        assert!(
+            SHELL_BRIDGE_JS.contains("window.origin === 'null'"),
+            "fail-closed page must detect the opaque-origin (sandboxed new-tab) \
+             case so it can give the right recovery guidance (#4645)"
+        );
+        // The "open in a normal tab" recovery only helps on a SECURE connection:
+        // over http even a fresh tab can't mint a token (SHELL_USER_TOKEN_JS
+        // refuses), so the https guidance must win when a page is BOTH sandboxed
+        // and plaintext. Pin that the reopen affordance is gated on
+        // `opaqueOrigin && !plaintext` rather than opaqueOrigin alone (Codex P3).
+        assert!(
+            SHELL_BRIDGE_JS.contains("opaqueOrigin && !plaintext"),
+            "the re-open recovery must be gated on a secure connection, so an \
+             http+sandboxed page is told to use https rather than to re-open a \
+             URL that still can't mint a token"
+        );
+        // For that case it surfaces the current URL so the user can re-open it
+        // in a normal top-level tab (where a real origin lets the token mint).
+        assert!(
+            SHELL_BRIDGE_JS.contains("field.value = location.href"),
+            "fail-closed page must surface the page URL for the user to re-open"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("Copy address"),
+            "fail-closed page must offer a one-click copy of the address"
+        );
+        // The three distinct causes (opaque-origin restricted tab, plain http,
+        // storage disabled) get distinct headings so the guidance actually
+        // matches the situation rather than blaming https/storage for all.
+        assert!(
+            SHELL_BRIDGE_JS.contains("Open this app in a normal tab")
+                && SHELL_BRIDGE_JS.contains("Secure connection required")
+                && SHELL_BRIDGE_JS.contains("Browser storage required"),
+            "fail-closed page must tailor its heading to each of the three causes"
+        );
+        // Anti-footgun: the fail-closed block must NOT try to re-open the app
+        // via `window.open` — a popup opened from this already-sandboxed context
+        // inherits the sandbox and hits the exact same dead end. Recovery is the
+        // user opening a fresh top-level tab themselves. (The bridge does call
+        // window.open legitimately in the open_url handler far below, so scope
+        // the check to the fail-closed rendering block.)
+        let block_start = SHELL_BRIDGE_JS
+            .find("if (hostedNoToken) {")
+            .expect("fail-closed block present");
+        // Anchor the block end on CODE from the normal (non-fail-closed) load
+        // branch rather than a comment, so a future comment reword can't
+        // silently move the boundary. `iframe.getAttribute('data-src')` is the
+        // first statement of the else branch and never appears in the
+        // fail-closed block.
+        let block_end = SHELL_BRIDGE_JS[block_start..]
+            .find("iframe.getAttribute('data-src')")
+            .expect("fail-closed block is followed by the normal iframe-load branch")
+            + block_start;
+        let fail_closed_block = &SHELL_BRIDGE_JS[block_start..block_end];
+        assert!(
+            !fail_closed_block.contains("window.open("),
+            "fail-closed recovery must not call window.open (a popup from this \
+             sandboxed context inherits the sandbox and re-hits the dead end)"
+        );
+    }
+
     /// Non-hosted mode must NEVER reach the fail-closed path: the bridge is
     /// called with one argument, so `hostedMode` is undefined and the whole
     /// hostedNoToken branch is inert — the app loads and connects over http
