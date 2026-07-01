@@ -2171,6 +2171,23 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_budget_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_budget_evictions_total),
                 );
+                // Demand-ordered eviction gauges (#4642 A3). Same
+                // hand-mirrored footgun as the A2 gauges above: a new
+                // `RouterSnapshotInfo` field is invisible to the collector unless
+                // added here. Pinned by
+                // `router_snapshot_json_includes_hosting_fuel_gauge_gauges`.
+                obj.insert(
+                    "hosting_evictions_of_recently_read_total".to_string(),
+                    serde_json::json!(snapshot.hosting_evictions_of_recently_read_total),
+                );
+                obj.insert(
+                    "hosting_local_hits_total".to_string(),
+                    serde_json::json!(snapshot.hosting_local_hits_total),
+                );
+                obj.insert(
+                    "hosting_local_misses_total".to_string(),
+                    serde_json::json!(snapshot.hosting_local_misses_total),
+                );
             }
             body
         }
@@ -2360,6 +2377,30 @@ mod tests {
             ("hosting_current_bytes", 263),
             ("hosting_contract_count", 269),
             ("hosting_budget_evictions_total", 271),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the demand-ordered eviction gauges (#4642 A3) must
+    /// also reach the hand-mirrored OTLP body — same footgun as the A2 gauges. A
+    /// silent drop would re-blind us to the #4338 miscalibration signal
+    /// (evicting repeatedly-read contracts) and the local hit-rate, the whole
+    /// point of instrumenting A3.
+    #[test]
+    fn router_snapshot_json_includes_hosting_fuel_gauge_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_evictions_of_recently_read_total = Some(277);
+        info.hosting_local_hits_total = Some(281);
+        info.hosting_local_misses_total = Some(283);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hosting_evictions_of_recently_read_total", 277),
+            ("hosting_local_hits_total", 281),
+            ("hosting_local_misses_total", 283),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

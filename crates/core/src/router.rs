@@ -205,6 +205,19 @@ pub(crate) struct RouterSnapshotInfo {
     pub hosting_current_bytes: Option<u64>,
     pub hosting_contract_count: Option<u64>,
     pub hosting_budget_evictions_total: Option<u64>,
+    /// Demand-ordered eviction gauges (#4642 A3), populated by
+    /// `Ring` from the `HostingManager` on the snapshot cadence.
+    /// `hosting_evictions_of_recently_read_total` is the #4338 miscalibration
+    /// signal (evictions whose victim had genuine repeat demand);
+    /// `hosting_local_hits_total` / `hosting_local_misses_total` are the local
+    /// hit-rate, counted at the actual serve-vs-forward decision in the client
+    /// GET handler (`client_events`) — a hit is a client GET answered from local
+    /// hosted state, a miss is one routed to the network — NOT a cache-membership
+    /// proxy. All monotonic counters the collector differences into rates.
+    /// `None` until the ring is built. Per-node aggregate scalars.
+    pub hosting_evictions_of_recently_read_total: Option<u64>,
+    pub hosting_local_hits_total: Option<u64>,
+    pub hosting_local_misses_total: Option<u64>,
     /// Interest-weighted (two-tier) module-cache SHADOW gauges (#4441/#4534),
     /// populated by `Ring` from the same per-node `ModuleCacheMetrics` `Arc`.
     /// These are ALWAYS ON, independent of the `FREENET_MODULE_CACHE_INTEREST_TIERED`
@@ -1105,6 +1118,11 @@ impl Router {
             hosting_current_bytes: None,
             hosting_contract_count: None,
             hosting_budget_evictions_total: None,
+            // Demand-ordered eviction gauges, populated by Ring
+            // on the snapshot cadence (#4642 A3).
+            hosting_evictions_of_recently_read_total: None,
+            hosting_local_hits_total: None,
+            hosting_local_misses_total: None,
             // Interest-weighted (two-tier) module-cache shadow gauges,
             // populated by Ring on the snapshot cadence (#4441/#4534).
             contract_module_cache_cold_evictable_bytes: None,

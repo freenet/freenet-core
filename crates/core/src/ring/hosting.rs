@@ -30,6 +30,7 @@
 //! - TTL protects recently accessed contracts from premature eviction
 
 mod cache;
+mod demand;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
@@ -50,13 +51,16 @@ use cache::{DEFAULT_MIN_TTL, HostingCache, HostingCacheStats};
 #[cfg(test)]
 pub(crate) use cache::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
 use dashmap::{DashMap, DashSet};
+use demand::ProximityPrior;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{debug, info};
 
+use super::Location;
 use super::interest::PeerKey;
 
 // =============================================================================
@@ -211,9 +215,32 @@ pub(crate) struct HostingManager {
     /// Prevents hosting cache eviction while client subscriptions exist.
     client_subscriptions: DashMap<ContractInstanceId, HashSet<crate::client_events::ClientId>>,
 
-    /// Unified hosting cache with byte-budget LRU and TTL protection.
-    /// This is the single source of truth for which contracts we're hosting.
+    /// Unified hosting cache with byte-budget demand-ordered eviction ("fuel
+    /// gauge") and TTL protection. This is the single source of truth for which
+    /// contracts we're hosting.
     hosting_cache: RwLock<HostingCache<InstantTimeSrc>>,
+
+    /// Proximity-prior demand estimator (A3, freenet/freenet-core#4642). Maps a
+    /// contract's ring distance from this peer to a predicted read rate, used as
+    /// the `predicted_demand` term in the demand-ordered `keep_score`. Trained
+    /// from this peer's own observed read rates; see [`demand::ProximityPrior`].
+    demand_estimator: RwLock<ProximityPrior>,
+
+    /// This peer's own ring location, pushed in by `Ring` on the snapshot
+    /// cadence (`set_own_location`). `None` until the node has learned its
+    /// location, in which case demand falls back to neutral (eviction degrades
+    /// to Greedy-Dual floor + recency). The estimator needs it to turn a
+    /// contract key into a distance.
+    own_location: RwLock<Option<Location>>,
+
+    /// Local-client GET hit-rate counters (#4642 A3 instrumentation). Driven by
+    /// the actual serve-vs-forward DECISION in the client GET handler
+    /// (`client_events`), not by cache membership: `local_get_serves` counts
+    /// client GETs answered from local hosted state; `local_get_forwards` counts
+    /// those routed to the network. The collector derives the hit-rate as
+    /// `serves / (serves + forwards)`. Monotonic per-node scalars.
+    local_get_serves: AtomicU64,
+    local_get_forwards: AtomicU64,
 
     /// Downstream peers subscribed to contracts we host, with lease timestamps.
     /// Drives `should_unsubscribe_upstream()` decisions.
@@ -302,6 +329,10 @@ impl HostingManager {
                 DEFAULT_MIN_TTL,
                 InstantTimeSrc::new(),
             )),
+            demand_estimator: RwLock::new(ProximityPrior::new()),
+            own_location: RwLock::new(None),
+            local_get_serves: AtomicU64::new(0),
+            local_get_forwards: AtomicU64::new(0),
             downstream_subscribers: DashMap::new(),
             time_source: InstantTimeSrc::new(),
             pending_subscription_requests: DashSet::new(),
@@ -1026,6 +1057,52 @@ impl HostingManager {
     // Hosting Cache Management
     // =========================================================================
 
+    /// Update this peer's own ring location, used to turn a contract key into a
+    /// distance for the proximity-prior demand estimate. Pushed by `Ring` on the
+    /// snapshot cadence (`own_location()` can be `None` early in a node's life,
+    /// so callers should only push a known location).
+    pub(crate) fn set_own_location(&self, location: Location) {
+        *self.own_location.write() = Some(location);
+    }
+
+    /// Record that a local-client GET was answered from local hosted state (a
+    /// hit). Counted at the actual serve decision in the client GET handler, not
+    /// by cache membership, so the hit-rate metric reflects real serves. (#4642 A3)
+    pub(crate) fn record_local_get_serve(&self) {
+        self.local_get_serves.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a local-client GET was routed to the network (a miss/forward).
+    /// Counterpart to [`record_local_get_serve`](Self::record_local_get_serve).
+    pub(crate) fn record_local_get_forward(&self) {
+        self.local_get_forwards.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Monotonic count of local-client GETs served from local hosted state.
+    pub(crate) fn local_get_serves(&self) -> u64 {
+        self.local_get_serves.load(Ordering::Relaxed)
+    }
+
+    /// Monotonic count of local-client GETs routed to the network.
+    pub(crate) fn local_get_forwards(&self) -> u64 {
+        self.local_get_forwards.load(Ordering::Relaxed)
+    }
+
+    /// Ring distance from this peer to `key`, and the proximity-prior demand at
+    /// that distance. Returns `(None, NEUTRAL_DEMAND)` when this peer's own
+    /// location is not yet known — demand degrades to neutral, so eviction falls
+    /// back to Greedy-Dual floor + recency ordering (still demand-aware via the
+    /// read-refresh floor, just without distance weighting).
+    fn distance_and_demand(&self, key: &ContractKey) -> (Option<f64>, f64) {
+        let own = *self.own_location.read();
+        let distance = own.map(|loc| loc.distance(Location::from(key)).as_f64());
+        let demand = match distance {
+            Some(d) => self.demand_estimator.read().predict(d),
+            None => demand::NEUTRAL_DEMAND,
+        };
+        (distance, demand)
+    }
+
     /// Record a contract access in the hosting cache.
     ///
     /// This is the main entry point for adding contracts to the hosting cache.
@@ -1061,13 +1138,28 @@ impl HostingManager {
         // refreshed by the subsequent `record_contract_access` from that
         // write path.
         let current_generation = self.state_generation(&key);
-        let result = self.hosting_cache.write().record_access(
+
+        // Demand-ordered eviction (A3): predict this contract's read-demand from its
+        // ring distance to us via the proximity prior. The read guard is dropped
+        // before the hosting-cache write lock is taken (no nested lock order).
+        let (distance, predicted_demand) = self.distance_and_demand(&key);
+
+        let result = self.hosting_cache.write().record_access_with_demand(
             key,
             size_bytes,
             access_type,
             current_generation,
+            predicted_demand,
             |k: &ContractKey| self.contract_in_use(k),
         );
+
+        // Train the proximity prior from this peer's own observed read rate for
+        // the accessed contract (only reads yield a sample; PUT is a seed). The
+        // estimator is trained on the aggregate distance -> rate relationship;
+        // the per-contract blend is A4. Cache lock already dropped.
+        if let (Some(d), Some(rate)) = (distance, result.observed_read_rate) {
+            self.demand_estimator.write().observe(d, rate);
+        }
 
         // Persist hosting metadata for the accessed contract
         if let Some(storage) = self.storage.read().as_ref() {
@@ -1338,11 +1430,25 @@ impl HostingManager {
         self.hosting_cache.read().has_local_client_access(key)
     }
 
-    /// Touch a contract in the hosting cache (refresh TTL without adding).
+    /// Touch a contract in the hosting cache (refresh demand without adding).
     ///
-    /// Called when a user GET serves a hosted contract from local cache.
+    /// Called when a user GET serves a hosted contract from local cache — the
+    /// dominant read path for hot contracts. Trains the proximity prior from the
+    /// observed local-serve read rate (A3), the same way `record_contract_access`
+    /// does for network GETs, so the prior is not blind to the reads it is meant
+    /// to model. The cache write lock is dropped before the estimator write lock
+    /// (no nested lock order), matching `record_contract_access`.
     pub fn touch_hosting(&self, key: &ContractKey) {
-        self.hosting_cache.write().touch(key);
+        let observed_read_rate = self.hosting_cache.write().touch(key);
+        if let Some(rate) = observed_read_rate {
+            let distance = {
+                let own = *self.own_location.read();
+                own.map(|loc| loc.distance(Location::from(key)).as_f64())
+            };
+            if let Some(d) = distance {
+                self.demand_estimator.write().observe(d, rate);
+            }
+        }
     }
 
     /// Sweep for expired entries in the hosting cache.
@@ -2013,6 +2119,109 @@ mod tests {
         assert_eq!(
             default_manager.hosting_budget_bytes(),
             default_hosting_budget_bytes()
+        );
+    }
+
+    /// The demand path (A3): once the manager knows its own ring location, a
+    /// repeated read of a contract trains the proximity prior with a
+    /// `(distance, rate)` sample, and `distance_and_demand` yields a distance +
+    /// a finite, non-negative demand. Without a known location, demand is
+    /// neutral and no distance is available (eviction degrades to floor + LRU).
+    #[test]
+    fn test_demand_estimator_trains_from_repeated_reads() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(1);
+
+        // No own-location yet: no distance, neutral demand, no training.
+        let (dist, demand) = manager.distance_and_demand(&key);
+        assert!(dist.is_none(), "distance unknown until own location is set");
+        assert_eq!(demand, demand::NEUTRAL_DEMAND);
+        assert_eq!(manager.demand_estimator.read().len(), 0);
+
+        // Learn our location, then read the contract twice. The second read has
+        // non-zero residency (floored at 1s), so it yields a training sample.
+        manager.set_own_location(Location::new(0.5));
+        manager.record_contract_access(key, 1_000, AccessType::Get);
+        manager.record_contract_access(key, 1_000, AccessType::Get);
+
+        assert_eq!(
+            manager.demand_estimator.read().len(),
+            1,
+            "a repeated read must train the proximity prior with one sample"
+        );
+
+        let (dist, demand) = manager.distance_and_demand(&key);
+        assert!(dist.is_some(), "distance is known once own location is set");
+        assert!(
+            demand.is_finite() && demand >= 0.0,
+            "predicted demand must be finite and non-negative, got {demand}"
+        );
+    }
+
+    /// A PUT is a SEED at the manager level too: it must NOT feed the proximity
+    /// prior (only reads are demand). Regression guard against wiring PUT into
+    /// the training path.
+    #[test]
+    fn test_put_does_not_train_demand_estimator() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(1);
+        manager.set_own_location(Location::new(0.5));
+
+        manager.record_contract_access(key, 1_000, AccessType::Put);
+        manager.record_contract_access(key, 1_000, AccessType::Put);
+
+        assert_eq!(
+            manager.demand_estimator.read().len(),
+            0,
+            "PUT is a seed, not read-demand -- it must not train the prior"
+        );
+    }
+
+    /// Local-client GET hit-rate counters (#4642 A3) are driven by explicit
+    /// serve/forward signals from the client GET handler, not by cache
+    /// membership, and accumulate monotonically per node.
+    #[test]
+    fn test_local_get_hit_rate_counters() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        assert_eq!(manager.local_get_serves(), 0);
+        assert_eq!(manager.local_get_forwards(), 0);
+
+        manager.record_local_get_serve();
+        manager.record_local_get_serve();
+        manager.record_local_get_forward();
+
+        assert_eq!(manager.local_get_serves(), 2, "two local serves recorded");
+        assert_eq!(manager.local_get_forwards(), 1, "one forward recorded");
+    }
+
+    /// The local-serve path (`touch_hosting`) also trains the proximity prior, so
+    /// the dominant read path for hot contracts is not invisible to the estimator
+    /// (A3 — addresses the Codex/adversarial review finding that only network
+    /// refetches trained the prior).
+    #[test]
+    fn test_touch_hosting_trains_demand_estimator() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(1);
+        manager.set_own_location(Location::new(0.5));
+
+        // Host the contract (a new-entry insert yields no rate sample), then
+        // serve it locally: the touch has non-zero residency so it trains.
+        manager.record_contract_access(key, 1_000, AccessType::Get);
+        let before = manager.demand_estimator.read().len();
+        manager.touch_hosting(&key);
+        assert!(
+            manager.demand_estimator.read().len() > before,
+            "a local-serve touch must train the proximity prior"
+        );
+
+        // Touching an unhosted contract is a no-op and trains nothing.
+        let absent = make_contract_key(2);
+        let n = manager.demand_estimator.read().len();
+        manager.touch_hosting(&absent);
+        assert_eq!(
+            manager.demand_estimator.read().len(),
+            n,
+            "touching an absent contract must not train the prior"
         );
     }
 
