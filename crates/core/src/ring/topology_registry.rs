@@ -223,6 +223,14 @@ pub struct RenewalMetrics {
     /// interest-gated renewal keeps the subscription count bounded by active
     /// interest rather than by the number of hosts formed.
     pub chain_hosts_formed: u64,
+    /// Event-driven re-subscribes this node fired because an UPSTREAM peer
+    /// dropped (#4642 piece F). Each increment is one `run_renewal_subscribe`
+    /// spawned immediately on upstream-loss detection (after passing the shared
+    /// ban / backoff / dedup gates), rather than waiting for the periodic
+    /// renewal cycle. A `run_simulation_direct` test asserts this rises promptly
+    /// after crashing a node's upstream — the deterministic proof that recovery
+    /// is event-driven, not lease-timer-driven.
+    pub event_driven_resubscribes: u64,
 }
 
 static RENEWAL_METRICS_REGISTRY: LazyLock<DashMap<(String, SocketAddr), RenewalMetrics>> =
@@ -276,6 +284,18 @@ pub fn record_chain_host_formed(peer_addr: SocketAddr) {
     }
 }
 
+/// Record that this node fired an event-driven re-subscribe because an upstream
+/// peer dropped (#4642 piece F). No-op outside a simulation context (no current
+/// network name).
+pub fn record_event_driven_resubscribe(peer_addr: SocketAddr) {
+    if let Some(network_name) = get_current_network_name() {
+        RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default()
+            .event_driven_resubscribes += 1;
+    }
+}
+
 /// Get the renewal metrics for a specific peer in a network.
 pub fn get_renewal_metrics(network_name: &str, peer_addr: &SocketAddr) -> Option<RenewalMetrics> {
     RENEWAL_METRICS_REGISTRY
@@ -310,6 +330,7 @@ pub fn aggregate_renewal_metrics(network_name: &str) -> RenewalMetrics {
             // count), so the aggregate stays meaningful as "worst single-cycle
             // batch any node reached".
             acc.max_cycle_batch = acc.max_cycle_batch.max(entry.value().max_cycle_batch);
+            acc.event_driven_resubscribes += entry.value().event_driven_resubscribes;
             acc
         })
 }
