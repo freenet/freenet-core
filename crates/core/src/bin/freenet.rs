@@ -255,6 +255,15 @@ async fn run_network_node_with_signals(
         freenet::enable_fast_crash_exit_code();
     }
 
+    // #4604: this is the real node process, so let the contract storage layer
+    // exit-for-restart if redb gets poisoned by a transient I/O error (e.g. a disk
+    // EIO / filesystem csum failure). Without this the node stays "running" while
+    // every contract GET/PUT/UPDATE fails forever; with it, the supervisor restarts
+    // the node with a fresh database handle. The exit code reuses the fatal-listener
+    // decision above, so a database that re-poisons on every boot (persistent
+    // corruption) is bounded by the same crash-loop protection rather than looping.
+    freenet::enable_abort_on_redb_poison();
+
     // #4073 crash-loop auto-rollback: once this (possibly freshly auto-updated)
     // node has run healthily for the commit window, clear any post-update
     // probation marker so ordinary later crashes never trigger a rollback. The

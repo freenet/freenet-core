@@ -21,7 +21,7 @@ mod message;
 mod node;
 pub use node::{
     EventLoopExitReason, Node, ShutdownHandle, enable_abort_on_fatal_listener_exit,
-    enable_fast_crash_exit_code, run_local_node, run_network_node,
+    enable_abort_on_redb_poison, enable_fast_crash_exit_code, run_local_node, run_network_node,
 };
 
 /// Network operation/transaction state machines.
