@@ -13,6 +13,7 @@ use crate::{
     ring::{Location, PeerKeyLocation, RingError},
 };
 
+pub(crate) mod bootstrap;
 pub(crate) mod connect;
 pub(crate) mod get;
 pub(crate) mod op_ctx;

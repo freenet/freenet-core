@@ -23,6 +23,7 @@ use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{DeltaOrFullState, InterestMessage, NetMessage, NodeEvent, Transaction};
 use crate::node::OpManager;
 use crate::operations::OpError;
+use crate::operations::bootstrap::bootstrap_gateway_target;
 use crate::ring::{PeerKeyLocation, RingError};
 use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
 
@@ -218,6 +219,27 @@ async fn drive_client_update(
         op_manager
             .ring
             .closest_potentially_hosting(&key, [sender_addr].as_slice())
+            // Bootstrap fallback (#4361 / #4365): with an empty ring there
+            // is no routing candidate, so route the UPDATE via a configured
+            // gateway instead of handling it locally. In the hosting case
+            // the remote-target branch applies the update locally and
+            // forwards it to the gateway, so it actually propagates instead
+            // of broadcasting to an empty ring. In the not-hosting case the
+            // local apply fails with missing params and the existing
+            // auto-fetch + retry path primes the store from the gateway —
+            // far better than the flat NoHostingPeers a fresh node hits today.
+            .or_else(|| {
+                bootstrap_gateway_target(op_manager, |addr| addr == sender_addr).map(
+                    |(gateway, gateway_addr)| {
+                        tracing::info!(
+                            %key,
+                            gateway = %gateway_addr,
+                            "update: ring empty — target falls back to configured gateway"
+                        );
+                        gateway
+                    },
+                )
+            })
     };
 
     match target {
@@ -2087,6 +2109,40 @@ mod tests {
             src.contains("value: updated_value"),
             "RequestUpdate must use the post-merge updated_value, not the original \
              client update_data (mirrors legacy update.rs:2055)"
+        );
+    }
+
+    /// Source-grep pin (#4361 / #4365): the client UPDATE driver must
+    /// consult `bootstrap_gateway_target` when neither the proximity
+    /// cache nor `closest_potentially_hosting` yields a target, so a
+    /// freshly-bootstrapped node (empty ring) routes the UPDATE through a
+    /// configured gateway. In the hosting case this propagates the update
+    /// instead of applying it locally to no audience; in the not-hosting
+    /// case it lets the existing missing-params auto-fetch + retry path
+    /// prime the local store from the gateway rather than failing flat.
+    #[test]
+    fn drive_client_update_uses_bootstrap_gateway_fallback() {
+        // Brace-matched `extract_fn_body` over `production_source()` (not a
+        // `"\nasync fn "` EOF scan): the scan bounded this pin only by
+        // function ordering — if `drive_client_update` ever became the last
+        // top-level `async fn`, its "body" would run to EOF and swallow the
+        // test module (the defect that neutered the PUT streaming pin, #4635
+        // review). Brace-matching bounds it structurally instead.
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "async fn drive_client_update(");
+        assert!(
+            body.contains("bootstrap_gateway_target("),
+            "drive_client_update must fall back to bootstrap_gateway_target \
+             on an empty ring instead of applying locally to no audience or \
+             failing with NoHostingPeers (#4361 / #4365)"
+        );
+        // The exclusion predicate must skip this node's own address, matching
+        // the skip list passed to closest_potentially_hosting — not a no-op.
+        assert!(
+            body.contains("bootstrap_gateway_target(op_manager, |addr| addr == sender_addr)"),
+            "drive_client_update must exclude its own address (sender_addr) \
+             when selecting the bootstrap gateway (#4361 / #4365)"
         );
     }
 
