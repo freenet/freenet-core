@@ -1194,24 +1194,7 @@ where
         "PUT relay: processing Request"
     );
 
-    // ── Step 1: Store contract locally (all nodes cache) ────────────────────
-    // Originator-loopback (a local client's own PUT, mapped to
-    // upstream_addr=own_addr in dispatch) is ClientLocal so it lands in the
-    // reserved fair-queue lane; a genuine relay store stays NetworkRelay (#4534).
-    let store_priority = put_store_priority(op_manager, upstream_addr);
-    let merged_value = relay_put_store_locally(
-        op_manager,
-        incoming_tx,
-        key,
-        value.clone(),
-        &contract,
-        related_contracts.clone(),
-        htl,
-        store_priority,
-    )
-    .await?;
-
-    // ── Step 2: Build skip list + select next hop ──────────────────────────
+    // ── Step 1: Build skip list + select next hop ──────────────────────────
     let mut new_skip_list = skip_list;
     new_skip_list.insert(upstream_addr);
     if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
@@ -1226,18 +1209,21 @@ where
         None
     };
 
-    let (next_peer, next_addr) = match next_hop {
+    // ── Step 2: Decide terminus (finalize/host here) vs forward next hop ────
+    // `None` = this node is the final destination (host the near-key seed);
+    // `Some((peer, addr))` = forward one hop closer to the key (pure routing).
+    let forward_target: Option<(PeerKeyLocation, SocketAddr)> = match next_hop {
         Some(peer) => {
             // Greedy-routing terminus guard (#4363): finalize here only
             // when the chain has provably descended to this node (the
             // closest-seen point) AND the best next hop would climb back
             // out of the contract neighbourhood. Forwarding past an
-            // overshoot would place the authoritative replica where
-            // greedy GETs never descend; terminating *before* the chain
-            // has reached the neighbourhood (e.g. at the originator
-            // loopback) would strand the contract far from the target —
-            // see `put_routing_should_terminate` for why the away-move
-            // alone is not a sufficient stop condition.
+            // overshoot would place the seed where greedy GETs never
+            // descend; terminating *before* the chain has reached the
+            // neighbourhood (e.g. at the originator loopback) would strand
+            // the contract far from the target — see
+            // `put_routing_should_terminate` for why the away-move alone is
+            // not a sufficient stop condition.
             let target = crate::ring::Location::from(&key);
             // own_location() is the address-derived ring position (not the
             // configured get_stored_location()); this matches the
@@ -1267,88 +1253,64 @@ where
                     phase = "relay_put_terminus",
                     "PUT relay: chain descended here and next hop moves away; finalizing here (#4363)"
                 );
-                // Finalize the operation at this closest-seen node (#4363
-                // placement) but STILL replicate the contract one hop onward so
-                // the UPDATE broadcast tree stays connected (#4509 convergence).
-                // See `relay_put_replicate_forward` for why both are required.
-                if let Some(next_addr) = peer.socket_addr() {
-                    relay_put_replicate_forward(
-                        op_manager,
-                        next_addr,
-                        key,
-                        contract.clone(),
-                        related_contracts.clone(),
-                        merged_value.clone(),
-                        htl,
-                        new_skip_list.clone(),
-                    )
-                    .await;
+                // Piece E (demand-driven hosting): the terminus finalizes and
+                // HOSTS the seed here (Step 3), and does NOT replicate the
+                // contract one hop onward. The former #4509
+                // `relay_put_replicate_forward` planted an unsolicited copy on
+                // a peer with no demand to keep the OLD PUT-path UPDATE
+                // broadcast tree connected — that is the relay-caching
+                // anti-pattern. Under the demand-driven model the update mesh
+                // is the connected sub-graph of demand-pinned SUBSCRIBED
+                // co-hosts (docs/design/demand-driven-hosting.md §2), built by
+                // SUBSCRIBE, not by the PUT route. do NOT re-add
+                // replicate-on-terminus — see hosting-invariants.
+                None
+            } else {
+                match peer.socket_addr() {
+                    Some(addr) => Some((peer, addr)),
+                    None => {
+                        tracing::error!(
+                            tx = %incoming_tx,
+                            contract = %key,
+                            target_pub_key = %peer.pub_key(),
+                            "PUT relay: next hop has no socket address"
+                        );
+                        // No usable next hop — act as final destination.
+                        None
+                    }
                 }
-                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-                return relay_put_finalize_local(
-                    op_manager,
-                    incoming_tx,
-                    key,
-                    merged_value,
-                    upstream_addr,
-                    hop_count,
-                )
-                .await;
             }
-            let addr = match peer.socket_addr() {
-                Some(a) => a,
-                None => {
-                    tracing::error!(
-                        tx = %incoming_tx,
-                        contract = %key,
-                        target_pub_key = %peer.pub_key(),
-                        "PUT relay: next hop has no socket address"
-                    );
-                    // No next hop — act as final destination.
-                    // This node IS the storer; hop_count = max_htl - htl_we_received.
-                    let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-                    return relay_put_finalize_local(
-                        op_manager,
-                        incoming_tx,
-                        key,
-                        merged_value,
-                        upstream_addr,
-                        hop_count,
-                    )
-                    .await;
-                }
-            };
-            (peer, addr)
         }
         None => {
             // Bootstrap fallback (#4361 / #4365): with an empty ring,
             // forward via a configured gateway instead of finalizing
             // locally. Without this, a freshly-bootstrapped node's PUT is
-            // stored locally (Step 1 above) and finalized here, so the
-            // client gets a success while the contract never reaches the
-            // network — the PUT analog of GET's empty-ring blind spot.
-            // Bypasses the #4363 terminus guard on purpose: an empty ring
-            // has no overshoot to guard against, we only need to reach the
-            // network. The local replica is already stored, so the
-            // originator keeps it AND the gateway relays the PUT toward the
-            // contract location. Respects `new_skip_list` (self + upstream).
+            // finalized here and never reaches the network — the PUT analog
+            // of GET's empty-ring blind spot. Bypasses the #4363 terminus
+            // guard on purpose: an empty ring has no overshoot to guard
+            // against, we only need to reach the network. Whether this node
+            // KEEPS a local copy is decided by the demand-driven `should_host`
+            // gate in Step 3, NOT unconditionally (piece E — relay-caching
+            // removed): the originator's own PUT (originator loopback) and an
+            // already-hosting peer still keep a copy; a pure routing hop does
+            // not. Respects `new_skip_list` (self + upstream).
             //
             // Intentional asymmetry with `drive_relay_put_streaming` (which
             // gates the gateway fallback on `htl > 0`): this arm is also
             // reached when `htl == 0` (next_hop is forced None then), so it
-            // can forward to a gateway at htl 0. Benign — the contract is
-            // already stored locally (no false success), it is a single
-            // bounded next-hop (no fan-out), and the forward is terminating:
-            // each hop adds itself (and its upstream) to `new_skip_list`, so
-            // in a pathological all-empty-ring chain `select_bootstrap_gateway`
-            // eventually excludes every configured gateway and returns None
-            // (finalize locally). Termination here is skip_list exhaustion —
-            // NOT htl, and NOT the receiving gateway's ring being populated.
-            // In the normal case the gateway does have a populated ring and
-            // routes the PUT toward the contract location (better placement
-            // than this empty-ring node). The originator loopback always
-            // starts at max_htl so it never hits htl 0 here. Do not
-            // "harmonize" the two paths — there is no correctness gain.
+            // can forward to a gateway at htl 0. Benign — no false success (the
+            // originator's own copy is stored by the Step 3 gate), it is a
+            // single bounded next-hop (no fan-out), and the forward is
+            // terminating: each hop adds itself (and its upstream) to
+            // `new_skip_list`, so in a pathological all-empty-ring chain
+            // `select_bootstrap_gateway` eventually excludes every configured
+            // gateway and returns None (finalize locally). Termination here is
+            // skip_list exhaustion — NOT htl, and NOT the receiving gateway's
+            // ring being populated. In the normal case the gateway does have a
+            // populated ring and routes the PUT toward the contract location
+            // (better placement than this empty-ring node). The originator
+            // loopback always starts at max_htl so it never hits htl 0 here.
+            // Do not "harmonize" the two paths — there is no correctness gain.
             match bootstrap_gateway_target(op_manager, |addr| new_skip_list.contains(&addr)) {
                 Some((gateway, gateway_addr)) => {
                     tracing::info!(
@@ -1358,34 +1320,84 @@ where
                         phase = "relay_put_bootstrap_gateway",
                         "PUT relay: ring empty — forwarding to configured gateway"
                     );
-                    (gateway, gateway_addr)
+                    Some((gateway, gateway_addr))
                 }
                 None => {
                     // No next hop and no configured gateway — genuinely
                     // isolated, so this node is the final destination.
+                    // Finalized in Step 4; the Step 3 demand gate
+                    // (`finalize_here`) stores the near-key seed here.
                     tracing::info!(
                         tx = %incoming_tx,
                         contract = %key,
                         phase = "relay_put_complete",
                         "PUT relay: no next hop, finalizing at this node"
                     );
-                    // Same arm as above: this node IS the storer.
-                    let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-                    return relay_put_finalize_local(
-                        op_manager,
-                        incoming_tx,
-                        key,
-                        merged_value,
-                        upstream_addr,
-                        hop_count,
-                    )
-                    .await;
+                    None
                 }
             }
         }
     };
 
-    // ── Step 3: Forward downstream, await Response, bubble up ──────────────
+    // ── Step 3: Host locally ONLY where demand-driven (piece E) ─────────────
+    // RELAY-CACHING REMOVED. A pure routing hop no longer stores a copy of
+    // every PUT it forwards ("all nodes cache"). This node stores + hosts +
+    // announces ONLY when it has a demand-driven reason to hold the contract:
+    //   * originator loopback — a local client's own PUT (local demand), OR
+    //   * terminus / final destination — the near-key findability seed, OR
+    //   * it already hosts the contract — a real host merges writes it sees.
+    // A peer that merely forwards a PUT one hop closer to the key is ROUTING,
+    // not hosting (docs/design/demand-driven-hosting.md §1); creating a durable
+    // advertised copy there is the "anti-gravity" that scattered hosting across
+    // the ring. do NOT re-add store-at-every-hop — see hosting-invariants
+    // (relay-caching anti-pattern).
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let originator_loopback = Some(upstream_addr) == own_addr;
+    let finalize_here = forward_target.is_none();
+    let should_host =
+        originator_loopback || finalize_here || op_manager.ring.is_hosting_contract(&key);
+
+    let merged_value = if should_host {
+        // Originator-loopback (a local client's own PUT, mapped to
+        // upstream_addr=own_addr in dispatch) is ClientLocal so it lands in the
+        // reserved fair-queue lane; a genuine relay store stays NetworkRelay (#4534).
+        let store_priority = put_store_priority(op_manager, upstream_addr);
+        relay_put_store_locally(
+            op_manager,
+            incoming_tx,
+            key,
+            value.clone(),
+            &contract,
+            related_contracts.clone(),
+            htl,
+            store_priority,
+        )
+        .await?
+    } else {
+        // Routing-only hop: forward the client's value unchanged. The merge
+        // happens where the state lives (originator + near-key host); in the
+        // commutative-monoid model an intermediate merge is redundant.
+        value.clone()
+    };
+
+    // ── Step 4: Finalize here, or fall through to forward one hop closer ────
+    let (next_peer, next_addr) = match forward_target {
+        None => {
+            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+            return relay_put_finalize_local(
+                op_manager,
+                incoming_tx,
+                key,
+                merged_value,
+                upstream_addr,
+                hop_count,
+            )
+            .await;
+        }
+        Some(target) => target,
+    };
+
+    // ── Step 5: Forward downstream, await Response, bubble up ──────────────
 
     let new_htl = htl.saturating_sub(1);
 
@@ -1419,8 +1431,7 @@ where
     // the originator's still-installed callback. The relay does not
     // bubble up (skipping `relay_put_send_response`) because the
     // originator IS the upstream and is already waiting.
-    let own_addr = op_manager.ring.connection_manager.get_own_addr();
-    let originator_loopback = Some(upstream_addr) == own_addr;
+    // (`originator_loopback` was computed above in Step 3.)
 
     // Streaming upgrade on forward: serialize the payload, and if it
     // exceeds `streaming_threshold`, send a `RequestStreaming` metadata
@@ -1709,10 +1720,12 @@ where
         })) => {
             // Streaming response arrived from downstream. Slice A does
             // not relay-forward streaming payloads, so log and
-            // synthesize a non-streaming Response upstream. This
-            // preserves correctness — the contract IS stored at this
-            // node (step 1) — at the cost of the upstream not getting
-            // the streamed payload. Slice B handles stream pass-through.
+            // synthesize a non-streaming Response upstream. This is a
+            // success bubble because the DOWNSTREAM stored the contract
+            // (it returned ResponseStreaming) — not because this routing
+            // hop cached it (piece E removed store-at-every-hop). The cost
+            // is the upstream not getting the streamed payload; slice B
+            // handles stream pass-through.
             tracing::warn!(
                 tx = %incoming_tx,
                 contract = %reply_key,
@@ -1915,103 +1928,20 @@ async fn relay_put_store_locally(
     Ok(merged_value)
 }
 
-/// Fire-and-forget a replication-only `PutMsg::Request` to `next_addr`
-/// when the #4363 terminus guard finalizes the operation locally.
-///
-/// # Why the guard must still replicate (issue #4509 convergence fix)
-///
-/// The terminus guard makes the *closest-seen* node the authoritative
-/// finalizer (it sends the upstream `PutMsg::Response`, so the originator's
-/// reply and `hop_count` reflect placement at the contract neighbourhood —
-/// the #4363 goal). But finalizing must NOT also stop the contract from
-/// replicating onward: this codebase forms the UPDATE broadcast tree along
-/// the PUT forward path (each relay `host_contract` + `announce_contract_hosted`
-/// in `relay_put_store_locally`). If the guard simply returns after the
-/// upstream Response, the next hop — and everything past it — never receives
-/// the contract, so a later UPDATE that the router fans out to one of those
-/// peers fails with `missing contract` and the network splits into divergent
-/// state groups (observed in `test_six_peer_contract_lifecycle`: contract on
-/// 4/6 peers, a 2/2 v20-vs-v30 split, node-2's updates reaching no one).
-///
-/// To keep placement (#4363) AND replication breadth (convergence), the guard
-/// finalizes locally *and* forwards a replication copy onward with a FRESH
-/// transaction so it does not collide with the upstream finalization waiter
-/// (the originator is already satisfied by this node's Response). The forward
-/// is fire-and-forget: no reply is awaited, and the downstream relay drives
-/// its own replication (including re-applying the same guard one hop deeper).
-/// The skip list — which already contains `upstream_addr` and `own_addr` —
-/// rides along unchanged, and HTL is decremented, so the replication copy is
-/// bounded and cannot loop back upstream. This is the "ensure terminated PUTs
-/// still replicate to the contract neighbourhood" resolution.
-#[allow(clippy::too_many_arguments)]
-async fn relay_put_replicate_forward(
-    op_manager: &OpManager,
-    next_addr: SocketAddr,
-    key: ContractKey,
-    contract: ContractContainer,
-    related_contracts: RelatedContracts<'static>,
-    merged_value: WrappedState,
-    htl: usize,
-    skip_list: HashSet<SocketAddr>,
-) {
-    // The replication copy is sent as a single `PutMsg::Request`. For a
-    // payload that would need streaming we skip the replication forward rather
-    // than re-implement the piped-stream upgrade here: the local store already
-    // placed the authoritative replica at this closest-seen node (#4363), and
-    // the convergence regression this restores (#4509) is on the small-state
-    // non-streaming path. A large-contract terminus is rare; skipping leaves
-    // placement correct and only forgoes the extra broadcast-path replica.
-    let payload = PutStreamingPayload {
-        contract: contract.clone(),
-        related_contracts: related_contracts.clone(),
-        value: merged_value.clone(),
-    };
-    let payload_size = bincode::serialized_size(&payload).unwrap_or(u64::MAX) as usize;
-    if crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_size) {
-        tracing::debug!(
-            contract = %key,
-            target = %next_addr,
-            payload_size,
-            phase = "relay_put_terminus_replicate",
-            "PUT relay: terminus replication skipped for streaming-size payload (placement still correct)"
-        );
-        return;
-    }
-
-    // Fresh tx: the upstream Response under `incoming_tx` already satisfies
-    // the originator's waiter; reusing it would (a) make the downstream relay
-    // bubble a second Response back to a node with no waiter and (b) trip the
-    // per-node dedup gate on `incoming_tx`. A new transaction keeps the
-    // replication copy a clean, independent fire-and-forget op.
-    let replication_tx = Transaction::new::<PutMsg>();
-    let forward = NetMessage::from(PutMsg::Request {
-        id: replication_tx,
-        contract,
-        related_contracts,
-        value: merged_value,
-        htl: htl.saturating_sub(1),
-        skip_list,
-    });
-    let mut ctx = op_manager.op_ctx(replication_tx);
-    if let Err(err) = ctx.send_fire_and_forget(next_addr, forward).await {
-        tracing::debug!(
-            replication_tx = %replication_tx,
-            contract = %key,
-            target = %next_addr,
-            error = %err,
-            phase = "relay_put_terminus_replicate",
-            "PUT relay: terminus replication forward failed (best-effort)"
-        );
-    } else {
-        tracing::debug!(
-            replication_tx = %replication_tx,
-            contract = %key,
-            target = %next_addr,
-            phase = "relay_put_terminus_replicate",
-            "PUT relay: finalized locally but forwarded replication copy onward (#4509)"
-        );
-    }
-}
+// `relay_put_replicate_forward` (the #4509 terminus replication forward) was
+// REMOVED in piece E of the demand-driven hosting redesign. It planted an
+// unsolicited copy of the contract on the next-hop peer whenever the #4363
+// terminus guard fired, in order to keep the OLD PUT-path UPDATE broadcast tree
+// connected — the broadcast tree that `relay_put_store_locally`'s
+// store-at-every-hop built. That whole tree was the relay-caching anti-pattern
+// (docs/design/demand-driven-hosting.md §9, hosting-invariants). Under the
+// demand-driven model the update mesh is the connected sub-graph of
+// demand-pinned SUBSCRIBED co-hosts (§2), built by SUBSCRIBE routing toward the
+// key, not by scattering copies along the PUT route. The #4509 convergence
+// regression it fixed (test_six_peer_contract_lifecycle) is now maintained by
+// subscriptions: that test subscribes every peer, so the mesh forms without
+// PUT-route replication. do NOT re-add a terminus/every-hop replication forward
+// — see hosting-invariants (relay-caching anti-pattern).
 
 /// Finalize at this node when there's no next hop. Emits `put_success`
 /// telemetry and sends `PutMsg::Response` upstream.
@@ -2104,6 +2034,39 @@ async fn relay_put_send_error(
     let mut ctx = op_manager.op_ctx(incoming_tx);
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
     relay_put_send_error_with_ctx(&mut ctx, own_addr, incoming_tx, cause, upstream_addr).await
+}
+
+/// Terminal reply for the streaming relay when the downstream forward failed
+/// (timeout / channel closed / unexpected variant).
+///
+/// Piece E (demand-driven hosting): a pure routing hop no longer stores a copy
+/// of every PUT it forwards, so it can only claim success on downstream failure
+/// when it actually holds the contract (`stored_locally` — originator loopback
+/// or an already-hosting peer). Otherwise the PUT reached no reachable host via
+/// this route, and claiming success would silently lose it — so we report
+/// failure upstream (mirroring the non-streaming relay), letting the
+/// originator's retry loop try another route.
+async fn relay_put_streaming_downstream_failure(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    upstream_addr: SocketAddr,
+    htl: usize,
+    stored_locally: bool,
+    reason: &str,
+) -> Result<(), OpError> {
+    if stored_locally {
+        // This node holds a copy — the contract exists in the network here, so
+        // report our own forward depth as a successful placement.
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+        relay_put_send_response(op_manager, incoming_tx, key, upstream_addr, hop_count).await
+    } else {
+        let cause = bound_cause(format!(
+            "PUT streaming relay: {reason}; this routing hop holds no copy \
+             (piece E: no relay-caching) — retry via another route"
+        ));
+        relay_put_send_error(op_manager, incoming_tx, cause, upstream_addr).await
+    }
 }
 
 /// Shutdown fallback for `run_relay_put`'s originator-loopback error
@@ -2492,18 +2455,12 @@ where
     // Greedy-routing terminus guard (#4363), streaming path. Mirrors the
     // non-streaming `drive_relay_put` guard: finalize here only when the
     // chain has descended to this node AND the next hop would climb back
-    // out (the overshoot). The stream is assembled and stored here in
-    // step 5/6 regardless, so terminating never drops the contract — it
-    // just stops piping the replica to a farther peer the contract
-    // neighbourhood will never descend to. The away-move alone is not a
-    // sufficient stop condition; see `put_routing_should_terminate`.
-    // When the terminus guard fires it drops `next_hop` (stops piping), but
-    // the contract must still replicate one hop onward to keep the UPDATE
-    // broadcast tree connected (#4509 convergence — see
-    // `relay_put_replicate_forward`). The streaming payload isn't assembled
-    // until step 5, so we remember the next-hop address here and forward a
-    // replication copy after the local store in step 6.
-    let mut terminus_replicate_to: Option<SocketAddr> = None;
+    // out (the overshoot). When the guard fires it drops `next_hop`, stopping
+    // the piped forward to a farther peer the contract neighbourhood will
+    // never descend to. The away-move alone is not a sufficient stop
+    // condition; see `put_routing_should_terminate`. Whether this node then
+    // HOSTS the assembled contract (step 6) is a separate demand-driven
+    // decision (piece E) — a pure routing hop pipes onward without storing.
     let next_hop = match next_hop {
         Some(peer) => {
             let target = crate::ring::Location::from(&contract_key);
@@ -2529,7 +2486,6 @@ where
                     phase = "relay_put_streaming_terminus",
                     "PUT streaming relay: chain descended here and next hop moves away; finalizing here (#4363)"
                 );
-                terminus_replicate_to = peer.socket_addr();
                 None
             } else {
                 Some(peer)
@@ -2718,42 +2674,45 @@ where
         return Err(OpError::invalid_transition(incoming_tx));
     }
 
-    // ── Step 6: Store contract locally (shared helper with slice A) ──────
-    // Clone the contract/related-contracts for a possible terminus replication
-    // forward (#4509) before the store consumes `related_contracts`.
-    let replicate_payload =
-        terminus_replicate_to.map(|addr| (addr, contract.clone(), related_contracts.clone()));
-    // Originator-loopback client PUT → ClientLocal reserved lane (#4534).
-    let store_priority = put_store_priority(op_manager, upstream_addr);
-    let merged_value = relay_put_store_locally(
-        op_manager,
-        incoming_tx,
-        key,
-        value,
-        &contract,
-        related_contracts,
-        htl,
-        store_priority,
-    )
-    .await?;
+    // ── Step 6: Host locally ONLY where demand-driven (piece E) ──────────
+    // RELAY-CACHING REMOVED (streaming path). The stream was already piped
+    // one hop closer to the key above (Step 3, routing) without waiting on
+    // this local store, so a pure routing hop pipes onward and does NOT store
+    // a copy. This node stores + hosts + announces the assembled contract ONLY
+    // when it has a demand-driven reason to hold it: originator loopback (local
+    // client PUT), the terminus / final destination (near-key seed), or it
+    // already hosts the contract (a real host merges writes it sees). The
+    // former #4509 terminus `relay_put_replicate_forward` — which planted an
+    // unsolicited copy on a demand-less peer to keep the OLD PUT-path UPDATE
+    // broadcast tree connected — is removed: under the demand-driven model the
+    // update mesh is the connected sub-graph of SUBSCRIBED co-hosts
+    // (docs/design/demand-driven-hosting.md §2), not the PUT route. do NOT
+    // re-add store-at-every-hop or replicate-on-terminus — see hosting-invariants.
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let originator_loopback = Some(upstream_addr) == own_addr;
+    let finalize_here = next_hop.is_none();
+    let should_host =
+        originator_loopback || finalize_here || op_manager.ring.is_hosting_contract(&key);
 
-    // Terminus guard fired (#4363) on the streaming path: finalize here but
-    // still replicate the assembled contract one hop onward so the UPDATE
-    // broadcast tree stays connected (#4509). Mirrors the non-streaming guard
-    // branch; see `relay_put_replicate_forward`.
-    if let Some((next_addr, contract, related_contracts)) = replicate_payload {
-        relay_put_replicate_forward(
+    let merged_value = if should_host {
+        // Originator-loopback client PUT → ClientLocal reserved lane (#4534).
+        let store_priority = put_store_priority(op_manager, upstream_addr);
+        relay_put_store_locally(
             op_manager,
-            next_addr,
+            incoming_tx,
             key,
-            contract,
+            value,
+            &contract,
             related_contracts,
-            merged_value.clone(),
             htl,
-            new_skip_list.clone(),
+            store_priority,
         )
-        .await;
-    }
+        .await?
+    } else {
+        // Routing-only hop: the fragments were already piped onward; forward
+        // the client's value unchanged as the (unstored) response payload.
+        value
+    };
 
     // ── Step 7: Await downstream reply (if piping), then bubble upstream ──
     //
@@ -2791,16 +2750,20 @@ where
                     );
                 }
                 op_manager.release_pending_op_slot(incoming_tx).await;
-                // Best-effort upstream reply after downstream failure: this
-                // node IS the storer (contract was put locally in step 6),
-                // so hop_count = max_htl - htl_we_received.
-                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-                return relay_put_send_response(
+                // Downstream failed. Under piece E this routing hop only holds
+                // a copy if `should_host` (originator/already-hosting); a pure
+                // routing hop did NOT store, so it must NOT claim success (that
+                // would silently lose the PUT). Mirror the non-streaming path:
+                // report failure upstream so the originator retries another
+                // route. A storing hop reports its own forward depth as before.
+                return relay_put_streaming_downstream_failure(
                     op_manager,
                     incoming_tx,
                     key,
                     upstream_addr,
-                    hop_count,
+                    htl,
+                    should_host,
+                    "downstream reply channel closed before reply",
                 )
                 .await;
             }
@@ -2820,15 +2783,16 @@ where
                     );
                 }
                 op_manager.release_pending_op_slot(incoming_tx).await;
-                // Same as the channel-closed arm: this node stored locally
-                // in step 6 so we report our own forward depth.
-                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-                return relay_put_send_response(
+                // See the channel-closed arm: a pure routing hop holds no copy
+                // (piece E), so report failure rather than fake success.
+                return relay_put_streaming_downstream_failure(
                     op_manager,
                     incoming_tx,
                     key,
                     upstream_addr,
-                    hop_count,
+                    htl,
+                    should_host,
+                    "downstream reply timed out",
                 )
                 .await;
             }
@@ -2881,10 +2845,18 @@ where
                     reply_variant = ?std::mem::discriminant(&other),
                     "PUT streaming relay: unexpected reply variant"
                 );
-                // Same as the error arms: this node stored locally.
-                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-                relay_put_send_response(op_manager, incoming_tx, key, upstream_addr, hop_count)
-                    .await
+                // Same as the error arms: only claim success if this node
+                // actually stored a copy (piece E); otherwise report failure.
+                relay_put_streaming_downstream_failure(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    upstream_addr,
+                    htl,
+                    should_host,
+                    "unexpected downstream reply variant",
+                )
+                .await
             }
         }
     } else {
@@ -4462,11 +4434,15 @@ mod tests {
         );
     }
 
-    /// Pin: driver MUST call `put_contract` + `host_contract` before
-    /// forwarding (so the local cache + hosting advertisement happens
-    /// regardless of whether the forward succeeds).
+    /// Piece E (demand-driven hosting): the relay driver stores + hosts +
+    /// announces the contract ONLY when it has a demand-driven reason to hold
+    /// it (originator loopback / terminus-final-destination / already-hosting),
+    /// NEVER unconditionally at every routing hop. This pin locks the
+    /// `should_host` gate into the call path so re-introducing store-at-every-hop
+    /// ("all nodes cache", the relay-caching anti-pattern) fails the build.
+    /// See hosting-invariants + docs/design/demand-driven-hosting.md §1.
     #[test]
-    fn drive_relay_put_stores_locally_before_forwarding() {
+    fn drive_relay_put_hosts_only_when_demand_driven() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
             .find("async fn drive_relay_put<CB>(")
@@ -4476,18 +4452,36 @@ mod tests {
             .expect("driver body end not found")
             + driver_start;
         let driver_src = &src[driver_start..driver_end];
+
+        let gate_pos = driver_src.find("let should_host =").expect(
+            "drive_relay_put MUST compute a `should_host` demand gate (piece E: \
+             no store-at-every-hop relay-caching)",
+        );
         let store_pos = driver_src
             .find("relay_put_store_locally(")
             .expect("relay_put_store_locally call missing in driver");
-        let forward_pos = driver_src
-            .find("ctx.send_to_and_await(")
-            .expect("send_to_and_await call missing in driver");
         assert!(
-            store_pos < forward_pos,
-            "local store MUST run before the downstream forward"
+            gate_pos < store_pos,
+            "the `should_host` gate MUST be decided before the store — the store \
+             is only for demand-driven hosting, not every routing hop"
+        );
+        // The gate must include exactly the three demand-driven reasons.
+        let gate_region = &driver_src[gate_pos..store_pos];
+        assert!(
+            gate_region.contains("originator_loopback"),
+            "should_host MUST include originator loopback (local client demand)"
+        );
+        assert!(
+            gate_region.contains("finalize_here"),
+            "should_host MUST include terminus/final-destination (near-key seed)"
+        );
+        assert!(
+            gate_region.contains("is_hosting_contract"),
+            "should_host MUST include already-hosting (a real host merges writes it sees)"
         );
 
-        // Helper must encapsulate put_contract + host_contract + announce.
+        // Helper still performs put_contract + host_contract + announce for the
+        // hosting cases (originator / terminus / already-hosting).
         let helper_start = src
             .find("async fn relay_put_store_locally(")
             .expect("helper not found");
@@ -4517,8 +4511,7 @@ mod tests {
     /// the helper in isolation — without this pin, deleting the call site
     /// (re-introducing the #4363 wander) would leave every unit test
     /// green. This locks the guard into the call path the same way
-    /// `drive_relay_put_stores_locally_before_forwarding` locks the
-    /// store-before-forward ordering.
+    /// `drive_relay_put_hosts_only_when_demand_driven` locks the demand gate.
     #[test]
     fn drive_relay_put_applies_terminus_guard_before_forwarding() {
         let src = include_str!("op_ctx_task.rs");
@@ -4543,11 +4536,13 @@ mod tests {
              PUT and the replica overshoots the contract neighbourhood"
         );
 
-        // The guard must finalize locally on its terminus branch (so the
-        // closest-seen node is the authoritative finalizer, #4363) AND still
-        // replicate the contract one hop onward (so the UPDATE broadcast tree
-        // stays connected, #4509) — not just log, and not fall through to the
-        // forward. Both calls live in the terminus branch before the forward.
+        // The terminus branch finalizes locally (relay_put_finalize_local), so
+        // the closest-seen node is the authoritative finalizer (#4363) and
+        // hosts the near-key seed. Piece E: it does NOT replicate the contract
+        // one hop onward — the #4509 relay_put_replicate_forward was REMOVED
+        // (relay-caching anti-pattern; the update mesh is now built by SUBSCRIBE,
+        // not the PUT route). finalize_local is reached via the `finalize_here`
+        // return in Step 4, which sits between the guard and the forward.
         let guard_region = &body[guard_pos..forward_pos];
         assert!(
             guard_region.contains("relay_put_finalize_local("),
@@ -4555,11 +4550,10 @@ mod tests {
              relay_put_finalize_local, not fall through to the forward"
         );
         assert!(
-            guard_region.contains("relay_put_replicate_forward("),
-            "the terminus branch MUST still replicate the contract onward via \
-             relay_put_replicate_forward (#4509) — finalizing without \
-             replicating orphans the UPDATE broadcast path and splits the \
-             network into divergent state groups"
+            !body.contains("relay_put_replicate_forward("),
+            "piece E removed the #4509 terminus replication forward — do NOT \
+             re-add relay_put_replicate_forward (relay-caching anti-pattern; \
+             see hosting-invariants)"
         );
     }
 
@@ -4601,19 +4595,25 @@ mod tests {
              locally"
         );
 
-        // The streaming guard records the dropped next hop in
-        // `terminus_replicate_to` and, after the local store, replicates the
-        // contract one hop onward via `relay_put_replicate_forward` (#4509) so
-        // the streaming path does not orphan the UPDATE broadcast tree either.
+        // Piece E: the streaming path demand-gates its local store via
+        // `should_host` (no store-at-every-hop) and does NOT replicate the
+        // contract onward — `terminus_replicate_to` and the #4509
+        // relay_put_replicate_forward were REMOVED (relay-caching anti-pattern;
+        // the update mesh is built by SUBSCRIBE, not the PUT route).
         assert!(
-            body.contains("terminus_replicate_to"),
-            "streaming guard MUST record the dropped next hop in \
-             terminus_replicate_to for the #4509 replication forward"
+            body.contains("let should_host ="),
+            "streaming driver MUST demand-gate its local store via should_host \
+             (piece E: no store-at-every-hop)"
         );
         assert!(
-            body.contains("relay_put_replicate_forward("),
-            "streaming terminus path MUST still replicate the contract onward \
-             via relay_put_replicate_forward (#4509)"
+            !body.contains("terminus_replicate_to"),
+            "piece E removed the streaming #4509 replicate-forward — do NOT \
+             re-add terminus_replicate_to (relay-caching anti-pattern)"
+        );
+        assert!(
+            !body.contains("relay_put_replicate_forward("),
+            "piece E removed the streaming #4509 replicate-forward — do NOT \
+             re-add relay_put_replicate_forward (see hosting-invariants)"
         );
     }
 
@@ -4965,9 +4965,11 @@ mod tests {
         // hop_count computation + multi-line call site added in #4248.
         let arm = &b[pos..pos + 1200.min(b.len() - pos)];
         assert!(
-            arm.contains("relay_put_send_response"),
-            "timeout arm must still call relay_put_send_response so the \
-             upstream waiter is not left to its own OPERATION_TTL"
+            arm.contains("relay_put_streaming_downstream_failure"),
+            "timeout arm must reply upstream via relay_put_streaming_downstream_failure \
+             (success if this node stored a copy, else a failure so the originator \
+             retries) so the upstream waiter is not left to its own OPERATION_TTL. \
+             Piece E: a pure routing hop no longer holds a copy to claim success with."
         );
     }
 
