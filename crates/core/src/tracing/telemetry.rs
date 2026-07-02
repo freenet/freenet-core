@@ -2188,6 +2188,23 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_local_misses_total".to_string(),
                     serde_json::json!(snapshot.hosting_local_misses_total),
                 );
+                // Capability-relative admission gauges (#4642 piece B). Same
+                // hand-mirrored footgun as the A2/A3 gauges above: a new
+                // `RouterSnapshotInfo` field is invisible to the collector
+                // unless added here. Pinned by
+                // `router_snapshot_json_includes_hosting_admission_gauges`.
+                obj.insert(
+                    "hosting_fanout_capacity".to_string(),
+                    serde_json::json!(snapshot.hosting_fanout_capacity),
+                );
+                obj.insert(
+                    "hosting_total_downstream_subscribers".to_string(),
+                    serde_json::json!(snapshot.hosting_total_downstream_subscribers),
+                );
+                obj.insert(
+                    "hosting_subscription_refusals_total".to_string(),
+                    serde_json::json!(snapshot.hosting_subscription_refusals_total),
+                );
             }
             body
         }
@@ -2401,6 +2418,30 @@ mod tests {
             ("hosting_evictions_of_recently_read_total", 277),
             ("hosting_local_hits_total", 281),
             ("hosting_local_misses_total", 283),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the capability-relative admission gauges (#4642 piece B) must also
+    /// reach the hand-mirrored OTLP body — same footgun as the A2/A3 gauges. A
+    /// silent drop would blind us to whether admission-refusal is biting in
+    /// production (refusal rate) and whether the fan-out capacity is tuned right
+    /// (occupancy vs capacity), the whole point of instrumenting piece B.
+    #[test]
+    fn router_snapshot_json_includes_hosting_admission_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_fanout_capacity = Some(1024);
+        info.hosting_total_downstream_subscribers = Some(37);
+        info.hosting_subscription_refusals_total = Some(11);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hosting_fanout_capacity", 1024),
+            ("hosting_total_downstream_subscribers", 37),
+            ("hosting_subscription_refusals_total", 11),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

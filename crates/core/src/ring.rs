@@ -1568,6 +1568,19 @@ impl Ring {
             snapshot.hosting_local_hits_total = Some(ring.hosting_manager.local_get_serves());
             snapshot.hosting_local_misses_total = Some(ring.hosting_manager.local_get_forwards());
 
+            // Capability-relative admission gauges (#4642 piece B): the
+            // aggregate update-fanout capacity, its current occupancy (total
+            // downstream subscribers this node fans updates to), and the
+            // monotonic count of subscriptions REFUSED because the node was
+            // over-committed. Let us observe in production whether admission
+            // bites (refusals climbing) and whether the capacity is tuned right
+            // (occupancy vs capacity). Per-node aggregate scalars only.
+            snapshot.hosting_fanout_capacity = Some(ring.hosting_manager.fanout_capacity() as u64);
+            snapshot.hosting_total_downstream_subscribers =
+                Some(ring.hosting_manager.total_downstream_subscribers() as u64);
+            snapshot.hosting_subscription_refusals_total =
+                Some(ring.hosting_manager.subscription_refusals_total());
+
             // Keep the hosting manager's copy of our own ring location current so
             // the proximity-prior demand estimate (#4642 A3) can turn a contract
             // key into a distance. Best-effort: only push a known location.
@@ -2886,6 +2899,21 @@ impl Ring {
 
     pub fn has_downstream_subscribers(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.has_downstream_subscribers(contract)
+    }
+
+    /// Piece B admission (#4642): may this node ACCEPT becoming/acting-as a host
+    /// for a NEW downstream subscription of `contract`, or is it over-committed
+    /// (fan-out or byte-budget) and must REFUSE? See
+    /// [`HostingManager::can_admit_subscription`]. Callers must NOT consult this
+    /// for the originator's own local-client subscribe, nor for renewals.
+    pub(crate) fn can_admit_subscription(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.can_admit_subscription(contract)
+    }
+
+    /// Override the hosting fan-out capacity (simulation harness / operator
+    /// config). See [`HostingManager::set_fanout_capacity`].
+    pub(crate) fn set_hosting_fanout_capacity(&self, capacity: usize) {
+        self.hosting_manager.set_fanout_capacity(capacity);
     }
 
     /// Whether something still depends on this node hosting `contract` — a
