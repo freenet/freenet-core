@@ -4017,6 +4017,162 @@ mod tests {
         assert!(matches!(classify(msg), AttemptOutcome::Retry));
     }
 
+    // ── Routing backtracking (hosting-invariants §E, #4642) ──────────────────
+
+    #[test]
+    fn notfound_remaining_budget_extracted_from_notfound_reply() {
+        let tx = dummy_tx();
+        let key = dummy_key();
+        let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+            id: tx,
+            instance_id: *key.id(),
+            result: GetMsgResult::NotFound,
+            hop_count: 2,
+            remaining_backtrack_budget: 3,
+        }));
+        assert_eq!(
+            notfound_remaining_backtrack_budget(&msg),
+            Some(3),
+            "the relay must read the downstream's returned budget so it threads \
+             the per-request counter depth-first"
+        );
+    }
+
+    #[test]
+    fn notfound_remaining_budget_none_for_non_notfound() {
+        let tx = dummy_tx();
+        let key = dummy_key();
+        // A Found reply carries no meaningful backtrack budget.
+        let found = NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+            id: tx,
+            instance_id: *key.id(),
+            result: GetMsgResult::Found {
+                key,
+                value: StoreResponse {
+                    state: Some(WrappedState::new(vec![1])),
+                    contract: None,
+                },
+            },
+            hop_count: 0,
+            remaining_backtrack_budget: 9,
+        }));
+        assert_eq!(
+            notfound_remaining_backtrack_budget(&found),
+            None,
+            "a Found reply must not be treated as carrying a backtrack budget"
+        );
+        // A Request is not a reply at all.
+        let req = NetMessage::V1(NetMessageV1::Get(GetMsg::Request {
+            id: tx,
+            instance_id: *key.id(),
+            fetch_contract: true,
+            htl: 5,
+            visited: VisitedPeers::new(&tx),
+            subscribe: false,
+            backtrack_budget: 4,
+        }));
+        assert_eq!(notfound_remaining_backtrack_budget(&req), None);
+    }
+
+    /// Pin: the relay loop must THREAD the per-request budget, not reset it
+    /// per hop. A per-hop reset (or a per-hop retry cap) reintroduces the
+    /// `k^HTL` fan-out blow-up the old `MAX_RELAY_RETRIES = 1` guarded (#4630).
+    #[test]
+    fn relay_get_threads_backtrack_budget_depth_first() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        // Seeded from the incoming Request, not a local constant.
+        assert!(
+            body.contains("let mut budget = backtrack_budget;"),
+            "drive_relay_get_inner must seed its budget from the incoming \
+             Request's backtrack_budget (threaded), not a per-hop constant"
+        );
+        // Adopts the downstream subtree's returned budget on a clean NotFound.
+        assert!(
+            body.contains("notfound_remaining_backtrack_budget(&reply)")
+                && body.contains("budget = remaining"),
+            "the relay must ADOPT the budget its downstream returned before \
+             deciding whether to backtrack further (depth-first threading)"
+        );
+        // Forwards the CURRENT budget downstream (not the originator default).
+        assert!(
+            body.contains("backtrack_budget: budget"),
+            "the relay must forward the budget it currently holds so the \
+             downstream subtree draws from the same shared counter"
+        );
+        // Echoes the remaining budget upstream on its own NotFound.
+        assert!(
+            body.contains("budget,\n                    )\n                    .await;")
+                || body.contains("relay_send_not_found(") && body.contains("budget,"),
+            "the terminus NotFound must echo the remaining budget upstream"
+        );
+    }
+
+    /// Pin: only a CLEAN downstream NotFound may spend backtracking budget.
+    /// A transport failure / timeout must NOT retry routing (the reused tx
+    /// could still get a late reply — Codex P2), preserving the pre-backtrack
+    /// give-up-on-failure behaviour.
+    #[test]
+    fn relay_get_backtrack_gated_on_clean_notfound() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        // The Retry (clean NotFound) arm enables backtracking.
+        let retry_pos = body
+            .find("downstream returned NotFound; backtracking")
+            .expect("Retry arm log message must exist");
+        let retry_after = &body[retry_pos..retry_pos + 1500.min(body.len() - retry_pos)];
+        assert!(
+            retry_after.contains("backtrack_allowed = true"),
+            "the clean-NotFound arm must set backtrack_allowed = true"
+        );
+        // The transport-failure arms disable backtracking.
+        assert!(
+            body.matches("backtrack_allowed = false").count() >= 2,
+            "the send-failure and timeout arms must set backtrack_allowed = \
+             false so a no-reply forward does not spend budget on a retry"
+        );
+    }
+
+    /// Pin: the advance helper gates alternatives on the shared budget, and the
+    /// first (greedy) forward is free. Guards against re-introducing a per-hop
+    /// multiplicative cap.
+    #[test]
+    fn relay_advance_gates_alternatives_on_shared_budget() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "fn relay_advance_to_next_peer(");
+        assert!(
+            body.contains("if *retries > 0"),
+            "the first forward (retries == 0) must be free; only subsequent \
+             forwards are budget-gated backtracks"
+        );
+        assert!(
+            body.contains("*budget == 0") && body.contains("*budget -= 1"),
+            "an alternative forward must require budget > 0 and decrement it"
+        );
+        assert!(
+            !body.contains("MAX_RELAY_RETRIES"),
+            "the per-hop MAX_RELAY_RETRIES cap must be gone — backtracking is \
+             bounded by the shared per-request budget, not a per-hop multiplier"
+        );
+    }
+
+    /// Pin: the originator seeds a real (non-zero) budget so backtracking can
+    /// actually fire. A regression to 0 would silently disable the mechanism.
+    #[test]
+    fn originator_get_seeds_default_backtrack_budget() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "fn build_request(&mut self, attempt_tx: Transaction)");
+        assert!(
+            body.contains("backtrack_budget: crate::operations::DEFAULT_BACKTRACK_BUDGET"),
+            "the originator GET must seed backtrack_budget with \
+             DEFAULT_BACKTRACK_BUDGET so relays have budget to backtrack with"
+        );
+        assert!(
+            crate::operations::DEFAULT_BACKTRACK_BUDGET > 0,
+            "DEFAULT_BACKTRACK_BUDGET must be > 0 or backtracking is disabled"
+        );
+    }
+
     #[test]
     fn classify_response_streaming_is_streaming_terminal() {
         let tx = dummy_tx();
