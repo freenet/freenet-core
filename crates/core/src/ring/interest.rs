@@ -2979,4 +2979,117 @@ mod tests {
             &ghosts[..ghosts.len().min(10)]
         );
     }
+
+    /// D-without-E fallback safety (the "keep relay-caching" 0.2.91 scope).
+    ///
+    /// A relay-cached / GET-cached copy carries its update-mesh membership via
+    /// LOCAL HOSTING interest, not via an `active_subscriptions` lease.
+    /// `cache_contract_locally` (GET return-path) and the PUT-relay store both
+    /// call `register_local_hosting` (hosting=true) with NO client subscription,
+    /// NO downstream subscriber, and install NO subscription lease. That local
+    /// interest is what the 5-minute `interest_heartbeat` advertises
+    /// (`get_all_interest_hashes`), which makes connected co-hosts register this
+    /// peer as an UPDATE broadcast target (`get_broadcast_targets_update`
+    /// Source 2 / the proximity cache). Crucially, local hosting interest has NO
+    /// TTL: it does not lapse with time and is NOT governed by
+    /// `contracts_needing_renewal`. So piece D's interest-gated subscription
+    /// renewal (which only touches `active_subscriptions` leases) CANNOT lapse a
+    /// relay-cached copy out of the update mesh. Removal from the mesh is
+    /// eviction-driven (`unregister_local_hosting`, called on hosting-cache
+    /// eviction — piece A), never renewal-driven (piece D).
+    ///
+    /// This pins the positive half of the fallback-safety question; the
+    /// negative half (a bare `active_subscriptions` lease with no demand DOES
+    /// lapse) is pinned by `hosting.rs::test_active_lease_renewed_iff_contract_in_use`.
+    #[test]
+    fn relay_cached_hosting_interest_advertised_independent_of_subscription_lease() {
+        let (manager, time) = make_manager();
+        let relay_cached = make_contract_key(1);
+
+        // Relay-cache shape: local hosting interest only, no lease/client/downstream.
+        let became = manager.register_local_hosting(&relay_cached);
+        assert!(
+            became,
+            "first register_local_hosting reports newly interested"
+        );
+
+        // Advertised in the interest heartbeat -> co-hosts broadcast UPDATEs to it.
+        assert!(
+            manager
+                .get_all_interest_hashes()
+                .contains(&contract_hash(&relay_cached)),
+            "a hosting-only (relay-cached) copy MUST be advertised in the interest \
+             heartbeat so connected co-hosts broadcast UPDATEs to it"
+        );
+
+        // Advance well past the subscription lease TTL (8 min) AND the peer-interest
+        // TTL (20 min). Local hosting interest has no lease, so it does NOT lapse.
+        time.advance_time(INTEREST_TTL * 2);
+        assert!(
+            manager
+                .get_all_interest_hashes()
+                .contains(&contract_hash(&relay_cached)),
+            "local hosting interest must NOT lapse with time — relay-cached freshness \
+             is heartbeat/interest-driven, independent of the subscription lease that \
+             piece D's interest-gated renewal governs"
+        );
+
+        // Only explicit eviction removes it from the mesh (piece A), not a lease lapse.
+        assert!(manager.unregister_local_hosting(&relay_cached));
+        assert!(
+            !manager
+                .get_all_interest_hashes()
+                .contains(&contract_hash(&relay_cached)),
+            "removal from the update mesh is eviction-driven (piece A), not \
+             renewal-driven (piece D)"
+        );
+    }
+
+    /// Receive side of the same fact: a co-host that advertises a shared
+    /// contract via the Interests heartbeat becomes an UPDATE broadcast target
+    /// and stays one purely on heartbeat refreshes — no subscription lease
+    /// anywhere in the loop. So a relay-cached co-host keeps receiving fresh
+    /// UPDATEs on the mesh that piece D does not touch.
+    #[test]
+    fn co_host_stays_broadcast_target_via_heartbeat_without_subscription() {
+        let (manager, time) = make_manager();
+        let shared = make_contract_key(2);
+        let co_host = make_peer_key(9);
+
+        // We host `shared` (relay-cache shape), so we care about its updates.
+        manager.register_local_hosting(&shared);
+
+        // The co-host's heartbeat advertises `shared`; the receive path
+        // (node.rs `InterestMessage::Interests`) matches shared interest and
+        // registers the sender as an interested peer (a broadcast target).
+        assert!(
+            manager
+                .get_matching_contracts(&[contract_hash(&shared)])
+                .contains(&shared),
+            "shared interest must match so the receive path registers the co-host"
+        );
+        assert!(manager.register_peer_interest(&shared, co_host.clone(), None, false));
+        assert!(
+            manager
+                .get_interested_peers(&shared)
+                .iter()
+                .any(|(p, _)| p == &co_host),
+            "co-host must be an UPDATE broadcast target after a single heartbeat, \
+             with no subscription needed"
+        );
+
+        // A heartbeat refresh just before the 20-min TTL keeps it a live target
+        // indefinitely, independent of any subscription lease.
+        time.advance_time(INTEREST_TTL - Duration::from_secs(30));
+        manager.refresh_peer_interest(&shared, &co_host);
+        time.advance_time(INTEREST_TTL - Duration::from_secs(30));
+        assert!(
+            !manager
+                .get_peer_interest(&shared, &co_host)
+                .expect("co-host interest still present")
+                .is_expired_at(time.now()),
+            "heartbeat refresh keeps the co-host a live broadcast target with no \
+             subscription — the freshness path piece D leaves untouched"
+        );
+    }
 }
