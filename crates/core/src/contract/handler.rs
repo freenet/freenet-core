@@ -80,11 +80,20 @@ pub(crate) trait ContractHandler {
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve>;
 
     fn executor(&mut self) -> &mut Self::ContractExecutor;
+
+    /// The delegate wakeup scheduler (#3972), if this handler backs one. The
+    /// `contract_handling` loop uses it to persist `ScheduleWakeup` requests
+    /// and to drive `WakeupFired` delivery. Handlers without durable delegate
+    /// execution (mocks, simulation) return `None`, disabling wakeups.
+    fn wakeup_scheduler(&mut self) -> Option<&mut super::wakeup::WakeupScheduler> {
+        None
+    }
 }
 
 pub(crate) struct NetworkContractHandler {
     executor: RuntimePool,
     channel: ContractHandlerChannel<ContractHandlerHalve>,
+    wakeups: super::wakeup::WakeupScheduler,
 }
 
 impl ContractHandler for NetworkContractHandler {
@@ -123,6 +132,10 @@ impl ContractHandler for NetworkContractHandler {
         // Set up hosting storage reference for eviction cleanup
         // This must be done before loading the cache so evictions work correctly
         let storage = executor.state_store().inner().clone();
+
+        // Rehydrate any delegate wakeups (#3972) persisted before restart from
+        // the same backing store the executor uses.
+        let wakeups = super::wakeup::WakeupScheduler::load(storage.clone());
         op_manager.ring.set_hosting_storage(storage.clone());
         // Hydrate broken-invariants flags from the same backing store so a
         // node that previously detected a non-idempotent contract doesn't
@@ -165,7 +178,11 @@ impl ContractHandler for NetworkContractHandler {
             .neighbor_hosting
             .initialize_from_hosting_cache(hosted_ids);
 
-        Ok(Self { executor, channel })
+        Ok(Self {
+            executor,
+            channel,
+            wakeups,
+        })
     }
 
     fn channel(&mut self) -> &mut ContractHandlerChannel<ContractHandlerHalve> {
@@ -174,6 +191,10 @@ impl ContractHandler for NetworkContractHandler {
 
     fn executor(&mut self) -> &mut Self::ContractExecutor {
         &mut self.executor
+    }
+
+    fn wakeup_scheduler(&mut self) -> Option<&mut super::wakeup::WakeupScheduler> {
+        Some(&mut self.wakeups)
     }
 }
 

@@ -50,6 +50,19 @@ pub(crate) const BROKEN_INVARIANTS_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("secrets_index");
 
+/// Scheduled delegate wakeups (#3972), persisted so they survive node restart.
+/// Keyed by `(DelegateKey, tag)` so re-scheduling with the same tag overwrites
+/// the prior row (cancel-by-tag). The encode/decode of both key and value lives
+/// in `contract::wakeup`; this table stores the raw bytes.
+///
+/// Key: DelegateKey (64 bytes) || tag (variable)
+/// Value: fire-at seconds-since-epoch (u64 LE) || nanos (u32 LE) || params (variable)
+pub(crate) const WAKEUPS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("scheduled_wakeups");
+
+/// A raw `(key_bytes, value_bytes)` wakeup row as stored in [`WAKEUPS_TABLE`].
+pub(crate) type RawWakeupRow = (Vec<u8>, Vec<u8>);
+
 /// Index table for the per-user secret dimension (P1 of #4381). SEPARATE
 /// from [`SECRETS_INDEX_TABLE`] so the existing single-user index keeps its
 /// exact schema and a pre-#4381 database opens unchanged (this table is
@@ -417,6 +430,17 @@ impl ReDb {
                     table = "BROKEN_INVARIANTS_TABLE",
                     phase = "table_init_failed",
                     "Failed to open BROKEN_INVARIANTS_TABLE"
+                );
+                e
+            })?;
+
+            // Absent in pre-#3972 databases → created empty on first open.
+            txn.open_table(WAKEUPS_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "WAKEUPS_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open WAKEUPS_TABLE"
                 );
                 e
             })?;
@@ -817,6 +841,46 @@ impl ReDb {
                 let delegate_key =
                     DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
                 result.push((delegate_key, CodeHash::from(&value_bytes)));
+            }
+            Ok(result)
+        })
+    }
+
+    // ==================== Scheduled Wakeups (#3972) ====================
+    // Raw-bytes CRUD for the wakeup scheduler; key/value framing lives in
+    // `contract::wakeup`. Keyed by `(DelegateKey, tag)` so `insert` overwrites
+    // on re-schedule (cancel-by-tag).
+
+    /// Insert or replace a scheduled wakeup row.
+    pub fn store_wakeup(&self, key: &[u8], value: &[u8]) -> Result<(), redb::Error> {
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(WAKEUPS_TABLE)?;
+            tbl.insert(key, value)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Remove a scheduled wakeup row (on fire or explicit cancel). Removing an
+    /// absent key is a no-op.
+    pub fn remove_wakeup(&self, key: &[u8]) -> Result<(), redb::Error> {
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(WAKEUPS_TABLE)?;
+            tbl.remove(key)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Load every persisted wakeup as `(key_bytes, value_bytes)` for rebuilding
+    /// the in-memory indexes at startup.
+    pub fn load_all_wakeups(&self) -> Result<Vec<RawWakeupRow>, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(WAKEUPS_TABLE)?;
+            let mut result = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                result.push((key.value().to_vec(), value.value().to_vec()));
             }
             Ok(result)
         })

@@ -14,6 +14,7 @@ pub(crate) mod governance;
 mod handler;
 pub mod storages;
 pub(crate) mod user_input;
+pub(crate) mod wakeup;
 
 pub(crate) use executor::{
     ContractExecutor, ExecutorTransactionStream, ExportBusy, MAX_CREATED_DELEGATES_PER_NODE,
@@ -53,6 +54,11 @@ const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
 /// Matches the same bounded-drain pattern as MAX_DRAIN_BATCH for contract events,
 /// preventing delegate notification channel growth under sustained contract load.
 const MAX_DELEGATE_DRAIN_BATCH: usize = 16;
+
+/// Max delegate wakeups (#3972) fired per event-loop iteration. Each fire is a
+/// full delegate execution, so bound it like the delegate-notification drain so
+/// a burst of simultaneously-due wakeups can't starve contract events.
+const MAX_WAKEUP_DRAIN_BATCH: usize = 16;
 
 /// Timeout for the off-loop related-contract fetch that backs a deferred
 /// PUT/UPDATE (#4391).
@@ -566,11 +572,14 @@ where
             }
             Err(err) => {
                 // Downgrade "not found" to warn — expected during legacy
-                // migration probes when old delegate WASM isn't on this node
+                // migration probes when old delegate WASM isn't on this node, and
+                // when a scheduled wakeup (#3972) fires for a delegate that has
+                // since been uninstalled (the wakeup is then simply dropped).
                 if err.is_missing_delegate() {
                     tracing::warn!(
                         delegate_key = %delegate_key,
-                        "Delegate not found in store (expected for migration probes)"
+                        "Delegate not found in store (expected for migration probes \
+                         or a fired wakeup on an uninstalled delegate)"
                     );
                 } else {
                     tracing::error!(
@@ -593,6 +602,10 @@ where
         let mut subscribe_requests: Vec<SubscribeContractRequest> = Vec::new();
         let mut delegate_messages: Vec<DelegateMessage> = Vec::new();
         let mut user_input_requests: Vec<UserInputRequest<'static>> = Vec::new();
+        // Wakeups the delegate asked us to schedule this iteration (#3972).
+        // Fire-and-forget: persisted below, NOT re-fed to the delegate, so a
+        // schedule alone does not keep the request loop spinning.
+        let mut schedule_wakeups: Vec<(std::time::SystemTime, Vec<u8>)> = Vec::new();
 
         for msg in values {
             match msg {
@@ -614,11 +627,46 @@ where
                 OutboundDelegateMsg::RequestUserInput(req) => {
                     user_input_requests.push(req);
                 }
+                OutboundDelegateMsg::ScheduleWakeup { at, tag } => {
+                    schedule_wakeups.push((at, tag));
+                }
                 other @ OutboundDelegateMsg::ApplicationMessage(_)
                 | other @ OutboundDelegateMsg::ContextUpdated(_) => {
                     // Accumulate non-request messages
                     accumulated_messages.push(other);
                 }
+            }
+        }
+
+        // Persist any scheduled wakeups. We capture the delegate's CURRENT
+        // params so the wakeup replays it in the exact same param context it
+        // scheduled from (the host has no other way to recover params — the
+        // DelegateKey is a one-way hash of code+params). Re-scheduling the same
+        // (delegate, tag) replaces the prior pending entry (cancel-by-tag).
+        //
+        // NOTE: when a delegate is invoked from the contract-notification path
+        // (`handle_delegate_notification`), `current_params` is empty (that path
+        // passes no params, pre-existing #3275), so a wakeup scheduled from a
+        // notification would replay with empty params. The primary use case
+        // (client-driven scheduling, e.g. River key rotation) carries real
+        // params, and a wakeup re-scheduled from a fired wakeup carries the
+        // originally-captured params forward, so this only affects the
+        // notification-triggered-scheduling edge.
+        if !schedule_wakeups.is_empty() {
+            if let Some(scheduler) = contract_handler.wakeup_scheduler() {
+                let params_bytes = current_params.as_ref().to_vec();
+                for (at, tag) in schedule_wakeups {
+                    // schedule() enforces per-delegate / global / tag-size caps
+                    // and logs on rejection; the delegate is not notified (the
+                    // primitive is fire-and-forget).
+                    scheduler.schedule(delegate_key.clone(), tag, at, params_bytes.clone());
+                }
+            } else {
+                tracing::warn!(
+                    delegate_key = %delegate_key,
+                    "delegate requested ScheduleWakeup but this handler has no \
+                     wakeup scheduler configured; dropping the request"
+                );
             }
         }
 
@@ -1211,6 +1259,33 @@ where
             }
         }
 
+        // Fire any delegate wakeups (#3972) that are now due, bounded per
+        // iteration. Checked every pass (even when the fair queue has work) so a
+        // due wakeup isn't delayed under sustained contract load. Firing happens
+        // INLINE on this task — the same task that owns the executor and runs
+        // delegates — so there is no cross-task channel and no lossy dispatch.
+        // Scheduling also happens on this task (in
+        // `handle_delegate_with_contract_requests`), so a newly-scheduled
+        // earlier wakeup is picked up on the next pass with no notification.
+        //
+        // Wall-clock exception (cf. code-style.md "use TimeSource"): wakeups
+        // target ABSOLUTE `SystemTime`s that must survive restart ("fire next
+        // Tuesday"), which the monotonic/simulated `TimeSource` cannot model, so
+        // real `SystemTime::now()` is the correct clock here — analogous to the
+        // documented `boot_time::Instant` exception. It is also never reached
+        // under DST: simulation handlers return `wakeup_scheduler() == None`
+        // (below), so neither this `now()` nor `sleep_until_wakeup`'s sleep runs
+        // in a paused-time simulation.
+        let due_wakeups = contract_handler
+            .wakeup_scheduler()
+            .map(|scheduler| {
+                scheduler.take_due(std::time::SystemTime::now(), MAX_WAKEUP_DRAIN_BATCH)
+            })
+            .unwrap_or_default();
+        for due in due_wakeups {
+            handle_wakeup_fired(&mut contract_handler, due, &prompter).await;
+        }
+
         // Process one event from the fair queue in normal round-robin order.
         // There is NO per-contract holding: an event for a contract whose
         // PUT/UPDATE is mid-deferral runs immediately and may observe the
@@ -1231,7 +1306,15 @@ where
         }
 
         // Fair queue is empty. Block-wait for a new event, a resumed deferral,
-        // or a delegate notification.
+        // a delegate notification, or the next scheduled wakeup coming due.
+        //
+        // `next_wakeup_due` is read into a local BEFORE the `select!` so the
+        // sleep branch doesn't take a second `&mut contract_handler` (all
+        // branch expressions in a `select!` are evaluated up front). When it's
+        // due the loop simply wakes and re-runs the top-of-loop wakeup drain.
+        let next_wakeup_due = contract_handler
+            .wakeup_scheduler()
+            .and_then(|scheduler| scheduler.next_due());
         tokio::select! {
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event, priority) = result?;
@@ -1253,6 +1336,92 @@ where
             notification = recv_delegate_notification(&mut delegate_rx) => {
                 handle_delegate_notification(&mut contract_handler, notification, &prompter).await;
             }
+            _ = sleep_until_wakeup(next_wakeup_due) => {
+                // The earliest wakeup is now due; the top-of-loop drain on the
+                // next iteration removes and fires it.
+            }
+        }
+    }
+}
+
+/// Sleep until `next_due`, or forever if there is no pending wakeup (so this
+/// `select!` branch is effectively disabled until one is scheduled). Because
+/// past-due wakeups are already drained at the top of the loop, `next_due` is
+/// always in the future here.
+///
+/// Uses real `SystemTime`/`tokio::time::sleep` rather than `TimeSource` for the
+/// same reason the top-of-loop drain does (see the wall-clock exception comment
+/// there): wakeups fire at absolute wall-clock times and this branch is never
+/// reached under DST (simulation handlers have no wakeup scheduler). A backward
+/// wall-clock jump can at worst oversleep a fire, self-correcting on the next
+/// event since every loop iteration re-drains and recomputes `next_due`.
+async fn sleep_until_wakeup(next_due: Option<std::time::SystemTime>) {
+    match next_due {
+        Some(at) => {
+            let dur = at
+                .duration_since(std::time::SystemTime::now())
+                .unwrap_or(std::time::Duration::ZERO);
+            tokio::time::sleep(dur).await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Deliver a fired scheduled wakeup (#3972) to its delegate as an
+/// [`InboundDelegateMsg::WakeupFired`], replaying the params captured at
+/// schedule time so the delegate wakes in its own param context.
+///
+/// If the delegate is no longer registered, `execute_delegate_request` reports a
+/// missing-delegate error which is logged and dropped — the wakeup was already
+/// removed from the schedule by `take_due`, so it is neither re-fired nor
+/// re-installed (matching the issue's "drop on uninstalled delegate" rule).
+async fn handle_wakeup_fired<CH, P>(contract_handler: &mut CH, due: wakeup::DueWakeup, prompter: &P)
+where
+    CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter,
+{
+    let wakeup::DueWakeup {
+        delegate_key,
+        tag,
+        params,
+    } = due;
+
+    tracing::debug!(
+        delegate = %delegate_key,
+        tag_len = tag.len(),
+        "Delivering scheduled wakeup to delegate"
+    );
+
+    let req = DelegateRequest::ApplicationMessages {
+        key: delegate_key.clone(),
+        params: Parameters::from(params),
+        inbound: vec![InboundDelegateMsg::WakeupFired { tag }],
+    };
+
+    let outbound = handle_delegate_with_contract_requests(
+        contract_handler,
+        req,
+        None,
+        // A scheduled wakeup fires outside any client/user connection, so there
+        // is no user token and no per-user secret namespace — secrets stay
+        // `SecretScope::Local`, exactly like a contract notification.
+        None,
+        &delegate_key,
+        prompter,
+    )
+    .await;
+
+    // Like contract notifications, a wakeup-driven invocation has no originating
+    // client connection, so any ApplicationMessages the delegate emits have
+    // nowhere to route yet (#3275). Log and drop.
+    for msg in &outbound {
+        if let OutboundDelegateMsg::ApplicationMessage(app_msg) = msg {
+            tracing::warn!(
+                delegate = %delegate_key,
+                payload_len = app_msg.payload.len(),
+                "Delegate produced ApplicationMessage from a scheduled wakeup but no \
+                 client routing is available yet — message dropped"
+            );
         }
     }
 }
@@ -1982,7 +2151,8 @@ async fn handle_delegate_notification<CH, P>(
             | OutboundDelegateMsg::PutContractRequest(_)
             | OutboundDelegateMsg::UpdateContractRequest(_)
             | OutboundDelegateMsg::SubscribeContractRequest(_)
-            | OutboundDelegateMsg::SendDelegateMessage(_) => {
+            | OutboundDelegateMsg::SendDelegateMessage(_)
+            | OutboundDelegateMsg::ScheduleWakeup { .. } => {
                 tracing::warn!(
                     delegate = %delegate_key,
                     msg_type = ?std::mem::discriminant(msg),

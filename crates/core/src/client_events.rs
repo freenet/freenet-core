@@ -1378,6 +1378,7 @@ async fn process_open_request(
                                         "ContractNotification"
                                     }
                                     InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+                                    InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
                                     _ => "Unknown",
                                 })
                                 .collect();

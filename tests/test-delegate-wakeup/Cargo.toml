@@ -1,0 +1,20 @@
+[package]
+name = "test-delegate-wakeup"
+version = "0.1.0"
+edition = "2024"
+description = "Test delegate exercising the scheduled-wakeup primitive (#3972)"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.8.3", features = ["contract"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+trace = ["freenet-stdlib/trace"]

@@ -172,6 +172,7 @@ impl Runtime {
             InboundDelegateMsg::SubscribeContractResponse(_) => "SubscribeContractResponse",
             InboundDelegateMsg::ContractNotification(_) => "ContractNotification",
             InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+            InboundDelegateMsg::WakeupFired { .. } => "WakeupFired",
             // `InboundDelegateMsg` is `#[non_exhaustive]` (stdlib 0.6.0+).
             // Future variants land here for tracing only — they still flow
             // through the wasm boundary as raw bincode below; classifying
@@ -258,6 +259,9 @@ impl Runtime {
                             msg.payload.len()
                         )
                     }
+                    OutboundDelegateMsg::ScheduleWakeup { tag, .. } => {
+                        format!("ScheduleWakeup(tag_len={})", tag.len())
+                    }
                 })
                 .collect::<Vec<String>>()
                 .join(", ");
@@ -296,6 +300,7 @@ impl Runtime {
                         OutboundDelegateMsg::UpdateContractRequest(r) => format!("UpdateContractReq({})", r.contract_id),
                         OutboundDelegateMsg::SubscribeContractRequest(r) => format!("SubscribeContractReq({})", r.contract_id),
                         OutboundDelegateMsg::SendDelegateMessage(m) => format!("SendDelegateMsg(target={})", m.target),
+                        OutboundDelegateMsg::ScheduleWakeup { tag, .. } => format!("ScheduleWakeup(tag_len={})", tag.len()),
                     }
                 }).collect::<Vec<_>>()
             } else {
@@ -452,7 +457,8 @@ impl Runtime {
                             | OutboundDelegateMsg::PutContractRequest(_)
                             | OutboundDelegateMsg::UpdateContractRequest(_)
                             | OutboundDelegateMsg::SubscribeContractRequest(_)
-                            | OutboundDelegateMsg::SendDelegateMessage(_)) => results.push(msg),
+                            | OutboundDelegateMsg::SendDelegateMessage(_)
+                            | OutboundDelegateMsg::ScheduleWakeup { .. }) => results.push(msg),
                         }
                     }
                     break;
@@ -463,6 +469,27 @@ impl Runtime {
                     tracing::debug!("SendDelegateMessage processed");
                     context.clear();
                     context.extend_from_slice(ctx.as_ref());
+                }
+                OutboundDelegateMsg::ScheduleWakeup { at, tag } => {
+                    // Fire-and-forget scheduling request (#3972). The runtime
+                    // layer can't persist it (it has no scheduler handle), so
+                    // surface it to `handle_delegate_with_contract_requests`,
+                    // which owns the `WakeupScheduler`.
+                    //
+                    // Unlike the request arms, we do NOT drain-and-break here:
+                    // draining the rest of `outbound_msgs` verbatim would copy any
+                    // trailing `SendDelegateMessage` through WITHOUT the sender
+                    // attestation its own arm applies, re-opening the drain-bypass
+                    // spoofing hole #3282 closed. Falling through instead routes
+                    // each following message to its own arm (attestation
+                    // preserved), and a trailing `ContextUpdated` still folds into
+                    // `context`. ScheduleWakeup is fire-and-forget, so there is no
+                    // reason to terminate processing early.
+                    tracing::debug!(
+                        tag_len = tag.len(),
+                        "Passing ScheduleWakeup up to be scheduled"
+                    );
+                    results.push(OutboundDelegateMsg::ScheduleWakeup { at, tag });
                 }
             }
         }

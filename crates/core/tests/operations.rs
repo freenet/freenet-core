@@ -2319,7 +2319,8 @@ async fn test_delegate_request(ctx: &mut TestContext) -> TestResult {
                 | other @ OutboundDelegateMsg::PutContractRequest(_)
                 | other @ OutboundDelegateMsg::UpdateContractRequest(_)
                 | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
-                | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
+                | other @ OutboundDelegateMsg::SendDelegateMessage(_)
+                | other @ OutboundDelegateMsg::ScheduleWakeup { .. } => {
                     bail!("Expected ApplicationMessage, got {:?}", other)
                 }
             };
@@ -2479,7 +2480,8 @@ async fn test_attested_contract_passed_to_delegate(ctx: &mut TestContext) -> Tes
                 | other @ OutboundDelegateMsg::PutContractRequest(_)
                 | other @ OutboundDelegateMsg::UpdateContractRequest(_)
                 | other @ OutboundDelegateMsg::SubscribeContractRequest(_)
-                | other @ OutboundDelegateMsg::SendDelegateMessage(_) => {
+                | other @ OutboundDelegateMsg::SendDelegateMessage(_)
+                | other @ OutboundDelegateMsg::ScheduleWakeup { .. } => {
                     bail!("Expected ApplicationMessage, got {:?}", other)
                 }
             };
