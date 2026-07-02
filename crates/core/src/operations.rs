@@ -466,78 +466,18 @@ pub(crate) fn reclaim_evicted_contract(
     );
 }
 
-/// Complete subscription at the originator node via GET piggyback.
-///
-/// The subscription tree was built by relay nodes during GET response propagation.
-/// This function performs the local registration at the originator:
-/// 1. Mark subscribed (lease in active_subscriptions)
-/// 2. Register the upstream peer as an interest source
-/// 3. Register local interest so ChangeInterests from peers are processed
-/// 4. Announce contract hosted so neighbors send UPDATEs
-pub(crate) async fn complete_piggyback_subscription(
-    op_manager: &OpManager,
-    key: &ContractKey,
-    tx: &crate::message::Transaction,
-    sender_from_addr: &Option<crate::ring::PeerKeyLocation>,
-) {
-    op_manager.ring.subscribe(*key);
-    op_manager.ring.complete_subscription_request(key, true);
-
-    // Register local interest so ChangeInterests from peers get properly processed.
-    let became_interested = op_manager.interest_manager.add_local_client(key);
-    if became_interested {
-        broadcast_change_interests(op_manager, vec![*key], vec![]).await;
-    }
-
-    // Announce that we host this contract so neighbors include us in broadcast targets.
-    announce_contract_hosted(op_manager, key).await;
-
-    if let Some(upstream_pkl) = sender_from_addr.as_ref() {
-        let peer_key = crate::ring::interest::PeerKey::from(upstream_pkl.pub_key.clone());
-        let is_new = op_manager
-            .interest_manager
-            .register_peer_interest(key, peer_key, None, true);
-        if is_new {
-            // #4359 (MUST-FIX 1): the piggyback upstream is now a viable
-            // broadcast target — flush any deferred fresh-contract broadcast so
-            // a cold-id PUT that gave up with no targets reaches the network.
-            op_manager.flush_pending_broadcast_on_interest(key).await;
-        }
-        tracing::debug!(tx = %tx, contract = %key, "Subscription completed via GET piggyback");
-    } else {
-        // sender_from_addr can be None for transient connections not yet in the ring.
-        // Subscription is still marked locally; the 2-minute renewal cycle will
-        // establish a full subscription tree via a standard SUBSCRIBE operation.
-        tracing::warn!(
-            tx = %tx,
-            contract = %key,
-            "GET piggyback: upstream peer not in ring, subscription tree incomplete -- renewal will heal"
-        );
-    }
-}
-
-/// Auto-subscribe at the originator: use piggybacked subscription if available,
-/// otherwise fall back to a separate SUBSCRIBE operation.
-///
-/// Called from GET response handling when `AUTO_SUBSCRIBE_ON_GET` is enabled and
-/// the originator is not yet subscribed. Consolidates the piggyback-or-fallback
-/// logic that appears in both streaming and non-streaming response paths.
-pub(crate) async fn auto_subscribe_on_get_response(
-    op_manager: &OpManager,
-    key: &ContractKey,
-    tx: &crate::message::Transaction,
-    sender_from_addr: &Option<crate::ring::PeerKeyLocation>,
-    subscribe_requested: bool,
-    blocking_sub: bool,
-    path_label: &str,
-) {
-    if subscribe_requested {
-        complete_piggyback_subscription(op_manager, key, tx, sender_from_addr).await;
-    } else {
-        let child_tx = start_subscription_request(op_manager, *tx, *key, blocking_sub);
-        tracing::debug!(tx = %tx, %child_tx, blocking = %blocking_sub, "started subscription ({path_label}, fallback)");
-    }
-}
+// `complete_piggyback_subscription` and `auto_subscribe_on_get_response` were
+// REMOVED in piece E of the demand-driven hosting redesign
+// (docs/design/demand-driven-hosting.md §9, hosting-invariants anti-patterns
+// table). Their only caller was the GET-auto-subscribe block in
+// `get/op_ctx_task.rs`, which auto-installed a durable subscription on every
+// successful GET (subscribe=false) — the "GET-auto-subscribe" anti-pattern that
+// manufactures demand no client requested. A GET now hosts on the return path
+// only under piece A's demand gauge (evictable, non-durable); a client that
+// wants ongoing freshness sets `subscribe=true`, which routes through the
+// explicit subscribe path (`maybe_subscribe_child` -> `run_client_subscribe`).
+// do NOT re-add an auto-subscribe-on-GET helper — see hosting-invariants
+// (invariants 1 & 2).
 
 /// Broadcast ChangeInterests message to all connected peers.
 ///
