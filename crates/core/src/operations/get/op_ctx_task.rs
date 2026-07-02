@@ -1461,44 +1461,6 @@ const MAX_RETRIES: usize = 3;
 /// bubble-up halts at the first Found).
 const MAX_TERMINAL_CONSULT_HOSTS: usize = 2;
 
-/// Pure selection core for the bootstrap gateway fallback (#4361).
-///
-/// Returns the first configured gateway that is not this node and not
-/// excluded by the caller's skip predicate — but ONLY when the ring is
-/// empty (`ring_connection_count == 0`). A non-empty ring means normal
-/// routing had ring entries to consider (its candidates may still all
-/// be filtered as transient/visited, but that exhaustion is genuine),
-/// so the fallback must stay out of the way.
-///
-/// Selection is deliberately deterministic (config order), unlike the
-/// randomized pick in #3219's CONNECT re-bootstrap: the client driver
-/// and the per-attempt loopback relay select independently and must
-/// converge on the same gateway given the same exclusion set — stream
-/// claims and route telemetry are attributed via the client's
-/// `current_target`, so divergence would mis-key both. Failover
-/// diversity comes from the exclusion predicate (tried/visited), not
-/// from randomization.
-///
-/// Split out from [`bootstrap_gateway_target`] so unit tests can
-/// exercise the selection rules without constructing an `OpManager`.
-fn select_bootstrap_gateway(
-    ring_connection_count: usize,
-    configured_gateways: &[PeerKeyLocation],
-    own_addr: Option<SocketAddr>,
-    is_excluded: impl Fn(SocketAddr) -> bool,
-) -> Option<(PeerKeyLocation, SocketAddr)> {
-    if ring_connection_count > 0 {
-        return None;
-    }
-    configured_gateways.iter().find_map(|gw| {
-        let addr = gw.socket_addr()?;
-        if Some(addr) == own_addr || is_excluded(addr) {
-            return None;
-        }
-        Some((gw.clone(), addr))
-    })
-}
-
 /// Carry the client driver's tried set into a fresh attempt's visited
 /// bloom, excluding the attempt's intended destination (#4361 / #4364
 /// review H1). Split out so unit tests can pin the exclusion behavior
