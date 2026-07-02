@@ -1984,6 +1984,16 @@ impl Ring {
                     }
                 }
             }
+            // Push the active seed-lease gauge for simulation observability
+            // (no-op in production — see `topology_registry`). Lets the seed-chain
+            // sim assert the per-node cap holds (peak) and that seeds collapse to
+            // zero after the window (last), the spam-safety signal.
+            if let Some(addr) = ring.connection_manager.get_own_addr() {
+                crate::ring::topology_registry::record_active_seed_leases(
+                    addr,
+                    ring.active_seed_lease_count() as u64,
+                );
+            }
 
             // Gate: skip renewal spawning if we have no ring connections (#3676).
             // Subscribe requests require connected peers to route through.
@@ -3004,11 +3014,6 @@ impl Ring {
     /// `HostingManager::install_seed_lease`.
     pub(crate) fn install_seed_lease(&self, contract: ContractKey) -> bool {
         self.hosting_manager.install_seed_lease(contract)
-    }
-
-    /// Whether `contract` currently holds an active PUT seed lease.
-    pub(crate) fn has_active_seed_lease(&self, contract: &ContractKey) -> bool {
-        self.hosting_manager.has_active_seed_lease(contract)
     }
 
     /// Number of currently-active (non-expired) seed leases on this node.
