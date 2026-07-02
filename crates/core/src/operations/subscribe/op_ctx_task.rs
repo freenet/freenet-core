@@ -1906,12 +1906,12 @@ async fn drive_relay_subscribe(
     }
 
     // ── Step 4: Terminal advertisement consult (piece C, invariant 5) ─────
-    // Like GET, the SUBSCRIBE relay forwards a SINGLE greedy hop toward the
-    // key and does NOT retry its other neighbors (the same fan-out cap that
-    // GET enforces with MAX_RELAY_RETRIES=1). If that hop returns NotFound,
-    // the closest advertised host may be a neighbor the cap skipped — one hop
-    // off the routing path. Before declaring a dead-end, consult the host
-    // advertisements our neighbors broadcast and try that host.
+    // Like GET, once the SUBSCRIBE relay has exhausted greedy routing plus
+    // bounded backtracking (Step 3b) toward the key, the closest advertised
+    // host may still be a neighbor OFF the routing path that k_closest never
+    // returned. If the final outcome is NotFound, consult the host
+    // advertisements our neighbors broadcast and try that host before declaring
+    // a dead-end.
     //
     // Bounded and NOT the removed per-hop fan-out: forwards ONLY to an
     // already-advertised host (nothing pushed/cached), a local lookup gates
