@@ -505,10 +505,10 @@ pub(super) async fn finalize_originator_subscribe(
 ///    later via the sub-op GET's own cache path, `get/op_ctx_task.rs` announces
 ///    there on first-time cache.
 ///
-/// See also `crate::operations::complete_piggyback_subscription` — the
-/// GET-piggyback finalization path, which performs the same conceptual steps in
-/// a different order (no fetch step: the body arrived inside the GET response).
-/// Keep the two in sync when adding host side effects.
+/// (The former `complete_piggyback_subscription` GET-piggyback finalization path
+/// was removed with GET-auto-subscribe in piece E of the demand-driven hosting
+/// redesign; explicit `subscribe=true` GETs now route through the ordinary
+/// subscribe driver, which reaches this helper.)
 pub(super) async fn finalize_host_subscribe(
     op_manager: &OpManager,
     key: ContractKey,
