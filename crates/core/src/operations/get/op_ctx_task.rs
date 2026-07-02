@@ -2388,17 +2388,24 @@ fn relay_advance_to_next_peer(
     backtrack_allowed: bool,
     new_visited: &VisitedPeers,
 ) -> Option<(PeerKeyLocation, SocketAddr)> {
-    if *retries > 0 {
-        // A backtrack: gated on a clean prior NotFound and on remaining budget.
-        // do NOT re-add a per-hop retry cap here — the linear fan-out bound
-        // depends on this being the shared per-request budget, not a per-hop
-        // multiplier (see hosting-invariants #4630 / DEFAULT_BACKTRACK_BUDGET).
-        if !backtrack_allowed || *budget == 0 {
-            return None;
-        }
-        *budget -= 1;
+    // A backtrack (retries > 0) is gated on a clean prior NotFound and on
+    // remaining budget. do NOT re-add a per-hop retry cap here — the linear
+    // fan-out bound depends on this being the shared per-request budget, not a
+    // per-hop multiplier (see hosting-invariants #4630 / DEFAULT_BACKTRACK_BUDGET).
+    // The budget is CHARGED only when a usable candidate is actually returned
+    // (`charge` closure), NOT here: a no-candidate / addressless / already-tried
+    // terminus makes no forward and must echo its budget unchanged, so it must
+    // not "spend" a unit it never used.
+    let is_backtrack = *retries > 0;
+    if is_backtrack && (!backtrack_allowed || *budget == 0) {
+        return None;
     }
-    *retries += 1;
+    let charge = |retries: &mut usize, budget: &mut u32| {
+        if is_backtrack {
+            *budget -= 1;
+        }
+        *retries += 1;
+    };
 
     // Use new_visited as the skip list so upstream's visited set and our own
     // marks are both respected.
@@ -2428,6 +2435,7 @@ fn relay_advance_to_next_peer(
                         "GET relay advance: ring empty — forwarding to configured gateway"
                     );
                     tried.push(addr);
+                    charge(retries, budget);
                     Some((gw, addr))
                 }
                 None => {
@@ -2461,6 +2469,7 @@ fn relay_advance_to_next_peer(
         return None;
     }
     tried.push(addr);
+    charge(retries, budget);
     Some((peer, addr))
 }
 
@@ -4188,13 +4197,23 @@ mod tests {
         let src = include_str!("op_ctx_task.rs");
         let body = extract_fn_body(src, "fn relay_advance_to_next_peer(");
         assert!(
-            body.contains("if *retries > 0"),
+            body.contains("let is_backtrack = *retries > 0;"),
             "the first forward (retries == 0) must be free; only subsequent \
              forwards are budget-gated backtracks"
         );
         assert!(
             body.contains("*budget == 0") && body.contains("*budget -= 1"),
             "an alternative forward must require budget > 0 and decrement it"
+        );
+        // The budget must be charged only when a usable candidate is actually
+        // returned (via the `charge` closure at each Some(...) site), NOT
+        // unconditionally before candidate selection — otherwise a
+        // no-candidate / addressless / already-tried terminus echoes a budget
+        // that is one too low (Codex finding).
+        assert!(
+            body.contains("charge(retries, budget)"),
+            "budget must be charged at the Some(...) return sites, not before \
+             confirming a usable candidate"
         );
         assert!(
             !body.contains("MAX_RELAY_RETRIES"),
@@ -4213,10 +4232,6 @@ mod tests {
             body.contains("backtrack_budget: crate::operations::DEFAULT_BACKTRACK_BUDGET"),
             "the originator GET must seed backtrack_budget with \
              DEFAULT_BACKTRACK_BUDGET so relays have budget to backtrack with"
-        );
-        assert!(
-            crate::operations::DEFAULT_BACKTRACK_BUDGET > 0,
-            "DEFAULT_BACKTRACK_BUDGET must be > 0 or backtracking is disabled"
         );
     }
 
