@@ -4935,4 +4935,92 @@ mod tests {
         assert!(needs_renewal.contains(&want_b));
         assert!(needs_renewal.contains(&within_window));
     }
+
+    /// Regression for the piece-D §1 renewal gate (adversarial-review MAJOR): a
+    /// live active lease is renewed **iff** the contract is `contract_in_use` —
+    /// a live client subscription OR a downstream subscriber. This pins that the
+    /// gate does NOT false-lapse a demanded contract, and that a demand-less
+    /// lease correctly lapses:
+    ///
+    ///  - **No false-lapse for demand-backed contracts.** Every WS-client
+    ///    subscribe entry point (a plain SUBSCRIBE and a GET-with-`subscribe:true`)
+    ///    registers `client_subscriptions` via the listener-registration handler
+    ///    (`client_events.rs:98` / `:1194`, `RegisterSubscriberListenerResponse`
+    ///    → `ring.add_client_subscription`) — which is exactly the map
+    ///    `contract_in_use` reads. So a genuinely client-subscribed contract's
+    ///    lease is always selected by §1. A chain host is renewed via its
+    ///    downstream subscriber.
+    ///  - **A bare lease with no demand LAPSES, correctly.**
+    ///    `run_executor_subscribe` installs an `active_subscriptions` lease but
+    ///    registers interest only in the InterestManager (`add_local_client`),
+    ///    NOT `client_subscriptions`. With no accompanying WS-client subscription
+    ///    or downstream (a PUT/seed with no ongoing interest), the lease is NOT
+    ///    renewed and lapses. Per design §1 a PUT only *seeds* a contract and is
+    ///    not demand, so an idle seed must evaporate — this is the intended
+    ///    behavior, not a false-lapse. Any real demand behind an executor
+    ///    subscribe is the WS client that PUT/subscribed, tracked separately in
+    ///    `client_subscriptions`.
+    #[test]
+    fn test_active_lease_renewed_iff_contract_in_use() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Move a lease into the renewal window (§1 only considers soon-to-expire
+        // leases; a fresh `subscribe()` lease is now+8min, outside the window).
+        let into_window = |m: &HostingManager, key: &ContractKey| {
+            if let Some(mut lease) = m.active_subscriptions.get_mut(key) {
+                lease.expires_at = Instant::now() + Duration::from_secs(30);
+            }
+        };
+
+        // (a) Bare lease — the `run_executor_subscribe` / PUT-seed shape: an
+        //     active lease with no client subscription and no downstream. Must
+        //     NOT be renewed → lapses.
+        let seed = make_contract_key(1);
+        manager.subscribe(seed);
+        into_window(&manager, &seed);
+        assert!(!manager.contract_in_use(&seed));
+        assert!(
+            !manager.contracts_needing_renewal().contains(&seed),
+            "a bare active lease with no client subscription and no downstream (a \
+             PUT / executor seed) must NOT be renewed — it lapses (design §1: a \
+             seed is not demand)"
+        );
+
+        // (b) Demand-backed by a client subscription — the WS-subscribe entry
+        //     point populates this via `add_client_subscription`. Must be renewed.
+        let client_backed = make_contract_key(2);
+        manager.subscribe(client_backed);
+        into_window(&manager, &client_backed);
+        let client_id = crate::client_events::ClientId::next();
+        manager.add_client_subscription(client_backed.id(), client_id);
+        assert!(manager.contract_in_use(&client_backed));
+        assert!(
+            manager.contracts_needing_renewal().contains(&client_backed),
+            "a client-subscribed contract's lease MUST be renewed — no false-lapse \
+             for a demand-backed subscription"
+        );
+
+        // (c) Demand-backed by a downstream subscriber — a chain host. Must be
+        //     renewed.
+        let downstream_backed = make_contract_key(3);
+        manager.subscribe(downstream_backed);
+        into_window(&manager, &downstream_backed);
+        manager.add_downstream_subscriber(&downstream_backed, make_peer_key(7));
+        assert!(manager.contract_in_use(&downstream_backed));
+        assert!(
+            manager
+                .contracts_needing_renewal()
+                .contains(&downstream_backed),
+            "a chain host (downstream subscriber) lease MUST be renewed"
+        );
+
+        // (d) Removing the client subscription makes the once-demanded lease
+        //     lapse — the collapse trigger.
+        manager.remove_client_subscription(client_backed.id(), client_id);
+        assert!(!manager.contract_in_use(&client_backed));
+        assert!(
+            !manager.contracts_needing_renewal().contains(&client_backed),
+            "once the client subscription is gone the lease is no longer renewed \
+             and lapses (chain collapse on interest loss)"
+        );
+    }
 }

@@ -360,10 +360,11 @@ fn no_closer_routable_neighbor(
 /// neighbors already paired with their ring distance to the contract, pick the
 /// one STRICTLY closer to the contract than `my_distance` (the most-keyward
 /// host), breaking ties on equal distance by ascending socket address so the
-/// choice is deterministic (design §6 point 2 total order; addressless peers
-/// sort last). Candidates with no known location are pre-filtered by the caller
-/// (they can't be distance-compared), so every item here carries a concrete
-/// distance.
+/// choice is deterministic (design §6 point 2 total order). The
+/// `most_keyward_hosting_neighbor` caller pre-filters candidates through
+/// `pkl.location()?`, which requires a resolvable socket address, so no
+/// addressless candidate ever reaches this helper and every item here carries a
+/// concrete distance and a concrete address for the tiebreak.
 ///
 /// Returns `None` when no candidate is strictly closer than us — either the
 /// candidate set is empty or every candidate is farther-or-equal (so we are the
