@@ -55,7 +55,7 @@ use demand::ProximityPrior;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{debug, info};
@@ -97,6 +97,68 @@ const MAX_SUBSCRIPTION_BACKOFF_ENTRIES: usize = 4096;
 /// Maximum number of downstream peer subscribers per contract.
 /// Prevents network-level subscription amplification attacks.
 const MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT: usize = 512;
+
+// -----------------------------------------------------------------------------
+// Piece B admission: capability-relative update-fanout capacity (#4642)
+// -----------------------------------------------------------------------------
+//
+// The one variable hosting cost weighed at ADMISSION (not eviction) is update
+// FANOUT (hosting-invariants §3, docs/design/hosting-eviction.md §21): the work
+// a node does broadcasting every UPDATE to its downstream subscribers, summed
+// across all hosted contracts. When a node already fans out to more downstream
+// subscribers than its capability-relative capacity, it REFUSES new
+// subscriptions rather than over-committing and thrashing. This is what bounds
+// popular-contract fan-out (piece D measured it as unbounded): a saturated
+// near-key host refuses, spreading load to hosts with headroom.
+//
+// TUNING PARAMETER (flagged for review): the design doc fixes the BYTE budget
+// (A2, RAM/8) concretely but leaves the fan-out capacity's numeric scaling
+// open. Absent a shipped uplink/CPU capability signal, we scale off the same
+// RAM signal that sizes the byte budget (a bigger box generally has more uplink
+// and CPU to sustain broadcast fan-out). The divisor/clamps below are the
+// initial, deliberately-generous defaults; production telemetry
+// (`hosting_subscription_refusals_total`, `hosting_fanout_capacity`) is the
+// instrument for tuning them. The clamp floor stays well above a hobby node's
+// real fan-out so refusal only bites genuinely over-committed peers.
+
+/// Lower clamp for the RAM-scaled default fan-out capacity. A small box refuses
+/// once it fans updates to this many downstream subscribers in aggregate.
+const MIN_DEFAULT_FANOUT_CAPACITY: usize = 64;
+
+/// Upper clamp for the RAM-scaled default fan-out capacity. Comfortably above
+/// the per-contract hard cap ([`MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT`]) so a
+/// capable node can still fully host a single maximally-popular contract; the
+/// aggregate cap only bites a node hosting many popular contracts at once.
+const MAX_DEFAULT_FANOUT_CAPACITY: usize = 4096;
+
+/// One aggregate fan-out slot per this many bytes of system RAM (8 MiB).
+/// Yields ~64 (512 MiB box) → ~1024 (8 GiB) → ~4096 (≥32 GiB) after clamping.
+const FANOUT_CAPACITY_RAM_DIVISOR_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Fallback total-RAM estimate when the OS/cgroup query fails, matching the
+/// conservative fallback the byte budget uses so a mis-detected box gets the
+/// smallest sane capacity rather than the largest.
+const FANOUT_FALLBACK_TOTAL_RAM_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Capability-relative default aggregate update-fanout capacity, scaled by the
+/// node's total RAM (the same signal that sizes the hosting byte budget, A2).
+///
+/// This is the single source of truth for the default; a `HostingManager`
+/// stores it in an atomic that simulation tests (and, later, an operator
+/// override) can replace via [`HostingManager::set_fanout_capacity`].
+pub(crate) fn default_fanout_capacity() -> usize {
+    let total_ram = crate::wasm_runtime::read_total_ram_bytes()
+        .map(|b| b as u64)
+        .unwrap_or(FANOUT_FALLBACK_TOTAL_RAM_BYTES);
+    fanout_capacity_for_ram(total_ram)
+}
+
+/// Pure clamp math behind [`default_fanout_capacity`], split out so it is unit
+/// testable without depending on the test host's real RAM.
+fn fanout_capacity_for_ram(total_ram: u64) -> usize {
+    let raw = (total_ram / FANOUT_CAPACITY_RAM_DIVISOR_BYTES) as usize;
+    raw.clamp(MIN_DEFAULT_FANOUT_CAPACITY, MAX_DEFAULT_FANOUT_CAPACITY)
+}
 
 // =============================================================================
 // Result Types
@@ -247,6 +309,21 @@ pub(crate) struct HostingManager {
     local_get_serves: AtomicU64,
     local_get_forwards: AtomicU64,
 
+    /// Piece B admission (#4642): the capability-relative aggregate
+    /// update-fanout capacity — how many downstream subscribers (summed across
+    /// all hosted contracts) this node will serve before it REFUSES new
+    /// subscriptions. Initialised to [`default_fanout_capacity`] (RAM-scaled);
+    /// simulation tests replace it via [`Self::set_fanout_capacity`] to exercise
+    /// refusal at small scale.
+    fanout_capacity: AtomicUsize,
+
+    /// Piece B admission instrumentation (#4642): monotonic count of fresh
+    /// downstream subscriptions this node REFUSED because it was over-committed
+    /// (fan-out or byte-budget). Surfaced on the periodic `RouterSnapshot` so
+    /// production telemetry can observe how often admission bites. Per-node
+    /// aggregate scalar.
+    subscription_refusals_total: AtomicU64,
+
     /// Downstream peers subscribed to contracts we host, with lease timestamps.
     /// Drives `should_unsubscribe_upstream()` decisions.
     ///
@@ -356,6 +433,8 @@ impl HostingManager {
             own_location: RwLock::new(None),
             local_get_serves: AtomicU64::new(0),
             local_get_forwards: AtomicU64::new(0),
+            fanout_capacity: AtomicUsize::new(default_fanout_capacity()),
+            subscription_refusals_total: AtomicU64::new(0),
             downstream_subscribers: DashMap::new(),
             time_source,
             pending_subscription_requests: DashSet::new(),
@@ -1001,6 +1080,100 @@ impl HostingManager {
         }
 
         benefits
+    }
+
+    // =========================================================================
+    // Piece B admission (#4642): capability-relative over-commit decision
+    // =========================================================================
+
+    /// Total lease-valid downstream subscribers across ALL contracts — the
+    /// node's aggregate update-fanout width (the cost weighed at admission).
+    ///
+    /// Derived by iterating `downstream_subscribers` (single source of truth,
+    /// no mirrored counter to rot — see the "manually-mirrored counters"
+    /// bug-prevention pattern), applying the SAME lease-validity rule as
+    /// [`Self::beneficiary_counts`]: a lease counts iff renewed within
+    /// `SUBSCRIPTION_LEASE_DURATION`. Stale-but-unswept entries drop out here,
+    /// so the count can only over-state briefly if the periodic expiry sweep is
+    /// mid-cycle — and over-stating fan-out only makes admission MORE
+    /// conservative (refuse slightly early), never over-commit.
+    pub(crate) fn total_downstream_subscribers(&self) -> usize {
+        let now = self.time_source.now();
+        self.downstream_subscribers
+            .iter()
+            .map(|entry| {
+                entry
+                    .value()
+                    .values()
+                    .filter(|last_renewed| {
+                        now.duration_since(**last_renewed) < SUBSCRIPTION_LEASE_DURATION
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    /// The node's current capability-relative aggregate update-fanout capacity.
+    pub(crate) fn fanout_capacity(&self) -> usize {
+        self.fanout_capacity.load(Ordering::Relaxed)
+    }
+
+    /// Override the fan-out capacity (simulation tests / operator config). In
+    /// production this defaults to [`default_fanout_capacity`]; the simulation
+    /// harness sets a small value to exercise refusal + re-route at test scale.
+    pub(crate) fn set_fanout_capacity(&self, capacity: usize) {
+        self.fanout_capacity.store(capacity, Ordering::Relaxed);
+    }
+
+    /// Monotonic count of fresh downstream subscriptions this node has REFUSED
+    /// because it was over-committed (piece B instrumentation, for telemetry).
+    pub(crate) fn subscription_refusals_total(&self) -> u64 {
+        self.subscription_refusals_total.load(Ordering::Relaxed)
+    }
+
+    /// Piece B admission decision: may this node ACCEPT becoming (or continuing
+    /// to act as) a host for a NEW downstream subscription of `contract`, or is
+    /// it over-committed and must REFUSE?
+    ///
+    /// Refuses (returns `false`, bumping the refusal counter) when EITHER
+    /// capability-relative signal has no headroom:
+    ///
+    /// 1. **Fan-out capacity.** The node already fans updates to at least
+    ///    [`Self::fanout_capacity`] downstream subscribers in aggregate. Taking
+    ///    on another one would push its per-UPDATE broadcast work past what its
+    ///    resources sustain. This is the term that BOUNDS popular-contract
+    ///    fan-out (hosting-invariants §3/§B).
+    /// 2. **Byte-budget headroom.** Only for a contract this node does NOT
+    ///    already host: the hosting byte-budget (A3 gauge) is already at/over
+    ///    capacity, so admitting a NEW contract would immediately thrash
+    ///    eviction. A contract already hosted adds fan-out but no new bytes, so
+    ///    the byte term does not apply to it.
+    ///
+    /// The caller uses a `false` here to answer `NotFound` instead of
+    /// `Subscribed`, so the requester re-routes to another acceptor (or, if all
+    /// closer peers refuse, remains a valid stranded host — design §5d). It must
+    /// NOT be consulted for a peer's own local-client subscribe (a node always
+    /// hosts its own client demand) nor for renewals (they merely maintain an
+    /// existing demand-pinned host and add no new fan-out).
+    pub(crate) fn can_admit_subscription(&self, contract: &ContractKey) -> bool {
+        // 1. Aggregate fan-out capacity.
+        if self.total_downstream_subscribers() >= self.fanout_capacity() {
+            self.subscription_refusals_total
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        // 2. Byte-budget headroom — only for a brand-new contract.
+        if !self.is_hosting_contract(contract) {
+            let stats = self.hosting_cache_stats();
+            if stats.current_bytes >= stats.budget_bytes {
+                self.subscription_refusals_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Whether something still depends on this node hosting `contract` — a
