@@ -18,11 +18,15 @@
 use either::Either;
 
 pub(crate) use self::messages::{SubscribeMsg, SubscribeMsgResult};
+use std::sync::Arc;
+
 use super::OpError;
 use super::bootstrap::bootstrap_gateway_target;
 use crate::ring::PeerKeyLocation;
 use crate::tracing::NetEventLog;
+use crate::util::backoff::ExponentialBackoff;
 use crate::{
+    config::{GlobalExecutor, GlobalRng},
     message::{InnerMessage, Transaction},
     node::OpManager,
     ring::Location,
@@ -470,7 +474,7 @@ pub(super) async fn fetch_contract_if_missing(
 /// completes"); the latency is the cost of the client knowing the
 /// subscriber can actually serve a follow-up GET.
 pub(super) async fn finalize_originator_subscribe(
-    op_manager: &OpManager,
+    op_manager: &Arc<OpManager>,
     key: ContractKey,
     upstream_addr: std::net::SocketAddr,
     is_renewal: bool,
@@ -531,7 +535,7 @@ pub(super) async fn finalize_originator_subscribe(
 /// a different order (no fetch step: the body arrived inside the GET response).
 /// Keep the two in sync when adding host side effects.
 pub(super) async fn finalize_host_subscribe(
-    op_manager: &OpManager,
+    op_manager: &Arc<OpManager>,
     key: ContractKey,
     responder_addr: std::net::SocketAddr,
     // `Some(_)` routes the body fetch THROUGH the responder rather than greedily
@@ -613,7 +617,94 @@ pub(super) async fn finalize_host_subscribe(
 
     if have_body {
         super::announce_contract_hosted(op_manager, &key).await;
+    } else {
+        // The bounded inline fetch did not land the body in time. With
+        // relay-caching removed (piece E) a just-subscribed chain host is
+        // genuinely body-less until it syncs from a connected co-host, so the
+        // one-shot fetch is not enough and the old "UPDATE propagation will fill
+        // the gap" fallback is unreliable (an UPDATE to a body-less node needs
+        // fetch-then-apply — handled defensively in the UPDATE path). Spawn a
+        // background retry that keeps pulling the body (bounded backoff) until it
+        // lands, THEN announces — so the node becomes a findable/computable host
+        // and joins the update mesh. Until then it is subscribed-but-not-serving
+        // (invariant 1's allowed "state in flight during resync" transient). This
+        // is the §5d proximity/summary sync: a joined host bootstraps its state,
+        // direction-agnostically, from its co-host(s). We do NOT block the caller
+        // (the originator's subscribe_success stays on the bounded inline path,
+        // #4223) — the sync completes and announces out of band.
+        spawn_host_state_sync_retry(op_manager, key);
     }
+}
+
+/// Background retry that pulls a chain host's contract body from its connected
+/// co-host(s) and announces hosting once it lands. Spawned by
+/// [`finalize_host_subscribe`] when the bounded inline fetch did not land the
+/// body. Bounded and self-terminating: it stops when the body is present (and
+/// announces), when demand fades (`contract_in_use` becomes false — the chain
+/// collapsed under it, so there is no longer a reason to host), or after a fixed
+/// attempt budget. Announce is deferred until the body is present so we never
+/// advertise a copy we cannot serve or keep fresh (hosting invariant 1).
+fn spawn_host_state_sync_retry(op_manager: &Arc<OpManager>, key: ContractKey) {
+    // Each attempt already waits up to `CONTRACT_WAIT_TIMEOUT_MS` (2 s) inside
+    // `fetch_contract_if_missing`, so this many attempts spans ~30-40 s of real
+    // pull effort — enough for the body to propagate outward as the chain forms
+    // from the key. If demand persists past that and the body still has not
+    // landed, the interest-gated renewal cycle re-runs finalize and re-arms this.
+    const MAX_ATTEMPTS: u32 = 12;
+    // Base/max kept < 1 s so the inter-attempt sleep is exempt from the
+    // interruptible-sleep rule (code-style.md); termination is bounded by the
+    // demand-fade check and the attempt budget, not a cancel token.
+    let backoff = ExponentialBackoff::new(Duration::from_millis(400), Duration::from_millis(900));
+    let op_manager = op_manager.clone();
+    GlobalExecutor::spawn(async move {
+        for attempt in 0..MAX_ATTEMPTS {
+            // Stop if the reason to host has gone (the chain collapsed under us
+            // while we were syncing) — do not keep pulling state for a contract
+            // we no longer host. This is the same demand gate as renewal (§5a).
+            if !op_manager.ring.contract_in_use(&key) {
+                tracing::debug!(
+                    contract = %key,
+                    "host state-sync: demand faded before body landed; stopping"
+                );
+                return;
+            }
+            // Greedy fetch (None), NOT targeted through the original responder:
+            // the responder may itself be a still-forming, body-less chain host
+            // that would dead-end the pull. A greedy GET routes toward the key
+            // and, via terminal-advertisement consult (piece C), lands on a peer
+            // that actually advertises the body (the near-key holder). This is
+            // the §5d "bootstrap from whichever co-host has the state" pull.
+            match fetch_contract_if_missing(&op_manager, *key.id(), None).await {
+                Ok(Some(_)) => {
+                    super::announce_contract_hosted(&op_manager, &key).await;
+                    tracing::debug!(
+                        contract = %key,
+                        attempt,
+                        "host state-sync: body present, announced hosting"
+                    );
+                    return;
+                }
+                Ok(None) => { /* not yet — back off and retry */ }
+                Err(err) => {
+                    // Transient local plumbing error; keep retrying within budget.
+                    tracing::warn!(
+                        contract = %key,
+                        error = %err,
+                        "host state-sync: fetch infra error, retrying"
+                    );
+                }
+            }
+            // ±20% jitter (code-style.md); delay stays < 1 s (see above).
+            let jitter = 0.8 + (GlobalRng::random_u64() % 41) as f64 / 100.0;
+            let delay = backoff.delay(attempt).mul_f64(jitter);
+            sleep(delay).await;
+        }
+        tracing::debug!(
+            contract = %key,
+            "host state-sync: attempt budget exhausted without body; \
+             renewal will re-arm if demand persists"
+        );
+    });
 }
 
 /// Register a downstream subscriber for a contract.
