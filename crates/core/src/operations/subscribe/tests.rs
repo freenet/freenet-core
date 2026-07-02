@@ -135,10 +135,56 @@ fn subscribe_dispatch_routes_unsubscribe_to_inbound_handler() {
 #[test]
 fn finalize_originator_subscribe_contains_all_required_side_effects() {
     const SOURCE: &str = include_str!("../subscribe.rs");
-    let fn_start = SOURCE
+
+    // The host-formation side effects (steps 1-5) were extracted into
+    // `finalize_host_subscribe`, which `finalize_originator_subscribe`
+    // delegates to (piece D refactor). Pin the delegation so the originator
+    // path still runs them, then scrape `finalize_host_subscribe` for the
+    // individual side effects below.
+    let orig_start = SOURCE
         .find("pub(super) async fn finalize_originator_subscribe(")
         .expect(
             "finalize_originator_subscribe not found in subscribe.rs — \
+             rename or removal must trip this pin (issue #4223)",
+        );
+    let orig_open = SOURCE[orig_start..]
+        .find('{')
+        .expect("finalize_originator_subscribe body open brace not found")
+        + orig_start;
+    let mut d = 0i32;
+    let mut orig_end = orig_open;
+    for (i, c) in SOURCE[orig_open..].char_indices() {
+        match c {
+            '{' => d += 1,
+            '}' => {
+                d -= 1;
+                if d == 0 {
+                    orig_end = orig_open + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let orig_body = &SOURCE[orig_start..orig_end];
+    assert!(
+        orig_body.contains("finalize_host_subscribe("),
+        "finalize_originator_subscribe must delegate host formation to \
+         `finalize_host_subscribe(...)` — the shared host-formation sequence \
+         where steps 1-5 (#4223/#3851) now live"
+    );
+    assert!(
+        orig_body.contains("add_local_client("),
+        "finalize_originator_subscribe must register local client interest \
+         (`add_local_client`) — the originator-only step 6"
+    );
+
+    // Steps 1-5 + fetch-before-announce ordering now live in the shared
+    // `finalize_host_subscribe` helper.
+    let fn_start = SOURCE
+        .find("pub(super) async fn finalize_host_subscribe(")
+        .expect(
+            "finalize_host_subscribe not found in subscribe.rs — \
              rename or removal must trip this pin (issue #4223)",
         );
     // Anchor end: scan to the next top-level item declaration. Using
@@ -270,15 +316,11 @@ fn finalize_originator_subscribe_contains_all_required_side_effects() {
          actually gated by the fetch result, not by some unrelated \
          later binding of the same name"
     );
-    // (6) add_local_client gated on !is_renewal. Anchor on the API,
-    // not the variable name.
+    // (6) add_local_client gated on !is_renewal — the originator-only step 6,
+    // which lives in `finalize_originator_subscribe` (asserted via
+    // `orig_body` above). Confirm the `!is_renewal` gate here too.
     assert!(
-        body.contains("add_local_client("),
-        "finalize_originator_subscribe must call `add_local_client(...)` \
-         so inbound ChangeInterests for this contract get processed"
-    );
-    assert!(
-        body.contains("!is_renewal"),
+        orig_body.contains("!is_renewal"),
         "finalize_originator_subscribe must gate `add_local_client` on \
          `!is_renewal` — `add_client` is NOT idempotent \
          (`ring::interest::Contract::add_client` increments \

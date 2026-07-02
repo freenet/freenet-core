@@ -2411,9 +2411,10 @@ fn relay_advance_to_next_peer(
             // configured gateway instead of silently exhausting. Respects
             // both the request's visited bloom (cross-hop loop prevention —
             // a gateway the request already traversed is never re-picked)
-            // and `tried` (exact local exclusion). Stays within
-            // MAX_RELAY_RETRIES, so the 3^HTL fan-out guard above is
-            // unaffected.
+            // and `tried` (exact local exclusion). This selection is still
+            // gated by the per-request backtracking budget (a gateway retry
+            // after a prior forward costs one budget unit like any other
+            // alternative), so the linear fan-out bound is unaffected.
             return match bootstrap_gateway_target(op_manager, |addr| {
                 tried.contains(&addr) || new_visited.probably_visited(addr)
             }) {
@@ -2873,7 +2874,7 @@ where
     // that k_closest deliberately skips — so we skip the consult there for
     // counter accuracy and parity with SUBSCRIBE's `candidates.is_empty()`
     // branch. The consult's value is reaching an unvisited advertised neighbor
-    // the single greedy forward (MAX_RELAY_RETRIES) skipped, which requires a
+    // that greedy routing + bounded backtracking skipped, which requires a
     // routing forward to have occurred.
     let mut did_forward = false;
 
@@ -2930,9 +2931,10 @@ where
                     return Ok(());
                 }
 
-                // This relay has exhausted its single greedy routing forward
-                // (MAX_RELAY_RETRIES = 1) without finding the contract, and
-                // holds no local copy. Before declaring a findability
+                // This relay has exhausted its greedy routing forward plus any
+                // bounded backtracking (per-request budget spent, or no more
+                // candidates) without finding the contract, and holds no local
+                // copy. Before declaring a findability
                 // dead-end, consult the host advertisements our neighbors
                 // broadcast for this key (invariant 5) and try the closest
                 // UNVISITED advertised hosts the retry cap skipped — the "one
@@ -6264,7 +6266,7 @@ mod tests {
         // The Retry/NotFound arm must record SuccessUntimed too — see
         // the outcome-attribution rationale in operations.rs::record_relay_route_event
         // rustdoc. A peer answering NotFound has not failed.
-        let pos = body.unwrap_or_default_pos("downstream returned NotFound; advancing");
+        let pos = body.unwrap_or_default_pos("downstream returned NotFound; backtracking");
         let after = &body[pos..pos + 1500.min(body.len() - pos)];
         assert!(
             after.contains("record_relay_route_event")
