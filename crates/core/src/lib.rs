@@ -122,11 +122,6 @@ pub mod dev_tool {
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_DRIVER_CALL_COUNT;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DRIVER_CALL_COUNT;
-    // PUT seed-chain: testing-only override of the findability-bootstrap window,
-    // so a simulation can observe the post-window collapse (spam-safety) with a
-    // short, feasible window instead of advancing hours of virtual time.
-    #[cfg(any(test, feature = "testing"))]
-    pub use crate::ring::set_seed_lease_duration_override;
 
     // Test hooks for the relay-hop routing-event plumbing. Each counter
     // increments every time `operations::record_relay_route_event` fires
