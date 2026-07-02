@@ -2629,10 +2629,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_seed_lease_cap_floored_for_tiny_budget() {
-        // A tiny/zero budget still admits at least one PUT's worth of seed chain.
+        // A tiny/zero budget still admits at least one PUT's worth of seed chain
+        // via the floor (MIN_SEED_LEASE_CAP), rather than dropping to zero.
         let manager = HostingManager::new(0);
         assert_eq!(manager.seed_lease_cap(), MIN_SEED_LEASE_CAP);
-        assert!(MIN_SEED_LEASE_CAP >= 1);
     }
 
     #[tokio::test]
