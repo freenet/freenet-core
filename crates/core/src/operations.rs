@@ -65,6 +65,15 @@ pub(crate) use visited_peers::VisitedPeers;
 /// either guard and the counter can be duplicated or inflated, and the `k^HTL`
 /// amplification returns.
 ///
+/// The terminal-advertisement consult (piece C, `consult_advertised_hosts`) is
+/// deliberately OUTSIDE this budget: it is a separate, independently-bounded
+/// findability mechanism (at most `MAX_TERMINAL_CONSULT_HOSTS` / `1` off-path
+/// forward per relay, gated on routing being fully exhausted). So the overall
+/// worst-case per-request fan-out is `backtrack bound + consult bound`, both
+/// linear. The consult forward carries the CURRENT (post-backtrack) budget, so
+/// its own subtree is still budget-bounded and cannot mint (its returned budget
+/// is clamped like any other).
+///
 /// `4` is a conservative starting value (§E suggested raising the per-hop cap
 /// to 2-3; a shared budget of 4 leaves headroom). It should be tuned against a
 /// sparse-ring findability sim that reproduces a genuine greedy stall (holder
