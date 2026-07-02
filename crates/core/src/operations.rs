@@ -32,6 +32,35 @@ pub(crate) use visited_peers::VisitedPeers;
 // `result_router_tx` (see `op_ctx_task::*`); no central carrier
 // is required.
 
+/// Total per-request backtracking budget for GET/SUBSCRIBE routing
+/// (hosting redesign, routing-robustness prerequisite for piece E —
+/// `.claude/rules/hosting-invariants.md` §E, `docs/design/demand-driven-hosting.md`).
+///
+/// Greedy single-path routing toward a *sparse* near-key host dead-ends
+/// when the greedy descent stalls at a local minimum more than one hop
+/// from the lone holder (6/8 dead-ends in a 16-peer sparse-ring sim once
+/// relay-caching's scattered copies are gone). The fix is bounded
+/// backtracking: on a NotFound from the greedy next-hop, a relay tries the
+/// next-closest `k_closest` candidates it already computed.
+///
+/// The budget is a **single per-request counter**, NOT a per-hop cap. It is
+/// carried forward in `GetMsg::Request.backtrack_budget` /
+/// `SubscribeMsg::Request.backtrack_budget` and returned in the NotFound
+/// reply (`GetMsg::Response.remaining_backtrack_budget` /
+/// `SubscribeMsg::Response.remaining_backtrack_budget`). Because the relay
+/// awaits each downstream synchronously, the counter threads the whole
+/// traversal in depth-first order: a relay adopts the budget its downstream
+/// subtree returned before deciding whether to backtrack further. That keeps
+/// the worst-case fan-out LINEAR — at most `max_htl * (1 + budget)` forwards
+/// (the greedy spine plus one bounded greedy sub-spine per backtrack) —
+/// instead of the `k^HTL` blow-up a per-hop retry cap of `k` would produce
+/// (the #4630 DoS surface the previous `MAX_RELAY_RETRIES = 1` guarded).
+///
+/// Tuned against the Delta sparse-ring churn sim (see
+/// `routing_backtracking` simulation tests): the smallest value that closes
+/// the far-GET/subscribe dead-ends while keeping fan-out bounded.
+pub(crate) const DEFAULT_BACKTRACK_BUDGET: u32 = 4;
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) enum OpOutcome<'a> {

@@ -86,6 +86,21 @@ mod messages {
             /// formed by the time the response reaches the originator.
             #[serde(default)]
             subscribe: bool,
+            /// Remaining per-request backtracking budget (hosting redesign
+            /// routing-robustness; see `operations::DEFAULT_BACKTRACK_BUDGET`).
+            /// The originator seeds this with `DEFAULT_BACKTRACK_BUDGET`; each
+            /// relay forwards the value it currently holds, so the counter
+            /// threads the whole depth-first traversal and bounds total
+            /// alternative next-hop forwards across the ENTIRE request (not
+            /// per hop). When it reaches 0 a relay stops backtracking and
+            /// reports NotFound.
+            ///
+            /// `#[serde(default)]` is for source clarity only; bincode is
+            /// positional, so cross-version wire compat with peers lacking
+            /// this field is handled at the handshake layer via
+            /// `MIN_COMPATIBLE_VERSION` (same as `subscribe` / `hop_count`).
+            #[serde(default)]
+            backtrack_budget: u32,
         },
         /// Response for a GET operation. Routed hop-by-hop back to originator.
         /// Uses instance_id for routing (always available from the request).
@@ -110,6 +125,19 @@ mod messages {
             /// handshake layer via `MIN_COMPATIBLE_VERSION`.
             #[serde(default)]
             hop_count: usize,
+            /// Backtracking budget remaining after the responder's subtree
+            /// finished (hosting redesign routing-robustness; see
+            /// `operations::DEFAULT_BACKTRACK_BUDGET`). Only meaningful on a
+            /// `NotFound` result: the upstream relay ADOPTS this value before
+            /// deciding whether to try another next-hop candidate, so the
+            /// per-request budget is threaded back up the depth-first
+            /// traversal. Set to 0 for `Found` (ignored there).
+            ///
+            /// `#[serde(default)]` is for source clarity; cross-version wire
+            /// compat is handled at the handshake layer via
+            /// `MIN_COMPATIBLE_VERSION` (same as `hop_count`).
+            #[serde(default)]
+            remaining_backtrack_budget: u32,
         },
 
         /// Streaming response for large contract data. Used when the response payload

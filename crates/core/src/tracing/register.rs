@@ -1302,6 +1302,7 @@ impl<'a> NetEventLog<'a> {
                 instance_id,
                 result: GetMsgResult::NotFound,
                 hop_count,
+                ..
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
                 // hop_count is carried on the wire Response (same semantics
@@ -1372,6 +1373,7 @@ impl<'a> NetEventLog<'a> {
                 instance_id,
                 result: SubscribeMsgResult::NotFound,
                 hop_count,
+                ..
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
                 // hop_count is carried on the wire Response (same semantics
