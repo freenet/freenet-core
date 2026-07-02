@@ -3001,6 +3001,66 @@ mod tests {
         );
     }
 
+    // ── Routing backtracking (hosting-invariants §E, #4642) ──────────────────
+
+    /// Pin: the SUBSCRIBE relay backtracks over its remaining k_closest
+    /// candidates on a clean downstream NotFound, bounded by the shared
+    /// per-request budget it threads (forward in the Request, back in the
+    /// NotFound reply). A per-hop cap would reintroduce the `k^HTL` blow-up.
+    #[test]
+    fn drive_relay_subscribe_backtracks_within_shared_budget() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let driver_end = src[driver_start..]
+            .find("\n/// Outcome of a single SUBSCRIBE relay forward")
+            .map(|p| p + driver_start)
+            .unwrap_or(src.len());
+        let body = &src[driver_start..driver_end];
+        // Seeded from the incoming Request (threaded), not a per-hop constant.
+        assert!(
+            body.contains("let mut budget = backtrack_budget;"),
+            "drive_relay_subscribe must seed its budget from the incoming \
+             Request's backtrack_budget"
+        );
+        // A backtrack loop over the remaining candidates, gated on NotFound.
+        assert!(
+            body.contains("while let SubscribeForwardOutcome::NotFound"),
+            "drive_relay_subscribe must loop over remaining candidates while the \
+             outcome is a clean NotFound"
+        );
+        // Adopts the downstream's returned budget, then spends one per alternative.
+        assert!(
+            body.contains("budget = remaining_budget") && body.contains("budget -= 1"),
+            "each backtrack must adopt the downstream's remaining budget and \
+             spend exactly one unit for the alternative it tries"
+        );
+        // Stops at 0 or when candidates run out (bounded fan-out).
+        assert!(
+            body.contains("budget == 0 || candidates.is_empty()"),
+            "backtracking must stop when the shared budget hits 0 or no more \
+             candidates remain"
+        );
+        // Forwards the current budget and echoes the final budget upstream.
+        assert!(
+            body.contains("relay_subscribe_forward_once(") && body.contains("final_budget"),
+            "the relay must forward the current budget and echo the final \
+             remaining budget on its NotFound Response"
+        );
+    }
+
+    /// Pin: the originator SUBSCRIBE seeds a real (non-zero) budget.
+    #[test]
+    fn originator_subscribe_seeds_default_backtrack_budget() {
+        let src = include_str!("op_ctx_task.rs");
+        assert!(
+            src.contains("backtrack_budget: crate::operations::DEFAULT_BACKTRACK_BUDGET"),
+            "the originator SUBSCRIBE must seed backtrack_budget with \
+             DEFAULT_BACKTRACK_BUDGET so relays have budget to backtrack with"
+        );
+    }
+
     /// Piece C (invariant 5): after the SUBSCRIBE relay's single greedy
     /// routing forward returns NotFound, it must consult neighbor host
     /// advertisements and try an off-path advertised host BEFORE bubbling the
