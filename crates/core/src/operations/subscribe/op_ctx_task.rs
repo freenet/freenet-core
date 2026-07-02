@@ -1617,6 +1617,28 @@ async fn run_relay_subscribe(
     op_manager.release_pending_op_slot(incoming_tx).await;
 }
 
+/// Log + count a piece-B admission refusal. The count is
+/// simulation-observability only (`record_subscription_refused` is a no-op in
+/// production; the production signal is `hosting_subscription_refusals_total` on
+/// the periodic `RouterSnapshot`). Factored out so the three refusal sites
+/// (local-hit terminus + greedy/consult chain host) stay in sync.
+fn record_subscribe_admission_refusal(
+    op_manager: &OpManager,
+    incoming_tx: &Transaction,
+    key: &freenet_stdlib::prelude::ContractKey,
+) {
+    if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
+        crate::ring::topology_registry::record_subscription_refused(addr);
+    }
+    tracing::debug!(
+        tx = %incoming_tx,
+        contract = %key,
+        phase = "relay_subscribe_admission_refused",
+        "SUBSCRIBE relay: REFUSING new subscription (over-committed, piece B) — \
+         answering NotFound so the requester re-routes"
+    );
+}
+
 /// Drive a fresh inbound relay `SubscribeMsg::Request`: fast-path on
 /// local contract hit, otherwise forward to the closest potentially
 /// hosting peer and bubble the Response upstream.
@@ -1645,29 +1667,6 @@ async fn run_relay_subscribe(
 /// without originating traffic), extend `OpCtx::send_to_and_await`
 /// to emit a stat update on `Err(_elapsed)` via a hook rather than
 /// reintroducing the signal on each relay driver.
-
-/// Log + count a piece-B admission refusal. The count is
-/// simulation-observability only (`record_subscription_refused` is a no-op in
-/// production; the production signal is `hosting_subscription_refusals_total` on
-/// the periodic `RouterSnapshot`). Factored out so the three refusal sites
-/// (local-hit terminus + greedy/consult chain host) stay in sync.
-fn record_subscribe_admission_refusal(
-    op_manager: &OpManager,
-    incoming_tx: &Transaction,
-    key: &freenet_stdlib::prelude::ContractKey,
-) {
-    if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
-        crate::ring::topology_registry::record_subscription_refused(addr);
-    }
-    tracing::debug!(
-        tx = %incoming_tx,
-        contract = %key,
-        phase = "relay_subscribe_admission_refused",
-        "SUBSCRIBE relay: REFUSING new subscription (over-committed, piece B) — \
-         answering NotFound so the requester re-routes"
-    );
-}
-
 async fn drive_relay_subscribe(
     op_manager: &Arc<OpManager>,
     incoming_tx: Transaction,

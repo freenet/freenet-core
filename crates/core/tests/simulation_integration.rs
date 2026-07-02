@@ -13286,12 +13286,8 @@ fn run_popular_fanout_scenario(
         ));
     }
 
-    let result = sim.run_controlled_simulation(
-        seed,
-        ops,
-        Duration::from_secs(300),
-        Duration::from_secs(60),
-    );
+    let result =
+        sim.run_controlled_simulation(seed, ops, Duration::from_secs(300), Duration::from_secs(60));
     assert!(
         result.turmoil_result.is_ok(),
         "seed={seed:x}: sim failed: {:?}",
@@ -13417,7 +13413,10 @@ fn test_refused_subscription_reroutes_no_deadend() {
         eprintln!(
             "[pieceB-proof2 seed={seed:x}] natural_subscribed={} | cap={cap}: subscribed={} \
              hosting_nodes={} refusals={}",
-            natural.subscribed_peers, capped.subscribed_peers, capped.hosting_nodes, capped.refusals,
+            natural.subscribed_peers,
+            capped.subscribed_peers,
+            capped.hosting_nodes,
+            capped.refusals,
         );
 
         // The cap bit (a host refused a subscriber)...

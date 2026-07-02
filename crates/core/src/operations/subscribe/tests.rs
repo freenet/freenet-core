@@ -261,7 +261,8 @@ fn finalize_host_subscribe_contains_all_required_side_effects() {
 #[test]
 fn finalize_originator_subscribe_delegates_and_adds_local_client() {
     const SOURCE: &str = include_str!("../subscribe.rs");
-    let body = extract_fn_body_stripped(SOURCE, "pub(super) async fn finalize_originator_subscribe(");
+    let body =
+        extract_fn_body_stripped(SOURCE, "pub(super) async fn finalize_originator_subscribe(");
     let body = body.as_str();
 
     assert!(
