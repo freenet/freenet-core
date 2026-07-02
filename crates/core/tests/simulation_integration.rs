@@ -13220,3 +13220,332 @@ fn test_popular_contract_fanout_is_measured() {
         );
     }
 }
+
+// =============================================================================
+// Delta churn-sim (#4642 piece E / #4665) — the RELAY-CACHING-FREE findability
+// validation gate for the demand-driven hosting redesign.
+//
+// This branch is the D branch (`feat/computed-upstream-chains`) with the FULL
+// piece E cherry-picked on top: PUT relay-caching removal (851eeb62) + its
+// streaming-PUT fix (dbf85fbd) AND GET-auto-subscribe removal (43040597). So the
+// network no longer scatters demand-blind copies of a contract along the PUT
+// route, and a plain (subscribe=false) GET no longer installs a durable
+// subscription. Host-on-GET (return-path hosting under piece A's demand gauge)
+// is deliberately RETAINED — that is a demand-driven feature, not the
+// anti-pattern — but it only fires on a SUCCESSFUL GET, so it cannot rescue a
+// dead-end. Migration is pinned OFF (piece 0 field condition). Net: the ONLY
+// findability mechanisms are routing + the 1-hop terminal-advertisement consult
+// (piece C) — exactly the production condition the fresh findability solution
+// (bounded backtracking + PUT seed-chain, hosting-invariants §E RESOLVED
+// 2026-07-02) must work in.
+//
+// THE GAP: with relay-caching removed, a fire-and-forget PUT of a contract with
+// no ongoing demand lands ONLY on the near-key terminus (+ the publisher's own
+// loopback copy). There is no scattered copy ~1 hop off every route. When churn
+// removes those few holders (CrashNode — the real failure mode: membership
+// change, not a clock TTL, since there is NO time-based hosting eviction), a far
+// GET has nothing reachable to route to and DEAD-ENDS. The redesign's answer is
+// (1) a PUT seed-chain that lands C on a few fresh near-K hosts (so churn leaves
+// survivors) and (2) bounded routing backtracking (so a far GET whose greedy
+// descent stalls reaches a surviving near-K host). Neither exists yet, so the
+// gate below fails.
+//
+// `test_delta_churn_sim_reachability_gate` is the GATE. It asserts the far GET
+// finds the state and is `#[ignore]`d because it is EXPECTED TO FAIL on this
+// branch (confirm with `--ignored`). Removing the `#[ignore]` once backtracking
+// + the seed-chain land is how the findability bundle proves it closed the gap.
+// `test_delta_get_reliability_under_churn` MEASURES the GET success rate (with
+// vs without churn, over seeds) so the recovery from each piece is quantifiable;
+// it PASSES (asserts only sim completion + scenario non-degeneracy + the §7
+// no-storm safety property, and reports the rate).
+// =============================================================================
+
+/// End-of-run observations for one Delta churn-sim run. Primitives only so the
+/// gate and the measurement test share one driver without leaking the sim-result
+/// type.
+struct DeltaChurnObs {
+    /// For each getter node number, whether its local store held C at the end of
+    /// the run. A successful GET writes the fetched state into the requester's
+    /// `MockStateStorage`; a dead-ended GET obtains nothing — the same success
+    /// signal the terminal-consult dead-end tests use.
+    getter_found: Vec<(usize, bool)>,
+    /// Node numbers still hosting C in their live Ring at the end (the holder
+    /// set). A crashed node is message-blocked, NOT torn down, so it still
+    /// reports hosting here even though it is unreachable.
+    holders: Vec<usize>,
+    /// Holder node numbers that were NOT crashed (i.e. still reachable). If this
+    /// is non-empty but a getter failed, the failure is a routing dead-end; if it
+    /// is empty, the failure is holder loss (churn removed every reachable copy).
+    reachable_holders: Vec<usize>,
+    /// Node numbers that were crash-scripted (empty if no churn).
+    crashed: Vec<usize>,
+    /// Network-wide count of peers still holding an ACTIVE SUBSCRIPTION lease for
+    /// C at the end (the no-storm signal — a PUT-seeded, un-subscribed, plain-GET
+    /// contract with no client demand must hold ZERO leases anywhere).
+    surviving_leases: usize,
+    /// Max per-node subscription-lease count across the whole network.
+    max_sub_count: usize,
+    total_snapshots: usize,
+}
+
+/// Delta churn-sim driver: a sparse ~16-peer ring, relay-caching-free, migration
+/// off. The publisher (node 4, far from the key) PUTs contract C once
+/// (`subscribe=false` — a fire-and-forget publish with no ongoing demand, which
+/// is the point). With relay-caching removed, C lands only on the near-key
+/// terminus (node 1, placed unambiguously closest to K) plus the publisher's own
+/// loopback copy. Optionally the hosting clock jumps a "day" (`advance`), then
+/// every node in `crash` is crashed, then each getter issues a plain GET toward
+/// the key.
+///
+/// Placement is controlled (`new_with_node_locations`) so the crash targets are
+/// known labels: node 1 is the lone near-key holder and node 4 the publisher.
+/// Nodes 2 and 3 sit in a near-key BAND farther out than node 1 — they do NOT
+/// hold C today (relay-caching-free ⇒ single terminus), but they are exactly the
+/// fresh near-K hosts a future PUT seed-chain would land on and a backtracking
+/// GET would reach, so the gate flips green once those land. The publisher is on
+/// the opposite (+0.5) arc so its loopback copy is off every getter's greedy
+/// path toward the key.
+fn run_delta_churn_scenario(
+    seed: u64,
+    network: &str,
+    getters: &[usize],
+    crash: &[usize],
+    advance: Option<Duration>,
+) -> DeltaChurnObs {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let contract = SimOperation::create_test_contract(0xDE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+
+    // 15 regular nodes. Offsets from the key location:
+    //   node 1      : the lone near-key holder (PUT terminus), unambiguously
+    //                 closest to K by a wide margin.
+    //   nodes 2,3   : near-key BAND (do NOT hold C today; seed-chain / backtrack
+    //                 targets for the future fix).
+    //   node 4      : publisher, far on the +0.5 arc (loopback copy off-path).
+    //   nodes 5..=15: getters / filler spread around the ring, kept off the
+    //                 publisher's +0.5 arc.
+    let offsets: [f64; 15] = [
+        0.0015, // node1: lone near-K holder / terminus
+        0.030, 0.045, // nodes 2,3: near-K band (non-holders today)
+        0.50,  // node4: publisher (far)
+        -0.30, -0.15, -0.42, -0.22, -0.37, -0.09, // getters (negative arc)
+        0.14, 0.20, 0.27, 0.35, 0.08, // getters (positive arc, below the publisher)
+    ];
+    let node_locations: Vec<f64> = offsets.iter().map(|o| wrap(key_loc + o)).collect();
+    let num_nodes = node_locations.len();
+
+    let mut sim = rt.block_on(async {
+        // Sparse ring: max 5 / min 3 connections per peer, 16 peers incl. gateway.
+        SimNetwork::new_with_node_locations(
+            network,
+            1,
+            num_nodes,
+            10,
+            7,
+            5,
+            3,
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+    // Relay-caching-free is the code state (cherry-picked full piece E). Pin
+    // migration OFF too — piece 0's field condition — so the fresh solution is
+    // exercised in the exact production condition (routing + 1-hop consult only).
+    // Migration ON would scatter copies toward the key and mask the gap.
+    sim.disable_placement_migration();
+    if advance.is_some() {
+        sim.enable_hosting_time_control();
+    }
+
+    let publisher = NodeLabel::node(network, 4);
+
+    let mut ops = vec![ScheduledOperation::new(
+        publisher.clone(),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_test_state(1),
+            subscribe: false,
+        },
+    )];
+    if let Some(d) = advance {
+        // Age leases by a "day". There is NO time-based hosting eviction, so a
+        // holder still holds C in cache after this jump — it is churn, not the
+        // clock, that removes the holder below.
+        ops.push(ScheduledOperation::new(
+            publisher.clone(),
+            SimOperation::AdvanceHostingClock { duration: d },
+        ));
+    }
+    for n in crash {
+        ops.push(ScheduledOperation::new(
+            NodeLabel::node(network, *n),
+            SimOperation::CrashNode,
+        ));
+    }
+    for g in getters {
+        ops.push(ScheduledOperation::new(
+            NodeLabel::node(network, *g),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let result =
+        sim.run_controlled_simulation(seed, ops, Duration::from_secs(360), Duration::from_secs(90));
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x}: sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let getter_found: Vec<(usize, bool)> = getters
+        .iter()
+        .map(|g| {
+            let label = NodeLabel::node(network, *g);
+            let found = result
+                .node_storages
+                .get(&label)
+                .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+            (*g, found)
+        })
+        .collect();
+
+    let holders: Vec<usize> = (1..=num_nodes)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(network, *n), &contract_key))
+        .collect();
+    let reachable_holders: Vec<usize> = holders
+        .iter()
+        .copied()
+        .filter(|n| !crash.contains(n))
+        .collect();
+
+    let surviving_leases = result
+        .topology_snapshots
+        .iter()
+        .filter(|s| s.active_subscription_keys.contains(&contract_id))
+        .count();
+    let max_sub_count = result
+        .captured_node_labels()
+        .iter()
+        .map(|l| result.node_subscription_count(l))
+        .max()
+        .unwrap_or(0);
+
+    DeltaChurnObs {
+        getter_found,
+        holders,
+        reachable_holders,
+        crashed: crash.to_vec(),
+        surviving_leases,
+        max_sub_count,
+        total_snapshots: result.topology_snapshots.len(),
+    }
+}
+
+/// PROBE 2 (independent per-getter findability): each far getter runs against a
+/// PRISTINE network (fresh PUT, NO other getter) so host-on-GET cross-warming
+/// cannot mask the routing gap. Reports how many far positions reach the lone
+/// near-K holder via greedy single-path routing + 1-hop consult. This is the
+/// faithful §E "6/8 dead-end" measurement.
+#[test_log::test]
+fn test_delta_independent_getter_probe() {
+    const SEEDS: [u64; 2] = [0x4642_E5B1, 0x4642_E5B2];
+    const GETTERS: [usize; 8] = [5, 6, 7, 8, 11, 12, 13, 14];
+    for seed in SEEDS {
+        let mut found = 0usize;
+        let mut per: Vec<(usize, bool)> = Vec::new();
+        for g in GETTERS {
+            let obs = run_delta_churn_scenario(
+                seed,
+                &format!("delta-indep-{seed:x}-g{g}"),
+                &[g],
+                &[],
+                Some(Duration::from_secs(24 * 60 * 60)),
+            );
+            let f = obs.getter_found.iter().any(|(_, ok)| *ok);
+            if f {
+                found += 1;
+            }
+            per.push((g, f));
+        }
+        eprintln!(
+            "[delta-indep seed={seed:x}] PRISTINE per-getter found {found}/{} : {per:?}",
+            GETTERS.len()
+        );
+    }
+}
+
+/// PROBE (not a gate): prints where a relay-caching-free PUT lands and whether a
+/// single far GET finds it, with and without churn — used to characterise the
+/// baseline. PASSES (only sanity asserts); its value is the eprintln! record.
+#[test_log::test]
+fn test_delta_churn_sim_probe() {
+    const SEEDS: [u64; 3] = [0x4642_E5F1, 0x4642_E5F2, 0x4642_E5F3];
+    const B: usize = 5;
+    for seed in SEEDS {
+        // PUT-only: pure PUT landing, NO getter (so host-on-GET return-path
+        // caching cannot pollute the holder set) and NO crash.
+        let put_only = run_delta_churn_scenario(
+            seed,
+            &format!("delta-probe-putonly-{seed:x}"),
+            &[],
+            &[],
+            Some(Duration::from_secs(24 * 60 * 60)),
+        );
+        // PUT + crash{1,4}, still NO getter: the reachable holder set a far GET
+        // would face after churn (this is the decisive number).
+        let put_crash = run_delta_churn_scenario(
+            seed,
+            &format!("delta-probe-putcrash-{seed:x}"),
+            &[],
+            &[1, 4],
+            Some(Duration::from_secs(24 * 60 * 60)),
+        );
+        let base = run_delta_churn_scenario(
+            seed,
+            &format!("delta-probe-base-{seed:x}"),
+            &[B],
+            &[],
+            Some(Duration::from_secs(24 * 60 * 60)),
+        );
+        let churn = run_delta_churn_scenario(
+            seed,
+            &format!("delta-probe-churn-{seed:x}"),
+            &[B],
+            &[1, 4],
+            Some(Duration::from_secs(24 * 60 * 60)),
+        );
+        eprintln!(
+            "[delta-probe seed={seed:x}] PUT-only holders={:?} leases={} | \
+             PUT+crash{{1,4}} holders={:?} reachable={:?} leases={} || \
+             BASELINE(+GET) holders={:?} B_found={} | \
+             CHURN(+GET) holders={:?} reachable={:?} B_found={} leases={}",
+            put_only.holders,
+            put_only.surviving_leases,
+            put_crash.holders,
+            put_crash.reachable_holders,
+            put_crash.surviving_leases,
+            base.holders,
+            base.getter_found.iter().any(|(_, f)| *f),
+            churn.holders,
+            churn.reachable_holders,
+            churn.getter_found.iter().any(|(_, f)| *f),
+            churn.surviving_leases,
+        );
+        assert!(
+            base.total_snapshots > 0,
+            "seed={seed:x}: probe captured no snapshots"
+        );
+    }
+}
