@@ -550,6 +550,13 @@ impl Ring {
             shutdown,
         };
 
+        // Piece B admission (#4642): apply the test/sim fan-out capacity override
+        // if set. `None` in production, where the RAM-scaled default the
+        // `HostingManager` initialised itself with applies.
+        if let Some(capacity) = config.hosting_fanout_capacity_override {
+            ring.hosting_manager.set_fanout_capacity(capacity);
+        }
+
         if let Some(loc) = config.location {
             if config.own_addr.is_none() && is_gateway {
                 return Err(anyhow::anyhow!("own_addr is required for gateways"));
@@ -2908,12 +2915,6 @@ impl Ring {
     /// for the originator's own local-client subscribe, nor for renewals.
     pub(crate) fn can_admit_subscription(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.can_admit_subscription(contract)
-    }
-
-    /// Override the hosting fan-out capacity (simulation harness / operator
-    /// config). See [`HostingManager::set_fanout_capacity`].
-    pub(crate) fn set_hosting_fanout_capacity(&self, capacity: usize) {
-        self.hosting_manager.set_fanout_capacity(capacity);
     }
 
     /// Whether something still depends on this node hosting `contract` — a
