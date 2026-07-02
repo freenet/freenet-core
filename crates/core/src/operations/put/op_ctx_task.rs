@@ -1642,14 +1642,26 @@ where
             // Preserve the storer-side hop_count so the originator sees the
             // *forward* depth from Request to storer, not the depth from
             // Request to this relay. Mirrors GET relay bubble-up.
-            relay_put_send_response(
+            let send_result = relay_put_send_response(
                 op_manager,
                 incoming_tx,
                 reply_key,
                 upstream_addr,
                 downstream_hop_count,
             )
-            .await
+            .await;
+            // AFTER bubbling upstream (forward-before-contract-handling): if this
+            // relay is within the near-key seed window of the terminus, take a
+            // seed lease so the renewal loop drives it into the update mesh as a
+            // fresh, advertised host for the findability bootstrap window (§E).
+            maybe_install_put_seed_lease(
+                op_manager,
+                reply_key,
+                htl,
+                downstream_hop_count,
+                upstream_addr,
+            );
+            send_result
         }
         NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
             key: reply_key,
@@ -1679,14 +1691,23 @@ where
                 crate::node::network_status::OpType::Put,
             );
             // Downgrade still preserves the storer-side forward depth.
-            relay_put_send_response(
+            let send_result = relay_put_send_response(
                 op_manager,
                 incoming_tx,
                 reply_key,
                 upstream_addr,
                 downstream_hop_count,
             )
-            .await
+            .await;
+            // Same near-key seed-window install as the non-streaming arm.
+            maybe_install_put_seed_lease(
+                op_manager,
+                reply_key,
+                htl,
+                downstream_hop_count,
+                upstream_addr,
+            );
+            send_result
         }
         NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
             cause: downstream_cause,
@@ -1914,6 +1935,89 @@ async fn relay_put_finalize_local(
     }
 
     relay_put_send_response(op_manager, incoming_tx, key, upstream_addr, hop_count).await
+}
+
+/// Install a PUT seed lease on this relay if it sits within the near-key
+/// **seed window** of the PUT's terminus — a bounded findability / churn-
+/// redundancy bootstrap for the gap between a PUT and the contract's first
+/// read (hosting-invariants.md §E; docs/design/demand-driven-hosting.md).
+///
+/// Post-piece-E a PUT hosts only its near-key terminus (a stored + advertised
+/// seed) plus originator/already-hosting peers; a pure routing hop stores
+/// nothing. This helper adds, on the PUT's Response (return) path, a short chain
+/// of REAL near-key hosts: the last `SEED_CHAIN_LENGTH - 1` hops of the descent
+/// each take a time-bounded `SEED_LEASE_DURATION` seed lease. The lease makes
+/// the hop `contract_in_use`, so the ordinary interest-gated renewal loop
+/// (`contracts_needing_renewal`) drives it into the update mesh as a subscribed,
+/// advertised host — fresh via proximity to its near-key co-hosts, NOT a stale
+/// unsubscribed relay-cache copy. When the lease lapses with no real demand the
+/// hop drops out of the renewal set and the chain collapses, so this cannot
+/// accumulate hosting (spam-safe) and is not the relay-caching anti-pattern.
+///
+/// **Identifying "the last few hops toward the key" with no wire change.** The
+/// terminus embeds its forward depth in `PutMsg::Response.hop_count`, preserved
+/// verbatim as the Response bubbles up (relays don't increment on the return
+/// path). This relay knows its own forward depth (`max_htl - received_htl`), so
+/// `terminus_depth - own_depth` is its hop distance from the terminus. It seeds
+/// iff that distance is in `1..=SEED_CHAIN_LENGTH-1` (the terminus itself is
+/// distance 0, the piece-E baseline) AND it actually DESCENDED toward the key on
+/// its inbound hop (own location strictly closer to the key than its upstream) —
+/// the descent gate keeps seeds on the near-key approach and excludes
+/// non-descending early hops. Only relays that forwarded the PUT and are
+/// awaiting its Response reach here (the originator-loopback path returns
+/// earlier), so the originator itself never seeds.
+///
+/// Cheap and synchronous: it only installs the lease (the renewal loop does the
+/// subscribe). Call it AFTER bubbling the Response upstream so the
+/// forward-before-contract-handling invariant (operations.md) holds.
+fn maybe_install_put_seed_lease(
+    op_manager: &Arc<OpManager>,
+    key: ContractKey,
+    received_htl: usize,
+    terminus_hop_count: usize,
+    upstream_addr: SocketAddr,
+) {
+    let max_htl = op_manager.ring.max_hops_to_live;
+    let own_forward_depth = max_htl.saturating_sub(received_htl);
+    let distance_from_terminus = terminus_hop_count.saturating_sub(own_forward_depth);
+    // Terminus is seed #0 (the piece-E baseline near-key seed); seed only the
+    // next `SEED_CHAIN_LENGTH - 1` hops of the descent. `saturating_sub` keeps
+    // this well-defined for any `SEED_CHAIN_LENGTH` (0/1 => seed nothing).
+    let max_seed_distance = crate::ring::SEED_CHAIN_LENGTH.saturating_sub(1);
+    if distance_from_terminus == 0 || distance_from_terminus > max_seed_distance {
+        return;
+    }
+
+    // Descent gate: only seed a hop that moved strictly closer to the key on its
+    // inbound hop. Keeps seeds on the near-key approach (near the key is where
+    // reader routes converge) and excludes non-descending early hops. When
+    // either location is unknown we cannot check descent; fall through to the
+    // distance bound alone (still bounded by the window + the per-node cap).
+    let target = crate::ring::Location::from(&key);
+    let own_loc = op_manager.ring.connection_manager.own_location().location();
+    let upstream_loc = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(upstream_addr)
+        .and_then(|p| p.location());
+    if let (Some(own_loc), Some(upstream_loc)) = (own_loc, upstream_loc) {
+        let descended = own_loc.distance(target).as_f64() < upstream_loc.distance(target).as_f64();
+        if !descended {
+            return;
+        }
+    }
+
+    if op_manager.ring.install_seed_lease(key) {
+        tracing::debug!(
+            contract = %key,
+            distance_from_terminus,
+            phase = "put_seed_lease_installed",
+            "PUT relay: installed near-key seed lease (findability bootstrap window)"
+        );
+        if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
+            crate::ring::topology_registry::record_put_seed_lease_installed(addr);
+        }
+    }
 }
 
 /// Send `PutMsg::Response` upstream (fire-and-forget: upstream relay
@@ -2746,14 +2850,24 @@ where
                     );
                 }
                 // Preserve downstream storer's forward depth.
-                relay_put_send_response(
+                let send_result = relay_put_send_response(
                     op_manager,
                     incoming_tx,
                     reply_key,
                     upstream_addr,
                     downstream_hop_count,
                 )
-                .await
+                .await;
+                // Same near-key seed-window install as the non-streaming driver,
+                // after bubbling upstream (forward-before-contract-handling).
+                maybe_install_put_seed_lease(
+                    op_manager,
+                    reply_key,
+                    htl,
+                    downstream_hop_count,
+                    upstream_addr,
+                );
+                send_result
             }
             other => {
                 // Unexpected reply variant: unclear attribution. Skip the

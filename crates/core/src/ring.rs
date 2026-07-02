@@ -28,6 +28,8 @@ pub use hosting::{
     AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult,
     SubscribedContractSnapshot,
 };
+// PUT seed-chain constant (findability bootstrap window, hosting-invariants §E).
+pub(crate) use hosting::SEED_CHAIN_LENGTH;
 
 use crate::message::TransactionType;
 use crate::topology::TopologyAdjustment;
@@ -1962,6 +1964,32 @@ impl Ring {
                 }
             }
 
+            // Expire lapsed PUT seed leases (findability bootstrap window). When a
+            // seed lease lapses with no real demand behind it, the seed host stops
+            // being `contract_in_use`, drops out of `contracts_needing_renewal`,
+            // and its subscription lease lapses — collapsing the seed chain
+            // (hosting-invariants.md §E). Tearing down the now-demandless upstream
+            // subscription here makes that collapse prompt rather than waiting for
+            // the 8-minute lease lapse.
+            let seed_lapsed = ring.expire_stale_seed_leases();
+            if !seed_lapsed.is_empty() {
+                tracing::debug!(
+                    lapsed_count = seed_lapsed.len(),
+                    "Expired stale PUT seed leases"
+                );
+                if let Some(op_manager) = ring.upgrade_op_manager() {
+                    for contract in &seed_lapsed {
+                        if ring.should_unsubscribe_upstream(contract) {
+                            let op_mgr = op_manager.clone();
+                            let contract = *contract;
+                            GlobalExecutor::spawn(async move {
+                                op_mgr.send_unsubscribe_upstream(&contract).await;
+                            });
+                        }
+                    }
+                }
+            }
+
             // Gate: skip renewal spawning if we have no ring connections (#3676).
             // Subscribe requests require connected peers to route through.
             // Without this, disconnected peers flood the notification channel
@@ -2973,6 +3001,30 @@ impl Ring {
 
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
         self.hosting_manager.expire_stale_downstream_subscribers()
+    }
+
+    /// Install (or refresh) a PUT seed lease for `contract` (findability
+    /// bootstrap window). Returns `true` if a lease is now active, `false` if
+    /// the per-node seed-lease cap rejected a new lease. See
+    /// `HostingManager::install_seed_lease`.
+    pub(crate) fn install_seed_lease(&self, contract: ContractKey) -> bool {
+        self.hosting_manager.install_seed_lease(contract)
+    }
+
+    /// Whether `contract` currently holds an active PUT seed lease.
+    pub(crate) fn has_active_seed_lease(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.has_active_seed_lease(contract)
+    }
+
+    /// Number of currently-active (non-expired) seed leases on this node.
+    pub(crate) fn active_seed_lease_count(&self) -> usize {
+        self.hosting_manager.active_seed_lease_count()
+    }
+
+    /// Expire lapsed PUT seed leases; returns the contracts whose lease just
+    /// lapsed. See `HostingManager::expire_stale_seed_leases`.
+    pub(crate) fn expire_stale_seed_leases(&self) -> Vec<ContractKey> {
+        self.hosting_manager.expire_stale_seed_leases()
     }
 
     pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {
