@@ -700,7 +700,6 @@ impl OpManager {
     /// * **Source 2 — interest manager** (`register_peer_interest` is_new):
     ///   - `subscribe::register_downstream_subscriber` (downstream subscriber)
     ///   - `subscribe::finalize_originator_subscribe` (originator upstream)
-    ///   - `operations::complete_piggyback_subscription` (GET-piggyback sub)
     ///   - `get::op_ctx_task` remote GET `subscribe=false` (requester interest)
     ///   - `node.rs` Interests / Summaries interest-sync handlers
     /// * **Source 1 — proximity cache** (`neighbors_with_contract`):

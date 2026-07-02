@@ -499,12 +499,11 @@ pub(super) async fn fetch_contract_if_missing(
 /// completes"); the latency is the cost of the client knowing the
 /// subscriber can actually serve a follow-up GET.
 ///
-/// See also: `crate::operations::complete_piggyback_subscription` —
-/// the GET-piggyback originator finalization path, which performs the
-/// same conceptual steps in a different order (it does NOT need the
-/// fetch step because the contract just arrived inside the GET
-/// response that carried the piggyback). Keep the two helpers in sync
-/// when adding new originator-side side effects.
+/// (The former `crate::operations::complete_piggyback_subscription`
+/// GET-piggyback originator finalization path was removed with
+/// GET-auto-subscribe in piece E of the demand-driven hosting redesign;
+/// explicit `subscribe=true` GETs now route through the ordinary subscribe
+/// driver, which reaches this helper.)
 pub(super) async fn finalize_originator_subscribe(
     op_manager: &OpManager,
     key: ContractKey,
