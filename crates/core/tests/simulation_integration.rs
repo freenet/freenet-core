@@ -11344,6 +11344,322 @@ fn test_terminal_advertisement_consult_closes_subscribe_dead_end() {
     );
 }
 
+/// Per-run observation for the relay-become-host dead-end proof.
+struct RelayBecomeHostObservation {
+    /// Cumulative relay-become-host events across all peers (design piece D).
+    /// This counter increments ONLY when a relay routes a SUBSCRIBE to a
+    /// downstream host, gets `Subscribed` back, and installs itself as a real
+    /// host (`finalize_host_subscribe` — fetch body + `ring.subscribe` +
+    /// announce). It is the direct measurement that the relay-become-host path
+    /// fired.
+    chain_hosts_formed: u64,
+    /// Consult telemetry cross-check: recorded ONLY when a consulted advertised
+    /// host answers `Subscribed`. With migration off, this is the unambiguous
+    /// signal the terminal consult (not routing/migration) drove the chain.
+    consult_resolved_found: u64,
+    /// The seeded far holder still hosts the contract at the end.
+    holder_hosts: bool,
+    /// Cluster nodes (node_no 1..=6 — NEITHER the holder nor the subscriber)
+    /// that ended up hosting the contract WITH state present. Under piece D a
+    /// chain host fetches the body, so it holds real state; the pre-piece-D
+    /// hollow relay would register downstream interest but hold NO state.
+    intermediate_hosts_with_state: Vec<usize>,
+    /// The subscriber ends up hosting the contract at the end.
+    subscriber_hosts: bool,
+    /// Upstream (parent) edges the subscriber recorded for the contract — a
+    /// non-trivial end-to-end signal that its SUBSCRIBE wired into the mesh
+    /// (its first hop answered `Subscribed` and was registered as upstream).
+    subscriber_upstreams: usize,
+    /// Every node index hosting the contract at the end (diagnostics).
+    hosting_node_indices: Vec<usize>,
+    /// Peers holding the contract in `active_subscription_keys` (mesh size).
+    active_subscription_peers: usize,
+}
+
+/// Drive one relay-become-host dead-end scenario and collect observations.
+///
+/// Topology (proven deterministic by
+/// `test_terminal_advertisement_consult_closes_subscribe_dead_end`, which shares
+/// it): a dense NON-hosting cluster of 6 peers sits right on the contract's key;
+/// exactly ONE seeded holder sits just OUTSIDE the cluster (farther from the key
+/// than every cluster peer, so greedy routing never selects it, but close enough
+/// to become a cluster peer's neighbor and advertise its hosting to it); one far
+/// subscriber sits on the opposite side of the key.
+///
+/// The subscriber's SUBSCRIBE routes greedily toward the key, dead-ends at the
+/// non-hosting cluster, and a cluster relay consults the host advertisement it
+/// received and forwards the SUBSCRIBE to the off-path holder — which answers
+/// `Subscribed`. That relay then becomes a REAL host (piece D): it fetches the
+/// body through the holder and installs a lease. This is the findability
+/// dead-end (a single distant holder unreachable by greedy routing) being CLOSED
+/// by a fresh mid-chain host.
+fn run_relay_become_host_scenario(seed: u64, network_name: &str) -> RelayBecomeHostObservation {
+    use freenet::config::GlobalTestMetrics;
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    setup_deterministic_state(seed);
+    GlobalTestMetrics::reset();
+
+    let contract = SimOperation::create_test_contract(0xC0);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+
+    // Non-hosting cluster tightly around the key.
+    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    // Holder just outside the cluster: farther from the key than every cluster
+    // peer (greedy routing never selects it), yet close enough to become a
+    // cluster peer's neighbor and advertise its hosting.
+    let host_loc = wrap(key_loc + 0.05);
+    // Subscriber on the opposite side of the key, so its inbound path approaches
+    // the key from the far side and never passes near the holder.
+    let requester_loc = wrap(key_loc - 0.60);
+    let mut node_locations = cluster.clone();
+    node_locations.push(host_loc); // regular-node order 6 -> node_no 7
+    node_locations.push(requester_loc); // regular-node order 7 -> node_no 8
+    let num_nodes = node_locations.len(); // 8
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            network_name,
+            1,         // 1 gateway
+            num_nodes, // 8 regular nodes
+            10,        // ring_max_htl
+            7,         // rnd_if_htl_above
+            8,         // max_connections
+            3,         // min_connections
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+    // Migration OFF: the ONLY mechanism that can build a host chain toward the
+    // holder is the SUBSCRIBE terminal consult + relay-become-host (piece D),
+    // not the SubscribeHint placement cascade.
+    sim.disable_placement_migration();
+    // Opt into advertising the seeded holder so the consult can find it (OFF by
+    // default; existing dead-end controls keep a seeded host un-advertised).
+    sim.enable_seeded_host_advertisements();
+
+    let host_label = NodeLabel::node(network_name, 7);
+    let requester_label = NodeLabel::node(network_name, 8);
+
+    // Setup sanity: the holder must be strictly FARTHER from the key than the
+    // closest cluster peer, so greedy routing lands on the cluster (terminus)
+    // and never picks the holder directly. get_peer_locations() is [gw, node1..8].
+    let locs = sim.get_peer_locations();
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let host_dist = ring_dist(locs[7], key_loc);
+    let cluster_min = (1..=6)
+        .map(|i| ring_dist(locs[i], key_loc))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        cluster_min < host_dist,
+        "scenario setup wrong: a cluster peer must be closer to the key than the holder \
+         (cluster_min={cluster_min}, host_dist={host_dist})"
+    );
+
+    let operations = vec![
+        // Only the holder hosts the contract initially — seeded into its store +
+        // Ring hosting manager + neighbor-hosting advertised set, no network
+        // propagation. It is the single distant holder a greedy subscribe cannot
+        // reach; findability of it relies on the terminal advertisement consult.
+        ScheduledOperation::new(
+            host_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![11, 22, 33, 44],
+            },
+        ),
+        // Seed the subscriber too: a bare SUBSCRIBE for an absent contract fails
+        // the local RegisterSubscriberListener gate and never starts the network
+        // subscribe. With the contract present, the SUBSCRIBE passes that gate
+        // and routes UPSTREAM toward the key to build the subscription tree.
+        // (This makes the subscriber's own hosting non-load-bearing — see the
+        // test's assertion comments — but it does NOT short-circuit the chain:
+        // the subscribe still routes to the network and dead-ends at the cluster,
+        // exactly where the consult + relay-become-host fires.)
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![11, 22, 33, 44],
+            },
+        ),
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x}: simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let intermediate_hosts_with_state: Vec<usize> = (1..=6usize)
+        .filter(|n| {
+            let label = NodeLabel::node(network_name, *n);
+            result.is_node_hosting(&label, &contract_key)
+                && result
+                    .node_storages
+                    .get(&label)
+                    .is_some_and(|s| s.get_stored_state(&contract_key).is_some())
+        })
+        .collect();
+    let hosting_node_indices: Vec<usize> = (1..=8usize)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(network_name, *n), &contract_key))
+        .collect();
+    let active_subscription_peers = result
+        .topology_snapshots
+        .iter()
+        .filter(|s| s.active_subscription_keys.contains(&contract_id))
+        .count();
+
+    RelayBecomeHostObservation {
+        chain_hosts_formed: result.aggregate_renewal_metrics().chain_hosts_formed,
+        consult_resolved_found: GlobalTestMetrics::terminal_consult_resolved_found(),
+        holder_hosts: result.is_node_hosting(&host_label, &contract_key),
+        intermediate_hosts_with_state,
+        subscriber_hosts: result.is_node_hosting(&requester_label, &contract_key),
+        subscriber_upstreams: result.node_upstream_count(&requester_label, &contract_key),
+        hosting_node_indices,
+        active_subscription_peers,
+    }
+}
+
+/// Piece D's raison d'être (design doc `docs/design/demand-driven-hosting.md` §3):
+/// a findability DEAD-END is CLOSED by a relay that becomes a REAL host mid-chain.
+///
+/// The prior subscription-mesh proofs (proofs 2-4) formed the mesh via the
+/// ORIGINATOR path only — a PUT pre-replicated the contract to ~half the peers,
+/// so every subscribe resolved at hop 1 on an already-hosting neighbor and the
+/// relay-become-host counter stayed 0. This test instead constructs a topology
+/// where the contract exists on EXACTLY ONE distant holder (seeded, off the
+/// greedy path) so a subscribe MUST traverse a non-hosting cluster relay, which
+/// consults the holder's advertisement and becomes a host itself.
+///
+/// What this proves that the sibling
+/// `test_terminal_advertisement_consult_closes_subscribe_dead_end` does not:
+/// that test asserts only the CONSULT fired (`resolved_found > 0`). This test
+/// asserts the PIECE-D OUTCOME — `chain_hosts_formed > 0` AND a fresh mid-chain
+/// host holding real state — i.e. the relay-become-host code path executed end
+/// to end, not merely that a consult returned Subscribed.
+///
+/// NEGATIVE CONTROL (comment, not a separate run — the code IS piece D now):
+/// before piece D, a cluster relay on this path would `register_downstream_
+/// subscriber` but never `ring.subscribe`/fetch/host — a HOLLOW relay that holds
+/// NO state (the findability dead-end this file's `hosting-invariants` rule
+/// documents). The `intermediate_hosts_with_state` assertion below is precisely
+/// the discriminator: a hollow relay would host nothing (or host without state),
+/// so a cluster node that hosts WITH state can only be a real piece-D chain host.
+/// `chain_hosts_formed` corroborates it: that counter fires ONLY on the
+/// relay-become-host branch, never on the pre-piece-D hollow-relay path.
+#[test_log::test]
+fn test_relay_become_host_closes_deadend() {
+    // Reuse the seed proven deterministic for this topology by the sibling
+    // consult test, plus one variant to guard against single-seed luck. If the
+    // variant proves fragile (organic connection formation is seed-sensitive and
+    // the consult needs a cluster peer to be the holder's neighbor), drop back to
+    // the single proven seed with a note — the piece-D path is also covered by
+    // the unit-level pin tests in `operations/subscribe/`.
+    const SEEDS: [u64; 2] = [0xC0FF_EEC0_0008, 0xC0FF_EEC0_0011];
+
+    let observations: Vec<(u64, RelayBecomeHostObservation)> = SEEDS
+        .iter()
+        .map(|&seed| {
+            let network_name = format!("relay-become-host-deadend-{seed:x}");
+            (seed, run_relay_become_host_scenario(seed, &network_name))
+        })
+        .collect();
+
+    for (seed, obs) in &observations {
+        eprintln!(
+            "[relay-become-host seed={seed:x}] chain_hosts_formed={} consult_resolved_found={} \
+             holder_hosts={} intermediate_hosts_with_state={:?} subscriber_hosts={} \
+             subscriber_upstreams={} hosting_node_indices={:?} active_subscription_peers={}",
+            obs.chain_hosts_formed,
+            obs.consult_resolved_found,
+            obs.holder_hosts,
+            obs.intermediate_hosts_with_state,
+            obs.subscriber_hosts,
+            obs.subscriber_upstreams,
+            obs.hosting_node_indices,
+            obs.active_subscription_peers,
+        );
+    }
+
+    for (seed, obs) in &observations {
+        // The seeded holder must remain the authoritative source throughout.
+        assert!(
+            obs.holder_hosts,
+            "seed={seed:x}: the seeded holder should still host the contract"
+        );
+
+        // PRIMARY PROOF (piece D): the relay-become-host path actually fired.
+        assert!(
+            obs.chain_hosts_formed > 0,
+            "seed={seed:x}: chain_hosts_formed=0 — no relay became a host via a \
+             `Subscribed` reply. The subscribe never traversed a non-hosting relay that \
+             then hosted (the whole point of piece D). intermediate_hosts_with_state={:?}, \
+             consult_resolved_found={}, hosting_node_indices={:?}",
+            obs.intermediate_hosts_with_state,
+            obs.consult_resolved_found,
+            obs.hosting_node_indices,
+        );
+
+        // CORE OF THE FIX: a real host was created MID-CHAIN — a cluster peer
+        // that is neither the seeded holder (node 7) nor the subscriber (node 8)
+        // now hosts the contract WITH state. That closed the findability
+        // dead-end: a subsequent key-routed GET/SUBSCRIBE now lands on a fresh
+        // host in the cluster instead of dead-ending. A hollow relay (pre-piece
+        // D) would hold NO state here.
+        assert!(
+            !obs.intermediate_hosts_with_state.is_empty(),
+            "seed={seed:x}: no mid-chain cluster peer (node_no 1..=6) hosts the contract \
+             WITH state, so the dead-end was not closed by a real host. \
+             chain_hosts_formed={}, hosting_node_indices={:?} (a hollow relay would host \
+             nothing / no state — piece D must make it a real host)",
+            obs.chain_hosts_formed,
+            obs.hosting_node_indices,
+        );
+
+        // The subscriber ends up hosting the contract. NOTE: this is NOT the
+        // load-bearing signal — the subscriber is pre-seeded (to pass the local
+        // RegisterSubscriberListener gate), so it hosts regardless of whether the
+        // network subscribe completed. The load-bearing proof is above:
+        // `chain_hosts_formed > 0` + a fresh mid-chain host holding state. We
+        // keep this assertion because the seeded holder / subscriber must remain
+        // hosts throughout for the mesh they anchor to be meaningful.
+        //
+        // `subscriber_upstreams` is reported (see the eprintln) but NOT asserted:
+        // `upstream_interest_count` records an edge only when a subscribe resolves
+        // at a real connected peer and NOT at the originator/root (see its
+        // rustdoc). The seeded far subscriber resolves as its own root here, so 0
+        // is expected and is not evidence against the chain — the chain metrics
+        // and the mid-chain hosts are the evidence.
+        assert!(
+            obs.subscriber_hosts,
+            "seed={seed:x}: subscriber should host the contract at the end"
+        );
+    }
+}
+
 /// Reproduction + regression test for the placement-migration renewal storm
 /// (#4440, the storm symptom of the #4404 placement work).
 ///
@@ -11984,12 +12300,12 @@ fn test_placement_migration_at_scale_renewal_load_stays_bounded() {
         // test could pass with migration silently inert (which would defeat its
         // purpose as migration's scale home).
         let mut migrated: Vec<(usize, usize)> = Vec::new();
-        for ci in 0..NUM_CONTRACTS {
+        for (ci, contract_key) in contract_keys.iter().enumerate().take(NUM_CONTRACTS) {
             // Non-loaded regular nodes are node_no 2..=num_nodes (node 1 is the
             // loaded host; the loaded node hosting its own seeded contract is not
             // a migration).
             for n in 2..=num_nodes {
-                if result.is_node_hosting(&NodeLabel::node(network_name, n), &contract_keys[ci]) {
+                if result.is_node_hosting(&NodeLabel::node(network_name, n), contract_key) {
                     migrated.push((ci, n));
                 }
             }
@@ -12298,4 +12614,607 @@ fn test_advance_hosting_clock_without_control_is_graceful_noop() {
         result.is_node_hosting(&gateway, &contract.key()),
         "gateway should still host its PUT contract"
     );
+}
+
+// =============================================================================
+// Computed-upstream demand-driven subscription model — SIMULATION PROOFS
+// (freenet/freenet-core#4642, piece D). Design: docs/design/hosting-eviction.md
+// + the converged model in `.claude/rules/hosting-invariants.md` (piece D).
+//
+// These four tests are the load-bearing validation gate for the piece-D model.
+// They prove PROPERTIES, not plumbing (that is what the three harness tests
+// above cover):
+//
+//   1. `test_subscription_count_tracks_demand_not_cache`
+//        Renewal is interest-gated, so live SUBSCRIPTION leases track ACTIVE
+//        DEMAND, not accumulated hosting cache (the #3763 no-storm invariant).
+//   2. `test_subscription_chain_collapses_on_client_leave`
+//        When the last client interest ends, the multi-hop chain of subscribed
+//        hosts COLLAPSES — no lease self-renews without demand (design §5a/§6).
+//   3. `test_chain_collapse_reaches_root_no_cycle`
+//        The collapse is TOTAL: zero survivors. A lone survivor would be a
+//        self-perpetuating lease; a surviving pair a two-peer mutual-upstream
+//        cycle. Strict-distance computed-upstream forbids both (design §6/§7).
+//   4. `test_popular_contract_fanout_is_measured`
+//        Fan-out of a popular contract is MEASURED (not bounded here — the
+//        admission bound is piece B, not in this piece; unbounded fan-out is
+//        EXPECTED and is reported, not asserted against).
+//
+// Determinism/isolation (per .claude/rules/testing.md): every seed iteration
+// uses a UNIQUE network name and re-seeds global state; `SimNetwork::Drop`
+// clears the per-network registries.
+// =============================================================================
+
+/// Proof 1 (no-storm, design §7 / #3763): a node's live subscription-lease
+/// count tracks its ACTIVE DEMAND, and does NOT grow with its hosting-cache
+/// size. Renewal is interest-gated (`HostingManager::contracts_needing_renewal`
+/// §1 `contract_in_use`; §3's recent-local-access is time-bounded), so
+/// cache-only contracts a node stops accessing lapse instead of accreting
+/// leases forever.
+///
+/// Scenario: a hub node SUBSCRIBES to a few contracts (real, pinned demand) and
+/// GETs many more (cache-only, no subscribe). A plain GET marks recent local
+/// access, which `contracts_needing_renewal` §3 would renew — the #3769
+/// "keep-recently-read-fresh" path. We then advance the hosting clock past the
+/// 8-minute recency window (simulating "the local user stopped reading those
+/// GET'd contracts"): their renewal source ages out and the leases lapse, while
+/// the still-client-subscribed demand contracts keep their leases via §1/§2.
+/// The surviving subscription count must therefore track demand, not cache.
+#[test_log::test]
+fn test_subscription_count_tracks_demand_not_cache() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEEDS: [u64; 3] = [0x4642_D101, 0x4642_D102, 0x4642_D103];
+    const DEMAND: usize = 2; // contracts the hub SUBSCRIBES to (active demand)
+    const CACHE: usize = 8; // contracts the hub only GETs (cache-only)
+
+    for seed in SEEDS {
+        setup_deterministic_state(seed);
+        let rt = create_runtime();
+        let network = format!("subcount-demand-{seed:x}");
+
+        let gateway = NodeLabel::gateway(&network, 0);
+        let hub = NodeLabel::node(&network, 1);
+
+        let demand_contracts: Vec<_> = (0..DEMAND)
+            .map(|i| SimOperation::create_test_contract(0x40 + i as u8))
+            .collect();
+        let cache_contracts: Vec<_> = (0..CACHE)
+            .map(|i| SimOperation::create_test_contract(0x60 + i as u8))
+            .collect();
+        // Instance-id sets so we can categorize surviving subscription leases
+        // network-wide as demand-backed vs cache-only.
+        let demand_ids: HashSet<_> = demand_contracts.iter().map(|c| *c.key().id()).collect();
+        let cache_ids: HashSet<_> = cache_contracts.iter().map(|c| *c.key().id()).collect();
+
+        // Dense 3-peer ring so every GET/SUBSCRIBE reliably completes — this
+        // test is about renewal accounting, not routing/findability.
+        let (sim, _clock) = rt.block_on(async {
+            let mut sim = SimNetwork::new(&network, 1, 2, 7, 3, 10, 2, seed).await;
+            let clock = sim.enable_hosting_time_control();
+            // Deliberately reduced budget (1 MiB vs the ~1 GiB default) — still
+            // comfortably holds the ~10 tiny test contracts, so the cache load
+            // is observable as hosting_count >> subscription_count.
+            sim.with_hosting_budget(1024 * 1024);
+            (sim, clock)
+        });
+
+        let mut ops = Vec::new();
+        // Gateway PUTs (and announces) every contract so the hub can fetch them.
+        for c in demand_contracts.iter().chain(cache_contracts.iter()) {
+            ops.push(ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Put {
+                    contract: c.clone(),
+                    state: SimOperation::create_test_state(1),
+                    subscribe: false,
+                },
+            ));
+        }
+        // Hub SUBSCRIBES to the demand contracts (real, pinned demand).
+        for c in &demand_contracts {
+            ops.push(ScheduledOperation::new(
+                hub.clone(),
+                SimOperation::Subscribe {
+                    contract_id: *c.key().id(),
+                },
+            ));
+        }
+        // Hub GETs the cache-only contracts (fills its hosting cache, no subscribe).
+        for c in &cache_contracts {
+            ops.push(ScheduledOperation::new(
+                hub.clone(),
+                SimOperation::Get {
+                    contract_id: *c.key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+        // Jump the hosting clock 20 minutes — well past the 8-minute lease AND
+        // the 8-minute recent-local-access window (§3) — so any GET-only lease
+        // that §3 transiently installed loses its renewal source and lapses,
+        // while the client-subscribed demand contracts keep their leases via the
+        // §1/§2 `contract_in_use` (client-subscription) renewal path.
+        ops.push(ScheduledOperation::new(
+            hub.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: Duration::from_secs(20 * 60),
+            },
+        ));
+
+        let result = sim.run_controlled_simulation(
+            seed,
+            ops,
+            Duration::from_secs(300),
+            Duration::from_secs(120),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "seed={seed:x}: sim failed: {:?}",
+            result.turmoil_result.err()
+        );
+
+        let hosting = result.node_hosting_count(&hub);
+        let subs = result.node_subscription_count(&hub);
+        let demand = result.node_active_demand_count(&hub);
+        let metrics = result.aggregate_renewal_metrics();
+
+        // Categorize every surviving subscription lease NETWORK-WIDE as
+        // demand-backed (one of the hub's client subscriptions) vs cache-only
+        // (one of the GET-only contracts). This is the strongest form of the
+        // no-storm property: after demand fades, cache-only contracts hold ZERO
+        // leases anywhere, while client-subscribed contracts keep theirs.
+        let mut demand_leases = 0usize;
+        let mut cache_leases = 0usize;
+        for snap in &result.topology_snapshots {
+            for id in &snap.active_subscription_keys {
+                if demand_ids.contains(id) {
+                    demand_leases += 1;
+                } else if cache_ids.contains(id) {
+                    cache_leases += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[proof1 seed={seed:x}] hub hosting_count={hosting} subscription_count={subs} \
+             active_demand_count={demand} | network leases: demand={demand_leases} \
+             cache={cache_leases} | max_cycle_batch={} chain_hosts_formed={}",
+            metrics.max_cycle_batch, metrics.chain_hosts_formed
+        );
+
+        // Scenario sanity: the cache load actually landed (not a degenerate run
+        // where GETs never cached), so hosting_count >> lease-set is meaningful.
+        assert!(
+            hosting >= DEMAND + CACHE / 2,
+            "seed={seed:x}: hub hosting_count ({hosting}) too low — the GET cache-load \
+             did not land; test would be degenerate"
+        );
+
+        // CORE no-storm property (design §7 / #3763): the cache-only contracts —
+        // which the hub GET-accessed but never subscribed, and stopped accessing
+        // 20 virtual minutes ago — hold ZERO subscription leases anywhere in the
+        // network. Interest-gated renewal must NOT let cache accrete leases.
+        assert_eq!(
+            cache_leases, 0,
+            "seed={seed:x}: #3763 storm signature — {cache_leases} cache-only contract lease(s) \
+             survived network-wide after demand faded. Subscriptions must track active demand, \
+             NOT accumulated cache (hub hosting_count={hosting})."
+        );
+
+        // The hub's OWN lease set is bounded by the demand it actually created
+        // (2 client subscriptions), never by its 10-contract cache.
+        assert!(
+            subs <= DEMAND + 1,
+            "seed={seed:x}: hub subscription_count ({subs}) exceeds the demand it created \
+             ({DEMAND}) + 1 — leases must not track the {hosting}-contract cache."
+        );
+        assert!(
+            hosting > subs,
+            "seed={seed:x}: hub hosting_count ({hosting}) must exceed subscription_count \
+             ({subs}) — the separation between cache and leases must be real."
+        );
+
+        // Non-degeneracy: the demand subscriptions genuinely persisted (this is
+        // NOT a run where everything simply lapsed).
+        assert!(
+            demand_leases >= 1,
+            "seed={seed:x}: no demand-backed lease survived — the run is degenerate \
+             (subscribes never took or all lapsed), so the cache==0 result is vacuous"
+        );
+
+        // Renewal batch cap (#4601): no node fans out more than 10 renewals per
+        // 30s cycle, regardless of how many contracts are eligible.
+        assert!(
+            metrics.max_cycle_batch <= 10,
+            "seed={seed:x}: max_cycle_batch ({}) exceeded the renewal cap of 10",
+            metrics.max_cycle_batch
+        );
+    }
+}
+
+/// Per-run observation for the subscription-mesh proofs (2, 3, 4). Primitives
+/// only, so the proofs share a driver without naming the sim-result type.
+struct MeshObservation {
+    /// Peers holding the contract in `active_subscriptions` at the end. In a
+    /// FORMATION run this is the size of the subscription mesh; in a COLLAPSE
+    /// run it is the set of survivors (must be empty).
+    subscribed_peers: Vec<SocketAddr>,
+    /// Nodes still hosting the contract in their cache at the end.
+    hosting_nodes: usize,
+    /// Cumulative relay-become-host events (see the note in the proof-2 rustdoc:
+    /// this is 0 in achievable sim topologies because subscribers become hosts
+    /// via the ORIGINATOR path, not the relay path — reported, not asserted on).
+    chain_hosts_formed: u64,
+    /// Max recorded upstreams at any node (subscription-tree parent edges).
+    max_upstreams: usize,
+    /// Total snapshots captured (guards against an empty-registry false read).
+    total_snapshots: usize,
+}
+
+/// Shared driver for the subscription-mesh proofs.
+///
+/// Builds a moderately-connected ring, PUTs + announces a contract on the
+/// gateway, and has `subscriber_ids` nodes subscribe — forming a connected mesh
+/// of subscribed hosts toward the key (design §4: co-hosting path). When
+/// `collapse` is set it then ends ALL client interest (disconnect the PUT
+/// originator AND every subscriber) and jumps the hosting clock 20 minutes past
+/// the 8-minute lease, so interest-gated renewal must let every lease lapse.
+///
+/// The FORMATION run (`collapse=false`) and the COLLAPSE run (`collapse=true`)
+/// share the same seed, topology, and subscribe prefix, so the mesh the
+/// formation run measures at its end is deterministically the same mesh the
+/// collapse run tears down — this is how a single end-of-run snapshot proves
+/// "formed THEN collapsed" without a mid-run measurement.
+fn run_subscription_mesh(
+    seed: u64,
+    network: &str,
+    subscriber_ids: &[usize],
+    collapse: bool,
+) -> MeshObservation {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(network, 0);
+    let contract = SimOperation::create_test_contract(0xC0);
+    let contract_key = contract.key();
+    let contract_id = *contract.key().id();
+
+    // Moderately connected so distant subscribes reliably reach the holder
+    // (the terminal-advertisement consult only sees direct-neighbor hosts, so
+    // too-sparse a ring dead-ends multi-hop subscribes) while still large enough
+    // to build a real multi-node mesh.
+    let sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(network, 1, 15, 10, 3, 5, 3, seed).await;
+        sim.enable_hosting_time_control();
+        sim
+    });
+
+    let mut ops = vec![ScheduledOperation::new(
+        gateway.clone(),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_test_state(1),
+            subscribe: true,
+        },
+    )];
+    for id in subscriber_ids {
+        ops.push(ScheduledOperation::new(
+            NodeLabel::node(network, *id),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    if collapse {
+        // End ALL client interest: disconnect the PUT originator AND every
+        // subscriber (Disconnect is ordered last for its node).
+        ops.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Disconnect,
+        ));
+        for id in subscriber_ids {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, *id),
+                SimOperation::Disconnect,
+            ));
+        }
+        // Jump 20 minutes — past the 8-minute lease AND the recent-access window
+        // — so no renewal branch keeps an un-demanded lease alive.
+        ops.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: Duration::from_secs(20 * 60),
+            },
+        ));
+    }
+
+    // Generous settle (120s ≈ 4 renewal/expiry cycles at 30s each) so the
+    // expire-sweep + interest-gated non-renewal removes every lapsed lease
+    // before the final snapshot.
+    let result = sim.run_controlled_simulation(
+        seed,
+        ops,
+        Duration::from_secs(360),
+        Duration::from_secs(120),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x} collapse={collapse}: sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let subscribed_peers: Vec<SocketAddr> = result
+        .topology_snapshots
+        .iter()
+        .filter(|s| s.active_subscription_keys.contains(&contract_id))
+        .map(|s| s.peer_addr)
+        .collect();
+    let hosting_nodes = result
+        .captured_node_labels()
+        .iter()
+        .filter(|l| result.is_node_hosting(l, &contract_key))
+        .count();
+    let max_upstreams = result
+        .captured_node_labels()
+        .iter()
+        .map(|l| result.node_upstream_count(l, &contract_key))
+        .max()
+        .unwrap_or(0);
+
+    MeshObservation {
+        subscribed_peers,
+        hosting_nodes,
+        chain_hosts_formed: result.aggregate_renewal_metrics().chain_hosts_formed,
+        max_upstreams,
+        total_snapshots: result.topology_snapshots.len(),
+    }
+}
+
+/// Subscriber set used by the collapse proofs — a spread of nodes across the
+/// ring so a genuine multi-node mesh forms.
+const MESH_SUBSCRIBERS: [usize; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
+
+/// Proof 2 (chain collapse on client leave, design §5a/§6). Two phases sharing
+/// one seed + topology + subscribe prefix (so determinism makes the FORMATION
+/// run's mesh identical to what the COLLAPSE run tears down):
+///
+///   * FORMATION run: a genuine multi-node subscription mesh forms.
+///   * COLLAPSE run: after ALL clients leave + a 20-minute clock jump, EVERY
+///     lease lapses — interest-gated renewal keeps none alive.
+///
+/// NOTE on `chain_hosts_formed` / `max_upstreams` (both stay 0 in the harness):
+/// the mesh forms via the ORIGINATOR subscribe path (each subscriber fetches +
+/// subscribes + hosts, then serves the next subscriber 1 hop out), so the
+/// relay-become-host counter `chain_hosts_formed` never increments — it only
+/// fires when a NON-subscribing pure relay forwards a subscribe to a host. That
+/// path is structurally unreachable here for two compounding reasons, both
+/// confirmed empirically (a single-subscriber sweep across all 15 nodes yielded
+/// chain_hosts_formed=0, max_upstreams=0 every time): (a) a PUT pre-replicates
+/// the contract to ~8 of 16 peers, and (b) every mesh member is itself a
+/// subscriber, so a subscribe's first hop is essentially always an
+/// already-hosting peer that fulfils it locally (`relay_subscribe_local_hit`),
+/// never traversing a non-hosting relay. We therefore prove formation by the
+/// mesh SIZE (measured before collapse), not by that counter, and only report
+/// the counter for the record. This is a harness limitation, NOT a piece-D
+/// defect: the relay-become-host code path is real; these sims just don't
+/// exercise it.
+#[test_log::test]
+fn test_subscription_chain_collapses_on_client_leave() {
+    const SEEDS: [u64; 3] = [0x4642_D201, 0x4642_D202, 0x4642_D203];
+    // The mesh must be non-trivial for a collapse-to-zero to be meaningful.
+    const MIN_MESH: usize = 3;
+
+    for seed in SEEDS {
+        // Phase A — formation baseline (no disconnect / no clock jump).
+        let form = run_subscription_mesh(
+            seed,
+            &format!("chain-form-{seed:x}"),
+            &MESH_SUBSCRIBERS,
+            false,
+        );
+        eprintln!(
+            "[proof2 seed={seed:x} FORM] mesh_size={} hosting_nodes={} chain_hosts_formed={} \
+             max_upstreams={} total_snapshots={}",
+            form.subscribed_peers.len(),
+            form.hosting_nodes,
+            form.chain_hosts_formed,
+            form.max_upstreams,
+            form.total_snapshots,
+        );
+        assert!(
+            form.subscribed_peers.len() >= MIN_MESH,
+            "seed={seed:x}: formation degenerate — only {} peer(s) in the subscription mesh \
+             (need >= {MIN_MESH}); the collapse below would be vacuous. \
+             Requested {} subscribers.",
+            form.subscribed_peers.len(),
+            MESH_SUBSCRIBERS.len(),
+        );
+
+        // Phase B — collapse (same seed/topology + disconnect-all + 20-min jump).
+        let coll = run_subscription_mesh(
+            seed,
+            &format!("chain-collapse-{seed:x}"),
+            &MESH_SUBSCRIBERS,
+            true,
+        );
+        eprintln!(
+            "[proof2 seed={seed:x} COLLAPSE] survivors={} hosting_nodes={} total_snapshots={} {:?}",
+            coll.subscribed_peers.len(),
+            coll.hosting_nodes,
+            coll.total_snapshots,
+            coll.subscribed_peers,
+        );
+        assert!(
+            coll.total_snapshots > 0,
+            "seed={seed:x}: no snapshots captured in collapse run — cannot judge collapse"
+        );
+        assert!(
+            coll.subscribed_peers.is_empty(),
+            "seed={seed:x}: chain did NOT collapse — {} peer(s) still hold the contract in \
+             active_subscriptions after all client interest ended + a 20-min clock jump: {:?}. \
+             Interest-gated renewal must let every un-demanded lease lapse.",
+            coll.subscribed_peers.len(),
+            coll.subscribed_peers,
+        );
+    }
+}
+
+/// Proof 3 (total collapse reaches the root, NO self-perpetuating cycle, design
+/// §6/§7): same two-phase scenario as proof 2, but the emphasis is that the
+/// collapse is COMPLETE. A single survivor would be a lease that self-renewed
+/// with no demand; a surviving PAIR would be a two-peer mutual-upstream cycle.
+/// The strict-distance computed-upstream design (upstream = strictly-closer-to-
+/// key host → a total order → acyclic) forbids both, so the survivor count must
+/// be exactly zero.
+#[test_log::test]
+fn test_chain_collapse_reaches_root_no_cycle() {
+    const SEEDS: [u64; 3] = [0x4642_D301, 0x4642_D302, 0x4642_D303];
+    const MIN_MESH: usize = 3;
+
+    for seed in SEEDS {
+        // Formation baseline: confirm a real mesh formed (non-vacuous collapse).
+        let form = run_subscription_mesh(
+            seed,
+            &format!("nocycle-form-{seed:x}"),
+            &MESH_SUBSCRIBERS,
+            false,
+        );
+        assert!(
+            form.subscribed_peers.len() >= MIN_MESH,
+            "seed={seed:x}: formation degenerate — mesh_size={} (< {MIN_MESH}); \
+             total collapse would be vacuous",
+            form.subscribed_peers.len(),
+        );
+
+        // Collapse run.
+        let coll = run_subscription_mesh(
+            seed,
+            &format!("nocycle-collapse-{seed:x}"),
+            &MESH_SUBSCRIBERS,
+            true,
+        );
+        let survivors = coll.subscribed_peers.len();
+        let shape = match survivors {
+            0 => "none (total collapse)",
+            1 => "SINGLE survivor — a self-perpetuating lease",
+            2 => "PAIR of survivors — a two-peer mutual-upstream cycle",
+            _ => "MULTIPLE survivors — chain failed to collapse",
+        };
+        eprintln!(
+            "[proof3 seed={seed:x}] formed_mesh={} survivors={survivors} shape=\"{shape}\" {:?}",
+            form.subscribed_peers.len(),
+            coll.subscribed_peers,
+        );
+        // TOTAL collapse: exactly zero survivors. Any survivor is a
+        // self-perpetuation failure the computed-upstream design must prevent.
+        assert_eq!(
+            survivors, 0,
+            "seed={seed:x}: collapse incomplete — {survivors} survivor(s), shape: {shape}. \
+             A single survivor = a self-perpetuating lease; a pair = a mutual-upstream cycle. \
+             Strict-distance computed-upstream (acyclic by construction) forbids both. \
+             Survivors: {:?}",
+            coll.subscribed_peers,
+        );
+    }
+}
+
+/// Proof 4 (popular-contract fan-out is MEASURED, not bounded here): many
+/// distant nodes subscribe to ONE contract, building a wide mesh toward its key.
+/// We MEASURE the fan-out (subscription-mesh size, max recorded upstreams, max
+/// per-node lease count) and REPORT it. We assert only that a real mesh formed —
+/// the fan-out UPPER bound is piece B (admission: an over-committed peer REFUSES
+/// new subscriptions), which is NOT in this piece, so unbounded fan-out here is
+/// EXPECTED and is reported, not failed.
+#[test_log::test]
+fn test_popular_contract_fanout_is_measured() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEEDS: [u64; 3] = [0x4642_D401, 0x4642_D402, 0x4642_D403];
+    // Every regular node subscribes to the one popular contract.
+    const POPULAR_SUBSCRIBERS: [usize; 15] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+    for seed in SEEDS {
+        setup_deterministic_state(seed);
+        let rt = create_runtime();
+        let network = format!("popular-fanout-{seed:x}");
+
+        let gateway = NodeLabel::gateway(&network, 0);
+        let contract = SimOperation::create_test_contract(0xC4);
+        let contract_key = contract.key();
+        let contract_id = *contract.key().id();
+
+        let sim = rt.block_on(async { SimNetwork::new(&network, 1, 15, 10, 3, 5, 3, seed).await });
+
+        let mut ops = vec![ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_test_state(1),
+                subscribe: true,
+            },
+        )];
+        for id in POPULAR_SUBSCRIBERS {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(&network, id),
+                SimOperation::Subscribe { contract_id },
+            ));
+        }
+
+        let result = sim.run_controlled_simulation(
+            seed,
+            ops,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "seed={seed:x}: sim failed: {:?}",
+            result.turmoil_result.err()
+        );
+
+        let subscribed_peers: Vec<SocketAddr> = result
+            .topology_snapshots
+            .iter()
+            .filter(|s| s.active_subscription_keys.contains(&contract_id))
+            .map(|s| s.peer_addr)
+            .collect();
+        let max_subscription_count = result
+            .captured_node_labels()
+            .iter()
+            .map(|l| result.node_subscription_count(l))
+            .max()
+            .unwrap_or(0);
+        let max_upstreams = result
+            .captured_node_labels()
+            .iter()
+            .map(|l| result.node_upstream_count(l, &contract_key))
+            .max()
+            .unwrap_or(0);
+        let hosting_nodes = result
+            .captured_node_labels()
+            .iter()
+            .filter(|l| result.is_node_hosting(l, &contract_key))
+            .count();
+        let chain_hosts_formed = result.aggregate_renewal_metrics().chain_hosts_formed;
+
+        // MEASURE-ONLY report. Fan-out is bounded only by piece B (admission),
+        // which is NOT in this piece, so we do NOT assert an upper bound.
+        eprintln!(
+            "[proof4 seed={seed:x}] subscribers_requested={} mesh_size={} hosting_nodes={hosting_nodes} \
+             max_node_subscription_count={max_subscription_count} max_node_upstreams={max_upstreams} \
+             chain_hosts_formed={chain_hosts_formed} \
+             (fan-out is UNBOUNDED here by design — admission/piece B is not in this piece)",
+            POPULAR_SUBSCRIBERS.len(),
+            subscribed_peers.len(),
+        );
+
+        assert!(
+            subscribed_peers.len() >= 3,
+            "seed={seed:x}: only {} peer(s) subscribed to the popular contract — no real mesh \
+             formed, so the fan-out measurement would be meaningless.",
+            subscribed_peers.len(),
+        );
+    }
 }
