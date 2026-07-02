@@ -3367,6 +3367,142 @@ mod tests {
     }
 
     // =========================================================================
+    // Piece B admission (#4642): can_admit_subscription + fan-out capacity
+    // =========================================================================
+
+    #[test]
+    fn fanout_capacity_for_ram_clamps() {
+        // Below the floor divisor → clamped up to MIN.
+        assert_eq!(
+            fanout_capacity_for_ram(0),
+            MIN_DEFAULT_FANOUT_CAPACITY,
+            "zero RAM clamps up to the floor"
+        );
+        assert_eq!(
+            fanout_capacity_for_ram(64 * 1024 * 1024),
+            MIN_DEFAULT_FANOUT_CAPACITY,
+            "512 MiB → 8 raw, clamps up to the floor (64)"
+        );
+        // Mid-range scales linearly: 8 GiB / 8 MiB = 1024.
+        assert_eq!(fanout_capacity_for_ram(8 * 1024 * 1024 * 1024), 1024);
+        // Above the ceiling → clamped down to MAX.
+        assert_eq!(
+            fanout_capacity_for_ram(1024 * 1024 * 1024 * 1024),
+            MAX_DEFAULT_FANOUT_CAPACITY,
+            "1 TiB clamps down to the ceiling"
+        );
+    }
+
+    #[test]
+    fn total_downstream_subscribers_sums_lease_valid_across_contracts() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let c1 = make_contract_key(1);
+        let c2 = make_contract_key(2);
+        manager.add_downstream_subscriber(&c1, make_peer_key(10));
+        manager.add_downstream_subscriber(&c1, make_peer_key(11));
+        manager.add_downstream_subscriber(&c2, make_peer_key(12));
+        assert_eq!(
+            manager.total_downstream_subscribers(),
+            3,
+            "sums lease-valid downstream subscribers across all contracts"
+        );
+
+        // A stale (expired-but-unswept) lease must NOT be counted — mirrors the
+        // lease-validity rule of downstream_subscriber_count / beneficiary_counts.
+        if let Some(mut peers) = manager.downstream_subscribers.get_mut(&c1) {
+            peers.insert(
+                make_peer_key(10),
+                Instant::now() - SUBSCRIPTION_LEASE_DURATION - Duration::from_secs(1),
+            );
+        }
+        assert_eq!(
+            manager.total_downstream_subscribers(),
+            2,
+            "stale-unswept lease drops out of the aggregate fan-out count"
+        );
+    }
+
+    #[test]
+    fn can_admit_subscription_accepts_with_headroom() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        manager.set_fanout_capacity(8);
+        let contract = make_contract_key(1);
+        // Fan-out under capacity, byte budget has room → accept.
+        assert!(manager.can_admit_subscription(&contract));
+        assert_eq!(manager.subscription_refusals_total(), 0);
+    }
+
+    #[test]
+    fn can_admit_subscription_refuses_at_fanout_capacity() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        manager.set_fanout_capacity(3);
+        // Fill aggregate fan-out to capacity across two contracts.
+        let c1 = make_contract_key(1);
+        let c2 = make_contract_key(2);
+        manager.add_downstream_subscriber(&c1, make_peer_key(10));
+        manager.add_downstream_subscriber(&c1, make_peer_key(11));
+        manager.add_downstream_subscriber(&c2, make_peer_key(12));
+        assert_eq!(manager.total_downstream_subscribers(), 3);
+
+        // A fresh subscription to ANY contract is now refused (over-committed),
+        // and the refusal counter increments.
+        let c3 = make_contract_key(3);
+        assert!(
+            !manager.can_admit_subscription(&c3),
+            "at fan-out capacity, a fresh subscription must be refused"
+        );
+        assert_eq!(manager.subscription_refusals_total(), 1);
+        // Even a contract we already host is refused on the fan-out axis — the
+        // node genuinely cannot sustain more broadcast fan-out.
+        assert!(!manager.can_admit_subscription(&c1));
+        assert_eq!(manager.subscription_refusals_total(), 2);
+    }
+
+    #[test]
+    fn can_admit_subscription_refuses_new_contract_over_byte_budget() {
+        // Tiny budget; a hosted contract pushes current_bytes over it.
+        let manager = HostingManager::new(100);
+        manager.set_fanout_capacity(1000); // fan-out never the limiting factor here
+        let hosted = make_contract_key(1);
+        manager.record_contract_access(hosted, 500, AccessType::Put);
+        assert!(manager.is_hosting_contract(&hosted));
+        let stats = manager.hosting_cache_stats();
+        assert!(
+            stats.current_bytes >= stats.budget_bytes,
+            "precondition: cache is over its byte budget"
+        );
+
+        // A brand-new (not-yet-hosted) contract is refused: admitting it would
+        // immediately thrash eviction.
+        let fresh = make_contract_key(2);
+        assert!(
+            !manager.can_admit_subscription(&fresh),
+            "new contract refused when the byte budget is saturated"
+        );
+        assert_eq!(manager.subscription_refusals_total(), 1);
+    }
+
+    #[test]
+    fn can_admit_subscription_allows_already_hosted_when_byte_budget_full() {
+        // Over the byte budget, but the contract in question is ALREADY hosted:
+        // serving one more subscriber for it adds fan-out, not new bytes, so the
+        // byte term does not apply and (with fan-out headroom) it is accepted.
+        let manager = HostingManager::new(100);
+        manager.set_fanout_capacity(1000);
+        let hosted = make_contract_key(1);
+        manager.record_contract_access(hosted, 500, AccessType::Put);
+        let stats = manager.hosting_cache_stats();
+        assert!(stats.current_bytes >= stats.budget_bytes);
+
+        assert!(
+            manager.can_admit_subscription(&hosted),
+            "already-hosted contract is admitted despite a full byte budget \
+             (fan-out has headroom; no new bytes)"
+        );
+        assert_eq!(manager.subscription_refusals_total(), 0);
+    }
+
+    // =========================================================================
     // Governance Beneficiary-Count Accessor Tests
     // =========================================================================
     //
