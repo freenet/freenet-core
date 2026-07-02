@@ -2690,9 +2690,19 @@ where
     // re-add store-at-every-hop or replicate-on-terminus — see hosting-invariants.
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
     let originator_loopback = Some(upstream_addr) == own_addr;
-    let finalize_here = next_hop.is_none();
+    // We are the effective terminus for this contract whenever we are NOT going
+    // to forward it downstream. That is `downstream_reply_rx.is_none()`, which
+    // covers BOTH "no next hop" (finalize) AND "next hop chosen but the piped
+    // forward was not set up" (payload below the streaming threshold, next-hop
+    // address unresolved, or send_to_and_register_waiter failed). In every
+    // not-forwarding case this node MUST host, or the Step 7 `else` branch below
+    // reports a successful PutMsg::Response for a contract that was neither
+    // stored here nor forwarded — silently losing the streamed PUT. A hop that
+    // IS piping forward is pure routing and does not host (unless it is the
+    // originator or already hosts the contract).
+    let not_forwarding = downstream_reply_rx.is_none();
     let should_host =
-        originator_loopback || finalize_here || op_manager.ring.is_hosting_contract(&key);
+        originator_loopback || not_forwarding || op_manager.ring.is_hosting_contract(&key);
 
     let merged_value = if should_host {
         // Originator-loopback client PUT → ClientLocal reserved lane (#4534).
@@ -2709,8 +2719,8 @@ where
         )
         .await?
     } else {
-        // Routing-only hop: the fragments were already piped onward; forward
-        // the client's value unchanged as the (unstored) response payload.
+        // Routing-only hop that IS piping the fragments onward: forward the
+        // client's value unchanged as the (unstored) response payload.
         value
     };
 
