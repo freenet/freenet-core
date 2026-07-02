@@ -79,8 +79,9 @@
 //! The deterministic fix is to use the supported non-host path: `nat-peer`
 //! issues `GET` with `subscribe=true`. The GET routes *toward* the contract
 //! (so it reliably resolves on `gateway`/`host-peer`), fetches and caches the
-//! body on `nat-peer`, and the GET driver's `auto_subscribe_on_get_response`
-//! then registers the subscription through the SAME relay path a bare SUBSCRIBE
+//! body on `nat-peer`, and the explicit `subscribe=true` flag then registers
+//! the subscription (`maybe_subscribe_child` -> `run_client_subscribe`) through
+//! the SAME relay path a bare SUBSCRIBE
 //! would use — the wire `SubscribeMsg::Request` still carries no address, so
 //! each hop still fills `upstream_addr` from the observed transport
 //! `source_addr` and registers the previous hop as a downstream subscriber.
