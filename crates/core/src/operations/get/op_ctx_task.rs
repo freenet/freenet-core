@@ -2060,7 +2060,6 @@ fn missing_state_cause(instance_id: &ContractInstanceId) -> String {
 /// - GC-spawned retries.
 /// - `start_targeted_op` (UPDATE-triggered auto-fetch).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_relay_get<CB>(
     op_manager: Arc<OpManager>,
     conn_manager: CB,
@@ -2226,7 +2225,6 @@ async fn run_relay_get<CB>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn drive_relay_get<CB>(
     op_manager: &Arc<OpManager>,
