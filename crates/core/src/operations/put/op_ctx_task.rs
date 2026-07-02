@@ -1338,11 +1338,17 @@ where
             // reached when `htl == 0` (next_hop is forced None then), so it
             // can forward to a gateway at htl 0. Benign — the contract is
             // already stored locally (no false success), it is a single
-            // bounded next-hop (no fan-out), the gateway forwards at
-            // `htl - 1 == 0` and finalizes on its populated ring (better
-            // placement than this empty-ring node), and the originator
-            // loopback always starts at max_htl so it never hits htl 0 here.
-            // Do not "harmonize" the two paths — there is no correctness gain.
+            // bounded next-hop (no fan-out), and the forward is terminating:
+            // each hop adds itself (and its upstream) to `new_skip_list`, so
+            // in a pathological all-empty-ring chain `select_bootstrap_gateway`
+            // eventually excludes every configured gateway and returns None
+            // (finalize locally). Termination here is skip_list exhaustion —
+            // NOT htl, and NOT the receiving gateway's ring being populated.
+            // In the normal case the gateway does have a populated ring and
+            // routes the PUT toward the contract location (better placement
+            // than this empty-ring node). The originator loopback always
+            // starts at max_htl so it never hits htl 0 here. Do not
+            // "harmonize" the two paths — there is no correctness gain.
             match bootstrap_gateway_target(op_manager, |addr| new_skip_list.contains(&addr)) {
                 Some((gateway, gateway_addr)) => {
                     tracing::info!(
@@ -3281,6 +3287,51 @@ mod tests {
         );
     }
 
+    /// Truncate this file's source at the `#[cfg(test)]` marker so the
+    /// source-pin tests never match code or comments inside the test
+    /// module itself (mirrors the GET / UPDATE helpers).
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("op_ctx_task.rs");
+        let cutoff = FULL
+            .find("#[cfg(test)]")
+            .expect("file must have a #[cfg(test)] section");
+        &FULL[..cutoff]
+    }
+
+    /// Isolate a named fn's body by brace-matching from its opening `{`
+    /// to the matching `}`, so a pin cannot silently run past the
+    /// function into unrelated source. The defect this replaces did
+    /// exactly that: a `"\nasync fn "` EOF scan on `drive_relay_put_streaming`
+    /// found no following top-level `async fn`, ran the "body" to EOF, and
+    /// swallowed the whole test module — so neutering the streaming call
+    /// site still left the pin green.
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..]
+            .find('{')
+            .expect("fn signature must have a body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unterminated fn body for {signature_prefix}");
+    }
+
     /// Source-grep pin (#4361 / #4365): both relay PUT drivers must
     /// consult `bootstrap_gateway_target` when
     /// `closest_potentially_hosting` yields no next hop, so a
@@ -3289,26 +3340,26 @@ mod tests {
     /// false success to the client. Dropping either call site silently
     /// reintroduces the empty-ring silent-store bug that GET fixed in
     /// #4364.
+    ///
+    /// Uses brace-matched `extract_fn_body` over `production_source()`,
+    /// NOT a `"\nasync fn "` EOF scan: the old scan let the streaming
+    /// driver's "body" run to EOF and swallow this module, so neutering
+    /// the streaming call site left the pin green — the exact regression
+    /// this guards (verified fail-without-fix by neutering each call site
+    /// in turn). A driver-level *behavioral* test (build an `OpManager`
+    /// with `connection_count()==0` + a configured gateway and assert the
+    /// gateway is the chosen next hop) is deferred: there is no `OpManager`
+    /// unit-test builder, and a static sim self-promotes its gateway into
+    /// the ring (`connection_count()` settles at 1, not 0) — the same infra
+    /// gap that deferred GET's equivalent (#4364).
     #[test]
     fn relay_put_drivers_use_bootstrap_gateway_fallback() {
-        let src = include_str!("op_ctx_task.rs");
+        let src = production_source();
         for entry in [
             "async fn drive_relay_put<CB>",
             "async fn drive_relay_put_streaming<CB>",
         ] {
-            let start = src
-                .find(entry)
-                .unwrap_or_else(|| panic!("{entry} must exist"));
-            // Body spans from the fn signature to the start of the next
-            // top-level `async fn`. The call site lives in the empty-ring
-            // branch of the next-hop selection, which can sit far from the
-            // signature, so scan the whole body rather than a fixed window.
-            let after_sig = start + entry.len();
-            let body_end = src[after_sig..]
-                .find("\nasync fn ")
-                .map(|off| after_sig + off)
-                .unwrap_or(src.len());
-            let body = &src[start..body_end];
+            let body = extract_fn_body(src, entry);
             assert!(
                 body.contains("bootstrap_gateway_target("),
                 "{entry} must fall back to bootstrap_gateway_target on an \

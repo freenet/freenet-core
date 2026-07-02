@@ -2122,15 +2122,15 @@ mod tests {
     /// prime the local store from the gateway rather than failing flat.
     #[test]
     fn drive_client_update_uses_bootstrap_gateway_fallback() {
-        let src = include_str!("op_ctx_task.rs");
-        let entry = "async fn drive_client_update";
-        let start = src.find(entry).expect("drive_client_update must exist");
-        let after_sig = start + entry.len();
-        let body_end = src[after_sig..]
-            .find("\nasync fn ")
-            .map(|off| after_sig + off)
-            .unwrap_or(src.len());
-        let body = &src[start..body_end];
+        // Brace-matched `extract_fn_body` over `production_source()` (not a
+        // `"\nasync fn "` EOF scan): the scan bounded this pin only by
+        // function ordering — if `drive_client_update` ever became the last
+        // top-level `async fn`, its "body" would run to EOF and swallow the
+        // test module (the defect that neutered the PUT streaming pin, #4635
+        // review). Brace-matching bounds it structurally instead.
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "async fn drive_client_update(");
         assert!(
             body.contains("bootstrap_gateway_target("),
             "drive_client_update must fall back to bootstrap_gateway_target \
