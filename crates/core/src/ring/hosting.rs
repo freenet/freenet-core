@@ -1157,21 +1157,24 @@ impl HostingManager {
     pub(crate) fn install_seed_lease(&self, contract: ContractKey) -> bool {
         let now = self.time_source.now();
         let expires_at = now + SEED_LEASE_DURATION;
-        use dashmap::mapref::entry::Entry;
-        match self.seed_leases.entry(contract) {
-            Entry::Occupied(mut e) => {
-                // Refresh (re-PUT): extend the hard deadline, still one lease.
-                *e.get_mut() = expires_at;
-                true
-            }
-            Entry::Vacant(e) => {
-                if self.active_seed_lease_count() >= self.seed_lease_cap() {
-                    return false;
-                }
-                e.insert(expires_at);
-                true
-            }
+        // Refresh path (re-PUT): extend the hard deadline in place. Drop the
+        // shard guard before any full-map scan below.
+        if let Some(mut existing) = self.seed_leases.get_mut(&contract) {
+            *existing = expires_at;
+            return true;
         }
+        // New lease: enforce the per-node cap. The count scan iterates every
+        // shard, so it MUST run with no seed_leases shard guard held (the
+        // refresh guard above was already dropped) — otherwise it self-deadlocks
+        // against its own held shard. Two concurrent NEW installs can both pass a
+        // just-under-cap check and transiently exceed the cap by a bounded amount;
+        // that is an accepted SOFT cap — the hard per-lease deadline and the
+        // reaper still bound the set.
+        if self.active_seed_lease_count() >= self.seed_lease_cap() {
+            return false;
+        }
+        self.seed_leases.insert(contract, expires_at);
+        true
     }
 
     /// Remove expired seed leases. Returns the contracts whose lease just lapsed
@@ -2464,6 +2467,172 @@ mod tests {
             !manager.is_subscribed(&contract),
             "lease should expire once the injected clock passes SUBSCRIPTION_LEASE_DURATION"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // PUT seed leases (findability bootstrap window) — hosting-invariants.md §E
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_install_seed_lease_makes_contract_in_use() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(1);
+
+        assert!(!manager.has_active_seed_lease(&contract));
+        assert!(!manager.contract_in_use(&contract), "no signal yet");
+
+        assert!(manager.install_seed_lease(contract));
+        assert!(manager.has_active_seed_lease(&contract));
+        assert!(
+            manager.contract_in_use(&contract),
+            "an active seed lease is a (time-bounded) in-use signal"
+        );
+        assert_eq!(manager.active_seed_lease_count(), 1);
+    }
+
+    /// Spam-safety core: with no real demand, a seed lease lapses at its hard
+    /// deadline, `contract_in_use` goes false, and the contract drops out of the
+    /// renewal set — the chain collapses and cannot accumulate hosting.
+    #[tokio::test]
+    async fn test_seed_lease_lapses_and_collapses_after_window() {
+        use crate::util::time_source::SharedMockTimeSource;
+        let clock = SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let contract = make_contract_key(2);
+
+        assert!(manager.install_seed_lease(contract));
+        // During the window the seed-leased contract is in the renewal set (this
+        // is what drives the seed host into the mesh) even with NO active sub.
+        assert!(
+            manager.contracts_needing_renewal().contains(&contract),
+            "seed-leased contract must be renewed during the window"
+        );
+
+        clock.advance_time(SEED_LEASE_DURATION - Duration::from_secs(1));
+        assert!(manager.has_active_seed_lease(&contract));
+        assert!(manager.contract_in_use(&contract));
+
+        clock.advance_time(Duration::from_secs(2));
+        assert!(
+            !manager.has_active_seed_lease(&contract),
+            "hard deadline lapsed"
+        );
+        assert!(
+            !manager.contract_in_use(&contract),
+            "no real demand: the lapsed seed lease removes the in-use signal"
+        );
+        assert!(
+            !manager.contracts_needing_renewal().contains(&contract),
+            "a lapsed seed lease drops out of the renewal set — the chain collapses"
+        );
+
+        let lapsed = manager.expire_stale_seed_leases();
+        assert_eq!(lapsed, vec![contract]);
+        assert_eq!(manager.active_seed_lease_count(), 0);
+    }
+
+    /// The deadline is HARD: the seed's own reads / renewal-set membership must
+    /// not extend it. Only a fresh install (a re-PUT) can.
+    #[tokio::test]
+    async fn test_seed_lease_is_not_renewable_by_the_seed_itself() {
+        use crate::util::time_source::SharedMockTimeSource;
+        let clock = SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let contract = make_contract_key(3);
+        assert!(manager.install_seed_lease(contract));
+
+        // Exercise the read/renewal predicates repeatedly across the window.
+        for _ in 0..10 {
+            clock.advance_time(SEED_LEASE_DURATION / 12);
+            let _ = manager.has_active_seed_lease(&contract);
+            let _ = manager.contracts_needing_renewal();
+        }
+        assert!(manager.has_active_seed_lease(&contract));
+        // Cross the ORIGINAL deadline; the reads above must not have extended it.
+        clock.advance_time(SEED_LEASE_DURATION / 3);
+        assert!(
+            !manager.has_active_seed_lease(&contract),
+            "the seed lease deadline is hard — reads/renewals cannot extend it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seed_lease_refresh_extends_and_stays_one_lease() {
+        use crate::util::time_source::SharedMockTimeSource;
+        let clock = SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let contract = make_contract_key(4);
+
+        assert!(manager.install_seed_lease(contract));
+        assert_eq!(manager.active_seed_lease_count(), 1);
+
+        clock.advance_time(SEED_LEASE_DURATION / 2);
+        assert!(manager.install_seed_lease(contract)); // re-PUT
+        assert_eq!(
+            manager.active_seed_lease_count(),
+            1,
+            "refresh of an existing lease is still one lease"
+        );
+
+        // The original deadline would have lapsed here; the refresh extended it.
+        clock.advance_time(SEED_LEASE_DURATION * 3 / 4);
+        assert!(
+            manager.has_active_seed_lease(&contract),
+            "a re-PUT within the window extends the hard deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seed_lease_cap_bounds_new_leases() {
+        // 16 MiB budget -> cap = 16/4/1 = 4 (above the floor of MIN_SEED_LEASE_CAP).
+        let manager = HostingManager::new(16 * 1024 * 1024);
+        let cap = manager.seed_lease_cap();
+        assert_eq!(
+            cap, 4,
+            "cap is budget-derived (1/{SEED_LEASE_BUDGET_DIVISOR} of budget / ~1 MiB/contract)"
+        );
+
+        for seed in 0..cap as u8 {
+            assert!(
+                manager.install_seed_lease(make_contract_key(seed)),
+                "lease {seed} within cap must be accepted"
+            );
+        }
+        assert_eq!(manager.active_seed_lease_count(), cap);
+
+        // A NEW contract over the cap is rejected (no lease installed) — this is
+        // what stops a spam burst from pinning unbounded eviction-exempt hosts.
+        let over = make_contract_key(cap as u8 + 10);
+        assert!(
+            !manager.install_seed_lease(over),
+            "a new seed lease over the cap must be rejected"
+        );
+        assert!(!manager.has_active_seed_lease(&over));
+        assert_eq!(manager.active_seed_lease_count(), cap);
+
+        // Refreshing an ALREADY-leased contract at the cap is still allowed.
+        assert!(
+            manager.install_seed_lease(make_contract_key(0)),
+            "refresh at the cap must be allowed (still one lease)"
+        );
+        assert_eq!(manager.active_seed_lease_count(), cap);
+    }
+
+    #[tokio::test]
+    async fn test_seed_lease_cap_floored_for_tiny_budget() {
+        // A tiny/zero budget still admits at least one PUT's worth of seed chain.
+        let manager = HostingManager::new(0);
+        assert_eq!(manager.seed_lease_cap(), MIN_SEED_LEASE_CAP);
+        assert!(MIN_SEED_LEASE_CAP >= 1);
     }
 
     #[tokio::test]

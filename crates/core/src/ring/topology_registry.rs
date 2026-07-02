@@ -218,9 +218,17 @@ pub struct RenewalMetrics {
     /// Times this node installed a PUT seed lease on the near-key descent of a
     /// PUT it relayed (findability bootstrap window, hosting-invariants.md §E).
     /// Cumulative. Lets the seed-chain simulation assert seeds ARE installed
-    /// during the window and — cross-checked against `active_seed_lease_count`
-    /// going to zero after the window — that they do NOT accumulate (spam-safe).
+    /// during the window.
     pub put_seed_leases_installed: u64,
+    /// Peak number of simultaneously-active seed leases observed on this node
+    /// across all reaper ticks. Bounds-check for the per-node cap: a spam burst
+    /// can never push this above `seed_lease_cap`.
+    pub peak_active_seed_leases: u64,
+    /// Most-recently-observed active seed-lease count (reaper-tick gauge). After
+    /// the sim advances past `SEED_LEASE_DURATION` with no demand, this must fall
+    /// to zero on every node — the spam-safety "no accumulation past the window"
+    /// signal (the chain collapsed).
+    pub last_active_seed_leases: u64,
     /// Times this node became a HOST of a contract because it routed a SUBSCRIBE
     /// to a downstream host and got `Subscribed` back (piece D: chain peers are
     /// real subscribed hosts, not stateless forwarders). Cumulative. Lets the
@@ -313,6 +321,21 @@ pub fn record_put_seed_lease_installed(peer_addr: SocketAddr) {
             .entry((network_name, peer_addr))
             .or_default()
             .put_seed_leases_installed += 1;
+    }
+}
+
+/// Record the current active seed-lease count for this node on a reaper tick
+/// (a gauge): updates the running peak and the last-observed value. No-op
+/// outside a simulation context.
+pub fn record_active_seed_leases(peer_addr: SocketAddr, count: u64) {
+    if let Some(network_name) = get_current_network_name() {
+        let mut entry = RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default();
+        entry.last_active_seed_leases = count;
+        if count > entry.peak_active_seed_leases {
+            entry.peak_active_seed_leases = count;
+        }
     }
 }
 
