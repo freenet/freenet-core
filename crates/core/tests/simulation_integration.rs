@@ -13790,6 +13790,26 @@ const DELTA_CHURN_SET: [usize; 2] = [1, 4];
 /// it).
 const DELTA_DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Test-only knob for the hosting-clock advance the Delta churn scenarios apply
+/// between PUT and the far GET. Defaults to `DELTA_DAY` (the as-specified gate:
+/// findability a simulated *day* after PUT). Because the PUT seed-chain's extra
+/// near-key copies are time-bounded (`SEED_LEASE_DURATION` = 2h), the default
+/// day-jump always expires them before the GET; setting `DELTA_ADVANCE=none`
+/// measures IN-WINDOW findability (before any seed lease lapses) so the
+/// seed-chain's contribution is observable, and `DELTA_ADVANCE=<secs>` picks a
+/// custom jump. Lets one build measure both horizons without recompiling.
+/// NOTE: default (unset) reproduces the exact prior behavior, so the CI suite is
+/// unchanged.
+fn delta_advance() -> Option<Duration> {
+    match std::env::var("DELTA_ADVANCE").ok().as_deref() {
+        None | Some("") | Some("day") => Some(DELTA_DAY),
+        Some("none") => None,
+        Some(s) => Some(Duration::from_secs(s.parse().expect(
+            "DELTA_ADVANCE must be 'day', 'none', or an integer seconds value",
+        ))),
+    }
+}
+
 /// THE GATE — currently FAILS relay-caching-free; `#[ignore]`d so the branch's
 /// normal suite stays green (confirm the failing baseline with `--ignored`).
 ///
@@ -13859,7 +13879,7 @@ fn test_delta_churn_sim_reachability_gate() {
             &format!("delta-gate-base-{seed:x}"),
             &[B],
             &[],
-            Some(DELTA_DAY),
+            delta_advance(),
         );
         let base_found = base.getter_found.iter().any(|(_, f)| *f);
 
@@ -13869,7 +13889,7 @@ fn test_delta_churn_sim_reachability_gate() {
             &format!("delta-gate-churn-{seed:x}"),
             &[B],
             &DELTA_CHURN_SET,
-            Some(DELTA_DAY),
+            delta_advance(),
         );
         let b_found = churn.getter_found.iter().any(|(_, f)| *f);
         let failure_mode = if b_found {
@@ -13922,7 +13942,8 @@ fn test_delta_churn_sim_reachability_gate() {
         .collect();
     let found = results.len() - dead_ended.len();
     eprintln!(
-        "[delta-gate SUMMARY] {found}/{} seeds reached C under churn; DEAD-ENDED {}/{}: {dead_ended:?}",
+        "[delta-gate SUMMARY | advance={:?}] {found}/{} seeds reached C under churn; DEAD-ENDED {}/{}: {dead_ended:?}",
+        delta_advance(),
         results.len(),
         dead_ended.len(),
         results.len(),
@@ -13963,7 +13984,13 @@ fn test_delta_churn_sim_reachability_gate() {
 /// reflects the true post-churn findability (≈0 relay-caching-free).
 #[test_log::test]
 fn test_delta_get_reliability_under_churn() {
-    const SEEDS: [u64; 3] = [0x4642_E5A1, 0x4642_E5A2, 0x4642_E5A3];
+    const SEEDS: [u64; 5] = [
+        0x4642_E5A1,
+        0x4642_E5A2,
+        0x4642_E5A3,
+        0x4642_E5A4,
+        0x4642_E5A5,
+    ];
     // All far nodes GET C (publisher is node 4, near-K holder is node 1).
     const GETTERS: [usize; 11] = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
@@ -13976,14 +14003,14 @@ fn test_delta_get_reliability_under_churn() {
             &format!("delta-rate-nochurn-{seed:x}"),
             &GETTERS,
             &[],
-            Some(DELTA_DAY),
+            delta_advance(),
         );
         let churn = run_delta_churn_scenario(
             seed,
             &format!("delta-rate-churn-{seed:x}"),
             &GETTERS,
             &DELTA_CHURN_SET,
-            Some(DELTA_DAY),
+            delta_advance(),
         );
 
         let nc_found = no_churn.getter_found.iter().filter(|(_, f)| *f).count();
@@ -14034,10 +14061,12 @@ fn test_delta_get_reliability_under_churn() {
         }
     };
     eprintln!(
-        "[delta-rate AGGREGATE over {} seeds] no-churn GET success = {}/{} ({:.0}%, cross-warmed \
-         upper bound) | churn GET success = {}/{} ({:.0}%). Relay-caching-free baseline; watch the \
-         churn number climb as bounded backtracking + the PUT seed-chain land (#4642 piece E / #4665).",
+        "[delta-rate AGGREGATE over {} seeds | advance={:?}] no-churn GET success = {}/{} ({:.0}%, \
+         cross-warmed upper bound) | churn GET success = {}/{} ({:.0}%). Relay-caching-free \
+         baseline; watch the churn number climb as bounded backtracking + the PUT seed-chain land \
+         (#4642 piece E / #4665).",
         SEEDS.len(),
+        delta_advance(),
         agg_no_churn.0,
         agg_no_churn.1,
         pct(agg_no_churn),
