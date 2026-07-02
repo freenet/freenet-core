@@ -2265,9 +2265,14 @@ where
                 "GET relay: inner driver returned error; sending NotFound upstream"
             );
             // On infrastructure error, send NotFound upstream so the upstream
-            // doesn't time out waiting for us. Our subtree did not run to
-            // completion, so we did not consume backtracking budget — return
-            // the incoming budget unchanged so the upstream can still backtrack.
+            // doesn't time out waiting for us. Echo budget 0, NOT the incoming
+            // budget: the inner driver may have already forwarded and fanned out
+            // a subtree (spending budget) before erroring, and we cannot tell.
+            // Reporting the un-spent incoming budget would let the upstream
+            // re-spend what a partial subtree already spent — the same
+            // monotonicity guard the no-reply arms apply, keeping fan-out
+            // bounded (#4630). A pre-forward error simply forgoes this relay's
+            // backtracking, which is safe (the upstream still has its own).
             let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
             relay_send_not_found(
                 op_manager,
@@ -2275,7 +2280,7 @@ where
                 instance_id,
                 upstream_addr,
                 hop_count,
-                backtrack_budget,
+                0,
             )
             .await;
             Err(err)
@@ -3204,8 +3209,18 @@ where
                 // no-reply: a late reply could satisfy the alternative's reused
                 // waiter. This preserves the pre-backtrack give-up-on-failure
                 // behaviour (the terminus/notfound path handles it below).
+                //
+                // ZERO the budget: we handed this child the current `budget` and
+                // it may have spent all of it fanning out before the reply was
+                // lost. We cannot prove otherwise, so — to keep the budget
+                // monotone and the fan-out bound intact (#4630) — treat the
+                // handed budget as consumed. Echoing the un-adopted budget
+                // upstream would let each lost reply DUPLICATE the shared
+                // counter (parent re-spends what the child already spent),
+                // re-opening k^HTL amplification.
                 last_forward_failed = true;
                 backtrack_allowed = false;
+                budget = 0;
                 // Continue loop to try next peer.
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -3226,9 +3241,14 @@ where
                 );
                 // Timed out with no reply — the peer may reply late on the
                 // reused tx, so do NOT consult after this (Codex P2), and do
-                // NOT backtrack (retry routing) for the same reason.
+                // NOT backtrack (retry routing) for the same reason. ZERO the
+                // budget: the timed-out child was handed `budget` and may have
+                // spent it fanning out (a malicious relay can fan out then
+                // withhold its reply); echoing it upstream would duplicate the
+                // shared counter and re-open k^HTL amplification (#4630).
                 last_forward_failed = true;
                 backtrack_allowed = false;
+                budget = 0;
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
@@ -3245,8 +3265,16 @@ where
         // some of the shared per-request budget on its own backtracking, so our
         // subsequent alternatives must respect what's left. Peeked before
         // `classify` consumes `reply`.
+        //
+        // CLAMP with `.min(budget)`: `remaining` is an UNTRUSTED wire value. The
+        // linear fan-out bound (#4630) depends on the budget being monotonically
+        // non-increasing — a subtree may only SPEND budget, never MINT it. A
+        // buggy/malicious downstream that returns an inflated
+        // `remaining_backtrack_budget` (e.g. u32::MAX) must NOT be able to raise
+        // our budget above what we handed it. `budget` here still holds the
+        // value we forwarded, so `min` enforces exactly that.
         if let Some(remaining) = notfound_remaining_backtrack_budget(&reply) {
-            budget = remaining;
+            budget = remaining.min(budget);
         }
 
         // Classify the reply.
@@ -3632,8 +3660,12 @@ where
                     "GET relay: unexpected LocalCompletion (Request-echo) — trying next peer"
                 );
                 // Not a clean downstream NotFound — do not spend backtracking
-                // budget on a protocol anomaly.
+                // budget on a protocol anomaly. Zero the budget: this child may
+                // have fanned out before replying with the anomalous variant, so
+                // echoing the un-adopted budget upstream could duplicate the
+                // shared counter (same monotonicity guard as the no-reply arms).
                 backtrack_allowed = false;
+                budget = 0;
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
@@ -3679,8 +3711,10 @@ where
                     "GET relay: unexpected reply variant; advancing to next peer"
                 );
                 // Not a clean downstream NotFound — do not spend backtracking
-                // budget on an unexpected variant.
+                // budget on an unexpected variant. Zero the budget for the same
+                // monotonicity reason as the no-reply / anomaly arms above.
                 backtrack_allowed = false;
+                budget = 0;
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
@@ -4087,12 +4121,15 @@ mod tests {
             "drive_relay_get_inner must seed its budget from the incoming \
              Request's backtrack_budget (threaded), not a per-hop constant"
         );
-        // Adopts the downstream subtree's returned budget on a clean NotFound.
+        // Adopts the downstream subtree's returned budget on a clean NotFound,
+        // CLAMPED with `.min(budget)` so an untrusted downstream cannot MINT
+        // budget (monotonicity — the #4630 fan-out bound depends on it).
         assert!(
             body.contains("notfound_remaining_backtrack_budget(&reply)")
-                && body.contains("budget = remaining"),
-            "the relay must ADOPT the budget its downstream returned before \
-             deciding whether to backtrack further (depth-first threading)"
+                && body.contains("budget = remaining.min(budget)"),
+            "the relay must ADOPT (clamped via .min(budget)) the budget its \
+             downstream returned; a bare `budget = remaining` would let a \
+             malicious peer inflate the budget and re-open k^HTL fan-out (#4630)"
         );
         // Forwards the CURRENT budget downstream (not the originator default).
         assert!(
@@ -4130,6 +4167,33 @@ mod tests {
             body.matches("backtrack_allowed = false").count() >= 2,
             "the send-failure and timeout arms must set backtrack_allowed = \
              false so a no-reply forward does not spend budget on a retry"
+        );
+    }
+
+    /// Pin (#4630 monotonicity): every relay arm that forwarded but did NOT get
+    /// a clean downstream NotFound (no reply, timeout, anomalous variant) MUST
+    /// zero the budget. Echoing the un-adopted budget upstream would let a lost
+    /// reply DUPLICATE the shared counter (a malicious relay can fan out then
+    /// withhold its reply), re-opening the k^HTL fan-out the budget bounds.
+    #[test]
+    fn relay_get_zeroes_budget_when_no_clean_notfound() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        // send-failure, timeout, LocalCompletion, Unexpected = 4 non-adopt arms.
+        assert!(
+            body.matches("budget = 0;").count() >= 4,
+            "each forwarded-but-no-clean-NotFound arm (send-fail, timeout, \
+             LocalCompletion, Unexpected) must set `budget = 0;` — found {}",
+            body.matches("budget = 0;").count()
+        );
+        // The wrapper's infra-error path must echo 0, not the incoming budget.
+        let wrapper = extract_fn_body(src, "async fn drive_relay_get<CB>(");
+        assert!(
+            wrapper.contains("hop_count,\n                0,\n            )")
+                || wrapper.contains("relay_send_not_found(")
+                    && !wrapper.contains("backtrack_budget,\n            )"),
+            "drive_relay_get infra-error path must echo budget 0 (inner driver \
+             may have fanned out before erroring), not the incoming budget"
         );
     }
 
