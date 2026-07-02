@@ -4852,9 +4852,12 @@ mod tests {
         // make a peer a first-viable-target via `register_peer_interest` and
         // are correctly flush-paired. A NEW production call site in any other
         // file must FAIL this pin — see the set-equality assertion below.
+        // NOTE: "operations.rs" was dropped from this set in piece E of the
+        // demand-driven hosting redesign — its only register_peer_interest call
+        // lived in `complete_piggyback_subscription` (the GET-auto-subscribe
+        // piggyback finalizer), which was removed with GET-auto-subscribe.
         let known_wired: std::collections::BTreeSet<&str> = [
             "node.rs",
-            "operations.rs",
             "operations/subscribe.rs",
             "operations/get/op_ctx_task.rs",
         ]

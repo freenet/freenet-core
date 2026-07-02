@@ -336,7 +336,7 @@ async fn drive_client_get_inner(
     // returns (and the side-effect block below has run). Do not add
     // explicit `completed()` calls in the arms here — doing so would
     // race the originator-side side effects (`cache_contract_locally`,
-    // `auto_subscribe_on_get_response`, `maybe_subscribe_child`)
+    // `maybe_subscribe_child`)
     // because once the tx is in `ops.completed`, any
     // `op_manager.push(...)` for that tx is silently dropped (see
     // `op_state_manager.rs::push` short-circuit on
