@@ -215,6 +215,12 @@ pub struct RenewalMetrics {
     /// regression guard for the cap (#4601); if the cap were removed, a node
     /// with N > 10 simultaneously-eligible contracts would record N here.
     pub max_cycle_batch: u64,
+    /// Times this node installed a PUT seed lease on the near-key descent of a
+    /// PUT it relayed (findability bootstrap window, hosting-invariants.md §E).
+    /// Cumulative. Lets the seed-chain simulation assert seeds ARE installed
+    /// during the window and — cross-checked against `active_seed_lease_count`
+    /// going to zero after the window — that they do NOT accumulate (spam-safe).
+    pub put_seed_leases_installed: u64,
     /// Times this node became a HOST of a contract because it routed a SUBSCRIBE
     /// to a downstream host and got `Subscribed` back (piece D: chain peers are
     /// real subscribed hosts, not stateless forwarders). Cumulative. Lets the
@@ -296,6 +302,17 @@ pub fn record_event_driven_resubscribe(peer_addr: SocketAddr) {
             .entry((network_name, peer_addr))
             .or_default()
             .event_driven_resubscribes += 1;
+    }
+}
+
+/// Record that this node installed a PUT seed lease on the near-key descent of
+/// a relayed PUT (findability bootstrap). No-op outside a simulation context.
+pub fn record_put_seed_lease_installed(peer_addr: SocketAddr) {
+    if let Some(network_name) = get_current_network_name() {
+        RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default()
+            .put_seed_leases_installed += 1;
     }
 }
 
