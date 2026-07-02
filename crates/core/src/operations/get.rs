@@ -272,6 +272,7 @@ mod tests {
             htl: 5,
             visited: VisitedPeers::new(&tx),
             subscribe: false,
+            backtrack_budget: 0,
         };
         assert_eq!(*msg.id(), tx, "id() should return the transaction ID");
     }
@@ -286,6 +287,7 @@ mod tests {
             htl: 5,
             visited: VisitedPeers::new(&tx),
             subscribe: false,
+            backtrack_budget: 0,
         };
         let display = format!("{}", msg);
         assert!(
@@ -309,6 +311,7 @@ mod tests {
                 },
             },
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         };
         let display = format!("{}", msg);
         assert!(
@@ -330,6 +333,7 @@ mod tests {
             instance_id,
             result: GetMsgResult::NotFound,
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         };
         let display = format!("{}", msg);
         assert!(
@@ -392,6 +396,7 @@ mod tests {
                 },
             },
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         };
         let location_found = msg_found.requested_location();
         assert!(
@@ -410,6 +415,7 @@ mod tests {
             instance_id,
             result: GetMsgResult::NotFound,
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         };
         let location_notfound = msg_notfound.requested_location();
         assert!(
@@ -487,6 +493,7 @@ mod tests {
                     },
                 },
                 hop_count,
+                remaining_backtrack_budget: 0,
             };
             let bytes = bincode::serialize(&found).expect(label);
             let restored: GetMsg = bincode::deserialize(&bytes).expect(label);
@@ -503,6 +510,7 @@ mod tests {
                 instance_id: *key.id(),
                 result: GetMsgResult::NotFound,
                 hop_count,
+                remaining_backtrack_budget: 0,
             };
             let bytes = bincode::serialize(&notfound).expect(label);
             let restored: GetMsg = bincode::deserialize(&bytes).expect(label);
@@ -528,6 +536,7 @@ mod tests {
             htl: 10,
             visited: VisitedPeers::default(),
             subscribe: true,
+            backtrack_budget: 0,
         };
         let bytes = bincode::serialize(&msg).unwrap();
         let restored: GetMsg = bincode::deserialize(&bytes).unwrap();
@@ -543,6 +552,7 @@ mod tests {
             htl: 10,
             visited: VisitedPeers::default(),
             subscribe: false,
+            backtrack_budget: 0,
         };
         let bytes_false = bincode::serialize(&msg_false).unwrap();
         let restored_false: GetMsg = bincode::deserialize(&bytes_false).unwrap();

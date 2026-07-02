@@ -2477,6 +2477,7 @@ mod tests {
             instance_id: *key.id(),
             result: SubscribeMsgResult::Subscribed { key },
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         }));
         match classify_reply(&msg) {
             ReplyClass::Subscribed { key: got } => assert_eq!(got, key),
@@ -2495,6 +2496,7 @@ mod tests {
             instance_id,
             result: SubscribeMsgResult::NotFound,
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         }));
         assert!(matches!(classify_reply(&msg), ReplyClass::NotFound));
     }
@@ -2521,6 +2523,7 @@ mod tests {
                 instance_id: *key.id(),
                 result: SubscribeMsgResult::Subscribed { key },
                 hop_count: hc,
+                remaining_backtrack_budget: 0,
             }));
             assert!(
                 matches!(classify_reply(&msg), ReplyClass::Subscribed { .. }),
@@ -2547,6 +2550,7 @@ mod tests {
                 instance_id,
                 result: SubscribeMsgResult::NotFound,
                 hop_count: hc,
+                remaining_backtrack_budget: 0,
             }));
             assert!(
                 matches!(classify_reply(&msg), ReplyClass::NotFound),
@@ -2576,6 +2580,7 @@ mod tests {
             htl: 5,
             visited: super::VisitedPeers::new(&tx),
             is_renewal: false,
+            backtrack_budget: 0,
         }));
         assert!(matches!(classify_reply(&msg), ReplyClass::Unexpected));
     }

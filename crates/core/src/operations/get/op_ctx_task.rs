@@ -3936,6 +3936,7 @@ mod tests {
                 },
             },
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         }));
         assert!(matches!(
             classify(msg),
@@ -3967,6 +3968,7 @@ mod tests {
                     },
                 },
                 hop_count: hc,
+                remaining_backtrack_budget: 0,
             }));
             match classify(msg) {
                 AttemptOutcome::Terminal(Terminal::InlineFound { hop_count, .. }) => {
@@ -3993,6 +3995,7 @@ mod tests {
             instance_id: *key.id(),
             result: GetMsgResult::NotFound,
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         }));
         assert!(matches!(classify(msg), AttemptOutcome::Retry));
     }
@@ -4053,6 +4056,7 @@ mod tests {
             htl: 5,
             visited: VisitedPeers::new(&tx),
             subscribe: false,
+            backtrack_budget: 0,
         }));
         assert!(matches!(
             classify(msg),
@@ -4078,6 +4082,7 @@ mod tests {
                 },
             },
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         }));
         assert!(matches!(classify(msg), AttemptOutcome::Unexpected));
     }
