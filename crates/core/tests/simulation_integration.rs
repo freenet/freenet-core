@@ -12009,3 +12009,293 @@ fn test_placement_migration_at_scale_renewal_load_stays_bounded() {
         );
     }
 }
+
+// =============================================================================
+// Demand-driven hosting harness (#4642) — example sim tests exercising the
+// sim-harness infrastructure added for the hosting/subscription redesign:
+//   * injectable, controllable hosting clock (enable_hosting_time_control +
+//     SimOperation::AdvanceHostingClock)   — piece A (eviction/TTL)
+//   * per-node hosting-budget knob (with_hosting_budget)                — piece A
+//   * per-node subscription / hosting / active-demand measurement
+//     accessors on ControlledSimulationResult                          — piece D
+//   * scripted mid-run node crash (SimOperation::CrashNode)            — piece F
+//
+// These validate the harness end-to-end. The strong, deterministic proof that
+// the injected clock drives eviction lives in the unit test
+// `ring::hosting::tests::test_with_time_source_lease_expiry_follows_injected_clock`.
+// =============================================================================
+
+/// End-to-end validation of the controllable hosting clock + budget knob +
+/// per-node measurement accessors (#4642 pieces A & D).
+///
+/// Injects a controllable hosting clock and a tiny hosting budget into every
+/// node, runs a controlled scenario that PUTs a demanded contract, advances the
+/// hosting clock far past the 8-minute TTL gate via `AdvanceHostingClock`, and
+/// then reads the new per-node measurement accessors. Asserts the harness
+/// plumbing works end-to-end and that a contract backed by active demand
+/// survives a large clock jump (demand protects against eviction).
+#[test]
+fn test_hosting_clock_injection_and_measurement_end_to_end() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const NETWORK: &str = "hosting-clock-injection";
+    const SEED: u64 = 0x4642_A001_CAFE;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    // The gateway PUTs (and hosts) the demanded contract — a gateway reliably
+    // hosts its own PUT, avoiding placement non-determinism. A regular node
+    // (labels start at `number_of_gateways`) later GETs it.
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let getter = NodeLabel::node(NETWORK, 1);
+    let demanded = SimOperation::create_test_contract(11);
+    let demanded_key = demanded.key();
+    let demanded_id = *demanded.key().id();
+    let demanded_state = SimOperation::create_test_state(11);
+
+    // Build + configure the network inside a tokio runtime; run_controlled_simulation
+    // manages its OWN turmoil runtime and must be called OUTSIDE block_on.
+    let (sim, clock, clock_start) = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 2, 7, 3, 10, 2, SEED).await;
+
+        // Piece A: inject a controllable hosting clock (so TTL/eviction is under
+        // test control) and a tiny per-node budget (to force cache pressure).
+        let clock = sim.enable_hosting_time_control();
+        sim.with_hosting_budget(4096);
+        let clock_start = clock.current_time();
+        (sim, clock, clock_start)
+    });
+
+    let operations = vec![
+        // Demanded contract: PUT with subscribe=true → the gateway hosts it AND
+        // holds a local client subscription, so eviction must NOT drop it.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: demanded.clone(),
+                state: demanded_state.clone(),
+                subscribe: true,
+            },
+        ),
+        // Jump the hosting clock 30 minutes — far past the 8-minute TTL gate —
+        // deterministically, WITHOUT running 30 minutes of virtual time.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: Duration::from_secs(30 * 60),
+            },
+        ),
+        // Re-access the demanded contract from a node, which exercises the GET
+        // path and triggers hosting-cache activity on the advanced clock.
+        ScheduledOperation::new(
+            getter.clone(),
+            SimOperation::Get {
+                contract_id: demanded_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(30),
+    );
+
+    // The injected clock is shared with every node; confirm the scripted
+    // AdvanceHostingClock actually moved it forward by the 30 minutes we
+    // scheduled (the sim advanced the same Arc-backed clock this handle sees).
+    assert!(
+        clock.current_time() >= clock_start + Duration::from_secs(30 * 60),
+        "AdvanceHostingClock should have advanced the shared hosting clock by >= 30 minutes"
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "controlled simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // The measurement accessors (#4642 piece D) must be readable per node.
+    for label in result.captured_node_labels() {
+        tracing::info!(
+            node = %label,
+            hosting = result.node_hosting_count(&label),
+            subscriptions = result.node_subscription_count(&label),
+            active_demand = result.node_active_demand_count(&label),
+            "hosting measurement snapshot"
+        );
+    }
+
+    // The demanded contract must still be hosted on the gateway after the large
+    // clock jump — its local client subscription protects it from TTL/budget
+    // eviction. This exercises the clock-injection + budget plumbing end-to-end.
+    assert!(
+        result.is_node_hosting(&gateway, &demanded_key),
+        "gateway should still host the demanded (subscribed) contract after a 30-minute \
+         hosting-clock jump; its client subscription must protect it from eviction"
+    );
+    assert!(
+        result.node_hosting_count(&gateway) >= 1,
+        "gateway should host at least the demanded contract"
+    );
+
+    // The per-node subscription / active-demand accessors (#4642 piece D) are
+    // exercised in the logging loop above. They are the measurement surface a
+    // no-storm proof asserts on (subscriptions ∝ demand, not ∝ cache size); the
+    // strict storm bound is a property piece D must establish, so this harness
+    // test asserts only that the accessors are wired and the plumbing runs, not
+    // the storm bound itself.
+}
+
+/// Demonstrates the scripted mid-run node-crash capability (#4642 piece F):
+/// `SimOperation::CrashNode` removes a specific peer at a scripted point via the
+/// per-network fault injector, in-order with the other events. Asserts the
+/// simulation completes and the contract remains hosted somewhere in the
+/// surviving network.
+///
+/// NOTE: `CrashNode` is a SILENT (message-blocking) crash — the crashed peer's
+/// transport is not torn down, so surviving peers notice on their own
+/// routing-health cadence rather than an immediate transport close. A test that
+/// needs *prompt* upstream-loss detection (the core of piece F) additionally
+/// depends on the event-driven re-subscribe production change, which is not on
+/// `main`.
+#[test]
+fn test_scripted_node_crash_mid_run() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const NETWORK: &str = "scripted-node-crash";
+    const SEED: u64 = 0x4642_F001_CAFE;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    // Regular-node labels start at `number_of_gateways` (= 1 here).
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let node1 = NodeLabel::node(NETWORK, 1);
+    let node2 = NodeLabel::node(NETWORK, 2);
+
+    let contract = SimOperation::create_test_contract(21);
+    let contract_key = contract.key();
+    let contract_id = *contract.key().id();
+    let state = SimOperation::create_test_state(21);
+
+    // Build the network inside a tokio runtime; run_controlled_simulation manages
+    // its OWN turmoil runtime and must be called OUTSIDE block_on.
+    let sim = rt.block_on(async { SimNetwork::new(NETWORK, 1, 3, 7, 3, 10, 2, SEED).await });
+
+    let operations = vec![
+        // Gateway hosts the contract.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state.clone(),
+                subscribe: true,
+            },
+        ),
+        // Two nodes subscribe to it.
+        ScheduledOperation::new(node1.clone(), SimOperation::Subscribe { contract_id }),
+        ScheduledOperation::new(node2.clone(), SimOperation::Subscribe { contract_id }),
+        // Crash node1 mid-run (scripted, in-order).
+        ScheduledOperation::new(node1.clone(), SimOperation::CrashNode),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(30),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "controlled simulation with a scripted crash should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // The contract must still be hosted somewhere in the surviving network
+    // (the gateway hosts it, and node1.s crash must not take it down).
+    let hosted_somewhere = result
+        .captured_node_labels()
+        .iter()
+        .any(|label| result.is_node_hosting(label, &contract_key));
+    assert!(
+        hosted_somewhere,
+        "contract should remain hosted on a surviving node after node1 was crashed"
+    );
+
+    for label in result.captured_node_labels() {
+        tracing::info!(
+            node = %label,
+            hosting = result.node_hosting_count(&label),
+            subscriptions = result.node_subscription_count(&label),
+            upstream = result.node_upstream_count(&label, &contract_key),
+            "post-crash measurement snapshot"
+        );
+    }
+}
+
+/// Error-path coverage for the controllable-clock harness: scheduling
+/// `SimOperation::AdvanceHostingClock` WITHOUT first calling
+/// `enable_hosting_time_control()` must degrade gracefully — the runner logs a
+/// warning and the advance is a no-op, rather than panicking or wedging. This
+/// exercises the "no controllable hosting clock was enabled" branch of the
+/// special-op dispatch.
+#[test]
+fn test_advance_hosting_clock_without_control_is_graceful_noop() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const NETWORK: &str = "advance-clock-no-control";
+    const SEED: u64 = 0x4642_A002_CAFE;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let contract = SimOperation::create_test_contract(31);
+    let state = SimOperation::create_test_state(31);
+
+    // NOTE: enable_hosting_time_control() is deliberately NOT called here.
+    let sim = rt.block_on(async { SimNetwork::new(NETWORK, 1, 1, 7, 3, 10, 2, SEED).await });
+
+    let operations = vec![
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state.clone(),
+                subscribe: true,
+            },
+        ),
+        // No controllable clock is enabled → this must be a graceful no-op.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: Duration::from_secs(30 * 60),
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(20),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation must complete gracefully even when AdvanceHostingClock is scheduled \
+         without a controllable clock enabled: {:?}",
+        result.turmoil_result.err()
+    );
+    // The gateway still hosts its PUT — the no-op advance changed nothing.
+    assert!(
+        result.is_node_hosting(&gateway, &contract.key()),
+        "gateway should still host its PUT contract"
+    );
+}

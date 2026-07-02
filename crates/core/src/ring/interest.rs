@@ -798,6 +798,29 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .unwrap_or(false)
     }
 
+    /// Count contracts backed by *real demand*: a local client subscription or
+    /// a downstream subscriber. This deliberately EXCLUDES the cache-only
+    /// `hosting` reason, so it does not grow with the hosting cache.
+    ///
+    /// This is the denominator for the #3763 no-storm invariant: renewal /
+    /// subscription volume must scale with active demand, not with cache size.
+    /// `LocalInterest::is_interested()` (which folds in `hosting`) is the wrong
+    /// signal for that check — see the sim assertions in
+    /// `simulation_integration.rs` and the unit test
+    /// `test_contracts_needing_renewal_bounded_by_active_interest`.
+    ///
+    /// Test/sim-only accessor (reached via `Ring::active_demand_count`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn active_demand_count(&self) -> usize {
+        self.local_interests
+            .iter()
+            .filter(|entry| {
+                let li = entry.value();
+                li.local_client_count > 0 || li.downstream_subscriber_count > 0
+            })
+            .count()
+    }
+
     /// Remove local interest entry if no longer interested.
     pub fn cleanup_local_interest(&self, contract: &ContractKey) {
         if let Some(entry) = self.local_interests.get(contract) {
@@ -2252,6 +2275,72 @@ mod tests {
         assert!(
             !manager.has_local_interest(&contract),
             "No downstream subscribers left — should lose interest"
+        );
+    }
+
+    /// `active_demand_count()` counts only contracts backed by REAL demand — a
+    /// local client subscription or a downstream subscriber — and EXCLUDES
+    /// cache-only `hosting` interest. This is the denominator for the #3763
+    /// no-storm invariant, so the exclusion of hosting-only contracts is the
+    /// load-bearing behavior and is asserted directly here (not just logged in
+    /// the sim harness).
+    #[test]
+    fn test_active_demand_count_excludes_cache_only_hosting() {
+        let (manager, _time) = make_manager();
+
+        assert_eq!(manager.active_demand_count(), 0, "empty manager → 0 demand");
+
+        // Cache-only hosting (no client, no downstream) is interest but NOT demand.
+        let hosting_only = make_contract_key(1);
+        manager.register_local_hosting(&hosting_only);
+        assert!(
+            manager.has_local_interest(&hosting_only),
+            "register_local_hosting creates local interest"
+        );
+        assert_eq!(
+            manager.active_demand_count(),
+            0,
+            "a hosting-only contract is interest but must NOT count as active demand"
+        );
+
+        // A local client subscription IS demand.
+        let client = make_contract_key(2);
+        manager.add_local_client(&client);
+        assert_eq!(
+            manager.active_demand_count(),
+            1,
+            "a local client subscription is active demand"
+        );
+
+        // A downstream subscriber IS demand.
+        let downstream = make_contract_key(3);
+        manager.add_downstream_subscriber(&downstream);
+        assert_eq!(
+            manager.active_demand_count(),
+            2,
+            "a downstream subscriber is active demand"
+        );
+
+        // Adding cache-only hosting on top of the client-demand contract must
+        // neither double-count it nor change the total.
+        manager.register_local_hosting(&client);
+        assert_eq!(
+            manager.active_demand_count(),
+            2,
+            "hosting layered on top of an already-demanded contract does not change the count"
+        );
+
+        // The hosting-only contract is genuinely tracked as interest — the
+        // point is that interest (which includes hosting) and demand (which
+        // does not) are distinct: it is interested but excluded from demand.
+        assert!(
+            manager.has_local_interest(&hosting_only),
+            "the hosting-only contract is still tracked as local interest"
+        );
+        assert_eq!(
+            manager.active_demand_count(),
+            2,
+            "...yet it is still excluded from the active-demand count"
         );
     }
 
