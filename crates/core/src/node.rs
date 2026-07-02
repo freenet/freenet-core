@@ -347,6 +347,17 @@ pub struct NodeConfig {
     /// outside tests.
     #[serde(skip)]
     pub(crate) hosting_time_source_override: Option<crate::util::time_source::DynTimeSource>,
+    /// Test/sim-only override for the piece-B admission fan-out capacity
+    /// (`HostingManager::fanout_capacity`, #4642). `None` in production, where
+    /// the RAM-scaled [`default_fanout_capacity`](crate::ring) applies. The
+    /// simulation harness sets a small value via
+    /// `SimNetwork::with_fanout_capacity` so tests can exercise admission
+    /// refusal + re-route at a handful of subscribers instead of the production
+    /// default of hundreds. Applied at `Ring::new` after the `HostingManager` is
+    /// built. Not cfg-gated for the same reason as the time-source override:
+    /// `node::testing_impl` sets it and is compiled unconditionally.
+    #[serde(skip)]
+    pub(crate) hosting_fanout_capacity_override: Option<usize>,
     /// Test-only harness flag: when set, a startup-hosted contract
     /// (`SeedHostedContract`, i.e. `append_contracts` with `subscription =
     /// true`) is registered in the neighbor-hosting advertised set so the
@@ -498,6 +509,7 @@ impl NodeConfig {
             governance_config_override: None,
             subscribe_hint_floor_override: None,
             hosting_time_source_override: None,
+            hosting_fanout_capacity_override: None,
             advertise_seeded_hosts: false,
         })
     }

@@ -1617,6 +1617,31 @@ async fn run_relay_subscribe(
     op_manager.release_pending_op_slot(incoming_tx).await;
 }
 
+/// Log + count a piece-B admission refusal. Bumps BOTH the production counter
+/// (`HostingManager::subscription_refusals_total`, surfaced on the periodic
+/// `RouterSnapshot` as `hosting_subscription_refusals_total`) and the
+/// simulation-observability counter (`topology_registry::record_subscription_refused`,
+/// a no-op in production). Factored out so the three refusal sites (local-hit
+/// terminus + greedy/consult chain host) keep all refusal accounting in sync and
+/// `can_admit_subscription` stays a side-effect-free query.
+fn record_subscribe_admission_refusal(
+    op_manager: &OpManager,
+    incoming_tx: &Transaction,
+    key: &freenet_stdlib::prelude::ContractKey,
+) {
+    op_manager.ring.record_subscription_refused();
+    if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
+        crate::ring::topology_registry::record_subscription_refused(addr);
+    }
+    tracing::debug!(
+        tx = %incoming_tx,
+        contract = %key,
+        phase = "relay_subscribe_admission_refused",
+        "SUBSCRIBE relay: REFUSING new subscription (over-committed, piece B) — \
+         answering NotFound so the requester re-routes"
+    );
+}
+
 /// Drive a fresh inbound relay `SubscribeMsg::Request`: fast-path on
 /// local contract hit, otherwise forward to the closest potentially
 /// hosting peer and bubble the Response upstream.
@@ -1672,6 +1697,38 @@ async fn drive_relay_subscribe(
     )
     .await?
     {
+        // Local-hit storer arm: this node hosts the contract.
+        // hop_count = max_htl - htl_we_received.
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+
+        // Piece B admission (#4642): we already host the contract, so serving
+        // this NEW subscriber costs only update FAN-OUT (no new bytes). If we
+        // are over our capability-relative fan-out capacity, REFUSE rather than
+        // over-committing and thrashing: answer `NotFound` (the rejection the
+        // subscribe path already handles — no wire change) so the requester
+        // re-routes to another acceptor. If NO reachable host will accept (every
+        // closer peer saturated and no alternate path), the subscribe exhausts
+        // and the originator's client subscribe fails — genuine capacity
+        // back-pressure, NOT a stranded host (the originator does not auto-host
+        // on exhaustion; see `drive_client_subscribe_inner`). Piece B relies on
+        // piece D's chain-host multiplicity + the generous default capacity so
+        // this is rare, and MUST NOT ship before D is live (hosting-invariants
+        // §B release order). Renewals are NEVER refused: they maintain an
+        // existing demand-pinned host and add no new fan-out (a refused renewal
+        // would collapse a live chain).
+        if !is_renewal && !op_manager.ring.can_admit_subscription(&key) {
+            record_subscribe_admission_refusal(op_manager, &incoming_tx, &key);
+            return relay_subscribe_send_response(
+                op_manager,
+                incoming_tx,
+                instance_id,
+                SubscribeMsgResult::NotFound,
+                upstream_addr,
+                hop_count,
+            )
+            .await;
+        }
+
         // Register the subscribing peer as a downstream subscriber.
         // The relay driver path does not know the requester's
         // `TransportPublicKey` (the legacy path had it because the op
@@ -1696,9 +1753,6 @@ async fn drive_relay_subscribe(
             phase = "relay_subscribe_local_hit",
             "SUBSCRIBE relay: fulfilled locally, sending Response"
         );
-        // Local-hit storer arm: this node hosts the contract.
-        // hop_count = max_htl - htl_we_received.
-        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
         return relay_subscribe_send_response(
             op_manager,
             incoming_tx,
@@ -1823,7 +1877,6 @@ async fn drive_relay_subscribe(
         is_renewal,
         next_hop,
         next_addr,
-        upstream_addr,
     )
     .await;
 
@@ -1871,11 +1924,36 @@ async fn drive_relay_subscribe(
                 responder_addr,
                 responder,
             } => {
-                // The keyward responder is our update source and body-fetch
-                // target — it just proved it holds the contract by answering
-                // `Subscribed`.
-                become_host = Some((key, responder_addr, responder));
-                (SubscribeMsgResult::Subscribed { key }, hop_count, None)
+                // Piece B admission (#4642): becoming a chain host for this NEW
+                // subscription costs a hosted contract (bytes) + ongoing update
+                // fan-out. If we are over-committed, REFUSE: do NOT register the
+                // downstream and do NOT become a host — bubble `NotFound` so the
+                // requester re-routes to another acceptor. (The downstream host
+                // we just found still exists; its phantom registration of us —
+                // added when IT answered `Subscribed` — lapses via interest-gated
+                // renewal since we never renew a lease we did not install.)
+                // Renewals are never refused. On accept, register the requester
+                // as our downstream subscriber HERE (moved out of
+                // `relay_subscribe_forward_once` so the accept decision lives in
+                // one place) and capture the host intent; the keyward responder
+                // is our update source and body-fetch target.
+                if is_renewal || op_manager.ring.can_admit_subscription(&key) {
+                    register_downstream_subscriber(
+                        op_manager,
+                        &key,
+                        upstream_addr,
+                        None,
+                        Some(upstream_addr),
+                        &incoming_tx,
+                        " (driver relay chain host)",
+                    )
+                    .await;
+                    become_host = Some((key, responder_addr, responder));
+                    (SubscribeMsgResult::Subscribed { key }, hop_count, None)
+                } else {
+                    record_subscribe_admission_refusal(op_manager, &incoming_tx, &key);
+                    (SubscribeMsgResult::NotFound, hop_count, None)
+                }
             }
             SubscribeForwardOutcome::NotFound { hop_count } => {
                 let visited_snapshot = new_visited.clone();
@@ -1904,7 +1982,6 @@ async fn drive_relay_subscribe(
                             is_renewal,
                             consult_hop,
                             consult_addr,
-                            upstream_addr,
                         )
                         .await;
                         match consult_outcome {
@@ -1915,15 +1992,38 @@ async fn drive_relay_subscribe(
                                 responder,
                             } => {
                                 // A consulted advertised host subscribed us:
-                                // same as the greedy path, this node becomes a
-                                // host with the consulted responder as its
-                                // update source / body-fetch target.
-                                become_host = Some((key, responder_addr, responder));
-                                (
-                                    SubscribeMsgResult::Subscribed { key },
-                                    hop_count,
-                                    Some(true),
-                                )
+                                // same as the greedy path, admission-gate becoming
+                                // a chain host. On accept, register + become host
+                                // with the consulted responder as update source /
+                                // body-fetch target. On refuse, bubble NotFound —
+                                // the consult did NOT close the dead-end for the
+                                // requester (it re-routes), so consult_outcome is
+                                // Some(false).
+                                if is_renewal || op_manager.ring.can_admit_subscription(&key) {
+                                    register_downstream_subscriber(
+                                        op_manager,
+                                        &key,
+                                        upstream_addr,
+                                        None,
+                                        Some(upstream_addr),
+                                        &incoming_tx,
+                                        " (driver relay chain host, consult)",
+                                    )
+                                    .await;
+                                    become_host = Some((key, responder_addr, responder));
+                                    (
+                                        SubscribeMsgResult::Subscribed { key },
+                                        hop_count,
+                                        Some(true),
+                                    )
+                                } else {
+                                    record_subscribe_admission_refusal(
+                                        op_manager,
+                                        &incoming_tx,
+                                        &key,
+                                    );
+                                    (SubscribeMsgResult::NotFound, hop_count, Some(false))
+                                }
                             }
                             SubscribeForwardOutcome::NotFound { hop_count }
                             | SubscribeForwardOutcome::Failed { hop_count } => {
@@ -2014,13 +2114,17 @@ enum SubscribeForwardOutcome {
 }
 
 /// Forward a `SubscribeMsg::Request` to a single target, await the reply, and
-/// classify it into [`SubscribeForwardOutcome`]. Registers the requester as a
-/// downstream subscriber on a Subscribed reply and feeds the router the
-/// observed outcome. Does NOT itself install the local host lease or fetch
-/// state: it returns the keyward responder in the `Subscribed` outcome so the
-/// caller can become a host (via `finalize_host_subscribe`) AFTER bubbling the
-/// reply upstream (forward-before-contract-handling). Does NOT bubble upstream
-/// — the caller owns that and may retry via the consult on a NotFound.
+/// classify it into [`SubscribeForwardOutcome`], feeding the router the observed
+/// outcome. Does NOT register the requester as a downstream subscriber, install
+/// the local host lease, or fetch state: it returns the keyward responder in the
+/// `Subscribed` outcome so the CALLER runs the piece-B admission decision and,
+/// on accept, registers the downstream subscriber and becomes a host (via
+/// `finalize_host_subscribe`) AFTER bubbling the reply upstream
+/// (forward-before-contract-handling). Keeping the accept decision (register +
+/// become-host) in one place lets the caller REFUSE a fresh subscription when
+/// over-committed without having to un-register a downstream this function had
+/// already added. Does NOT bubble upstream — the caller owns that and may retry
+/// via the consult on a NotFound.
 #[allow(clippy::too_many_arguments)]
 async fn relay_subscribe_forward_once(
     op_manager: &Arc<OpManager>,
@@ -2031,7 +2135,6 @@ async fn relay_subscribe_forward_once(
     is_renewal: bool,
     next_hop: PeerKeyLocation,
     next_addr: std::net::SocketAddr,
-    upstream_addr: std::net::SocketAddr,
 ) -> SubscribeForwardOutcome {
     let new_htl = htl.saturating_sub(1);
     // Forward-failure / unexpected-variant depth for THIS relay.
@@ -2126,17 +2229,11 @@ async fn relay_subscribe_forward_once(
             hop_count: downstream_hop_count,
             ..
         })) => {
-            register_downstream_subscriber(
-                op_manager,
-                &key,
-                upstream_addr,
-                None,
-                Some(upstream_addr),
-                &incoming_tx,
-                " (driver relay registration on Response)",
-            )
-            .await;
-
+            // NOTE: the downstream-subscriber registration used to live here.
+            // It moved to the caller's `Subscribed`-outcome handling in
+            // `drive_relay_subscribe` so the piece-B admission decision
+            // (accept → register + become host; refuse → NotFound) lives in one
+            // place and a refusal never has to un-register a downstream.
             tracing::info!(
                 tx = %incoming_tx,
                 contract = %key,
@@ -3017,12 +3114,15 @@ mod tests {
         );
     }
 
-    /// Pin: relay driver MUST call `register_downstream_subscriber`
-    /// on BOTH the local-hit and downstream-Subscribed paths. Missing
-    /// this registration breaks UPDATE propagation to the original
-    /// requester (see subscribe.rs:1655–1688 for full reasoning).
+    /// Pin: relay driver MUST call `register_downstream_subscriber` on ALL
+    /// THREE accept paths — local-hit terminus, greedy-`Subscribed` chain host,
+    /// and consult-`Subscribed` chain host. Piece B moved the registration out
+    /// of `relay_subscribe_forward_once` into the caller's accept branches, so
+    /// each accept arm now registers explicitly; missing any one breaks UPDATE
+    /// propagation to the original requester on that path. (`>= 3` also guards
+    /// against a future refactor silently dropping one of the three.)
     #[test]
-    fn relay_subscribe_registers_downstream_on_both_paths() {
+    fn relay_subscribe_registers_downstream_on_all_accept_paths() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
             .find("async fn drive_relay_subscribe(")
@@ -3036,9 +3136,9 @@ mod tests {
             .matches("register_downstream_subscriber(")
             .count();
         assert!(
-            hits >= 2,
-            "driver must call register_downstream_subscriber on BOTH local-hit \
-             and downstream-Subscribed paths (found {hits})"
+            hits >= 3,
+            "driver must call register_downstream_subscriber on ALL THREE accept \
+             paths (local-hit + greedy-Subscribed + consult-Subscribed) (found {hits})"
         );
     }
 

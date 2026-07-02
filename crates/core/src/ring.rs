@@ -550,6 +550,13 @@ impl Ring {
             shutdown,
         };
 
+        // Piece B admission (#4642): apply the test/sim fan-out capacity override
+        // if set. `None` in production, where the RAM-scaled default the
+        // `HostingManager` initialised itself with applies.
+        if let Some(capacity) = config.hosting_fanout_capacity_override {
+            ring.hosting_manager.set_fanout_capacity(capacity);
+        }
+
         if let Some(loc) = config.location {
             if config.own_addr.is_none() && is_gateway {
                 return Err(anyhow::anyhow!("own_addr is required for gateways"));
@@ -1567,6 +1574,19 @@ impl Ring {
             // cache membership).
             snapshot.hosting_local_hits_total = Some(ring.hosting_manager.local_get_serves());
             snapshot.hosting_local_misses_total = Some(ring.hosting_manager.local_get_forwards());
+
+            // Capability-relative admission gauges (#4642 piece B): the
+            // aggregate update-fanout capacity, its current occupancy (total
+            // downstream subscribers this node fans updates to), and the
+            // monotonic count of subscriptions REFUSED because the node was
+            // over-committed. Let us observe in production whether admission
+            // bites (refusals climbing) and whether the capacity is tuned right
+            // (occupancy vs capacity). Per-node aggregate scalars only.
+            snapshot.hosting_fanout_capacity = Some(ring.hosting_manager.fanout_capacity() as u64);
+            snapshot.hosting_total_downstream_subscribers =
+                Some(ring.hosting_manager.total_downstream_subscribers() as u64);
+            snapshot.hosting_subscription_refusals_total =
+                Some(ring.hosting_manager.subscription_refusals_total());
 
             // Keep the hosting manager's copy of our own ring location current so
             // the proximity-prior demand estimate (#4642 A3) can turn a contract
@@ -2886,6 +2906,29 @@ impl Ring {
 
     pub fn has_downstream_subscribers(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.has_downstream_subscribers(contract)
+    }
+
+    /// Piece B admission (#4642): may this node ACCEPT becoming/acting-as a host
+    /// for a NEW downstream subscription of `contract`, or is it over-committed
+    /// (fan-out or byte-budget) and must REFUSE? See
+    /// [`HostingManager::can_admit_subscription`]. Callers must NOT consult this
+    /// for the originator's own local-client subscribe, nor for renewals.
+    pub(crate) fn can_admit_subscription(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.can_admit_subscription(contract)
+    }
+
+    /// Record a piece-B admission refusal for production telemetry. See
+    /// [`HostingManager::record_subscription_refused`].
+    pub(crate) fn record_subscription_refused(&self) {
+        self.hosting_manager.record_subscription_refused();
+    }
+
+    /// Aggregate update-fan-out width: total lease-valid downstream subscribers
+    /// across all contracts (the quantity piece-B admission caps). Used by the
+    /// snapshot telemetry and the simulation harness's per-node fan-out assertion.
+    /// See [`HostingManager::total_downstream_subscribers`](hosting::HostingManager::total_downstream_subscribers).
+    pub(crate) fn total_downstream_subscribers(&self) -> usize {
+        self.hosting_manager.total_downstream_subscribers()
     }
 
     /// Whether something still depends on this node hosting `contract` — a

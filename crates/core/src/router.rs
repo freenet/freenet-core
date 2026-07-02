@@ -218,6 +218,18 @@ pub(crate) struct RouterSnapshotInfo {
     pub hosting_evictions_of_recently_read_total: Option<u64>,
     pub hosting_local_hits_total: Option<u64>,
     pub hosting_local_misses_total: Option<u64>,
+    /// Capability-relative admission gauges (#4642 piece B), populated by `Ring`
+    /// from the `HostingManager` on the snapshot cadence. `hosting_fanout_capacity`
+    /// is the aggregate update-fanout capacity (RAM-scaled default or override);
+    /// `hosting_total_downstream_subscribers` is its current occupancy (total
+    /// lease-valid downstream subscribers across all contracts);
+    /// `hosting_subscription_refusals_total` is a monotonic counter of fresh
+    /// subscriptions refused because the node was over-committed (the collector
+    /// differences it into a refusal rate). `None` until the ring is built.
+    /// Per-node aggregate scalars.
+    pub hosting_fanout_capacity: Option<u64>,
+    pub hosting_total_downstream_subscribers: Option<u64>,
+    pub hosting_subscription_refusals_total: Option<u64>,
     /// Interest-weighted (two-tier) module-cache SHADOW gauges (#4441/#4534),
     /// populated by `Ring` from the same per-node `ModuleCacheMetrics` `Arc`.
     /// These are ALWAYS ON, independent of the `FREENET_MODULE_CACHE_INTEREST_TIERED`
@@ -1123,6 +1135,9 @@ impl Router {
             hosting_evictions_of_recently_read_total: None,
             hosting_local_hits_total: None,
             hosting_local_misses_total: None,
+            hosting_fanout_capacity: None,
+            hosting_total_downstream_subscribers: None,
+            hosting_subscription_refusals_total: None,
             // Interest-weighted (two-tier) module-cache shadow gauges,
             // populated by Ring on the snapshot cadence (#4441/#4534).
             contract_module_cache_cold_evictable_bytes: None,

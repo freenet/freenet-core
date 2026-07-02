@@ -13218,3 +13218,231 @@ fn test_popular_contract_fanout_is_measured() {
         );
     }
 }
+
+// =============================================================================
+// Piece B admission-refusal — SIMULATION PROOFS (#4642)
+// =============================================================================
+//
+// These are the load-bearing sim gate for piece B. Fan-out is emergent and
+// seed-dependent, so rather than pick a fixed capacity and hope it bites, each
+// proof runs piece D's popular-contract scenario TWICE on the same topology:
+// once UNCAPPED (huge capacity) to measure the natural peak fan-out, then again
+// CAPPED below that peak. The comparison is what makes the proof robust across
+// seeds — it directly shows that admission reduced the peak fan-out and that the
+// cap actually bit (refusals > 0), without depending on the absolute numbers a
+// given seed happens to produce.
+
+/// One popular-contract run's observations.
+struct PopularFanoutObservation {
+    /// Largest aggregate downstream-subscriber count (update fan-out width) at
+    /// any single peer — the quantity piece B bounds.
+    max_peer_fanout: usize,
+    /// Peers holding an active subscription lease for the contract (mesh size).
+    subscribed_peers: usize,
+    /// Peers hosting the contract at the end.
+    hosting_nodes: usize,
+    /// Aggregate admission refusals across all peers.
+    refusals: u64,
+}
+
+/// Drive the popular-contract scenario (1 gateway hosts, 15 nodes subscribe)
+/// once at the given fan-out capacity and collect observations. `None` capacity
+/// leaves the RAM-scaled production default (effectively unbounded at this
+/// scale); `Some(cap)` applies `with_fanout_capacity(cap)`.
+fn run_popular_fanout_scenario(
+    seed: u64,
+    network: &str,
+    fanout_capacity: Option<usize>,
+) -> PopularFanoutObservation {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const POPULAR_SUBSCRIBERS: [usize; 15] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(network, 0);
+    let contract = SimOperation::create_test_contract(0xC4);
+    let contract_key = contract.key();
+    let contract_id = *contract.key().id();
+
+    let mut sim = rt.block_on(async { SimNetwork::new(network, 1, 15, 10, 3, 5, 3, seed).await });
+    if let Some(cap) = fanout_capacity {
+        sim.with_fanout_capacity(cap);
+    }
+
+    let mut ops = vec![ScheduledOperation::new(
+        gateway.clone(),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_test_state(1),
+            subscribe: true,
+        },
+    )];
+    for id in POPULAR_SUBSCRIBERS {
+        ops.push(ScheduledOperation::new(
+            NodeLabel::node(network, id),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    let result =
+        sim.run_controlled_simulation(seed, ops, Duration::from_secs(300), Duration::from_secs(60));
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x}: sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let subscribed_peers = result
+        .topology_snapshots
+        .iter()
+        .filter(|s| s.active_subscription_keys.contains(&contract_id))
+        .count();
+    let max_peer_fanout = result
+        .captured_node_labels()
+        .iter()
+        .map(|l| result.node_total_downstream_subscribers(l))
+        .max()
+        .unwrap_or(0);
+    let hosting_nodes = result
+        .captured_node_labels()
+        .iter()
+        .filter(|l| result.is_node_hosting(l, &contract_key))
+        .count();
+    let refusals = result.aggregate_renewal_metrics().subscriptions_refused;
+
+    PopularFanoutObservation {
+        max_peer_fanout,
+        subscribed_peers,
+        hosting_nodes,
+        refusals,
+    }
+}
+
+/// Piece B proof 1 (design §B / hosting-invariants §3): admission BOUNDS
+/// per-peer update fan-out for a popular contract. Piece D's
+/// `test_popular_contract_fanout_is_measured` measured it (MEASURE-ONLY) as
+/// unbounded because admission was not yet in place. Here we measure the natural
+/// peak, then re-run with a capacity strictly below it and assert the peak
+/// fan-out drops AND the cap actually bit (refusals recorded).
+#[test_log::test]
+fn test_popular_contract_fanout_bounded_by_admission() {
+    const SEEDS: [u64; 3] = [0x4642_B101, 0x4642_B102, 0x4642_B103];
+
+    for seed in SEEDS {
+        // Run 1: uncapped — natural peak fan-out for this topology/seed.
+        let natural = run_popular_fanout_scenario(seed, &format!("fanout-nat-{seed:x}"), None);
+        // Only meaningful if the scenario actually funnels (some peer serves >=2
+        // downstream). Piece D's whole concern is that it does; guard so a
+        // degenerate seed fails loudly rather than silently proving nothing.
+        assert!(
+            natural.max_peer_fanout >= 2,
+            "seed={seed:x}: natural peak fan-out {} < 2 — scenario did not funnel, cannot test \
+             the bound (pick a different seed)",
+            natural.max_peer_fanout
+        );
+
+        // Run 2: cap strictly below the natural peak so admission must bite.
+        let cap = (natural.max_peer_fanout / 2).max(1);
+        let capped = run_popular_fanout_scenario(seed, &format!("fanout-cap-{seed:x}"), Some(cap));
+
+        eprintln!(
+            "[pieceB-proof1 seed={seed:x}] natural: max_fanout={} subscribed={} hosting={} | \
+             cap={cap}: max_fanout={} subscribed={} hosting={} refusals={}",
+            natural.max_peer_fanout,
+            natural.subscribed_peers,
+            natural.hosting_nodes,
+            capped.max_peer_fanout,
+            capped.subscribed_peers,
+            capped.hosting_nodes,
+            capped.refusals,
+        );
+
+        // THE piece-B property: admission reduced the peak fan-out below its
+        // natural (uncapped) level. (A soft gate, not an atomic reservation, so
+        // concurrent in-flight subscribes can overshoot the cap slightly — hence
+        // "< natural", not "<= cap".)
+        assert!(
+            capped.max_peer_fanout < natural.max_peer_fanout,
+            "seed={seed:x}: capped peak fan-out {} did not drop below the natural peak {} — \
+             admission is not bounding fan-out",
+            capped.max_peer_fanout,
+            natural.max_peer_fanout
+        );
+        // The cap must actually BITE, else the drop above proves nothing.
+        assert!(
+            capped.refusals > 0,
+            "seed={seed:x}: no admission refusals recorded at cap={cap} — the cap never bit"
+        );
+        // Admission must not collapse the mesh.
+        assert!(
+            capped.subscribed_peers >= 3,
+            "seed={seed:x}: only {} peer(s) subscribed under the cap — admission collapsed the mesh",
+            capped.subscribed_peers
+        );
+    }
+}
+
+/// Piece B proof 2 (design §5d / "no deadlock, no dead-end"): a subscriber
+/// refused by a saturated host still FINDS a host. The refusal (`NotFound`)
+/// makes it re-route to another acceptor via the existing retry plumbing, so the
+/// mesh spreads across MULTIPLE hosts instead of dead-ending at the single
+/// saturated peer. We compare the capped run against the uncapped baseline: even
+/// though the cap forces refusals, the number of subscribed peers does not
+/// collapse (it stays a healthy fraction of the uncapped baseline) and the
+/// contract ends up hosted on multiple peers — i.e. refused subscribers landed
+/// elsewhere rather than being turned away.
+#[test_log::test]
+fn test_refused_subscription_reroutes_no_deadend() {
+    const SEEDS: [u64; 3] = [0x4642_B201, 0x4642_B202, 0x4642_B203];
+
+    for seed in SEEDS {
+        let natural = run_popular_fanout_scenario(seed, &format!("reroute-nat-{seed:x}"), None);
+        assert!(
+            natural.max_peer_fanout >= 2,
+            "seed={seed:x}: natural peak fan-out {} < 2 — scenario did not funnel (pick another seed)",
+            natural.max_peer_fanout
+        );
+
+        // Cap hard (below the natural peak) so many subscribers are refused by
+        // the would-be host and must re-route.
+        let cap = (natural.max_peer_fanout / 2).max(1);
+        let capped = run_popular_fanout_scenario(seed, &format!("reroute-cap-{seed:x}"), Some(cap));
+
+        eprintln!(
+            "[pieceB-proof2 seed={seed:x}] natural_subscribed={} | cap={cap}: subscribed={} \
+             hosting_nodes={} refusals={}",
+            natural.subscribed_peers,
+            capped.subscribed_peers,
+            capped.hosting_nodes,
+            capped.refusals,
+        );
+
+        // The cap bit (a host refused a subscriber)...
+        assert!(
+            capped.refusals > 0,
+            "seed={seed:x}: no refusals at cap={cap} — this run does not exercise re-route"
+        );
+        // ...yet the contract is hosted on MULTIPLE peers: refused subscribers
+        // re-routed and became/attached-to other hosts rather than dead-ending.
+        assert!(
+            capped.hosting_nodes >= 2,
+            "seed={seed:x}: contract hosted on only {} peer(s) under the cap — refused subscribers \
+             did not re-route to other hosts",
+            capped.hosting_nodes
+        );
+        // ...and the mesh did NOT collapse: if refusals had dead-ended, the
+        // subscribed set would shrink drastically vs the uncapped baseline. We
+        // require it to stay at least half the baseline (and > the cap itself),
+        // demonstrating refused subscribers found hosts elsewhere.
+        let floor = (natural.subscribed_peers / 2).max(cap + 1);
+        assert!(
+            capped.subscribed_peers >= floor,
+            "seed={seed:x}: subscribed peers collapsed to {} under the cap (baseline {}, floor \
+             {floor}) — refused subscribers appear to have dead-ended instead of re-routing",
+            capped.subscribed_peers,
+            natural.subscribed_peers,
+        );
+    }
+}
