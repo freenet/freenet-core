@@ -154,38 +154,6 @@ const APPROX_SEED_CONTRACT_BYTES: u64 = 1 << 20;
 /// unset) budget still admits at least one PUT's worth of seed chain.
 const MIN_SEED_LEASE_CAP: usize = SEED_CHAIN_LENGTH;
 
-/// Testing-only override of the seed-lease window, in seconds (0 = unset, use
-/// the production `SEED_LEASE_DURATION`). Lets a simulation observe the
-/// post-window collapse / no-accumulation with a short, feasible window instead
-/// of advancing hours of virtual time. Compiled out of production builds.
-#[cfg(any(test, feature = "testing"))]
-static SEED_LEASE_DURATION_OVERRIDE_SECS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Set (or clear with `None`) the testing seed-lease window override. Global and
-/// process-scoped: intended for simulation tests under nextest's per-test
-/// process isolation. Compiled out of production builds.
-#[cfg(any(test, feature = "testing"))]
-pub fn set_seed_lease_duration_override(dur: Option<Duration>) {
-    SEED_LEASE_DURATION_OVERRIDE_SECS.store(
-        dur.map(|d| d.as_secs().max(1)).unwrap_or(0),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-}
-
-/// The effective seed-lease window: the testing override if set, else the
-/// production `SEED_LEASE_DURATION`.
-fn seed_lease_duration() -> Duration {
-    #[cfg(any(test, feature = "testing"))]
-    {
-        let secs = SEED_LEASE_DURATION_OVERRIDE_SECS.load(std::sync::atomic::Ordering::Relaxed);
-        if secs > 0 {
-            return Duration::from_secs(secs);
-        }
-    }
-    SEED_LEASE_DURATION
-}
-
 // =============================================================================
 // Result Types
 // =============================================================================
@@ -1188,7 +1156,7 @@ impl HostingManager {
     /// stays bounded and spam-safe.
     pub(crate) fn install_seed_lease(&self, contract: ContractKey) -> bool {
         let now = self.time_source.now();
-        let expires_at = now + seed_lease_duration();
+        let expires_at = now + SEED_LEASE_DURATION;
         // Refresh path (re-PUT): extend the hard deadline in place. Drop the
         // shard guard before any full-map scan below.
         if let Some(mut existing) = self.seed_leases.get_mut(&contract) {
