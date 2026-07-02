@@ -1459,6 +1459,40 @@ impl SimNetwork {
         self
     }
 
+    /// Opt this network's [`SimOperation::CrashNode`] events into ACTUALLY
+    /// blocking message delivery under the turmoil `run_controlled_simulation`
+    /// runner.
+    ///
+    /// # Why this is needed
+    ///
+    /// `CrashNode` records the peer in the per-network fault injector's
+    /// `crashed_nodes` set, but the `SimulationSocket` send path only drops a
+    /// packet when the global `PacketDeliveryCallback` says so — and that
+    /// callback was historically never registered, so `crashed_nodes` was never
+    /// consulted during delivery. A "crashed" node therefore kept answering
+    /// requests, making `CrashNode` a silent no-op in the controlled runner
+    /// (its harness example only asserted "hosted somewhere", which held whether
+    /// or not the crash took effect). `run_controlled_simulation` now registers
+    /// a crash-aware callback, but gated on this per-network opt-in flag so that
+    /// EVERY existing test keeps its prior behaviour (fault injection inert in
+    /// the SimulationSocket path) unless it explicitly asks for real crashes.
+    ///
+    /// The gate is crash-only (it consults `is_crashed`, not loss/partition) so
+    /// the hot send path stays deterministic — no RNG or virtual-time read per
+    /// packet. Call this before `run_controlled_simulation`.
+    pub fn enable_crash_delivery_gating(&mut self) -> &mut Self {
+        use crate::node::network_bridge::get_fault_injector;
+        if let Some(injector) = get_fault_injector(&self.name) {
+            injector.lock().unwrap().config.delivery_gating_enabled = true;
+        } else {
+            tracing::warn!(
+                network = %self.name,
+                "enable_crash_delivery_gating: no fault injector registered for this network"
+            );
+        }
+        self
+    }
+
     /// Inject a governance-manager config override into every node this
     /// network builds. Compresses the production minute-to-hour governance
     /// timescales and lowers `min_samples` so the rate-limit → MAD → evict
@@ -4112,6 +4146,41 @@ impl SimNetwork {
 
         // Set the current network name for topology registration
         set_current_network_name(&self.name);
+
+        // Register the crash-aware packet-delivery callback so a scripted
+        // `CrashNode` actually blocks messages to/from the crashed peer — but
+        // ONLY when THIS network opted in via `enable_crash_delivery_gating`
+        // (default off ⇒ every existing test's fault injection stays inert in
+        // the SimulationSocket path, i.e. no behaviour change / zero blast
+        // radius, and no per-packet cost). The callback is global (keyed by the
+        // packet's own network name so it gates each network by its own
+        // injector), idempotent to re-register, and cleared on
+        // `SimNetwork::drop`. Crash-only + no RNG/time read keeps the hot send
+        // path deterministic.
+        {
+            use crate::node::network_bridge::get_fault_injector;
+            use crate::transport::in_memory_socket::{
+                PacketDeliveryDecision, set_packet_delivery_callback,
+            };
+            let gating_enabled = get_fault_injector(&self.name)
+                .map(|inj| inj.lock().unwrap().config.delivery_gating_enabled)
+                .unwrap_or(false);
+            if gating_enabled {
+                set_packet_delivery_callback(Some(std::sync::Arc::new(
+                    |network: &str, from: SocketAddr, to: SocketAddr| {
+                        if let Some(injector) = get_fault_injector(network) {
+                            let state = injector.lock().unwrap();
+                            if state.config.delivery_gating_enabled
+                                && (state.config.is_crashed(&from) || state.config.is_crashed(&to))
+                            {
+                                return PacketDeliveryDecision::Drop;
+                            }
+                        }
+                        PacketDeliveryDecision::Deliver
+                    },
+                )));
+            }
+        }
 
         // Save network name for topology retrieval after simulation
         let network_name = self.name.clone();

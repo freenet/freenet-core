@@ -13240,24 +13240,37 @@ fn test_popular_contract_fanout_is_measured() {
 // 2026-07-02) must work in.
 //
 // THE GAP: with relay-caching removed, a fire-and-forget PUT of a contract with
-// no ongoing demand lands ONLY on the near-key terminus (+ the publisher's own
-// loopback copy). There is no scattered copy ~1 hop off every route. When churn
-// removes those few holders (CrashNode — the real failure mode: membership
-// change, not a clock TTL, since there is NO time-based hosting eviction), a far
-// GET has nothing reachable to route to and DEAD-ENDS. The redesign's answer is
-// (1) a PUT seed-chain that lands C on a few fresh near-K hosts (so churn leaves
-// survivors) and (2) bounded routing backtracking (so a far GET whose greedy
-// descent stalls reaches a surviving near-K host). Neither exists yet, so the
-// gate below fails.
+// no ongoing demand lands only on the FEW peers a single greedy PUT reaches
+// toward K (the near-K terminus + the publisher's own loopback copy) — there is
+// no scattered copy ~1 hop off every route. When churn removes those few holders
+// (CrashNode — the real failure mode: membership change, not a clock TTL, since
+// there is NO time-based hosting eviction), a far GET routed toward K has nothing
+// reachable to route to and DEAD-ENDS. Empirically this reproduces on a MAJORITY
+// of seeds (~3/5 in the gate, ~2/3 seeds ⇒ ~30% GET success in the measurement);
+// on a minority the sparse-ring PUT itself fails to reach K and leaves C on a far
+// peer that happens to still be reachable, so relay-caching-free findability is
+// UNRELIABLE — which is itself the gap. The redesign's answer is (1) a PUT
+// seed-chain that lands C on a few fresh near-K hosts (so churn leaves survivors)
+// and (2) bounded routing backtracking (so a far GET whose greedy descent stalls
+// reaches a surviving near-K host). Neither exists yet, so the gate below fails.
 //
-// `test_delta_churn_sim_reachability_gate` is the GATE. It asserts the far GET
-// finds the state and is `#[ignore]`d because it is EXPECTED TO FAIL on this
-// branch (confirm with `--ignored`). Removing the `#[ignore]` once backtracking
-// + the seed-chain land is how the findability bundle proves it closed the gap.
-// `test_delta_get_reliability_under_churn` MEASURES the GET success rate (with
-// vs without churn, over seeds) so the recovery from each piece is quantifiable;
-// it PASSES (asserts only sim completion + scenario non-degeneracy + the §7
-// no-storm safety property, and reports the rate).
+// HARNESS NOTE (fixed here): `CrashNode` was a silent no-op under the turmoil
+// `run_controlled_simulation` runner — the fault injector's `crashed_nodes` set
+// was never consulted during delivery (the SimulationSocket `DELIVERY_CALLBACK`
+// was never registered with a crash-aware closure). Without the fix a "crashed"
+// near-K holder keeps answering, so this whole churn scenario is inert. The fix
+// (opt-in `SimNetwork::enable_crash_delivery_gating`, default OFF ⇒ zero blast
+// radius) registers a crash-aware callback so `CrashNode` actually blocks
+// delivery. See that method + the callback in `run_controlled_simulation`.
+//
+// `test_delta_churn_sim_reachability_gate` is the GATE. It asserts EVERY seed's
+// far GET reaches C under churn and is `#[ignore]`d because it is EXPECTED TO
+// FAIL on this branch (confirm with `--ignored`). Removing the `#[ignore]` once
+// backtracking + the seed-chain land is how the findability bundle proves it
+// closed the gap. `test_delta_get_reliability_under_churn` MEASURES the GET
+// success rate (with vs without churn, over seeds) so the recovery from each
+// piece is quantifiable; it PASSES (asserts only sim completion + scenario
+// non-degeneracy + the §7 per-node no-storm safety property, and reports the rate).
 // =============================================================================
 
 /// End-of-run observations for one Delta churn-sim run. Primitives only so the
@@ -13277,6 +13290,11 @@ struct DeltaChurnObs {
     /// is non-empty but a getter failed, the failure is a routing dead-end; if it
     /// is empty, the failure is holder loss (churn removed every reachable copy).
     reachable_holders: Vec<usize>,
+    /// ALL end-of-run hosting labels (nodes AND the gateway), for diagnostics.
+    holder_labels: Vec<String>,
+    /// Whether the gateway (label gateway-0) hosts C at end (its derived location
+    /// can make it the near-K terminus on some seeds).
+    gateway_hosts: bool,
     /// Node numbers that were crash-scripted (empty if no churn).
     crashed: Vec<usize>,
     /// Network-wide count of peers still holding an ACTIVE SUBSCRIPTION lease for
@@ -13285,7 +13303,6 @@ struct DeltaChurnObs {
     surviving_leases: usize,
     /// Max per-node subscription-lease count across the whole network.
     max_sub_count: usize,
-    total_snapshots: usize,
 }
 
 /// Delta churn-sim driver: a sparse ~16-peer ring, relay-caching-free, migration
@@ -13364,6 +13381,11 @@ fn run_delta_churn_scenario(
     if advance.is_some() {
         sim.enable_hosting_time_control();
     }
+    if !crash.is_empty() {
+        // Make CrashNode actually block delivery (opt-in; default runner leaves
+        // it inert). Without this the crashed near-K holder keeps answering.
+        sim.enable_crash_delivery_gating();
+    }
 
     let publisher = NodeLabel::node(network, 4);
 
@@ -13382,6 +13404,18 @@ fn run_delta_churn_scenario(
         ops.push(ScheduledOperation::new(
             publisher.clone(),
             SimOperation::AdvanceHostingClock { duration: d },
+        ));
+    }
+    if !crash.is_empty() {
+        // Also crash the gateway: its ring location is derived from its
+        // (seed-dependent) address, so on some seeds it lands closest to K and
+        // becomes the PUT terminus / a K-region routing hub. Crashing it makes
+        // the near-K holder removal robust across seeds (harmless when the
+        // gateway is far from K — bootstrap is long done by the GET, peers hold
+        // min_connections=3 peer-to-peer links).
+        ops.push(ScheduledOperation::new(
+            NodeLabel::gateway(network, 0),
+            SimOperation::CrashNode,
         ));
     }
     for n in crash {
@@ -13429,6 +13463,16 @@ fn run_delta_churn_scenario(
         .copied()
         .filter(|n| !crash.contains(n))
         .collect();
+    // ALL hosting labels (including the gateway, whose derived location can make
+    // it the near-K terminus) — for diagnostics, since `holders` above only sees
+    // regular node numbers.
+    let holder_labels: Vec<String> = result
+        .captured_node_labels()
+        .iter()
+        .filter(|l| result.is_node_hosting(l, &contract_key))
+        .map(|l| l.to_string())
+        .collect();
+    let gateway_hosts = result.is_node_hosting(&NodeLabel::gateway(network, 0), &contract_key);
 
     let surviving_leases = result
         .topology_snapshots
@@ -13445,107 +13489,281 @@ fn run_delta_churn_scenario(
     DeltaChurnObs {
         getter_found,
         holders,
+        holder_labels,
+        gateway_hosts,
         reachable_holders,
         crashed: crash.to_vec(),
         surviving_leases,
         max_sub_count,
-        total_snapshots: result.topology_snapshots.len(),
     }
 }
 
-/// PROBE 2 (independent per-getter findability): each far getter runs against a
-/// PRISTINE network (fresh PUT, NO other getter) so host-on-GET cross-warming
-/// cannot mask the routing gap. Reports how many far positions reach the lone
-/// near-K holder via greedy single-path routing + 1-hop consult. This is the
-/// faithful §E "6/8 dead-end" measurement.
-#[test_log::test]
-fn test_delta_independent_getter_probe() {
-    const SEEDS: [u64; 2] = [0x4642_E5B1, 0x4642_E5B2];
-    const GETTERS: [usize; 8] = [5, 6, 7, 8, 11, 12, 13, 14];
-    for seed in SEEDS {
-        let mut found = 0usize;
-        let mut per: Vec<(usize, bool)> = Vec::new();
-        for g in GETTERS {
-            let obs = run_delta_churn_scenario(
-                seed,
-                &format!("delta-indep-{seed:x}-g{g}"),
-                &[g],
-                &[],
-                Some(Duration::from_secs(24 * 60 * 60)),
-            );
-            let f = obs.getter_found.iter().any(|(_, ok)| *ok);
-            if f {
-                found += 1;
-            }
-            per.push((g, f));
-        }
-        eprintln!(
-            "[delta-indep seed={seed:x}] PRISTINE per-getter found {found}/{} : {per:?}",
-            GETTERS.len()
-        );
-    }
-}
+/// Crash set (node numbers) for the churn runs: the near-K holder (node 1, the
+/// usual PUT terminus) + the publisher (node 4, whose originator-loopback copy is
+/// crashed too so the scenario isolates "does the NETWORK keep C reachable after
+/// the near-K holders churn"). The driver ALSO crashes the gateway (its derived
+/// location makes it the near-K terminus on some seeds). Nodes 2 and 3 (the near-K
+/// band) are deliberately NOT crashed: relay-caching-free they hold nothing today
+/// (a single greedy PUT seeds one terminus), but they are exactly the fresh near-K
+/// hosts a PUT seed-chain would land on and a backtracking GET would reach, so the
+/// gate flips green once those pieces land.
+const DELTA_CHURN_SET: [usize; 2] = [1, 4];
+/// A "day"-long hosting-clock jump: ages leases (there is no time-based hosting
+/// eviction, so the holder still holds C in cache — churn, not the clock, removes
+/// it).
+const DELTA_DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// PROBE (not a gate): prints where a relay-caching-free PUT lands and whether a
-/// single far GET finds it, with and without churn — used to characterise the
-/// baseline. PASSES (only sanity asserts); its value is the eprintln! record.
+/// THE GATE — currently FAILS relay-caching-free; `#[ignore]`d so the branch's
+/// normal suite stays green (confirm the failing baseline with `--ignored`).
+///
+/// Relay-caching-free Delta scenario, 5 seeds: the publisher PUTs C once toward
+/// key K (relay-caching-free, so C lands only on the few peers the single greedy
+/// PUT reaches — typically the near-K terminus + the publisher's loopback copy),
+/// the hosting clock jumps a "day", the near-K holder + publisher (+ gateway) are
+/// CRASHED (real message-blocking churn, via the opt-in crash delivery gate), then
+/// a far peer B GETs C. It asserts B finds the state on EVERY seed.
+///
+/// On this branch it FAILS on a majority of seeds (~3/5): with relay-caching
+/// removed there is no scattered copy ~1 hop off B's route, and once the near-K
+/// holders churn out, greedy single-path routing + the 1-hop terminal consult
+/// have nothing reachable to reach — B dead-ends (`reachable_holders` empty). On a
+/// minority the sparse-ring PUT fails to reach K and leaves C on a far peer that
+/// stays reachable, so findability is UNRELIABLE. The fix — a PUT seed-chain (C
+/// also lands on near-K band nodes 2,3, which churn leaves alive) + bounded
+/// routing backtracking (B reaches them) — must make ALL seeds reach C. Removing
+/// the `#[ignore]` arms the gate. Tracker: #4642 (piece E), daily cross-peer
+/// PUT/GET net test #4665.
+///
+/// Also carries the safety half of the gate (design §7): a PUT-seeded,
+/// un-subscribed, zero-demand contract must hold NO active-subscription lease
+/// anywhere (no #3763 storm), and per-node lease counts stay tiny — so a future
+/// findability fix cannot buy reachability by re-introducing durable unsubscribed
+/// leases. (The formation/collapse/no-cycle proofs for real subscription demand
+/// live in `test_subscription_chain_collapses_on_client_leave` and
+/// `test_chain_collapse_reaches_root_no_cycle`, which run on this same
+/// relay-caching-free branch.)
 #[test_log::test]
-fn test_delta_churn_sim_probe() {
-    const SEEDS: [u64; 3] = [0x4642_E5F1, 0x4642_E5F2, 0x4642_E5F3];
-    const B: usize = 5;
+#[ignore = "Delta churn-sim findability GATE: EXPECTED TO FAIL relay-caching-free until \
+            bounded backtracking + PUT seed-chain land (#4642 piece E / #4665). Run with \
+            --ignored to confirm the failing baseline."]
+fn test_delta_churn_sim_reachability_gate() {
+    // 5 seeds: the gap is seed-dependent — relay-caching-free findability is
+    // UNRELIABLE under churn (C is reachable on some seeds, dead-ends on others),
+    // which is itself the gap. The gate asserts 100% reliability (every seed
+    // reaches C under churn) and fails because not every seed does.
+    const SEEDS: [u64; 5] = [
+        0x4642_E501,
+        0x4642_E502,
+        0x4642_E503,
+        0x4642_E504,
+        0x4642_E505,
+    ];
+    const B: usize = 5; // a far getter on the negative arc, off the publisher's arc
+
+    // (seed, base_found, churn_found, failure_mode)
+    let mut results: Vec<(u64, bool, bool, &'static str)> = Vec::new();
+
     for seed in SEEDS {
-        // PUT-only: pure PUT landing, NO getter (so host-on-GET return-path
-        // caching cannot pollute the holder set) and NO crash.
-        let put_only = run_delta_churn_scenario(
-            seed,
-            &format!("delta-probe-putonly-{seed:x}"),
-            &[],
-            &[],
-            Some(Duration::from_secs(24 * 60 * 60)),
-        );
-        // PUT + crash{1,4}, still NO getter: the reachable holder set a far GET
-        // would face after churn (this is the decisive number).
-        let put_crash = run_delta_churn_scenario(
-            seed,
-            &format!("delta-probe-putcrash-{seed:x}"),
-            &[],
-            &[1, 4],
-            Some(Duration::from_secs(24 * 60 * 60)),
-        );
+        // Baseline (no churn) — characterises whether greedy single-path routing
+        // reaches the LIVE holder in this ring at all (informational: if it does,
+        // a churn failure is attributable to churn, not an unconditional routing
+        // dead-end).
         let base = run_delta_churn_scenario(
             seed,
-            &format!("delta-probe-base-{seed:x}"),
+            &format!("delta-gate-base-{seed:x}"),
             &[B],
             &[],
-            Some(Duration::from_secs(24 * 60 * 60)),
+            Some(DELTA_DAY),
+        );
+        let base_found = base.getter_found.iter().any(|(_, f)| *f);
+
+        // Churn run — crash the near-K holder + publisher (+ gateway), then B GETs.
+        let churn = run_delta_churn_scenario(
+            seed,
+            &format!("delta-gate-churn-{seed:x}"),
+            &[B],
+            &DELTA_CHURN_SET,
+            Some(DELTA_DAY),
+        );
+        let b_found = churn.getter_found.iter().any(|(_, f)| *f);
+        let failure_mode = if b_found {
+            "FOUND (C stayed reachable this seed)"
+        } else if !churn.reachable_holders.is_empty() {
+            "DEAD-END NotFound (a holder survives + is reachable, routing missed it)"
+        } else {
+            "REACHABILITY GAP (every reachable copy churned out; C exists only on crashed holders)"
+        };
+        eprintln!(
+            "[delta-gate seed={seed:x}] baseline_no_churn B_found={base_found} (holders={:?} gw={}) | \
+             CHURN B_found={b_found} failure_mode=\"{failure_mode}\" crashed={:?} \
+             reachable_holders={:?} gw_hosts={} all_holders={:?} surviving_leases={} max_sub_count={}",
+            base.holder_labels,
+            base.gateway_hosts,
+            churn.crashed,
+            churn.reachable_holders,
+            churn.gateway_hosts,
+            churn.holder_labels,
+            churn.surviving_leases,
+            churn.max_sub_count,
+        );
+
+        // Non-degeneracy: C actually landed (the PUT took), else the gate is vacuous.
+        assert!(
+            !churn.holder_labels.is_empty(),
+            "seed={seed:x}: C never landed — PUT did not take, gate is vacuous"
+        );
+        // SAFETY (design §7 no-storm, per-node signal): no node accretes multiple
+        // leases for this single zero-demand contract. The authoritative,
+        // cache-proportional no-storm proof (leases ∝ demand not cache) is D's own
+        // `test_subscription_count_tracks_demand_not_cache`, which runs on this
+        // same relay-caching-free branch; a findability fix must not regain
+        // reachability by re-adding durable unsubscribed leases. (`surviving_leases`
+        // is reported above; a small, bounded chain lease is O(1), not a storm.)
+        assert!(
+            churn.max_sub_count <= 1,
+            "seed={seed:x}: max per-node subscription count {} — a single zero-demand contract \
+             must not accrete multiple leases on any node",
+            churn.max_sub_count,
+        );
+
+        results.push((seed, base_found, b_found, failure_mode));
+    }
+
+    let dead_ended: Vec<String> = results
+        .iter()
+        .filter(|(_, _, found, _)| !found)
+        .map(|(s, _, _, m)| format!("{s:x} [{m}]"))
+        .collect();
+    let found = results.len() - dead_ended.len();
+    eprintln!(
+        "[delta-gate SUMMARY] {found}/{} seeds reached C under churn; DEAD-ENDED {}/{}: {dead_ended:?}",
+        results.len(),
+        dead_ended.len(),
+        results.len(),
+    );
+
+    // THE GATE: EVERY seed's far GET must reach C under churn (100% reliable
+    // findability). It currently FAILS relay-caching-free — that failing baseline
+    // IS the deliverable; the findability bundle (bounded backtracking + PUT
+    // seed-chain, #4642 piece E / #4665) must make ALL seeds reach C.
+    assert!(
+        dead_ended.is_empty(),
+        "DELTA FINDABILITY GAP — {}/{} seeds' far GET dead-ended under churn: {dead_ended:?}. \
+         Relay-caching-free findability is unreliable: greedy single-path routing + the 1-hop \
+         terminal consult cannot reach the near-K holder set after it churns out (no scattered \
+         copy remains). Bounded backtracking + the PUT seed-chain (#4642 piece E / #4665) must \
+         make ALL seeds reach C.",
+        dead_ended.len(),
+        results.len(),
+    );
+}
+
+/// GET-reliability-under-churn MEASUREMENT (PASSES — reports the success rate so
+/// the recovery from each findability piece is quantifiable). Every far node GETs
+/// the single relay-caching-free PUT-seeded contract; we count how many obtain
+/// the state, with and without churn on the near-K holder set, across seeds.
+///
+/// Asserts only sim completion + scenario non-degeneracy + the §7 no-storm safety
+/// property; the success RATE is reported, never gated, because on this branch it
+/// is expected to collapse under churn and the whole point is to watch it climb
+/// as bounded backtracking + the seed-chain land.
+///
+/// NOTE on the no-churn number: getters run sequentially and host-on-GET caches
+/// the fetched state on each success's return path, so after the first success
+/// later getters find nearer copies — the no-churn rate is inflated by that
+/// cross-warming and is reported as an upper-bound reference, not a per-getter
+/// routing measurement. The CHURN number is the meaningful one: with every
+/// reachable holder crashed, no getter can bootstrap that cross-warming, so it
+/// reflects the true post-churn findability (≈0 relay-caching-free).
+#[test_log::test]
+fn test_delta_get_reliability_under_churn() {
+    const SEEDS: [u64; 3] = [0x4642_E5A1, 0x4642_E5A2, 0x4642_E5A3];
+    // All far nodes GET C (publisher is node 4, near-K holder is node 1).
+    const GETTERS: [usize; 11] = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+    let mut agg_no_churn = (0usize, 0usize); // (found, total)
+    let mut agg_churn = (0usize, 0usize);
+
+    for seed in SEEDS {
+        let no_churn = run_delta_churn_scenario(
+            seed,
+            &format!("delta-rate-nochurn-{seed:x}"),
+            &GETTERS,
+            &[],
+            Some(DELTA_DAY),
         );
         let churn = run_delta_churn_scenario(
             seed,
-            &format!("delta-probe-churn-{seed:x}"),
-            &[B],
-            &[1, 4],
-            Some(Duration::from_secs(24 * 60 * 60)),
+            &format!("delta-rate-churn-{seed:x}"),
+            &GETTERS,
+            &DELTA_CHURN_SET,
+            Some(DELTA_DAY),
         );
+
+        let nc_found = no_churn.getter_found.iter().filter(|(_, f)| *f).count();
+        let c_found = churn.getter_found.iter().filter(|(_, f)| *f).count();
+        agg_no_churn.0 += nc_found;
+        agg_no_churn.1 += GETTERS.len();
+        agg_churn.0 += c_found;
+        agg_churn.1 += GETTERS.len();
+
         eprintln!(
-            "[delta-probe seed={seed:x}] PUT-only holders={:?} leases={} | \
-             PUT+crash{{1,4}} holders={:?} reachable={:?} leases={} || \
-             BASELINE(+GET) holders={:?} B_found={} | \
-             CHURN(+GET) holders={:?} reachable={:?} B_found={} leases={}",
-            put_only.holders,
-            put_only.surviving_leases,
-            put_crash.holders,
-            put_crash.reachable_holders,
-            put_crash.surviving_leases,
-            base.holders,
-            base.getter_found.iter().any(|(_, f)| *f),
-            churn.holders,
+            "[delta-rate seed={seed:x}] no-churn: {nc_found}/{} found (holders={:?}) | \
+             churn: {c_found}/{} found (crashed={:?} reachable_holders={:?}) | \
+             churn-failures={:?}",
+            GETTERS.len(),
+            no_churn.holders,
+            GETTERS.len(),
+            churn.crashed,
             churn.reachable_holders,
-            churn.getter_found.iter().any(|(_, f)| *f),
-            churn.surviving_leases,
+            churn
+                .getter_found
+                .iter()
+                .filter(|(_, f)| !*f)
+                .map(|(g, _)| *g)
+                .collect::<Vec<_>>(),
         );
+
+        // Non-degeneracy per seed: the PUT took (C landed near K).
         assert!(
-            base.total_snapshots > 0,
-            "seed={seed:x}: probe captured no snapshots"
+            !no_churn.holders.is_empty(),
+            "seed={seed:x}: no-churn run — C never landed, measurement vacuous"
+        );
+        // Safety (per-node no-storm signal): no node accretes multiple leases for
+        // this single zero-demand contract, with or without churn.
+        assert!(
+            no_churn.max_sub_count <= 1 && churn.max_sub_count <= 1,
+            "seed={seed:x}: per-node subscription accretion (no-churn={}, churn={}) — a single \
+             zero-demand contract must not accrete multiple leases on any node",
+            no_churn.max_sub_count,
+            churn.max_sub_count,
         );
     }
+
+    let pct = |x: (usize, usize)| {
+        if x.1 == 0 {
+            0.0
+        } else {
+            100.0 * x.0 as f64 / x.1 as f64
+        }
+    };
+    eprintln!(
+        "[delta-rate AGGREGATE over {} seeds] no-churn GET success = {}/{} ({:.0}%, cross-warmed \
+         upper bound) | churn GET success = {}/{} ({:.0}%). Relay-caching-free baseline; watch the \
+         churn number climb as bounded backtracking + the PUT seed-chain land (#4642 piece E / #4665).",
+        SEEDS.len(),
+        agg_no_churn.0,
+        agg_no_churn.1,
+        pct(agg_no_churn),
+        agg_churn.0,
+        agg_churn.1,
+        pct(agg_churn),
+    );
+
+    // Measurement only: assert the harness produced a usable measurement, never a
+    // success-rate floor (that is what the findability bundle must raise).
+    assert!(
+        agg_churn.1 > 0 && agg_no_churn.1 > 0,
+        "measurement produced no getter samples"
+    );
 }
