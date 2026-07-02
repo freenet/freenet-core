@@ -11344,6 +11344,322 @@ fn test_terminal_advertisement_consult_closes_subscribe_dead_end() {
     );
 }
 
+/// Per-run observation for the relay-become-host dead-end proof.
+struct RelayBecomeHostObservation {
+    /// Cumulative relay-become-host events across all peers (design piece D).
+    /// This counter increments ONLY when a relay routes a SUBSCRIBE to a
+    /// downstream host, gets `Subscribed` back, and installs itself as a real
+    /// host (`finalize_host_subscribe` — fetch body + `ring.subscribe` +
+    /// announce). It is the direct measurement that the relay-become-host path
+    /// fired.
+    chain_hosts_formed: u64,
+    /// Consult telemetry cross-check: recorded ONLY when a consulted advertised
+    /// host answers `Subscribed`. With migration off, this is the unambiguous
+    /// signal the terminal consult (not routing/migration) drove the chain.
+    consult_resolved_found: u64,
+    /// The seeded far holder still hosts the contract at the end.
+    holder_hosts: bool,
+    /// Cluster nodes (node_no 1..=6 — NEITHER the holder nor the subscriber)
+    /// that ended up hosting the contract WITH state present. Under piece D a
+    /// chain host fetches the body, so it holds real state; the pre-piece-D
+    /// hollow relay would register downstream interest but hold NO state.
+    intermediate_hosts_with_state: Vec<usize>,
+    /// The subscriber ends up hosting the contract at the end.
+    subscriber_hosts: bool,
+    /// Upstream (parent) edges the subscriber recorded for the contract — a
+    /// non-trivial end-to-end signal that its SUBSCRIBE wired into the mesh
+    /// (its first hop answered `Subscribed` and was registered as upstream).
+    subscriber_upstreams: usize,
+    /// Every node index hosting the contract at the end (diagnostics).
+    hosting_node_indices: Vec<usize>,
+    /// Peers holding the contract in `active_subscription_keys` (mesh size).
+    active_subscription_peers: usize,
+}
+
+/// Drive one relay-become-host dead-end scenario and collect observations.
+///
+/// Topology (proven deterministic by
+/// `test_terminal_advertisement_consult_closes_subscribe_dead_end`, which shares
+/// it): a dense NON-hosting cluster of 6 peers sits right on the contract's key;
+/// exactly ONE seeded holder sits just OUTSIDE the cluster (farther from the key
+/// than every cluster peer, so greedy routing never selects it, but close enough
+/// to become a cluster peer's neighbor and advertise its hosting to it); one far
+/// subscriber sits on the opposite side of the key.
+///
+/// The subscriber's SUBSCRIBE routes greedily toward the key, dead-ends at the
+/// non-hosting cluster, and a cluster relay consults the host advertisement it
+/// received and forwards the SUBSCRIBE to the off-path holder — which answers
+/// `Subscribed`. That relay then becomes a REAL host (piece D): it fetches the
+/// body through the holder and installs a lease. This is the findability
+/// dead-end (a single distant holder unreachable by greedy routing) being CLOSED
+/// by a fresh mid-chain host.
+fn run_relay_become_host_scenario(seed: u64, network_name: &str) -> RelayBecomeHostObservation {
+    use freenet::config::GlobalTestMetrics;
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    setup_deterministic_state(seed);
+    GlobalTestMetrics::reset();
+
+    let contract = SimOperation::create_test_contract(0xC0);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+
+    // Non-hosting cluster tightly around the key.
+    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    // Holder just outside the cluster: farther from the key than every cluster
+    // peer (greedy routing never selects it), yet close enough to become a
+    // cluster peer's neighbor and advertise its hosting.
+    let host_loc = wrap(key_loc + 0.05);
+    // Subscriber on the opposite side of the key, so its inbound path approaches
+    // the key from the far side and never passes near the holder.
+    let requester_loc = wrap(key_loc - 0.60);
+    let mut node_locations = cluster.clone();
+    node_locations.push(host_loc); // regular-node order 6 -> node_no 7
+    node_locations.push(requester_loc); // regular-node order 7 -> node_no 8
+    let num_nodes = node_locations.len(); // 8
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            network_name,
+            1,         // 1 gateway
+            num_nodes, // 8 regular nodes
+            10,        // ring_max_htl
+            7,         // rnd_if_htl_above
+            8,         // max_connections
+            3,         // min_connections
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+    // Migration OFF: the ONLY mechanism that can build a host chain toward the
+    // holder is the SUBSCRIBE terminal consult + relay-become-host (piece D),
+    // not the SubscribeHint placement cascade.
+    sim.disable_placement_migration();
+    // Opt into advertising the seeded holder so the consult can find it (OFF by
+    // default; existing dead-end controls keep a seeded host un-advertised).
+    sim.enable_seeded_host_advertisements();
+
+    let host_label = NodeLabel::node(network_name, 7);
+    let requester_label = NodeLabel::node(network_name, 8);
+
+    // Setup sanity: the holder must be strictly FARTHER from the key than the
+    // closest cluster peer, so greedy routing lands on the cluster (terminus)
+    // and never picks the holder directly. get_peer_locations() is [gw, node1..8].
+    let locs = sim.get_peer_locations();
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let host_dist = ring_dist(locs[7], key_loc);
+    let cluster_min = (1..=6)
+        .map(|i| ring_dist(locs[i], key_loc))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        cluster_min < host_dist,
+        "scenario setup wrong: a cluster peer must be closer to the key than the holder \
+         (cluster_min={cluster_min}, host_dist={host_dist})"
+    );
+
+    let operations = vec![
+        // Only the holder hosts the contract initially — seeded into its store +
+        // Ring hosting manager + neighbor-hosting advertised set, no network
+        // propagation. It is the single distant holder a greedy subscribe cannot
+        // reach; findability of it relies on the terminal advertisement consult.
+        ScheduledOperation::new(
+            host_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![11, 22, 33, 44],
+            },
+        ),
+        // Seed the subscriber too: a bare SUBSCRIBE for an absent contract fails
+        // the local RegisterSubscriberListener gate and never starts the network
+        // subscribe. With the contract present, the SUBSCRIBE passes that gate
+        // and routes UPSTREAM toward the key to build the subscription tree.
+        // (This makes the subscriber's own hosting non-load-bearing — see the
+        // test's assertion comments — but it does NOT short-circuit the chain:
+        // the subscribe still routes to the network and dead-ends at the cluster,
+        // exactly where the consult + relay-become-host fires.)
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![11, 22, 33, 44],
+            },
+        ),
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x}: simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let intermediate_hosts_with_state: Vec<usize> = (1..=6usize)
+        .filter(|n| {
+            let label = NodeLabel::node(network_name, *n);
+            result.is_node_hosting(&label, &contract_key)
+                && result
+                    .node_storages
+                    .get(&label)
+                    .is_some_and(|s| s.get_stored_state(&contract_key).is_some())
+        })
+        .collect();
+    let hosting_node_indices: Vec<usize> = (1..=8usize)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(network_name, *n), &contract_key))
+        .collect();
+    let active_subscription_peers = result
+        .topology_snapshots
+        .iter()
+        .filter(|s| s.active_subscription_keys.contains(&contract_id))
+        .count();
+
+    RelayBecomeHostObservation {
+        chain_hosts_formed: result.aggregate_renewal_metrics().chain_hosts_formed,
+        consult_resolved_found: GlobalTestMetrics::terminal_consult_resolved_found(),
+        holder_hosts: result.is_node_hosting(&host_label, &contract_key),
+        intermediate_hosts_with_state,
+        subscriber_hosts: result.is_node_hosting(&requester_label, &contract_key),
+        subscriber_upstreams: result.node_upstream_count(&requester_label, &contract_key),
+        hosting_node_indices,
+        active_subscription_peers,
+    }
+}
+
+/// Piece D's raison d'être (design doc `docs/design/demand-driven-hosting.md` §3):
+/// a findability DEAD-END is CLOSED by a relay that becomes a REAL host mid-chain.
+///
+/// The prior subscription-mesh proofs (proofs 2-4) formed the mesh via the
+/// ORIGINATOR path only — a PUT pre-replicated the contract to ~half the peers,
+/// so every subscribe resolved at hop 1 on an already-hosting neighbor and the
+/// relay-become-host counter stayed 0. This test instead constructs a topology
+/// where the contract exists on EXACTLY ONE distant holder (seeded, off the
+/// greedy path) so a subscribe MUST traverse a non-hosting cluster relay, which
+/// consults the holder's advertisement and becomes a host itself.
+///
+/// What this proves that the sibling
+/// `test_terminal_advertisement_consult_closes_subscribe_dead_end` does not:
+/// that test asserts only the CONSULT fired (`resolved_found > 0`). This test
+/// asserts the PIECE-D OUTCOME — `chain_hosts_formed > 0` AND a fresh mid-chain
+/// host holding real state — i.e. the relay-become-host code path executed end
+/// to end, not merely that a consult returned Subscribed.
+///
+/// NEGATIVE CONTROL (comment, not a separate run — the code IS piece D now):
+/// before piece D, a cluster relay on this path would `register_downstream_
+/// subscriber` but never `ring.subscribe`/fetch/host — a HOLLOW relay that holds
+/// NO state (the findability dead-end this file's `hosting-invariants` rule
+/// documents). The `intermediate_hosts_with_state` assertion below is precisely
+/// the discriminator: a hollow relay would host nothing (or host without state),
+/// so a cluster node that hosts WITH state can only be a real piece-D chain host.
+/// `chain_hosts_formed` corroborates it: that counter fires ONLY on the
+/// relay-become-host branch, never on the pre-piece-D hollow-relay path.
+#[test_log::test]
+fn test_relay_become_host_closes_deadend() {
+    // Reuse the seed proven deterministic for this topology by the sibling
+    // consult test, plus one variant to guard against single-seed luck. If the
+    // variant proves fragile (organic connection formation is seed-sensitive and
+    // the consult needs a cluster peer to be the holder's neighbor), drop back to
+    // the single proven seed with a note — the piece-D path is also covered by
+    // the unit-level pin tests in `operations/subscribe/`.
+    const SEEDS: [u64; 2] = [0xC0FF_EEC0_0008, 0xC0FF_EEC0_0011];
+
+    let observations: Vec<(u64, RelayBecomeHostObservation)> = SEEDS
+        .iter()
+        .map(|&seed| {
+            let network_name = format!("relay-become-host-deadend-{seed:x}");
+            (seed, run_relay_become_host_scenario(seed, &network_name))
+        })
+        .collect();
+
+    for (seed, obs) in &observations {
+        eprintln!(
+            "[relay-become-host seed={seed:x}] chain_hosts_formed={} consult_resolved_found={} \
+             holder_hosts={} intermediate_hosts_with_state={:?} subscriber_hosts={} \
+             subscriber_upstreams={} hosting_node_indices={:?} active_subscription_peers={}",
+            obs.chain_hosts_formed,
+            obs.consult_resolved_found,
+            obs.holder_hosts,
+            obs.intermediate_hosts_with_state,
+            obs.subscriber_hosts,
+            obs.subscriber_upstreams,
+            obs.hosting_node_indices,
+            obs.active_subscription_peers,
+        );
+    }
+
+    for (seed, obs) in &observations {
+        // The seeded holder must remain the authoritative source throughout.
+        assert!(
+            obs.holder_hosts,
+            "seed={seed:x}: the seeded holder should still host the contract"
+        );
+
+        // PRIMARY PROOF (piece D): the relay-become-host path actually fired.
+        assert!(
+            obs.chain_hosts_formed > 0,
+            "seed={seed:x}: chain_hosts_formed=0 — no relay became a host via a \
+             `Subscribed` reply. The subscribe never traversed a non-hosting relay that \
+             then hosted (the whole point of piece D). intermediate_hosts_with_state={:?}, \
+             consult_resolved_found={}, hosting_node_indices={:?}",
+            obs.intermediate_hosts_with_state,
+            obs.consult_resolved_found,
+            obs.hosting_node_indices,
+        );
+
+        // CORE OF THE FIX: a real host was created MID-CHAIN — a cluster peer
+        // that is neither the seeded holder (node 7) nor the subscriber (node 8)
+        // now hosts the contract WITH state. That closed the findability
+        // dead-end: a subsequent key-routed GET/SUBSCRIBE now lands on a fresh
+        // host in the cluster instead of dead-ending. A hollow relay (pre-piece
+        // D) would hold NO state here.
+        assert!(
+            !obs.intermediate_hosts_with_state.is_empty(),
+            "seed={seed:x}: no mid-chain cluster peer (node_no 1..=6) hosts the contract \
+             WITH state, so the dead-end was not closed by a real host. \
+             chain_hosts_formed={}, hosting_node_indices={:?} (a hollow relay would host \
+             nothing / no state — piece D must make it a real host)",
+            obs.chain_hosts_formed,
+            obs.hosting_node_indices,
+        );
+
+        // The subscriber ends up hosting the contract. NOTE: this is NOT the
+        // load-bearing signal — the subscriber is pre-seeded (to pass the local
+        // RegisterSubscriberListener gate), so it hosts regardless of whether the
+        // network subscribe completed. The load-bearing proof is above:
+        // `chain_hosts_formed > 0` + a fresh mid-chain host holding state. We
+        // keep this assertion because the seeded holder / subscriber must remain
+        // hosts throughout for the mesh they anchor to be meaningful.
+        //
+        // `subscriber_upstreams` is reported (see the eprintln) but NOT asserted:
+        // `upstream_interest_count` records an edge only when a subscribe resolves
+        // at a real connected peer and NOT at the originator/root (see its
+        // rustdoc). The seeded far subscriber resolves as its own root here, so 0
+        // is expected and is not evidence against the chain — the chain metrics
+        // and the mid-chain hosts are the evidence.
+        assert!(
+            obs.subscriber_hosts,
+            "seed={seed:x}: subscriber should host the contract at the end"
+        );
+    }
+}
+
 /// Reproduction + regression test for the placement-migration renewal storm
 /// (#4440, the storm symptom of the #4404 placement work).
 ///
