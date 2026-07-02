@@ -350,6 +350,16 @@ pub fn aggregate_renewal_metrics(network_name: &str) -> RenewalMetrics {
             // count), so the aggregate stays meaningful as "worst single-cycle
             // batch any node reached".
             acc.max_cycle_batch = acc.max_cycle_batch.max(entry.value().max_cycle_batch);
+            // Seed leases installed / currently-active are counts: sum them.
+            // `last_active_seed_leases` summed across nodes is the network-wide
+            // active seed-lease total at the last reaper tick — the spam-safety
+            // signal that must reach zero after the window. `peak_active_seed_
+            // leases` is a per-node peak, so take the max across peers.
+            acc.put_seed_leases_installed += entry.value().put_seed_leases_installed;
+            acc.last_active_seed_leases += entry.value().last_active_seed_leases;
+            acc.peak_active_seed_leases = acc
+                .peak_active_seed_leases
+                .max(entry.value().peak_active_seed_leases);
             acc
         })
 }

@@ -30,6 +30,9 @@ pub use hosting::{
 };
 // PUT seed-chain constant (findability bootstrap window, hosting-invariants §E).
 pub(crate) use hosting::SEED_CHAIN_LENGTH;
+// Testing-only seed-window override (re-exported through `dev_tool`).
+#[cfg(any(test, feature = "testing"))]
+pub use hosting::set_seed_lease_duration_override;
 
 use crate::message::TransactionType;
 use crate::topology::TopologyAdjustment;
