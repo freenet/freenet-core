@@ -4292,6 +4292,7 @@ mod tests {
                 instance_id,
                 result: SubscribeMsgResult::Subscribed { key },
                 hop_count: 0,
+                remaining_backtrack_budget: 0,
             };
 
             let taken = subscribe_branch_would_forward(&op, Some(&tx));
@@ -4353,6 +4354,7 @@ mod tests {
                 htl: 5,
                 visited: VisitedPeers::new(&sub_tx),
                 is_renewal: false,
+                backtrack_budget: 0,
             };
 
             let taken = subscribe_branch_would_forward(&op, Some(&tx));
@@ -4371,6 +4373,7 @@ mod tests {
                 instance_id,
                 result: SubscribeMsgResult::NotFound,
                 hop_count: 0,
+                remaining_backtrack_budget: 0,
             };
 
             let taken = subscribe_branch_would_forward(&op, None);
