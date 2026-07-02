@@ -610,21 +610,57 @@ pub(crate) async fn register_downstream_subscriber(
     tx: &Transaction,
     warn_suffix: &str,
 ) {
-    let peer_key = requester_pub_key
-        .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
+    // Resolve the requester to a connected peer (with a ring location) —
+    // preferred via the pre-resolved pub key, else by address (NAT-timing
+    // fallback). We need the location for the §6 strict-distance guard below.
+    let peer_pkl = requester_pub_key
+        .and_then(|pk| op_manager.ring.connection_manager.get_peer_by_pub_key(pk))
         .or_else(|| {
             op_manager
                 .ring
                 .connection_manager
                 .get_peer_by_addr(requester_addr)
-                .or_else(|| {
-                    source_addr
-                        .and_then(|sa| op_manager.ring.connection_manager.get_peer_by_addr(sa))
-                })
-                .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key))
+        })
+        .or_else(|| {
+            source_addr.and_then(|sa| op_manager.ring.connection_manager.get_peer_by_addr(sa))
+        });
+
+    let peer_key = requester_pub_key
+        .map(|pk| crate::ring::interest::PeerKey::from(pk.clone()))
+        .or_else(|| {
+            peer_pkl
+                .as_ref()
+                .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key.clone()))
         });
 
     if let Some(peer_key) = peer_key {
+        // §6 strict-distance guard (demand-driven-hosting design). A downstream
+        // subscriber must be STRICTLY FARTHER from the contract's key than us.
+        // If we register a peer that is actually CLOSER — i.e. our upstream —
+        // as a downstream, two connected co-hosts would each count the other as
+        // demand and prop each other up forever with no real demand behind
+        // either (mutual self-perpetuation, §7). Skip registration only when the
+        // peer's position is RESOLVABLE and closer-or-equal to the key; if we
+        // can't resolve its location we register (the lease-expiry backstop
+        // bounds any mistake). This is the collapse-side dual of the computed
+        // upstream's "strictly closer" rule; together they keep the chain
+        // acyclic and its collapse terminating.
+        if let (Some(peer_loc), Some(my_loc)) = (
+            peer_pkl.as_ref().and_then(|pkl| pkl.location()),
+            op_manager.ring.connection_manager.own_location().location(),
+        ) {
+            let contract_loc = crate::ring::Location::from(key);
+            if peer_loc.distance(contract_loc) <= my_loc.distance(contract_loc) {
+                tracing::debug!(
+                    tx = %tx,
+                    contract = %key,
+                    "skip downstream registration: peer is not strictly farther \
+                     from the contract key than us (it is our upstream, §6){}",
+                    warn_suffix
+                );
+                return;
+            }
+        }
         if op_manager
             .ring
             .add_downstream_subscriber(key, peer_key.clone())
