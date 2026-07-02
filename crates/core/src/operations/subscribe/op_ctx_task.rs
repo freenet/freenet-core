@@ -1871,7 +1871,12 @@ async fn drive_relay_subscribe(
         remaining_budget, ..
     } = outcome
     {
-        budget = remaining_budget;
+        // CLAMP with `.min(budget)`: `remaining_budget` is an UNTRUSTED wire
+        // value. The linear fan-out bound (#4630) requires the budget to be
+        // monotonically non-increasing — a subtree may only SPEND, never MINT.
+        // `budget` still holds the value we forwarded, so `min` forbids a
+        // downstream from raising it above what we handed it.
+        budget = remaining_budget.min(budget);
         if budget == 0 || candidates.is_empty() {
             break;
         }
@@ -2021,12 +2026,18 @@ async fn drive_relay_subscribe(
                             SubscribeMsgResult::NotFound,
                             hop_count,
                             Some(false),
-                            remaining_budget,
+                            // CLAMP: the consult host's returned budget is an
+                            // untrusted wire value; it may only spend the budget
+                            // we handed it, never mint (monotonicity, #4630).
+                            remaining_budget.min(budget),
                         ),
                         SubscribeForwardOutcome::Failed { hop_count } => {
-                            // Consult forward got no reply — it consumed no
-                            // budget, so echo what we had.
-                            (SubscribeMsgResult::NotFound, hop_count, Some(false), budget)
+                            // Consult forward got no reply. Echo budget 0: the
+                            // consulted host was handed `budget` and may have
+                            // fanned out before the reply was lost, so treating
+                            // it as consumed keeps the shared counter monotone
+                            // (#4630). Same guard as the greedy Failed arm below.
+                            (SubscribeMsgResult::NotFound, hop_count, Some(false), 0)
                         }
                     }
                 }
@@ -2041,8 +2052,13 @@ async fn drive_relay_subscribe(
             // send failure / unexpected variant). Consulting would install a new
             // waiter on the reused tx that a late reply from the timed-out
             // peer could satisfy (Codex P2), so bubble NotFound WITHOUT
-            // consulting. `budget` is unchanged by a no-reply forward.
-            (SubscribeMsgResult::NotFound, hop_count, None, budget)
+            // consulting. Echo budget 0, NOT the current `budget`: the
+            // un-replied child was handed `budget` and may have fanned out a
+            // subtree before its reply was lost (a malicious relay can fan out
+            // then withhold). Echoing the un-consumed budget upstream would
+            // duplicate the shared counter and re-open k^HTL amplification
+            // (#4630) — so treat the handed budget as consumed.
+            (SubscribeMsgResult::NotFound, hop_count, None, 0)
         }
     };
 
@@ -3030,11 +3046,21 @@ mod tests {
             "drive_relay_subscribe must loop over remaining candidates while the \
              outcome is a clean NotFound"
         );
-        // Adopts the downstream's returned budget, then spends one per alternative.
+        // Adopts the downstream's returned budget CLAMPED with .min(budget)
+        // (monotonicity — a downstream cannot MINT budget, #4630), then spends
+        // one unit per alternative.
         assert!(
-            body.contains("budget = remaining_budget") && body.contains("budget -= 1"),
-            "each backtrack must adopt the downstream's remaining budget and \
-             spend exactly one unit for the alternative it tries"
+            body.contains("budget = remaining_budget.min(budget)") && body.contains("budget -= 1"),
+            "each backtrack must adopt the downstream's remaining budget CLAMPED \
+             (.min(budget)) and spend one unit per alternative; a bare adopt \
+             would let a malicious peer inflate the budget (#4630)"
+        );
+        // A no-reply forward (Failed outcome) must echo budget 0, not the
+        // un-consumed budget, so a lost reply cannot duplicate the counter.
+        assert!(
+            body.contains("SubscribeMsgResult::NotFound, hop_count, None, 0"),
+            "the greedy/backtrack Failed (no-reply) arm must echo final_budget 0 \
+             (the un-replied child may have fanned out its handed budget)"
         );
         // Stops at 0 or when candidates run out (bounded fan-out).
         assert!(

@@ -236,7 +236,7 @@ fn finalize_originator_subscribe_contains_all_required_side_effects() {
     // (1) upstream-peer registration → enables `send_unsubscribe_upstream` (#3874).
     assert!(
         body.contains("register_peer_interest"),
-        "finalize_originator_subscribe must register the responding peer as \
+        "finalize_host_subscribe must register the responding peer as \
          upstream interest — without it `send_unsubscribe_upstream` cannot \
          find the peer to notify on client disconnect (#3874)"
     );
@@ -244,7 +244,7 @@ fn finalize_originator_subscribe_contains_all_required_side_effects() {
     // not the variable name, so renaming `key` does not break the pin.
     assert!(
         body.contains("ring.subscribe("),
-        "finalize_originator_subscribe must call `ring.subscribe(...)` to \
+        "finalize_host_subscribe must call `ring.subscribe(...)` to \
          install the lease in `active_subscriptions` — without it the \
          contract is not picked up by `contracts_needing_renewal` and the \
          subscription silently dies at TTL expiry (#3851)"
@@ -253,14 +253,14 @@ fn finalize_originator_subscribe_contains_all_required_side_effects() {
     // independent of the contract-key variable name.
     assert!(
         body.contains("complete_subscription_request(") && body.contains(", true)"),
-        "finalize_originator_subscribe must call \
+        "finalize_host_subscribe must call \
          `complete_subscription_request(..., true)` to clear the pending \
          mark and reset backoff"
     );
     // (4) fetch contract body if missing → THIS is the core #4223 fix.
     assert!(
         body.contains("fetch_contract_if_missing"),
-        "finalize_originator_subscribe MUST call `fetch_contract_if_missing` \
+        "finalize_host_subscribe MUST call `fetch_contract_if_missing` \
          so the originator has the contract body locally and can answer \
          subsequent GETs from local state instead of returning NotFound \
          (#4223 — 37% of GETs through subscriber peers were failing)"
@@ -272,7 +272,7 @@ fn finalize_originator_subscribe_contains_all_required_side_effects() {
     // cannot validate).
     assert!(
         body.contains("announce_contract_hosted"),
-        "finalize_originator_subscribe MUST call `announce_contract_hosted` \
+        "finalize_host_subscribe MUST call `announce_contract_hosted` \
          (gated on fetch success) so neighbors include us as an UPDATE \
          broadcast target — without this, UPDATEs may not reach the \
          subscriber even after the contract body is local (#3851)"
@@ -286,7 +286,7 @@ fn finalize_originator_subscribe_contains_all_required_side_effects() {
     assert!(
         fetch_pos < announce_pos,
         "fetch_contract_if_missing must appear BEFORE \
-         announce_contract_hosted in finalize_originator_subscribe — \
+         announce_contract_hosted in finalize_host_subscribe — \
          announcing before the body is local would tell neighbors to \
          forward UPDATEs to a peer that cannot validate them (Codex \
          HIGH finding on PR #4224)"
