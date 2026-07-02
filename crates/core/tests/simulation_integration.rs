@@ -13535,13 +13535,22 @@ const DELTA_DAY: Duration = Duration::from_secs(24 * 60 * 60);
 /// PUT/GET net test #4665.
 ///
 /// Also carries the safety half of the gate (design §7): a PUT-seeded,
-/// un-subscribed, zero-demand contract must hold NO active-subscription lease
-/// anywhere (no #3763 storm), and per-node lease counts stay tiny — so a future
-/// findability fix cannot buy reachability by re-introducing durable unsubscribed
-/// leases. (The formation/collapse/no-cycle proofs for real subscription demand
-/// live in `test_subscription_chain_collapses_on_client_leave` and
-/// `test_chain_collapse_reaches_root_no_cycle`, which run on this same
-/// relay-caching-free branch.)
+/// un-subscribed, zero-demand contract must not accrete multiple leases on any
+/// node (per-node no-storm signal) — so a future findability fix cannot buy
+/// reachability by re-introducing durable unsubscribed leases.
+///
+/// NOTE on the fuller no-storm/collapse/no-cycle proofs
+/// (`test_subscription_count_tracks_demand_not_cache`,
+/// `test_subscription_chain_collapses_on_client_leave`,
+/// `test_chain_collapse_reaches_root_no_cycle`): those D-branch proofs build a
+/// multi-node subscription mesh via SUBSCRIBE routing, and on THIS
+/// relay-caching-free branch that formation DEGENERATES (mesh_size < 3, or a
+/// subscribe never takes) — the very same findability gap this gate targets, now
+/// showing that SUBSCRIBE routing (not just GET) dead-ends without relay-caching.
+/// So they cannot stand as green safety proofs here until the findability fix
+/// (backtracking) restores reliable mesh formation; they should be re-validated
+/// as part of the findability bundle. The per-node check above is what this gate
+/// can assert robustly relay-caching-free.
 #[test_log::test]
 #[ignore = "Delta churn-sim findability GATE: EXPECTED TO FAIL relay-caching-free until \
             bounded backtracking + PUT seed-chain land (#4642 piece E / #4665). Run with \
