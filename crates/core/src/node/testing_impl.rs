@@ -507,6 +507,13 @@ impl ControlledSimulationResult {
                 acc.chain_hosts_formed += m.chain_hosts_formed;
                 // Per-node peak → aggregate as the max across peers.
                 acc.max_cycle_batch = acc.max_cycle_batch.max(m.max_cycle_batch);
+                // PUT seed-chain: installs / current-active are counts (sum);
+                // per-node active peak → max across peers. Keep in sync with the
+                // sibling fold in `topology_registry::aggregate_renewal_metrics`.
+                acc.put_seed_leases_installed += m.put_seed_leases_installed;
+                acc.last_active_seed_leases += m.last_active_seed_leases;
+                acc.peak_active_seed_leases =
+                    acc.peak_active_seed_leases.max(m.peak_active_seed_leases);
                 acc
             },
         )

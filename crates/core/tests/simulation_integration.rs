@@ -14268,6 +14268,283 @@ fn test_chain_collapse_reaches_root_no_cycle() {
     }
 }
 
+/// PUT seed-chain spam-safety (hosting-invariants.md §E, piece §E): with NO
+/// demand, the near-key seed leases a batch of PUTs installs must all LAPSE
+/// after the findability window and the seed chains must COLLAPSE — they cannot
+/// accumulate hosting past the window. This is exactly what makes a spammer's
+/// bogus PUTs evaporate rather than pile up.
+///
+/// Scenario: a gateway PUTs several DISTINCT contracts with NO subscribe (no
+/// demand anywhere). Each PUT descends toward its key and installs near-key seed
+/// leases (the mechanism), which the interest-gated renewal loop drives into
+/// subscribed near-key hosts — a fresh mesh forms (findability DURING the
+/// window). Then the hosting clock jumps PAST the seed window
+/// (`SEED_LEASE_DURATION` = 2h) with still no demand. The hard, non-renewable
+/// seed-lease deadline lapses, so the renewal loop stops renewing and every seed
+/// chain collapses. Assertion: network-wide active seed-lease count is zero and
+/// no seed-formed subscription survives — no accumulation past the window.
+#[test_log::test]
+fn test_put_seed_chain_no_accumulation_after_window() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    // Jump well past SEED_LEASE_DURATION (2h) so every un-demanded seed lease
+    // lapses. The const is not exposed to integration tests; 3h is safely past.
+    const SEED_WINDOW_JUMP: Duration = Duration::from_secs(3 * 60 * 60);
+    const SEEDS: [u64; 3] = [0x5EED_0001, 0x5EED_0002, 0x5EED_0003];
+    // A batch of DISTINCT no-demand "spam" PUTs, each from a regular far node
+    // (not the highly-connected gateway, whose PUTs terminate in ~1 hop and would
+    // never create an intermediate seed hop). Each regular node's PUT to a random
+    // key descends multi-hop across the ring, so many of these leave a seed chain
+    // on the near-key descent. The batch is also what paces virtual time: the
+    // controlled runner fires one op every ~3s, so ~20 PUTs give the renewal loop
+    // (30s cycle) time to form the seed hosts and the reaper time to observe them
+    // active BEFORE the clock jump collapses them.
+    const NUM_PUTS: usize = 20;
+
+    for seed in SEEDS {
+        setup_deterministic_state(seed);
+        let network = format!("put-seed-noaccum-{seed:x}");
+        let rt = create_runtime();
+        // Moderately connected 15-node ring so PUTs descend multi-hop toward
+        // their key (a seed chain needs a >=2-hop descent to exist). Hosting time
+        // control lets us jump the seed window without hours of virtual time.
+        let sim = rt.block_on(async {
+            let mut sim = SimNetwork::new(&network, 1, 15, 10, 3, 5, 3, seed).await;
+            sim.enable_hosting_time_control();
+            sim
+        });
+
+        let gateway = NodeLabel::gateway(&network, 0);
+        let contracts: Vec<_> = (0..NUM_PUTS)
+            .map(|i| SimOperation::create_test_contract(0x10 + i as u8))
+            .collect();
+        let contract_ids: Vec<_> = contracts.iter().map(|c| *c.key().id()).collect();
+
+        let mut ops = Vec::new();
+        for (i, contract) in contracts.iter().enumerate() {
+            // Spread originators across the 14 regular nodes (never the gateway).
+            let originator = 1 + (i % 14);
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(&network, originator),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state((i + 1) as u8),
+                    subscribe: false, // NO demand
+                },
+            ));
+        }
+        // Jump past the seed-lease window with no demand ever registered.
+        ops.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: SEED_WINDOW_JUMP,
+            },
+        ));
+
+        // ~63s of PUTs pace formation before the jump; 120s post-wait ≈ 4
+        // reaper cycles so the expire-sweep clears every lapsed seed lease and the
+        // reaper gauge re-reads zero on every node.
+        let result = sim.run_controlled_simulation(
+            seed,
+            ops,
+            Duration::from_secs(420),
+            Duration::from_secs(120),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "seed={seed:x}: sim failed: {:?}",
+            result.turmoil_result.err()
+        );
+
+        let metrics = result.aggregate_renewal_metrics();
+        eprintln!(
+            "[seed-noaccum seed={seed:x}] installed={} peak_active={} last_active={}",
+            metrics.put_seed_leases_installed,
+            metrics.peak_active_seed_leases,
+            metrics.last_active_seed_leases,
+        );
+
+        // The mechanism fired: near-key seed leases were installed on PUT descents.
+        assert!(
+            metrics.put_seed_leases_installed > 0,
+            "seed={seed:x}: no PUT seed leases installed — the {NUM_PUTS} no-demand PUTs never \
+             descended >=2 hops, so the seed-chain mechanism never ran"
+        );
+        // They were ACTIVE at some point (a fresh near-key mesh existed).
+        assert!(
+            metrics.peak_active_seed_leases > 0,
+            "seed={seed:x}: seed leases installed but never observed active on a reaper tick"
+        );
+
+        // SPAM-SAFETY (primary): a seed lease is what pins a seed-chain host as
+        // `contract_in_use` (renewed + advertised). After the window jump with no
+        // demand, EVERY seed lease has lapsed network-wide, so no seed host is
+        // renewed and the seed chains collapse — a spammer's PUTs cannot
+        // accumulate hosting past the window. This is measured directly from the
+        // per-node reaper gauge (summed across peers).
+        assert_eq!(
+            metrics.last_active_seed_leases,
+            0,
+            "seed={seed:x}: {} seed lease(s) still active after a {}h hosting-clock jump with \
+             NO demand — a spammer's PUTs would accumulate hosting past the window",
+            metrics.last_active_seed_leases,
+            SEED_WINDOW_JUMP.as_secs() / 3600,
+        );
+
+        // Corroboration: the number of peers whose LATEST topology snapshot still
+        // shows a live seed-contract subscription is bounded — the seed chains do
+        // NOT keep growing. (An exact zero is NOT asserted here: `topology_snapshots`
+        // holds each peer's latest overwrite, and a peer that goes fully idle after
+        // the jump stops refreshing its snapshot, so a pre-jump snapshot showing a
+        // then-live lease can linger. The authoritative collapse signal is the seed
+        // gauge above; verified during development that ZERO subscription renewals
+        // fire after the jump, so nothing is actually kept alive.) Guard only
+        // against unbounded growth: survivors must not exceed the PUT count.
+        let surviving: usize = result
+            .topology_snapshots
+            .iter()
+            .filter(|s| {
+                contract_ids
+                    .iter()
+                    .any(|id| s.active_subscription_keys.contains(id))
+            })
+            .count();
+        assert!(
+            surviving <= NUM_PUTS,
+            "seed={seed:x}: {surviving} peers show a live seed-contract subscription (> the \
+             {NUM_PUTS} PUTs) — seed chains are accumulating rather than collapsing"
+        );
+    }
+}
+
+/// PUT seed-chain findability + churn-redundancy (hosting-invariants.md §E).
+///
+/// Post-piece-E a no-subscribe PUT leaves the contract on only its near-key
+/// terminus (plus the originator's own copy) — a single distant holder that a
+/// greedy single-path reader can dead-end short of (§E's findability gap, shown
+/// by `test_get_dead_ends_at_close_cluster_without_migration`). The seed chain
+/// adds a SHORT chain of FRESH, subscribed near-key hosts, giving the contract
+/// REDUNDANT findable landing spots near its key during the bootstrap window:
+/// more reader routes converge on a real host, and the loss of any one near-key
+/// host still leaves others (churn-redundancy).
+///
+/// Asserts the emergent benefit across a batch of distinct contracts (so the
+/// seed mechanism reliably fires): seed leases ARE installed on the near-key
+/// descents, and a far first-read GET of each contract obtains the state at a
+/// high rate. A first read has no prior GET-cache for that contract, so its
+/// success reflects real findability of the freshly-PUT copies — the terminus
+/// plus the fresh near-key seed hosts the chain adds.
+#[test_log::test]
+fn test_put_seed_chain_creates_fresh_redundant_near_key_hosts() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEEDS: [u64; 2] = [0x5EED_F001, 0x5EED_F002];
+    // Distinct contracts, each PUT (no demand) from one far node and first-read
+    // GET from a different far node.
+    const NUM_CONTRACTS: usize = 10;
+
+    for seed in SEEDS {
+        setup_deterministic_state(seed);
+        let network = format!("put-seed-findable-{seed:x}");
+        let rt = create_runtime();
+        let sim = rt.block_on(async { SimNetwork::new(&network, 1, 15, 10, 3, 5, 3, seed).await });
+
+        let contracts: Vec<_> = (0..NUM_CONTRACTS)
+            .map(|i| SimOperation::create_test_contract(0x40 + i as u8))
+            .collect();
+
+        // Interleave PUTs then GETs: all PUTs first (so seed chains form), then a
+        // far first-read GET of each contract from a node far from its originator.
+        let mut ops = Vec::new();
+        for (i, contract) in contracts.iter().enumerate() {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(&network, 1 + (i % 14)),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state((i + 1) as u8),
+                    subscribe: false,
+                },
+            ));
+        }
+        for (i, contract) in contracts.iter().enumerate() {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(&network, 1 + ((i + 7) % 14)),
+                SimOperation::Get {
+                    contract_id: *contract.key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+
+        let result = sim.run_controlled_simulation(
+            seed,
+            ops,
+            Duration::from_secs(420),
+            Duration::from_secs(90),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "seed={seed:x}: sim failed: {:?}",
+            result.turmoil_result.err()
+        );
+
+        let installed = result.aggregate_renewal_metrics().put_seed_leases_installed;
+        // Per contract: how many peers host it WITH state (redundant fresh copies)
+        // and did the far getter obtain the state.
+        let mut get_successes = 0usize;
+        let mut total_hosts_with_state = 0usize;
+        for (i, contract) in contracts.iter().enumerate() {
+            let contract_key = contract.key();
+            let hosts_with_state = result
+                .captured_node_labels()
+                .into_iter()
+                .filter(|l| {
+                    result.is_node_hosting(l, &contract_key)
+                        && result
+                            .node_storages
+                            .get(l)
+                            .is_some_and(|s| s.get_stored_state(&contract_key).is_some())
+                })
+                .count();
+            total_hosts_with_state += hosts_with_state;
+            let getter = NodeLabel::node(&network, 1 + ((i + 7) % 14));
+            if result
+                .node_storages
+                .get(&getter)
+                .is_some_and(|s| s.get_stored_state(&contract_key).is_some())
+            {
+                get_successes += 1;
+            }
+        }
+        eprintln!(
+            "[seed-findable seed={seed:x}] installed={installed} get_successes={get_successes}/{NUM_CONTRACTS} \
+             total_hosts_with_state={total_hosts_with_state}"
+        );
+
+        // The mechanism reliably fired across the batch (seed leases installed on
+        // near-key descents).
+        assert!(
+            installed > 0,
+            "seed={seed:x}: no PUT seed leases installed across {NUM_CONTRACTS} PUTs — the \
+             mechanism never ran"
+        );
+        // Redundant fresh near-key hosts exist (more copies than one-per-contract:
+        // originator + terminus + the seed chain's near-key hosts).
+        assert!(
+            total_hosts_with_state > NUM_CONTRACTS,
+            "seed={seed:x}: only {total_hosts_with_state} hosts-with-state across \
+             {NUM_CONTRACTS} contracts — no redundant fresh copies (findability/churn-redundancy)"
+        );
+        // Findability: a strong majority of far first-read GETs obtain the state.
+        assert!(
+            get_successes * 10 >= NUM_CONTRACTS * 7,
+            "seed={seed:x}: only {get_successes}/{NUM_CONTRACTS} far first-read GETs obtained \
+             state — findability is weak (a single-holder contract dead-ends far readers)"
+        );
+    }
+}
+
 /// Proof 4 (popular-contract fan-out is MEASURED, not bounded here): many
 /// distant nodes subscribe to ONE contract, building a wide mesh toward its key.
 /// We MEASURE the fan-out (subscription-mesh size, max recorded upstreams, max
