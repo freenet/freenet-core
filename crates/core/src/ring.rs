@@ -2917,6 +2917,14 @@ impl Ring {
         self.hosting_manager.can_admit_subscription(contract)
     }
 
+    /// Aggregate update-fan-out width: total lease-valid downstream subscribers
+    /// across all contracts (the quantity piece-B admission caps). Used by the
+    /// snapshot telemetry and the simulation harness's per-node fan-out assertion.
+    /// See [`HostingManager::total_downstream_subscribers`](hosting::HostingManager::total_downstream_subscribers).
+    pub(crate) fn total_downstream_subscribers(&self) -> usize {
+        self.hosting_manager.total_downstream_subscribers()
+    }
+
     /// Whether something still depends on this node hosting `contract` — a
     /// live local client subscription or a downstream peer subscriber.
     ///

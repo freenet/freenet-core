@@ -507,9 +507,21 @@ impl ControlledSimulationResult {
                 acc.chain_hosts_formed += m.chain_hosts_formed;
                 // Per-node peak → aggregate as the max across peers.
                 acc.max_cycle_batch = acc.max_cycle_batch.max(m.max_cycle_batch);
+                acc.subscriptions_refused += m.subscriptions_refused;
                 acc
             },
         )
+    }
+
+    /// Aggregate update-fan-out width of `label`'s node at the end of the run —
+    /// the total lease-valid downstream subscribers across all contracts, the
+    /// quantity piece-B admission caps. Returns 0 if the node never published
+    /// its Ring. See [`Ring::total_downstream_subscribers`].
+    pub fn node_total_downstream_subscribers(&self, label: &NodeLabel) -> usize {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.total_downstream_subscribers())
+            .unwrap_or(0)
     }
 }
 
