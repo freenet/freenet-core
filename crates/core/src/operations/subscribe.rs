@@ -927,6 +927,19 @@ mod messages {
             /// Whether this is a renewal (requester already has contract state).
             /// If true, responder skips sending state to save bandwidth.
             is_renewal: bool,
+            /// Remaining per-request backtracking budget (hosting redesign
+            /// routing-robustness; see `operations::DEFAULT_BACKTRACK_BUDGET`).
+            /// Mirror of `GetMsg::Request.backtrack_budget`: the originator
+            /// seeds `DEFAULT_BACKTRACK_BUDGET` and each relay forwards the
+            /// value it holds, so the counter threads the whole depth-first
+            /// traversal and bounds total alternative next-hop forwards across
+            /// the ENTIRE request. When it hits 0, backtracking stops.
+            ///
+            /// `#[serde(default)]` is for source clarity; cross-version wire
+            /// compat is handled at the handshake layer via
+            /// `MIN_COMPATIBLE_VERSION` (same as `is_renewal`).
+            #[serde(default)]
+            backtrack_budget: u32,
         },
         /// Response for a SUBSCRIBE operation. Routed hop-by-hop back to originator.
         /// Uses instance_id for routing (always available from the request).
@@ -955,6 +968,16 @@ mod messages {
             /// `PutMsg::Response.hop_count`.
             #[serde(default)]
             hop_count: usize,
+            /// Backtracking budget remaining after the responder's subtree
+            /// finished (hosting redesign routing-robustness; see
+            /// `operations::DEFAULT_BACKTRACK_BUDGET`). Only meaningful on a
+            /// `NotFound` result: the upstream relay ADOPTS this before
+            /// deciding whether to try another next-hop candidate, threading
+            /// the per-request budget back up the depth-first traversal. Set
+            /// to 0 for `Subscribed` (ignored there). Mirror of
+            /// `GetMsg::Response.remaining_backtrack_budget`.
+            #[serde(default)]
+            remaining_backtrack_budget: u32,
         },
         /// Explicit unsubscribe notification sent upstream for fast cleanup.
         /// Fire-and-forget: does not require a response or existing operation state.

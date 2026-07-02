@@ -1297,6 +1297,7 @@ where
                         htl,
                         visited,
                         subscribe,
+                        backtrack_budget,
                     } => {
                         if let Err(err) = get::op_ctx_task::start_relay_get(
                             op_manager.clone(),
@@ -1308,6 +1309,7 @@ where
                             visited.clone(),
                             *fetch_contract,
                             *subscribe,
+                            *backtrack_budget,
                         )
                         .await
                         {
@@ -1541,6 +1543,7 @@ where
                         htl,
                         visited,
                         is_renewal,
+                        backtrack_budget,
                     } => {
                         // Phase 7 ban-list gate. Drop SUBSCRIBE for
                         // banned contracts before reaching the driver
@@ -1565,6 +1568,7 @@ where
                             visited.clone(),
                             *is_renewal,
                             upstream_addr,
+                            *backtrack_budget,
                         )
                         .await
                         {
