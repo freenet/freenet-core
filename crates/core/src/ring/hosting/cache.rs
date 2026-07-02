@@ -78,8 +78,10 @@ const DEFAULT_HOSTING_BUDGET_RAM_DIVISOR: u64 = 8;
 
 /// Fallback total-RAM estimate (1 GiB) when the OS query fails. Conservative:
 /// at 1 GiB the divisor yields 128 MiB (the floor), so an unknown-RAM host gets
-/// the smallest sane budget rather than the max.
-const FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
+/// the smallest sane budget rather than the max. Shared as the single "how much
+/// memory do I have when detection fails" answer — piece B's fan-out capacity
+/// (`ring::hosting::default_fanout_capacity`) uses the same value.
+pub(crate) const FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Default hosting-storage budget, scaled to the memory the node may use.
 ///

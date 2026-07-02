@@ -135,21 +135,19 @@ const MAX_DEFAULT_FANOUT_CAPACITY: usize = 4096;
 /// Yields ~64 (512 MiB box) → ~1024 (8 GiB) → ~4096 (≥32 GiB) after clamping.
 const FANOUT_CAPACITY_RAM_DIVISOR_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Fallback total-RAM estimate when the OS/cgroup query fails, matching the
-/// conservative fallback the byte budget uses so a mis-detected box gets the
-/// smallest sane capacity rather than the largest.
-const FANOUT_FALLBACK_TOTAL_RAM_BYTES: u64 = 512 * 1024 * 1024;
-
 /// Capability-relative default aggregate update-fanout capacity, scaled by the
 /// node's total RAM (the same signal that sizes the hosting byte budget, A2).
 ///
 /// This is the single source of truth for the default; a `HostingManager`
 /// stores it in an atomic that simulation tests (and, later, an operator
-/// override) can replace via [`HostingManager::set_fanout_capacity`].
+/// override) can replace via [`HostingManager::set_fanout_capacity`]. On failed
+/// RAM detection it uses the SAME fallback estimate as the byte budget
+/// ([`cache::FALLBACK_TOTAL_RAM_BYTES`]) so the node has one notion of "how much
+/// memory do I have".
 pub(crate) fn default_fanout_capacity() -> usize {
     let total_ram = crate::wasm_runtime::read_total_ram_bytes()
         .map(|b| b as u64)
-        .unwrap_or(FANOUT_FALLBACK_TOTAL_RAM_BYTES);
+        .unwrap_or(cache::FALLBACK_TOTAL_RAM_BYTES);
     fanout_capacity_for_ram(total_ram)
 }
 
@@ -1150,16 +1148,26 @@ impl HostingManager {
     ///    the byte term does not apply to it.
     ///
     /// The caller uses a `false` here to answer `NotFound` instead of
-    /// `Subscribed`, so the requester re-routes to another acceptor (or, if all
-    /// closer peers refuse, remains a valid stranded host — design §5d). It must
-    /// NOT be consulted for a peer's own local-client subscribe (a node always
-    /// hosts its own client demand) nor for renewals (they merely maintain an
-    /// existing demand-pinned host and add no new fan-out).
+    /// `Subscribed`, so the requester re-routes to another acceptor via the
+    /// existing retry plumbing. If NO reachable host will accept (every closer
+    /// peer saturated and no alternate path), the subscribe exhausts and the
+    /// originator's client subscribe fails — genuine capacity back-pressure, NOT
+    /// a stranded host (the originator does not auto-host on exhaustion). Piece B
+    /// therefore relies on piece D's chain-host multiplicity + the generous
+    /// default capacity so global saturation of a key region is rare; see the
+    /// release-order note in `.claude/rules/hosting-invariants.md §B` (B must not
+    /// ship before D is live). It must NOT be consulted for a peer's own
+    /// local-client subscribe (a node always hosts its own client demand) nor for
+    /// renewals (they merely maintain an existing demand-pinned host and add no
+    /// new fan-out).
+    ///
+    /// Side-effect-free query: the refusal counter is bumped separately by
+    /// [`Self::record_subscription_refused`] at the actual refusal sites, so a
+    /// future speculative "would this be admitted?" caller cannot inflate the
+    /// production refusal telemetry.
     pub(crate) fn can_admit_subscription(&self, contract: &ContractKey) -> bool {
         // 1. Aggregate fan-out capacity.
         if self.total_downstream_subscribers() >= self.fanout_capacity() {
-            self.subscription_refusals_total
-                .fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
@@ -1167,13 +1175,19 @@ impl HostingManager {
         if !self.is_hosting_contract(contract) {
             let stats = self.hosting_cache_stats();
             if stats.current_bytes >= stats.budget_bytes {
-                self.subscription_refusals_total
-                    .fetch_add(1, Ordering::Relaxed);
                 return false;
             }
         }
 
         true
+    }
+
+    /// Record that a fresh downstream subscription was REFUSED by admission
+    /// (piece B). Called at each refusal site so all refusal accounting lives in
+    /// one place and `can_admit_subscription` stays a side-effect-free query.
+    pub(crate) fn record_subscription_refused(&self) {
+        self.subscription_refusals_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether something still depends on this node hosting `contract` — a
@@ -3381,7 +3395,12 @@ mod tests {
         assert_eq!(
             fanout_capacity_for_ram(64 * 1024 * 1024),
             MIN_DEFAULT_FANOUT_CAPACITY,
-            "512 MiB → 8 raw, clamps up to the floor (64)"
+            "64 MiB → 8 raw, clamps up to the floor (64)"
+        );
+        assert_eq!(
+            fanout_capacity_for_ram(512 * 1024 * 1024),
+            MIN_DEFAULT_FANOUT_CAPACITY,
+            "512 MiB → 64 raw = exactly the floor"
         );
         // Mid-range scales linearly: 8 GiB / 8 MiB = 1024.
         assert_eq!(fanout_capacity_for_ram(8 * 1024 * 1024 * 1024), 1024);
@@ -3444,17 +3463,28 @@ mod tests {
         manager.add_downstream_subscriber(&c2, make_peer_key(12));
         assert_eq!(manager.total_downstream_subscribers(), 3);
 
-        // A fresh subscription to ANY contract is now refused (over-committed),
-        // and the refusal counter increments.
+        // A fresh subscription to ANY contract is now refused (over-committed).
+        // `can_admit_subscription` is a pure query — it does NOT bump the refusal
+        // counter (that is `record_subscription_refused`, called at the refusal
+        // site); see `record_subscription_refused_bumps_counter`.
         let c3 = make_contract_key(3);
         assert!(
             !manager.can_admit_subscription(&c3),
             "at fan-out capacity, a fresh subscription must be refused"
         );
-        assert_eq!(manager.subscription_refusals_total(), 1);
         // Even a contract we already host is refused on the fan-out axis — the
         // node genuinely cannot sustain more broadcast fan-out.
         assert!(!manager.can_admit_subscription(&c1));
+        // Pure query: no telemetry mutated.
+        assert_eq!(manager.subscription_refusals_total(), 0);
+    }
+
+    #[test]
+    fn record_subscription_refused_bumps_counter() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        assert_eq!(manager.subscription_refusals_total(), 0);
+        manager.record_subscription_refused();
+        manager.record_subscription_refused();
         assert_eq!(manager.subscription_refusals_total(), 2);
     }
 
@@ -3479,7 +3509,6 @@ mod tests {
             !manager.can_admit_subscription(&fresh),
             "new contract refused when the byte budget is saturated"
         );
-        assert_eq!(manager.subscription_refusals_total(), 1);
     }
 
     #[test]

@@ -1617,16 +1617,19 @@ async fn run_relay_subscribe(
     op_manager.release_pending_op_slot(incoming_tx).await;
 }
 
-/// Log + count a piece-B admission refusal. The count is
-/// simulation-observability only (`record_subscription_refused` is a no-op in
-/// production; the production signal is `hosting_subscription_refusals_total` on
-/// the periodic `RouterSnapshot`). Factored out so the three refusal sites
-/// (local-hit terminus + greedy/consult chain host) stay in sync.
+/// Log + count a piece-B admission refusal. Bumps BOTH the production counter
+/// (`HostingManager::subscription_refusals_total`, surfaced on the periodic
+/// `RouterSnapshot` as `hosting_subscription_refusals_total`) and the
+/// simulation-observability counter (`topology_registry::record_subscription_refused`,
+/// a no-op in production). Factored out so the three refusal sites (local-hit
+/// terminus + greedy/consult chain host) keep all refusal accounting in sync and
+/// `can_admit_subscription` stays a side-effect-free query.
 fn record_subscribe_admission_refusal(
     op_manager: &OpManager,
     incoming_tx: &Transaction,
     key: &freenet_stdlib::prelude::ContractKey,
 ) {
+    op_manager.ring.record_subscription_refused();
     if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
         crate::ring::topology_registry::record_subscription_refused(addr);
     }
@@ -1703,10 +1706,16 @@ async fn drive_relay_subscribe(
         // are over our capability-relative fan-out capacity, REFUSE rather than
         // over-committing and thrashing: answer `NotFound` (the rejection the
         // subscribe path already handles — no wire change) so the requester
-        // re-routes to another acceptor, or, if all closer peers refuse, remains
-        // a valid stranded host (hosting-invariants §B / design §5d). Renewals
-        // are NEVER refused: they maintain an existing demand-pinned host and
-        // add no new fan-out (a refused renewal would collapse a live chain).
+        // re-routes to another acceptor. If NO reachable host will accept (every
+        // closer peer saturated and no alternate path), the subscribe exhausts
+        // and the originator's client subscribe fails — genuine capacity
+        // back-pressure, NOT a stranded host (the originator does not auto-host
+        // on exhaustion; see `drive_client_subscribe_inner`). Piece B relies on
+        // piece D's chain-host multiplicity + the generous default capacity so
+        // this is rare, and MUST NOT ship before D is live (hosting-invariants
+        // §B release order). Renewals are NEVER refused: they maintain an
+        // existing demand-pinned host and add no new fan-out (a refused renewal
+        // would collapse a live chain).
         if !is_renewal && !op_manager.ring.can_admit_subscription(&key) {
             record_subscribe_admission_refusal(op_manager, &incoming_tx, &key);
             return relay_subscribe_send_response(
@@ -3105,12 +3114,15 @@ mod tests {
         );
     }
 
-    /// Pin: relay driver MUST call `register_downstream_subscriber`
-    /// on BOTH the local-hit and downstream-Subscribed paths. Missing
-    /// this registration breaks UPDATE propagation to the original
-    /// requester (see subscribe.rs:1655–1688 for full reasoning).
+    /// Pin: relay driver MUST call `register_downstream_subscriber` on ALL
+    /// THREE accept paths — local-hit terminus, greedy-`Subscribed` chain host,
+    /// and consult-`Subscribed` chain host. Piece B moved the registration out
+    /// of `relay_subscribe_forward_once` into the caller's accept branches, so
+    /// each accept arm now registers explicitly; missing any one breaks UPDATE
+    /// propagation to the original requester on that path. (`>= 3` also guards
+    /// against a future refactor silently dropping one of the three.)
     #[test]
-    fn relay_subscribe_registers_downstream_on_both_paths() {
+    fn relay_subscribe_registers_downstream_on_all_accept_paths() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
             .find("async fn drive_relay_subscribe(")
@@ -3124,9 +3136,9 @@ mod tests {
             .matches("register_downstream_subscriber(")
             .count();
         assert!(
-            hits >= 2,
-            "driver must call register_downstream_subscriber on BOTH local-hit \
-             and downstream-Subscribed paths (found {hits})"
+            hits >= 3,
+            "driver must call register_downstream_subscriber on ALL THREE accept \
+             paths (local-hit + greedy-Subscribed + consult-Subscribed) (found {hits})"
         );
     }
 

@@ -2917,6 +2917,12 @@ impl Ring {
         self.hosting_manager.can_admit_subscription(contract)
     }
 
+    /// Record a piece-B admission refusal for production telemetry. See
+    /// [`HostingManager::record_subscription_refused`].
+    pub(crate) fn record_subscription_refused(&self) {
+        self.hosting_manager.record_subscription_refused();
+    }
+
     /// Aggregate update-fan-out width: total lease-valid downstream subscribers
     /// across all contracts (the quantity piece-B admission caps). Used by the
     /// snapshot telemetry and the simulation harness's per-node fan-out assertion.
