@@ -3058,18 +3058,23 @@ impl Ring {
     /// Number of contracts this node has *real demand* for — a local client
     /// subscription or a downstream subscriber — EXCLUDING cache-only hosting.
     ///
-    /// Reads the live `InterestManager` (on the `OpManager`) via the Ring's
-    /// back-reference. Returns `0` if the `OpManager` is not attached yet or has
-    /// been torn down (the normal startup / shutdown windows). This is the
-    /// "active interest" denominator for the #3763 no-storm invariant — see
-    /// [`InterestManager::active_demand_count`](crate::ring::interest::InterestManager::active_demand_count).
+    /// The number of distinct contracts in active use on this node — the #3763
+    /// no-storm denominator. Reads `HostingManager::in_use_contract_count`, which
+    /// counts contracts backed by a live client subscription or a downstream
+    /// subscriber: the SAME `client_subscriptions`/`downstream_subscribers` maps
+    /// that `contract_in_use` and the renewal gate consult.
+    ///
+    /// This deliberately does NOT read the `InterestManager`'s separate
+    /// `active_demand_count` (`local_client_count`/`downstream_subscriber_count`),
+    /// which is a different source of truth and can diverge from the leases the
+    /// renewal gate actually keeps alive — reporting 0 demand for a
+    /// genuinely-demand-backed, renewed lease. Using the gate's own source makes
+    /// this accessor a truthful "leases track demand, not cache" measurement.
     ///
     /// Test/sim-only accessor (read by `ControlledSimulationResult`).
     #[cfg(any(test, feature = "testing"))]
     pub fn active_demand_count(&self) -> usize {
-        self.upgrade_op_manager()
-            .map(|op_manager| op_manager.interest_manager.active_demand_count())
-            .unwrap_or(0)
+        self.hosting_manager.in_use_contract_count()
     }
 
     /// Number of *upstream* peers this node has recorded for `contract` — i.e.

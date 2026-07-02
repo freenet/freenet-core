@@ -855,6 +855,33 @@ impl HostingManager {
             .is_some_and(|peers| !peers.is_empty())
     }
 
+    /// Number of DISTINCT contracts currently in active use — i.e. backed by a
+    /// live local client subscription OR a registered downstream subscriber.
+    /// This is the exact set the renewal gate keeps alive (`contract_in_use`,
+    /// demand-driven-hosting §5a/§6), so it is the honest #3763 no-storm
+    /// denominator: it must NOT grow with cache size.
+    ///
+    /// NOTE: this reads HostingManager's own `client_subscriptions` /
+    /// `downstream_subscribers` maps — the SAME source `contract_in_use` and the
+    /// renewal gate read — deliberately, NOT the InterestManager's separate
+    /// `local_client_count`/`downstream_subscriber_count`, which can diverge and
+    /// therefore mis-reports the leases the gate actually keeps alive.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn in_use_contract_count(&self) -> usize {
+        let mut ids: HashSet<ContractInstanceId> = HashSet::new();
+        for e in self.client_subscriptions.iter() {
+            if !e.value().is_empty() {
+                ids.insert(*e.key());
+            }
+        }
+        for e in self.downstream_subscribers.iter() {
+            if !e.value().is_empty() {
+                ids.insert(*e.key().id());
+            }
+        }
+        ids.len()
+    }
+
     /// Number of local (WebSocket) clients currently subscribed to this
     /// contract. Used by governance to compute the live beneficiary
     /// snapshot (the strong, hard-to-fake demand signal). Reads
