@@ -90,6 +90,16 @@ pub struct FaultConfig {
     pub crashed_nodes: HashSet<SocketAddr>,
     /// Probability of a node crashing per time step
     pub node_crash_rate: f64,
+    /// Opt-in flag: when true, the SimulationSocket delivery path drops packets
+    /// to/from a `crashed_nodes` member for THIS network. The
+    /// `PacketDeliveryCallback` registered by `run_controlled_simulation`
+    /// consults this flag per network, so leaving it `false` (the default)
+    /// keeps every existing test's fault injection exactly as it was (inert in
+    /// the SimulationSocket path) — only a network that explicitly opts in via
+    /// `SimNetwork::enable_crash_delivery_gating` has its `CrashNode` events
+    /// actually block messages. See the callback registration for why gating is
+    /// crash-only (deterministic, no RNG/time in the hot send path).
+    pub delivery_gating_enabled: bool,
 }
 
 impl Default for FaultConfig {
@@ -100,6 +110,7 @@ impl Default for FaultConfig {
             partitions: Vec::new(),
             crashed_nodes: HashSet::new(),
             node_crash_rate: 0.0,
+            delivery_gating_enabled: false,
         }
     }
 }
