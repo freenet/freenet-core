@@ -4628,6 +4628,67 @@ mod tests {
         );
     }
 
+    /// PUT seed-chain (hosting-invariants.md §E): the relay's Response arm must
+    /// install the near-key seed lease ONLY AFTER bubbling the Response upstream,
+    /// so the seed formation (contract-handling work driven by the renewal loop)
+    /// never sits on the upstream critical path (forward-before-contract-handling,
+    /// operations.md). This locks the ordering into the call path so a future
+    /// edit that seeds before the forward fails the build.
+    #[test]
+    fn drive_relay_put_installs_seed_lease_after_upstream_bubble() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_put<CB>(")
+            .expect("drive_relay_put not found");
+        let driver_end = src[driver_start..]
+            .find("\nasync fn relay_put_store_locally(")
+            .expect("driver body end not found")
+            + driver_start;
+        let driver_src = &src[driver_start..driver_end];
+
+        // In the Response-handling match, the upstream bubble precedes the seed
+        // install. Anchor on the first bubble in the reply match (there are two —
+        // Response and ResponseStreaming — both must precede their seed install).
+        let seed_pos = driver_src
+            .find("maybe_install_put_seed_lease(")
+            .expect("drive_relay_put MUST install the near-key seed lease on the Response path");
+        let bubble_pos = driver_src
+            .find("relay_put_send_response(")
+            .expect("drive_relay_put MUST bubble the Response upstream");
+        assert!(
+            bubble_pos < seed_pos,
+            "the upstream Response bubble MUST precede the seed-lease install \
+             (forward-before-contract-handling): seed formation is driven off the \
+             renewal loop and must not sit on the upstream critical path"
+        );
+
+        // The helper is demand-blind at the hop level but bounded: it gates on the
+        // near-key seed window via the existing wire `hop_count` (terminus depth)
+        // and `SEED_CHAIN_LENGTH`, and installs through the capped seed-lease store
+        // (NOT a durable unconditional store — that would be relay-caching).
+        let helper_start = src
+            .find("fn maybe_install_put_seed_lease(")
+            .expect("maybe_install_put_seed_lease helper not found");
+        let helper_end = src[helper_start..]
+            .find("\n}\n")
+            .expect("helper body end not found")
+            + helper_start;
+        let helper_src = &src[helper_start..helper_end];
+        assert!(
+            helper_src.contains("SEED_CHAIN_LENGTH"),
+            "seed helper MUST bound the chain length via SEED_CHAIN_LENGTH"
+        );
+        assert!(
+            helper_src.contains("install_seed_lease("),
+            "seed helper MUST go through the capped install_seed_lease (not a durable store)"
+        );
+        assert!(
+            helper_src.contains("terminus_hop_count") && helper_src.contains("received_htl"),
+            "seed helper MUST derive its distance from the terminus using the existing \
+             wire hop_count + its own htl (no new wire field)"
+        );
+    }
+
     /// Wiring pin for #4363: the greedy-routing terminus guard
     /// (`put_routing_should_terminate`) MUST be invoked in the
     /// non-streaming relay body, BEFORE the chosen next hop is forwarded
