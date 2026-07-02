@@ -3609,13 +3609,15 @@ fn run_fanout_liveness_scenario_inner(
     ));
     for node_idx in 1..=subscribers {
         // Each subscriber GETs-then-subscribes rather than issuing a bare
-        // `Subscribe`. This is REQUIRED for the subscriber to actually join the
-        // fan-out: a bare `ContractRequest::Subscribe` is rejected by the
-        // client-event handler ("Rejecting SUBSCRIBE: contract WASM not cached
-        // locally", client_events.rs) unless the node already holds the
-        // contract WASM — the production guard that forces a real client to PUT
-        // or GET the contract before subscribing (so it can validate/apply
-        // incoming updates). `GET+subscribe=true` is the documented exempt path:
+        // `Subscribe`. NOTE (#4642): a bare `Subscribe` on an uncached contract
+        // no longer rejects — it now routes as this SAME combined get+subscribe
+        // internally (client_events.rs). This test keeps the explicit
+        // `GET+subscribe=true` for clarity; historically it was REQUIRED because
+        // a bare `ContractRequest::Subscribe` was rejected by the client-event
+        // handler ("Rejecting SUBSCRIBE: contract WASM not cached locally",
+        // client_events.rs) unless the node already held the contract WASM —
+        // the #3757 guard that forced a client to PUT or GET before subscribing
+        // (so it could validate/apply updates). `GET+subscribe=true` is the path:
         // the GET inherently fetches the WASM+state from the host over the
         // preseeded connection, and the explicit `subscribe=true` flag then
         // subscribes (`maybe_subscribe_child` -> `run_client_subscribe`),
@@ -11481,10 +11483,11 @@ fn run_relay_become_host_scenario(seed: u64, network_name: &str) -> RelayBecomeH
                 state: vec![11, 22, 33, 44],
             },
         ),
-        // Seed the subscriber too: a bare SUBSCRIBE for an absent contract fails
-        // the local RegisterSubscriberListener gate and never starts the network
-        // subscribe. With the contract present, the SUBSCRIBE passes that gate
-        // and routes UPSTREAM toward the key to build the subscription tree.
+        // Seed the subscriber with the contract so its SUBSCRIBE takes the
+        // local-cache path (subscribe directly, routing UPSTREAM toward the key
+        // to build the subscription tree) rather than the combined get+subscribe
+        // path a bare SUBSCRIBE on an absent contract now takes (#4642). Seeding
+        // keeps this test's behaviour identical to before that change.
         // (This makes the subscriber's own hosting non-load-bearing — see the
         // test's assertion comments — but it does NOT short-circuit the chain:
         // the subscribe still routes to the network and dead-ends at the cluster,

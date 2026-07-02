@@ -57,7 +57,14 @@
 //!
 //! ## Why `nat-peer` GETs (with `subscribe=true`) instead of a bare SUBSCRIBE (#4524)
 //!
-//! A bare `ContractRequest::Subscribe` is rejected by the client-event handler
+//! NOTE (#4642): as of the demand-driven combined get+subscribe, a bare
+//! `ContractRequest::Subscribe` on an uncached contract NO LONGER rejects — it
+//! routes as a get+subscribe (the GET fetches state toward the key). This test
+//! keeps the explicit `GET+subscribe=true` because it exercises the SAME relay
+//! path and makes the WASM-acquisition precondition explicit; the reject
+//! described below is historical (the #3757 guard, removed by #4642).
+//!
+//! A bare `ContractRequest::Subscribe` was rejected by the client-event handler
 //! unless the contract WASM/state is already cached on the *local* node
 //! (`client_events.rs`: "Rejecting SUBSCRIBE: contract WASM not cached
 //! locally" — the guard added in #3757 so a node can't be "subscribed but

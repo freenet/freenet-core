@@ -461,13 +461,21 @@ async fn test_subscribe_failure_notifies_client(ctx: &mut TestContext) -> TestRe
     Ok(())
 }
 
-/// Subscribe without prior PUT is rejected immediately with a descriptive error.
+/// Subscribe to a contract that exists NOWHERE fails fast with an error.
 ///
-/// When a client subscribes to a contract that hasn't been PUT or GET'd,
-/// the node lacks the WASM needed to validate updates.
-/// The Subscribe must be rejected fast (not after a network timeout).
+/// Semantics changed with the demand-driven combined get+subscribe (#4642
+/// piece D/E, design §3/§8): a bare `Subscribe` on an uncached contract no
+/// longer REJECTS ("contract WASM not cached locally", the old #3757 guard).
+/// It now routes as a combined get+subscribe — the GET fetches state toward the
+/// key so the subscriber can become a real host — because with relay-caching
+/// removed that is the only way a non-host acquires state. Here the contract was
+/// never PUT anywhere, so on this lone gateway the GET finds no hosting peer and
+/// the operation fails fast (`NoHostingPeers`), delivering an error to the
+/// client. The test therefore still asserts "a subscribe to an unreachable
+/// contract fails fast, not after a network timeout" — only the failure CAUSE
+/// changed (no-host-to-fetch-from, not local-cache-miss).
 ///
-/// Regression test for #3601.
+/// Regression test for #3601; semantics updated for #4642.
 #[freenet_test(
     health_check_readiness = true,
     nodes = ["gateway"],
@@ -484,7 +492,9 @@ async fn test_subscribe_without_wasm_rejected(ctx: &mut TestContext) -> TestResu
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = load_contract(TEST_CONTRACT, vec![42u8; 32].into())?;
 
-    // Subscribe WITHOUT prior PUT — should be rejected quickly
+    // Subscribe to a contract that was never PUT anywhere. Under the combined
+    // get+subscribe (#4642) this routes as a GET toward the key; on this lone
+    // gateway there is no host to fetch from, so it fails fast (NoHostingPeers).
     make_subscribe(&mut client, contract.key()).await?;
 
     let start = tokio::time::Instant::now();
