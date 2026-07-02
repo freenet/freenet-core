@@ -223,6 +223,15 @@ pub struct RenewalMetrics {
     /// interest-gated renewal keeps the subscription count bounded by active
     /// interest rather than by the number of hosts formed.
     pub chain_hosts_formed: u64,
+    /// Times this node REFUSED to become/act-as a host for a fresh downstream
+    /// subscription because it was over-committed (piece B admission, #4642):
+    /// its aggregate update-fanout width or its hosting byte-budget had no
+    /// headroom, so it answered `NotFound` and the requester re-routed to
+    /// another acceptor. Cumulative. Lets the popular-contract fan-out
+    /// simulation assert that a saturated near-key host DOES refuse (so
+    /// per-peer fan-out stays bounded) while the re-route proof shows the
+    /// refused subscriber still finds a host.
+    pub subscriptions_refused: u64,
 }
 
 static RENEWAL_METRICS_REGISTRY: LazyLock<DashMap<(String, SocketAddr), RenewalMetrics>> =
@@ -276,6 +285,17 @@ pub fn record_chain_host_formed(peer_addr: SocketAddr) {
     }
 }
 
+/// Record that this node REFUSED a fresh downstream subscription because it was
+/// over-committed (piece B admission). No-op outside a simulation context.
+pub fn record_subscription_refused(peer_addr: SocketAddr) {
+    if let Some(network_name) = get_current_network_name() {
+        RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default()
+            .subscriptions_refused += 1;
+    }
+}
+
 /// Get the renewal metrics for a specific peer in a network.
 pub fn get_renewal_metrics(network_name: &str, peer_addr: &SocketAddr) -> Option<RenewalMetrics> {
     RENEWAL_METRICS_REGISTRY
@@ -306,6 +326,7 @@ pub fn aggregate_renewal_metrics(network_name: &str) -> RenewalMetrics {
             acc.wire_attempts += entry.value().wire_attempts;
             acc.terminus_satisfied += entry.value().terminus_satisfied;
             acc.chain_hosts_formed += entry.value().chain_hosts_formed;
+            acc.subscriptions_refused += entry.value().subscriptions_refused;
             // Aggregate as the max across peers (it is a per-node peak, not a
             // count), so the aggregate stays meaningful as "worst single-cycle
             // batch any node reached".
