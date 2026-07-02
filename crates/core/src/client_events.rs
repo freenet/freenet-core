@@ -1110,18 +1110,92 @@ async fn process_open_request(
                                 // Contract WASM and state are cached locally, proceed
                             }
                             Ok(crate::contract::ContractHandlerEvent::GetResponse { .. }) => {
-                                tracing::warn!(
+                                // Combined get+subscribe (design §3/§8, epic #4642
+                                // piece D/E). The contract is not cached locally, so
+                                // a bare SUBSCRIBE cannot become a fresh host on its
+                                // own — the subscribe carries no state. Rather than
+                                // REJECT (the pre-demand-driven #3757 guard, which
+                                // assumed relay-caching had already pre-positioned the
+                                // state along the route), route it as a GET+subscribe:
+                                // the GET fetches the state toward the key and, on the
+                                // return path, EACH hop caches+hosts it (host-on-GET,
+                                // `get/op_ctx_task.rs::cache_contract_locally`, which
+                                // fires at intermediate relays, not just the
+                                // originator) — so the state "rides in with the
+                                // operation" and the chain forms with REAL hosts. The
+                                // explicit `subscribe=true` then installs the lease and
+                                // joins the update mesh (`maybe_subscribe_child` ->
+                                // `run_client_subscribe`). This reuses the proven,
+                                // wire-compatible GET+subscribe path — no separate/racy
+                                // deferred fetch, no wire-format change — and realizes
+                                // "a subscribe on a non-host routes toward the key and
+                                // fetches" (design §8). §5d is preserved: host-on-GET
+                                // only fires on a SUCCESSFUL GET (state present), so no
+                                // hop advertises a copy before it is synced.
+                                //
+                                // With relay-caching removed (piece E) this is the ONLY
+                                // way a spread-out subscriber acquires state
+                                // relay-caching-free; the old REJECT degenerated the
+                                // subscription mesh to the PUT holders only.
+                                tracing::debug!(
                                     client_id = %client_id,
                                     request_id = %request_id,
                                     contract = %key,
-                                    "Rejecting SUBSCRIBE: contract WASM not cached locally. \
-                                     PUT the contract or GET the contract first."
+                                    "SUBSCRIBE on uncached contract: routing as combined \
+                                     GET+subscribe (state rides in with the op; §3/§8)"
                                 );
-                                return Err(Error::Node(format!(
-                                    "Cannot subscribe to contract {key}: contract WASM/parameters \
-                                     not cached locally. PUT the contract or GET the contract \
-                                     before subscribing."
-                                )));
+                                let get_tx = crate::message::Transaction::new::<get::GetMsg>();
+                                op_manager
+                                    .ch_outbound
+                                    .waiting_for_transaction_result(get_tx, client_id, request_id)
+                                    .await?;
+                                // Register the client's update listener BEFORE starting
+                                // the GET (mirrors the explicit GET+subscribe handler),
+                                // so updates that arrive as soon as the subscription
+                                // takes are delivered to this client.
+                                if let Some(sl) = subscription_listener {
+                                    register_subscription_listener(
+                                        &op_manager,
+                                        key,
+                                        client_id,
+                                        sl,
+                                        "SUBSCRIBE->GET",
+                                    )
+                                    .await?;
+                                }
+                                let key_for_err = ContractKey::from_id_and_code(
+                                    key,
+                                    freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+                                );
+                                if let Err(err) = get::op_ctx_task::start_client_get(
+                                    op_manager.clone(),
+                                    get_tx,
+                                    key,
+                                    // return_contract_code=true: we need the WASM so the
+                                    // new host can validate/apply future updates (the
+                                    // exact invariant the #3757 guard protected).
+                                    true,
+                                    // subscribe=true: install the lease + join the mesh
+                                    // once the GET lands the state.
+                                    true,
+                                    // blocking_subscribe=false: match the client
+                                    // GET+subscribe default.
+                                    false,
+                                )
+                                .await
+                                {
+                                    report_op_init_error(
+                                        &op_manager,
+                                        get_tx,
+                                        &key_for_err,
+                                        "SUBSCRIBE->GET",
+                                        &err,
+                                        client_id,
+                                        request_id,
+                                    )
+                                    .await;
+                                }
+                                return Ok(None);
                             }
                             Err(err) => {
                                 tracing::error!(
