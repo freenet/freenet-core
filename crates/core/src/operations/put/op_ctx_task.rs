@@ -2007,6 +2007,21 @@ fn maybe_install_put_seed_lease(
         }
     }
 
+    // Freshness caveat (hosting invariant 1; Codex review 2026-07-02). A seed
+    // lease makes this relay `contract_in_use`, so the renewal loop drives it
+    // through `finalize_host_subscribe`. In the COMMON case a routing relay does
+    // not hold the contract, so that path fetches the fresh body from the
+    // terminus before it announces. The EDGE case is a relay that still has an
+    // EVICTED-but-on-disk OLDER body for this key (is_hosting=false, state
+    // present): `fetch_contract_if_missing` short-circuits on the present body, so
+    // the seed host can briefly advertise a not-yet-reconciled copy. This is a
+    // property of the SHARED `finalize_host_subscribe` fetch short-circuit (every
+    // piece-D chain host inherits it), not of the seed chain specifically, and it
+    // self-corrects: the seed host is now in `should_summarize_or_broadcast`, so
+    // the next InterestSync summary/delta exchange reconciles it to the mesh. The
+    // proper tightening ("announce only after a freshness reconcile", §5d "must
+    // not serve until synced") belongs in `finalize_host_subscribe` and benefits
+    // piece D too — tracked for bundle integration, out of scope for this PR.
     if op_manager.ring.install_seed_lease(key) {
         tracing::debug!(
             contract = %key,
