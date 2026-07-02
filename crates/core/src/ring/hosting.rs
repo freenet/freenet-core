@@ -98,6 +98,62 @@ const MAX_SUBSCRIPTION_BACKOFF_ENTRIES: usize = 4096;
 /// Prevents network-level subscription amplification attacks.
 const MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT: usize = 512;
 
+// -----------------------------------------------------------------------------
+// PUT seed-chain (findability bootstrap) — hosting-invariants.md §E,
+// docs/design/demand-driven-hosting.md
+// -----------------------------------------------------------------------------
+
+/// PUT seed-chain length: the number of near-key hosts a PUT seeds, INCLUDING
+/// the terminus. The terminus is the persistent, capacity-bounded near-key seed
+/// (piece E baseline, unchanged); the other `SEED_CHAIN_LENGTH - 1` hops along
+/// the near-key descent become time-bounded SEED-LEASED hosts (see
+/// `SEED_LEASE_DURATION`). Bounded to a few hops on purpose: near the key is
+/// where reader routes converge, so extra fresh copies there are
+/// findability-effective, whereas seeding the far part of the PUT route is
+/// demand-blind waste (the relay-caching anti-pattern).
+pub const SEED_CHAIN_LENGTH: usize = 3;
+
+/// PUT seed-lease window.
+///
+/// A seed-leased host keeps renewing its subscription (staying in the update
+/// mesh and advertised for terminal-consult) for this long WITHOUT any demand,
+/// bridging the gap between a PUT and the contract's first read/subscribe. It is
+/// deliberately on the order of HOURS, not days: durability is demand's job (a
+/// subscriber keeps a copy alive), not the seed chain's — the seed chain only
+/// bootstraps findability until real demand arrives.
+///
+/// Spam-safety rests on this being a HARD, non-renewable deadline: the seed
+/// itself cannot extend it, so with no real demand every seed lease lapses after
+/// the window, its subscription stops being renewed, and the seed chain
+/// collapses (demand-driven-hosting.md §5-§7). A spammer's bogus PUTs therefore
+/// cannot accumulate hosting past the window. ~15x the ordinary
+/// `SUBSCRIPTION_LEASE_DURATION`.
+pub const SEED_LEASE_DURATION: Duration = Duration::from_secs(2 * 60 * 60); // 2 hours
+
+/// Absolute ceiling on concurrently-active seed leases per node.
+///
+/// A seed lease pins a contract as `contract_in_use` (renewed + eviction-exempt)
+/// for the whole window, so an unbounded seed-lease set is a memory / renewal
+/// amplification vector: a burst of spam PUTs routed near this peer's key region
+/// could pin many eviction-exempt hosts at once (even though each individually
+/// lapses after the window). The effective cap is the SMALLER of this ceiling
+/// and a byte-budget-derived limit (`seed_lease_cap`) so a small-RAM node
+/// (#4565) never lets seeds dominate its hosting budget.
+pub const MAX_ACTIVE_SEED_LEASES: usize = 256;
+
+/// Seed leases may occupy at most `1 / SEED_LEASE_BUDGET_DIVISOR` of the hosting
+/// byte-budget, so they cannot starve real demand or OOM a small node.
+const SEED_LEASE_BUDGET_DIVISOR: u64 = 4;
+
+/// Approximate per-contract resident cost, used ONLY to turn the byte-budget
+/// fraction into a seed-lease COUNT cap. ~1 MiB matches the per-contract
+/// resident figure profiled for the eviction budget (hosting-invariants.md).
+const APPROX_SEED_CONTRACT_BYTES: u64 = 1 << 20;
+
+/// Floor for the byte-budget-derived seed-lease cap so a node with a tiny (or
+/// unset) budget still admits at least one PUT's worth of seed chain.
+const MIN_SEED_LEASE_CAP: usize = SEED_CHAIN_LENGTH;
+
 // =============================================================================
 // Result Types
 // =============================================================================
@@ -261,6 +317,20 @@ pub(crate) struct HostingManager {
     /// eviction is deterministic. Shared (same `Arc`) with `hosting_cache`.
     time_source: DynTimeSource,
 
+    /// Active PUT seed leases: contract → hard expiry `Instant`.
+    ///
+    /// A seed lease is a time-bounded, non-demand reason to keep hosting a
+    /// freshly-PUT contract near its key, giving a findability / churn-redundancy
+    /// bootstrap window (`SEED_LEASE_DURATION`) before the contract's first read.
+    /// It feeds `contract_in_use` (so the seed host is renewed + eviction-exempt)
+    /// and `contracts_needing_renewal` (so the renewal loop drives the seed host
+    /// into the update mesh). Unlike a client/downstream signal it is NOT
+    /// renewable by the seed itself — the expiry is a hard deadline, which is
+    /// what makes it a bounded exemption (AGENTS.md cleanup rule) and spam-safe
+    /// (the chain collapses when the lease lapses). Swept by
+    /// `expire_stale_seed_leases`; bounded by `seed_lease_cap`.
+    seed_leases: DashMap<ContractKey, Instant>,
+
     /// Contracts with subscription requests currently in-flight.
     pending_subscription_requests: DashSet<ContractKey>,
 
@@ -358,6 +428,7 @@ impl HostingManager {
             local_get_forwards: AtomicU64::new(0),
             downstream_subscribers: DashMap::new(),
             time_source,
+            seed_leases: DashMap::new(),
             pending_subscription_requests: DashSet::new(),
             subscription_backoff: RwLock::new(TrackedBackoff::new(
                 backoff_config,
@@ -1025,8 +1096,106 @@ impl HostingManager {
     /// The narrow case "subscribed but no local interest" should be handled
     /// by tearing down the orphaned upstream subscription, not by carrying
     /// an unbounded GC exemption here.
+    ///
+    /// **Why a PUT seed lease IS included (unlike `is_subscribed`).** A seed
+    /// lease (`has_active_seed_lease`) is the deliberate, time-bounded exemption
+    /// the redesign adds for the PUT-to-first-demand findability window
+    /// (`SEED_LEASE_DURATION`, hosting-invariants.md §E). It is safe to include
+    /// here precisely because it is bounded where `is_subscribed` is not: the
+    /// expiry is a HARD deadline the seed cannot renew, and the total set is
+    /// capped (`seed_lease_cap`). So a seed-leased contract is renewed +
+    /// eviction-exempt for the window and then, absent real demand, lapses and
+    /// collapses — it cannot self-perpetuate the way an unconditional
+    /// `is_subscribed` exemption would.
     pub fn contract_in_use(&self, contract: &ContractKey) -> bool {
-        self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
+        self.has_client_subscriptions(contract.id())
+            || self.has_downstream_subscribers(contract)
+            || self.has_active_seed_lease(contract)
+    }
+
+    // =========================================================================
+    // PUT seed leases (findability bootstrap window)
+    // =========================================================================
+
+    /// Effective per-node cap on active seed leases: the smaller of the absolute
+    /// ceiling (`MAX_ACTIVE_SEED_LEASES`) and a byte-budget-derived limit, so a
+    /// small-RAM node never lets eviction-exempt seed leases dominate its hosting
+    /// budget (#4565). Floored at `MIN_SEED_LEASE_CAP` so even a tiny/unset
+    /// budget admits one PUT's worth of seed chain.
+    pub(crate) fn seed_lease_cap(&self) -> usize {
+        let budget_bytes = self.hosting_cache.read().budget_bytes();
+        let budget_derived = (budget_bytes / SEED_LEASE_BUDGET_DIVISOR / APPROX_SEED_CONTRACT_BYTES)
+            .min(MAX_ACTIVE_SEED_LEASES as u64) as usize;
+        budget_derived.max(MIN_SEED_LEASE_CAP)
+    }
+
+    /// Number of currently-active (non-expired) seed leases.
+    pub(crate) fn active_seed_lease_count(&self) -> usize {
+        let now = self.time_source.now();
+        self.seed_leases.iter().filter(|e| *e.value() > now).count()
+    }
+
+    /// Whether `contract` currently holds an active PUT seed lease.
+    pub(crate) fn has_active_seed_lease(&self, contract: &ContractKey) -> bool {
+        self.seed_leases
+            .get(contract)
+            .map(|e| *e.value() > self.time_source.now())
+            .unwrap_or(false)
+    }
+
+    /// Install (or refresh) a PUT seed lease for `contract`, expiring a hard
+    /// `SEED_LEASE_DURATION` from now. Returns `true` if a lease is now active.
+    ///
+    /// Refresh of an already-seed-leased contract (a re-PUT within the window)
+    /// is always allowed and extends the deadline — it is still one lease, so it
+    /// does not count against the cap. A NEW contract is rejected (returns
+    /// `false`, no lease installed) when the active-lease count is at
+    /// `seed_lease_cap`; the caller still seeds the terminus (piece E) but adds
+    /// no extra seed-chain host. The deadline is deliberately NOT extendable by
+    /// the seed's own activity — only a fresh PUT refreshes it — so the window
+    /// stays bounded and spam-safe.
+    pub(crate) fn install_seed_lease(&self, contract: ContractKey) -> bool {
+        let now = self.time_source.now();
+        let expires_at = now + SEED_LEASE_DURATION;
+        use dashmap::mapref::entry::Entry;
+        match self.seed_leases.entry(contract) {
+            Entry::Occupied(mut e) => {
+                // Refresh (re-PUT): extend the hard deadline, still one lease.
+                *e.get_mut() = expires_at;
+                true
+            }
+            Entry::Vacant(e) => {
+                if self.active_seed_lease_count() >= self.seed_lease_cap() {
+                    return false;
+                }
+                e.insert(expires_at);
+                true
+            }
+        }
+    }
+
+    /// Remove expired seed leases. Returns the contracts whose lease just lapsed
+    /// so the reaper can record abandonment (the contract may have just become
+    /// no-longer-in-use, letting the next over-budget sweep target it first) and
+    /// tear down the now-demandless upstream subscription. Called on the periodic
+    /// reaper tick alongside `expire_stale_downstream_subscribers`.
+    pub(crate) fn expire_stale_seed_leases(&self) -> Vec<ContractKey> {
+        let now = self.time_source.now();
+        let mut lapsed = Vec::new();
+        self.seed_leases.retain(|contract, expires_at| {
+            if *expires_at <= now {
+                lapsed.push(*contract);
+                false
+            } else {
+                true
+            }
+        });
+        for contract in &lapsed {
+            // The lease was the last in-use signal for a no-demand seed, so its
+            // expiry may transition the contract to no-longer-in-use.
+            self.maybe_record_abandonment(contract);
+        }
+        lapsed
     }
 
     /// Hook called from every code path that removes an "in-use" signal
@@ -1708,6 +1877,32 @@ impl HostingManager {
                 {
                     needs_renewal_set.insert(key);
                 }
+            }
+        }
+
+        // 4. Contracts with an active PUT seed lease (findability bootstrap
+        //    window). Include them whether or not an active subscription exists:
+        //    a seed-leased contract WITHOUT an active sub needs a fresh subscribe
+        //    driven toward the key so it becomes a real, mesh-connected host
+        //    (piece D `run_renewal_subscribe` handles both the initial subscribe
+        //    and re-rooting); one WITH an active sub is already covered by
+        //    section 1 (the seed lease makes it `contract_in_use`) but is cheap
+        //    to re-insert into the dedup set. This is what carries the seed host
+        //    through the window; when the seed lease lapses the contract drops
+        //    out of every section here (no client, no downstream, no seed lease,
+        //    no recent access) and the chain collapses. Bounded by the same
+        //    per-cycle batch limit as any other renewal.
+        {
+            let now = self.time_source.now();
+            let mut seed_leased: Vec<ContractKey> = self
+                .seed_leases
+                .iter()
+                .filter(|e| *e.value() > now)
+                .map(|e| *e.key())
+                .collect();
+            seed_leased.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+            for key in seed_leased {
+                needs_renewal_set.insert(key);
             }
         }
 
