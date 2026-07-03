@@ -2707,13 +2707,42 @@ async fn handle_interest_sync_message(
                             continue;
                         }
 
-                        // Register their interest
-                        let is_new = op_manager.interest_manager.register_peer_interest(
-                            &contract,
-                            pk.clone(),
-                            None,
-                            false,
-                        );
+                        // Register their interest — but preserve an existing
+                        // entry's `is_upstream` flag (and cached summary). A
+                        // ChangeInterests "added" gossip from a peer that is
+                        // ALREADY our upstream host (is_upstream = true, set when
+                        // we subscribed through it — subscribe.rs / operations.rs)
+                        // must NOT be downgraded to a plain downstream interest.
+                        // A bare re-registration with is_upstream=false overwrites
+                        // the whole PeerInterest, flipping is_upstream true -> false
+                        // and wiping the delta-sync summary to None. The is_upstream
+                        // clobber defeats event-driven collapse:
+                        // `send_unsubscribe_upstream` locates the upstream via
+                        // `is_upstream`, so after the first gossip round the
+                        // Unsubscribe is never sent upstream and the chain only
+                        // lapses on lease expiry (~6 min stale window). An upstream
+                        // peer hosts the contract, so it re-advertises interest on
+                        // every ~5-min interest-sync heartbeat, making this clobber
+                        // deterministic and periodic. Mirror the refresh-guard the
+                        // `Interests` full-replace arm above uses. (Guarded wiring
+                        // pinned by change_interests_arm_guards_register_with_refresh_pin.)
+                        let is_new = if op_manager
+                            .interest_manager
+                            .get_peer_interest(&contract, pk)
+                            .is_some()
+                        {
+                            op_manager
+                                .interest_manager
+                                .refresh_peer_interest(&contract, pk);
+                            false
+                        } else {
+                            op_manager.interest_manager.register_peer_interest(
+                                &contract,
+                                pk.clone(),
+                                None,
+                                false,
+                            )
+                        };
                         if is_new {
                             // #4359 (MUST-FIX 1): a ChangeInterests addition
                             // makes this peer a viable broadcast target. Flush
@@ -3498,6 +3527,67 @@ mod tests {
             gated_calls >= 3,
             "expected the 3 periodic interest-sync arms to call \
              summary_if_hosted_or_in_use, found {gated_calls}"
+        );
+    }
+
+    /// Regression pin for the D2 `is_upstream` clobber in the `ChangeInterests`
+    /// interest-sync arm.
+    ///
+    /// A peer that is already our UPSTREAM host (`is_upstream = true`, set when
+    /// we subscribed through it) re-advertises interest on every ~5-min
+    /// interest-sync heartbeat (it hosts the contract, so it is interested).
+    /// A bare `register_peer_interest(.., is_upstream = false)` overwrites the
+    /// whole `PeerInterest`, flipping `is_upstream` true -> false and wiping the
+    /// cached delta-sync summary. The is_upstream clobber defeats event-driven
+    /// chain collapse: `send_unsubscribe_upstream` finds the upstream via
+    /// `is_upstream`, so after the first gossip round the Unsubscribe is never
+    /// sent upstream and the chain only lapses on lease expiry (~6-min stale
+    /// window). The arm therefore MUST guard re-registration of an existing
+    /// entry with `get_peer_interest().is_some() -> refresh_peer_interest()`,
+    /// exactly like the `Interests` full-replace arm.
+    ///
+    /// The primitive behaviour (refresh preserves, bare register clobbers) is
+    /// pinned in `ring/interest.rs` by
+    /// `upstream_interest_survives_refresh_but_bare_register_clobbers_it`.
+    /// Driving the async handler end-to-end needs a full OpManager + connection
+    /// fixture, so — following the codebase convention for interest-sync
+    /// wiring (see `op_state_manager.rs` #4359 pins) — the HANDLER wiring is
+    /// pinned at the source level here.
+    #[test]
+    fn change_interests_arm_guards_register_with_refresh_pin() {
+        let src = include_str!("node.rs");
+
+        let handler_start = src
+            .find("async fn handle_interest_sync_message(")
+            .expect("handle_interest_sync_message not found");
+        let handler_src = &src[handler_start..];
+
+        // Bound the slice to the ChangeInterests arm: from its match pattern up
+        // to the next arm (ResyncRequest), so the guard assertions below can't
+        // false-pass on a neighbouring arm's guard.
+        let arm_start = handler_src
+            .find("InterestMessage::ChangeInterests { added, removed } =>")
+            .expect("ChangeInterests arm not found");
+        let arm_len = handler_src[arm_start..]
+            .find("InterestMessage::ResyncRequest")
+            .expect("ResyncRequest arm (ChangeInterests terminator) not found");
+        let arm = &handler_src[arm_start..arm_start + arm_len];
+
+        // Presence of BOTH guard calls is the regression signal: the pre-fix
+        // (unguarded) arm re-registered every peer with a bare
+        // `is_upstream = false` and contained NEITHER call. Reverting to that
+        // clobber removes both, tripping this pin. (Presence-based rather than
+        // positional so a future comment mentioning a call token can't
+        // spuriously fail it — the sibling `Interests` arm uses the same guard.)
+        assert!(
+            arm.contains("get_peer_interest("),
+            "ChangeInterests arm MUST guard re-registration with get_peer_interest() \
+             so an existing upstream peer is not clobbered to is_upstream=false (D2)"
+        );
+        assert!(
+            arm.contains("refresh_peer_interest("),
+            "ChangeInterests arm MUST refresh (not re-register) an existing entry to \
+             preserve is_upstream + the cached summary (D2)"
         );
     }
 
