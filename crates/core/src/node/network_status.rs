@@ -47,6 +47,16 @@ pub type RingStatsProvider = Arc<dyn Fn() -> RingStatsSnapshot + Send + Sync + '
 /// `Ring::contract_ban_list` directly — no mirrored counter to rot.
 pub type BanListProvider = Arc<dyn Fn() -> BanListSnapshot + Send + Sync + 'static>;
 
+/// Provider for the demand-driven hosting snapshot (piece A, #4642). Same
+/// pattern as the other providers: registered at node startup, replaceable
+/// for multi-node test harnesses, read by `get_snapshot` on every dashboard
+/// request. In production the closure captures `Arc<Ring>` and calls
+/// `Ring::dashboard_hosting_snapshot()`, which reads the canonical hosting
+/// cache (Greedy-Dual keep_score + capability-relative RAM budget) — the
+/// mechanism that actually governs retention now, replacing the dormant MAD
+/// governance detector (#4296).
+pub type HostingProvider = Arc<dyn Fn() -> HostingSnapshot + Send + Sync + 'static>;
+
 /// Snapshot of ring-level statistics exposed to the dashboard.
 #[derive(Debug, Clone, Default)]
 pub struct RingStatsSnapshot {
@@ -109,6 +119,16 @@ static BAN_LIST_PROVIDER: parking_lot::RwLock<Option<BanListProvider>> =
 /// harnesses can re-wire to the current node.
 pub fn set_ban_list_provider(provider: BanListProvider) {
     *BAN_LIST_PROVIDER.write() = Some(provider);
+}
+
+static HOSTING_PROVIDER: parking_lot::RwLock<Option<HostingProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the dashboard's demand-driven hosting data source (piece A,
+/// #4642). Replaces any previously-registered provider so multi-node
+/// in-process harnesses can re-wire to the current node.
+pub fn set_hosting_provider(provider: HostingProvider) {
+    *HOSTING_PROVIDER.write() = Some(provider);
 }
 
 /// Replaceable storage for the subscription provider. Wrapped in a
@@ -645,6 +665,11 @@ pub struct NetworkStatusSnapshot {
     /// provider closure — no mirrored counter to rot. Empty when nothing
     /// is banned (the common case).
     pub ban_list: BanListSnapshot,
+    /// Demand-driven hosting state (piece A, #4642): the capability-relative
+    /// RAM budget + per-contract Greedy-Dual keep_score that actually governs
+    /// retention. Drives the "Demand-driven eviction" card. Read from the
+    /// canonical hosting cache via the provider closure — no mirrored counter.
+    pub hosting: HostingSnapshot,
 }
 
 /// Snapshot of the contract ban list for the dashboard (#4302).
@@ -863,6 +888,56 @@ pub struct ContractSnapshot {
     pub instance_id: String,
     pub subscribed_secs: u64,
     pub last_updated_secs: Option<u64>,
+    /// Whether this node is genuinely receiving updates for the contract —
+    /// the real per-contract freshness signal (`is_hosting` is NOT; only an
+    /// active subscription keeps the cache fresh, PR #3699).
+    pub is_receiving_updates: bool,
+    /// Whether real demand pins the contract (local client subscription or a
+    /// registered downstream subscriber).
+    pub in_use: bool,
+}
+
+/// Snapshot of the demand-driven hosting cache (piece A, #4642) for the
+/// local-peer dashboard. This is the mechanism that actually governs
+/// retention today — a capability-relative RAM budget plus a Greedy-Dual
+/// `keep_score` per contract (`ring/hosting/{cache,demand}.rs`) — and it
+/// replaced the dormant MAD `GovernanceManager` (#4296). Default (all zeros,
+/// no contracts) when the node hosts nothing yet or the provider is unset.
+#[derive(Default, Clone)]
+pub struct HostingSnapshot {
+    /// Configured RAM-scaled byte budget for hosted contract state.
+    pub budget_bytes: u64,
+    /// Bytes currently used by hosted contract state. Headroom = budget - used.
+    pub used_bytes: u64,
+    /// Number of contracts currently in the hosting cache.
+    pub contract_count: u64,
+    /// Monotonic count of contracts evicted specifically for being over budget.
+    pub budget_evictions_total: u64,
+    /// Over-budget evictions whose victim had genuine repeat demand (read >= 2
+    /// times). Should stay near zero; a rising value means the demand estimate
+    /// is mis-ordering the working set (the #4338 miscalibration symptom).
+    pub evictions_of_recently_read_total: u64,
+    /// Per-contract Greedy-Dual rows in EVICTION order (the next victim under
+    /// budget pressure is first). May be truncated by the renderer; the full
+    /// count is `contract_count`.
+    pub contracts: Vec<HostedContractEntry>,
+}
+
+/// One hosted contract's demand-driven eviction row for the dashboard.
+#[derive(Clone)]
+pub struct HostedContractEntry {
+    /// Full contract-key string.
+    pub key_full: String,
+    /// Truncated key for display.
+    pub key_short: String,
+    /// Greedy-Dual priority (`eviction_floor + predicted_demand`). Lowest evicts first.
+    pub keep_score: f64,
+    /// Stored per-contract read-demand estimate (reads/second).
+    pub predicted_demand: f64,
+    /// Per-contract memory cost (state bytes).
+    pub size_bytes: u64,
+    /// Read accesses (GET/SUBSCRIBE) observed over this entry's residency.
+    pub read_count: u32,
 }
 
 /// Snapshot of operation stats. Each tuple is `(success_count, failure_count)`.
@@ -1000,6 +1075,8 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
                         instance_id,
                         subscribed_secs: c.subscribed_secs,
                         last_updated_secs: c.last_updated_secs,
+                        is_receiving_updates: c.is_receiving_updates,
+                        in_use: c.in_use,
                     }
                 })
                 .collect()
@@ -1070,6 +1147,11 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             .map(|provider| provider())
             .unwrap_or_default(),
         ban_list: BAN_LIST_PROVIDER
+            .read()
+            .as_ref()
+            .map(|provider| provider())
+            .unwrap_or_default(),
+        hosting: HOSTING_PROVIDER
             .read()
             .as_ref()
             .map(|provider| provider())
@@ -1403,11 +1485,15 @@ mod tests {
                 key: key_a,
                 subscribed_secs: 30,
                 last_updated_secs: Some(5),
+                is_receiving_updates: true,
+                in_use: true,
             },
             crate::ring::SubscribedContractSnapshot {
                 key: key_b,
                 subscribed_secs: 30,
                 last_updated_secs: None,
+                is_receiving_updates: true,
+                in_use: true,
             },
         ];
         set_subscription_provider(Arc::new(move || snapshot.clone()));

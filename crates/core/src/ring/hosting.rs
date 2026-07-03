@@ -34,6 +34,7 @@ mod demand;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
+pub(crate) use cache::HostingContractScore;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` (see the constant's docs).
 pub(crate) use cache::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
@@ -181,6 +182,17 @@ pub struct SubscribedContractSnapshot {
     pub subscribed_secs: u64,
     /// Seconds since the most recent observed state update, if any.
     pub last_updated_secs: Option<u64>,
+    /// Whether this node is genuinely receiving updates for this contract —
+    /// the real freshness signal ([`HostingManager::is_receiving_updates`]).
+    /// `is_hosting` is NOT a freshness signal (a hosting-cache copy can go
+    /// stale after its subscription lapses); only an active network/client
+    /// subscription guarantees the cached state is kept current (PR #3699).
+    pub is_receiving_updates: bool,
+    /// Whether real demand pins this contract: a local client subscription or
+    /// a registered downstream subscriber ([`HostingManager::contract_in_use`]).
+    /// Distinguishes contracts held for actual demand from network-only
+    /// subscriptions with no local/downstream reader.
+    pub in_use: bool,
 }
 
 // =============================================================================
@@ -550,22 +562,40 @@ impl HostingManager {
     /// and lost its recording hook.
     pub fn dashboard_subscription_snapshot(&self) -> Vec<SubscribedContractSnapshot> {
         let now = self.time_source.now();
-        let mut snapshot: Vec<SubscribedContractSnapshot> = self
+        // Phase 1: collect the lease data while iterating `active_subscriptions`.
+        // Do NOT call `is_receiving_updates`/`is_subscribed` in here — they
+        // re-`.get()` `active_subscriptions`, which would deadlock against the
+        // shard guard this `.iter()` holds when the key hashes to the same
+        // shard. Compute the freshness/demand booleans in phase 2, after the
+        // iterator's guards are released.
+        let leases: Vec<(ContractKey, u64, Option<u64>)> = self
             .active_subscriptions
             .iter()
             .filter(|entry| entry.value().expires_at > now)
             .map(|entry| {
                 let lease = *entry.value();
-                SubscribedContractSnapshot {
-                    key: *entry.key(),
-                    subscribed_secs: now
-                        .saturating_duration_since(lease.subscribed_since)
+                (
+                    *entry.key(),
+                    now.saturating_duration_since(lease.subscribed_since)
                         .as_secs(),
-                    last_updated_secs: lease
+                    lease
                         .last_updated
                         .map(|t| now.saturating_duration_since(t).as_secs()),
-                }
+                )
             })
+            .collect();
+        // Phase 2: iterator guards are dropped; the per-key lookups are now safe.
+        let mut snapshot: Vec<SubscribedContractSnapshot> = leases
+            .into_iter()
+            .map(
+                |(key, subscribed_secs, last_updated_secs)| SubscribedContractSnapshot {
+                    key,
+                    subscribed_secs,
+                    last_updated_secs,
+                    is_receiving_updates: self.is_receiving_updates(&key),
+                    in_use: self.contract_in_use(&key),
+                },
+            )
             .collect();
         // Most recently updated first; never-updated entries fall to the
         // end. Ties on `last_updated_secs` (including the (None, None)
@@ -1355,6 +1385,15 @@ impl HostingManager {
     /// read lock, for the per-node `RouterSnapshot` telemetry (A2).
     pub(crate) fn hosting_cache_stats(&self) -> HostingCacheStats {
         self.hosting_cache.read().stats()
+    }
+
+    /// Per-contract Greedy-Dual eviction rows for the local-peer dashboard,
+    /// in eviction order (next victim first). Reads the canonical hosting
+    /// cache under a single lock — this is piece A's live demand-driven
+    /// retention state (#4642), the mechanism that replaced the dormant MAD
+    /// governance detector. See [`HostingContractScore`].
+    pub(crate) fn dashboard_hosting_scores(&self) -> Vec<HostingContractScore> {
+        self.hosting_cache.read().eviction_ordered_scores()
     }
 
     /// Check if we should continue hosting a contract.
@@ -2551,6 +2590,43 @@ mod tests {
 
         manager.add_client_subscription(contract.id(), client_id);
         assert!(manager.is_receiving_updates(&contract));
+    }
+
+    /// The dashboard subscription snapshot must carry the per-contract
+    /// freshness (`is_receiving_updates`) and demand (`in_use`) signals, and
+    /// building it must NOT deadlock (the booleans are computed in a second
+    /// pass after the `active_subscriptions` iterator's guards are released —
+    /// `is_receiving_updates` re-`.get()`s that same DashMap).
+    #[test]
+    fn dashboard_subscription_snapshot_reports_freshness_and_demand() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Network subscription only: receiving updates, but no local/downstream demand.
+        let network_only = make_contract_key(1);
+        manager.subscribe(network_only);
+        // Network + client subscription: receiving updates AND in use.
+        let in_use = make_contract_key(2);
+        manager.subscribe(in_use);
+        manager.add_client_subscription(in_use.id(), crate::client_events::ClientId::next());
+
+        let snap = manager.dashboard_subscription_snapshot();
+        let net = snap
+            .iter()
+            .find(|c| c.key == network_only)
+            .expect("network-only subscription present");
+        assert!(
+            net.is_receiving_updates,
+            "an active network subscription is receiving updates"
+        );
+        assert!(
+            !net.in_use,
+            "a network-only subscription has no local/downstream demand"
+        );
+        let used = snap
+            .iter()
+            .find(|c| c.key == in_use)
+            .expect("in-use subscription present");
+        assert!(used.is_receiving_updates);
+        assert!(used.in_use, "a client subscription is real demand → in_use");
     }
 
     #[test]

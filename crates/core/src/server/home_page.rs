@@ -19,8 +19,8 @@ pub(super) use std::fmt::Write;
 
 use assets::{CSS, JS};
 use cards::{
-    build_ban_list_card, build_contracts_card, build_governance_card, build_ops_card,
-    build_peers_card, build_status_card, build_transfer_card,
+    build_ban_list_card, build_contracts_card, build_governance_card, build_hosting_card,
+    build_ops_card, build_peers_card, build_status_card, build_transfer_card,
 };
 use favicon::build_favicon_data_uri;
 use peer_detail::peer_detail_html;
@@ -115,6 +115,7 @@ fn homepage_html() -> String {
 
     let status_card = build_status_card(&snap);
     let peers_card = build_peers_card(&snap);
+    let hosting_card = build_hosting_card(&snap);
     let governance_card = build_governance_card(&snap);
     let ban_list_card = build_ban_list_card(&snap);
     let contracts_card = build_contracts_card(&snap);
@@ -172,6 +173,7 @@ fn homepage_html() -> String {
         status_card = status_card,
         peers_card = peers_card,
         transfer_card = transfer_card,
+        hosting_card = hosting_card,
         governance_card = governance_card,
         ban_list_card = ban_list_card,
         contracts_card = contracts_card,
@@ -226,6 +228,7 @@ mod tests {
             transport_snapshot: TransportSnapshot::default(),
             governance: Default::default(),
             ban_list: Default::default(),
+            hosting: Default::default(),
         }
     }
 
@@ -765,6 +768,8 @@ mod tests {
                 instance_id: "ABC123".to_string(),
                 subscribed_secs: 100,
                 last_updated_secs: Some(5),
+                is_receiving_updates: true,
+                in_use: true,
             },
             ContractSnapshot {
                 key_short: "DEF4...".to_string(),
@@ -772,6 +777,8 @@ mod tests {
                 instance_id: "DEF456".to_string(),
                 subscribed_secs: 50,
                 last_updated_secs: None,
+                is_receiving_updates: true,
+                in_use: true,
             },
         ];
         let html = build_ops_card(&Some(snap));
@@ -1315,6 +1322,8 @@ mod tests {
             instance_id: "ABC123XYZ".to_string(),
             subscribed_secs: 100,
             last_updated_secs: Some(5),
+            is_receiving_updates: true,
+            in_use: true,
         }];
         let html = build_contracts_card(&Some(snap));
         assert!(
@@ -1463,6 +1472,8 @@ mod tests {
                 instance_id: "HOST1".to_string(),
                 subscribed_secs: 60,
                 last_updated_secs: Some(5),
+                is_receiving_updates: true,
+                in_use: true,
             },
             ContractSnapshot {
                 key_short: "HOST2...".to_string(),
@@ -1470,6 +1481,8 @@ mod tests {
                 instance_id: "HOST2".to_string(),
                 subscribed_secs: 60,
                 last_updated_secs: Some(5),
+                is_receiving_updates: true,
+                in_use: true,
             },
             // This one is ALSO flagged — should be skipped in the
             // hosted dim-dot loop to avoid a duplicate marker.
@@ -1479,6 +1492,8 @@ mod tests {
                 instance_id: "FLAG1".to_string(),
                 subscribed_secs: 60,
                 last_updated_secs: Some(5),
+                is_receiving_updates: true,
+                in_use: true,
             },
         ];
 
@@ -1581,6 +1596,8 @@ mod tests {
             instance_id: "DEADBEEF".to_string(),
             subscribed_secs: 60,
             last_updated_secs: Some(2),
+            is_receiving_updates: true,
+            in_use: true,
         }];
         let html = build_contracts_card(&Some(snap));
         assert!(
@@ -1619,6 +1636,8 @@ mod tests {
                 instance_id: "FRESH".to_string(),
                 subscribed_secs: 1,
                 last_updated_secs: Some(1),
+                is_receiving_updates: true,
+                in_use: true,
             },
             ContractSnapshot {
                 key_short: "NEVER..".to_string(),
@@ -1626,6 +1645,8 @@ mod tests {
                 instance_id: "NEVER".to_string(),
                 subscribed_secs: 1,
                 last_updated_secs: None,
+                is_receiving_updates: true,
+                in_use: true,
             },
         ];
         let html = build_contracts_card(&Some(snap));
@@ -1637,43 +1658,64 @@ mod tests {
         );
     }
 
-    /// Regression test for the ContractKey/ContractInstanceId
-    /// id-vs-key string mismatch that Codex review of #4298 caught:
-    /// `GovernanceSnapshot.state_by_id` is keyed by
-    /// `ContractInstanceId::to_string()` (the 32-byte content hash),
-    /// while `ContractSnapshot.key_full` is the full `ContractKey`
-    /// encoding (including parameters / code-hash bookkeeping). The
-    /// two strings are NOT equal, so a lookup keyed on `key_full`
-    /// would silently miss every flagged contract.
-    ///
-    /// Pin: with a contract whose `instance_id` differs from
-    /// `key_full` and whose state in `state_by_id` is Banned, the
-    /// rendered row MUST show "banned" (not "ok"). Pre-fix the
-    /// assertion would have failed because the lookup never found
-    /// the entry.
+    /// The Subscribed Contracts table's second column shows the REAL
+    /// per-contract freshness/demand signal, not the retired MAD-governance
+    /// state. `is_receiving_updates` drives the fresh/stale pill (only an
+    /// active subscription keeps the cache current — `is_hosting` is NOT a
+    /// freshness signal, PR #3699); `in_use` drives the in-use/idle pill
+    /// (real demand: a local client or a downstream subscriber).
     #[test]
-    fn contracts_table_gov_column_uses_instance_id_not_key_full() {
-        use crate::node::network_status::{ContractSnapshot, GovernanceStateSnapshot};
+    fn contracts_table_shows_freshness_and_demand_pills() {
+        use crate::node::network_status::ContractSnapshot;
         let mut snap = base_snapshot();
         snap.open_connections = 1;
-        // The critical part: instance_id ≠ key_full. In production
-        // key_full includes the params / code hash so this is the
-        // common case, not an edge.
-        snap.contracts = vec![ContractSnapshot {
-            key_short: "FOO1234...".to_string(),
-            key_full: "FOO1234WITH_PARAMS_AND_CODE_HASH".to_string(),
-            instance_id: "FOO1234".to_string(),
-            subscribed_secs: 60,
-            last_updated_secs: Some(10),
-        }];
-        snap.governance
-            .state_by_id
-            .insert("FOO1234".to_string(), GovernanceStateSnapshot::Banned);
+        snap.contracts = vec![
+            // Fresh + genuinely in use.
+            ContractSnapshot {
+                key_short: "FRESH...".to_string(),
+                key_full: "FRESH_IN_USE".to_string(),
+                instance_id: "FRESH_IN_USE".to_string(),
+                subscribed_secs: 60,
+                last_updated_secs: Some(10),
+                is_receiving_updates: true,
+                in_use: true,
+            },
+            // Not receiving updates and no demand → stale + idle.
+            ContractSnapshot {
+                key_short: "STALE...".to_string(),
+                key_full: "STALE_IDLE".to_string(),
+                instance_id: "STALE_IDLE".to_string(),
+                subscribed_secs: 60,
+                last_updated_secs: None,
+                is_receiving_updates: false,
+                in_use: false,
+            },
+        ];
         let html = build_contracts_card(&Some(snap));
         assert!(
-            html.contains(r#"<span class="gov-pill gov-banned">banned</span>"#),
-            "Gov column lookup must use `instance_id` (not `key_full`) so \
-             state_by_id keys match — got:\n{html}"
+            html.contains(r#"<span class="fresh-pill fresh-ok">fresh</span>"#),
+            "receiving-updates contract must render the fresh pill — got:\n{html}"
+        );
+        assert!(
+            html.contains(r#"<span class="fresh-pill use-active">in use</span>"#),
+            "in-use contract must render the in-use pill — got:\n{html}"
+        );
+        assert!(
+            html.contains(r#"<span class="fresh-pill fresh-stale">stale</span>"#),
+            "non-receiving contract must render the stale pill — got:\n{html}"
+        );
+        assert!(
+            html.contains(r#"<span class="fresh-pill use-idle">idle</span>"#),
+            "no-demand contract must render the idle pill — got:\n{html}"
+        );
+        // The retired governance column must be gone.
+        assert!(
+            !html.contains("gov-pill"),
+            "the retired MAD-governance column must not render — got:\n{html}"
+        );
+        assert!(
+            html.contains(">Freshness<"),
+            "the second column header should now be 'Freshness' — got:\n{html}"
         );
     }
 
@@ -1868,11 +1910,12 @@ mod tests {
     }
 
     #[test]
-    fn governance_card_empty_state_off_mode_is_disabled() {
-        // Regression (#4338 review): with the default mode now Off, the
-        // empty state must NOT claim "scoring activates after N contracts"
-        // — scoring never activates while Off, so that copy is misleading
-        // on every default node. It must say governance is off instead.
+    fn governance_card_hidden_when_off() {
+        // The MAD governance detector is default-Off and is being replaced by
+        // demand-driven eviction (#4296, #4642). On a default (Off) node the
+        // dashboard must NOT render the dormant, superseded governance card at
+        // all — it only ever said "Governance is off" and misled operators.
+        // The demand-driven eviction card surfaces live retention instead.
         let mut snap = base_snapshot();
         snap.governance = GovernanceSnapshot {
             mode: GovernanceModeSnapshot::Off,
@@ -1885,16 +1928,8 @@ mod tests {
         };
         let html = build_governance_card(&Some(snap));
         assert!(
-            html.contains("Governance is off"),
-            "Off empty state must say governance is off — got:\n{html}"
-        );
-        assert!(
-            !html.contains("Scoring activates"),
-            "Off empty state must NOT claim scoring will activate — got:\n{html}"
-        );
-        assert!(
-            html.contains(r#"g-mode g-mode-off">off<"#),
-            "Off empty state must show the off mode pill — got:\n{html}"
+            html.is_empty(),
+            "Off-mode governance card must be hidden entirely — got:\n{html}"
         );
     }
 
@@ -1981,8 +2016,10 @@ mod tests {
 
     #[test]
     fn governance_card_mode_pill_reflects_snapshot_mode() {
+        // Off is hidden entirely (see governance_card_hidden_when_off); only
+        // the explicitly-enabled modes render, and when they do the pill must
+        // reflect the mode.
         for (mode, label) in [
-            (GovernanceModeSnapshot::Off, "off"),
             (GovernanceModeSnapshot::DryRun, "dry-run"),
             (GovernanceModeSnapshot::Enforce, "enforce"),
         ] {
@@ -2002,12 +2039,96 @@ mod tests {
                 "mode pill should reflect {label} — got:\n{html}"
             );
         }
+
+        // And the Off mode renders nothing at all.
+        let mut off = base_snapshot();
+        off.governance = GovernanceSnapshot {
+            mode: GovernanceModeSnapshot::Off,
+            contracts: vec![mk_entry(GovernanceStateSnapshot::Normal, "ok")],
+            norms: NetworkNorms::default(),
+            observed_count: 0,
+            min_samples: 30,
+            last_tick_at: None,
+            state_by_id: std::collections::HashMap::new(),
+        };
+        assert!(
+            build_governance_card(&Some(off)).is_empty(),
+            "Off mode must render no governance card"
+        );
     }
 
     #[test]
     fn governance_card_omits_when_snap_is_none() {
         let html = build_governance_card(&None);
         assert!(html.is_empty());
+    }
+
+    // ─── Demand-driven eviction card (piece A, #4642) ───────────────
+
+    #[test]
+    fn hosting_card_hidden_when_nothing_hosted() {
+        // A fresh/idle node hosts nothing → the card is noise, hide it.
+        let snap = base_snapshot(); // default hosting: contract_count == 0
+        assert!(build_hosting_card(&Some(snap)).is_empty());
+        assert!(build_hosting_card(&None).is_empty());
+    }
+
+    #[test]
+    fn hosting_card_renders_budget_and_eviction_order() {
+        use crate::node::network_status::{HostedContractEntry, HostingSnapshot};
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 2,
+            budget_evictions_total: 3,
+            evictions_of_recently_read_total: 1,
+            // Provider emits rows in eviction order (lowest keep_score first).
+            contracts: vec![
+                HostedContractEntry {
+                    key_full: "VICTIM_FULL".to_string(),
+                    key_short: "VICTIM...".to_string(),
+                    keep_score: 0.10,
+                    predicted_demand: 0.0,
+                    size_bytes: 1024,
+                    read_count: 0,
+                },
+                HostedContractEntry {
+                    key_full: "HOT_FULL".to_string(),
+                    key_short: "HOT...".to_string(),
+                    keep_score: 5.0,
+                    predicted_demand: 4.0,
+                    size_bytes: 2048,
+                    read_count: 42,
+                },
+            ],
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Demand-driven eviction"),
+            "card title — got:\n{html}"
+        );
+        assert!(
+            html.contains("64.0 MB / 256.0 MB"),
+            "RAM used/budget tile — got:\n{html}"
+        );
+        // Non-zero recently-read evictions are the miscalibration alarm: colored.
+        assert!(
+            html.contains("var(--danger"),
+            "recently-read eviction count should be highlighted — got:\n{html}"
+        );
+        // The next-to-evict badge attaches to the first (lowest keep_score) row.
+        let victim_idx = html.find("VICTIM_FULL").expect("victim row present");
+        let hot_idx = html.find("HOT_FULL").expect("hot row present");
+        let badge_idx = html.find("next to evict").expect("next-to-evict badge");
+        assert!(
+            victim_idx < hot_idx,
+            "rows must be in eviction order (lowest keep_score first) — got:\n{html}"
+        );
+        assert!(
+            badge_idx > victim_idx && badge_idx < hot_idx,
+            "the next-to-evict badge must be on the victim (first) row — got:\n{html}"
+        );
     }
 
     // ─── Contract ban-list card (#4302) ────────────────────────────
@@ -2081,10 +2202,12 @@ mod tests {
             html.contains("OperatorBannedContract22"),
             "operator-banned contract id must appear — got:\n{html}"
         );
-        // Reasons distinguish AutoMad vs Operator.
+        // Reasons distinguish AutoMad vs Operator. The AutoMad path is
+        // dormant (governance default-Off, being replaced by demand-driven
+        // eviction), so its label is de-emphasized as legacy/dormant.
         assert!(
-            html.contains("auto (governance)"),
-            "AutoMad ban must render an 'auto (governance)' reason — got:\n{html}"
+            html.contains("auto (legacy governance, dormant)"),
+            "AutoMad ban must render the de-emphasized legacy-governance reason — got:\n{html}"
         );
         assert!(
             html.contains(">operator<"),

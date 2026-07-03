@@ -612,12 +612,14 @@ impl Ring {
 
         // Spawn periodic governance reaper tick.
         // Computes per-contract state from accumulated cost/benefit
-        // samples and logs `ReaperDecision`s. Mode defaults to DryRun
-        // per the staged-rollout plan, so this task only ever logs —
-        // no eviction actions until the operator (or release default)
-        // flips to Enforce. The dashboard reads `governance.score_snapshot`
-        // independently of the tick; the tick is only the engine that
-        // updates state.
+        // samples and logs `ReaperDecision`s. Mode defaults to `Off`
+        // (see `GovernanceConfig` in contract/governance.rs): the MAD
+        // outlier detector is dormant and being replaced by demand-driven
+        // eviction (#4296, #4642), so this task is a no-op on default
+        // nodes and only ever logs (never evicts) even when an operator
+        // explicitly flips it to DryRun/Enforce. The dashboard reads the
+        // governance snapshot independently of the tick; the tick is only
+        // the engine that updates state.
         task_monitor.register(
             "governance_reaper",
             GlobalExecutor::spawn(Self::governance_reaper_loop(ring.clone())),
@@ -3122,6 +3124,54 @@ impl Ring {
             norms,
             last_tick_at,
             state_by_id,
+        }
+    }
+
+    /// Snapshot of the demand-driven hosting state for the local-peer
+    /// dashboard (piece A, #4642). Reads the canonical hosting cache — the
+    /// capability-relative RAM budget + per-contract Greedy-Dual keep_score
+    /// that actually governs retention today, replacing the dormant MAD
+    /// governance detector (#4296). No mirror, no cache: the aggregate gauges
+    /// and per-contract rows come straight from the `HostingManager`, so the
+    /// panel can't drift the way a mirrored counter would.
+    ///
+    /// Per-contract rows are returned in EVICTION order (next victim first).
+    /// The renderer bounds how many it displays; the full count is
+    /// `contract_count`.
+    pub fn dashboard_hosting_snapshot(&self) -> crate::node::network_status::HostingSnapshot {
+        use crate::node::network_status as ns;
+
+        let stats = self.hosting_manager.hosting_cache_stats();
+        let contracts: Vec<ns::HostedContractEntry> = self
+            .hosting_manager
+            .dashboard_hosting_scores()
+            .into_iter()
+            .map(|row| {
+                let key_full = row.key.to_string();
+                let key_short = if key_full.chars().count() > 12 {
+                    let trunc: String = key_full.chars().take(12).collect();
+                    format!("{trunc}...")
+                } else {
+                    key_full.clone()
+                };
+                ns::HostedContractEntry {
+                    key_full,
+                    key_short,
+                    keep_score: row.keep_score,
+                    predicted_demand: row.predicted_demand,
+                    size_bytes: row.size_bytes,
+                    read_count: row.read_count,
+                }
+            })
+            .collect();
+
+        ns::HostingSnapshot {
+            budget_bytes: stats.budget_bytes,
+            used_bytes: stats.current_bytes,
+            contract_count: stats.contract_count,
+            budget_evictions_total: stats.budget_evictions_total,
+            evictions_of_recently_read_total: stats.evictions_of_recently_read_total,
+            contracts,
         }
     }
 
