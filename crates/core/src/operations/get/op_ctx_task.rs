@@ -2346,8 +2346,55 @@ fn relay_advance_to_next_peer(
     // handle cross-peer retries (which IS legitimate in
     // `drive_client_get_inner`'s retry loop).
     const MAX_RELAY_RETRIES: usize = 1;
-    if *retries >= MAX_RELAY_RETRIES {
+    // TESTING-ONLY findability experiment (#4642 piece E): "bounded
+    // backtracking" is raising this per-hop greedy-forward cap above 1 so a
+    // relay whose downstream returns NotFound tries the next-closest
+    // candidate(s) before consulting/giving up. To measure its marginal
+    // findability lift over the shipped consult-only path WITHOUT a rebuild, a
+    // sim can raise the cap via FN_SIM_MAX_RELAY_RETRIES. Compiled only under
+    // `testing`; a no-op unless the env var is set. Read once via OnceLock so
+    // the hot path stays deterministic. Production ALWAYS uses MAX_RELAY_RETRIES.
+    #[cfg(feature = "testing")]
+    let max_relay_retries: usize = {
+        use std::sync::OnceLock;
+        static OVERRIDE: OnceLock<usize> = OnceLock::new();
+        *OVERRIDE.get_or_init(|| {
+            match std::env::var("FN_SIM_MAX_RELAY_RETRIES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v >= 1)
+            {
+                Some(v) => {
+                    // One-time confirmation the override is live (verifies the
+                    // knob reaches the GET relay driver, not just the harness).
+                    // Only prints when the env var is explicitly set, so the
+                    // normal test suite is unaffected.
+                    eprintln!(
+                        "[FN_SIM_MAX_RELAY_RETRIES override active: relay per-hop cap = {v}]"
+                    );
+                    v
+                }
+                None => MAX_RELAY_RETRIES,
+            }
+        })
+    };
+    #[cfg(not(feature = "testing"))]
+    let max_relay_retries = MAX_RELAY_RETRIES;
+    if *retries >= max_relay_retries {
         return None;
+    }
+    // One-shot signal (per process) confirming per-hop backtracking ACTUALLY
+    // FIRED — a relay advanced past its first greedy forward. Only reachable when
+    // the cap was raised above 1 (env-set), so the normal suite never prints it.
+    // If this never appears under cap>1, raising the cap changed nothing because
+    // the extra candidates were never reached. Testing-only.
+    #[cfg(feature = "testing")]
+    if *retries >= 1 && max_relay_retries > 1 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        if !FIRED.swap(true, Ordering::Relaxed) {
+            eprintln!("[relay backtracking FIRED: a relay advanced past its 1st greedy forward]");
+        }
     }
     *retries += 1;
 

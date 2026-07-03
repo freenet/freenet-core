@@ -511,6 +511,26 @@ impl ControlledSimulationResult {
             },
         )
     }
+
+    /// Ring-connection link distances across the whole captured topology: for
+    /// every captured node, the ring distance from that node's own location to
+    /// each of its ring-connected peers' locations. Edges are counted from both
+    /// endpoints (a→b and b→a), which does not bias the median. Calibration-only
+    /// helper: a simulated network is tuned to match production's observed
+    /// median link distance (0.081 across ~374 live peers, 2026-07) by sweeping
+    /// `max_connections`/`min_connections`/`nodes` until this median matches.
+    pub fn connection_link_distances(&self) -> Vec<f64> {
+        let mut dists = Vec::new();
+        for ring in self.node_rings.values() {
+            let Some(own_loc) = ring.connection_manager.get_stored_location() else {
+                continue;
+            };
+            for peer_loc in ring.connection_manager.location_for_all_peers() {
+                dists.push(own_loc.distance(peer_loc).as_f64());
+            }
+        }
+        dists
+    }
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]

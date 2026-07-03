@@ -13776,3 +13776,421 @@ fn test_delta_get_reliability_under_churn() {
         "measurement produced no getter samples"
     );
 }
+
+// =============================================================================
+// FINDABILITY-vs-DENSITY investigation (#4642 piece E)
+//
+// Question: is bounded backtracking (raising GET's per-hop MAX_RELAY_RETRIES
+// above 1) actually necessary for relay-caching-free findability, or does greedy
+// routing + the shipped 1-hop terminal advertisement consult (piece C) already
+// reach a lone near-K holder at production density (~374 live peers, median link
+// distance ~0.081, 2026-07)?
+//
+// Unlike `test_delta_churn_sim_reachability_gate` — whose dead-ends are HOLDER
+// LOSS (it crashes the only near-K holder, so nothing survives to route to) —
+// this scenario keeps the lone near-K holder ALIVE and asks the routing question
+// directly: can a FAR getter reach a SURVIVING lone near-K holder? That is the
+// "6/8 dead-end" routing case that motivated backtracking.
+//
+// Everything is env-tunable so ONE build sweeps density + the backtracking cap:
+//   FN_SIM_NODES             regular-node count      (default 374 = prod live peers)
+//   FN_SIM_MAXCONN           max ring connections    (default 20)
+//   FN_SIM_MINCONN           min ring connections    (default 10)
+//   FN_SIM_HTL               ring_max_htl            (default 20)
+//   FN_SIM_RND_ABOVE         rnd_if_htl_above        (default 14)
+//   FN_SIM_SEEDS             number of seeds         (default 12)
+//   FN_SIM_DUR / FN_SIM_POST sim / post-op seconds   (default 600 / 150)
+//   FN_SIM_MAX_RELAY_RETRIES GET per-hop cap         (default 1 = consult-only;
+//                            3 = bounded backtracking; read in get/op_ctx_task.rs)
+//
+// One far getter per run: host-on-GET caches on the return path, so multiple
+// getters per run cross-warm and inflate success (the confound the
+// reliability-measurement test documents). We vary seed x getter-arc to sample.
+// The tests are #[ignore]d (heavy, env-driven experiment; not part of the normal
+// suite) — run explicitly with --ignored.
+// =============================================================================
+
+fn find_env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+fn find_env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+struct FindObs {
+    found: bool,
+    /// Ring locations of every node still hosting C at end of run.
+    holder_locs: Vec<f64>,
+    /// Holder locations that were NOT crashed (still reachable). Non-empty here
+    /// means a surviving holder exists, so a not-found is a ROUTING dead-end
+    /// (the backtracking-relevant case), not holder loss.
+    reachable_holder_locs: Vec<f64>,
+    /// Does node 0 (the intended lone near-K holder) survive AND host C?
+    holder_near_k: bool,
+    getter_loc: f64,
+    holder0_loc: f64,
+    key_loc: f64,
+    max_sub_count: usize,
+    median_link_distance: f64,
+    mean_connections: f64,
+    captured_nodes: usize,
+}
+
+/// Ring distance on the unit circle.
+fn ring_dist(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs();
+    d.min(1.0 - d)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_findability_scenario(
+    seed: u64,
+    network: &str,
+    num_nodes: usize,
+    max_conn: usize,
+    min_conn: usize,
+    htl: usize,
+    rnd_above: usize,
+    getter_arc: f64,
+    duration_secs: u64,
+    post_secs: u64,
+    // When true: GUARANTEE a lone near-K holder via SeedHostedContract on node 0
+    // (advertised through the neighbor-hosting mesh, exactly as a real host
+    // would), skipping the PUT + publisher/gateway crash. Isolates pure
+    // GET-findability of a KNOWN near-K advertised holder (no PUT-routing
+    // variance). When false: real PUT from the far publisher (subscribe=false),
+    // then crash publisher + gateway, leaving whatever near-K terminus the PUT
+    // reached as the lone reachable holder (end-to-end; also exposes PUT-side
+    // findability).
+    seed_holder: bool,
+) -> FindObs {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let contract = SimOperation::create_test_contract(0xDE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+
+    // Node labels are 1-based; offsets[j] (0-based) maps to node label j+1
+    // (and to get_peer_locations()[num_gateways + j] = achieved[1 + j]).
+    //   node 1 (offsets[0]): lone near-K holder — uniquely closest to K
+    //           (offset +0.0012; nearest filler is ~1/num_nodes away, so it
+    //           stays closest). In seed_holder mode this node is SeedHosted.
+    //   node 2 (offsets[1]): publisher — far (+0.5). In real-PUT mode PUTs C
+    //           (subscribe=false), then is crashed so its loopback copy is gone.
+    //   node 3 (offsets[2]): the far getter (negative arc, |getter_arc| from K).
+    //   node 4.. (offsets[3..]): fillers, spread uniformly around the whole ring.
+    const HOLDER: usize = 1;
+    const PUBLISHER: usize = 2;
+    const GETTER: usize = 3;
+    let mut offsets = vec![0.0_f64; num_nodes];
+    offsets[HOLDER - 1] = 0.0012;
+    offsets[PUBLISHER - 1] = 0.5;
+    offsets[GETTER - 1] = wrap(-getter_arc);
+    for (i, off) in offsets.iter_mut().enumerate().skip(3) {
+        *off = (i as f64 - 2.0) / (num_nodes as f64 - 2.0);
+    }
+    let node_locations: Vec<f64> = offsets.iter().map(|o| wrap(key_loc + o)).collect();
+
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            network,
+            1,
+            num_nodes,
+            htl,
+            rnd_above,
+            max_conn,
+            min_conn,
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+    sim.disable_placement_migration();
+    if seed_holder {
+        // Make the seeded near-K holder advertise through the neighbor-hosting
+        // mesh so the terminal consult (piece C) can find it — production-faithful.
+        sim.enable_seeded_host_advertisements();
+    } else {
+        sim.enable_crash_delivery_gating();
+    }
+
+    // Achieved locations: get_peer_locations() returns gateways first (1 here),
+    // then regular nodes in order, so node label k (1-based) is at achieved[k].
+    let achieved = sim.get_peer_locations();
+    let node_loc = |n: usize| achieved.get(n).copied().unwrap_or(f64::NAN);
+
+    let publisher = NodeLabel::node(network, PUBLISHER);
+    let mut ops = Vec::new();
+    if seed_holder {
+        // Guarantee a lone near-K holder at node HOLDER (advertised); no PUT/crash.
+        ops.push(ScheduledOperation::new(
+            NodeLabel::node(network, HOLDER),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: SimOperation::create_test_state(1),
+            },
+        ));
+    } else {
+        // Real PUT from the far publisher, then crash publisher + gateway so the
+        // only reachable holder is whatever near-K terminus the PUT reached.
+        ops.push(ScheduledOperation::new(
+            publisher.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_test_state(1),
+                subscribe: false,
+            },
+        ));
+        ops.push(ScheduledOperation::new(
+            publisher.clone(),
+            SimOperation::CrashNode,
+        ));
+        ops.push(ScheduledOperation::new(
+            NodeLabel::gateway(network, 0),
+            SimOperation::CrashNode,
+        ));
+    }
+    // One far getter (node GETTER).
+    ops.push(ScheduledOperation::new(
+        NodeLabel::node(network, GETTER),
+        SimOperation::Get {
+            contract_id,
+            return_contract_code: true,
+            subscribe: false,
+        },
+    ));
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        ops,
+        Duration::from_secs(duration_secs),
+        Duration::from_secs(post_secs),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x}: sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let getter_label = NodeLabel::node(network, GETTER);
+    let found = result
+        .node_storages
+        .get(&getter_label)
+        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+
+    // Crash set (real-PUT mode only) = {node PUBLISHER, gateway}; node HOLDER
+    // and node GETTER are never crashed.
+    let holders: Vec<usize> = (1..=num_nodes)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(network, *n), &contract_key))
+        .collect();
+    let holder_locs: Vec<f64> = holders.iter().map(|n| node_loc(*n)).collect();
+    let reachable_holder_locs: Vec<f64> = holders
+        .iter()
+        .filter(|n| seed_holder || **n != PUBLISHER)
+        .map(|n| node_loc(*n))
+        .collect();
+    let holder_near_k = result.is_node_hosting(&NodeLabel::node(network, HOLDER), &contract_key);
+
+    let max_sub_count = result
+        .captured_node_labels()
+        .iter()
+        .map(|l| result.node_subscription_count(l))
+        .max()
+        .unwrap_or(0);
+
+    let link_dists = result.connection_link_distances();
+    let median_link_distance = median(&link_dists);
+    let captured_nodes = result.captured_node_labels().len();
+    let mean_connections = if captured_nodes == 0 {
+        0.0
+    } else {
+        link_dists.len() as f64 / captured_nodes as f64
+    };
+
+    FindObs {
+        found,
+        holder_locs,
+        reachable_holder_locs,
+        holder_near_k,
+        getter_loc: node_loc(GETTER),
+        holder0_loc: node_loc(HOLDER),
+        key_loc,
+        max_sub_count,
+        median_link_distance,
+        mean_connections,
+        captured_nodes,
+    }
+}
+
+fn median(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return f64::NAN;
+    }
+    let mut v = xs.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = v.len() / 2;
+    if v.len() % 2 == 0 {
+        (v[mid - 1] + v[mid]) / 2.0
+    } else {
+        v[mid]
+    }
+}
+
+/// CALIBRATION: build ONE network at the env-configured size/connectivity, form
+/// topology, PUT + one GET, and print the emergent topology stats (median link
+/// distance, mean connections/node) so the sim can be tuned to production's
+/// median link distance (~0.081 over ~374 live peers). Also reports whether the
+/// lone near-K holder was found by the far getter (a single-sample sanity read).
+#[test_log::test]
+#[ignore = "findability investigation: calibration probe, run with --ignored"]
+fn test_findability_calibrate() {
+    let nodes = find_env_usize("FN_SIM_NODES", 374);
+    let max_conn = find_env_usize("FN_SIM_MAXCONN", 20);
+    let min_conn = find_env_usize("FN_SIM_MINCONN", 10);
+    let htl = find_env_usize("FN_SIM_HTL", 20);
+    let rnd_above = find_env_usize("FN_SIM_RND_ABOVE", 14);
+    let dur = find_env_usize("FN_SIM_DUR", 600) as u64;
+    let post = find_env_usize("FN_SIM_POST", 150) as u64;
+    let seed_holder = find_env_usize("FN_SIM_SEED_HOLDER", 0) == 1;
+    let seed = 0x4642_F1C0_u64;
+
+    let t0 = std::time::Instant::now();
+    let obs = run_findability_scenario(
+        seed,
+        &format!("find-cal-{seed:x}"),
+        nodes,
+        max_conn,
+        min_conn,
+        htl,
+        rnd_above,
+        0.30,
+        dur,
+        post,
+        seed_holder,
+    );
+    let elapsed = t0.elapsed();
+    eprintln!(
+        "[find-calibrate] nodes={nodes} max_conn={max_conn} min_conn={min_conn} htl={htl} \
+         rnd_above={rnd_above} | captured_nodes={} mean_connections/node={:.1} \
+         MEDIAN_LINK_DISTANCE={:.4} (prod target 0.081) | getter@{:.4} holder0@{:.4} keyloc={:.4} \
+         getter_dist_to_K={:.4} | found={} holder_near_k={} holders={} reachable_holders={} \
+         wall_time={:.1}s",
+        obs.captured_nodes,
+        obs.mean_connections,
+        obs.median_link_distance,
+        obs.getter_loc,
+        obs.holder0_loc,
+        obs.key_loc,
+        ring_dist(obs.getter_loc, obs.key_loc),
+        obs.found,
+        obs.holder_near_k,
+        obs.holder_locs.len(),
+        obs.reachable_holder_locs.len(),
+        elapsed.as_secs_f64(),
+    );
+}
+
+/// MEASUREMENT (Part B / Part C): far-getter findability of a SURVIVING lone
+/// near-K holder, one getter per run, over FN_SIM_SEEDS seeds x rotating getter
+/// arcs. Reports the success RATE and a cause breakdown; never gates it. Run
+/// twice — FN_SIM_MAX_RELAY_RETRIES=1 (consult-only, Part B) and =3 (bounded
+/// backtracking, Part C) — to isolate backtracking's marginal lift at a given
+/// density. Sweep FN_SIM_NODES/MAXCONN/MINCONN to compare densities.
+#[test_log::test]
+#[ignore = "findability investigation: Part B/C measurement, run with --ignored"]
+fn test_findability_measure() {
+    let nodes = find_env_usize("FN_SIM_NODES", 374);
+    let max_conn = find_env_usize("FN_SIM_MAXCONN", 20);
+    let min_conn = find_env_usize("FN_SIM_MINCONN", 10);
+    let htl = find_env_usize("FN_SIM_HTL", 20);
+    let rnd_above = find_env_usize("FN_SIM_RND_ABOVE", 14);
+    let n_seeds = find_env_usize("FN_SIM_SEEDS", 12);
+    let dur = find_env_usize("FN_SIM_DUR", 600) as u64;
+    let post = find_env_usize("FN_SIM_POST", 150) as u64;
+    let backtrack = find_env_usize("FN_SIM_MAX_RELAY_RETRIES", 1);
+    let seed_holder = find_env_usize("FN_SIM_SEED_HOLDER", 0) == 1;
+
+    // Rotating far getter arcs (all >= 0.20 from K, avoiding the publisher @0.5).
+    const ARCS: [f64; 6] = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45];
+
+    let mut found_cnt = 0usize;
+    let mut routing_deadend = 0usize; // not found, but a reachable holder survives
+    let mut holder_loss = 0usize; // not found, no reachable holder (PUT didn't land)
+    let mut median_links: Vec<f64> = Vec::new();
+    let mut mean_conns: Vec<f64> = Vec::new();
+
+    for i in 0..n_seeds {
+        let seed = 0x4642_F200_u64 + i as u64;
+        let arc = ARCS[i % ARCS.len()];
+        let obs = run_findability_scenario(
+            seed,
+            &format!("find-meas-{backtrack}-sh{}-{seed:x}", seed_holder as u8),
+            nodes,
+            max_conn,
+            min_conn,
+            htl,
+            rnd_above,
+            arc,
+            dur,
+            post,
+            seed_holder,
+        );
+        median_links.push(obs.median_link_distance);
+        mean_conns.push(obs.mean_connections);
+
+        let cause = if obs.found {
+            found_cnt += 1;
+            "FOUND"
+        } else if !obs.reachable_holder_locs.is_empty() {
+            routing_deadend += 1;
+            "ROUTING DEAD-END (surviving reachable holder, greedy+consult missed it)"
+        } else {
+            holder_loss += 1;
+            "HOLDER LOSS / PUT-did-not-land (no reachable holder)"
+        };
+        // per-run subscription no-storm signal
+        assert!(
+            obs.max_sub_count <= 1,
+            "seed={seed:x}: max per-node subscription count {} for a zero-demand contract",
+            obs.max_sub_count
+        );
+        eprintln!(
+            "[find-meas backtrack={backtrack} seed={seed:x} arc={arc:.2}] found={} cause=\"{cause}\" \
+             | holder_near_k={} holders={} reachable_holders={} getter@{:.4} (dist_to_K={:.4}) \
+             holder0@{:.4} keyloc={:.4} | median_link={:.4} mean_conns={:.1}",
+            obs.found,
+            obs.holder_near_k,
+            obs.holder_locs.len(),
+            obs.reachable_holder_locs.len(),
+            obs.getter_loc,
+            ring_dist(obs.getter_loc, obs.key_loc),
+            obs.holder0_loc,
+            obs.key_loc,
+            obs.median_link_distance,
+            obs.mean_connections,
+        );
+    }
+
+    let pct = 100.0 * found_cnt as f64 / n_seeds as f64;
+    eprintln!(
+        "[find-meas SUMMARY backtrack={backtrack} seed_holder={seed_holder}] nodes={nodes} \
+         max_conn={max_conn} min_conn={min_conn} htl={htl}/{rnd_above} seeds={n_seeds} | \
+         MEDIAN_LINK(median over runs)={:.4} mean_conns={:.1} | FOUND={found_cnt}/{n_seeds} ({pct:.0}%) | \
+         routing_dead_ends={routing_deadend} holder_loss/put_miss={holder_loss}",
+        median(&median_links),
+        median(&mean_conns),
+    );
+
+    assert!(n_seeds > 0, "no seeds run");
+}
