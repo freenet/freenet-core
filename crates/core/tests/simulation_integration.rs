@@ -11989,6 +11989,21 @@ fn run_multihop_chain_scenario(
     max_conn: usize,
     min_conn: usize,
     client_leaves: bool,
+    // `Some(bytes)` sets a tiny per-node hosting budget so piece-A
+    // demand-driven eviction runs during the scenario: after the 20-min clock
+    // jump, every past-`min_ttl`, NOT-`contract_in_use` cached copy is evicted,
+    // while leased / in-use copies are retained by `sweep_expired_hosting`'s
+    // `contract_in_use` predicate. Used by the stale-island-under-eviction
+    // probe (#4642 piece D / invariant 1).
+    budget_bytes: Option<u64>,
+    // When true, the HOLDER also issues a local `Subscribe` (a self-pinning
+    // client). This keeps the holder `contract_in_use` so a sub-contract-sized
+    // `budget_bytes` cannot evict the holder's own copy — the realistic
+    // "publisher keeps a subscription" durability posture (see
+    // hosting-invariants "durability rides on demand"). Without it a tiny budget
+    // reaps the holder too (it is demand=0 after the clock jump), making the run
+    // degenerate. Only meaningful together with `budget_bytes`.
+    pin_holder: bool,
 ) -> MultiHopChainObservation {
     use freenet::dev_tool::{
         Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation, register_crdt_contract,
@@ -12038,6 +12053,9 @@ fn run_multihop_chain_scenario(
     });
     sim.disable_placement_migration();
     let _clock = sim.enable_hosting_time_control();
+    if let Some(b) = budget_bytes {
+        sim.with_hosting_budget(b);
+    }
 
     let holder = NodeLabel::node(network_name, 1);
     let subscriber = NodeLabel::node(network_name, subscriber_no);
@@ -12062,6 +12080,16 @@ fn run_multihop_chain_scenario(
             },
         ),
     ];
+    if pin_holder {
+        // Self-pin the holder with a local client so a sub-contract-sized
+        // `budget_bytes` cannot evict the holder's own copy (it is demand=0
+        // after the clock jump otherwise). Inserted after the Seed, before the
+        // clock jump, so the holder is `contract_in_use` throughout.
+        operations.insert(
+            1,
+            ScheduledOperation::new(holder.clone(), SimOperation::Subscribe { contract_id }),
+        );
+    }
     if client_leaves {
         // Collapse arm: the client disconnects, then we advance past another
         // lease window so any still-renewing host reveals itself. §5a: with
@@ -12080,6 +12108,28 @@ fn run_multihop_chain_scenario(
         // Freshness arm: holder UPDATEs to v99 across the >8-min mark. A
         // maintained mesh converges the far subscriber to v99; a stale island
         // stays at v1.
+        //
+        // When a `budget_bytes` is set (the eviction probe), the periodic
+        // hosting sweep (`GET_SUBSCRIPTION_SWEEP_INTERVAL`, 60 s of TOKIO time)
+        // must actually FIRE and reap the zero-demand co-host bridges BEFORE the
+        // v99 UPDATE propagates — otherwise the update races over the still-intact
+        // mesh and reaches the subscriber before its bridges are gone, and the
+        // probe never tests post-islanding freshness. The inter-op dispatch gap
+        // is only 3 s of tokio time, so burn ~90 s of tokio time with a run of
+        // tiny hosting-clock advances (each dispatch incurs a 3 s tokio sleep;
+        // `AdvanceHostingClock` does NOT touch `record_access`, so it never
+        // resets an entry's eviction-TTL). After this, at least one 60 s sweep
+        // has fired and the bridges are evicted; THEN the holder emits v99.
+        if budget_bytes.is_some() {
+            for _ in 0..30 {
+                operations.push(ScheduledOperation::new(
+                    subscriber.clone(),
+                    SimOperation::AdvanceHostingClock {
+                        duration: Duration::from_secs(1),
+                    },
+                ));
+            }
+        }
         operations.push(ScheduledOperation::new(
             holder.clone(),
             SimOperation::Update {
@@ -12156,8 +12206,13 @@ fn run_multihop_chain_scenario(
         } else {
             "middle"
         };
+        let node_state_v = result
+            .node_storages
+            .get(label)
+            .and_then(|s| s.get_stored_state(&contract_key))
+            .map(|ws| state_version(&ws));
         per_node.push_str(&format!(
-            "\n    node{node_no} ({role}): hosting={} state={} leases={} demand={} upstreams={} neighbors={:?}",
+            "\n    node{node_no} ({role}): hosting={} state={} v={node_state_v:?} leases={} demand={} upstreams={} neighbors={:?}",
             result.is_node_hosting(label, &contract_key),
             has_state(label),
             result.node_subscription_count(label),
@@ -12254,7 +12309,7 @@ fn test_combined_multihop_chain_renews_clientless_middle() {
 
     for seed in SEEDS {
         let name = format!("mh-renew-{seed:x}");
-        let obs = run_multihop_chain_scenario(seed, &name, NUM_NODES, 5, 3, false);
+        let obs = run_multihop_chain_scenario(seed, &name, NUM_NODES, 5, 3, false, None, false);
         eprintln!(
             "[renew seed={seed:x}] hop_dist={:?} clientless_middles={:?} leased={:?} \
              holder_in_use={} subscriber_v={:?} total_demand={}{}",
@@ -12350,7 +12405,7 @@ fn test_combined_multihop_chain_collapses_on_client_leave() {
 
     for seed in SEEDS {
         let name = format!("mh-collapse-{seed:x}");
-        let obs = run_multihop_chain_scenario(seed, &name, NUM_NODES, 5, 3, true);
+        let obs = run_multihop_chain_scenario(seed, &name, NUM_NODES, 5, 3, true, None, false);
         eprintln!(
             "[collapse seed={seed:x}] total_demand={} subscriber_demand={} \
              clientless_middles={:?} leased_middles={:?}{}",
@@ -12403,8 +12458,9 @@ fn test_multihop_chain_explore() {
     for &(num_nodes, max_conn, min_conn) in configs {
         for &seed in seeds {
             let name = format!("mh-explore-{num_nodes}-{seed:x}");
-            let obs =
-                run_multihop_chain_scenario(seed, &name, num_nodes, max_conn, min_conn, false);
+            let obs = run_multihop_chain_scenario(
+                seed, &name, num_nodes, max_conn, min_conn, false, None, false,
+            );
             eprintln!(
                 "[explore n={num_nodes} mc={max_conn} seed={seed:x}] \
                  hop_dist={:?} clientless_middles={:?} leased={:?} upstream={:?} \
@@ -12425,6 +12481,138 @@ fn test_multihop_chain_explore() {
             );
             assert!(obs.holder_hosts, "seed={seed:x}: holder must still host");
         }
+    }
+}
+
+/// LOAD-BEARING probe for hosting invariant 1 ("a served copy is fresh") under
+/// the DEFECT-1 disjoint chain (#4642 piece D / the piece-E ship gate).
+///
+/// ## What it exercises
+///
+/// The multi-hop combined get+subscribe can leave a leased clientless MIDDLE
+/// whose renewal chain DEAD-ENDS: measured (no-eviction renew arm) at seed d001
+/// the middle (node 4) holds a lease but the holder is NEVER pinned
+/// `contract_in_use` (`holder_in_use=false`). In that disjoint state the far
+/// subscriber's freshness is carried ONLY by piece-D proximity propagation among
+/// the CONNECTED zero-demand co-hosts left behind by host-on-GET — NOT by the
+/// (broken) renewal chain.
+///
+/// This probe adds piece-A eviction pressure (a sub-contract-sized hosting
+/// budget; the 20-min clock jump ages every copy past `min_ttl`). Eviction
+/// retains `contract_in_use` copies (the holder — self-pinned here — the leased
+/// middle, and the subscriber) but reaps the zero-demand co-hosts that bridge
+/// them. The question it MEASURES:
+///
+///   When the zero-demand update-carriers are evicted, does the demand-pinned
+///   subscriber keep converging to the holder's post-eviction UPDATE (v99), or
+///   is it left holding a VALID lease over SILENTLY STALE state (v1 / no error)
+///   — an invariant-1 violation?
+///
+/// ## Making eviction precede the update
+///
+/// The hosting sweep is `GET_SUBSCRIPTION_SWEEP_INTERVAL` = 60 s of TOKIO time,
+/// but scheduled ops are only 3 s apart, so a single UPDATE would otherwise race
+/// over the still-intact mesh before any sweep fires (this is what the first,
+/// non-decisive run of this probe measured: all three seeds looked "fresh"
+/// because the update out-ran eviction). `run_multihop_chain_scenario` therefore
+/// burns ~90 s of tokio time (a run of tiny hosting-clock advances that do NOT
+/// reset the eviction-TTL) between the clock jump and the UPDATE whenever a
+/// budget is set, so at least one sweep reaps the zero-demand bridges FIRST.
+///
+/// ## Verdict is read from the numbers, not asserted
+///
+/// Reports per-seed `subscriber_version` (Some(99) = fresh → REFUTED for that
+/// seed; Some(1)/None while the holder is at Some(99) = stale island →
+/// CONFIRMED) plus the surviving hosting mesh. Asserts only non-degeneracy (the
+/// self-pinned holder still hosts and is authoritative at v99), so it cannot
+/// "pass" by begging the question. The holder is self-pinned with its own client
+/// subscription — the realistic "publisher keeps a subscription" durability
+/// posture (hosting-invariants: durability rides on demand), and the only way to
+/// keep an authoritative holder under a sub-contract budget.
+///
+/// ## Measured (2026-07-03, decisive eviction-before-update run)
+///
+///   * d001 (DISJOINT chain, `holder_in_use=false` in the renew arm):
+///     subscriber ends at **v1 while the holder is at v99** — a demand-pinned
+///     host (hosting=true, leases=1) serving SILENTLY STALE state. INVARIANT-1
+///     VIOLATION, CONFIRMED. This seed is the clean case: its update-carrying
+///     bridges are *inherently* zero-demand (the false-root at node 4 never
+///     propagated demand through them), so piece-A eviction correctly reaps them
+///     and severs node 4 + the subscriber from the holder's update mesh. The
+///     `upstreams=0` everywhere means no is_upstream edge survives (DEFECT 2),
+///     and a re-root re-subscribe cannot rescue it: node 4 is the most-keyward
+///     host among its own neighbours, so a greedy re-descent dead-ends at node 4
+///     — the SAME single-holder findability weakness the piece-E gate already
+///     tracks (hosting-invariants piece E).
+///   * d002 (CONNECTED chain): subscriber stays at v99 — a chain whose pinned
+///     hosts survive eviction keeps the mesh intact. REFUTED for this seed.
+///   * d004 (CONNECTED chain): subscriber also ends at v1 (CONFIRMED) — but
+///     MUDDIER than d001: the ~90 s burn advances the frozen sim hosting clock
+///     enough that renewals go quiet and some in-use intermediate registrations
+///     lapse, so a chain that stays pinned under a continuously-renewing
+///     production clock may be partially collapsed here. Treat d004 as
+///     corroboration, not as clean as d001.
+///
+/// So the load-bearing consequence is CONFIRMED (cleanly on the disjoint seed):
+/// under eviction, the false-root disjoint chain leaves the demand-pinned
+/// subscriber holding a valid lease over silently stale state. CAVEAT: the sim's
+/// frozen hosting clock suppresses the renewal-driven re-root that an advancing
+/// production clock would attempt; the dead-end analysis (node 4 most-keyward
+/// among neighbours) argues that re-root would fail in production too, but a
+/// future advancing-clock variant would settle whether the staleness is
+/// permanent or a bounded window.
+#[test_log::test]
+fn test_combined_multihop_chain_freshness_under_eviction() {
+    const NUM_NODES: usize = 16;
+    // Same seeds as the renew/collapse pins. d001 is the DISJOINT-chain seed
+    // (holder_in_use=false in the no-eviction arm); d002/d004 form connected
+    // chains. Running all three shows whether the stale-island depends on the
+    // disjointness.
+    const SEEDS: [u64; 3] = [0x4642_D001, 0x4642_D002, 0x4642_D004];
+    // Below one 136-byte contract state (`create_crdt_state`) → every
+    // past-`min_ttl`, NOT-`contract_in_use` cached copy is evicted; leased /
+    // in-use copies survive.
+    const TINY_BUDGET_BYTES: u64 = 64;
+
+    for seed in SEEDS {
+        let name = format!("mh-evict-{seed:x}");
+        let obs = run_multihop_chain_scenario(
+            seed,
+            &name,
+            NUM_NODES,
+            5,
+            3,
+            false,
+            Some(TINY_BUDGET_BYTES),
+            /* pin_holder */ true,
+        );
+        eprintln!(
+            "[evict seed={seed:x}] hop_dist={:?} clientless_middles={:?} leased={:?} \
+             holder_in_use={} holder_hosts={} holder_v={:?} subscriber_v={:?} \
+             total_demand={}{}",
+            obs.subscriber_hop_distance,
+            obs.clientless_middles,
+            obs.leased_middles,
+            obs.holder_in_use,
+            obs.holder_hosts,
+            obs.holder_version,
+            obs.subscriber_version,
+            obs.total_demand,
+            obs.per_node,
+        );
+
+        // Non-degeneracy: the self-pinned holder must still host AND be
+        // authoritative at v99 — otherwise the run cannot distinguish "fresh"
+        // from "stale" and the freshness reading is meaningless.
+        assert!(
+            obs.holder_hosts,
+            "seed={seed:x}: self-pinned holder must still host under eviction (else degenerate)"
+        );
+        assert_eq!(
+            obs.holder_version,
+            Some(99),
+            "seed={seed:x}: holder must have applied its own v99 UPDATE (else nothing to be stale against)"
+        );
     }
 }
 
