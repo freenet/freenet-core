@@ -4726,6 +4726,72 @@ mod tests {
     fn strip_cfg_test_regions(src: &str) -> String {
         const MARKER: &str = "#[cfg(test)]";
         let bytes = src.as_bytes();
+
+        // Advance past a `//` line comment, `/* */` (nesting) block comment, or
+        // `"..."` string literal starting at `pos`, so braces/brackets inside
+        // them are NOT counted during region-boundary detection. Returns the
+        // index just past the construct, or None if `pos` does not start one.
+        //
+        // Why this matters: the gated-item boundary is found by raw brace
+        // balance, and a stray `}` in a comment or string (e.g. a doc comment
+        // that writes "its closing `}`" or a `.find("\n}\n")` call) used to tip
+        // the balance to zero early, truncating the strip mid-module. Everything
+        // after the truncation then leaked into the "production" text and was
+        // mis-counted by the register/flush pairing assertion. `char` literals
+        // are intentionally NOT handled — `'a` lifetimes make `'` ambiguous, and
+        // no `char` literal containing a brace or quote exists in the scanned
+        // sources (asserted implicitly by this pin staying green). Raw strings
+        // likewise don't appear; add handling here if one is ever introduced.
+        // Byte-only (never slices `src`): the scanning loops advance one byte at
+        // a time and can land in the middle of a multi-byte UTF-8 char (e.g. a
+        // box-drawing glyph inside a doc comment), where `&src[pos..]` would
+        // panic. All the sentinels here (`/`, `*`, `"`, `\`, `\n`) are ASCII and
+        // never occur as a UTF-8 continuation byte, so byte scanning is correct.
+        fn skip_lexical(bytes: &[u8], pos: usize) -> Option<usize> {
+            let at = |o: usize| bytes.get(o).copied();
+            // `//` line comment → to just past the newline (or EOF).
+            if at(pos) == Some(b'/') && at(pos + 1) == Some(b'/') {
+                let mut j = pos + 2;
+                while j < bytes.len() && bytes[j] != b'\n' {
+                    j += 1;
+                }
+                return Some((j + 1).min(bytes.len()));
+            }
+            // `/* */` block comment (Rust block comments nest).
+            if at(pos) == Some(b'/') && at(pos + 1) == Some(b'*') {
+                let mut depth = 0usize;
+                let mut j = pos;
+                while j < bytes.len() {
+                    if bytes[j] == b'/' && at(j + 1) == Some(b'*') {
+                        depth += 1;
+                        j += 2;
+                    } else if bytes[j] == b'*' && at(j + 1) == Some(b'/') {
+                        depth -= 1;
+                        j += 2;
+                        if depth == 0 {
+                            return Some(j);
+                        }
+                    } else {
+                        j += 1;
+                    }
+                }
+                return Some(bytes.len());
+            }
+            // `"..."` string literal (with `\` escapes).
+            if at(pos) == Some(b'"') {
+                let mut j = pos + 1;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'\\' => j += 2, // skip the escaped byte
+                        b'"' => return Some(j + 1),
+                        _ => j += 1,
+                    }
+                }
+                return Some(bytes.len());
+            }
+            None
+        }
+
         let mut out = String::with_capacity(src.len());
         let mut i = 0usize;
         while i < src.len() {
@@ -4738,10 +4804,15 @@ mod tests {
                     while j < src.len() && bytes[j].is_ascii_whitespace() {
                         j += 1;
                     }
-                    if src[j..].starts_with("#[") {
-                        // Skip a balanced `#[ ... ]` attribute.
+                    if bytes.get(j) == Some(&b'#') && bytes.get(j + 1) == Some(&b'[') {
+                        // Skip a balanced `#[ ... ]` attribute (lexical-aware, so
+                        // a bracket inside a string attribute value can't skew it).
                         let mut depth = 0i32;
                         while j < src.len() {
+                            if let Some(nj) = skip_lexical(bytes, j) {
+                                j = nj;
+                                continue;
+                            }
                             match bytes[j] {
                                 b'[' => depth += 1,
                                 b']' => {
@@ -4764,6 +4835,10 @@ mod tests {
                 let mut k = j;
                 let mut found_brace = false;
                 while k < src.len() {
+                    if let Some(nk) = skip_lexical(bytes, k) {
+                        k = nk;
+                        continue;
+                    }
                     match bytes[k] {
                         b'{' => {
                             found_brace = true;
@@ -4775,9 +4850,14 @@ mod tests {
                     k += 1;
                 }
                 if found_brace {
-                    // Brace-balance to the matching close.
+                    // Brace-balance to the matching close, skipping lexicals so a
+                    // brace inside a comment/string is never counted.
                     let mut depth = 0i32;
                     while k < src.len() {
+                        if let Some(nk) = skip_lexical(bytes, k) {
+                            k = nk;
+                            continue;
+                        }
                         match bytes[k] {
                             b'{' => depth += 1,
                             b'}' => {
@@ -4798,9 +4878,9 @@ mod tests {
                 i = k;
                 continue;
             }
-            // Copy one byte of production source. `src` is valid UTF-8 and we
-            // only ever split on ASCII boundaries (markers/braces/`;`), so
-            // pushing the char at this index is safe.
+            // Copy one char of production source verbatim (comments and strings
+            // are preserved in the output — downstream assertions match on
+            // production comment text, e.g. the "Source 1 / proximity" check).
             let ch = src[i..].chars().next().unwrap();
             out.push(ch);
             i += ch.len_utf8();
