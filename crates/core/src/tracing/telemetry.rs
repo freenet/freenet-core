@@ -2188,6 +2188,30 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_local_misses_total".to_string(),
                     serde_json::json!(snapshot.hosting_local_misses_total),
                 );
+                // Terminal advertisement-consult counters (hosting redesign
+                // piece C, #4646; exported per #4658). Same hand-mirrored
+                // footgun as the gauges above: a new `RouterSnapshotInfo` field
+                // is invisible to the collector unless added here. These are the
+                // findability-baseline signal that decomposes production
+                // dead-ends (attempts → hits → resolved_found vs still_not_found)
+                // ahead of the piece-E / 0.2.92 decision. Pinned by
+                // `router_snapshot_json_includes_terminal_consult_counters`.
+                obj.insert(
+                    "terminal_consult_attempts".to_string(),
+                    serde_json::json!(snapshot.terminal_consult_attempts),
+                );
+                obj.insert(
+                    "terminal_consult_hits".to_string(),
+                    serde_json::json!(snapshot.terminal_consult_hits),
+                );
+                obj.insert(
+                    "terminal_consult_resolved_found".to_string(),
+                    serde_json::json!(snapshot.terminal_consult_resolved_found),
+                );
+                obj.insert(
+                    "terminal_consult_still_not_found".to_string(),
+                    serde_json::json!(snapshot.terminal_consult_still_not_found),
+                );
             }
             body
         }
@@ -2401,6 +2425,35 @@ mod tests {
             ("hosting_evictions_of_recently_read_total", 277),
             ("hosting_local_hits_total", 281),
             ("hosting_local_misses_total", 283),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the terminal advertisement-consult counters (hosting redesign piece
+    /// C, #4646) must also reach the hand-mirrored OTLP body — same footgun as
+    /// the gauges above. These four counters are the findability baseline #4658
+    /// exports so the piece-E / 0.2.92 decision rests on the production dead-end
+    /// decomposition (off-path-advertised-host dead-ends C closes vs the
+    /// no-host-near-key residual needing piece D), not simulation. A silent drop
+    /// would re-blind central telemetry to C's effectiveness — the exact gap
+    /// this change closes.
+    #[test]
+    fn router_snapshot_json_includes_terminal_consult_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.terminal_consult_attempts = Some(311);
+        info.terminal_consult_hits = Some(313);
+        info.terminal_consult_resolved_found = Some(317);
+        info.terminal_consult_still_not_found = Some(331);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("terminal_consult_attempts", 311),
+            ("terminal_consult_hits", 313),
+            ("terminal_consult_resolved_found", 317),
+            ("terminal_consult_still_not_found", 331),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

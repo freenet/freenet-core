@@ -1486,6 +1486,25 @@ impl Ring {
             snapshot.hosting_local_hits_total = Some(ring.hosting_manager.local_get_serves());
             snapshot.hosting_local_misses_total = Some(ring.hosting_manager.local_get_forwards());
 
+            // Terminal advertisement-consult counters (hosting redesign piece C,
+            // #4646). Exported here per #4658 so the production findability
+            // baseline — the dead-end decomposition (off-path-advertised-host
+            // dead-ends that C closes: attempts→hits→resolved_found, vs the
+            // no-host-near-key residual `still_not_found` that needs piece D) —
+            // is legible in central telemetry ahead of the piece-E / 0.2.92
+            // decision, instead of only in the internal singleton and sim-only
+            // metrics. Read from the per-node network_status singleton where the
+            // consult sites record them; `None` only before the singleton is
+            // initialized (i.e. always populated in production snapshots).
+            if let Some((attempts, hits, resolved_found, still_not_found)) =
+                crate::node::network_status::terminal_consult_counts()
+            {
+                snapshot.terminal_consult_attempts = Some(attempts);
+                snapshot.terminal_consult_hits = Some(hits);
+                snapshot.terminal_consult_resolved_found = Some(resolved_found);
+                snapshot.terminal_consult_still_not_found = Some(still_not_found);
+            }
+
             // Keep the hosting manager's copy of our own ring location current so
             // the proximity-prior demand estimate (#4642 A3) can turn a contract
             // key into a distance. Best-effort: only push a known location.
@@ -1607,6 +1626,10 @@ impl Ring {
                 subscribe_hint_received = pm.received,
                 subscribe_hint_acted = pm.acted,
                 renewal_terminus_satisfied = pm.renewal_terminus_satisfied,
+                terminal_consult_attempts = ?snapshot.terminal_consult_attempts,
+                terminal_consult_hits = ?snapshot.terminal_consult_hits,
+                terminal_consult_resolved_found = ?snapshot.terminal_consult_resolved_found,
+                terminal_consult_still_not_found = ?snapshot.terminal_consult_still_not_found,
                 "router_snapshot"
             );
 
