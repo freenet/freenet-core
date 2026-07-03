@@ -2092,6 +2092,7 @@ mod tests {
                     predicted_demand: 0.0,
                     size_bytes: 1024,
                     read_count: 0,
+                    eviction_eligible: true,
                 },
                 HostedContractEntry {
                     key_full: "HOT_FULL".to_string(),
@@ -2100,6 +2101,7 @@ mod tests {
                     predicted_demand: 4.0,
                     size_bytes: 2048,
                     read_count: 42,
+                    eviction_eligible: false,
                 },
             ],
         };
@@ -2128,6 +2130,90 @@ mod tests {
         assert!(
             badge_idx > victim_idx && badge_idx < hot_idx,
             "the next-to-evict badge must be on the victim (first) row — got:\n{html}"
+        );
+    }
+
+    fn mk_hosted_entry(
+        key: &str,
+        keep_score: f64,
+        eviction_eligible: bool,
+    ) -> crate::node::network_status::HostedContractEntry {
+        use crate::node::network_status::HostedContractEntry;
+        HostedContractEntry {
+            key_full: format!("{key}_FULL"),
+            key_short: format!("{key}..."),
+            keep_score,
+            predicted_demand: 0.0,
+            size_bytes: 1024,
+            read_count: 0,
+            eviction_eligible,
+        }
+    }
+
+    #[test]
+    fn hosting_card_badges_first_eligible_row_not_lowest_score() {
+        use crate::node::network_status::HostingSnapshot;
+        // The lowest-keep-score row is eviction-INELIGIBLE (within min_ttl or
+        // in use), so the real over-budget sweep would SKIP it. The badge must
+        // land on the first ELIGIBLE row instead — badging the lowest-score row
+        // would mislabel an eviction-exempt contract (the finding this fixes).
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 300 * 1024 * 1024, // over budget
+            contract_count: 2,
+            budget_evictions_total: 0,
+            evictions_of_recently_read_total: 0,
+            contracts: vec![
+                // Lowest score, but pinned (in use / within TTL) → not eligible.
+                mk_hosted_entry("PINNED", 0.10, false),
+                // Higher score, but actually eligible → this is the real victim.
+                mk_hosted_entry("EVICTABLE", 2.0, true),
+            ],
+        };
+        let html = build_hosting_card(&Some(snap));
+        let pinned_idx = html.find("PINNED_FULL").expect("pinned row present");
+        let evictable_idx = html.find("EVICTABLE_FULL").expect("evictable row present");
+        let badge_idx = html
+            .find("next to evict")
+            .expect("next-to-evict badge present");
+        assert!(
+            badge_idx > evictable_idx,
+            "badge must be on the EVICTABLE (eligible) row, not the pinned \
+             lowest-score row — got:\n{html}"
+        );
+        // The pinned row (rendered first) must NOT carry the badge.
+        assert!(
+            !(badge_idx > pinned_idx && badge_idx < evictable_idx),
+            "the pinned lowest-score row must not be badged — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn hosting_card_no_badge_when_nothing_eligible() {
+        use crate::node::network_status::HostingSnapshot;
+        // Every hosted contract is within-TTL / in use → the sweep can evict
+        // none of them right now, so NO row is labelled "next to evict".
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 300 * 1024 * 1024,
+            contract_count: 2,
+            budget_evictions_total: 0,
+            evictions_of_recently_read_total: 0,
+            contracts: vec![
+                mk_hosted_entry("A", 0.10, false),
+                mk_hosted_entry("B", 2.0, false),
+            ],
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Demand-driven eviction"),
+            "card still renders (hosting > 0) — got:\n{html}"
+        );
+        assert!(
+            !html.contains("next to evict"),
+            "no row may be badged when nothing is eviction-eligible — got:\n{html}"
         );
     }
 

@@ -3142,11 +3142,16 @@ impl Ring {
         use crate::node::network_status as ns;
 
         let stats = self.hosting_manager.hosting_cache_stats();
+        // Two-phase: `dashboard_hosting_scores()` returns owned rows with the
+        // `hosting_cache` read lock already dropped, so folding in
+        // `is_eviction_eligible` (which reads only the subscription maps via
+        // `contract_in_use`) holds no cache lock — no re-lock deadlock.
         let contracts: Vec<ns::HostedContractEntry> = self
             .hosting_manager
             .dashboard_hosting_scores()
             .into_iter()
             .map(|row| {
+                let eviction_eligible = self.hosting_manager.is_eviction_eligible(&row);
                 let key_full = row.key.to_string();
                 let key_short = if key_full.chars().count() > 12 {
                     let trunc: String = key_full.chars().take(12).collect();
@@ -3161,6 +3166,7 @@ impl Ring {
                     predicted_demand: row.predicted_demand,
                     size_bytes: row.size_bytes,
                     read_count: row.read_count,
+                    eviction_eligible,
                 }
             })
             .collect();

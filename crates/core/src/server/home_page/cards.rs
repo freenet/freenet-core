@@ -1147,13 +1147,23 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         "0".to_string()
     };
 
-    // Per-contract table, bounded. Rows arrive in EVICTION order (next victim
-    // first); show at most MAX_ROWS. The tile carries the full count.
+    // Per-contract table, bounded. Rows arrive in EVICTION order (lowest
+    // keep-score first); show at most MAX_ROWS. The tile carries the full count.
+    //
+    // The "next to evict" badge marks the first EVICTION-ELIGIBLE row, not
+    // simply the lowest keep-score row: the over-budget sweep SKIPS contracts
+    // that are within `min_ttl` or still in use (`should_retain`), so the
+    // lowest-score row may be one the cache would never actually evict. Badging
+    // it would mislabel an eviction-exempt contract — exactly the "dashboard
+    // misleads the operator" problem this card exists to fix. When nothing is
+    // currently eligible (every hosted contract is within-TTL / in use), no row
+    // is badged.
     const MAX_ROWS: usize = 20;
+    let next_victim_idx = h.contracts.iter().position(|c| c.eviction_eligible);
     let mut rows = String::new();
     for (i, c) in h.contracts.iter().take(MAX_ROWS).enumerate() {
-        let next_badge = if i == 0 {
-            r#" <span class="hz-badge hz-next">next to evict</span>"#
+        let next_badge = if Some(i) == next_victim_idx {
+            r#" <span class="hz-badge hz-next" title="Lowest keep-score among eviction-eligible contracts (past min-TTL and not in use) — the over-budget sweep would evict this one first.">next to evict</span>"#
         } else {
             ""
         };

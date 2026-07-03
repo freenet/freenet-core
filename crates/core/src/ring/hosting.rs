@@ -1396,6 +1396,26 @@ impl HostingManager {
         self.hosting_cache.read().eviction_ordered_scores()
     }
 
+    /// Whether the over-budget sweep would currently CONSIDER `score`'s
+    /// contract for eviction — i.e. whether it passes the same per-contract
+    /// filter [`cache::HostingCache::evict_over_budget`] applies:
+    /// `past_min_ttl` (the TTL half, precomputed by the cache) AND NOT
+    /// [`contract_in_use`](Self::contract_in_use) (the `should_retain` half).
+    ///
+    /// The dashboard uses this to badge the true "next to evict" contract: the
+    /// raw lowest-keep-score row can be an entry the sweep would SKIP (still
+    /// within `min_ttl`, or pinned by a local client / downstream subscriber),
+    /// so badging it unconditionally mislabels an eviction-exempt contract.
+    ///
+    /// Deadlock-safe by construction: `score` is already-collected owned data
+    /// (the `hosting_cache` read guard was released when
+    /// [`dashboard_hosting_scores`](Self::dashboard_hosting_scores) returned),
+    /// and `contract_in_use` reads only the subscription maps — never the
+    /// hosting cache — so there is no lock held across this call.
+    pub(crate) fn is_eviction_eligible(&self, score: &HostingContractScore) -> bool {
+        score.past_min_ttl && !self.contract_in_use(&score.key)
+    }
+
     /// Check if we should continue hosting a contract.
     ///
     /// Returns true if:
@@ -2592,11 +2612,18 @@ mod tests {
         assert!(manager.is_receiving_updates(&contract));
     }
 
-    /// The dashboard subscription snapshot must carry the per-contract
-    /// freshness (`is_receiving_updates`) and demand (`in_use`) signals, and
-    /// building it must NOT deadlock (the booleans are computed in a second
-    /// pass after the `active_subscriptions` iterator's guards are released —
-    /// `is_receiving_updates` re-`.get()`s that same DashMap).
+    /// Characterizes the dashboard subscription snapshot: it must carry the
+    /// per-contract freshness (`is_receiving_updates`) and demand (`in_use`)
+    /// signals with the correct values.
+    ///
+    /// NOTE: this asserts the two-phase snapshot's OUTPUT, not deadlock-safety.
+    /// The same-shard DashMap re-lock the two-phase split avoids
+    /// (`is_receiving_updates` re-`.get()`s `active_subscriptions`) is prevented
+    /// BY CONSTRUCTION — phase 2 runs only after the iterator's shard guards
+    /// drop. It does NOT manifest in this single-threaded, no-concurrent-writer
+    /// test: a re-inlined same-shard read would still pass here. The guard
+    /// against re-inlining is the load-bearing comment in
+    /// `dashboard_subscription_snapshot`, not this test.
     #[test]
     fn dashboard_subscription_snapshot_reports_freshness_and_demand() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
@@ -2627,6 +2654,79 @@ mod tests {
             .expect("in-use subscription present");
         assert!(used.is_receiving_updates);
         assert!(used.in_use, "a client subscription is real demand → in_use");
+    }
+
+    /// `is_eviction_eligible` must combine BOTH halves of the
+    /// `evict_over_budget` skip filter — the cache's `past_min_ttl` age gate
+    /// AND `!contract_in_use` — so the dashboard's "next to evict" badge only
+    /// marks a contract the sweep would actually consider. A within-TTL OR an
+    /// in-use low-score contract must read as NOT eligible (the sweep skips it);
+    /// badging it would mislabel an eviction-exempt contract.
+    #[test]
+    fn dashboard_is_eviction_eligible_matches_sweep_skip_filter() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+
+        // Case 1 — default cache (DEFAULT_MIN_TTL): a freshly-accessed contract
+        // is within its TTL window → past_min_ttl false → NOT eligible even
+        // though nothing pins it.
+        let fresh = make_contract_key(1);
+        manager.record_contract_access(fresh, 100, AccessType::Get);
+        let scores = manager.dashboard_hosting_scores();
+        let fresh_score = scores
+            .iter()
+            .find(|s| s.key == fresh)
+            .expect("fresh contract present");
+        assert!(
+            !fresh_score.past_min_ttl,
+            "a freshly-accessed contract is within min_ttl"
+        );
+        assert!(
+            !manager.is_eviction_eligible(fresh_score),
+            "within-TTL contract is skipped by the sweep → not eligible"
+        );
+
+        // Case 2 — override with a ZERO-TTL cache so every entry is instantly
+        // past the TTL gate; eligibility is then decided solely by
+        // `contract_in_use`.
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                10_000,
+                std::time::Duration::ZERO,
+                crate::util::time_source::InstantTimeSrc::new(),
+            );
+        }
+        let evictable = make_contract_key(2);
+        let pinned = make_contract_key(3);
+        manager.record_contract_access(evictable, 100, AccessType::Get);
+        manager.record_contract_access(pinned, 100, AccessType::Get);
+        // Pin `pinned` with a local client subscription → contract_in_use true.
+        let client = crate::client_events::ClientId::next();
+        manager.add_client_subscription(pinned.id(), client);
+        assert!(manager.contract_in_use(&pinned));
+        assert!(!manager.contract_in_use(&evictable));
+
+        let scores = manager.dashboard_hosting_scores();
+        let ev = scores
+            .iter()
+            .find(|s| s.key == evictable)
+            .expect("evictable contract present");
+        let pin = scores
+            .iter()
+            .find(|s| s.key == pinned)
+            .expect("pinned contract present");
+        assert!(
+            ev.past_min_ttl && pin.past_min_ttl,
+            "zero TTL → both entries are past the TTL gate"
+        );
+        assert!(
+            manager.is_eviction_eligible(ev),
+            "past-TTL and not in use → eligible (the real next victim)"
+        );
+        assert!(
+            !manager.is_eviction_eligible(pin),
+            "past-TTL but in use → NOT eligible (sweep skips it)"
+        );
     }
 
     #[test]
