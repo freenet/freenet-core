@@ -11665,6 +11665,270 @@ fn test_relay_become_host_closes_deadend() {
     }
 }
 
+/// #4642 piece E — ADVERSARIAL PROBE (verification, not a piece-D success proof).
+///
+/// Question under test: when a BARE `Subscribe` on an UNCACHED contract routes as
+/// the combined get+subscribe (#4642), does it build a SELF-MAINTAINING chain of
+/// LEASED hosts toward the key, or only a leaseless local-hit terminus that falls
+/// out of the renewal set?
+///
+/// The adversarial claim: the combined GET pre-caches every return-path hop
+/// (`get/op_ctx_task.rs::cache_contract_locally`, which installs NO lease and no
+/// upstream update-source), so the follow-up subscribe LOCAL-HITS at each cached
+/// hop (`drive_relay_subscribe` Step 1 → `register_downstream_subscriber` but NO
+/// `ring.subscribe` / no `finalize_host_subscribe`). The terminus host therefore
+/// ends up hosting + `contract_in_use` (it has a downstream subscriber) but with
+/// NO `active_subscriptions` lease → it is NOT in `contracts_needing_renewal` §1
+/// (which requires a live lease AND in-use) → it never renews. Only the
+/// originator subscriber holds a lease.
+///
+/// Scenario (matches the claim's setup): ONE far subscriber (clientful), a SINGLE
+/// seeded holder AT the key (no client), CLIENTLESS middle nodes (NO pre-seeding
+/// at intermediates). Run past the 8-minute `SUBSCRIPTION_LEASE_DURATION` so
+/// renewal cycles fire and any un-renewed lease lapses.
+///
+/// This test MEASURES + REPORTS: the per-node (leases, in-use-demand, upstreams,
+/// hosting) table, `chain_hosts_formed`, `max_upstreams`, and the set of
+/// non-originator nodes that are `in_use` (demand >= 1) yet hold ZERO leases —
+/// the "held up by demand but not renewing" smoking gun. It asserts only
+/// non-degeneracy (the subscriber acquired state and the holder still hosts) so
+/// the reported numbers, not a pre-baked expectation, decide CONFIRMED/REFUTED.
+#[test_log::test]
+fn test_combined_subscribe_chain_maintenance_probe() {
+    use freenet::dev_tool::{
+        Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation, register_crdt_contract,
+    };
+
+    const SEEDS: [u64; 3] = [0x4642_E501, 0x4642_E502, 0x4642_E503];
+    // Gradient of nodes from the key to the far subscriber, so a bare-SUBSCRIBE
+    // combined get+subscribe MUST route through clientless middle nodes to reach
+    // the single seeded holder — forcing the exact "clientless mid-chain host"
+    // the claim is about (rather than a degenerate direct subscriber↔holder link).
+    const NUM_NODES: usize = 10;
+
+    for seed in SEEDS {
+        setup_deterministic_state(seed);
+
+        let network_name = format!("combined-chain-probe-{seed:x}");
+        let contract = SimOperation::create_test_contract(0xE5);
+        let contract_id = *contract.key().id();
+        let contract_key = contract.key();
+        // CRDT/version-aware so a post-formation UPDATE can be checked for
+        // convergence at the far subscriber (the freshness / stale-island test).
+        register_crdt_contract(contract_id);
+        let key_loc = Location::from(&contract_key).as_f64();
+        let wrap = |x: f64| x.rem_euclid(1.0);
+        // Distinct state versions: seed = v1, post-subscribe update = v99.
+        let seed_state = SimOperation::create_crdt_state(1, 0xE5);
+        let update_state = SimOperation::create_crdt_state(99, 0xE5);
+        let state_version = |ws: &freenet_stdlib::prelude::WrappedState| -> u64 {
+            let b: &[u8] = ws.as_ref();
+            if b.len() >= 8 {
+                u64::from_le_bytes(b[0..8].try_into().unwrap())
+            } else {
+                0
+            }
+        };
+
+        // node order 1 = holder AT the key (seeded, no client);
+        // orders 2..=9 = CLIENTLESS middle (NOT seeded);
+        // order 10 = far subscriber (clientful, NOT seeded).
+        let node_locations: Vec<f64> = (0..NUM_NODES)
+            .map(|i| wrap(key_loc + (i as f64) * 0.045))
+            .collect();
+        let num_nodes = node_locations.len();
+
+        let rt = create_runtime();
+        let mut sim = rt.block_on(async {
+            SimNetwork::new_with_node_locations(
+                &network_name,
+                1,         // 1 gateway
+                num_nodes, // 10 regular nodes
+                10,        // ring_max_htl
+                7,         // rnd_if_htl_above
+                6,         // max_connections (sparse enough to force multi-hop)
+                3,         // min_connections
+                seed,
+                &node_locations,
+            )
+            .await
+        });
+        // Migration OFF: isolate the combined get+subscribe mechanism (no
+        // SubscribeHint placement cascade moving the contract around).
+        sim.disable_placement_migration();
+        // Controllable hosting clock so we can jump past the 8-min lease window
+        // BEFORE the freshness UPDATE — testing whether the subscription survives
+        // (still delivers updates) after leases would have lapsed.
+        let _clock = sim.enable_hosting_time_control();
+
+        let holder = NodeLabel::node(&network_name, 1);
+        let subscriber = NodeLabel::node(&network_name, num_nodes);
+
+        let operations = vec![
+            // Single distant holder — seeded into its store + Ring, NO network
+            // propagation, NO pre-seeding at intermediates. (NOTE: SeedHostedContract
+            // installs a self-subscription lease at the holder, so the holder's
+            // `leases`/`in_use` is partly a seed artifact — the DECISIVE signal is
+            // the freshness check below, which does not depend on how the holder
+            // acquired state.)
+            ScheduledOperation::new(
+                holder.clone(),
+                SimOperation::SeedHostedContract {
+                    contract: contract.clone(),
+                    state: seed_state.clone(),
+                },
+            ),
+            // Bare SUBSCRIBE on an UNCACHED contract → combined get+subscribe.
+            ScheduledOperation::new(subscriber.clone(), SimOperation::Subscribe { contract_id }),
+            // Jump the hosting clock 20 min — past SUBSCRIPTION_LEASE_DURATION
+            // (8 min) — so any subscription that is NOT being renewed lapses
+            // before the update below.
+            ScheduledOperation::new(
+                subscriber.clone(),
+                SimOperation::AdvanceHostingClock {
+                    duration: Duration::from_secs(20 * 60),
+                },
+            ),
+            // Holder UPDATEs to v99. If the far subscriber is still wired into a
+            // maintained subscription mesh, it converges to v99; if it is a
+            // stale-serving island (no maintained upstream path), it stays at v1.
+            ScheduledOperation::new(
+                holder.clone(),
+                SimOperation::Update {
+                    key: contract_key,
+                    data: update_state.clone(),
+                },
+            ),
+        ];
+
+        // Generous post-op wait so the update has time to propagate after the jump.
+        let result = sim.run_controlled_simulation(
+            seed,
+            operations,
+            Duration::from_secs(900),
+            Duration::from_secs(600),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "seed={seed:x}: simulation failed: {:?}",
+            result.turmoil_result.err()
+        );
+
+        let labels: Vec<NodeLabel> = (1..=num_nodes)
+            .map(|n| NodeLabel::node(&network_name, n))
+            .collect();
+        let has_state = |label: &NodeLabel| -> bool {
+            result
+                .node_storages
+                .get(label)
+                .and_then(|s| s.get_stored_state(&contract_key))
+                .is_some()
+        };
+
+        // Per-node table for the contract.
+        eprintln!("[probe seed={seed:x}] per-node (node1=holder@key, node{num_nodes}=subscriber):");
+        for (i, label) in labels.iter().enumerate() {
+            let node_no = i + 1;
+            let role = if node_no == 1 {
+                "holder"
+            } else if node_no == num_nodes {
+                "subscriber"
+            } else {
+                "middle"
+            };
+            eprintln!(
+                "    node{node_no} ({role}): hosting={} cache={} state={} leases={} in_use_demand={} upstreams={}",
+                result.is_node_hosting(label, &contract_key),
+                result.node_hosting_count(label),
+                has_state(label),
+                result.node_subscription_count(label),
+                result.node_active_demand_count(label),
+                result.node_upstream_count(label, &contract_key),
+            );
+        }
+
+        let chain_hosts_formed = result.aggregate_renewal_metrics().chain_hosts_formed;
+        let max_upstreams = labels
+            .iter()
+            .map(|l| result.node_upstream_count(l, &contract_key))
+            .max()
+            .unwrap_or(0);
+        let subscriber_upstreams = result.node_upstream_count(&subscriber, &contract_key);
+
+        // Intermediate nodes (NOT holder, NOT subscriber) that ended up HOSTING
+        // the contract WITH state — these are the combined GET's return-path
+        // caches, the would-be "chain hosts". For each, does it hold a lease?
+        let intermediate_hosts_with_state: Vec<usize> = (2..num_nodes)
+            .filter(|n| {
+                let l = NodeLabel::node(&network_name, *n);
+                result.is_node_hosting(&l, &contract_key) && has_state(&l)
+            })
+            .collect();
+        let intermediate_hosts_leased: Vec<usize> = intermediate_hosts_with_state
+            .iter()
+            .copied()
+            .filter(|n| result.node_subscription_count(&NodeLabel::node(&network_name, *n)) >= 1)
+            .collect();
+
+        // The smoking gun: non-subscriber nodes that are in_use (have a local
+        // client or a downstream subscriber → contract_in_use == true) yet hold
+        // ZERO active_subscriptions leases. Such a node is held up by demand but
+        // is NOT in contracts_needing_renewal §1, so it never renews.
+        let leaseless_but_in_use: Vec<usize> = labels
+            .iter()
+            .enumerate()
+            .filter(|(i, l)| {
+                let node_no = i + 1;
+                node_no != num_nodes // exclude the originator subscriber
+                    && result.node_active_demand_count(l) >= 1
+                    && result.node_subscription_count(l) == 0
+            })
+            .map(|(i, _)| i + 1)
+            .collect();
+        let lease_holders: Vec<usize> = labels
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| result.node_subscription_count(l) >= 1)
+            .map(|(i, _)| i + 1)
+            .collect();
+        // FRESHNESS / stale-island check: after the 20-min clock jump, did the
+        // holder's v99 UPDATE reach the far subscriber? Report each node's stored
+        // state version (v1 = stale seed, v99 = converged/fresh).
+        let holder_version = result
+            .node_storages
+            .get(&holder)
+            .and_then(|s| s.get_stored_state(&contract_key))
+            .map(|ws| state_version(&ws));
+        let subscriber_version = result
+            .node_storages
+            .get(&subscriber)
+            .and_then(|s| s.get_stored_state(&contract_key))
+            .map(|ws| state_version(&ws));
+
+        eprintln!(
+            "[probe seed={seed:x}] SUMMARY chain_hosts_formed={chain_hosts_formed} \
+             max_upstreams={max_upstreams} subscriber_upstreams={subscriber_upstreams} \
+             lease_holder_node_nos={lease_holders:?} leaseless_but_in_use_node_nos={leaseless_but_in_use:?} \
+             intermediate_hosts_with_state={intermediate_hosts_with_state:?} \
+             intermediate_hosts_LEASED={intermediate_hosts_leased:?} \
+             subscriber_hosts={} holder_hosts={} \
+             holder_state_version={holder_version:?} subscriber_state_version={subscriber_version:?} \
+             (v99=fresh/converged, v1=stale-island)",
+            result.is_node_hosting(&subscriber, &contract_key),
+            result.is_node_hosting(&holder, &contract_key),
+        );
+
+        // Non-degeneracy only: the holder must still be authoritative. The
+        // CONFIRMED/REFUTED judgement is made from the reported numbers above,
+        // NOT from a pre-baked expectation, so this probe cannot "pass" by
+        // begging the question.
+        assert!(
+            result.is_node_hosting(&holder, &contract_key),
+            "seed={seed:x}: holder must still host the seeded contract (else the run is degenerate)"
+        );
+    }
+}
+
 /// Reproduction + regression test for the placement-migration renewal storm
 /// (#4440, the storm symptom of the #4404 placement work).
 ///
