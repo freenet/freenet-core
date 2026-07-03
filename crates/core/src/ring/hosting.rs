@@ -1711,6 +1711,66 @@ impl HostingManager {
             }
         }
 
+        // 4. Hosted contracts held up by DEMAND but WITHOUT a live lease — the
+        //    clientless-middle-host gap (demand-driven-hosting design §5a; #4642
+        //    piece D). A peer that acquired state via host-on-GET and then
+        //    answered a downstream SUBSCRIBE from its local cache ("local hit")
+        //    registers the downstream subscriber but installs NO
+        //    `active_subscriptions` lease and never subscribes upstream. Such a
+        //    clientless middle host is `contract_in_use` (a downstream depends on
+        //    it) yet is invisible to sections 1-3: section 1 needs a live lease;
+        //    sections 2/3 need a local client / recent local access — a clientless
+        //    middle has neither. Without this section it never renews toward its
+        //    computed upstream, so it holds no subscription lease and its place in
+        //    the contract's update mesh rests solely on the separate proximity
+        //    mechanism (§2, co-host neighbours auto-exchange) rather than on a
+        //    maintained subscription — diverging from the §5a model in which
+        //    renewal is the single maintenance primitive that also drives
+        //    collapse and re-rooting. (Empirically the far subscriber can still
+        //    stay fresh via proximity, so this is a renewal-CORRECTNESS gap, not
+        //    necessarily an observable staleness bug today; see the simulation
+        //    test `test_combined_multihop_chain_renews_clientless_middle`.)
+        //
+        //    §5a: "a peer sends renewals toward its upstream only while it is
+        //    itself `contract_in_use`." Renewal is driven through
+        //    `run_renewal_subscribe`, which targets the COMPUTED UPSTREAM (the
+        //    most-keyward connected co-host, strictly closer to the key). Strict
+        //    distance is a total order, so the chain stays acyclic and its
+        //    collapse terminates: when the last downstream lease-expires (or the
+        //    client leaves), the contract drops out of `contract_in_use`, this
+        //    section stops selecting it, its own upstream lease lapses, and the
+        //    chain collapses inward toward the key.
+        //
+        //    STORM-SAFETY (#3763): the gate is strictly `contract_in_use`, which
+        //    is demand-bounded AND time-bounded (clients disconnect; downstream
+        //    registrations lease-expire via `expire_stale_downstream_subscribers`
+        //    after `SUBSCRIPTION_LEASE_DURATION` without renewal). It is NOT
+        //    `is_subscribed` / unconditional — renewing every hosted contract
+        //    regardless of interest is exactly the storm, and it grows with cache
+        //    rather than demand. The eviction budget (piece A) does NOT bound this
+        //    set: an in-use host is eviction-exempt, so this interest gate is the
+        //    only thing that bounds it. Contracts that already hold a live lease
+        //    are excluded (section 1 renews those on the near-expiry cadence); a
+        //    lapsed-or-absent lease is precisely what this section (re-)establishes.
+        {
+            let cache = self.hosting_cache.read();
+            let now = self.time_source.now();
+            for key in cache.iter() {
+                let has_live_lease = self
+                    .active_subscriptions
+                    .get(&key)
+                    .map(|e| e.expires_at > now)
+                    .unwrap_or(false);
+                // `contract_in_use` reads only the client-subscription and
+                // downstream-subscriber maps, never `hosting_cache`, so calling it
+                // under the `hosting_cache` read guard cannot re-enter that lock
+                // (same discipline as `maybe_record_abandonment`).
+                if !has_live_lease && self.contract_in_use(&key) {
+                    needs_renewal_set.insert(key);
+                }
+            }
+        }
+
         // Convert set to vec and sort for deterministic return order
         let mut result: Vec<ContractKey> = needs_renewal_set.into_iter().collect();
         result.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));

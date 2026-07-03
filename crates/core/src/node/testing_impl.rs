@@ -511,6 +511,80 @@ impl ControlledSimulationResult {
             },
         )
     }
+
+    /// Reconstructs the peer-to-peer ring connection graph (undirected
+    /// adjacency) among the captured nodes, keyed by [`NodeLabel`].
+    ///
+    /// An edge `a — b` appears in `a`'s neighbor list iff `a`'s live
+    /// `ConnectionManager` lists `b`'s own-address among its connected peers.
+    /// Any address that does not map to a captured node's own-address is
+    /// dropped, so the graph contains only established regular/gateway nodes.
+    ///
+    /// Used by multi-hop chain tests (#4642 piece D) to prove a subscriber is
+    /// GENUINELY several hops from a holder — i.e. there is no long-range
+    /// shortcut edge along the path that would let the combined get+subscribe
+    /// resolve directly at the holder rather than through a clientless middle.
+    pub fn connection_graph(&self) -> HashMap<NodeLabel, Vec<NodeLabel>> {
+        let mut addr_to_label: HashMap<std::net::SocketAddr, NodeLabel> = HashMap::new();
+        for (label, ring) in &self.node_rings {
+            if let Some(addr) = ring.connection_manager.get_own_addr() {
+                addr_to_label.insert(addr, label.clone());
+            }
+        }
+        let mut graph: HashMap<NodeLabel, Vec<NodeLabel>> = HashMap::new();
+        for (label, ring) in &self.node_rings {
+            let mut neighbors: Vec<NodeLabel> = ring
+                .connection_manager
+                .connected_peer_addrs()
+                .into_iter()
+                .filter_map(|a| addr_to_label.get(&a).cloned())
+                .filter(|n| n != label)
+                .collect();
+            neighbors.sort();
+            neighbors.dedup();
+            graph.insert(label.clone(), neighbors);
+        }
+        graph
+    }
+
+    /// Shortest hop distance from `from` to `to` over [`connection_graph`], or
+    /// `None` if `to` is unreachable from `from`. `Some(1)` means directly
+    /// connected. Optionally excludes a set of labels (e.g. the gateway, whose
+    /// bootstrap connection is transient) from the traversal.
+    ///
+    /// [`connection_graph`]: Self::connection_graph
+    pub fn hop_distance(
+        &self,
+        from: &NodeLabel,
+        to: &NodeLabel,
+        exclude: &[NodeLabel],
+    ) -> Option<usize> {
+        use std::collections::VecDeque;
+        if from == to {
+            return Some(0);
+        }
+        let graph = self.connection_graph();
+        let excluded: std::collections::HashSet<&NodeLabel> = exclude.iter().collect();
+        let mut visited: std::collections::HashSet<NodeLabel> = std::collections::HashSet::new();
+        let mut queue: VecDeque<(NodeLabel, usize)> = VecDeque::new();
+        visited.insert(from.clone());
+        queue.push_back((from.clone(), 0));
+        while let Some((node, dist)) = queue.pop_front() {
+            if let Some(neighbors) = graph.get(&node) {
+                for n in neighbors {
+                    if excluded.contains(n) || visited.contains(n) {
+                        continue;
+                    }
+                    if n == to {
+                        return Some(dist + 1);
+                    }
+                    visited.insert(n.clone());
+                    queue.push_back((n.clone(), dist + 1));
+                }
+            }
+        }
+        None
+    }
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
