@@ -2171,18 +2171,29 @@ mod tests {
         assert!(!downstream_entry.1.is_upstream);
     }
 
-    /// Regression for the D2 clobber in the `ChangeInterests` interest-sync
-    /// handler (`node.rs`): a peer that is already our UPSTREAM host
-    /// (`is_upstream = true`, set when we subscribed through it) must not be
-    /// downgraded to a plain downstream interest when it re-advertises interest
-    /// on the periodic interest-sync heartbeat.
+    /// Primitive-contract pin underpinning the D2 clobber fix in the
+    /// `ChangeInterests` interest-sync handler (`node.rs`): a peer that is
+    /// already our UPSTREAM host (`is_upstream = true`, set when we subscribed
+    /// through it) must not be downgraded to a plain downstream interest when it
+    /// re-advertises interest via a `ChangeInterests { added }` gossip. (That
+    /// gossip is EVENT-DRIVEN — emitted only on a 0->1 interest transition, not
+    /// on the ~5-min heartbeat, which sends the already-guarded `Interests`
+    /// full-replace arm.)
     ///
     /// `register_peer_interest(.., is_upstream = false)` overwrites the whole
     /// `PeerInterest`, flipping `is_upstream` true -> false and wiping the
-    /// cached delta-sync summary to `None`. The handlers therefore guard the
+    /// cached delta-sync summary to `None`. The handler therefore guards the
     /// re-registration of an EXISTING entry with
     /// `get_peer_interest().is_some() -> refresh_peer_interest()`, which
-    /// preserves both. This pins the primitive behaviour that guard relies on:
+    /// preserves both.
+    ///
+    /// SCOPE: this exercises the InterestManager PRIMITIVES directly, so it is a
+    /// characterization of the contract the guard relies on — it PASSES on the
+    /// pre-fix handler too (the bug was the handler calling the wrong
+    /// primitive, not a primitive misbehaving). The handler-WIRING regression
+    /// signal — the test that FAILS on the pre-fix unguarded arm — is
+    /// `change_interests_arm_guards_register_with_refresh_pin` in `node.rs`.
+    /// What this pins:
     ///   1. `refresh` PRESERVES `is_upstream` + summary, so
     ///      `send_unsubscribe_upstream`'s lookup
     ///      (`get_interested_peers().find(|i| i.is_upstream)`) still resolves,
