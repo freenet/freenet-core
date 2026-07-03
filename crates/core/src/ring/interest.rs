@@ -2171,6 +2171,101 @@ mod tests {
         assert!(!downstream_entry.1.is_upstream);
     }
 
+    /// Primitive-contract pin underpinning the D2 clobber fix in the
+    /// `ChangeInterests` interest-sync handler (`node.rs`): a peer that is
+    /// already our UPSTREAM host (`is_upstream = true`, set when we subscribed
+    /// through it) must not be downgraded to a plain downstream interest when it
+    /// re-advertises interest via a `ChangeInterests { added }` gossip. (That
+    /// gossip is EVENT-DRIVEN — emitted only on a 0->1 interest transition, not
+    /// on the ~5-min heartbeat, which sends the already-guarded `Interests`
+    /// full-replace arm.)
+    ///
+    /// `register_peer_interest(.., is_upstream = false)` overwrites the whole
+    /// `PeerInterest`, flipping `is_upstream` true -> false and wiping the
+    /// cached delta-sync summary to `None`. The handler therefore guards the
+    /// re-registration of an EXISTING entry with
+    /// `get_peer_interest().is_some() -> refresh_peer_interest()`, which
+    /// preserves both.
+    ///
+    /// SCOPE: this exercises the InterestManager PRIMITIVES directly, so it is a
+    /// characterization of the contract the guard relies on — it PASSES on the
+    /// pre-fix handler too (the bug was the handler calling the wrong
+    /// primitive, not a primitive misbehaving). The handler-WIRING regression
+    /// signal — the test that FAILS on the pre-fix unguarded arm — is
+    /// `change_interests_arm_guards_register_with_refresh_pin` in `node.rs`.
+    /// What this pins:
+    ///   1. `refresh` PRESERVES `is_upstream` + summary, so
+    ///      `send_unsubscribe_upstream`'s lookup
+    ///      (`get_interested_peers().find(|i| i.is_upstream)`) still resolves,
+    ///      keeping event-driven chain collapse working; and
+    ///   2. a bare `register(false)` CLOBBERS both — the failure mode the
+    ///      `ChangeInterests` handler exhibited before the guard was added.
+    #[test]
+    fn upstream_interest_survives_refresh_but_bare_register_clobbers_it() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let upstream = make_peer_key(1);
+        let summary = StateSummary::from(vec![1u8, 2, 3]);
+
+        // We subscribed through `upstream`, so it is registered as our upstream
+        // host with a cached delta-sync summary.
+        manager.register_peer_interest(&contract, upstream.clone(), Some(summary.clone()), true);
+        let before = manager.get_peer_interest(&contract, &upstream).unwrap();
+        assert!(before.is_upstream);
+        assert_eq!(before.summary.as_ref(), Some(&summary));
+
+        // FIXED handler path: an existing entry is refreshed, not
+        // re-registered. Refresh preserves is_upstream AND the cached summary.
+        manager.refresh_peer_interest(&contract, &upstream);
+        let after_refresh = manager.get_peer_interest(&contract, &upstream).unwrap();
+        assert!(
+            after_refresh.is_upstream,
+            "refresh must preserve is_upstream so send_unsubscribe_upstream can \
+             still find the upstream"
+        );
+        assert_eq!(
+            after_refresh.summary.as_ref(),
+            Some(&summary),
+            "refresh must preserve the cached delta-sync summary"
+        );
+
+        // `send_unsubscribe_upstream` locates the upstream exactly this way;
+        // assert it still resolves after the heartbeat refresh.
+        let found = manager
+            .get_interested_peers(&contract)
+            .into_iter()
+            .find(|(_, i)| i.is_upstream)
+            .map(|(p, _)| p);
+        assert_eq!(
+            found,
+            Some(upstream.clone()),
+            "the upstream lookup used by send_unsubscribe_upstream must still \
+             find the peer after a refresh"
+        );
+
+        // BUG path (the pre-fix unguarded `ChangeInterests` handler): a bare
+        // register(false) overwrites the entry, clobbering BOTH fields.
+        manager.register_peer_interest(&contract, upstream.clone(), None, false);
+        let clobbered = manager.get_peer_interest(&contract, &upstream).unwrap();
+        assert!(
+            !clobbered.is_upstream,
+            "documents the clobber: a bare register(false) flips is_upstream \
+             true -> false"
+        );
+        assert!(
+            clobbered.summary.is_none(),
+            "documents the clobber: a bare register(false) wipes the cached summary"
+        );
+        assert!(
+            manager
+                .get_interested_peers(&contract)
+                .into_iter()
+                .all(|(_, i)| !i.is_upstream),
+            "after the clobber, send_unsubscribe_upstream can no longer find any \
+             upstream — the event-driven-collapse defeat this fix prevents"
+        );
+    }
+
     #[test]
     fn test_register_peer_interest_resets_ttl() {
         // Verify that register_peer_interest resets TTL for existing entries.
