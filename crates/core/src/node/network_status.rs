@@ -524,6 +524,22 @@ pub fn record_terminal_consult_still_not_found() {
     }
 }
 
+/// Read the current terminal advertisement-consult counters (hosting redesign
+/// piece C, #4646) for export to the `router_snapshot` telemetry event (#4658).
+///
+/// Returns `(attempts, hits, resolved_found, still_not_found)` — the four
+/// per-node monotonic aggregates recorded by the consult sites — or `None`
+/// before the `NETWORK_STATUS` singleton is initialized. `Ring` polls this on
+/// the snapshot cadence and copies the values onto `RouterSnapshotInfo` so the
+/// production findability baseline (dead-end decomposition) is legible in
+/// central telemetry, not just the internal singleton / sim-only metrics.
+pub fn terminal_consult_counts() -> Option<(u64, u64, u64, u64)> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    let c = &s.terminal_consult_stats;
+    Some((c.attempts, c.hits, c.resolved_found, c.still_not_found))
+}
+
 /// Record a NAT traversal attempt.
 pub fn record_nat_attempt(success: bool) {
     if let Some(status) = NETWORK_STATUS.get() {
@@ -1181,6 +1197,45 @@ mod tests {
     fn test_html_escape() {
         assert_eq!(html_escape("<script>"), "&lt;script&gt;");
         assert_eq!(html_escape("a&b"), "a&amp;b");
+    }
+
+    /// End-to-end for #4658: the terminal-consult record sites must feed the
+    /// `terminal_consult_counts()` getter that `Ring` polls for the
+    /// `router_snapshot` telemetry export. `init()` resets the counters, each
+    /// `record_*` bumps its own field, and the getter returns them in
+    /// `(attempts, hits, resolved_found, still_not_found)` order — so a wiring
+    /// mistake (wrong field, dropped increment, transposed getter tuple) fails
+    /// here rather than silently emitting zeros in production.
+    #[test]
+    fn terminal_consult_counts_reflect_recorded_events() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        // Fresh singleton state for a deterministic baseline (init overwrites
+        // the process-global tracker in place, zeroing the consult counters).
+        init(31337, HashSet::new(), "test".to_string());
+
+        assert_eq!(
+            terminal_consult_counts(),
+            Some((0, 0, 0, 0)),
+            "counters start at zero after init"
+        );
+
+        // Distinct counts per field so a transposition can't pass.
+        record_terminal_consult_attempt();
+        record_terminal_consult_attempt();
+        record_terminal_consult_attempt();
+        record_terminal_consult_hit();
+        record_terminal_consult_hit();
+        record_terminal_consult_resolved_found();
+        record_terminal_consult_still_not_found();
+        record_terminal_consult_still_not_found();
+        record_terminal_consult_still_not_found();
+        record_terminal_consult_still_not_found();
+
+        assert_eq!(
+            terminal_consult_counts(),
+            Some((3, 2, 1, 4)),
+            "getter returns (attempts, hits, resolved_found, still_not_found)"
+        );
     }
 
     #[test]

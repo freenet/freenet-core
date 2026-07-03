@@ -218,6 +218,28 @@ pub(crate) struct RouterSnapshotInfo {
     pub hosting_evictions_of_recently_read_total: Option<u64>,
     pub hosting_local_hits_total: Option<u64>,
     pub hosting_local_misses_total: Option<u64>,
+    /// Terminal advertisement-consult counters (hosting redesign piece C,
+    /// #4646; exported to central telemetry per #4658), populated by `Ring`
+    /// from the per-node `network_status` singleton on the snapshot cadence.
+    ///
+    /// A GET/SUBSCRIBE that routes to a terminus (the closest peer it can reach,
+    /// can't route closer) consults the host-advertisements its neighbors sent
+    /// before returning NotFound. These four counters decompose dead-ends —
+    /// `attempts` → `hits` (found an advertised off-path host) → `resolved_found`
+    /// (that forward resolved to Found/Subscribed) are the dead-ends piece C
+    /// closes; `still_not_found` is the residual (no reachable host near the key)
+    /// that needs piece D. That decomposition is the findability baseline the
+    /// piece-E / 0.2.92 decision rests on, which is why it must be observable in
+    /// production rather than only in simulation. All monotonic lifetime totals
+    /// (the collector differences them across the cadence to derive rates),
+    /// segmentable by release via the `service.version` OTLP resource attribute
+    /// stamped on every batch. `None` until the ring's snapshot task has
+    /// populated them (i.e. always populated in production snapshots). Per-node
+    /// aggregate scalars.
+    pub terminal_consult_attempts: Option<u64>,
+    pub terminal_consult_hits: Option<u64>,
+    pub terminal_consult_resolved_found: Option<u64>,
+    pub terminal_consult_still_not_found: Option<u64>,
     /// Interest-weighted (two-tier) module-cache SHADOW gauges (#4441/#4534),
     /// populated by `Ring` from the same per-node `ModuleCacheMetrics` `Arc`.
     /// These are ALWAYS ON, independent of the `FREENET_MODULE_CACHE_INTEREST_TIERED`
@@ -1123,6 +1145,13 @@ impl Router {
             hosting_evictions_of_recently_read_total: None,
             hosting_local_hits_total: None,
             hosting_local_misses_total: None,
+            // Terminal advertisement-consult counters (piece C, #4646),
+            // populated by Ring from the network_status singleton on the
+            // snapshot cadence (#4658).
+            terminal_consult_attempts: None,
+            terminal_consult_hits: None,
+            terminal_consult_resolved_found: None,
+            terminal_consult_still_not_found: None,
             // Interest-weighted (two-tier) module-cache shadow gauges,
             // populated by Ring on the snapshot cadence (#4441/#4534).
             contract_module_cache_cold_evictable_bytes: None,
