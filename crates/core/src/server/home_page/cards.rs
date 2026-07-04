@@ -777,6 +777,18 @@ pub fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot
     };
     let g = &snap.governance;
 
+    // Retire the dormant MAD-governance card on default nodes. The MAD-based
+    // `GovernanceManager` is default-Off (see `GovernanceConfig` in
+    // contract/governance.rs) and is being replaced by demand-driven eviction
+    // (#4296, #4642); on a default node it only ever renders "Governance is
+    // off", so hide the card entirely unless an operator has explicitly enabled
+    // governance (DryRun/Enforce). Live retention is surfaced by the
+    // demand-driven eviction card instead. See .claude/rules/hosting-invariants.md
+    // (retention is now demand-driven, not MAD cost/benefit outlier detection).
+    if matches!(g.mode, network_status::GovernanceModeSnapshot::Off) {
+        return String::new();
+    }
+
     let mode_txt = match g.mode {
         network_status::GovernanceModeSnapshot::Off => "off",
         network_status::GovernanceModeSnapshot::DryRun => "dry-run",
@@ -804,17 +816,14 @@ pub fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot
     if g.contracts.is_empty() {
         let observed = g.observed_count;
         let needed = g.min_samples;
-        // When governance is Off (the default — see `GovernanceConfig`),
-        // no contract is ever scored, so the ramp-up / "scoring activates"
-        // copy below would be misleading on every default node. Render a
-        // disabled message instead.
-        let is_off = matches!(g.mode, network_status::GovernanceModeSnapshot::Off);
+        // NOTE: this branch is only reachable when governance is explicitly
+        // enabled (DryRun/Enforce) — the default `Off` mode returns an empty
+        // card above, so the ramp-up / "scoring activates" copy below is only
+        // shown to an operator who opted in.
         // Tiny pluralization helper so the user-facing messages
         // don't read "1 contracts" — Codex review nit.
         let plural = |n: usize| if n == 1 { "contract" } else { "contracts" };
-        let progress_msg = if is_off {
-            "Governance is off: contracts are not scored, and nothing is evicted.".to_string()
-        } else if needed == 0 {
+        let progress_msg = if needed == 0 {
             "Governance manager is not yet wired.".to_string()
         } else if observed == 0 {
             format!(
@@ -844,12 +853,7 @@ pub fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot
                 n_word = plural(observed),
             )
         };
-        let verdict_main = if is_off {
-            r#"<div class="verdict-num">—</div>
-                   <div class="verdict-headline">Governance off</div>
-                   <div class="verdict-detail">Contracts are not scored or evicted.</div>"#
-                .to_string()
-        } else if observed >= needed {
+        let verdict_main = if observed >= needed {
             format!(
                 r#"<div class="verdict-num">✓</div>
                    <div class="verdict-headline">{observed} contracts within normal range</div>
@@ -1108,6 +1112,117 @@ pub fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot
     )
 }
 
+/// Build the demand-driven eviction card (piece A, #4642). Surfaces the
+/// capability-relative RAM budget and the per-contract Greedy-Dual
+/// `keep_score` that ACTUALLY governs retention today — the mechanism that
+/// replaced the dormant MAD `GovernanceManager` (#4296), whose dashboard card
+/// is now hidden on default nodes. Every value comes from
+/// `Ring::dashboard_hosting_snapshot` reading the canonical hosting cache;
+/// nothing is invented at render time. See `.claude/rules/hosting-invariants.md`.
+///
+/// Hidden when the node hosts nothing (a fresh/idle node) — the budget still
+/// exists but there's nothing to retain, so the panel would just be noise.
+pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
+    let Some(snap) = snap else {
+        return String::new();
+    };
+    let h = &snap.hosting;
+    if h.contract_count == 0 {
+        return String::new();
+    }
+
+    let budget = h.budget_bytes.max(1);
+    let used_pct = (h.used_bytes as f64 / budget as f64 * 100.0).min(100.0);
+    let headroom = h.budget_bytes.saturating_sub(h.used_bytes);
+
+    // Recently-read evictions are the miscalibration alarm (#4338): evicting a
+    // repeatedly-requested contract means the demand estimate is mis-ordering
+    // the working set. Color it when non-zero so an operator notices.
+    let recently_read_value = if h.evictions_of_recently_read_total > 0 {
+        format!(
+            r#"<span style="color: var(--danger, #c0392b);">{}</span>"#,
+            h.evictions_of_recently_read_total
+        )
+    } else {
+        "0".to_string()
+    };
+
+    // Per-contract table, bounded. Rows arrive in EVICTION order (lowest
+    // keep-score first); show at most MAX_ROWS. The tile carries the full count.
+    //
+    // The "next to evict" badge marks the first EVICTION-ELIGIBLE row, not
+    // simply the lowest keep-score row: the over-budget sweep SKIPS contracts
+    // that are within `min_ttl` or still in use (`should_retain`), so the
+    // lowest-score row may be one the cache would never actually evict. Badging
+    // it would mislabel an eviction-exempt contract — exactly the "dashboard
+    // misleads the operator" problem this card exists to fix. When nothing is
+    // currently eligible (every hosted contract is within-TTL / in use), no row
+    // is badged.
+    const MAX_ROWS: usize = 20;
+    let next_victim_idx = h.contracts.iter().position(|c| c.eviction_eligible);
+    let mut rows = String::new();
+    for (i, c) in h.contracts.iter().take(MAX_ROWS).enumerate() {
+        let next_badge = if Some(i) == next_victim_idx {
+            r#" <span class="hz-badge hz-next" title="Lowest keep-score among eviction-eligible contracts (past min-TTL and not in use) — the over-budget sweep would evict this one first.">next to evict</span>"#
+        } else {
+            ""
+        };
+        rows.push_str(&format!(
+            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button>{next}</td><td class="right" data-sort="{keep:.6}">{keep:.3}</td><td class="right" data-sort="{demand:.6}">{demand:.3}</td><td class="right" data-sort="{size}">{size_fmt}</td><td class="right" data-sort="{reads}">{reads}</td></tr>"#,
+            full = html_escape(&c.key_full),
+            short = html_escape(&c.key_short),
+            next = next_badge,
+            keep = c.keep_score,
+            demand = c.predicted_demand,
+            size = c.size_bytes,
+            size_fmt = format_bytes(c.size_bytes),
+            reads = c.read_count,
+        ));
+    }
+    let shown = (h.contracts.len()).min(MAX_ROWS);
+    let footer = if (h.contract_count as usize) > shown {
+        format!(
+            r#"<p class="empty" style="margin: 0.4rem 0.9rem 0.6rem; font-size: 0.78rem; color: var(--text-muted, #888);">Showing the {shown} most-evictable of {total} hosted contracts (lowest keep-score first).</p>"#,
+            shown = shown,
+            total = h.contract_count,
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r##"<div class="card">
+            <div class="card-header"><h2>Demand-driven eviction</h2><span class="g-mode g-mode-enforce">piece A</span></div>
+            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven: contracts with the lowest predicted read-demand (keep-score) are evicted first when over the RAM budget.</p>
+            <div class="g-verdict-row">
+                <div class="g-norms">
+                    <div class="g-norm"><div class="g-norm-label">RAM used</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Headroom</div><div class="g-norm-value">{headroom}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Hosted</div><div class="g-norm-value">{count}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Budget evictions</div><div class="g-norm-value">{budget_evictions}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Evicted w/ demand</div><div class="g-norm-value">{recently_read}</div></div>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <table class="sortable" data-table-id="hosting">
+                    <thead><tr><th data-sort-type="text">Contract</th><th class="right" data-sort-type="num">Keep-score</th><th class="right" data-sort-type="num">Demand</th><th class="right" data-sort-type="num">Size</th><th class="right" data-sort-type="num">Reads</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+            {footer}
+        </div>"##,
+        used = format_bytes(h.used_bytes),
+        budget = format_bytes(h.budget_bytes),
+        pct = used_pct,
+        headroom = format_bytes(headroom),
+        count = h.contract_count,
+        budget_evictions = h.budget_evictions_total,
+        recently_read = recently_read_value,
+        rows = rows,
+        footer = footer,
+    )
+}
+
 /// Contract ban-list card (#4302). Surfaces the canonical
 /// `Ring::contract_ban_list` so operators can see whether the Phase 7
 /// hardening mechanism is catching abusers or sitting idle.
@@ -1154,7 +1269,10 @@ pub fn build_ban_list_card(snap: &Option<network_status::NetworkStatusSnapshot>)
         let mut rows = String::new();
         for e in &b.entries {
             let reason_txt = match e.reason {
-                network_status::BanReasonSnapshot::AutoMad => "auto (governance)",
+                // The MAD auto-ban path is dormant (governance default-Off,
+                // being replaced by demand-driven eviction — #4296/#4642), so
+                // in practice only the operator path produces live entries.
+                network_status::BanReasonSnapshot::AutoMad => "auto (legacy governance, dormant)",
                 network_status::BanReasonSnapshot::Operator => "operator",
             };
             let remaining = if e.expires_in_secs == 0 {
@@ -1216,7 +1334,6 @@ pub fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>
         return String::new();
     }
 
-    let state_by_id = &snap.governance.state_by_id;
     let mut rows = String::new();
     for c in &snap.contracts {
         let last_update = c
@@ -1224,32 +1341,33 @@ pub fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>
             .map(format_ago)
             .unwrap_or_else(|| "—".to_string());
         let last_update_sort = c.last_updated_secs.unwrap_or(u64::MAX);
-        // Governance state cell. A contract may appear in the
-        // Subscribed Contracts table without being flagged by
-        // governance — in that case the state isn't in `state_by_id`
-        // (the snapshot only carries flagged contracts) and we
-        // render it as "ok". Absence from the table specifically
-        // means "not flagged"; we trust the back-end's `iter_flagged_
-        // scores` filter.
-        let (gov_class, gov_label, gov_sort) = match state_by_id.get(&c.instance_id) {
-            None => ("gov-ok", "ok", 0u8),
-            Some(network_status::GovernanceStateSnapshot::Normal) => ("gov-ok", "ok", 0),
-            Some(network_status::GovernanceStateSnapshot::Borderline) => {
-                ("gov-borderline", "borderline", 1)
-            }
-            Some(network_status::GovernanceStateSnapshot::WouldEvict) => {
-                ("gov-wouldevict", "would evict", 2)
-            }
-            Some(network_status::GovernanceStateSnapshot::Evicted) => ("gov-evicted", "evicted", 3),
-            Some(network_status::GovernanceStateSnapshot::Banned) => ("gov-banned", "banned", 4),
+        // Freshness / demand cell (replaces the retired MAD-governance
+        // column). `is_receiving_updates` is the REAL per-contract freshness
+        // signal — only an active subscription keeps the cached state current
+        // (is_hosting is NOT a freshness signal, PR #3699). `in_use` shows
+        // whether real demand (a local client or a downstream subscriber)
+        // pins the contract, vs. a network-only subscription with no reader.
+        let (fresh_class, fresh_label) = if c.is_receiving_updates {
+            ("fresh-ok", "fresh")
+        } else {
+            ("fresh-stale", "stale")
         };
+        let (use_class, use_label) = if c.in_use {
+            ("use-active", "in use")
+        } else {
+            ("use-idle", "idle")
+        };
+        // Sort healthiest-first: freshness weighs more than in-use demand.
+        let fresh_sort = (c.is_receiving_updates as u8) * 2 + (c.in_use as u8);
         rows.push_str(&format!(
-            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button></td><td data-sort="{gov_sort}"><span class="gov-pill {gov_class}">{gov_label}</span></td><td data-sort="{sub_secs}">{subscribed}</td><td data-sort="{last_sort}">{last_update}</td></tr>"#,
+            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button></td><td data-sort="{fresh_sort}"><span class="fresh-pill {fresh_class}">{fresh_label}</span> <span class="fresh-pill {use_class}">{use_label}</span></td><td data-sort="{sub_secs}">{subscribed}</td><td data-sort="{last_sort}">{last_update}</td></tr>"#,
             full = html_escape(&c.key_full),
             short = html_escape(&c.key_short),
-            gov_sort = gov_sort,
-            gov_class = gov_class,
-            gov_label = gov_label,
+            fresh_sort = fresh_sort,
+            fresh_class = fresh_class,
+            fresh_label = fresh_label,
+            use_class = use_class,
+            use_label = use_label,
             sub_secs = c.subscribed_secs,
             subscribed = format_ago(c.subscribed_secs),
             last_sort = last_update_sort,
@@ -1262,7 +1380,7 @@ pub fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>
             <h2>Subscribed Contracts</h2>
             <div class="table-wrap">
                 <table class="sortable" data-table-id="contracts">
-                    <thead><tr><th data-sort-type="text">Contract</th><th data-sort-type="num">Gov</th><th data-sort-type="num">Subscribed</th><th data-sort-type="num">Last Update</th></tr></thead>
+                    <thead><tr><th data-sort-type="text">Contract</th><th data-sort-type="num">Freshness</th><th data-sort-type="num">Subscribed</th><th data-sort-type="num">Last Update</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>

@@ -501,6 +501,14 @@ impl NodeP2P {
         super::network_status::set_ban_list_provider(std::sync::Arc::new(move || {
             ban_list_ring.dashboard_ban_list_snapshot()
         }));
+        // Same pattern for the demand-driven hosting snapshot (piece A,
+        // #4642) — dashboard reads the canonical hosting cache (RAM budget +
+        // Greedy-Dual keep_score), the mechanism that actually governs
+        // retention now, replacing the dormant MAD governance detector.
+        let hosting_ring = self.op_manager.ring.clone();
+        super::network_status::set_hosting_provider(std::sync::Arc::new(move || {
+            hosting_ring.dashboard_hosting_snapshot()
+        }));
 
         // Wire live ring stats for the dashboard: connection count +
         // hosted contracts + own public key, read on every homepage

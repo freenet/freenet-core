@@ -1286,6 +1286,54 @@ table.sortable thead th.sort-desc::after {
   color: #d33682;
 }
 
+/* Freshness / demand pills in the Subscribed Contracts table (replaces the
+ * retired MAD-governance column). Same compact shape as `.gov-pill`. */
+.fresh-pill {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  font-size: 0.72rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 500;
+  line-height: 1.2;
+}
+.fresh-ok {
+  background: rgba(67, 193, 120, 0.16);
+  color: #43c178;
+}
+.fresh-stale {
+  background: rgba(255, 138, 61, 0.2);
+  color: #ff8a3d;
+}
+.use-active {
+  background: rgba(88, 166, 255, 0.16);
+  color: #58a6ff;
+}
+.use-idle {
+  background: rgba(139, 148, 158, 0.16);
+  color: var(--text-muted, #8b949e);
+}
+
+/* "next to evict" badge on the front row of the Demand-driven eviction
+ * table (the lowest keep-score contract, i.e. the next budget-pressure
+ * victim). */
+.hz-badge {
+  display: inline-block;
+  margin-left: 0.35rem;
+  padding: 0.05rem 0.4rem;
+  font-size: 0.66rem;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 500;
+  vertical-align: middle;
+}
+.hz-next {
+  background: rgba(255, 138, 61, 0.2);
+  color: #ff8a3d;
+}
+
 /* Denominator in the empty-state verdict ("3/30"). Smaller than the
  * numerator so the eye reads the count first and the threshold
  * second. */

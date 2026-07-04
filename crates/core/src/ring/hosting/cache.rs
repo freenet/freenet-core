@@ -150,6 +150,38 @@ pub(crate) struct HostingCacheStats {
     pub evictions_of_recently_read_total: u64,
 }
 
+/// Per-contract Greedy-Dual priority row for the local-peer dashboard.
+///
+/// This is what actually governs retention today (piece A of the
+/// demand-driven hosting redesign, #4642): the over-budget walk evicts the
+/// lowest `keep_score` first. Surfaced on the dashboard so an operator can
+/// see the live demand-ordered eviction policy — the mechanism that
+/// replaced the dormant MAD governance detector (#4296). Collected under a
+/// single cache read lock by [`HostingCache::eviction_ordered_scores`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostingContractScore {
+    pub key: ContractKey,
+    /// Greedy-Dual priority = `eviction_floor + predicted_demand` at the last
+    /// refresh. Lowest evicts first.
+    pub keep_score: f64,
+    /// Stored per-contract read-demand estimate (reads/second).
+    pub predicted_demand: f64,
+    /// Per-contract memory cost (state bytes).
+    pub size_bytes: u64,
+    /// Read accesses (GET/SUBSCRIBE) observed over this entry's residency.
+    pub read_count: u32,
+    /// Monotonic access sequence, the LRU tiebreak when keep_scores are equal.
+    pub last_access_seq: u64,
+    /// Whether this entry is past its `min_ttl` age gate — the TTL half of the
+    /// `evict_over_budget` eviction filter (`age >= min_ttl && !should_retain`).
+    /// This is the only half the cache can decide on its own; the
+    /// `!should_retain` (in-use) half is folded in by the `HostingManager`
+    /// layer via [`super::HostingManager::is_eviction_eligible`]. Used by the
+    /// dashboard so the "next to evict" badge only marks a contract the
+    /// over-budget sweep would actually consider — never one it would skip.
+    pub past_min_ttl: bool,
+}
+
 /// Multiplier for TTL relative to subscription renewal interval.
 /// Gives this many renewal attempts before eviction if renewals keep failing.
 pub const TTL_RENEWAL_MULTIPLIER: u32 = 4;
@@ -804,6 +836,38 @@ impl<T: TimeSource> HostingCache<T> {
             budget_evictions_total: self.budget_evictions_total,
             evictions_of_recently_read_total: self.evictions_of_recently_read_total,
         }
+    }
+
+    /// Per-contract Greedy-Dual rows for the local dashboard, in EVICTION
+    /// order (ascending `(keep_score, last_access_seq, key)` — the same order
+    /// [`Self::keys_eviction_order`] uses). The front of the vec is the next
+    /// victim under budget pressure. Unlike that test-only helper this carries
+    /// the score fields the dashboard renders and is available in production.
+    pub(crate) fn eviction_ordered_scores(&self) -> Vec<HostingContractScore> {
+        // `past_min_ttl` mirrors the `age >= self.min_ttl` term of the
+        // `evict_over_budget` filter so the dashboard reflects real sweep
+        // behavior rather than raw keep-score order (see `past_min_ttl` doc).
+        let now = self.time_source.now();
+        let mut rows: Vec<HostingContractScore> = self
+            .contracts
+            .iter()
+            .map(|(k, v)| HostingContractScore {
+                key: *k,
+                keep_score: v.keep_score,
+                predicted_demand: v.predicted_demand,
+                size_bytes: v.size_bytes,
+                read_count: v.read_count,
+                last_access_seq: v.last_access_seq,
+                past_min_ttl: now.saturating_duration_since(v.last_accessed) >= self.min_ttl,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.keep_score
+                .total_cmp(&b.keep_score)
+                .then_with(|| a.last_access_seq.cmp(&b.last_access_seq))
+                .then_with(|| a.key.as_bytes().cmp(b.key.as_bytes()))
+        });
+        rows
     }
 
     /// Get all hosted contract keys in EVICTION order — the order the
@@ -1472,6 +1536,69 @@ mod tests {
         assert!(
             cache.has_recent_local_client_access(&key, lease),
             "Re-marking should refresh the age gate"
+        );
+    }
+
+    #[test]
+    fn eviction_ordered_scores_matches_key_order_and_carries_fields() {
+        // The dashboard reads `eviction_ordered_scores` (production) to render
+        // piece A's demand-driven eviction. It must yield the same order as the
+        // test-only `keys_eviction_order` and carry each entry's score fields.
+        let (mut cache, _) = make_cache(10_000, Duration::from_secs(60));
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+        let key3 = make_key(3);
+        cache.record_access(key1, 111, AccessType::Get, 0, |_| false);
+        cache.record_access(key2, 222, AccessType::Get, 0, |_| false);
+        cache.record_access(key3, 333, AccessType::Get, 0, |_| false);
+
+        let scores = cache.eviction_ordered_scores();
+        let score_keys: Vec<_> = scores.iter().map(|s| s.key).collect();
+        assert_eq!(
+            score_keys,
+            cache.keys_eviction_order(),
+            "eviction_ordered_scores must use the same order as keys_eviction_order"
+        );
+        for s in &scores {
+            let entry = cache.get(&s.key).expect("scored key is in the cache");
+            assert_eq!(s.keep_score, entry.keep_score);
+            assert_eq!(s.size_bytes, entry.size_bytes);
+            assert_eq!(s.read_count, entry.read_count);
+            assert_eq!(s.predicted_demand, entry.predicted_demand);
+            assert_eq!(s.last_access_seq, entry.last_access_seq);
+            // Just accessed with a 60s min_ttl → not yet past the TTL gate.
+            assert!(
+                !s.past_min_ttl,
+                "a freshly-accessed entry is within min_ttl, so it is not \
+                 eviction-eligible yet"
+            );
+        }
+    }
+
+    #[test]
+    fn eviction_ordered_scores_flags_past_min_ttl_after_ttl_elapses() {
+        // `past_min_ttl` must mirror the `age >= min_ttl` term of the
+        // `evict_over_budget` filter: false while within the TTL window, true
+        // once the entry has aged past it. This is the cache half of the
+        // dashboard "next to evict" eligibility (the in-use half is folded in
+        // by `HostingManager::is_eviction_eligible`).
+        let min_ttl = Duration::from_secs(60);
+        let (mut cache, time_source) = make_cache(10_000, min_ttl);
+        let key = make_key(1);
+        cache.record_access(key, 111, AccessType::Get, 0, |_| false);
+
+        let before = cache.eviction_ordered_scores();
+        assert!(
+            !before[0].past_min_ttl,
+            "within min_ttl → not past the TTL gate"
+        );
+
+        // Age the entry past min_ttl.
+        time_source.advance_time(min_ttl + Duration::from_secs(1));
+        let after = cache.eviction_ordered_scores();
+        assert!(
+            after[0].past_min_ttl,
+            "past min_ttl → now eligible for the TTL gate"
         );
     }
 
