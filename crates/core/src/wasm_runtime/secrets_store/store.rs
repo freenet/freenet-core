@@ -2443,7 +2443,6 @@ mod test {
     use super::super::sweep::{
         // Private helpers exposed pub(super) for this test module
         LAST_SEEN_FILE,
-        SweepOutcome,
         enumerate_marked_users,
         read_user_last_seen,
         reclaim_inactive_users,

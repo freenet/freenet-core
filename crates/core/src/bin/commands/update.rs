@@ -3935,6 +3935,10 @@ done
     }
 
     #[test]
+    // The assertion IS on a `const` on purpose: this is a compile-time tripwire
+    // that fails the build the instant someone flips REQUIRE_RELEASE_SIGNATURE
+    // before the signed floor is established.
+    #[allow(clippy::assertions_on_constants)]
     fn transition_flag_is_false_until_signed_floor_established() {
         // Tripwire for the two-release rollout. Flipping this to `true` makes
         // an ABSENT signature refuse the install, which bricks auto-update for

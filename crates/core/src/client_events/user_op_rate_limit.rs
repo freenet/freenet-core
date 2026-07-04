@@ -668,7 +668,6 @@ mod tests {
                 let limiter = limiter.clone();
                 let admitted = admitted.clone();
                 let barrier = barrier.clone();
-                let user = user;
                 scope.spawn(move || {
                     // Line everyone up so the acquires actually overlap.
                     barrier.wait();
