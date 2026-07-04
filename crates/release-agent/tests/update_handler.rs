@@ -1053,6 +1053,22 @@ fn signed_announce(secret: &[u8], message: &str, issued_at: i64) -> (String, Str
     (body, sig)
 }
 
+fn signed_announce_with_version(
+    secret: &[u8],
+    message: &str,
+    version: &str,
+    issued_at: i64,
+) -> (String, String) {
+    let body = serde_json::to_string(&json!({
+        "message": message,
+        "issued_at": issued_at,
+        "version": version,
+    }))
+    .unwrap();
+    let sig = sign(secret, body.as_bytes());
+    (body, sig)
+}
+
 #[tokio::test]
 async fn announce_disabled_returns_503_with_valid_signature() {
     // The default-built Harness has an unconfigured announcer (empty
@@ -1154,6 +1170,75 @@ async fn announce_happy_path() {
     // Drain the in-flight stub child before the Harness/TempDir drops, so the
     // still-sleeping announce script isn't deleted out from under it.
     poll_file_nonempty(&done_marker).await;
+}
+
+#[tokio::test]
+async fn announce_forwards_target_version_as_flag() {
+    // #4496 plumbing: a request carrying `version` must reach the script as a
+    // trailing `--target-version <v>` flag on argv (so announce-to-river.sh can
+    // run its version-aware readiness gate). A leading `v` in the request is
+    // normalized off before forwarding.
+    let tmp = tempfile::tempdir().unwrap();
+    let record = tmp.path().join("argv.log");
+    let done_marker = tmp.path().join("done.log");
+    let announce_script = format!(
+        "#!/bin/sh\nsleep 1.5\necho done > {}\n",
+        done_marker.display()
+    );
+    let h = build_with_announcer(&announce_script, &record).await;
+    let (body, sig) =
+        signed_announce_with_version(&h.secret, "Freenet v0.2.90 released", "v0.2.90", now_secs());
+    let resp = reqwest::Client::new()
+        .post(format!("{}/announce/river", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status() == 200 || resp.status() == 202,
+        "got {}",
+        resp.status()
+    );
+    let recorded_full = {
+        // record.full is written by the fake-sudo wrapper; poll the primary
+        // record first to ensure both files exist.
+        poll_file_nonempty(&record).await;
+        std::fs::read_to_string(format!("{}.full", record.display()))
+            .expect("fake-sudo recorded full argv")
+    };
+    let full = recorded_full.trim();
+    // The message keeps its own `v`; the forwarded flag is normalized to bare
+    // semver. Pinning the exact suffix proves the flag is LAST (after the
+    // message positional) and semver-normalized.
+    assert!(
+        full.ends_with(" Freenet v0.2.90 released --target-version 0.2.90"),
+        "argv must end with the message then the normalized --target-version flag, got: {full:?}"
+    );
+    poll_file_nonempty(&done_marker).await;
+}
+
+#[tokio::test]
+async fn announce_rejects_malformed_target_version() {
+    // A non-semver `version` must be rejected with 400 BEFORE spawning the
+    // script: forwarding garbage would make the script wait out its whole
+    // budget for a version the node can never report.
+    let tmp = tempfile::tempdir().unwrap();
+    let record = tmp.path().join("argv.log");
+    let h = build_with_announcer("#!/bin/sh\nexit 0\n", &record).await;
+    let (body, sig) = signed_announce_with_version(&h.secret, "hello", "not-a-version", now_secs());
+    let resp = reqwest::Client::new()
+        .post(format!("{}/announce/river", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "a malformed target version must be rejected, not forwarded"
+    );
 }
 
 #[tokio::test]

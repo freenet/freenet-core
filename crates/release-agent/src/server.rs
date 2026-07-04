@@ -100,6 +100,14 @@ pub struct UpdateRequest {
 pub struct AnnounceRequest {
     pub message: String,
     pub issued_at: i64,
+    /// Release version this announcement is for (bare semver, no leading `v`).
+    /// Optional for backward compatibility with older callers; when present it
+    /// is forwarded to `announce-to-river.sh` so the script gates the post on
+    /// the restarted node reporting this version — the deterministic fix for
+    /// the #4496 announce/update race. Validated as strict semver before it
+    /// leaves this handler.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// Successful response from `POST /announce/river`.
@@ -449,7 +457,30 @@ async fn announce_river_handler(
         }
     }
 
-    if let Err(e) = state.announcer.run(&req.message).await {
+    // Validate the optional target version as strict semver before it reaches
+    // the script. A malformed value must not be forwarded (the script would
+    // then wait forever for a version the node can never report). Rejecting
+    // here keeps the version-gate #4496 fix well-defined and gives the caller
+    // a clear 400 rather than a silent late failure in journald.
+    let target_version = match req.version.as_deref() {
+        Some(raw) => {
+            let normalized = raw.strip_prefix('v').unwrap_or(raw);
+            match Version::parse(normalized) {
+                Ok(v) => Some(v.to_string()),
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, format!("bad version {raw:?}: {e}"))
+                        .into_response();
+                }
+            }
+        }
+        None => None,
+    };
+
+    if let Err(e) = state
+        .announcer
+        .run(&req.message, target_version.as_deref())
+        .await
+    {
         tracing::error!(error = %e, "announcer spawn failed");
         // Same contract as /update: failure does NOT consume the window.
         return (
