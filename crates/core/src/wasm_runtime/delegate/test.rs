@@ -3337,6 +3337,193 @@ async fn test_subscribe_then_notify_roundtrip() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// Regression test for #3275: a notification-driven delegate `ApplicationMessage`
+/// is routed to the app registered with that delegate, instead of being dropped.
+///
+/// Drives the real production `Runtime`: an app subscribes a delegate to a
+/// contract, the contract's state changes, the delegate emits an
+/// `ApplicationMessage` from the `ContractNotification` callback, and this test
+/// registers the app's notification channel in `delegate_app_registry` and
+/// routes via `route_to_apps` — the exact helper `handle_delegate_notification`
+/// invokes in production. Before the fix there was no registry and no routing
+/// call; the message was logged-and-dropped, so the app channel stayed empty.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+// Test asserts on specific outbound/response variants; the `other => panic!`
+// arms deliberately catch every non-matching (and future non_exhaustive) case.
+#[allow(clippy::wildcard_enum_match_arm)]
+async fn test_notification_application_message_routed_to_registered_app()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::client_events::{ClientId, HostResult};
+    use crate::contract::delegate_app_registry;
+    use crate::wasm_runtime::StateStorage;
+    use capabilities_messages::*;
+    use freenet_stdlib::client_api::HostResponse;
+
+    let temp_dir = get_temp_dir();
+    let contracts_dir = temp_dir.path().join("contracts");
+    let delegates_dir = temp_dir.path().join("delegates");
+    let secrets_dir = temp_dir.path().join("secrets");
+
+    let db = crate::contract::storages::Storage::new(temp_dir.path()).await?;
+    let contract_store = ContractStore::new(contracts_dir, 10_000, db.clone())?;
+    let delegate_store = DelegateStore::new(delegates_dir, 10_000, db.clone())?;
+    let secret_store = SecretsStore::new(secrets_dir, Default::default(), db.clone())?;
+
+    let mut runtime = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+    runtime.set_state_store_db(db.clone());
+
+    // Contract the delegate will subscribe to.
+    let contract_instance_id = ContractInstanceId::new([7u8; 32]);
+    let contract_code = ContractCode::from(vec![7, 7, 7]);
+    let contract_key = ContractKey::from_id_and_code(contract_instance_id, *contract_code.hash());
+    runtime.contract_store.ensure_key_indexed(&contract_key)?;
+    db.store(contract_key, WrappedState::new(vec![1, 2, 3]))
+        .await?;
+
+    // Load the capabilities delegate.
+    let delegate = {
+        let bytes = super::super::tests::get_test_module(TEST_DELEGATE_CAPABILITIES)?;
+        DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+            &bytes.into(),
+            &vec![].into(),
+        ))))
+    };
+    let _stored = runtime.delegate_store.store_delegate(delegate.clone());
+    let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+    let cipher = XChaCha20Poly1305::new(&key);
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let _registered = runtime
+        .secret_store
+        .register_delegate(delegate.key().clone(), cipher, nonce);
+    let delegate_key = delegate.key().clone();
+
+    // The delegate subscribes to the contract.
+    let subscribe_cmd = DelegateCommand::SubscribeContract {
+        contract_id: contract_instance_id,
+    };
+    let outbound = runtime.inbound_app_message(
+        &delegate_key,
+        &vec![].into(),
+        None,
+        None,
+        vec![InboundDelegateMsg::ApplicationMessage(
+            ApplicationMessage::new(bincode::serialize(&subscribe_cmd)?),
+        )],
+    )?;
+    let subscribe_req = match &outbound[0] {
+        OutboundDelegateMsg::SubscribeContractRequest(req) => req.clone(),
+        other => panic!("Expected SubscribeContractRequest, got {other:?}"),
+    };
+    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS
+        .entry(subscribe_req.contract_id)
+        .or_default()
+        .insert(delegate_key.clone());
+    // Feed the subscribe response back so the delegate finishes subscribing.
+    let _ = runtime.inbound_app_message(
+        &delegate_key,
+        &vec![].into(),
+        None,
+        None,
+        vec![InboundDelegateMsg::SubscribeContractResponse(
+            SubscribeContractResponse {
+                contract_id: subscribe_req.contract_id,
+                result: Ok(()),
+                context: subscribe_req.context.clone(),
+            },
+        )],
+    )?;
+
+    // The app registers its notification channel with the delegate (this is what
+    // client_events.rs does for an ApplicationMessages request carrying a
+    // notification channel).
+    let app_client = ClientId::FIRST;
+    let (app_tx, mut app_rx) = tokio::sync::mpsc::channel::<HostResult>(8);
+    assert!(
+        delegate_app_registry::register_app(&delegate_key, app_client, app_tx),
+        "app registration must succeed"
+    );
+
+    // Contract state changes → the delegate is notified and emits an
+    // ApplicationMessage (ContractNotificationReceived) meant for the app.
+    let updated_state = vec![9, 8, 7, 6];
+    let outbound = runtime.inbound_app_message(
+        &delegate_key,
+        &vec![].into(),
+        None,
+        None,
+        vec![InboundDelegateMsg::ContractNotification(
+            ContractNotification {
+                contract_id: contract_instance_id,
+                new_state: WrappedState::new(updated_state.clone()),
+                context: DelegateContext::default(),
+            },
+        )],
+    )?;
+    let app_msg = match &outbound[0] {
+        OutboundDelegateMsg::ApplicationMessage(msg) => msg.clone(),
+        other => panic!("Expected ApplicationMessage, got {other:?}"),
+    };
+
+    // Production routing: fan the ApplicationMessage out to registered apps,
+    // exactly as handle_delegate_notification does.
+    let response: HostResult = Ok(HostResponse::DelegateResponse {
+        key: delegate_key.clone(),
+        values: vec![OutboundDelegateMsg::ApplicationMessage(app_msg)],
+    });
+    let delivered = delegate_app_registry::route_to_apps(&delegate_key, response);
+    assert_eq!(delivered, 1, "message must reach the one registered app");
+
+    // The registered app receives the delegate's notification-driven reply.
+    let received = app_rx
+        .try_recv()
+        .expect("registered app must receive the ApplicationMessage");
+    match received {
+        Ok(HostResponse::DelegateResponse { key, values }) => {
+            assert_eq!(key, delegate_key);
+            assert_eq!(values.len(), 1);
+            match &values[0] {
+                OutboundDelegateMsg::ApplicationMessage(msg) => {
+                    let resp: DelegateResponse = bincode::deserialize(&msg.payload)?;
+                    match resp {
+                        DelegateResponse::ContractNotificationReceived {
+                            contract_id,
+                            new_state,
+                        } => {
+                            assert_eq!(contract_id, contract_instance_id);
+                            assert_eq!(new_state, updated_state);
+                        }
+                        other => panic!("Expected ContractNotificationReceived, got {other:?}"),
+                    }
+                }
+                other => panic!("Expected ApplicationMessage, got {other:?}"),
+            }
+        }
+        other => panic!("Expected DelegateResponse, got {other:?}"),
+    }
+
+    // Clean up: disconnecting the app removes its registration.
+    delegate_app_registry::remove_client(app_client);
+    assert_eq!(
+        delegate_app_registry::route_to_apps(
+            &delegate_key,
+            Ok(HostResponse::DelegateResponse {
+                key: delegate_key.clone(),
+                values: vec![],
+            }),
+        ),
+        0,
+        "after disconnect no app should remain registered"
+    );
+
+    crate::wasm_runtime::DELEGATE_SUBSCRIPTIONS.retain(|_, subs| {
+        subs.remove(&delegate_key);
+        !subs.is_empty()
+    });
+    std::mem::drop(temp_dir);
+    Ok(())
+}
+
 /// Test: removing a contract cleans up DELEGATE_SUBSCRIPTIONS.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_contract_removal_cleans_subscriptions() -> Result<(), Box<dyn std::error::Error>> {

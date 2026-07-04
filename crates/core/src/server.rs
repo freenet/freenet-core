@@ -103,8 +103,10 @@ pub(crate) enum HostCallbackResult {
     },
     SubscriptionChannel {
         id: ClientId,
-        /// The contract being subscribed to (identified by instance_id since full key may not be known yet)
-        key: ContractInstanceId,
+        /// Display label for the notification source (a contract instance id, or
+        /// a delegate key for delegate app-message routing — #3275). Used only
+        /// for logging; the callback receiver is what actually delivers messages.
+        key: String,
         callback: tokio::sync::mpsc::Receiver<HostResult>,
     },
 }

@@ -535,7 +535,7 @@ impl WebSocketProxy {
     fn setup_subscription(
         &self,
         client_id: ClientId,
-        key: ContractInstanceId,
+        key: String,
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
         origin_contract: Option<ContractInstanceId>,
@@ -593,19 +593,36 @@ impl WebSocketProxy {
                 user_context,
                 ..
             } => {
-                // Extract the subscription key if this request needs a notification channel.
-                let sub_key = match &*req {
-                    ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => Some(*key),
+                // Extract a notification-channel label if this request needs one.
+                // Contract subscriptions attach a channel so state updates flow
+                // back to the client; a delegate `ApplicationMessages` request
+                // attaches one so notification-driven delegate replies can be
+                // routed back to this app (#3275). The label is display-only; the
+                // callback receiver is what actually carries the messages.
+                let sub_key: Option<String> = match &*req {
+                    ClientRequest::ContractOp(ContractRequest::Subscribe { key, .. }) => {
+                        Some(key.to_string())
+                    }
                     ClientRequest::ContractOp(ContractRequest::Get {
                         key,
                         subscribe: true,
                         ..
-                    }) => Some(*key),
+                    }) => Some(key.to_string()),
                     ClientRequest::ContractOp(ContractRequest::Put {
                         contract,
                         subscribe: true,
                         ..
-                    }) => Some(*contract.key().id()),
+                    }) => Some(contract.key().id().to_string()),
+                    // A delegate app-message request registers this app for
+                    // notification-driven delegate replies (#3275): thread a
+                    // notification channel so process_open_request can register
+                    // it and so those replies reach this client's WS.
+                    ClientRequest::DelegateOp(
+                        freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                            key,
+                            ..
+                        },
+                    ) => Some(key.to_string()),
                     ClientRequest::DelegateOp(_)
                     | ClientRequest::ContractOp(_)
                     | ClientRequest::Disconnect { .. }
@@ -1606,7 +1623,9 @@ async fn new_client_connection(
 }
 
 struct NewSubscription {
-    key: ContractInstanceId,
+    /// Display label for the notification source (contract instance id or, for
+    /// delegate app-message routing #3275, a delegate key). Logging only.
+    key: String,
     callback: mpsc::Receiver<HostResult>,
 }
 
@@ -4087,5 +4106,76 @@ mod tests {
             drive_msg(auth, Some(&ctx), Some(&limiter)).await,
             "Authenticate must not be rate-limited even with an empty op bucket"
         );
+    }
+
+    /// Regression for #3275 (production WS-proxy wiring).
+    ///
+    /// A delegate `ApplicationMessages` request from a real client MUST get a
+    /// notification channel threaded onto its `OpenRequest`. That channel is the
+    /// exact `subscription_listener` `process_open_request` hands to
+    /// `delegate_app_registry::register_app` — without it, registration never
+    /// fires in production and notification-driven delegate `ApplicationMessage`s
+    /// have no app to route to (the inert-fix bug that made the 2nd pass dead).
+    ///
+    /// Before the wiring fix, `ClientRequest::DelegateOp(_)` fell into the
+    /// `None` arm of `internal_proxy_recv`'s `sub_key` match, so the built
+    /// `OpenRequest` carried `notification_channel == None` and this test's two
+    /// assertions both fail (no `SubscriptionChannel` callback is delivered, and
+    /// `notification_channel` is `None`).
+    #[tokio::test]
+    async fn delegate_app_messages_request_gets_notification_channel() {
+        use freenet_stdlib::client_api::DelegateRequest;
+        use freenet_stdlib::prelude::{CodeHash, DelegateKey};
+
+        let (mut proxy, _router) = WebSocketProxy::create_router(axum::Router::new());
+
+        // Register a response channel for the client, exactly as a NewConnection
+        // does — this is where a delegate app-message subscription callback is
+        // delivered so the client's WS reader can forward routed replies.
+        let client_id = ClientId::next();
+        let (cb_tx, mut cb_rx) = mpsc::unbounded_channel::<HostCallbackResult>();
+        proxy.response_channels.insert(client_id, cb_tx);
+
+        let delegate_key = DelegateKey::new([3u8; 32], CodeHash::new([3u8; 32]));
+        let req = Box::new(ClientRequest::DelegateOp(
+            DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: vec![].into(),
+                inbound: vec![],
+            },
+        ));
+
+        let open_req = proxy
+            .internal_proxy_recv(ClientConnection::Request {
+                client_id,
+                req,
+                auth_token: None,
+                origin_contract: None,
+                user_context: None,
+                api_version: ApiVersion::V1,
+            })
+            .await
+            .expect("proxy recv must not error")
+            .expect("delegate request must yield an OpenRequest");
+
+        // The core assertion: the WS proxy threaded a notification channel — the
+        // one process_open_request will register with the delegate.
+        assert!(
+            open_req.notification_channel.is_some(),
+            "a delegate ApplicationMessages request MUST carry a notification \
+             channel so register_app fires in production (#3275)"
+        );
+
+        // And the matching subscription callback was delivered to the client's
+        // response channel, keyed by the delegate for logging.
+        match cb_rx.try_recv() {
+            Ok(HostCallbackResult::SubscriptionChannel { id, key, .. }) => {
+                assert_eq!(id, client_id);
+                assert_eq!(key, delegate_key.to_string());
+            }
+            other => panic!(
+                "expected a SubscriptionChannel callback for the delegate request, got {other:?}"
+            ),
+        }
     }
 }
