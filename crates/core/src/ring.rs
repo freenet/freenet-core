@@ -205,6 +205,15 @@ pub(crate) struct Ring {
     connection_backoff: Arc<parking_lot::Mutex<ConnectionBackoff>>,
     /// Per-contract backoff for contract-directed CONNECT attempts.
     contract_connect_backoff: Mutex<HashMap<ContractKey, ContractConnectState>>,
+    /// Per-contract backoff for the keyward RE-ROOT FIND a clientless in-use
+    /// middle runs when it would otherwise self-declare subscription root
+    /// (#4642 piece D, DEFECT-1). Kept SEPARATE from
+    /// `contract_connect_backoff` (which throttles the CONNECT-based subtree
+    /// merge) so the two anti-stranding mechanisms don't throttle each other,
+    /// and so the SUBSCRIBE find has an independent cadence. This is the bound
+    /// that keeps a genuine terminus's find from re-issuing a wire subscribe
+    /// every 30s renewal cycle (the #4440 storm shape).
+    keyward_refind_backoff: Mutex<HashMap<ContractKey, ContractConnectState>>,
     /// Injectable time source used by `connection_maintenance`. Using `util::TimeSource`
     /// (which returns `tokio::time::Instant`) lets tests supply `SharedMockTimeSource` for
     /// fine-grained control without pausing the entire tokio runtime.
@@ -540,6 +549,7 @@ impl Ring {
             is_gateway,
             connection_backoff: Arc::new(Mutex::new(ConnectionBackoff::new())),
             contract_connect_backoff: Mutex::new(HashMap::new()),
+            keyward_refind_backoff: Mutex::new(HashMap::new()),
             time_source,
             peer_cache_dir,
             // One sink per node, shared with the module caches via the `Arc`
@@ -791,6 +801,16 @@ impl Ring {
     /// Maximum contract-directed CONNECTs per cycle.
     const MAX_CONTRACT_CONNECTS_PER_CYCLE: usize = 2;
 
+    // ============ Keyward re-root FIND (clientless-middle false-root) ============
+
+    /// Initial backoff before a clientless in-use middle re-runs the keyward
+    /// re-root FIND after a dead-end (nothing strictly closer reachable). Two
+    /// renewal cycles: enough to not fire every cycle, short enough that a
+    /// topology change is retried promptly.
+    const INITIAL_KEYWARD_REFIND_BACKOFF: Duration = Duration::from_secs(60);
+    /// Maximum backoff cap for the keyward re-root FIND (1 hour).
+    const MAX_KEYWARD_REFIND_BACKOFF: Duration = Duration::from_secs(60 * 60);
+
     /// If this peer is the body-holding subscription root for the contract
     /// identified by `instance_id`, returns the resolved [`ContractKey`];
     /// otherwise returns `None`.
@@ -956,6 +976,44 @@ impl Ring {
             });
         state.last_attempt = now;
         state.current_backoff = (state.current_backoff * 2).min(Self::MAX_CONTRACT_CONNECT_BACKOFF);
+    }
+
+    /// Is the keyward re-root FIND for `contract_key` currently in backoff?
+    /// (#4642 DEFECT-1.) True while a recent dead-ended find is cooling down —
+    /// the caller then takes the quiet, wire-free path this cycle.
+    pub(crate) fn is_in_keyward_refind_backoff(&self, contract_key: &ContractKey) -> bool {
+        let backoff = self.keyward_refind_backoff.lock();
+        if let Some(state) = backoff.get(contract_key) {
+            state.last_attempt.elapsed() < state.current_backoff
+        } else {
+            false
+        }
+    }
+
+    /// Record a keyward re-root FIND attempt, arming/doubling its backoff (up to
+    /// the cap) BEFORE the wire subscribe is sent, so a genuine dead-end can't
+    /// re-issue a find every renewal cycle (#4440 storm shape). A find that
+    /// reaches a strictly-closer host clears this via
+    /// [`Self::clear_keyward_refind_backoff`].
+    pub(crate) fn record_keyward_refind_attempt(&self, contract_key: &ContractKey) {
+        let mut backoff = self.keyward_refind_backoff.lock();
+        let now = self.time_source.now();
+        let state = backoff
+            .entry(*contract_key)
+            .or_insert_with(|| ContractConnectState {
+                current_backoff: Self::INITIAL_KEYWARD_REFIND_BACKOFF,
+                last_attempt: now,
+            });
+        state.last_attempt = now;
+        state.current_backoff = (state.current_backoff * 2).min(Self::MAX_KEYWARD_REFIND_BACKOFF);
+    }
+
+    /// Clear the keyward re-root FIND backoff for `contract_key` after a find
+    /// SUCCEEDS (a strictly-closer host was reached and adopted as upstream), so
+    /// a later re-strand re-attaches promptly rather than inheriting a long
+    /// cooled-down interval.
+    pub(crate) fn clear_keyward_refind_backoff(&self, contract_key: &ContractKey) {
+        self.keyward_refind_backoff.lock().remove(contract_key);
     }
 
     /// Periodic task: when this peer is a subscription root for a contract,
@@ -2926,6 +2984,17 @@ impl Ring {
     /// machinery would refresh the lease unboundedly).
     pub(crate) fn contract_in_use(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.contract_in_use(contract)
+    }
+
+    /// True if a LOCAL client (HTTP/WebSocket on this node) holds a subscription
+    /// to the contract. Unlike `is_subscribed` (which reads the
+    /// `active_subscriptions` lease map and so goes true for a self-installed
+    /// lease with no upstream), this is a freshness anchor that a stranded middle
+    /// cannot fake: it reflects real local client interest. Used by the DEFECT-1
+    /// renewal classification to keep client-anchored roots wire-free while a
+    /// clientless in-use middle runs a keyward re-root find (#4642).
+    pub(crate) fn has_client_subscriptions(&self, instance_id: &ContractInstanceId) -> bool {
+        self.hosting_manager.has_client_subscriptions(instance_id)
     }
 
     /// Single helper for every state-write chokepoint. Does the three

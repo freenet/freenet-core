@@ -400,26 +400,127 @@ pub(crate) async fn run_renewal_subscribe(
         .ring
         .body_holding_subscription_root_key(&instance_id)
     {
-        // Only refresh the local lease when the root has genuine, time-bounded
-        // interest; otherwise let it lapse so the no-interest root leaves the
-        // renewal set (see rationale above). Local-only; never any wire traffic.
-        if op_manager.ring.contract_in_use(&key) {
-            op_manager.ring.subscribe(key);
+        // DEFECT-1 classification (#4642 piece D). Reaching here means no
+        // ROUTABLE neighbor is strictly closer to the key than us, so
+        // distance-only logic would declare us the subscription root and satisfy
+        // the renewal locally. But "closest among my DIRECT neighbors" is NOT
+        // "the real holder": a clientless middle that acquired state via
+        // host-on-GET can be the most-keyward host it can see while the true
+        // holder H sits >1 hop away. If such a false root self-satisfies, it
+        // never pins H; the zero-demand host-on-GET bridges between us and H are
+        // reaped by piece-A eviction; and we then answer reads from a silently
+        // stale copy (hosting invariant 1). So "root" must be the OUTCOME of a
+        // bounded keyward find, not a distance-only assumption.
+        let in_use = op_manager.ring.contract_in_use(&key);
+        let has_local_client = op_manager.ring.has_client_subscriptions(key.id());
+
+        // Case 1 — LEGITIMATE wire-free terminus. Either a local client keeps
+        // this copy fresh through its own subscription (so we are genuinely in
+        // the update mesh, not a stranded middle), or there is no demand at all.
+        // This is the shipped #4440 storm short-circuit: send NO wire request,
+        // satisfy locally. Refresh the LOCAL lease only when in use — and only
+        // here, where a local client anchors freshness — so an in-use root is
+        // not re-selected every 30s cycle; a no-interest root's lease is left to
+        // lapse. `has_client_subscriptions`, NOT `is_subscribed`, is the
+        // freshness anchor on purpose: `ring.subscribe` installs a self-lease
+        // with no upstream, so `is_subscribed` / `is_receiving_updates` can read
+        // true for a stranded middle that is not actually receiving updates.
+        if has_local_client || !in_use {
+            if in_use {
+                op_manager.ring.subscribe(key);
+            }
+            op_manager.ring.record_renewal_terminus_satisfied();
+            // Simulation-test observability (no-op in production — see
+            // `topology_registry::record_renewal_terminus_satisfied`).
+            if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
+                crate::ring::topology_registry::record_renewal_terminus_satisfied(addr);
+            }
+            tracing::debug!(
+                tx = %renewal_tx,
+                contract = %key,
+                phase = "renewal_terminus_satisfied",
+                "subscribe renewal: body-holding root with a local client (or no \
+                 demand); satisfying renewal locally without an upstream request (#4440)"
+            );
+            return RenewalOutcome::Success;
         }
-        op_manager.ring.record_renewal_terminus_satisfied();
-        // Simulation-test observability (no-op in production — see
-        // `topology_registry::record_renewal_terminus_satisfied`).
+
+        // Case 2 — CLIENTLESS in-use middle: `contract_in_use` via a DOWNSTREAM
+        // subscriber, but no local client. This is the false-root risk surface.
+        //
+        // (1) A recent keyward find dead-ended and is cooling down: take the
+        //     quiet, wire-free path this cycle (#4440 storm-safety). Do NOT
+        //     install a self-lease here — that would masquerade as freshness and
+        //     defeat the fail-findably decision below; leaving the contract
+        //     leaseless keeps it re-selected each cycle (i.e. re-attaching) while
+        //     the backoff gates the wire.
+        if op_manager.ring.is_in_keyward_refind_backoff(&key) {
+            op_manager.ring.record_renewal_terminus_satisfied();
+            if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
+                crate::ring::topology_registry::record_renewal_terminus_satisfied(addr);
+            }
+            tracing::debug!(
+                tx = %renewal_tx,
+                contract = %key,
+                phase = "renewal_refind_backoff",
+                "subscribe renewal: clientless middle's keyward re-root find is in \
+                 backoff; satisfying locally without wire this cycle (#4642)"
+            );
+            return RenewalOutcome::Success;
+        }
+
+        // (2) Run ONE bounded keyward RE-ROOT FIND toward the key. Arm the
+        //     backoff FIRST so a genuine dead-end (a true global terminus, or an
+        //     H unreachable at this density) cannot re-issue a find every cycle.
+        //     `first_hop = None` routes a fresh subscribe greedily toward the
+        //     key; the shipped terminal-advertisement consult (piece C) resolves
+        //     a holder one hop off the greedy path. If it reaches a strictly-
+        //     closer host, `finalize_originator_subscribe` adopts that peer as
+        //     our real upstream (registers it, installs a real lease, fetches the
+        //     body) and the path relays become real hosts — so the NEXT cycle
+        //     computes a real upstream and the chain self-maintains. The find is
+        //     a one-shot chain-former, not a per-cycle cost.
+        op_manager.ring.record_keyward_refind_attempt(&key);
+        // The find enters the wire-renewal driver; count it (upper bound on wire
+        // renewals for this contract this cycle), same as the non-terminus path.
         if let Some(addr) = op_manager.ring.connection_manager.get_own_addr() {
-            crate::ring::topology_registry::record_renewal_terminus_satisfied(addr);
+            crate::ring::topology_registry::record_renewal_wire_attempt(addr);
         }
         tracing::debug!(
             tx = %renewal_tx,
             contract = %key,
-            phase = "renewal_terminus_satisfied",
-            "subscribe renewal: node is the body-holding subscription root; \
-             satisfying renewal locally without an upstream request (#4440)"
+            phase = "renewal_keyward_refind",
+            "subscribe renewal: clientless middle would be a false root; running a \
+             bounded keyward re-root find toward the key (#4642 DEFECT-1)"
         );
-        return RenewalOutcome::Success;
+        let refind = drive_client_subscribe_inner(
+            &op_manager,
+            instance_id,
+            renewal_tx,
+            /* is_renewal */ true,
+            /* first_hop */ None,
+        )
+        .await;
+        return match classify_renewal_result(refind) {
+            RenewalOutcome::Success => {
+                // Reached a strictly-closer host and adopted it as upstream; the
+                // chain is now demand-pinned. Clear the backoff so a later
+                // re-strand re-attaches promptly rather than inheriting a long
+                // cooled-down interval.
+                op_manager.ring.clear_keyward_refind_backoff(&key);
+                RenewalOutcome::Success
+            }
+            // Genuine dead-end: nothing strictly closer reachable. Backoff is
+            // already armed. A clientless middle with no reachable upstream
+            // cannot guarantee freshness, so FAIL FINDABLY — return the failure
+            // (keeps re-attaching via the recovery guard, and lets the
+            // demand-driven gauge reap the stale copy) rather than self-satisfy
+            // as a fresh authoritative root and serve stale (hosting invariant 1).
+            // Explicit (not `_ =>`) so a future RenewalOutcome variant forces a
+            // reconsideration of the fail-findably classification here.
+            failed @ RenewalOutcome::Failed { .. } => failed,
+            congestion @ RenewalOutcome::ChannelCongestion => congestion,
+        };
     }
 
     // Not a terminus: some connected neighbor is closer to the contract's key.
@@ -3226,18 +3327,25 @@ mod tests {
         ));
     }
 
-    /// #4440 proposal 1 — root-satisfied short-circuit pin.
+    /// #4440 storm short-circuit + #4642 DEFECT-1 classification pin.
     ///
     /// `run_renewal_subscribe` MUST check whether this node is the body-holding
-    /// subscription root for the contract and, if so, take the root-satisfied
-    /// path — return `RenewalOutcome::Success` WITHOUT calling
-    /// `drive_client_subscribe_inner` (no wire `Subscribe::Request`). A future
-    /// refactor that drops this check or moves it after the wire send would
-    /// silently reintroduce the renewal storm; this source-scrape pin fails the
-    /// build if that happens. (Behavioural coverage is the simulation test
-    /// `test_subscription_root_renewal_does_not_storm`; an equivalent unit test
-    /// would need a fully-built multi-peer Ring, hence the source pin — same
-    /// approach as `migration_counter_sites_present`.)
+    /// subscription root BEFORE driving any wire renewal, and classify:
+    ///
+    ///   * LEGITIMATE wire-free terminus (a local client anchors freshness, or
+    ///     there is no demand): return `RenewalOutcome::Success` WITHOUT calling
+    ///     the wire driver (the shipped #4440 storm short-circuit).
+    ///   * CLIENTLESS in-use middle (a false-root risk): may run ONE bounded
+    ///     keyward re-root find — but only gated by (a) `has_client_subscriptions`
+    ///     to keep genuine client-anchored roots wire-free, and (b)
+    ///     `is_in_keyward_refind_backoff` / `record_keyward_refind_attempt` so a
+    ///     dead-end can't re-issue a find every cycle (the #4440 storm shape).
+    ///
+    /// A refactor that drops the body-holding check, moves it after the wire
+    /// send, or removes either storm-safety gate would reopen the renewal storm;
+    /// this source-scrape pin fails the build if that happens. (Behavioural
+    /// coverage: `test_subscription_root_renewal_does_not_storm` for the storm,
+    /// `test_combined_multihop_chain_freshness_under_eviction` for DEFECT-1.)
     #[test]
     fn run_renewal_subscribe_short_circuits_body_holding_root() {
         let src = include_str!("op_ctx_task.rs");
@@ -3255,19 +3363,19 @@ mod tests {
                 "run_renewal_subscribe must check body_holding_subscription_root_key \
                  BEFORE driving a wire renewal (the storm short-circuit)",
             );
-        assert!(
-            before_drive[predicate_at..].contains("return RenewalOutcome::Success;"),
-            "the body-holding-root branch must return RenewalOutcome::Success (root-satisfied \
-             path) WITHOUT falling through to the wire renewal driver"
-        );
-        assert!(
-            before_drive[predicate_at..].contains("record_renewal_terminus_satisfied()"),
-            "the root-satisfied path must record the renewal_terminus_satisfied counter"
-        );
         let branch = &before_drive[predicate_at..];
         assert!(
+            branch.contains("return RenewalOutcome::Success;"),
+            "the body-holding-root branch must have a wire-free Success path (the \
+             legitimate-terminus short-circuit) BEFORE any wire renewal driver"
+        );
+        assert!(
+            branch.contains("record_renewal_terminus_satisfied()"),
+            "the wire-free path must record the renewal_terminus_satisfied counter"
+        );
+        assert!(
             branch.contains("op_manager.ring.subscribe(key)"),
-            "the root-satisfied path must be able to refresh the LOCAL lease so an in-use \
+            "the wire-free path must be able to refresh the LOCAL lease so an in-use \
              root is not re-selected for renewal every maintenance cycle: a lapsed lease \
              plus a client subscription / recent local access re-selects the root on every \
              30s cycle and can starve real wire renewals"
@@ -3280,10 +3388,24 @@ mod tests {
              interest re-check), violating the contract_in_use rustdoc + AGENTS.md \
              time-bounded-exemption rule"
         );
+        // DEFECT-1 storm-safety gates on the clientless-middle FIND path.
+        assert!(
+            branch.contains("has_client_subscriptions("),
+            "a client-anchored root MUST stay wire-free: the keyward re-root find must be \
+             gated so it only runs for a CLIENTLESS in-use middle (has_client_subscriptions \
+             discriminates), else a genuine client-pinned root would wire-renew every cycle \
+             (the #4440 storm)"
+        );
+        assert!(
+            branch.contains("is_in_keyward_refind_backoff(")
+                && branch.contains("record_keyward_refind_attempt("),
+            "the keyward re-root find MUST be backoff-gated (check is_in_keyward_refind_backoff \
+             and arm record_keyward_refind_attempt BEFORE the wire driver) so a genuine \
+             dead-end cannot re-issue a find every 30s renewal cycle (#4440 storm shape)"
+        );
         // The short-circuit must NOT reuse complete_local_subscription (different
         // semantics — it emits LocalSubscribeComplete and was the wrong vehicle
         // in an earlier draft). The dedicated path returns Success directly.
-        let branch = &before_drive[predicate_at..];
         assert!(
             !branch.contains("complete_local_subscription"),
             "the root-satisfied path must be dedicated, not reuse complete_local_subscription"

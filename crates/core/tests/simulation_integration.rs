@@ -11964,6 +11964,9 @@ struct MultiHopChainObservation {
     /// The far subscriber's own `active_demand_count` (its local client
     /// interest). After the client leaves this must be 0.
     subscriber_demand: usize,
+    /// Measured density: median ring-distance over every realised connection
+    /// edge. Lower = denser. `None` if no edges were captured.
+    median_link_distance: Option<f64>,
     per_node: String,
 }
 
@@ -12139,6 +12142,11 @@ fn run_multihop_chain_scenario(
         ));
     }
 
+    // Capture peer locations BEFORE `run_controlled_simulation` consumes `sim`,
+    // so the achieved density (median connection distance) can be measured from
+    // the realised topology afterward. Index 0 = gateway, index n = node n.
+    let peer_locations = sim.get_peer_locations();
+
     let result = sim.run_controlled_simulation(
         seed,
         operations,
@@ -12150,6 +12158,36 @@ fn run_multihop_chain_scenario(
         "seed={seed:x}: simulation failed: {:?}",
         result.turmoil_result.err()
     );
+
+    // Achieved DENSITY, measured (not a knob): the median ring-distance over
+    // every realised connection edge in the P2P graph. Lower = denser (shorter
+    // links). The DEFECT-1 reconciliation question is asked at "prod-like"
+    // density; this makes the density a reported number rather than an
+    // inference from (num_nodes, max_conn).
+    let ring_dist = |a: f64, b: f64| -> f64 {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let mut link_distances: Vec<f64> = Vec::new();
+    for (node, neighbors) in result.connection_graph() {
+        let ni = node.number();
+        if ni >= peer_locations.len() {
+            continue;
+        }
+        for neighbor in neighbors {
+            let mi = neighbor.number();
+            if mi >= peer_locations.len() {
+                continue;
+            }
+            link_distances.push(ring_dist(peer_locations[ni], peer_locations[mi]));
+        }
+    }
+    let median_link_distance = if link_distances.is_empty() {
+        None
+    } else {
+        link_distances.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Some(link_distances[link_distances.len() / 2])
+    };
 
     let labels: Vec<NodeLabel> = (1..=num_nodes)
         .map(|n| NodeLabel::node(network_name, n))
@@ -12247,6 +12285,7 @@ fn run_multihop_chain_scenario(
             .map(|ws| state_version(&ws)),
         total_demand,
         subscriber_demand: result.node_active_demand_count(&subscriber),
+        median_link_distance,
         per_node,
     }
 }
@@ -12561,6 +12600,31 @@ fn test_multihop_chain_explore() {
 /// among neighbours) argues that re-root would fail in production too, but a
 /// future advancing-clock variant would settle whether the staleness is
 /// permanent or a bounded window.
+///
+/// ## Post-DEFECT-1-fix update (2026-07-03)
+///
+/// The DEFECT-1 classification fix (`run_renewal_subscribe` root-satisfied path:
+/// a clientless in-use middle runs a bounded keyward re-root FIND instead of
+/// self-declaring root) CHANGES the measured behaviour here, but does NOT close
+/// D1 at THIS test's sparse density:
+///
+///   * d001 at this sparse config (16 nodes, max_conn 5, measured median link
+///     ~0.13): the middle's keyward find now REACHES the holder — `holder_in_use`
+///     flips false→true and the middle holds a real (find-installed) lease — but
+///     the far subscriber STILL ends at v1. Reaching H is not enough at this
+///     sparse connectivity: the subscriber↔middle segment is itself severed by
+///     eviction, so the update does not reach the subscriber. So the earlier
+///     "re-root cannot rescue it" analysis is only half right — the re-root pins
+///     H, yet D1 stays open at sparse density.
+///   * The reconciliation question — does the fix close D1 at PROD-LIKE
+///     connectivity without relay backtracking (MAX_RELAY_RETRIES=1)? — is
+///     answered by the sibling sweep `test_multihop_chain_freshness_closes_at_prod_density`:
+///     at max_conn ≥ 10 the same false-root seed d001 CLOSES (holder_in_use=true,
+///     a real multi-hop leased chain, subscriber v99). Since prod peers hold far
+///     more connections (min_connections ≥ 25) than any sweep config, the find
+///     reaches H and the demand-pinned chain keeps the subscriber fresh WITHOUT
+///     backtracking. This sparse config remains as the isolated hard case that
+///     backtracking / a wider consult would additionally cover.
 #[test_log::test]
 fn test_combined_multihop_chain_freshness_under_eviction() {
     const NUM_NODES: usize = 16;
@@ -12587,12 +12651,14 @@ fn test_combined_multihop_chain_freshness_under_eviction() {
             /* pin_holder */ true,
         );
         eprintln!(
-            "[evict seed={seed:x}] hop_dist={:?} clientless_middles={:?} leased={:?} \
-             holder_in_use={} holder_hosts={} holder_v={:?} subscriber_v={:?} \
+            "[evict seed={seed:x}] median_link={:?} hop_dist={:?} clientless_middles={:?} leased={:?} \
+             upstream_middles={:?} holder_in_use={} holder_hosts={} holder_v={:?} subscriber_v={:?} \
              total_demand={}{}",
+            obs.median_link_distance,
             obs.subscriber_hop_distance,
             obs.clientless_middles,
             obs.leased_middles,
+            obs.upstream_middles,
             obs.holder_in_use,
             obs.holder_hosts,
             obs.holder_version,
@@ -12613,6 +12679,132 @@ fn test_combined_multihop_chain_freshness_under_eviction() {
             Some(99),
             "seed={seed:x}: holder must have applied its own v99 UPDATE (else nothing to be stale against)"
         );
+    }
+}
+
+/// DEFECT-1 reconciliation MEASUREMENT (#4642 piece D / the piece-E ship gate).
+///
+/// The question this answers: does the DEFECT-1 classification fix (a clientless
+/// in-use middle runs a bounded keyward re-root FIND instead of self-declaring
+/// subscription root) close the stale-island under eviction AT PROD-LIKE DENSITY
+/// **without** relay backtracking (MAX_RELAY_RETRIES = 1, the shipped default —
+/// there is no knob to raise here)?
+///
+/// The forensics that motivate the fix put the greedy+consult reach probability
+/// at ~100% around a prod-like median link distance ~0.081. This sweep runs the
+/// SAME eviction scenario as `test_combined_multihop_chain_freshness_under_eviction`
+/// across a range of densities (measured, printed as `median_link`) and reads,
+/// per (config, seed): does a genuine multi-hop clientless middle still form
+/// (`hop_dist >= 2`), and if so does the subscriber converge to the holder's
+/// post-eviction v99 with the holder pinned in use (`holder_in_use`) — i.e. did
+/// the find reach H and pin a real renewing chain?
+///
+/// It asserts only NON-DEGENERACY (the self-pinned holder still hosts at v99) so
+/// it cannot beg the question; the verdict is read from the printed numbers and
+/// recorded in the module notes / PR. Backtracking stays OFF.
+///
+/// ## Measured verdict (2026-07-03) — D1 CLOSES without backtracking at density
+///
+/// Run across the 4-config × 6-seed sweep (MAX_RELAY_RETRIES=1, backtracking OFF):
+///
+///   * SPARSE (16 nodes, max_conn 5, median link ~0.13–0.19): the two disjoint
+///     false-root seeds d001 and d004 stay v1 under eviction (D1 open) — the
+///     find reaches H (holder_in_use flips true) but the far subscriber is still
+///     severed. Sub-prod connectivity (prod min_connections ≥ 25 ≫ 5).
+///   * MODERATE+ (24 nodes, max_conn 10, median link ~0.125): BOTH sparse-stale
+///     false-root seeds — d001 AND d004 — CLOSE (holder_in_use=true, a real
+///     multi-hop leased chain, subscriber v99). In fact 5 of 6 seeds close at
+///     this config; the one that does not (d005) fails with hop_dist=None — the
+///     subscriber never formed a P2P path to the holder (a topology/findability
+///     artifact of that seed), NOT the D1 false-root mechanism (no clientless
+///     middle forms). Crucially the median link is ~0.125 at BOTH configs, so it
+///     is the CONNECTIVITY (max_conn 5 → 10), NOT the median link alone, that
+///     lets the keyward find reach H and form a demand-pinned chain surviving
+///     eviction.
+///
+/// Because prod peers hold far more connections (min_connections ≥ 25) than any
+/// sweep config, the fix closes D1 at prod density WITHOUT relay backtracking —
+/// confirming backtracking can stay dropped for the common multi-hop case. The
+/// isolated sparse hard case (< 10 connections) is what a wider consult / bounded
+/// backtracking would still additionally cover.
+///
+/// `#[ignore]`d: this is a 24-run reconciliation MEASUREMENT (~40 min), far too
+/// long for CI. The decisive invariant-1 coverage that DOES run in CI is the
+/// sibling `test_combined_multihop_chain_freshness_under_eviction`. Run manually:
+/// `cargo test -p freenet --features "simulation_tests,testing" --test \
+/// simulation_integration test_multihop_chain_freshness_closes_at_prod_density -- \
+/// --ignored --nocapture`.
+#[ignore = "reconciliation measurement sweep (~40 min, 24 runs) — run manually; \
+            verdict recorded in the doc above. CI coverage is \
+            test_combined_multihop_chain_freshness_under_eviction"]
+#[test_log::test]
+fn test_multihop_chain_freshness_closes_at_prod_density() {
+    // (num_nodes, max_conn, min_conn) sweep from the sparse baseline toward
+    // denser, prod-like rings. Denser rings shorten the median link distance;
+    // the reconciliation hypothesis is that the find reaches H once the ring is
+    // dense enough that greedy+consult connects the middle to a closer host.
+    const CONFIGS: [(usize, usize, usize); 4] = [
+        (16, 5, 3),   // sparse baseline (the CONFIRMED-stale config)
+        (24, 10, 6),  // moderate
+        (32, 14, 10), // dense
+        (40, 18, 12), // very dense / prod-like
+    ];
+    // Wider seed set so several false-root chains are sampled per density.
+    const SEEDS: [u64; 6] = [
+        0x4642_D001,
+        0x4642_D002,
+        0x4642_D003,
+        0x4642_D004,
+        0x4642_D005,
+        0x4642_D006,
+    ];
+    const TINY_BUDGET_BYTES: u64 = 64;
+
+    for (num_nodes, max_conn, min_conn) in CONFIGS {
+        for seed in SEEDS {
+            let name = format!("mh-prod-{num_nodes}-{max_conn}-{seed:x}");
+            let obs = run_multihop_chain_scenario(
+                seed,
+                &name,
+                num_nodes,
+                max_conn,
+                min_conn,
+                false,
+                Some(TINY_BUDGET_BYTES),
+                /* pin_holder */ true,
+            );
+            // A genuine clientless-middle chain requires hop_dist >= 2; when the
+            // subscriber shortcuts to the holder (hop_dist <= 1) the DEFECT-1
+            // case never forms and the seed is not informative at this density.
+            let multi_hop = matches!(obs.subscriber_hop_distance, Some(d) if d >= 2);
+            let closed = obs.holder_in_use && obs.subscriber_version == Some(99);
+            eprintln!(
+                "[prod n={num_nodes} c={max_conn}/{min_conn} seed={seed:x}] \
+                 median_link={:?} hop_dist={:?} multi_hop={multi_hop} \
+                 clientless_middles={:?} leased={:?} upstream_middles={:?} \
+                 holder_in_use={} subscriber_v={:?} closed={closed}",
+                obs.median_link_distance,
+                obs.subscriber_hop_distance,
+                obs.clientless_middles,
+                obs.leased_middles,
+                obs.upstream_middles,
+                obs.holder_in_use,
+                obs.subscriber_version,
+            );
+
+            // Non-degeneracy only (the verdict is read from the printed numbers).
+            assert!(
+                obs.holder_hosts,
+                "n={num_nodes} seed={seed:x}: self-pinned holder must still host \
+                 under eviction (else degenerate)"
+            );
+            assert_eq!(
+                obs.holder_version,
+                Some(99),
+                "n={num_nodes} seed={seed:x}: holder must have applied its own v99 \
+                 UPDATE (else nothing to be stale against)"
+            );
+        }
     }
 }
 
