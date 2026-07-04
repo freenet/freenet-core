@@ -97,3 +97,57 @@ fallback_decision() {
         echo "hold"
     fi
 }
+
+# Stability gate for the "Verify version after update" poll (#4567). Extracted
+# here (rather than inline in gateway-update.yml) so the consecutive-success
+# semantics are unit-tested and cannot silently regress.
+#
+# WHY: the verify loop used to `exit 0` on the FIRST poll that produced a
+# `success` token. That confirms health at a single instant only, so a gateway
+# that comes up `active` and then dies within the remaining verify window
+# (flap-after-up: the racing-updater shape from the nova v0.2.78 incident, or a
+# crash-loop that happens to be up on the first poll) was still reported green.
+# Requiring N CONSECUTIVE `success` polls exploits the release-agent's 2s
+# service_active TTL cache: a crash-loop flaps service_active across polls, so
+# the streak resets and the update is not confirmed until the deadline fails it
+# closed.
+#
+# Usage (per poll):
+#   streak=$(stability_streak "$DECISION" "$streak")   # updated running count
+#   if [[ "$(stability_confirmed "$streak" "$REQUIRED")" == "confirm" ]]; then
+#       exit 0
+#   fi
+#
+# stability_streak echoes the new consecutive-success count: the previous count
+# + 1 on a `success` token, otherwise 0 (any non-success poll — wait,
+# unreachable, malformed — breaks the streak). Resetting on non-success is what
+# catches flap-after-up: an up→down sequence cannot accumulate the required run.
+# A normal restart gap happens BEFORE the first success (the service is down
+# while the binary is swapped), so it only delays the start of the streak; it
+# does not reset a streak already in progress. A restart AFTER first success
+# simply restarts the count within the same budget — failing closed only at the
+# deadline, which is the conservative, correct behaviour.
+stability_streak() {
+    local token="$1" prev="$2"
+    if [[ "$token" == "success" ]]; then
+        echo $(( prev + 1 ))
+    else
+        echo 0
+    fi
+}
+
+# stability_confirmed echoes `confirm` once the streak has reached the required
+# number of consecutive successes, otherwise `keep-polling`. `required` <= 0 is
+# treated as 1 (a misconfiguration must not disable the gate entirely — at least
+# one success is always needed).
+stability_confirmed() {
+    local streak="$1" required="$2"
+    if (( required < 1 )); then
+        required=1
+    fi
+    if (( streak >= required )); then
+        echo "confirm"
+    else
+        echo "keep-polling"
+    fi
+}

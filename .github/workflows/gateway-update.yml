@@ -263,6 +263,15 @@ jobs:
           # Remember if we ever saw the old-agent (no service_active) response,
           # so the deadline error can point at the real cause.
           SAW_FALLBACK=false
+          # #4567: require the gateway to report `success` on this many
+          # CONSECUTIVE polls before declaring the update converged. Confirming
+          # health at a single instant let a gateway that came up active then
+          # died within the window (flap-after-up) still report green. The
+          # release-agent's 2s service_active TTL cache means a crash-loop flaps
+          # the field across the 5s polls, resetting the streak. Cost on the
+          # happy path: (REQUIRED_SUCCESS_POLLS-1)*5s ≈ 10s.
+          REQUIRED_SUCCESS_POLLS=3
+          SUCCESS_STREAK=0
           while (( $(date +%s) < DEADLINE )); do
             RESPONSE=$(curl -sS --max-time 5 "$GATEWAY_URL/version" || true)
             INSTALLED=$(printf '%s' "$RESPONSE" | jq -r '.version // empty' 2>/dev/null || echo "")
@@ -271,8 +280,12 @@ jobs:
 
             case "$DECISION" in
               success)
-                echo "✓ Gateway ${{ matrix.gateway.name }} reports version $INSTALLED and service ${MANAGED_SERVICE:-?} is active"
-                exit 0
+                SUCCESS_STREAK=$(stability_streak "$DECISION" "$SUCCESS_STREAK")
+                if [[ "$(stability_confirmed "$SUCCESS_STREAK" "$REQUIRED_SUCCESS_POLLS")" == "confirm" ]]; then
+                  echo "✓ Gateway ${{ matrix.gateway.name }} reports version $INSTALLED and service ${MANAGED_SERVICE:-?} is active (stable across $SUCCESS_STREAK consecutive polls)"
+                  exit 0
+                fi
+                echo "Gateway ${{ matrix.gateway.name }} reports version $INSTALLED and service ${MANAGED_SERVICE:-?} active ($SUCCESS_STREAK/$REQUIRED_SUCCESS_POLLS consecutive healthy polls); confirming stability…"
                 ;;
               success-fallback)
                 # The agent predates the service_active field, so we cannot
@@ -291,11 +304,17 @@ jobs:
                   echo "✓ Gateway ${{ matrix.gateway.name }} now reports version $INSTALLED (binary-only check)"
                   exit 0
                 fi
+                # Not confirmed as active this poll → break any success streak.
+                SUCCESS_STREAK=0
                 SAW_FALLBACK=true
                 echo "::warning::Gateway ${{ matrix.gateway.name }} agent predates the service-health check (no 'service_active' in /version); cannot confirm the service is actually running. Update the release-agent (>= the #4378 build) to enable the service-health gate, or re-run with allow_binary_only_fallback=true to accept binary-only verification."
                 echo "Binary is $INSTALLED but service health is UNVERIFIABLE on this agent; treating as not-yet-converged…"
                 ;;
               wait)
+                # A non-success poll (service not active, unreachable, or
+                # malformed) breaks the consecutive-success streak (#4567): a
+                # gateway that flaps active→down cannot accumulate the run.
+                SUCCESS_STREAK=0
                 if [[ "$INSTALLED" == "$VERSION" ]]; then
                   echo "Binary is $INSTALLED but service ${MANAGED_SERVICE:-?} is NOT active yet; waiting for restart…"
                 else
