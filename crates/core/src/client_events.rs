@@ -1343,6 +1343,44 @@ async fn process_open_request(
                     "Received delegate operation from client"
                 );
                 let delegate_key = req.key().clone();
+
+                // Register (or refresh) this app's routing path so the delegate
+                // can push notification-driven ApplicationMessages back to it
+                // (#3275). An app "registers with a delegate" by talking to it
+                // over a connection that carries an async notification channel;
+                // any ApplicationMessages request with such a channel establishes
+                // the path. UnregisterDelegate tears it down. RegisterDelegate
+                // (installing the delegate binary) does NOT register an app —
+                // it's an admin op, not an app conversation.
+                match &req {
+                    freenet_stdlib::client_api::DelegateRequest::ApplicationMessages { .. } => {
+                        if let Some(sender) = &subscription_listener {
+                            if !crate::contract::delegate_app_registry::register_app(
+                                &delegate_key,
+                                client_id,
+                                sender.clone(),
+                            ) {
+                                tracing::warn!(
+                                    %client_id,
+                                    delegate = %delegate_key,
+                                    "App not registered for delegate notifications (registry at capacity)"
+                                );
+                            }
+                        }
+                    }
+                    freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(key) => {
+                        crate::contract::delegate_app_registry::remove_delegate(key);
+                    }
+                    // RegisterDelegate installs a delegate binary (admin op), not
+                    // an app conversation, so it registers no routing path. The
+                    // wildcard also absorbs future `#[non_exhaustive]` variants;
+                    // it exists ONLY to satisfy non_exhaustive (see
+                    // git-workflow.md) — new app-facing variants must be handled
+                    // explicitly above, not swept here.
+                    #[allow(clippy::wildcard_enum_match_arm)]
+                    freenet_stdlib::client_api::DelegateRequest::RegisterDelegate { .. } | _ => {}
+                }
+
                 // Derive a short discriminant tag for the INFO logs, but only when INFO is
                 // enabled — the Vec<&str> collect + format! would otherwise allocate on every
                 // delegate dispatch even when the log line is suppressed.
@@ -1502,6 +1540,10 @@ async fn process_open_request(
                     request_id = %request_id,
                     "Received disconnect request from client, triggering subscription cleanup"
                 );
+
+                // Drop any delegate-notification routing registrations for this
+                // client (#3275).
+                crate::contract::delegate_app_registry::remove_client(client_id);
 
                 let result = op_manager
                     .ring

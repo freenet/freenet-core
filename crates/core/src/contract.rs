@@ -7,6 +7,7 @@ use std::sync::Arc;
 use either::Either;
 use freenet_stdlib::prelude::*;
 
+pub(crate) mod delegate_app_registry;
 mod executor;
 mod fair_queue;
 pub(crate) use fair_queue::Priority;
@@ -1181,6 +1182,9 @@ where
                     if let ContractHandlerEvent::ClientDisconnect { client_id } = &event {
                         let client_id = *client_id;
                         contract_handler.executor().remove_client(client_id);
+                        // Drop any delegate-notification routing registrations
+                        // for this client (#3275).
+                        delegate_app_registry::remove_client(client_id);
                         contract_handler.channel().drop_waiting_response(id);
                         continue;
                     }
@@ -1959,23 +1963,18 @@ async fn handle_delegate_notification<CH, P>(
     )
     .await;
 
-    // TODO: Route outbound ApplicationMessages to subscribed apps #3275
-    // handle_delegate_with_contract_requests already processes contract requests
-    // (GET/PUT/UPDATE/SUBSCRIBE) internally. The remaining outbound messages are
-    // ApplicationMessages meant for connected apps, but notification-driven
-    // invocations have no originating client connection to route them to.
-    // When delegate-to-app notification routing is implemented, these should be
-    // forwarded to all apps registered with this delegate.
-    for msg in &outbound {
-        match msg {
-            OutboundDelegateMsg::ApplicationMessage(app_msg) => {
-                tracing::warn!(
-                    delegate = %delegate_key,
-                    payload_len = app_msg.payload.len(),
-                    "Delegate produced ApplicationMessage from contract notification \
-                     but no client routing is available yet — message dropped"
-                );
-            }
+    // Route outbound ApplicationMessages to the apps registered with this
+    // delegate (#3275). handle_delegate_with_contract_requests already
+    // processed the contract requests (GET/PUT/UPDATE/SUBSCRIBE) internally;
+    // the residual ApplicationMessages are the delegate's replies meant for
+    // connected apps. A notification-driven invocation has no originating
+    // client request to answer, so we fan them out via the delegate->apps
+    // registry (delegate_app_registry) — the mirror of DELEGATE_SUBSCRIPTIONS,
+    // populated when an app talks to the delegate over its WS connection.
+    let app_messages: Vec<OutboundDelegateMsg> = outbound
+        .into_iter()
+        .filter(|msg| match msg {
+            OutboundDelegateMsg::ApplicationMessage(_) => true,
             OutboundDelegateMsg::RequestUserInput(_)
             | OutboundDelegateMsg::ContextUpdated(_)
             | OutboundDelegateMsg::GetContractRequest(_)
@@ -1988,7 +1987,37 @@ async fn handle_delegate_notification<CH, P>(
                     msg_type = ?std::mem::discriminant(msg),
                     "Delegate produced unexpected outbound message from contract notification — dropped"
                 );
+                false
             }
+        })
+        .collect();
+
+    // Opportunistic TTL sweep of the delegate->apps registry, mirroring how
+    // prune_expired_contexts sweeps on delegate activity rather than via a
+    // background task. Bounds stale registrations for apps that vanished
+    // without a clean disconnect (AGENTS.md GC-exemption rule).
+    delegate_app_registry::sweep_expired();
+
+    if app_messages.is_empty() {
+        return;
+    }
+
+    // One HostResponse per ApplicationMessage so an app sees each reply as a
+    // distinct DelegateResponse, exactly as it would for a client-initiated
+    // ApplicationMessages request.
+    for app_msg in app_messages {
+        let response: crate::client_events::HostResult =
+            Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+                key: delegate_key.clone(),
+                values: vec![app_msg],
+            });
+        let delivered = delegate_app_registry::route_to_apps(&delegate_key, response);
+        if delivered == 0 {
+            tracing::debug!(
+                delegate = %delegate_key,
+                "Delegate notification produced an ApplicationMessage but no apps \
+                 are registered with this delegate — nothing to route to"
+            );
         }
     }
 }
