@@ -14068,12 +14068,22 @@ fn run_subscription_mesh(
                 SimOperation::Disconnect,
             ));
         }
-        // Jump 20 minutes — past the 8-minute lease AND the recent-access window
-        // — so no renewal branch keeps an un-demanded lease alive.
+        // Jump 3 HOURS — safely past the FULL retention window, not just the
+        // 8-minute SUBSCRIPTION_LEASE_DURATION. A subscribe descent that passes
+        // near the key installs a demand-INDEPENDENT seed lease (piece E,
+        // SEED_LEASE_DURATION = 2h, a hard spam-safety deadline). A 20-minute
+        // jump clears the 8-min sub leases but stays INSIDE the 2h seed window,
+        // so seed-anchored near-key hosts have not lapsed yet and read as FALSE
+        // survivors of the collapse. The jump must therefore exceed
+        // max(SUBSCRIPTION_LEASE_DURATION 8m, SEED_LEASE_DURATION 2h) plus margin
+        // for every un-demanded lease — sub AND seed — to lapse. (Both consts
+        // live in ring::hosting and are not exposed to integration tests; 3h is
+        // safely past the 2h seed deadline.) Do NOT lower this back to ~20 min:
+        // that reintroduces the seed-anchored false-survivor read.
         ops.push(ScheduledOperation::new(
             gateway.clone(),
             SimOperation::AdvanceHostingClock {
-                duration: Duration::from_secs(20 * 60),
+                duration: Duration::from_secs(3 * 60 * 60),
             },
         ));
     }
@@ -14129,8 +14139,9 @@ const MESH_SUBSCRIBERS: [usize; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
 /// run's mesh identical to what the COLLAPSE run tears down):
 ///
 ///   * FORMATION run: a genuine multi-node subscription mesh forms.
-///   * COLLAPSE run: after ALL clients leave + a 20-minute clock jump, EVERY
-///     lease lapses — interest-gated renewal keeps none alive.
+///   * COLLAPSE run: after ALL clients leave + a 3-hour clock jump (past the 2h
+///     seed-lease window, not just the 8-min sub lease), EVERY lease lapses —
+///     interest-gated renewal keeps none alive.
 ///
 /// NOTE on `chain_hosts_formed` / `max_upstreams` (both stay 0 in the harness):
 /// the mesh forms via the ORIGINATOR subscribe path (each subscriber fetches +
@@ -14180,7 +14191,7 @@ fn test_subscription_chain_collapses_on_client_leave() {
             MESH_SUBSCRIBERS.len(),
         );
 
-        // Phase B — collapse (same seed/topology + disconnect-all + 20-min jump).
+        // Phase B — collapse (same seed/topology + disconnect-all + 3-hour jump).
         let coll = run_subscription_mesh(
             seed,
             &format!("chain-collapse-{seed:x}"),
@@ -14201,7 +14212,7 @@ fn test_subscription_chain_collapses_on_client_leave() {
         assert!(
             coll.subscribed_peers.is_empty(),
             "seed={seed:x}: chain did NOT collapse — {} peer(s) still hold the contract in \
-             active_subscriptions after all client interest ended + a 20-min clock jump: {:?}. \
+             active_subscriptions after all client interest ended + a 3-hour clock jump: {:?}. \
              Interest-gated renewal must let every un-demanded lease lapse.",
             coll.subscribed_peers.len(),
             coll.subscribed_peers,
