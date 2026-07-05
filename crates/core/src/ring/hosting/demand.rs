@@ -6,34 +6,48 @@
 //! `predicted_demand(X)`: a per-contract estimate of X's read-request rate at
 //! this peer.
 //!
-//! For A3 the estimate is the **proximity prior only** — `g(distance-to-key)`,
-//! a monotone non-increasing function of the ring distance between this peer
-//! and the contract's key. Contracts near this peer's location are, on average,
-//! requested more often (routing gravity), so demand falls off with distance.
-//! The blend toward each contract's OWN observed read rate is deferred to A4
-//! (see `docs/design/hosting-eviction.md`); this estimator only tracks the
-//! aggregate distance -> rate relationship.
+//! The estimate blends two terms, **outside** the regression:
 //!
-//! The prior is fit with the same isotonic-regression (PAVA) machinery the
-//! router uses for its distance -> outcome curves ([`crate::router`] /
-//! `pav_regression`), deliberately reused rather than re-implemented. Points are
-//! `(distance, observed_read_rate)` samples this peer collects from its own
-//! reads; the fit is **descending** (rate non-increasing in distance). A rolling
-//! window bounds the retained points, so the curve tracks the peer's recent
-//! demand geometry rather than its whole history.
+//! ```text
+//! predicted_demand(d) = w(n) * g0(d) + (1 - w(n)) * fit(d)
+//! ```
+//!
+//! - `g0(d)` — an **analytic cold-start prior**: a smooth, strictly-decreasing
+//!   function of the ring distance `d` between this peer and the contract's key
+//!   ([`distance_prior`]). Contracts near this peer's location are, on average,
+//!   requested more often (routing gravity), so demand falls off with distance.
+//!   This makes near-key contracts score higher **from the very first read**,
+//!   before any samples exist — the cold-start behavior that fixes the
+//!   under-retention of near-key contracts.
+//! - `fit(d)` — the **learned aggregate estimate**: a descending isotonic
+//!   (PAVA) regression over `(distance, observed_read_rate)` samples this peer
+//!   collects from its own reads, reusing the same machinery the router uses for
+//!   its distance -> outcome curves ([`crate::router`] / `pav_regression`). A
+//!   rolling window bounds the retained points so the curve tracks the peer's
+//!   recent demand geometry rather than its whole history.
+//! - `w(n)` — a blend weight that **decays in the retained sample count `n`**
+//!   ([`blend_weight`]): `1.0` at `n = 0` (pure analytic prior) and `-> 0` as
+//!   `n` grows (the learned fit takes over). So the prior dominates cold and
+//!   real observations dominate warm, with a smooth hand-off and no threshold
+//!   discontinuity.
+//!
+//! The blend is deliberately computed **outside** the PAVA fit — the prior is
+//! NOT seeded as synthetic points into the regression. Seeding would make the
+//! prior's absolute scale load-bearing (it would have to be calibrated against
+//! real rates) and the FIFO rolling window would evict the synthetic seeds in a
+//! step, reintroducing exactly the cold-start cliff this design removes. Keeping
+//! it a separate blended term means only the *ratio* g0(near)/g0(far) matters,
+//! never its absolute scale.
 //!
 //! Only RATIOS matter to eviction ordering (`keep_score` is compared, never
 //! interpreted as an absolute rate), so no absolute calibration is required.
+//!
+//! The per-contract blend toward each contract's OWN observed read rate (as
+//! opposed to this aggregate distance -> rate relationship) remains deferred to
+//! A4.
 
 use pav_regression::{IsotonicRegression, Point};
 use std::collections::VecDeque;
-
-/// Minimum retained sample count before the fitted prior is trusted. Below this
-/// the estimator returns [`NEUTRAL_DEMAND`] for every distance, which makes
-/// `keep_score` degenerate to `eviction_floor + NEUTRAL_DEMAND` for all
-/// contracts — i.e. pure Greedy-Dual aging with a recency tiebreak, the sane
-/// cold-start behavior before any demand geometry is known.
-const MIN_POINTS_FOR_PRIOR: usize = 5;
 
 /// Maximum raw `(distance, rate)` points retained. Once reached, each new
 /// observation evicts the oldest (FIFO rolling window), mirroring the router's
@@ -41,12 +55,52 @@ const MIN_POINTS_FOR_PRIOR: usize = 5;
 /// memory + refit cost.
 const MAX_PRIOR_POINTS: usize = 500;
 
-/// Demand returned when the prior has insufficient data (or cannot interpolate).
-/// Positive and uniform: with equal demand for every contract, eviction reduces
-/// to Greedy-Dual floor-ordering with a last-read tiebreak. Must be `> 0` so
-/// that an abandoned contract (whose `keep_score` is dropped to the current
+/// Demand returned only when no ring distance is available (this peer's own
+/// location is unknown) or the requested distance is non-finite. Positive and
+/// uniform: with equal demand for every contract, eviction reduces to
+/// Greedy-Dual floor-ordering with a last-read tiebreak. Must be `> 0` so that
+/// an abandoned contract (whose `keep_score` is dropped to the current
 /// `eviction_floor`, i.e. zero demand credit) sorts below a still-credited one.
+/// Also the anchor for the cold-start prior at zero distance
+/// (`g0(0) == NEUTRAL_DEMAND`), so a near-key contract keeps the old neutral
+/// credit and only farther contracts are discounted.
 pub(crate) const NEUTRAL_DEMAND: f64 = 1.0;
+
+/// Falloff rate of the analytic cold-start prior
+/// `g0(d) = NEUTRAL_DEMAND * exp(-DISTANCE_PRIOR_DECAY * d)` over ring distance
+/// `d in [0, 0.5]`. Only the RATIO `g0(near)/g0(far)` feeds eviction ordering,
+/// so the exact rate is a soft choice: `4.0` gives a ~7x near-to-far demand
+/// ratio across the half-ring (`g0(0) = 1.0` down to `g0(0.5) = e^-2 ≈ 0.135`),
+/// a mild monotone gravity toward the key that a handful of real samples
+/// quickly overrides.
+const DISTANCE_PRIOR_DECAY: f64 = 4.0;
+
+/// Pseudo-observation weight of the analytic prior. With `n` retained real
+/// samples the prior's blend weight is `PRIOR_PSEUDO_COUNT / (PRIOR_PSEUDO_COUNT
+/// plus n)` (see [`blend_weight`]): the analytic prior counts as this many real
+/// observations. At `n = PRIOR_PSEUDO_COUNT` prior and fit weigh equally; past
+/// that the learned fit dominates. Set to the sample count the old hard gate
+/// required before it trusted the fit at all, so "enough data to trust the fit"
+/// and "prior no longer dominates" coincide.
+const PRIOR_PSEUDO_COUNT: f64 = 5.0;
+
+/// Analytic cold-start demand prior: expected read demand as a smooth,
+/// strictly-decreasing function of ring distance to the contract key. Closer to
+/// the key -> more routing gravity -> higher expected read demand. Anchored so
+/// `g0(0) == NEUTRAL_DEMAND`; distance is clamped to the valid `[0, 0.5]`
+/// ring-distance range defensively. Always strictly positive.
+fn distance_prior(distance: f64) -> f64 {
+    let d = distance.clamp(0.0, 0.5);
+    NEUTRAL_DEMAND * (-DISTANCE_PRIOR_DECAY * d).exp()
+}
+
+/// Blend weight on the analytic prior given `n` retained real samples:
+/// `PRIOR_PSEUDO_COUNT / (PRIOR_PSEUDO_COUNT + n)`. `1.0` at `n = 0`, strictly
+/// decreasing in `n`, and `-> 0` as `n` grows, so the estimate slides smoothly
+/// from the pure distance prior (cold) to the pure learned fit (warm).
+fn blend_weight(n: usize) -> f64 {
+    PRIOR_PSEUDO_COUNT / (PRIOR_PSEUDO_COUNT + n as f64)
+}
 
 /// Per-peer proximity-prior demand estimator.
 ///
@@ -64,8 +118,10 @@ pub(crate) struct ProximityPrior {
 }
 
 impl ProximityPrior {
-    /// Create an empty estimator. Until [`MIN_POINTS_FOR_PRIOR`] observations
-    /// accrue, [`predict`](Self::predict) returns [`NEUTRAL_DEMAND`].
+    /// Create an empty estimator. With no observations,
+    /// [`predict`](Self::predict) returns the pure analytic distance prior
+    /// [`distance_prior`] (monotone-decreasing in distance), and slides toward
+    /// the learned fit as observations accrue.
     pub(crate) fn new() -> Self {
         // `new_descending` on an empty slice yields an empty regression; the
         // router relies on the same empty-construction path.
@@ -107,17 +163,43 @@ impl ProximityPrior {
 
     /// Predict the read-demand for a contract at ring `distance` from this peer.
     ///
-    /// Returns [`NEUTRAL_DEMAND`] until [`MIN_POINTS_FOR_PRIOR`] samples have
-    /// accrued, or if the regression cannot interpolate. Otherwise returns the
-    /// fitted rate, floored at `0.0` (the descending fit can extrapolate
-    /// slightly negative near the data-range edges).
+    /// Blends the analytic cold-start prior [`distance_prior`] with the learned
+    /// isotonic fit by a sample-count-decayed [`blend_weight`]:
+    /// `w(n) * g0(d) + (1 - w(n)) * fit(d)`. Cold (`n = 0`) this is the pure
+    /// distance prior; warm it is the pure fit. When there is no usable fit yet
+    /// (no retained points, or the regression cannot interpolate) it is the pure
+    /// prior. `NEUTRAL_DEMAND` is returned only for a non-finite `distance`.
+    /// Always finite and non-negative.
     pub(crate) fn predict(&self, distance: f64) -> f64 {
-        if self.raw_points.len() < MIN_POINTS_FOR_PRIOR || !distance.is_finite() {
+        if !distance.is_finite() {
             return NEUTRAL_DEMAND;
         }
+        let g0 = distance_prior(distance);
+        // Blend OUTSIDE the regression: never seed the analytic prior as
+        // synthetic points into the PAVA fit (that would make its absolute scale
+        // load-bearing and the FIFO window would evict the seeds in a step). The
+        // prior and the fit are combined by a weight that decays in the retained
+        // sample count, so the estimate slides smoothly from prior to fit.
+        let w = blend_weight(self.raw_points.len());
+        match self.fit(distance) {
+            Some(fit) => w * g0 + (1.0 - w) * fit,
+            None => g0,
+        }
+    }
+
+    /// The learned aggregate estimate at `distance`: the descending isotonic fit
+    /// over retained `(distance, rate)` samples, floored at `0.0` (the fit can
+    /// extrapolate slightly negative near the data-range edges). `None` when
+    /// there is no usable fit yet — no retained points, or the regression cannot
+    /// interpolate — in which case [`predict`](Self::predict) uses the pure
+    /// analytic prior.
+    fn fit(&self, distance: f64) -> Option<f64> {
+        if self.raw_points.is_empty() {
+            return None;
+        }
         match self.regression.interpolate(distance) {
-            Some(rate) if rate.is_finite() => rate.max(0.0),
-            _ => NEUTRAL_DEMAND,
+            Some(rate) if rate.is_finite() => Some(rate.max(0.0)),
+            _ => None,
         }
     }
 
@@ -138,26 +220,138 @@ impl Default for ProximityPrior {
 mod tests {
     use super::*;
 
-    /// With no data the estimator is neutral for every distance, so eviction
-    /// degenerates to floor-ordering + recency (the cold-start contract).
+    /// COLD START (no samples): the estimate is the analytic distance prior,
+    /// which is strictly decreasing in ring distance — a near-key contract
+    /// predicts MORE read-demand than a far-key one from the very first moment.
+    /// This is the cold-start drift fix: before, every distance returned a flat
+    /// `NEUTRAL_DEMAND`, so near-key contracts were under-retained.
     #[test]
-    fn empty_prior_is_neutral_everywhere() {
+    fn cold_prior_is_monotone_decreasing_in_distance() {
         let prior = ProximityPrior::new();
         assert_eq!(prior.len(), 0);
-        assert_eq!(prior.predict(0.0), NEUTRAL_DEMAND);
-        assert_eq!(prior.predict(0.25), NEUTRAL_DEMAND);
-        assert_eq!(prior.predict(0.5), NEUTRAL_DEMAND);
+
+        // Sweep the valid ring-distance range and assert non-increasing +
+        // strictly positive.
+        let mut prev = f64::INFINITY;
+        let mut x = 0.0;
+        while x <= 0.5 + 1e-9 {
+            let y = prior.predict(x);
+            assert!(y > 0.0, "cold prior must stay positive: g0({x}) = {y}");
+            assert!(
+                y <= prev + 1e-12,
+                "cold prior must be non-increasing in distance: g0({x}) = {y} > previous {prev}"
+            );
+            prev = y;
+            x += 0.05;
+        }
+
+        // A near contract must predict STRICTLY more demand than a far one at
+        // cold start — the property the flat-neutral behavior lacked.
+        assert!(
+            prior.predict(0.02) > prior.predict(0.45),
+            "near-key cold demand must exceed far-key: near={}, far={}",
+            prior.predict(0.02),
+            prior.predict(0.45),
+        );
     }
 
-    /// Below the minimum sample count the fit is not trusted yet.
+    /// As real samples accumulate the learned fit dominates and the analytic
+    /// prior's slope washes out (blend weight → 0). A FLAT observed rate across
+    /// all distances drives the near-vs-far spread from the prior's large cold
+    /// slope down toward ~0 (the flat fit) — which can only happen if the
+    /// prior's weight decays as `n` grows.
     #[test]
-    fn prior_stays_neutral_below_min_points() {
-        let mut prior = ProximityPrior::new();
-        for i in 0..(MIN_POINTS_FOR_PRIOR - 1) {
-            prior.observe(0.1 * i as f64, 10.0 - i as f64);
+    fn warm_observations_wash_out_the_sloped_cold_prior() {
+        const FLAT_RATE: f64 = 5.0;
+
+        // Cold: a fresh prior carries a real near>far slope from the distance
+        // prior.
+        let cold = ProximityPrior::new();
+        let cold_spread = cold.predict(0.02) - cold.predict(0.45);
+        assert!(
+            cold_spread > 0.3,
+            "cold prior must carry a near>far slope, got spread {cold_spread}"
+        );
+
+        // Warm: many flat-rate samples spanning the ring → ~flat fit → near and
+        // far predictions converge.
+        let mut warm = ProximityPrior::new();
+        for i in 0..200 {
+            let d = 0.01 + (i % 49) as f64 / 100.0; // 0.01..=0.49
+            warm.observe(d, FLAT_RATE);
         }
-        assert!(prior.len() < MIN_POINTS_FOR_PRIOR);
-        assert_eq!(prior.predict(0.0), NEUTRAL_DEMAND);
+        let near = warm.predict(0.02);
+        let far = warm.predict(0.45);
+        let warm_spread = (near - far).abs();
+        assert!(
+            warm_spread < 0.25,
+            "warm flat-rate fit must wash out the prior slope: near={near}, far={far}, spread={warm_spread}"
+        );
+        assert!(
+            near > 3.0 && far > 3.0,
+            "warm predictions must track the observed rate {FLAT_RATE}: near={near}, far={far}"
+        );
+    }
+
+    /// The prediction slides SMOOTHLY from the analytic prior toward the fit as
+    /// samples accrue — no flat "neutral" plateau, no discontinuous jump. With a
+    /// flat observed rate above the far-distance prior value, the far-distance
+    /// prediction strictly INCREASES with each of the first few samples, because
+    /// the prior's blend weight strictly shrinks each step.
+    #[test]
+    fn prediction_transitions_smoothly_from_prior_to_fit() {
+        const FLAT_RATE: f64 = 5.0;
+        let mut prior = ProximityPrior::new();
+
+        let p0 = prior.predict(0.45); // cold: pure prior at far distance (small)
+        prior.observe(0.20, FLAT_RATE);
+        let p1 = prior.predict(0.45);
+        prior.observe(0.25, FLAT_RATE);
+        let p2 = prior.predict(0.45);
+        prior.observe(0.30, FLAT_RATE);
+        let p3 = prior.predict(0.45);
+
+        assert!(
+            p0 < p1 && p1 < p2 && p2 < p3,
+            "far-distance prediction must climb monotonically toward the fit as \
+             samples accrue: p0={p0}, p1={p1}, p2={p2}, p3={p3}"
+        );
+        assert!(
+            p3 < FLAT_RATE,
+            "still short of the full fit after only 3 samples (prior still weighted): p3={p3}"
+        );
+    }
+
+    /// The blend weight is `1.0` cold, strictly decreasing in the retained
+    /// sample count, and decays toward `0` as samples accumulate — the property
+    /// that hands control from the analytic prior to the learned fit.
+    #[test]
+    fn blend_weight_decays_with_sample_count() {
+        assert_eq!(blend_weight(0), 1.0, "prior owns the estimate at n = 0");
+
+        // Strictly decreasing across a growing sample count.
+        let mut prev = f64::INFINITY;
+        for n in [0usize, 1, 2, 5, 10, 25, 50, 100, 250, 500] {
+            let w = blend_weight(n);
+            assert!(w > 0.0 && w <= 1.0, "weight out of (0, 1]: w({n}) = {w}");
+            assert!(
+                w < prev,
+                "weight must strictly decrease: w({n}) = {w} >= {prev}"
+            );
+            prev = w;
+        }
+
+        // Equal weighting exactly at the pseudo-count, and negligible far past
+        // the sample window.
+        assert!(
+            (blend_weight(PRIOR_PSEUDO_COUNT as usize) - 0.5).abs() < 1e-9,
+            "prior and fit weigh equally at n = PRIOR_PSEUDO_COUNT"
+        );
+        assert!(
+            blend_weight(MAX_PRIOR_POINTS) < 0.02,
+            "prior weight must be negligible once the sample window is full: {}",
+            blend_weight(MAX_PRIOR_POINTS)
+        );
     }
 
     /// The fitted prior is monotone NON-INCREASING in distance: closer contracts
@@ -183,12 +377,14 @@ mod tests {
         for (d, r) in samples {
             prior.observe(d, r);
         }
-        assert!(prior.len() >= MIN_POINTS_FOR_PRIOR);
+        assert_eq!(prior.len(), samples.len());
 
         // Sample the curve WITHIN the observed data range [0.05, 0.45] (where
         // interpolation between the non-increasing fitted points is guaranteed
-        // monotone) and assert non-increasing. Extrapolation beyond the data
-        // edges is exercised separately by `prediction_is_non_negative_out_of_range`.
+        // monotone) and assert non-increasing. Both blended terms — the analytic
+        // prior and the descending fit — are non-increasing in distance, so
+        // their blend is too. Extrapolation beyond the data edges is exercised
+        // separately by `prediction_is_non_negative_out_of_range`.
         let mut prev = f64::INFINITY;
         let mut x = 0.05;
         while x <= 0.45 + 1e-9 {
@@ -238,7 +434,13 @@ mod tests {
         prior.observe(-0.1, 5.0);
         prior.observe(0.1, -5.0);
         assert_eq!(prior.len(), 0, "no invalid point should be retained");
-        assert_eq!(prior.predict(0.1), NEUTRAL_DEMAND);
+        // With no retained points the estimate is the pure cold prior; it must
+        // stay finite and positive.
+        let cold = prior.predict(0.1);
+        assert!(
+            cold.is_finite() && cold > 0.0,
+            "empty prior must return a finite positive estimate, got {cold}"
+        );
     }
 
     /// Predicted demand is always non-negative, even at distances beyond the
