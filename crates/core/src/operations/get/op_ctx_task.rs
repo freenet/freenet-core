@@ -4103,6 +4103,19 @@ mod tests {
              explicit subscribe=true. do NOT re-add auto_subscribe_on_get_response \
              — see hosting-invariants."
         );
+        // Belt-and-braces: catch a re-subscribe reintroduced via a DIFFERENT
+        // mechanism than the removed helper. The GET driver installs durable
+        // subscriptions ONLY through `maybe_subscribe_child` (a subscribe sub-op
+        // spawned on the explicit subscribe=true path); it must never call
+        // `ring.subscribe(` directly, which would re-open the GET-auto-subscribe
+        // anti-pattern regardless of the helper name.
+        assert!(
+            !src.contains("ring.subscribe("),
+            "GET driver must NOT call ring.subscribe( directly — the only durable \
+             subscribe path is maybe_subscribe_child (explicit subscribe=true). A \
+             direct ring.subscribe( in this driver re-introduces GET-auto-subscribe \
+             under a new name — see hosting-invariants (invariants 1 & 2)."
+        );
         // The explicit subscribe path must still be wired in.
         assert!(
             src.contains("maybe_subscribe_child"),
@@ -5856,6 +5869,9 @@ mod tests {
             .split("\n}\n\n/// Cause")
             .next()
             .expect("end of drive_sub_op_get body");
+        // Future-proofing: `auto_subscribe_on_get_response` no longer exists
+        // (piece E removed GET-auto-subscribe); this stays as an absence-pin so
+        // a re-added helper of that name would trip here too.
         assert!(
             !body.contains("auto_subscribe_on_get_response"),
             "drive_sub_op_get must NOT call auto_subscribe_on_get_response — \

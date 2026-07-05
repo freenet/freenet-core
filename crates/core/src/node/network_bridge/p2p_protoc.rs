@@ -4934,7 +4934,6 @@ mod tests {
         // file must FAIL this pin — see the set-equality assertion below.
         let known_wired: std::collections::BTreeSet<&str> = [
             "node.rs",
-            "operations.rs",
             "operations/subscribe.rs",
             "operations/get/op_ctx_task.rs",
         ]

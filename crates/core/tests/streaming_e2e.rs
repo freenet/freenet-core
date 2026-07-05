@@ -827,7 +827,7 @@ fn test_streaming_get_1mb_with_packet_loss() {
 #[test]
 fn test_streaming_get_hosts_on_return_path() {
     const SEED: u64 = 0xDE1A_0009_CAFE_F00D;
-    const NETWORK_NAME: &str = "streaming-get-auto-subscribe";
+    const NETWORK_NAME: &str = "streaming-get-hosts-return-path";
     const THRESHOLD: usize = 1024;
     const LARGE_STATE_SIZE: usize = 100 * 1024; // 100KB, above streaming threshold
 
