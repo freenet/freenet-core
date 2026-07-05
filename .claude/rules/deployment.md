@@ -34,6 +34,13 @@ CHECK: env!("VERGEN_GIT_DIRTY") or equivalent build metadata
 
 WHY: Dev builds triggering auto-update replaces the dev binary with a release
 binary, destroying the development environment.
+
+The GIT_DIRTY gate only covers a DIRTY tree. A CLEAN build that is not an
+official release but intentionally runs AHEAD of the latest release (e.g. the
+try.freenet.org from-source node) has GIT_DIRTY empty, so it is NOT gated — it
+would detect the newer published release and exit 42 in a loop. For that case,
+pass `--disable-auto-update` on that deployment's `ExecStart` (default is off,
+so release nodes are unaffected). See #4690.
 ```
 
 ### WHEN tightening security (sandbox, CSP, CORS)

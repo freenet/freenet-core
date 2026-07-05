@@ -186,6 +186,23 @@ async fn run_local(config: Config) -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)
 }
 
+/// Whether the node's automatic self-update check should be skipped entirely.
+///
+/// Two independent reasons, either sufficient:
+/// - a dirty/dev build (`git_dirty` non-empty): `freenet update` would replace
+///   the binary with a prebuilt release and discard local changes (#3245);
+/// - an explicit operator opt-out (`--disable-auto-update`, #4690): for a
+///   bespoke from-source deployment that intentionally runs ahead of releases
+///   (e.g. try.freenet.org) and must not try to "update" itself to a published
+///   release.
+///
+/// A clean release build with the flag unset returns `false`, so auto-update
+/// stays ON by default. This is load-bearing: peers must keep updating
+/// automatically given Freenet's release pace — do not flip the default.
+fn auto_update_is_disabled(git_dirty: &str, disable_flag: bool) -> bool {
+    !git_dirty.is_empty() || disable_flag
+}
+
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
 
@@ -198,6 +215,10 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
         .await
         .with_context(|| "failed to start HTTP/WebSocket client API")?;
     tracing::info!("Initializing node configuration");
+
+    // Capture before `config` is moved into NodeConfig; threaded to the
+    // update-check task so an operator opt-out (#4690) can park it.
+    let disable_auto_update = config.disable_auto_update;
 
     let node_config = NodeConfig::new(config)
         .await
@@ -212,7 +233,7 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     let shutdown_handle = node.shutdown_handle();
 
     // Run node with signal handling for graceful shutdown
-    run_network_node_with_signals(node, shutdown_handle).await
+    run_network_node_with_signals(node, shutdown_handle, disable_auto_update).await
 }
 
 /// Run the network node with signal handling for graceful shutdown.
@@ -226,6 +247,9 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
 async fn run_network_node_with_signals(
     node: freenet::Node,
     shutdown_handle: freenet::ShutdownHandle,
+    // Operator opt-out of the self-update check (#4690); captured from `Config`
+    // by the caller before the node is built. Default false → auto-update ON.
+    disable_auto_update: bool,
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
         UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, UpdateCheckResult,
@@ -360,24 +384,38 @@ async fn run_network_node_with_signals(
     // Disabled for dirty builds — `freenet update` replaces the binary with a
     // prebuilt release, which would discard local modifications (#3245)
     let (update_tx, mut update_rx) = tokio::sync::oneshot::channel::<String>();
-    let auto_update_disabled = !build_info::GIT_DIRTY.is_empty();
+    // Two independent reasons to skip auto-update: a dirty/dev build (#3245) OR
+    // an explicit operator opt-out for a from-source deployment that runs ahead
+    // of releases (#4690). A clean release build with the flag unset keeps
+    // auto-update ON — see `auto_update_is_disabled`.
+    let auto_update_disabled = auto_update_is_disabled(build_info::GIT_DIRTY, disable_auto_update);
     let update_check_task = GlobalExecutor::spawn(async move {
         use std::time::Instant;
 
         if auto_update_disabled {
-            // Loud, operator-visible (issue #4580): a dirty/dev build never even
-            // checks for updates, so this node will stay on its current version
-            // indefinitely with no further signal. That is the intended
-            // behaviour for a local build (auto-update would clobber local
-            // changes, #3245), but it must be surfaced rather than silent.
-            tracing::warn!(
-                git_dirty = build_info::GIT_DIRTY,
-                "Auto-update is DISABLED for this dirty (locally modified) build: this node will \
-                 NOT detect or apply updates and will stay on version {} until you act. This is \
-                 expected for a local build. Run `freenet update` manually to switch to the \
-                 latest release, or install a clean release build to re-enable auto-update.",
-                build_info::VERSION,
-            );
+            // Loud, operator-visible (issue #4580): this node never even checks
+            // for updates, so it will stay on its current version indefinitely
+            // with no further signal. Surface WHY rather than staying silent.
+            if disable_auto_update {
+                tracing::warn!(
+                    "Auto-update is DISABLED by configuration (--disable-auto-update): this node \
+                     will NOT detect or apply updates and will stay on version {} until you update \
+                     it out-of-band. Intended only for a from-source deployment that manages its \
+                     own builds (e.g. try.freenet.org); a normal release node should NOT set this.",
+                    build_info::VERSION,
+                );
+            } else {
+                // Dirty/dev build: auto-update would clobber local changes (#3245).
+                tracing::warn!(
+                    git_dirty = build_info::GIT_DIRTY,
+                    "Auto-update is DISABLED for this dirty (locally modified) build: this node \
+                     will NOT detect or apply updates and will stay on version {} until you act. \
+                     This is expected for a local build. Run `freenet update` manually to switch \
+                     to the latest release, or install a clean release build to re-enable \
+                     auto-update.",
+                    build_info::VERSION,
+                );
+            }
             std::future::pending::<()>().await;
             return;
         }
@@ -1012,10 +1050,18 @@ fn freenet_main() -> anyhow::Result<()> {
         }
         Some(Command::Network { mut config }) => {
             config.mode = Some(OperationMode::Network);
+            // `--disable-auto-update` placed BEFORE the subcommand lands in the
+            // top-level `cli.config`, which this arm otherwise discards. Merge it
+            // so the safety opt-out works in either position instead of being
+            // silently ignored (#4690) — critical because a silently-ignored
+            // opt-out leaves the from-source node auto-updating (the exact loop
+            // we are preventing).
+            config.disable_auto_update |= cli.config.disable_auto_update;
             run_node(config)
         }
         Some(Command::Local { mut config }) => {
             config.mode = Some(OperationMode::Local);
+            config.disable_auto_update |= cli.config.disable_auto_update;
             run_node(config)
         }
         None => {
@@ -1195,6 +1241,52 @@ fn main() {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::parse_listening_inode;
+
+    #[test]
+    fn auto_update_default_stays_enabled_flag_and_dirty_disable() {
+        use super::auto_update_is_disabled;
+        // LOAD-BEARING invariant (#4690): a clean release build with the flag
+        // UNSET must keep auto-update ON, or every peer stops updating given
+        // Freenet's release pace. This test fails if the default ever flips.
+        assert!(
+            !auto_update_is_disabled("", false),
+            "clean build + no flag must keep auto-update ON"
+        );
+        // Explicit operator opt-out disables it (the try.freenet.org from-source case).
+        assert!(
+            auto_update_is_disabled("", true),
+            "--disable-auto-update must turn auto-update OFF"
+        );
+        // A dirty/dev build still disables regardless of the flag (#3245).
+        assert!(auto_update_is_disabled("src/main.rs", false));
+        assert!(auto_update_is_disabled("src/main.rs", true));
+    }
+
+    #[test]
+    fn disable_auto_update_flag_honored_before_or_after_subcommand() {
+        use super::{Cli, Command};
+        use clap::Parser;
+        // The flag may appear BEFORE or AFTER the `network` subcommand. Before
+        // it, clap parses it into the top-level `cli.config`; after it, into the
+        // subcommand's `config`. `freenet_main` OR-merges the two so BOTH
+        // positions disable auto-update — a silently-ignored safety opt-out
+        // (#4690) would leave the from-source node auto-updating (Codex review).
+        for argv in [
+            ["freenet", "network", "--disable-auto-update"],
+            ["freenet", "--disable-auto-update", "network"],
+        ] {
+            let cli = Cli::try_parse_from(argv).expect("parse");
+            let sub = match cli.command {
+                Some(Command::Network { config }) => config.disable_auto_update,
+                _ => panic!("expected network subcommand"),
+            };
+            // Mirrors the OR-merge in freenet_main's Network/Local arms.
+            assert!(
+                sub || cli.config.disable_auto_update,
+                "flag must be honored in either position: {argv:?}"
+            );
+        }
+    }
 
     #[test]
     #[cfg(unix)]
