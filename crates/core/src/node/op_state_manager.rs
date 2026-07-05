@@ -792,6 +792,16 @@ impl OpManager {
         // before the stored-flag early-return so the "stored None but computed
         // Some" (and vice-versa) cases are also counted. Cheap: this path runs on
         // client-unsubscribe / chain-collapse, not a hot loop.
+        //
+        // CAVEAT — the recorded divergence rate is NOISY AT THE EDGES. A counted
+        // divergence means genuine stored-flag drift (#4671) OR one of two edge
+        // artifacts: (a) a transient `own_location == None` (early startup / a
+        // dropped self-location) makes `most_keyward_hosting_neighbor` return
+        // `None` while the stored flag is still `Some`, and (b) the `comparisons`
+        // denominator also counts non-divergent `None == None` calls (no upstream
+        // either way), diluting the ratio. So do NOT read
+        // `upstream_computed_vs_stored_*` as pure flag-drift: attribute startup /
+        // edge noise before concluding the flag has drifted.
         {
             let instance_id = *contract.id();
             let hosting_neighbors = self

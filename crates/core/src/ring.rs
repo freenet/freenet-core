@@ -893,8 +893,9 @@ impl Ring {
     /// this peer. Returns `None` when no such neighbor exists — either because
     /// this peer is the most-keyward host it can see (a terminus, design §5d-a)
     /// or because closer neighbors exist but none host the contract (a stranded
-    /// host that must re-root, §5d-b); the caller distinguishes those via
-    /// `is_subscription_root`.
+    /// host that must re-root, §5d-b). No current caller distinguishes those two
+    /// `None` cases — this step is observation-only; a later keystone step will
+    /// (via `is_subscription_root`).
     ///
     /// This is the *computed upstream* of the demand-driven-hosting design (§4,
     /// #4642 piece D): derived on demand from live neighbor-hosting
@@ -6955,11 +6956,25 @@ mod most_keyward_tests {
 
     #[test]
     fn excludes_farther_or_equal_neighbors() {
+        // This test PINS the strict `<` boundary (the acyclicity guarantee)
+        // against a regression to `<=`, so the "equal" candidate's distance must
+        // be BIT-IDENTICAL to `my_distance()`. The literal 0.10 is NOT: the ring
+        // distance `Location::new(0.60).distance(Location::new(0.50))` is
+        // `0.09999999999999998`, whereas `Distance::new(0.10)` stores
+        // `0.10000000000000001`, so a candidate built from `0.10` is actually
+        // strictly GREATER and is excluded as "farther" under BOTH `<` and `<=`
+        // — pinning nothing. Feeding `my_distance()` back in (via `as_f64`, which
+        // `Distance::new` stores verbatim for values <= 0.5) makes the candidate
+        // exactly equal, so `<` excludes it (None) while a regression to `<=`
+        // would include and pick it (Some): the two now disagree and this test
+        // fails under `<=`.
+        let equal_dist = my_distance().as_f64();
+
         // A strictly-closer neighbor (0.02) coexists with one at EXACTLY my
-        // distance (0.10) and one FARTHER (0.15). Only the strictly-closer one is
+        // distance and one FARTHER (0.15). Only the strictly-closer one is
         // eligible, so it is chosen — the equal and farther peers are excluded.
         let closer = candidate("127.0.0.1:9001", 0.02);
-        let equal = candidate("127.0.0.1:9002", 0.10);
+        let equal = candidate("127.0.0.1:9002", equal_dist);
         let farther = candidate("127.0.0.1:9003", 0.15);
         let want = closer.0.clone();
         let picked = most_keyward_among(my_distance(), [equal, farther, closer].into_iter());
@@ -6971,12 +6986,14 @@ mod most_keyward_tests {
 
         // With ONLY an equal-distance neighbor present, the strict `<` excludes
         // it → None (a peer at our exact distance never becomes our upstream, the
-        // acyclicity guarantee).
-        let equal_only = candidate("127.0.0.1:9002", 0.10);
+        // acyclicity guarantee). This is the assertion that DISTINGUISHES `<`
+        // from `<=`: under the shipped `<` the equal candidate yields None, while
+        // a regression to `<=` would yield `Some(equal)` and fail here.
+        let equal_only = candidate("127.0.0.1:9002", equal_dist);
         assert_eq!(
             most_keyward_among(my_distance(), std::iter::once(equal_only)),
             None,
-            "a neighbor at exactly our distance is farther-or-equal and must be excluded"
+            "a neighbor at exactly our distance is farther-or-equal and must be excluded (pins `<`, not `<=`)"
         );
     }
 
