@@ -174,6 +174,18 @@ impl MockStateStorage {
         inner.params.insert(key, params);
     }
 
+    /// Drop ONLY the params for a key, leaving its state intact.
+    ///
+    /// Models the "orphaned state without params" on-disk shape that issue
+    /// #3279 reports: a node that has a contract's state (and code) but is
+    /// missing its parameters, so a cross-node non-delta update cannot run.
+    /// There is no production `remove_params` — this is a test-only helper for
+    /// constructing that inconsistency deterministically.
+    pub fn remove_params_for_test(&self, key: &ContractKey) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.params.remove(key);
+    }
+
     /// Check if a specific key should fail.
     fn should_fail_for_key(inner: &MockStateStorageInner, key: &ContractKey) -> bool {
         inner.failure_config.fail_for_keys.contains(key)
