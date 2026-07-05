@@ -99,14 +99,17 @@ pub(crate) struct OpManager {
     pub neighbor_hosting: Arc<NeighborHostingManager>,
     /// Interest manager for delta-based state synchronization.
     ///
-    /// Its clock is the same injectable [`DynTimeSource`](crate::util::time_source::DynTimeSource)
-    /// the `HostingManager` receives (via `NodeConfig::hosting_time_source_override`),
-    /// so subscription/interest-lease expiry and hosting-cache TTL/eviction
-    /// advance on ONE clock. Production installs a fresh `Arc<InstantTimeSrc>`
-    /// (wall clock, behavior-identical to the previous hardcoded
-    /// `InstantTimeSrc`); simulation tests inject a controllable clock so a
-    /// chain-collapse / no-storm / interest-gated-renewal test can deterministically
-    /// age BOTH the subscription and demand halves together. See #4642 (piece A).
+    /// Its clock comes from the same injectable
+    /// [`DynTimeSource`](crate::util::time_source::DynTimeSource) *source* the
+    /// `HostingManager` uses (via `NodeConfig::hosting_time_source_override`), so
+    /// subscription/interest-lease expiry and hosting-cache TTL/eviction read the
+    /// same clock. In production the override is `None`, so the `HostingManager` and
+    /// the `InterestManager` each install their own fresh `Arc<InstantTimeSrc>` —
+    /// distinct instances, but the identical monotonic wall clock (stateless, zero
+    /// observable skew), behavior-identical to the previous hardcoded `InstantTimeSrc`.
+    /// In simulation both clone the SAME injected clock, so a chain-collapse /
+    /// no-storm / interest-gated-renewal test can deterministically age BOTH the
+    /// subscription and demand halves together. See #4642 (piece A).
     pub interest_manager:
         Arc<crate::ring::interest::InterestManager<crate::util::time_source::DynTimeSource>>,
     /// Dedup cache for skipping redundant broadcast WASM merges
@@ -387,12 +390,14 @@ impl OpManager {
         }
 
         let neighbor_hosting = Arc::new(NeighborHostingManager::new());
-        // The InterestManager shares the HostingManager's injectable clock so
-        // subscription/interest-lease expiry and hosting-cache TTL advance on one
-        // clock. Production (`hosting_time_source_override == None`) gets a fresh
-        // `Arc<InstantTimeSrc>` — behavior-identical to the previous hardcoded
-        // `InstantTimeSrc::new()`; sims inject a controllable clock (mirrors the
-        // `Ring::new` → `HostingManager::with_time_source` path). See #4642 piece A.
+        // The InterestManager draws its clock from the same injectable source as the
+        // HostingManager, so subscription/interest-lease expiry and hosting-cache TTL
+        // read the same clock. Production (`hosting_time_source_override == None`)
+        // installs a fresh `Arc<InstantTimeSrc>` here — a distinct instance from the
+        // HostingManager's, but the identical stateless wall clock (zero skew),
+        // behavior-identical to the previous hardcoded `InstantTimeSrc::new()`. Sims
+        // clone the same injected clock (mirrors the `Ring::new` →
+        // `HostingManager::with_time_source` path). See #4642 piece A.
         let interest_time_source: crate::util::time_source::DynTimeSource = config
             .hosting_time_source_override
             .clone()
