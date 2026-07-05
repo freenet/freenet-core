@@ -97,8 +97,18 @@ pub(crate) struct OpManager {
         Arc<Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>>,
     /// Neighbor hosting manager for tracking neighbor contract hosting
     pub neighbor_hosting: Arc<NeighborHostingManager>,
-    /// Interest manager for delta-based state synchronization
-    pub interest_manager: Arc<crate::ring::interest::InterestManager<InstantTimeSrc>>,
+    /// Interest manager for delta-based state synchronization.
+    ///
+    /// Its clock is the same injectable [`DynTimeSource`](crate::util::time_source::DynTimeSource)
+    /// the `HostingManager` receives (via `NodeConfig::hosting_time_source_override`),
+    /// so subscription/interest-lease expiry and hosting-cache TTL/eviction
+    /// advance on ONE clock. Production installs a fresh `Arc<InstantTimeSrc>`
+    /// (wall clock, behavior-identical to the previous hardcoded
+    /// `InstantTimeSrc`); simulation tests inject a controllable clock so a
+    /// chain-collapse / no-storm / interest-gated-renewal test can deterministically
+    /// age BOTH the subscription and demand halves together. See #4642 (piece A).
+    pub interest_manager:
+        Arc<crate::ring::interest::InterestManager<crate::util::time_source::DynTimeSource>>,
     /// Dedup cache for skipping redundant broadcast WASM merges
     pub broadcast_dedup_cache: Arc<crate::operations::update::BroadcastDedupCache>,
     /// Bounded per-contract UPDATE-propagation counters. Fed from the
@@ -377,8 +387,18 @@ impl OpManager {
         }
 
         let neighbor_hosting = Arc::new(NeighborHostingManager::new());
+        // The InterestManager shares the HostingManager's injectable clock so
+        // subscription/interest-lease expiry and hosting-cache TTL advance on one
+        // clock. Production (`hosting_time_source_override == None`) gets a fresh
+        // `Arc<InstantTimeSrc>` — behavior-identical to the previous hardcoded
+        // `InstantTimeSrc::new()`; sims inject a controllable clock (mirrors the
+        // `Ring::new` → `HostingManager::with_time_source` path). See #4642 piece A.
+        let interest_time_source: crate::util::time_source::DynTimeSource = config
+            .hosting_time_source_override
+            .clone()
+            .unwrap_or_else(|| Arc::new(InstantTimeSrc::new()));
         let interest_manager = Arc::new(crate::ring::interest::InterestManager::new(
-            InstantTimeSrc::new(),
+            interest_time_source,
         ));
 
         // Start background sweep task for interest expiration
