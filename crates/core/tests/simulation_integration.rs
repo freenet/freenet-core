@@ -12011,3 +12011,464 @@ fn test_placement_migration_at_scale_renewal_load_stays_bounded() {
         );
     }
 }
+
+// =============================================================================
+// Demand-driven hosting harness (#4642) — example sim tests exercising the
+// sim-harness infrastructure added for the hosting/subscription redesign:
+//   * injectable, controllable hosting clock (enable_hosting_time_control +
+//     SimOperation::AdvanceHostingClock)   — piece A (eviction/TTL)
+//   * per-node hosting-budget knob (with_hosting_budget)                — piece A
+//   * per-node subscription / hosting / active-demand measurement
+//     accessors on ControlledSimulationResult                          — piece D
+//   * scripted mid-run node crash (SimOperation::CrashNode)            — piece F
+//
+// These validate the harness end-to-end. The strong, deterministic proof that
+// the injected clock drives eviction lives in the unit test
+// `ring::hosting::tests::test_with_time_source_lease_expiry_follows_injected_clock`.
+// =============================================================================
+
+/// End-to-end validation of the controllable hosting clock + budget knob +
+/// per-node measurement accessors (#4642 pieces A & D).
+///
+/// Injects a controllable hosting clock and a tiny hosting budget into every
+/// node, runs a controlled scenario that PUTs a demanded contract, advances the
+/// hosting clock far past the 8-minute TTL gate via `AdvanceHostingClock`, and
+/// then reads the new per-node measurement accessors. Asserts the harness
+/// plumbing works end-to-end and that a contract backed by active demand
+/// survives a large clock jump (demand protects against eviction).
+#[test]
+fn test_hosting_clock_injection_and_measurement_end_to_end() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const NETWORK: &str = "hosting-clock-injection";
+    const SEED: u64 = 0x4642_A001_CAFE;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    // The gateway PUTs (and hosts) the demanded contract — a gateway reliably
+    // hosts its own PUT, avoiding placement non-determinism. A regular node
+    // (labels start at `number_of_gateways`) later GETs it.
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let getter = NodeLabel::node(NETWORK, 1);
+    let demanded = SimOperation::create_test_contract(11);
+    let demanded_key = demanded.key();
+    let demanded_id = *demanded.key().id();
+    let demanded_state = SimOperation::create_test_state(11);
+
+    // Build + configure the network inside a tokio runtime; run_controlled_simulation
+    // manages its OWN turmoil runtime and must be called OUTSIDE block_on.
+    let (sim, clock, clock_start) = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 2, 7, 3, 10, 2, SEED).await;
+
+        // Piece A: inject a controllable hosting clock (so TTL/eviction is under
+        // test control) and a tiny per-node budget (to force cache pressure).
+        let clock = sim.enable_hosting_time_control();
+        sim.with_hosting_budget(4096);
+        let clock_start = clock.current_time();
+        (sim, clock, clock_start)
+    });
+
+    let operations = vec![
+        // Demanded contract: PUT with subscribe=true → the gateway hosts it AND
+        // holds a local client subscription, so eviction must NOT drop it.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: demanded.clone(),
+                state: demanded_state.clone(),
+                subscribe: true,
+            },
+        ),
+        // Jump the hosting clock 30 minutes — far past the 8-minute TTL gate —
+        // deterministically, WITHOUT running 30 minutes of virtual time.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: Duration::from_secs(30 * 60),
+            },
+        ),
+        // Re-access the demanded contract from a node, which exercises the GET
+        // path and triggers hosting-cache activity on the advanced clock.
+        ScheduledOperation::new(
+            getter.clone(),
+            SimOperation::Get {
+                contract_id: demanded_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(30),
+    );
+
+    // The injected clock is shared with every node; confirm the scripted
+    // AdvanceHostingClock actually moved it forward by the 30 minutes we
+    // scheduled (the sim advanced the same Arc-backed clock this handle sees).
+    assert!(
+        clock.current_time() >= clock_start + Duration::from_secs(30 * 60),
+        "AdvanceHostingClock should have advanced the shared hosting clock by >= 30 minutes"
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "controlled simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // The measurement accessors (#4642 piece D) must be readable per node.
+    for label in result.captured_node_labels() {
+        tracing::info!(
+            node = %label,
+            hosting = result.node_hosting_count(&label),
+            subscriptions = result.node_subscription_count(&label),
+            active_demand = ?result.node_active_demand_count(&label),
+            "hosting measurement snapshot"
+        );
+    }
+
+    // The demanded contract must still be hosted on the gateway after the large
+    // clock jump — its local client subscription protects it from TTL/budget
+    // eviction. This exercises the clock-injection + budget plumbing end-to-end.
+    assert!(
+        result.is_node_hosting(&gateway, &demanded_key),
+        "gateway should still host the demanded (subscribed) contract after a 30-minute \
+         hosting-clock jump; its client subscription must protect it from eviction"
+    );
+    assert!(
+        result.node_hosting_count(&gateway) >= 1,
+        "gateway should host at least the demanded contract"
+    );
+
+    // The per-node subscription / active-demand accessors (#4642 piece D) are
+    // exercised in the logging loop above. They are the measurement surface a
+    // no-storm proof asserts on (subscriptions ∝ demand, not ∝ cache size); the
+    // strict storm bound is a property piece D must establish, so this harness
+    // test asserts only that the accessors are wired and the plumbing runs, not
+    // the storm bound itself.
+}
+
+/// Demonstrates the scripted mid-run node-crash capability (#4642 piece F):
+/// `SimOperation::CrashNode` removes a specific peer at a scripted point via the
+/// per-network fault injector, in-order with the other events. Asserts the
+/// simulation completes and the contract remains hosted somewhere in the
+/// surviving network.
+///
+/// NOTE: `CrashNode` is a SILENT (message-blocking) crash — the crashed peer's
+/// transport is not torn down, so surviving peers notice on their own
+/// routing-health cadence rather than an immediate transport close. A test that
+/// needs *prompt* upstream-loss detection (the core of piece F) additionally
+/// depends on the event-driven re-subscribe production change, which is not on
+/// `main`.
+#[test]
+fn test_scripted_node_crash_mid_run() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const NETWORK: &str = "scripted-node-crash";
+    const SEED: u64 = 0x4642_F001_CAFE;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    // Regular-node labels start at `number_of_gateways` (= 1 here).
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let node1 = NodeLabel::node(NETWORK, 1);
+    let node2 = NodeLabel::node(NETWORK, 2);
+
+    let contract = SimOperation::create_test_contract(21);
+    let contract_key = contract.key();
+    let contract_id = *contract.key().id();
+    let state = SimOperation::create_test_state(21);
+
+    // Build the network inside a tokio runtime; run_controlled_simulation manages
+    // its OWN turmoil runtime and must be called OUTSIDE block_on.
+    let sim = rt.block_on(async { SimNetwork::new(NETWORK, 1, 3, 7, 3, 10, 2, SEED).await });
+
+    let operations = vec![
+        // Gateway hosts the contract.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state.clone(),
+                subscribe: true,
+            },
+        ),
+        // Two nodes subscribe to it.
+        ScheduledOperation::new(node1.clone(), SimOperation::Subscribe { contract_id }),
+        ScheduledOperation::new(node2.clone(), SimOperation::Subscribe { contract_id }),
+        // Crash node1 mid-run (scripted, in-order).
+        ScheduledOperation::new(node1.clone(), SimOperation::CrashNode),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(30),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "controlled simulation with a scripted crash should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    for label in result.captured_node_labels() {
+        tracing::info!(
+            node = %label,
+            hosting = result.node_hosting_count(&label),
+            subscriptions = result.node_subscription_count(&label),
+            upstream = ?result.node_upstream_count(&label, &contract_key),
+            "post-crash measurement snapshot"
+        );
+    }
+
+    // DISCRIMINATING assertion: the crash must have actually taken effect.
+    // `CrashNode` installs the sim's packet-delivery callback and marks node1
+    // crashed in the fault injector; every packet to/from node1 is then dropped
+    // and counted. node1 held an established subscription (keep-alive traffic +
+    // renewals + update fan-out), so post-crash traffic to/from it is inevitable
+    // — `crash_packets_dropped() > 0` therefore holds ONLY if the crash really
+    // blocked node1's packets. Before this harness fix the callback was never
+    // installed, so a "crashed" node kept exchanging packets and this count
+    // stayed 0 (the false-green the fix closes). See #4642 piece F.
+    assert!(
+        result.crash_packets_dropped() > 0,
+        "scripted CrashNode must actually drop packets to/from the crashed node \
+         (crash_packets_dropped == 0 means the crash was a silent no-op)"
+    );
+
+    // The contract must still be hosted somewhere in the surviving network:
+    // the gateway hosts it, and node1's crash must not take it down.
+    let hosted_somewhere = result
+        .captured_node_labels()
+        .iter()
+        .any(|label| result.is_node_hosting(label, &contract_key));
+    assert!(
+        hosted_somewhere,
+        "contract should remain hosted on a surviving node after node1 was crashed"
+    );
+}
+
+/// Error-path coverage for the controllable-clock harness: scheduling
+/// `SimOperation::AdvanceHostingClock` WITHOUT first calling
+/// `enable_hosting_time_control()` must degrade gracefully — the runner logs a
+/// warning and the advance is a no-op, rather than panicking or wedging. This
+/// exercises the "no controllable hosting clock was enabled" branch of the
+/// special-op dispatch.
+#[test]
+fn test_advance_hosting_clock_without_control_is_graceful_noop() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const NETWORK: &str = "advance-clock-no-control";
+    const SEED: u64 = 0x4642_A002_CAFE;
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let contract = SimOperation::create_test_contract(31);
+    let state = SimOperation::create_test_state(31);
+
+    // NOTE: enable_hosting_time_control() is deliberately NOT called here.
+    let sim = rt.block_on(async { SimNetwork::new(NETWORK, 1, 1, 7, 3, 10, 2, SEED).await });
+
+    let operations = vec![
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state.clone(),
+                subscribe: true,
+            },
+        ),
+        // No controllable clock is enabled → this must be a graceful no-op.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: Duration::from_secs(30 * 60),
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(20),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation must complete gracefully even when AdvanceHostingClock is scheduled \
+         without a controllable clock enabled: {:?}",
+        result.turmoil_result.err()
+    );
+    // The gateway still hosts its PUT — the no-op advance changed nothing.
+    assert!(
+        result.is_node_hosting(&gateway, &contract.key()),
+        "gateway should still host its PUT contract"
+    );
+}
+
+/// M2 (#4642 piece A): proves the injected hosting clock is NOT a silent no-op
+/// end-to-end through SimNetwork → NodeConfig → Ring → HostingManager. This
+/// guards the whole clock-injection wiring against future refactors: it is the
+/// discriminating counterpart to
+/// `test_hosting_clock_injection_and_measurement_end_to_end` (which only shows a
+/// DEMANDED contract SURVIVES a clock jump — a no-op injection would pass that
+/// too).
+///
+/// A gateway hosts several UNDEMANDED (`subscribe=false`, cache-only) contracts
+/// under a 1-byte hosting budget, so the cache is permanently over budget and
+/// eviction is gated SOLELY by the TTL clock. Eviction of a past-TTL entry runs
+/// on the next cache access; a trailing PUT provides that access
+/// deterministically (no dependence on background-sweep timing). We run the SAME
+/// scenario twice, differing ONLY in how far the injected clock is advanced
+/// before that trailing access:
+///   * control: advance 1 min  (< DEFAULT_MIN_TTL = 8 min) → NO eviction
+///   * test:    advance 10 min (> DEFAULT_MIN_TTL)         → eviction
+///
+/// If the clock injection were broken (an `AdvanceHostingClock` that never
+/// reaches the `HostingManager`'s cache), both runs would behave identically and
+/// the `test_count < control_count` assertion would fail — which is exactly the
+/// regression this test exists to catch.
+#[test]
+fn test_injected_hosting_clock_drives_undemanded_eviction() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    // DEFAULT_MIN_TTL = TTL_RENEWAL_MULTIPLIER (4) × SUBSCRIPTION_RENEWAL_INTERVAL
+    // (120s) = 480s (8 min). One advance stays under it, the other crosses it.
+    const SUB_TTL_ADVANCE: Duration = Duration::from_secs(60); // 1 min  < 8 min
+    const SUPER_TTL_ADVANCE: Duration = Duration::from_secs(10 * 60); // 10 min > 8 min
+
+    // Seeds of the undemanded contracts the gateway hosts (cache-only). A
+    // distinct trigger contract is PUT AFTER the advance to force a cache access.
+    const UNDEMANDED_SEEDS: [u8; 3] = [41, 42, 43];
+    const TRIGGER_SEED: u8 = 44;
+
+    // Runs the scenario with a given clock advance; returns the gateway's final
+    // hosting count and whether each undemanded contract is still hosted.
+    let run = |network: &str, seed: u64, advance: Duration| -> (usize, [bool; 3]) {
+        setup_deterministic_state(seed);
+        let rt = create_runtime();
+        let gateway = NodeLabel::gateway(network, 0);
+
+        let undemanded: Vec<_> = UNDEMANDED_SEEDS
+            .iter()
+            .map(|s| SimOperation::create_test_contract(*s))
+            .collect();
+        let undemanded_keys: Vec<_> = undemanded.iter().map(|c| c.key()).collect();
+        let trigger = SimOperation::create_test_contract(TRIGGER_SEED);
+
+        let sim = rt.block_on(async {
+            let mut sim = SimNetwork::new(network, 1, 2, 7, 3, 10, 2, seed).await;
+            // Piece A: inject the controllable clock (TTL under test control) and
+            // a 1-byte budget so ANY hosted contract is over budget — eviction is
+            // then gated purely by the TTL clock this test advances.
+            sim.enable_hosting_time_control();
+            sim.with_hosting_budget(1);
+            sim
+        });
+
+        let mut operations = Vec::new();
+        // The gateway hosts each undemanded contract (host-on-PUT); with
+        // subscribe=false there is no client subscription, so it is cache-only
+        // (evictable) rather than demand-pinned.
+        for (c, s) in undemanded.iter().zip(UNDEMANDED_SEEDS.iter()) {
+            operations.push(ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Put {
+                    contract: c.clone(),
+                    state: SimOperation::create_test_state(*s),
+                    subscribe: false,
+                },
+            ));
+        }
+        // Jump the injected clock deterministically (no virtual minutes elapse).
+        operations.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::AdvanceHostingClock { duration: advance },
+        ));
+        // Trailing PUT: a fresh cache access that runs `evict_over_budget`. In
+        // the super-TTL run the undemanded entries are now past TTL and are
+        // evicted; in the sub-TTL run they are still TTL-protected. The trigger
+        // itself is freshly inserted (age 0) and cannot be evicted by its own
+        // access, so it survives in both runs.
+        operations.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: trigger.clone(),
+                state: SimOperation::create_test_state(TRIGGER_SEED),
+                subscribe: false,
+            },
+        ));
+
+        let result = sim.run_controlled_simulation(
+            seed,
+            operations,
+            Duration::from_secs(120),
+            Duration::from_secs(20),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "controlled simulation should complete: {:?}",
+            result.turmoil_result.err()
+        );
+        let flags = [
+            result.is_node_hosting(&gateway, &undemanded_keys[0]),
+            result.is_node_hosting(&gateway, &undemanded_keys[1]),
+            result.is_node_hosting(&gateway, &undemanded_keys[2]),
+        ];
+        (result.node_hosting_count(&gateway), flags)
+    };
+
+    const SEED: u64 = 0x4642_A003_CAFE;
+    let (control_count, control_flags) = run("clock-evict-control", SEED, SUB_TTL_ADVANCE);
+    let (test_count, test_flags) = run("clock-evict-test", SEED, SUPER_TTL_ADVANCE);
+
+    tracing::info!(
+        control_count,
+        test_count,
+        ?control_flags,
+        ?test_flags,
+        "injected-clock eviction: control (sub-TTL advance) vs test (super-TTL advance)"
+    );
+
+    // Sanity: host-on-PUT actually hosted the undemanded contracts (otherwise the
+    // comparison below would be vacuous). All three present in the control run.
+    assert!(
+        control_flags.iter().all(|&h| h),
+        "sub-TTL advance ({}s < 8min): all undemanded contracts must still be hosted \
+         — they are over budget but TTL-protected, so eviction must NOT fire; got {:?}",
+        SUB_TTL_ADVANCE.as_secs(),
+        control_flags
+    );
+
+    // After crossing DEFAULT_MIN_TTL: the SAME undemanded contracts ARE evicted.
+    assert!(
+        test_flags.iter().all(|&h| !h),
+        "super-TTL advance ({}s > 8min): all undemanded contracts must be evicted \
+         once the injected clock crosses DEFAULT_MIN_TTL; got {:?}",
+        SUPER_TTL_ADVANCE.as_secs(),
+        test_flags
+    );
+
+    // The discriminating comparison: the ONLY difference between the two runs is
+    // how far the injected clock advanced. Strictly fewer contracts surviving the
+    // super-TTL run can happen ONLY if `AdvanceHostingClock` actually reached the
+    // `HostingManager`'s cache. A no-op injection would make the runs identical.
+    assert!(
+        test_count < control_count,
+        "the super-TTL run must host strictly fewer contracts than the sub-TTL run \
+         (control={control_count}, test={test_count}); equal counts mean the injected \
+         clock never reached the hosting cache (silent no-op — the regression this \
+         test guards against)"
+    );
+}

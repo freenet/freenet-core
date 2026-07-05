@@ -484,7 +484,18 @@ impl Ring {
             max_hops_to_live,
             router,
             connection_manager,
-            hosting_manager: hosting::HostingManager::new(config.config.max_hosting_storage),
+            // Production passes the Ring's default `Arc<InstantTimeSrc>`
+            // (wall clock). Simulation tests can inject a controllable clock via
+            // `NodeConfig::hosting_time_source_override` so hosting-cache TTL /
+            // eviction is deterministic (#4642 piece A). Same `Arc` clone as the
+            // rest of the Ring when no override is set.
+            hosting_manager: hosting::HostingManager::with_time_source(
+                config.config.max_hosting_storage,
+                config
+                    .hosting_time_source_override
+                    .clone()
+                    .unwrap_or_else(|| time_source.clone()),
+            ),
             broken_invariants: BrokenInvariantsTracker::new(time_source.clone()),
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
@@ -2990,6 +3001,64 @@ impl Ring {
     /// This is the actual count of contracts this node is caching/hosting.
     pub fn hosting_contracts_count(&self) -> usize {
         self.hosting_manager.hosting_contracts_count()
+    }
+
+    /// Number of active network subscription leases this node currently holds.
+    ///
+    /// Together with [`hosting_contracts_count`](Self::hosting_contracts_count)
+    /// and [`active_demand_count`](Self::active_demand_count), this is the
+    /// per-node measurement a simulation test asserts on to detect a #3763-style
+    /// subscription storm: a healthy node's subscription count tracks active
+    /// demand, NOT cache size.
+    ///
+    /// Test/sim-only accessor (read by `ControlledSimulationResult`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn active_subscription_count(&self) -> usize {
+        self.hosting_manager.active_subscription_count()
+    }
+
+    /// Number of contracts this node has *real demand* for — a local client
+    /// subscription or a downstream subscriber — EXCLUDING cache-only hosting.
+    ///
+    /// Reads the live `InterestManager` (on the `OpManager`) via the Ring's
+    /// back-reference. Returns `None` if the `OpManager` is not attached yet or
+    /// has been torn down (the normal startup / shutdown windows) — distinct
+    /// from `Some(0)` ("attached, genuinely no demand"). This distinction is
+    /// load-bearing for the #3763 no-storm invariant: a no-storm assertion must
+    /// NOT treat a `None` (unmeasurable, detached node) as "demand == 0" and
+    /// falsely conclude there was no storm. See
+    /// [`InterestManager::active_demand_count`](crate::ring::interest::InterestManager::active_demand_count).
+    ///
+    /// Test/sim-only accessor (read by `ControlledSimulationResult`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn active_demand_count(&self) -> Option<usize> {
+        self.upgrade_op_manager()
+            .map(|op_manager| op_manager.interest_manager.active_demand_count())
+    }
+
+    /// Number of *upstream* peers this node has recorded for `contract` — i.e.
+    /// peers it subscribed THROUGH (its parent in the subscription tree). Reads
+    /// the live `InterestManager`'s `is_upstream` edges.
+    ///
+    /// This projects the subscription-tree upstream edge that the topology
+    /// snapshot does NOT carry (it hardcodes `upstream: None`), giving a sim test
+    /// a way to assert a KNOWN `subscriber → upstream` edge — e.g. verify the
+    /// edge exists, crash the upstream, then observe the edge re-form (#4642
+    /// piece F). NOTE: an upstream edge is only recorded when the subscription
+    /// resolved at a real connected peer (not at the originator/root), so a test
+    /// must place the contract key so the subscribe routes through an
+    /// intermediate hop. Returns `None` if the `OpManager` is not attached
+    /// (unmeasurable) — distinct from `Some(0)` ("attached, no upstream edge").
+    #[cfg(any(test, feature = "testing"))]
+    pub fn upstream_interest_count(&self, contract: &ContractKey) -> Option<usize> {
+        self.upgrade_op_manager().map(|op_manager| {
+            op_manager
+                .interest_manager
+                .get_interested_peers(contract)
+                .into_iter()
+                .filter(|(_, interest)| interest.is_upstream)
+                .count()
+        })
     }
 
     /// Get subscription state for all contracts (for telemetry).

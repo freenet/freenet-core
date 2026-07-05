@@ -96,6 +96,14 @@ pub struct FaultInjectorState {
     pub stats: NetworkStats,
     /// Network name for delivering pending messages
     pub network_name: Option<String>,
+    /// Opt-in: when true, the sim's global packet-delivery callback DROPS every
+    /// packet to/from a node in `config.crashed_nodes` (counting it in
+    /// `stats.messages_dropped_crash`). Off by default so installing the global
+    /// callback does not silently change fault behavior for networks that never
+    /// opted in (e.g. the direct-runner churn driver, whose crash semantics are
+    /// unchanged). `SimNetwork::run_controlled_simulation` sets it so
+    /// `SimOperation::CrashNode` is a real crash rather than a no-op (#4642 piece F).
+    pub enforce_crash_drops: bool,
 }
 
 impl FaultInjectorState {
@@ -108,6 +116,7 @@ impl FaultInjectorState {
             pending_messages: Vec::new(),
             stats: NetworkStats::default(),
             network_name: None,
+            enforce_crash_drops: false,
         }
     }
 
