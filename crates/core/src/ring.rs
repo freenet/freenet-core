@@ -3021,17 +3021,19 @@ impl Ring {
     /// subscription or a downstream subscriber — EXCLUDING cache-only hosting.
     ///
     /// Reads the live `InterestManager` (on the `OpManager`) via the Ring's
-    /// back-reference. Returns `0` if the `OpManager` is not attached yet or has
-    /// been torn down (the normal startup / shutdown windows). This is the
-    /// "active interest" denominator for the #3763 no-storm invariant — see
+    /// back-reference. Returns `None` if the `OpManager` is not attached yet or
+    /// has been torn down (the normal startup / shutdown windows) — distinct
+    /// from `Some(0)` ("attached, genuinely no demand"). This distinction is
+    /// load-bearing for the #3763 no-storm invariant: a no-storm assertion must
+    /// NOT treat a `None` (unmeasurable, detached node) as "demand == 0" and
+    /// falsely conclude there was no storm. See
     /// [`InterestManager::active_demand_count`](crate::ring::interest::InterestManager::active_demand_count).
     ///
     /// Test/sim-only accessor (read by `ControlledSimulationResult`).
     #[cfg(any(test, feature = "testing"))]
-    pub fn active_demand_count(&self) -> usize {
+    pub fn active_demand_count(&self) -> Option<usize> {
         self.upgrade_op_manager()
             .map(|op_manager| op_manager.interest_manager.active_demand_count())
-            .unwrap_or(0)
     }
 
     /// Number of *upstream* peers this node has recorded for `contract` — i.e.
@@ -3045,19 +3047,18 @@ impl Ring {
     /// piece F). NOTE: an upstream edge is only recorded when the subscription
     /// resolved at a real connected peer (not at the originator/root), so a test
     /// must place the contract key so the subscribe routes through an
-    /// intermediate hop. Returns 0 if the `OpManager` is not attached.
+    /// intermediate hop. Returns `None` if the `OpManager` is not attached
+    /// (unmeasurable) — distinct from `Some(0)` ("attached, no upstream edge").
     #[cfg(any(test, feature = "testing"))]
-    pub fn upstream_interest_count(&self, contract: &ContractKey) -> usize {
-        self.upgrade_op_manager()
-            .map(|op_manager| {
-                op_manager
-                    .interest_manager
-                    .get_interested_peers(contract)
-                    .into_iter()
-                    .filter(|(_, interest)| interest.is_upstream)
-                    .count()
-            })
-            .unwrap_or(0)
+    pub fn upstream_interest_count(&self, contract: &ContractKey) -> Option<usize> {
+        self.upgrade_op_manager().map(|op_manager| {
+            op_manager
+                .interest_manager
+                .get_interested_peers(contract)
+                .into_iter()
+                .filter(|(_, interest)| interest.is_upstream)
+                .count()
+        })
     }
 
     /// Get subscription state for all contracts (for telemetry).

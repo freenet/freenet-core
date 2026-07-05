@@ -12127,7 +12127,7 @@ fn test_hosting_clock_injection_and_measurement_end_to_end() {
             node = %label,
             hosting = result.node_hosting_count(&label),
             subscriptions = result.node_subscription_count(&label),
-            active_demand = result.node_active_demand_count(&label),
+            active_demand = ?result.node_active_demand_count(&label),
             "hosting measurement snapshot"
         );
     }

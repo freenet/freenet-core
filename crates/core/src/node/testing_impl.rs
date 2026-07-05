@@ -495,26 +495,35 @@ impl ControlledSimulationResult {
 
     /// Number of contracts `label`'s node had *real demand* for (local client
     /// or downstream subscriber, EXCLUDING cache-only hosting) at the end of the
-    /// run. Returns 0 if the node never published its Ring. This is the
-    /// denominator for the #3763 no-storm assertion — see
+    /// run. This is the denominator for the #3763 no-storm assertion — see
     /// [`Ring::active_demand_count`](crate::ring::Ring::active_demand_count).
-    pub fn node_active_demand_count(&self, label: &NodeLabel) -> usize {
+    ///
+    /// Returns `None` when the count is UNMEASURABLE — the node never published
+    /// its Ring, or its `OpManager` was detached (startup/shutdown). A no-storm
+    /// assertion MUST distinguish `None` (unmeasurable) from `Some(0)`
+    /// ("attached, genuinely no demand"): treating a torn-down node's `None` as
+    /// `0` would let a real storm read as "no demand" and pass falsely. Callers
+    /// that only log can `{:?}` it; callers that assert should handle `None`
+    /// explicitly (e.g. skip the node, or fail if a measurement was required).
+    pub fn node_active_demand_count(&self, label: &NodeLabel) -> Option<usize> {
         self.node_rings
             .get(label)
-            .map(|ring| ring.active_demand_count())
-            .unwrap_or(0)
+            .and_then(|ring| ring.active_demand_count())
     }
 
     /// Number of upstream peers `label`'s node recorded for `key` (its parents
-    /// in the subscription tree) at the end of the run. Returns 0 if the node
-    /// never published its Ring. Used by re-subscribe tests (#4642 piece F) to
-    /// assert a KNOWN subscriber→upstream edge. See
+    /// in the subscription tree) at the end of the run. Used by re-subscribe
+    /// tests (#4642 piece F) to assert a KNOWN subscriber→upstream edge. See
     /// [`Ring::upstream_interest_count`](crate::ring::Ring::upstream_interest_count).
-    pub fn node_upstream_count(&self, label: &NodeLabel, key: &ContractKey) -> usize {
+    ///
+    /// Returns `None` when unmeasurable (node never published its Ring, or its
+    /// `OpManager` was detached) — distinct from `Some(0)` ("attached, no
+    /// upstream edge recorded"). A piece-F re-root assertion must not read a
+    /// detached node's `None` as "edge gone".
+    pub fn node_upstream_count(&self, label: &NodeLabel, key: &ContractKey) -> Option<usize> {
         self.node_rings
             .get(label)
-            .map(|ring| ring.upstream_interest_count(key))
-            .unwrap_or(0)
+            .and_then(|ring| ring.upstream_interest_count(key))
     }
 
     /// Labels of every node whose live Ring was captured (started and published
