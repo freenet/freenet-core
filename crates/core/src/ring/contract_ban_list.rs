@@ -1151,13 +1151,17 @@ mod tests {
             "NeighborHosting overlap-sync block is missing the ban-list egress gate — \
              banned contracts would continue to be pushed to sibling peers",
         );
+        // The targeted-sync emit is routed through the `stale_peer_sync_event`
+        // builder (the single guarded construction site introduced by #3796);
+        // the raw `NodeEvent::SyncStateToPeer` literal no longer appears inline
+        // here. Match the builder call as the emit token.
         let emit_pos = block
-            .find("NodeEvent::SyncStateToPeer")
-            .expect("NeighborHosting block is missing SyncStateToPeer emit");
+            .find("stale_peer_sync_event(")
+            .expect("NeighborHosting block is missing the stale_peer_sync_event emit");
         assert!(
             gate_pos < emit_pos,
             "NeighborHosting ban-list gate (offset {gate_pos}) must \
-             precede SyncStateToPeer emit (offset {emit_pos})"
+             precede the stale_peer_sync_event emit (offset {emit_pos})"
         );
     }
 
@@ -1202,13 +1206,17 @@ mod tests {
              banned contracts would continue to be pushed to peers that report \
              stale summaries (defeats the Phase 7 wire-boundary drop)",
         );
+        // The targeted-sync emit is routed through the `stale_peer_sync_event`
+        // builder (the single guarded construction site introduced by #3796);
+        // the raw `NodeEvent::SyncStateToPeer` literal no longer appears inline
+        // in this loop. Match the builder call as the emit token.
         let emit_pos = scan
-            .find("NodeEvent::SyncStateToPeer")
-            .expect("stale-summary loop is missing SyncStateToPeer emit");
+            .find("stale_peer_sync_event(")
+            .expect("stale-summary loop is missing the stale_peer_sync_event emit");
         assert!(
             gate_pos < emit_pos,
             "InterestSync ban-list gate (offset {gate_pos}) must \
-             precede SyncStateToPeer emit (offset {emit_pos})"
+             precede the stale_peer_sync_event emit (offset {emit_pos})"
         );
     }
 

@@ -1724,11 +1724,18 @@ where
                     // the same notification channel that the executor's
                     // try_notify path is trying to keep responsive
                     // (#4145 / #4234).
-                    if let Err(e) = op_manager.try_notify_node_event(NodeEvent::SyncStateToPeer {
-                        key,
-                        new_state: state,
-                        target: source,
-                    }) {
+                    //
+                    // Targeted heal: `stale_peer_sync_event` builds a
+                    // `SyncStateToPeer` aimed at exactly `source` (the one
+                    // neighbor whose proximity announcement overlaps our
+                    // hosting), NEVER a `BroadcastStateChange` that would fan
+                    // the state out to ALL subscribers. Routing through the
+                    // shared builder keeps this second emit site pinned by
+                    // `proximity_overlap_emit_site_uses_targeted_builder`
+                    // (#3791/#3796) — the exact fan-out regression class.
+                    if let Err(e) =
+                        op_manager.try_notify_node_event(stale_peer_sync_event(key, state, source))
+                    {
                         // Best-effort by design (see comment above);
                         // log at debug to keep the caller layer in
                         // step with the helper-internal downgrade
@@ -2372,6 +2379,53 @@ fn emitted_indices_for_rotation(total: usize, start: usize) -> Vec<usize> {
     (0..budget).map(|p| (start + p) % total).collect()
 }
 
+/// Build the `NodeEvent` that heals a single peer by sending it our local
+/// state for one contract.
+///
+/// Two production emit sites route through this builder:
+///
+/// 1. The summary-mismatch heal in `handle_interest_sync_message`'s
+///    `Summaries` arm — `target` is the peer that reported the stale summary.
+/// 2. The proximity-cache overlap path in `handle_connect_msg` — `target` is
+///    the neighbor whose interest announcement just overlapped a contract we
+///    also host.
+///
+/// This MUST be a `SyncStateToPeer` — a **targeted** send to exactly the one
+/// peer (`target`) — and MUST NOT be a `BroadcastStateChange`, which fans the
+/// state out to *all* subscribers of the contract. Both sites are the same
+/// fan-out regression class (#3791/#3796): a single overlap/mismatch must cost
+/// O(1) peer transmissions, not O(subscribers).
+///
+/// # Why this is its own function (regression guard for #3791 / #3796)
+///
+/// A six-week-old regression (#3791) had the summary-mismatch handler emit
+/// `BroadcastStateChange` here. A misleading comment claimed it "sends state
+/// only to peers with stale summaries", but the production dispatch
+/// (`handle_broadcast_state_change` → `get_broadcast_targets_update`) fanned out
+/// to every subscriber (~28 peers), turning one mismatch into O(N × fan-out)
+/// transmissions and producing 19:1–163:1 upload/download ratios in production.
+///
+/// The original regression test only covered `InterestManager` data logic and
+/// would have stayed green if the `node.rs` dispatch were reverted. Isolating
+/// the dispatch *decision* (which `NodeEvent` variant, aimed at which peer) in
+/// this pure function lets `stale_peer_sync_event_is_targeted_not_broadcast`
+/// pin it directly: reverting to a `BroadcastStateChange` here fails that test.
+///
+/// See `.claude/rules/operations.md` (Event emission review) and
+/// `docs/architecture/event-dispatch.md` for the targeted-vs-fan-out
+/// distinction.
+fn stale_peer_sync_event(
+    key: freenet_stdlib::prelude::ContractKey,
+    new_state: freenet_stdlib::prelude::WrappedState,
+    target: std::net::SocketAddr,
+) -> crate::message::NodeEvent {
+    crate::message::NodeEvent::SyncStateToPeer {
+        key,
+        new_state,
+        target,
+    }
+}
+
 /// Handle incoming InterestSync messages for delta-based state synchronization.
 ///
 /// This function processes the interest exchange protocol:
@@ -2384,7 +2438,7 @@ async fn handle_interest_sync_message(
     source: std::net::SocketAddr,
     message: crate::message::InterestMessage,
 ) -> Option<crate::message::InterestMessage> {
-    use crate::message::{InterestMessage, NodeEvent, SummaryEntry};
+    use crate::message::{InterestMessage, SummaryEntry};
     use crate::ring::interest::contract_hash;
 
     match message {
@@ -2641,11 +2695,13 @@ async fn handle_interest_sync_message(
                 // will retry. Blocking here would stack the heal
                 // path on the same notification channel the executor
                 // is trying to keep responsive (#4145 / #4234).
-                if let Err(e) = op_manager.try_notify_node_event(NodeEvent::SyncStateToPeer {
-                    key: contract,
-                    new_state: state,
-                    target: source,
-                }) {
+                // Targeted heal: `stale_peer_sync_event` builds a
+                // `SyncStateToPeer` aimed at exactly `source`, NEVER an
+                // all-subscriber fan-out. Pinned by
+                // `stale_peer_sync_event_is_targeted_not_broadcast` (#3791/#3796).
+                if let Err(e) =
+                    op_manager.try_notify_node_event(stale_peer_sync_event(contract, state, source))
+                {
                     // Best-effort by design (see comment above); log
                     // at debug to keep the caller layer in step with
                     // the helper-internal downgrade (#4238).
@@ -5795,6 +5851,182 @@ mod tests {
                 "stale-sync rotation offset is no longer drawn from GlobalRng — \
                  a fixed/non-random rotation does not avoid starvation and \
                  breaks simulation determinism"
+            );
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Regression guard for #3791 (fixed by #3793) / #3796.
+    //
+    // The summary-mismatch handler in `handle_interest_sync_message`'s
+    // `Summaries` arm must heal a stale peer with a TARGETED
+    // `SyncStateToPeer` aimed at exactly that peer — never a
+    // `BroadcastStateChange`, which fans the state out to ALL subscribers
+    // (~28 peers in production) and caused the 19:1–163:1 upload/download
+    // ratios reported in #3791.
+    //
+    // The ORIGINAL regression test only exercised `InterestManager`
+    // stale-peer *data* logic and would have stayed green if the `node.rs`
+    // dispatch were reverted to `BroadcastStateChange`. These tests instead
+    // exercise the actual `node.rs` dispatch DECISION — which `NodeEvent`
+    // variant is built, and which peer it targets — via the pure
+    // `stale_peer_sync_event` builder the production loop calls. Reverting
+    // that builder to a broadcast fails `is_targeted_not_broadcast`; a
+    // source-scrape pin (`emit_site_uses_targeted_builder`) additionally
+    // fails if the loop stops routing through the builder.
+    // ───────────────────────────────────────────────────────────
+    mod fanout_regression_guard {
+        use super::super::stale_peer_sync_event;
+        use crate::message::NodeEvent;
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey, WrappedState};
+
+        fn test_key() -> ContractKey {
+            ContractKey::from_id_and_code(
+                ContractInstanceId::new([7u8; 32]),
+                CodeHash::new([9u8; 32]),
+            )
+        }
+
+        /// The load-bearing assertion: the summary-mismatch heal event is a
+        /// TARGETED `SyncStateToPeer` at the reporting peer, NOT an
+        /// all-subscriber `BroadcastStateChange`. This is exactly the bug
+        /// #3791 reintroduced — the event that reverting the fix would flip
+        /// back to a broadcast fan-out.
+        #[test]
+        fn stale_peer_sync_event_is_targeted_not_broadcast() {
+            let key = test_key();
+            let state = WrappedState::new(vec![1, 2, 3, 4]);
+            let target: std::net::SocketAddr = "203.0.113.7:31337".parse().unwrap();
+
+            let event = stale_peer_sync_event(key, state.clone(), target);
+
+            // The whole point of #3791/#3796: this MUST be a targeted
+            // SyncStateToPeer, NOT a BroadcastStateChange (all-subscriber
+            // fan-out) or any other variant.
+            let NodeEvent::SyncStateToPeer {
+                key: ev_key,
+                new_state,
+                target: ev_target,
+            } = event
+            else {
+                panic!(
+                    "summary-mismatch heal must emit a targeted SyncStateToPeer, \
+                     got fan-out/other variant: {event:?}"
+                );
+            };
+            assert_eq!(
+                ev_target, target,
+                "SyncStateToPeer must target EXACTLY the peer that reported the \
+                 stale summary, not any other peer"
+            );
+            assert_eq!(ev_key, key, "event must carry the mismatched contract key");
+            assert_eq!(
+                new_state.as_ref(),
+                state.as_ref(),
+                "event must carry the local state to heal the peer with"
+            );
+        }
+
+        /// A different reporting peer must be the sole target — proves the
+        /// event is genuinely per-peer targeted and not accidentally fixed to
+        /// one address.
+        #[test]
+        fn stale_peer_sync_event_targets_the_reporting_peer() {
+            let key = test_key();
+            let state = WrappedState::new(vec![0xAB]);
+            let a: std::net::SocketAddr = "198.51.100.1:1000".parse().unwrap();
+            let b: std::net::SocketAddr = "198.51.100.2:2000".parse().unwrap();
+
+            for target in [a, b] {
+                let event = stale_peer_sync_event(key, state.clone(), target);
+                let NodeEvent::SyncStateToPeer {
+                    target: ev_target, ..
+                } = event
+                else {
+                    panic!("expected targeted SyncStateToPeer, got {event:?}");
+                };
+                assert_eq!(ev_target, target);
+            }
+        }
+
+        /// Source-scrape pin: the production emit site in the `Summaries` arm
+        /// must route through `stale_peer_sync_event` rather than constructing
+        /// a `NodeEvent` inline. Without this, someone could reintroduce an
+        /// inline `NodeEvent::BroadcastStateChange { .. }` at the emit site and
+        /// leave the (still-passing) builder tests above untouched — the exact
+        /// test-gap #3796 calls out.
+        #[test]
+        fn emit_site_uses_targeted_builder() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            let anchor = "for contract in stale_contracts {";
+            let start = SOURCE
+                .find(anchor)
+                .expect("stale-contract emission loop not found — update this pin");
+            let window_end = SOURCE[start..]
+                .find("for (key, state_hash) in confirmed_states {")
+                .map(|off| start + off)
+                .unwrap_or(SOURCE.len());
+            let window = &SOURCE[start..window_end];
+
+            assert!(
+                window.contains("stale_peer_sync_event(contract, state, source)"),
+                "the stale-peer heal emit site no longer routes through \
+                 `stale_peer_sync_event(contract, state, source)` — the \
+                 targeted-vs-broadcast dispatch decision is no longer pinned \
+                 by the builder tests (#3791/#3796)"
+            );
+            assert!(
+                !window.contains("NodeEvent::BroadcastStateChange"),
+                "the stale-peer heal emit site now constructs a \
+                 NodeEvent::BroadcastStateChange — this is the #3791 \
+                 regression (all-subscriber fan-out instead of a targeted \
+                 SyncStateToPeer)"
+            );
+        }
+
+        /// Source-scrape pin for the SECOND emit site (#3796 B2 gap): the
+        /// proximity-cache overlap path in the connect handler must also route
+        /// through `stale_peer_sync_event` and MUST NOT construct an inline
+        /// `NodeEvent::SyncStateToPeer` (which a future edit could silently
+        /// flip to `BroadcastStateChange`, uncaught by any test). This site
+        /// was left unguarded by the first #3796 pass; this test closes it so
+        /// BOTH targeted-send sites are pinned to the same guarded builder.
+        #[test]
+        fn proximity_overlap_emit_site_uses_targeted_builder() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            let anchor = "Proximity cache overlap — syncing state to neighbor";
+            let start = SOURCE
+                .find(anchor)
+                .expect("proximity-overlap emit site not found — update this pin");
+            // Bound the window to the emit block: from the log line to the end
+            // of the best-effort error handler that follows the try_notify call.
+            let window_end = SOURCE[start..]
+                .find("for proximity sync (best-effort)")
+                .map(|off| start + off)
+                .expect("proximity-overlap emit block end marker not found");
+            let window = &SOURCE[start..window_end];
+
+            assert!(
+                window.contains("stale_peer_sync_event(key, state, source)"),
+                "the proximity-overlap emit site no longer routes through \
+                 `stale_peer_sync_event(key, state, source)` — its \
+                 targeted-vs-broadcast dispatch decision is no longer pinned \
+                 by the builder tests (#3791/#3796 B2 gap)"
+            );
+            assert!(
+                !window.contains("NodeEvent::SyncStateToPeer"),
+                "the proximity-overlap emit site constructs an inline \
+                 NodeEvent::SyncStateToPeer instead of using the guarded \
+                 builder — an inline construction is one edit away from an \
+                 unguarded BroadcastStateChange fan-out (#3796 B2 gap)"
+            );
+            assert!(
+                !window.contains("NodeEvent::BroadcastStateChange"),
+                "the proximity-overlap emit site now constructs a \
+                 NodeEvent::BroadcastStateChange — all-subscriber fan-out \
+                 instead of a targeted SyncStateToPeer (#3791/#3796)"
             );
         }
     }

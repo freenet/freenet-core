@@ -408,9 +408,64 @@ Pins (source-scrape, fail the build on regression):
   `recv_waiter_reply_*` (op_ctx.rs) and
   `orphaned_transaction_wakes_parked_waiter_with_peer_disconnected` (op_state_manager.rs)
 
+## Event emission review (targeted vs fan-out)
+
+**When reviewing (or writing) ANY code that emits a `NodeEvent`, you MUST
+explicitly verify two things and note them in the review:**
+
+```
+1. WHICH peers receive this event?
+   → Targeted   → SyncStateToPeer { target }  (exactly one peer)
+   → Fan-out    → BroadcastStateChange        (ALL subscribers of the key)
+   Name the actual recipient set out loud. "It syncs the peer" is not a
+   review — "it fans out to every subscriber of the contract" is.
+
+2. Does the code COMMENT match the actual dispatch path?
+   → A comment that describes the INTENDED effect ("sends state only to
+     peers with stale summaries") while the code takes the fan-out path is
+     a review failure, not a nit. Comments on event-emission sites MUST
+     name the concrete dispatch behavior (targeted address / all
+     subscribers), NOT the wished-for outcome.
+```
+
+**Why this is a mandatory checklist item.** #3791 was a six-week-old
+regression where the summary-mismatch handler emitted
+`BroadcastStateChange` (all-subscriber fan-out) instead of the intended
+targeted `SyncStateToPeer`. A misleading comment made the wrong event look
+correct on a quick read; it turned one mismatch into O(N × fan-out)
+transmissions and produced 19:1–163:1 upload/download ratios in
+production. The full targeted-vs-broadcast cost model is in
+`docs/architecture/event-dispatch.md`.
+
+**The trap that hid it, and how we guard against it now.** The original
+regression test only covered `InterestManager` stale-peer *data* logic —
+reverting the `node.rs` dispatch would have left that test green. A test
+for an event-emission fix MUST exercise the actual dispatch DECISION
+(which variant, which target), not just the data layer that feeds it.
+
+```
+WHEN adding or reviewing a test for an event-emission fix:
+  → Does the test assert on the emitted NodeEvent variant and its
+    recipient (target address vs all-subscriber fan-out)?
+    → NO: it does not guard the dispatch. A data-layer-only test would
+          stay green if someone reverted the emit site to a broadcast.
+  → Prefer a pure builder function for the emit decision (see
+    `node.rs::stale_peer_sync_event`) so the variant+target choice is
+    unit-testable without a full OpManager, PLUS a source-scrape pin that
+    the production loop still routes through it.
+```
+
+Pins (source-scrape / builder, fail the build on regression):
+- `stale_peer_sync_event_is_targeted_not_broadcast` (node.rs) — the heal
+  event is a targeted `SyncStateToPeer`, never a `BroadcastStateChange`.
+- `emit_site_uses_targeted_builder` (node.rs) — the `Summaries`-arm emit
+  site routes through `stale_peer_sync_event` and never names
+  `BroadcastStateChange`.
+
 ## Documentation
 
 - Architecture: `docs/architecture/operations/README.md`
+- Event dispatch (targeted vs fan-out): `docs/architecture/event-dispatch.md`
 - OpManager: `crates/core/src/node/op_state_manager.rs`
 - Round-trip primitive: `crates/core/src/operations/op_ctx.rs`
 - Orphan-wake signal: `crate::node::WaiterReply::PeerDisconnected` + `NodeEvent::TransactionOrphaned` (#4313)

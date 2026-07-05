@@ -466,3 +466,6 @@ sequenceDiagram
 - [Ring/DHT Architecture](../ring/README.md) - Routing decisions
 - [Transport Layer](../transport/README.md) - Network communication
 - [Testing](../testing/README.md) - DST with operation validation
+- [Event dispatch: targeted vs broadcast fan-out](../event-dispatch.md) -
+  `SyncStateToPeer` (one peer) vs `BroadcastStateChange` (all subscribers),
+  and why mixing them is a correctness + performance bug (#3791)
