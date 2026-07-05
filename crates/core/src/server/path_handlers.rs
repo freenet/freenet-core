@@ -1083,15 +1083,15 @@ const SHELL_USER_TOKEN_JS: &str = include_str!("path_handlers/assets/shell_user_
 const HOSTED_BAR_STYLES: &str = include_str!("path_handlers/assets/hosted_bar.css");
 
 /// Markup for the hosted-mode bar: the always-visible "not private" disclosure
-/// plus an Account popover with the access-key backup/restore and the
-/// export-to-your-own-peer action. The access key is the per-user token, read
-/// from the shell-only `__freenet_user_token` global — it never enters the
-/// sandboxed iframe. The Export action is a placeholder until the node-side
-/// export endpoint lands.
+/// plus an Account popover with the access-key backup/restore, a "New ID"
+/// control to start over with a fresh identity, and the export-to-your-own-peer
+/// action. The access key is the per-user token, read from the shell-only
+/// `__freenet_user_token` global — it never enters the sandboxed iframe.
 const HOSTED_BAR_HTML: &str = include_str!("path_handlers/assets/hosted_bar.html");
 
 /// Behavior for the hosted-mode bar (toggle popover, copy/restore the access
-/// key, export placeholder). Runs in the trusted shell context.
+/// key, mint a fresh identity via "New ID", export data). Runs in the trusted
+/// shell context.
 const HOSTED_BAR_JS: &str = include_str!("path_handlers/assets/hosted_bar.js");
 
 /// JavaScript for the shell page's postMessage bridge.
@@ -3484,6 +3484,58 @@ mod tests {
             "fail-closed recovery must not call window.open (a popup from this \
              sandboxed context inherits the sandbox and re-hits the dead end)"
         );
+    }
+
+    /// Regression test for #4645 (second half): the hosted Account popover must
+    /// offer a "New ID" control so a user can start over with a fresh identity
+    /// from the UI, instead of hand-deleting the token from browser devtools —
+    /// the exact friction the try.freenet.org feedback reported. Minting is
+    /// delegated to SHELL_USER_TOKEN_JS: clearing the stored key is enough
+    /// because the next load mints a new random token when the key is absent.
+    #[test]
+    fn hosted_bar_offers_new_id_control_4645() {
+        // The button exists in the Account popover.
+        assert!(
+            HOSTED_BAR_HTML.contains("id=\"fnnewid\""),
+            "hosted bar must expose a New ID control (#4645)"
+        );
+        // The handler is wired to that button.
+        let handler = HOSTED_BAR_JS
+            .find("getElementById('fnnewid')")
+            .expect("New ID button must have a click handler");
+        // It clears the SAME storage key SHELL_USER_TOKEN_JS mints under, so the
+        // reload re-mints a fresh token. Pin the exact key on BOTH sides: a
+        // rename on either would silently turn "New ID" into a no-op (clears a
+        // key nobody reads) or a broken reset (clears the wrong key).
+        assert!(
+            HOSTED_BAR_JS.contains("removeItem('__freenet_user_token__')"),
+            "New ID must clear the stored per-user token"
+        );
+        assert!(
+            SHELL_USER_TOKEN_JS.contains("__freenet_user_token__"),
+            "New ID clears the key SHELL_USER_TOKEN_JS mints under; keep in sync"
+        );
+        // Destructive action: confirm BEFORE clearing, so a cancelled prompt
+        // leaves the current identity intact.
+        let confirm = HOSTED_BAR_JS[handler..]
+            .find("window.confirm(")
+            .map(|o| o + handler)
+            .expect("New ID must confirm before discarding the current identity");
+        let clear = HOSTED_BAR_JS[handler..]
+            .find("removeItem('__freenet_user_token__')")
+            .map(|o| o + handler)
+            .expect("New ID must clear the token");
+        assert!(
+            confirm < clear,
+            "the confirm prompt must run before the token is cleared, so \
+             cancelling keeps the current identity"
+        );
+        // The reload (which re-mints) comes after clearing.
+        let reload = HOSTED_BAR_JS[clear..]
+            .find("location.reload()")
+            .map(|o| o + clear)
+            .expect("New ID must reload so a fresh token mints");
+        assert!(clear < reload, "must clear the token before reloading");
     }
 
     /// Non-hosted mode must NEVER reach the fail-closed path: the bridge is

@@ -60,6 +60,27 @@
       setOk('Storage unavailable');
     }
   });
+  document.getElementById('fnnewid').addEventListener('click', function () {
+    // Start over with a fresh identity. Deleting the stored token is enough:
+    // on reload SHELL_USER_TOKEN_JS mints a new random token because the key is
+    // absent. Destructive (the old data on this server is unreachable without
+    // the old key), so confirm first and point the user at "Copy key".
+    if (
+      !window.confirm(
+        'Start over with a new identity? Your current data on this server ' +
+          'stays under your old access key — copy that key first if you want ' +
+          'to get back to it. This browser will switch to a fresh, empty ID.',
+      )
+    ) {
+      return;
+    }
+    try {
+      localStorage.removeItem('__freenet_user_token__');
+      location.reload();
+    } catch (e) {
+      setOk('Storage unavailable');
+    }
+  });
   document.getElementById('fnexport').addEventListener('click', function () {
     var t =
       typeof __freenet_user_token !== 'undefined' ? __freenet_user_token : null;
