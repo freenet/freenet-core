@@ -1449,9 +1449,28 @@ where
     let mut ctx = op_manager.op_ctx(incoming_tx);
 
     if originator_loopback {
+        // Issue #3465 — a locally-applied PUT must not be reported to the
+        // client as a hard failure just because *propagation* toward the
+        // contract neighbourhood failed. At this point Step 1
+        // (`relay_put_store_locally`) has already succeeded on the
+        // originator's own node: the state IS applied locally (users proved
+        // this by re-PUTing at version+1 and getting "version must be higher
+        // than current version N"). The forward below is best-effort
+        // propagation. Pre-fix, a dispatch error here returned `Err`, which
+        // `run_relay_put`'s originator-loopback arm converted into a
+        // `PutMsg::Error` — surfacing "PUT operation timed out" / "peer
+        // connection dropped" to the client for an operation that in fact
+        // succeeded locally. Instead, on a forward-dispatch failure we
+        // finalize the PUT locally as a success (the originator is a valid
+        // storer for its own contract) via `relay_put_finalize_local`, which
+        // routes a `PutMsg::Response` back through the loopback bypass and
+        // classifies as `Stored`.
+        //
         // Fire-and-forget forward; do NOT install a waiter (would
         // overwrite the originator's pending_op_results callback).
-        // Response returns directly to the originator via the bypass.
+        // On a successful dispatch the downstream Response returns
+        // directly to the originator via the bypass.
+        let local_hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
         if upgrade_to_streaming {
             let stream_id = StreamId::next_operations();
             let metadata_msg = NetMessage::from(PutMsg::RequestStreaming {
@@ -1469,10 +1488,20 @@ where
                     contract = %key,
                     target = %next_addr,
                     error = %err,
-                    "PUT relay (loopback, loopback): \
-                     streaming-upgrade send_fire_and_forget failed"
+                    phase = "relay_put_loopback_forward_failed",
+                    "PUT relay (loopback): streaming-upgrade forward could not \
+                     be dispatched; finalizing PUT locally as success (#3465) — \
+                     state is stored on this node, propagation is best-effort"
                 );
-                return Err(err);
+                return relay_put_finalize_local(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    merged_value,
+                    upstream_addr,
+                    local_hop_count,
+                )
+                .await;
             }
             // Originator loopback: the retry-loop task (Task A) registered a
             // stream-progress handle keyed by `incoming_tx` before sending. We
@@ -1497,18 +1526,27 @@ where
                     target = %next_addr,
                     %stream_id,
                     error = %err,
-                    "PUT relay (loopback, loopback): send_stream failed"
+                    phase = "relay_put_loopback_forward_failed",
+                    "PUT relay (loopback): send_stream failed; finalizing PUT \
+                     locally as success (#3465) — state is stored on this node, \
+                     propagation is best-effort"
                 );
-                return Err(OpError::NotificationChannelError(format!(
-                    "send_stream failed: {err}"
-                )));
+                return relay_put_finalize_local(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    merged_value,
+                    upstream_addr,
+                    local_hop_count,
+                )
+                .await;
             }
         } else {
             let forward = NetMessage::from(PutMsg::Request {
                 id: incoming_tx,
                 contract,
                 related_contracts,
-                value: merged_value,
+                value: merged_value.clone(),
                 htl: new_htl,
                 skip_list: new_skip_list,
             });
@@ -1518,9 +1556,20 @@ where
                     contract = %key,
                     target = %next_addr,
                     error = %err,
-                    "PUT relay (loopback, loopback): send_fire_and_forget failed"
+                    phase = "relay_put_loopback_forward_failed",
+                    "PUT relay (loopback): forward could not be dispatched; \
+                     finalizing PUT locally as success (#3465) — state is \
+                     stored on this node, propagation is best-effort"
                 );
-                return Err(err);
+                return relay_put_finalize_local(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    merged_value,
+                    upstream_addr,
+                    local_hop_count,
+                )
+                .await;
             }
         }
         // Originator is awaiting the Response on its own callback —
@@ -5322,6 +5371,72 @@ mod tests {
             arm_body.contains("upstream_addr"),
             "the downstream-Error arm MUST target upstream_addr (the hop \
              we received the original Request from), not an arbitrary peer"
+        );
+    }
+
+    /// Regression pin for issue #3465: in `drive_relay_put`'s
+    /// originator-loopback arm, a *forward-dispatch* failure MUST finalize
+    /// the PUT locally as a **success** (`relay_put_finalize_local`, which
+    /// sends `PutMsg::Response`), NOT propagate the error.
+    ///
+    /// At the loopback forward, Step 1 (`relay_put_store_locally`) has
+    /// already stored the state on the originator's own node. The pre-fix
+    /// code did `return Err(err)` on a dispatch failure, and
+    /// `run_relay_put`'s loopback arm converted that into a `PutMsg::Error`
+    /// — so the client saw "PUT operation timed out" / "peer connection
+    /// dropped" for a PUT that was in fact applied locally (the reporter
+    /// proved local success by re-PUTing at version+1 and getting "version
+    /// must be higher than current version N"). This pin fails if any of
+    /// the three loopback dispatch-failure sites regresses to `return
+    /// Err(...)` instead of `relay_put_finalize_local`.
+    #[test]
+    fn drive_relay_put_loopback_forward_failure_finalizes_locally_not_error() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_put<CB>(")
+            .expect("drive_relay_put not found");
+        let driver_end = src[driver_start..]
+            .find("\nasync fn relay_put_finalize_local(")
+            .map(|p| driver_start + p)
+            .expect("end of drive_relay_put not found");
+        let driver_src = &src[driver_start..driver_end];
+
+        // Isolate the originator-loopback block: from `if originator_loopback {`
+        // to its terminal `return Ok(());` (the "originator is awaiting the
+        // Response on its own callback" comment marks the block end).
+        let loopback_start = driver_src
+            .find("if originator_loopback {")
+            .expect("originator_loopback block not found in drive_relay_put");
+        let loopback_end = driver_src[loopback_start..]
+            .find("// Originator is awaiting the Response on its own callback")
+            .map(|p| loopback_start + p)
+            .expect("end-of-loopback-block marker not found");
+        let loopback_block = &driver_src[loopback_start..loopback_end];
+
+        // Three dispatch sites (streaming metadata, send_stream, non-streaming
+        // Request) each guard a forward with `if let Err(err) = ...`. Every one
+        // of those failure arms must finalize locally as success.
+        let finalize_count = loopback_block.matches("relay_put_finalize_local(").count();
+        assert!(
+            finalize_count >= 3,
+            "issue #3465: all three originator-loopback forward-dispatch \
+             failure arms MUST call relay_put_finalize_local (success), so a \
+             locally-applied PUT is not reported as a hard failure; found only \
+             {finalize_count} call(s)"
+        );
+
+        // And none of them may return the forward error to the caller (which
+        // run_relay_put would turn into a client-visible PutMsg::Error).
+        assert!(
+            !loopback_block.contains("return Err(err)"),
+            "issue #3465: the originator-loopback forward-dispatch failure arms \
+             MUST NOT `return Err(err)` — the state is already stored locally, \
+             so propagate best-effort and finalize the PUT as a success"
+        );
+        assert!(
+            !loopback_block.contains("send_stream failed: {err}"),
+            "issue #3465: the send_stream failure arm MUST NOT bubble a \
+             NotificationChannelError — finalize locally as success instead"
         );
     }
 
