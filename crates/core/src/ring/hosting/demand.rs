@@ -27,9 +27,16 @@
 //!   recent demand geometry rather than its whole history.
 //! - `w(n)` — a blend weight that **decays in the retained sample count `n`**
 //!   ([`blend_weight`]): `1.0` at `n = 0` (pure analytic prior) and `-> 0` as
-//!   `n` grows (the learned fit takes over). So the prior dominates cold and
-//!   real observations dominate warm, with a smooth hand-off and no threshold
-//!   discontinuity.
+//!   `n` grows (the learned fit takes over), with a smooth hand-off and no
+//!   threshold discontinuity. Note the *value* hand-off is governed by the
+//!   magnitude ratio of the two terms, not `n` alone: `g0` is anchored at
+//!   `NEUTRAL_DEMAND = 1.0` while `fit` is in reads/sec, which for a low-traffic
+//!   peer is often `<< 1`. When the observed rate is that small, the prior's
+//!   distance slope can persist in the eviction *ordering* even at large `n`
+//!   (the neutral-scale prior term keeps dominating the tiny fit term). The
+//!   ordering DIRECTION stays sane throughout — both `g0` and `fit` are
+//!   non-increasing in distance, so their blend is too — and the per-contract
+//!   own-rate blend that fully retires the aggregate distance slope is A4.
 //!
 //! The blend is deliberately computed **outside** the PAVA fit — the prior is
 //! NOT seeded as synthetic points into the regression. Seeding would make the
@@ -168,8 +175,33 @@ impl ProximityPrior {
     /// `w(n) * g0(d) + (1 - w(n)) * fit(d)`. Cold (`n = 0`) this is the pure
     /// distance prior; warm it is the pure fit. When there is no usable fit yet
     /// (no retained points, or the regression cannot interpolate) it is the pure
-    /// prior. `NEUTRAL_DEMAND` is returned only for a non-finite `distance`.
-    /// Always finite and non-negative.
+    /// prior. `NEUTRAL_DEMAND` is returned only for a non-finite `distance` (the
+    /// guard that keeps a NaN out of the eviction sort). Always finite and
+    /// strictly positive: `g0 > 0` and `fit >= 0`, and `w(n) > 0`, so the blend
+    /// `w*g0 + (1-w)*fit >= w*g0 > 0`.
+    ///
+    /// # Accepted tradeoff (A3 intermediate)
+    ///
+    /// At cold start (and for a low-traffic peer whose observed rates stay
+    /// `<< NEUTRAL_DEMAND`; see the module docs) eviction ordering is effectively
+    /// **distance-only** — demand-blind, because the per-contract observed-read-
+    /// rate signal (A4) is deferred. Concretely: a FAR contract that is actually
+    /// GET-hot can be out-scored, and once past `min_ttl` evicted, in favor of an
+    /// unread NEAR contract that merely sits closer to this peer's key. This is
+    /// the spec-accepted intermediate state, not a bug:
+    ///
+    /// - It is **bounded by `min_ttl`** — the anti-thrash retention floor kept
+    ///   deliberately per the hosting design (`hosting-invariants.md`, invariant
+    ///   3 / #4441): nothing evicts a contract within `min_ttl` of its last read,
+    ///   so a genuinely hot far contract keeps being refreshed and survives.
+    /// - It is **fully resolved when A4 lands** (per-contract own-observed-rate
+    ///   blend) together with in-flight op-pinning, at which point real read
+    ///   demand overrides the distance prior for any contract with evidence.
+    ///
+    /// The design contract for this piece is exactly "distance prior + `min_ttl`
+    /// until A4" (`.claude/rules/hosting-invariants.md`, piece A / #4642). Do NOT
+    /// try to close the gap here by reaching for a per-contract counter — that is
+    /// A4's job and belongs with its telemetry and op-pinning.
     pub(crate) fn predict(&self, distance: f64) -> f64 {
         if !distance.is_finite() {
             return NEUTRAL_DEMAND;
@@ -441,6 +473,30 @@ mod tests {
             cold.is_finite() && cold > 0.0,
             "empty prior must return a finite positive estimate, got {cold}"
         );
+    }
+
+    /// A non-finite `distance` (NaN or ±∞) short-circuits to `NEUTRAL_DEMAND`
+    /// rather than propagating through `distance_prior`/the fit. This is the
+    /// guard that keeps a NaN out of `keep_score` — a NaN there would poison the
+    /// `total_cmp` eviction sort (every comparison against NaN is `Greater` under
+    /// `total_cmp`, silently corrupting the victim order). Holds cold (no
+    /// samples, pure prior) and the check lives in `predict` itself, so it holds
+    /// warm too.
+    #[test]
+    fn predict_guards_non_finite_distance() {
+        let cold = ProximityPrior::new();
+        assert_eq!(cold.predict(f64::NAN), NEUTRAL_DEMAND);
+        assert_eq!(cold.predict(f64::INFINITY), NEUTRAL_DEMAND);
+        assert_eq!(cold.predict(f64::NEG_INFINITY), NEUTRAL_DEMAND);
+
+        // Same guard once the estimator is warm (has a usable fit).
+        let mut warm = ProximityPrior::new();
+        for i in 0..20 {
+            warm.observe(0.01 * i as f64, 5.0);
+        }
+        assert_eq!(warm.predict(f64::NAN), NEUTRAL_DEMAND);
+        assert_eq!(warm.predict(f64::INFINITY), NEUTRAL_DEMAND);
+        assert_eq!(warm.predict(f64::NEG_INFINITY), NEUTRAL_DEMAND);
     }
 
     /// Predicted demand is always non-negative, even at distances beyond the

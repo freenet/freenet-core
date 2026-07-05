@@ -1498,15 +1498,20 @@ impl HostingManager {
     /// to model. The cache write lock is dropped before the estimator write lock
     /// (no nested lock order), matching `record_contract_access`.
     pub fn touch_hosting(&self, key: &ContractKey) {
-        let observed_read_rate = self.hosting_cache.write().touch(key);
-        if let Some(rate) = observed_read_rate {
-            let distance = {
-                let own = *self.own_location.read();
-                own.map(|loc| loc.distance(Location::from(key)).as_f64())
-            };
-            if let Some(d) = distance {
-                self.demand_estimator.write().observe(d, rate);
-            }
+        // Predict this contract's read-demand from its ring distance BEFORE
+        // touching, so a restart-loaded entry (seeded at neutral because our
+        // location was unknown at load) picks up the distance prior on this
+        // local-serve read — the same distance-prior path `record_contract_access`
+        // takes for network refetches. Read guards are dropped before the cache
+        // write lock (no nested lock order), matching `record_contract_access`.
+        let (distance, predicted_demand) = self.distance_and_demand(key);
+        let observed_read_rate = self
+            .hosting_cache
+            .write()
+            .touch_with_demand(key, predicted_demand);
+        // Cache lock dropped; train the prior from the observed local-serve rate.
+        if let (Some(d), Some(rate)) = (distance, observed_read_rate) {
+            self.demand_estimator.write().observe(d, rate);
         }
     }
 
@@ -1865,12 +1870,18 @@ impl HostingManager {
                 let age_ms = now_ms.saturating_sub(metadata.last_access_ms);
                 let age = std::time::Duration::from_millis(age_ms);
 
-                cache.load_persisted_entry(
+                // Seed the cold demand from the distance prior when our own
+                // location is already known at load; `distance_and_demand`
+                // returns NEUTRAL_DEMAND otherwise (the usual cold-restart case),
+                // and the first live read applies the prior lazily.
+                let predicted_demand = self.distance_and_demand(&key).1;
+                cache.load_persisted_entry_with_demand(
                     key,
                     metadata.size_bytes,
                     access_type,
                     age,
                     metadata.local_client_access,
+                    predicted_demand,
                 );
                 loaded += 1;
             }
@@ -1906,12 +1917,16 @@ impl HostingManager {
                 let size_bytes = storage.get_state_size(&key).unwrap_or(Some(0)).unwrap_or(0);
 
                 // Legacy contracts don't have local_client_access info
-                cache.load_persisted_entry(
+                // Distance prior when our location is known at load, else neutral
+                // (applied lazily on first read). See the metadata-load branch.
+                let predicted_demand = self.distance_and_demand(&key).1;
+                cache.load_persisted_entry_with_demand(
                     key,
                     size_bytes,
                     cache::AccessType::Get,
                     std::time::Duration::ZERO,
                     false,
+                    predicted_demand,
                 );
 
                 // Persist hosting metadata so future restarts don't need migration
@@ -2017,12 +2032,18 @@ impl HostingManager {
                 let age_ms = now_ms.saturating_sub(metadata.last_access_ms);
                 let age = std::time::Duration::from_millis(age_ms);
 
-                cache.load_persisted_entry(
+                // Seed the cold demand from the distance prior when our own
+                // location is already known at load; `distance_and_demand`
+                // returns NEUTRAL_DEMAND otherwise (the usual cold-restart case),
+                // and the first live read applies the prior lazily.
+                let predicted_demand = self.distance_and_demand(&key).1;
+                cache.load_persisted_entry_with_demand(
                     key,
                     metadata.size_bytes,
                     access_type,
                     age,
                     metadata.local_client_access,
+                    predicted_demand,
                 );
                 loaded += 1;
             }
@@ -2060,12 +2081,16 @@ impl HostingManager {
                     .unwrap_or(Some(0))
                     .unwrap_or(0);
 
-                cache.load_persisted_entry(
+                // Distance prior when our location is known at load, else neutral
+                // (applied lazily on first read). See the metadata-load branch.
+                let predicted_demand = self.distance_and_demand(&key).1;
+                cache.load_persisted_entry_with_demand(
                     key,
                     size_bytes,
                     cache::AccessType::Get,
                     std::time::Duration::ZERO,
                     false,
+                    predicted_demand,
                 );
 
                 // Persist hosting metadata so future restarts don't need migration
