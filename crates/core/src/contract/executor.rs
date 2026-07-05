@@ -363,17 +363,32 @@ impl ExecutorError {
     /// originator UPDATE call sites so a malformed delta or a disk
     /// error never triggers auto-fetch storms.
     ///
-    /// Discriminator: stdlib's `ContractError::Update` with a cause
-    /// containing the literal "missing contract parameters" string
-    /// (produced by `runtime.rs`'s `get_params` failure path,
-    /// approx. lines 920–953). Any other `Update` variant cause
-    /// returns false.
+    /// Discriminator: stdlib's `ContractError::Update` OR `ContractError::Put`
+    /// with a cause containing the literal "missing contract parameters"
+    /// string. BOTH variants must be matched (issue #3279):
+    ///
+    /// - The delta / update-only path
+    ///   (`executor/runtime/contract_ops.rs`) raises the `Update` variant.
+    /// - The full-state upsert path
+    ///   (`executor/runtime/executor_impl.rs::upsert_contract_state`) raises
+    ///   the `Put` variant when `state_store.get_params` returns `None`.
+    ///
+    /// A cross-node **full-state (non-delta)** UPDATE takes the upsert path,
+    /// so it surfaces as `Put`. Matching only `Update` (the pre-#3279
+    /// behavior) silently misclassified that case: the auto-fetch recovery
+    /// gated on this predicate (the originator self-heal and the no-remote
+    /// hosting-divergence branch in `update/op_ctx_task.rs`) never fired, so
+    /// a subscriber that received a full-state broadcast without local params
+    /// stayed permanently stuck on "missing contract parameters" — exactly
+    /// the #3279 regression. Any other cause string on either variant returns
+    /// false.
     pub fn is_missing_contract_parameters(&self) -> bool {
         match &self.inner {
             Either::Left(req_err) => matches!(
                 req_err.as_ref(),
-                RequestError::ContractError(StdContractError::Update { cause, .. })
-                    if cause.contains("missing contract parameters")
+                RequestError::ContractError(
+                    StdContractError::Update { cause, .. } | StdContractError::Put { cause, .. },
+                ) if cause.contains("missing contract parameters")
             ),
             Either::Right(_) => false,
         }
@@ -1404,6 +1419,64 @@ mod tests {
             assert!(
                 !err.is_contract_queue_full(),
                 "Missing contract parameters is not queue-full"
+            );
+        }
+
+        // ── is_missing_contract_parameters over BOTH variants (issue #3279) ──
+        //
+        // The predicate MUST match "missing contract parameters" whether it
+        // arrives as a `ContractError::Update` (delta / update-only path) or a
+        // `ContractError::Put` (full-state upsert path in executor_impl.rs). A
+        // cross-node non-delta UPDATE surfaces as `Put`; matching only `Update`
+        // silently suppressed the auto-fetch recovery for that case — the exact
+        // #3279 regression.
+
+        #[test]
+        fn test_missing_contract_parameters_true_for_update_variant() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::Update {
+                key,
+                cause: "missing contract parameters".into(),
+            });
+            assert!(
+                err.is_missing_contract_parameters(),
+                "Update-variant missing-params MUST be recognized"
+            );
+        }
+
+        #[test]
+        fn test_missing_contract_parameters_true_for_put_variant() {
+            // Regression guard for issue #3279: the full-state upsert path
+            // (executor_impl.rs) raises the `Put` variant. Before the fix the
+            // predicate only matched `Update`, so this returned false and the
+            // full-state cross-node UPDATE stayed permanently stuck.
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::Put {
+                key,
+                cause: "missing contract parameters".into(),
+            });
+            assert!(
+                err.is_missing_contract_parameters(),
+                "Put-variant missing-params MUST be recognized (issue #3279); \
+                 the full-state cross-node UPDATE path raises this variant and \
+                 the auto-fetch recovery gates on this predicate"
+            );
+        }
+
+        #[test]
+        fn test_missing_contract_parameters_false_for_other_put_cause() {
+            // A Put failure with a DIFFERENT cause must NOT trip the predicate:
+            // broadening to the Put variant must stay scoped to the exact
+            // missing-params cause, or unrelated PUT failures would spuriously
+            // trigger auto-fetch storms.
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::Put {
+                key,
+                cause: "state size 999 bytes exceeds maximum allowed".into(),
+            });
+            assert!(
+                !err.is_missing_contract_parameters(),
+                "Only the missing-params cause may match, not every Put error"
             );
         }
 

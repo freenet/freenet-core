@@ -196,3 +196,105 @@ fn test_is_invalid_update_rejection_matches_website_contract_format() {
         "predicate must match website-contract's same-version error format"
     );
 }
+
+// =========================================================================
+// Test: cross-node non-delta update with missing params is classified as
+//       is_missing_contract_parameters (issue #3279)
+// =========================================================================
+
+/// Regression test for issue #3279 (Part 2).
+///
+/// Reproduces the "missing contract parameters" failure that a node hits
+/// when it applies a cross-node full-state (non-delta) UPDATE for a contract
+/// whose parameters are absent from its `state_store`. This is the exact
+/// on-disk shape the issue describes: the node has the contract *state* (and,
+/// in production, the contract *code*) but never persisted the *params* —
+/// e.g. because an earlier code-less GET response could not cache them, or
+/// because of the documented `StateStore::store` partial-failure window where
+/// the state write succeeds but the params write fails, orphaning state
+/// without params.
+///
+/// The upsert MUST fail with an error that satisfies
+/// `is_missing_contract_parameters()`. That predicate is the load-bearing
+/// discriminator the whole recovery chain depends on:
+///   - the inbound broadcast/relay path
+///     (`update/op_ctx_task.rs::drive_relay_broadcast_to`) triggers
+///     `try_auto_fetch_contract` only when the full-state merge failed
+///     because code/params are missing (NOT on a contract-side WASM
+///     rejection);
+///   - the originator UPDATE self-heal
+///     (`update/op_ctx_task.rs`) auto-fetches on exactly this predicate.
+///
+/// If this classification silently broke (e.g. the cause string drifted, or
+/// the error were mapped to a different `ContractError` variant), every
+/// missing-params recovery path would misclassify and issue #3279 would
+/// regress into a hard, unrecoverable "missing contract parameters" on every
+/// cross-node update — with no auto-fetch to heal it.
+#[tokio::test(flavor = "current_thread")]
+async fn test_missing_params_non_delta_update_is_classified_as_missing_parameters() {
+    let storage = MockStateStorage::new();
+    let mut executor = Executor::new_mock_wasm("missing_params_test", storage.clone(), None, None)
+        .await
+        .expect("create MockWasmRuntime executor");
+
+    let contract = make_contract(b"missing_params_3279");
+    let key = contract.key();
+    let initial_state = WrappedState::new(vec![1, 2, 3, 4]);
+
+    // A clean initial PUT: contract code lands in the runtime store, state and
+    // params land on disk.
+    executor
+        .upsert_contract_state(
+            key,
+            Either::Left(initial_state.clone()),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("initial PUT should succeed");
+
+    // Now model the cross-node inconsistency issue #3279 reports: the node
+    // still has the contract state (and code) but has LOST its params (an
+    // earlier code-less GET could not cache them, or the documented
+    // `StateStore::store` partial-failure window orphaned state-without-params).
+    storage.remove_params_for_test(&key);
+    assert!(
+        storage.get_stored_state(&key).is_some(),
+        "state must remain on disk after dropping params"
+    );
+    assert!(
+        storage.get_stored_params(&key).is_none(),
+        "params must be absent — this is the #3279 orphaned-state shape"
+    );
+
+    // Now apply a cross-node full-state (non-delta) UPDATE with code == None
+    // (the wire delivery of a broadcast UPDATE carries no contract code). The
+    // executor must take the `else` branch that reads params from the
+    // state_store, find them missing, and return the typed error.
+    let incoming_state = WrappedState::new(vec![5, 6, 7, 8]);
+    let err = executor
+        .upsert_contract_state(
+            key,
+            Either::Left(incoming_state),
+            RelatedContracts::default(),
+            None,
+        )
+        .await
+        .expect_err("non-delta update with missing params must fail");
+
+    assert!(
+        err.is_missing_contract_parameters(),
+        "missing-params full-state update MUST satisfy \
+         is_missing_contract_parameters() — the recovery-chain discriminator \
+         for issue #3279; got: {err:?}"
+    );
+
+    // It must NOT be misclassified as a contract-side WASM rejection: that
+    // would suppress auto-fetch (the merge is assumed to have run against
+    // present code/params), permanently wedging the cross-node update.
+    assert!(
+        !err.is_contract_exec_rejection(),
+        "missing-params error must NOT be classified as a contract exec \
+         rejection, or auto-fetch recovery would be suppressed"
+    );
+}
