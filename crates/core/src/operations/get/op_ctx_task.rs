@@ -337,8 +337,7 @@ async fn drive_client_get_inner(
     // returns (and the side-effect block below has run). Do not add
     // explicit `completed()` calls in the arms here — doing so would
     // race the originator-side side effects (`cache_contract_locally`,
-    // `auto_subscribe_on_get_response`, `maybe_subscribe_child`)
-    // because once the tx is in `ops.completed`, any
+    // `maybe_subscribe_child`) because once the tx is in `ops.completed`, any
     // `op_manager.push(...)` for that tx is silently dropped (see
     // `op_state_manager.rs::push` short-circuit on
     // `ops.completed.contains`).
@@ -447,35 +446,18 @@ async fn drive_client_get_inner(
             )
             .await;
 
-            // Auto-subscribe on successful GET at the originator —
-            // mirrors the legacy branches at get.rs:2313/2408/3136/3185.
-            // AUTO_SUBSCRIBE_ON_GET (ring.rs:60) is a const; we still
-            // guard on `is_subscribed` to avoid duplicate registration
-            // if the request-router already wired up a subscribe.
-            //
-            // When the client explicitly set `subscribe=true`, the
-            // dedicated `maybe_subscribe_child` path below runs — skip
-            // auto-subscribe here so we never double-subscribe.
-            if host_result.is_ok()
-                && !subscribe
-                && crate::ring::AUTO_SUBSCRIBE_ON_GET
-                && !op_manager.ring.is_subscribed(&reply_key)
-            {
-                let path_label = match &terminal {
-                    Terminal::Streaming { .. } => "streaming",
-                    Terminal::InlineFound { .. } | Terminal::LocalCompletion => "non-streaming",
-                };
-                crate::operations::auto_subscribe_on_get_response(
-                    op_manager,
-                    &reply_key,
-                    &client_tx,
-                    &Some(driver.current_target.clone()),
-                    /* subscribe_requested */ false,
-                    /* blocking_sub */ blocking_subscribe,
-                    path_label,
-                )
-                .await;
-            }
+            // GET-auto-subscribe REMOVED (piece E, demand-driven hosting).
+            // A successful GET with subscribe=false previously installed a
+            // durable subscription here (AUTO_SUBSCRIBE_ON_GET). That is the
+            // "GET-auto-subscribe" anti-pattern: it manufactures ongoing demand
+            // no client requested and pins an advertised, self-renewing copy
+            // regardless of real interest. Under the demand-driven model the GET
+            // still hosts on the return path via `cache_contract_locally` above
+            // (bounded + evicted by piece A's demand gauge — the whole
+            // distinction from relay-caching), and a client that wants ongoing
+            // freshness sets `subscribe=true`, handled by `maybe_subscribe_child`
+            // below. do NOT re-add auto-subscribe here — see hosting-invariants
+            // (invariants 1 & 2, anti-patterns table).
 
             // Emit routing event + telemetry — `report_result` (which
             // normally does both) doesn't run because the bypass
@@ -558,8 +540,10 @@ async fn drive_client_get_inner(
             // `maybe_subscribe_child` — subscribe is never handled in
             // the terminal-result construction to avoid double-subscribe
             // (commit 494a3c69). This only runs when the client set
-            // `subscribe=true`; the auto-subscribe path above handles
-            // the AUTO_SUBSCRIBE_ON_GET fallback.
+            // `subscribe=true`; it is now the ONLY subscribe path on GET
+            // (piece E removed the AUTO_SUBSCRIBE_ON_GET fallback above —
+            // a subscribe=false GET hosts under the demand gauge but does
+            // not subscribe).
             maybe_subscribe_child(
                 op_manager,
                 client_tx,
@@ -4100,23 +4084,42 @@ mod tests {
         );
     }
 
-    /// Bug #2 reproduction (source-level): the legacy branch calls
-    /// `auto_subscribe_on_get_response` for any client-initiated GET
-    /// when `AUTO_SUBSCRIBE_ON_GET` is true (see `get.rs:2313, 2408`).
-    /// The driver currently never calls it; `maybe_subscribe_child`
-    /// only handles the explicit `subscribe=true` flag. This test
-    /// pairs with `test_driver_inline_get_triggers_auto_subscribe`
-    /// (integration) to lock down both the absence and the symptom.
+    /// Piece E (demand-driven hosting): GET-auto-subscribe was REMOVED.
+    /// A successful GET with `subscribe=false` must NOT install a durable
+    /// subscription — that is the "GET-auto-subscribe" anti-pattern
+    /// (hosting-invariants, invariants 1 & 2). The driver must therefore
+    /// never call `auto_subscribe_on_get_response`; the only subscribe path
+    /// left is the explicit-`subscribe=true` `maybe_subscribe_child`. This
+    /// pairs with `test_driver_inline_get_does_not_auto_subscribe`
+    /// (integration), which asserts the requesting node does NOT subscribe.
     #[test]
-    fn driver_calls_auto_subscribe_on_get_response() {
+    fn driver_does_not_auto_subscribe_on_get_response() {
         let src = production_source();
         assert!(
-            src.contains("auto_subscribe_on_get_response"),
-            "The driver must invoke `auto_subscribe_on_get_response` on \
-             successful GET terminal paths (AUTO_SUBSCRIBE_ON_GET = true in \
-             ring.rs:60). The legacy branch does this at get.rs:2313/2408/3136/3185; \
-             the driver must mirror it so client GETs with subscribe=false \
-             still register the fallback subscription."
+            !src.contains("auto_subscribe_on_get_response"),
+            "GET must NOT auto-subscribe (piece E removed AUTO_SUBSCRIBE_ON_GET). \
+             A GET with subscribe=false hosts on the return path only under the \
+             demand gauge (cache_contract_locally); ongoing freshness requires an \
+             explicit subscribe=true. do NOT re-add auto_subscribe_on_get_response \
+             — see hosting-invariants."
+        );
+        // Belt-and-braces: catch a re-subscribe reintroduced via a DIFFERENT
+        // mechanism than the removed helper. The GET driver installs durable
+        // subscriptions ONLY through `maybe_subscribe_child` (a subscribe sub-op
+        // spawned on the explicit subscribe=true path); it must never call
+        // `ring.subscribe(` directly, which would re-open the GET-auto-subscribe
+        // anti-pattern regardless of the helper name.
+        assert!(
+            !src.contains("ring.subscribe("),
+            "GET driver must NOT call ring.subscribe( directly — the only durable \
+             subscribe path is maybe_subscribe_child (explicit subscribe=true). A \
+             direct ring.subscribe( in this driver re-introduces GET-auto-subscribe \
+             under a new name — see hosting-invariants (invariants 1 & 2)."
+        );
+        // The explicit subscribe path must still be wired in.
+        assert!(
+            src.contains("maybe_subscribe_child"),
+            "the explicit subscribe=true path (maybe_subscribe_child) must remain"
         );
     }
 
@@ -5866,6 +5869,9 @@ mod tests {
             .split("\n}\n\n/// Cause")
             .next()
             .expect("end of drive_sub_op_get body");
+        // Future-proofing: `auto_subscribe_on_get_response` no longer exists
+        // (piece E removed GET-auto-subscribe); this stays as an absence-pin so
+        // a re-added helper of that name would trip here too.
         assert!(
             !body.contains("auto_subscribe_on_get_response"),
             "drive_sub_op_get must NOT call auto_subscribe_on_get_response — \

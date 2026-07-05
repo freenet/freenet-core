@@ -814,16 +814,20 @@ fn test_streaming_get_1mb_with_packet_loss() {
     );
 }
 
-/// Regression test for #3704: streaming GET path must trigger auto-subscribe
-/// and hosting announcement so that subsequent GETs are served from local cache.
+/// Regression test for #3704: streaming GET path must HOST the fetched
+/// contract on the return path (call `announce_contract_hosted()`, not just
+/// `record_get_access()`) so subsequent GETs can be served from local cache.
 ///
-/// Before the fix, the streaming GET completion path only called `record_get_access()`
-/// but skipped `announce_contract_hosted()` and `start_subscription_request()`, so
-/// `is_receiving_updates()` returned false and every subsequent GET hit the network.
+/// NOTE: piece E of the demand-driven hosting redesign REMOVED GET-auto-subscribe.
+/// The GETting node hosts under piece A's demand gauge (evictable, non-durable),
+/// but it does NOT auto-install a durable subscription. This test therefore
+/// asserts only the hosting side effect (`is_hosting`), not subscription — a GET
+/// with subscribe=false must not subscribe (see hosting-invariants, invariants
+/// 1 & 2, and `test_driver_inline_get_does_not_auto_subscribe`).
 #[test]
-fn test_streaming_get_triggers_auto_subscribe() {
+fn test_streaming_get_hosts_on_return_path() {
     const SEED: u64 = 0xDE1A_0009_CAFE_F00D;
-    const NETWORK_NAME: &str = "streaming-get-auto-subscribe";
+    const NETWORK_NAME: &str = "streaming-get-hosts-return-path";
     const THRESHOLD: usize = 1024;
     const LARGE_STATE_SIZE: usize = 100 * 1024; // 100KB, above streaming threshold
 
@@ -850,7 +854,8 @@ fn test_streaming_get_triggers_auto_subscribe() {
             },
         ),
         // Node 2 GETs the contract (will be streamed since >1KB threshold).
-        // subscribe=false here — we're relying on AUTO_SUBSCRIBE_ON_GET to kick in.
+        // subscribe=false: the node hosts the fetched state on the return path
+        // (under the demand gauge) but must NOT auto-subscribe (piece E).
         ScheduledOperation::new(
             NodeLabel::node(NETWORK_NAME, 2),
             SimOperation::Get {
@@ -912,6 +917,17 @@ fn test_streaming_get_triggers_auto_subscribe() {
             ))
             .collect::<Vec<_>>()
     );
+
+    // NOTE on subscription: this test asserts ONLY host-on-GET (`is_hosting`),
+    // not the absence of a subscription. In this topology the gateway's
+    // `subscribe=true` PUT propagates the contract to its neighbors and builds a
+    // subscription tree, so the GETting node ends up subscribed via that path
+    // regardless of GET-auto-subscribe. The piece-E guarantee — that the GET
+    // *driver* itself no longer auto-subscribes on a `subscribe=false` GET — is
+    // pinned at the source level by `driver_does_not_auto_subscribe_on_get_response`
+    // (runs) and behaviorally isolated (HTL=1, no PUT propagation) by
+    // `test_driver_inline_get_does_not_auto_subscribe` (currently `#[ignore]`'d
+    // for the pre-existing #3883 topology-routing gap).
 }
 
 // =============================================================================
@@ -1136,25 +1152,28 @@ fn test_driver_streaming_get_cold_cache() {
     );
 }
 
-/// Cold-cache non-streaming GET must auto-subscribe at originator.
+/// Cold-cache non-streaming GET must NOT auto-subscribe at the originator
+/// (piece E, demand-driven hosting).
 ///
-/// Scope: bug #2 from the #3884 skeptical review — the driver never calls
-/// `auto_subscribe_on_get_response`, so a client GET with `subscribe=false`
-/// against a cold cache silently skips the AUTO_SUBSCRIBE_ON_GET fallback
-/// that the legacy `process_message` branch would have invoked.
+/// Scope: piece E removed GET-auto-subscribe. A client GET with
+/// `subscribe=false` against a cold cache HOSTS the fetched state on the
+/// return path (under piece A's demand gauge — the node stores the state) but
+/// must NOT install a durable subscription. Auto-subscribing on GET is the
+/// anti-pattern (hosting-invariants, invariants 1 & 2). A client that wants
+/// ongoing freshness sets `subscribe=true` explicitly.
 ///
 /// ## Driver isolation strategy
 ///
 /// Same HTL=1 approach as `test_driver_streaming_get_cold_cache`.
 /// Phase 1 discovers a cold node; phase 2 GETs from it with a small
 /// (inline, not streamed) payload; asserts that the driver fired
-/// (via `GET_DRIVER_CALL_COUNT`) AND that the cold node ended up
-/// with an active subscription (AUTO_SUBSCRIBE_ON_GET fallback).
+/// (via `GET_DRIVER_CALL_COUNT`), that the cold node STORED the state
+/// (host-on-GET), and that NO node ended up with an active subscription.
 ///
 /// Same infrastructure gap as above — currently `#[ignore]`'d.
 #[ignore = "Infrastructure gap — HTL=1 topology isn't routable; see docstring and #3883"]
 #[test]
-fn test_driver_inline_get_triggers_auto_subscribe() {
+fn test_driver_inline_get_does_not_auto_subscribe() {
     use freenet::dev_tool::GET_DRIVER_CALL_COUNT;
     use std::sync::atomic::Ordering;
 
@@ -1275,21 +1294,26 @@ fn test_driver_inline_get_triggers_auto_subscribe() {
         "Cold-cache node should have stored the contract state after the GET"
     );
 
-    // Bug #2 regression: after the driver-routed GET with
-    // subscribe=false, the cold node should have auto-subscribed.
-    // AUTO_SUBSCRIBE_ON_GET = true in ring.rs:60.
-    let auto_subscribed = phase2
+    // Piece E (demand-driven hosting): GET-auto-subscribe was REMOVED. A
+    // driver-routed GET with subscribe=false must NOT install a durable
+    // subscription anywhere — the node still HOSTS the fetched state on the
+    // return path (asserted above: it stored the state, under piece A's demand
+    // gauge), but no client requested ongoing freshness, so no subscription is
+    // created. This inverts the former "Bug #2" assertion: auto-subscribe on
+    // GET is the anti-pattern (hosting-invariants, invariants 1 & 2). Neither
+    // the PUTting gateway nor the cold getter set subscribe=true, so NO node
+    // should carry an active subscription for this contract.
+    let any_subscribed = phase2
         .topology_snapshots
         .iter()
         .any(|s| s.active_subscription_keys.contains(&contract_id));
 
     assert!(
-        auto_subscribed,
-        "Bug #2 regression: cold-cache GET through the driver did not \
-         auto-subscribe the requesting node {cold_node_label:?}. The \
-         driver's Done arm must invoke `auto_subscribe_on_get_response` \
-         for successful GETs when the client did not explicitly set \
-         `subscribe=true`. Active subscriptions: {:#?}",
+        !any_subscribed,
+        "GET-auto-subscribe regression: a GET with subscribe=false installed a \
+         durable subscription. Piece E removed AUTO_SUBSCRIBE_ON_GET — a GET \
+         hosts under the demand gauge but must NOT auto-subscribe. Active \
+         subscriptions: {:#?}",
         phase2
             .topology_snapshots
             .iter()

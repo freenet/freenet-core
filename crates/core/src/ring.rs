@@ -111,10 +111,15 @@ mod placement_migration_metrics;
 pub mod topology_registry;
 pub(crate) mod update_rate_limit;
 
-/// Whether to auto-subscribe to contracts on GET.
-/// When true, GET operations will automatically subscribe to the contract
-/// to receive updates. This is controlled by hosting cache eviction.
-pub const AUTO_SUBSCRIBE_ON_GET: bool = true;
+// GET auto-subscribe (`AUTO_SUBSCRIBE_ON_GET`) was REMOVED in piece E of the
+// demand-driven hosting redesign (docs/design/demand-driven-hosting.md §9,
+// .claude/rules/hosting-invariants.md anti-patterns table). Auto-installing a
+// durable subscription on every GET manufactures demand that no client asked
+// for — the "GET-auto-subscribe" half of the relay-caching anti-pattern. A GET
+// may still host on the return path under the demand gauge (evictable,
+// non-durable; see `cache_contract_locally`), and a client that wants ongoing
+// freshness sets `subscribe=true` explicitly. do NOT re-add auto-subscribe on
+// GET — see hosting-invariants (invariants 1 & 2).
 
 /// Per-beneficiary weight for a local-client subscription when
 /// computing the LIVE benefit snapshot each governance reaper tick.

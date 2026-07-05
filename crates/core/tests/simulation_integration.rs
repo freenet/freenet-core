@@ -3617,9 +3617,11 @@ fn run_fanout_liveness_scenario_inner(
         // or GET the contract before subscribing (so it can validate/apply
         // incoming updates). `GET+subscribe=true` is the documented exempt path:
         // the GET inherently fetches the WASM+state from the host over the
-        // preseeded connection, and the same op then auto-subscribes
-        // (`auto_subscribe_on_get_response`), registering downstream interest at
-        // the host and joining the broadcast set. The topology preseed only
+        // preseeded connection, and the explicit `subscribe=true` flag then
+        // subscribes (`maybe_subscribe_child` -> `run_client_subscribe`),
+        // registering downstream interest at the host and joining the broadcast
+        // set. (Piece E removed the implicit AUTO_SUBSCRIBE_ON_GET fallback; this
+        // path is unaffected because it always set subscribe=true.) The topology preseed only
         // injects ring connections, not contract state, so without the GET each
         // subscriber's bare subscribe is rejected at t=0 and only the subset
         // that happened to receive the contract first (via an early broadcast /
