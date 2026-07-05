@@ -240,6 +240,16 @@ pub(crate) struct RouterSnapshotInfo {
     pub terminal_consult_hits: Option<u64>,
     pub terminal_consult_resolved_found: Option<u64>,
     pub terminal_consult_still_not_found: Option<u64>,
+    /// Computed-upstream vs. stored-`is_upstream`-flag divergence counters
+    /// (hosting redesign piece D, #4642 / #4671). `comparisons` is the
+    /// denominator (one per `send_unsubscribe_upstream`), `divergences` the times
+    /// the demand-driven-hosting computed upstream
+    /// (`Ring::most_keyward_hosting_neighbor`) disagreed with the stored flag the
+    /// site still consults. Behavior-preserving field evidence for the stored
+    /// flag's drift ahead of the reconcile-core keystone deleting it; monotonic
+    /// lifetime totals, `None` until the ring's snapshot task populates them.
+    pub upstream_computed_vs_stored_comparisons: Option<u64>,
+    pub upstream_computed_vs_stored_divergences: Option<u64>,
     /// Interest-weighted (two-tier) module-cache SHADOW gauges (#4441/#4534),
     /// populated by `Ring` from the same per-node `ModuleCacheMetrics` `Arc`.
     /// These are ALWAYS ON, independent of the `FREENET_MODULE_CACHE_INTEREST_TIERED`
@@ -1152,6 +1162,11 @@ impl Router {
             terminal_consult_hits: None,
             terminal_consult_resolved_found: None,
             terminal_consult_still_not_found: None,
+            // Computed-upstream vs. stored-flag divergence counters (piece D,
+            // #4642 / #4671), populated by Ring from the network_status
+            // singleton on the snapshot cadence.
+            upstream_computed_vs_stored_comparisons: None,
+            upstream_computed_vs_stored_divergences: None,
             // Interest-weighted (two-tier) module-cache shadow gauges,
             // populated by Ring on the snapshot cadence (#4441/#4534).
             contract_module_cache_cold_evictable_bytes: None,

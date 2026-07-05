@@ -356,6 +356,43 @@ fn no_closer_routable_neighbor(
     true
 }
 
+/// Pure core of [`Ring::most_keyward_hosting_neighbor`]: from candidate hosting
+/// neighbors already paired with their ring distance to the contract, pick the
+/// one STRICTLY closer to the contract than `my_distance` (the most-keyward
+/// host), breaking ties on equal distance by ascending socket address so the
+/// choice is deterministic (design §6 point 2 total order). The
+/// `most_keyward_hosting_neighbor` caller pre-filters candidates through
+/// `pkl.location()?`, which requires a resolvable socket address, so no
+/// addressless candidate ever reaches this helper and every item here carries a
+/// concrete distance and a concrete address for the tiebreak.
+///
+/// Returns `None` when no candidate is strictly closer than us — either the
+/// candidate set is empty or every candidate is farther-or-equal (so we are the
+/// terminus / a stranded host; the caller distinguishes those). The strict `<`
+/// is the acyclicity guarantee: a peer at exactly our distance never becomes our
+/// upstream. Factored out so the strict-closer + deterministic-tiebreak
+/// selection has direct unit coverage without a heavyweight async `Ring`
+/// fixture, mirroring [`no_closer_routable_neighbor`].
+///
+/// This is the computed-upstream primitive of the demand-driven-hosting redesign
+/// (#4642 piece D): the eventual replacement for the stored `is_upstream`
+/// interest flag, which drifts under gossip (#4671). It is introduced here
+/// behavior-preservingly — computed alongside the stored flag for divergence
+/// telemetry — ahead of the reconcile-core keystone that computes upstream
+/// everywhere.
+fn most_keyward_among(
+    my_distance: Distance,
+    candidates: impl Iterator<Item = (PeerKeyLocation, Distance)>,
+) -> Option<PeerKeyLocation> {
+    candidates
+        .filter(|(_, dist)| *dist < my_distance)
+        .min_by(|(a, ad), (b, bd)| {
+            ad.cmp(bd)
+                .then_with(|| a.socket_addr().cmp(&b.socket_addr()))
+        })
+        .map(|(pkl, _)| pkl)
+}
+
 /// Race an `.await` point in a background loop against the Ring shutdown
 /// token. Returns `true` if shutdown fired (the caller should stop its loop)
 /// and `false` if the wrapped future completed first (carry on).
@@ -847,6 +884,52 @@ impl Ring {
         });
 
         no_closer_routable_neighbor(my_distance, contract_location, neighbors)
+    }
+
+    /// Compute the CURRENT upstream for a contract this peer hosts: among
+    /// `hosting_neighbors` (connected neighbors that have advertised hosting the
+    /// contract, from `NeighborHostingManager::neighbors_with_contract_id`), the
+    /// one CLOSEST to the contract's key that is STRICTLY closer to the key than
+    /// this peer. Returns `None` when no such neighbor exists — either because
+    /// this peer is the most-keyward host it can see (a terminus, design §5d-a)
+    /// or because closer neighbors exist but none host the contract (a stranded
+    /// host that must re-root, §5d-b); the caller distinguishes those via
+    /// `is_subscription_root`.
+    ///
+    /// This is the *computed upstream* of the demand-driven-hosting design (§4,
+    /// #4642 piece D): derived on demand from live neighbor-hosting
+    /// advertisements + ring distance, never a stored formation flag. "Strictly
+    /// closer to the key" makes the upstream relation a strict descent toward the
+    /// key, so it is **acyclic by construction** (§4 point 2); the deterministic
+    /// peer-address tiebreak makes equidistant hosts a total order (§6 point 2).
+    ///
+    /// It is introduced here alongside — not in place of — the stored
+    /// `is_upstream` interest flag: the reconcile-core keystone will compute
+    /// upstream everywhere and delete the stored flag, but this first step only
+    /// computes it in parallel to measure how often the two disagree (the
+    /// `hosting_upstream_computed_vs_stored_divergence` telemetry recorded at
+    /// `OpManager::send_unsubscribe_upstream`), producing field evidence for the
+    /// flag's drift (#4671). No decision consults this method yet.
+    pub(crate) fn most_keyward_hosting_neighbor(
+        &self,
+        instance_id: &ContractInstanceId,
+        hosting_neighbors: &[TransportPublicKey],
+    ) -> Option<PeerKeyLocation> {
+        let contract_location = Location::from(instance_id);
+        let my_location = self.connection_manager.own_location().location()?;
+        let my_distance = my_location.distance(contract_location);
+
+        // Resolve each advertised pub key to a live connection with a known
+        // location, then delegate the strict-closer + deterministic-tiebreak
+        // selection to `most_keyward_among` (unit-tested in `most_keyward_tests`).
+        let candidates = hosting_neighbors
+            .iter()
+            .filter_map(|pk| self.connection_manager.get_peer_by_pub_key(pk))
+            .filter_map(|pkl| {
+                let dist = pkl.location()?.distance(contract_location);
+                Some((pkl, dist))
+            });
+        most_keyward_among(my_distance, candidates)
     }
 
     /// Check if a contract-directed CONNECT is currently in backoff.
@@ -1507,6 +1590,20 @@ impl Ring {
                 snapshot.terminal_consult_still_not_found = Some(still_not_found);
             }
 
+            // Computed-upstream vs. stored-`is_upstream`-flag divergence counters
+            // (#4642 piece D / #4671). Recorded at `send_unsubscribe_upstream`
+            // where the stored flag is still consulted; exported here so the
+            // stored flag's real-world drift rate is legible in central telemetry
+            // ahead of the reconcile-core keystone that deletes the flag. Read
+            // from the per-node network_status singleton; `None` only before the
+            // singleton is initialized (i.e. always populated in production).
+            if let Some((comparisons, divergences)) =
+                crate::node::network_status::upstream_divergence_counts()
+            {
+                snapshot.upstream_computed_vs_stored_comparisons = Some(comparisons);
+                snapshot.upstream_computed_vs_stored_divergences = Some(divergences);
+            }
+
             // Keep the hosting manager's copy of our own ring location current so
             // the proximity-prior demand estimate (#4642 A3) can turn a contract
             // key into a distance. Best-effort: only push a known location.
@@ -1632,6 +1729,10 @@ impl Ring {
                 terminal_consult_hits = ?snapshot.terminal_consult_hits,
                 terminal_consult_resolved_found = ?snapshot.terminal_consult_resolved_found,
                 terminal_consult_still_not_found = ?snapshot.terminal_consult_still_not_found,
+                upstream_computed_vs_stored_comparisons =
+                    ?snapshot.upstream_computed_vs_stored_comparisons,
+                upstream_computed_vs_stored_divergences =
+                    ?snapshot.upstream_computed_vs_stored_divergences,
                 "router_snapshot"
             );
 
@@ -6802,6 +6903,123 @@ mod subscription_root_predicate_tests {
             contract_loc(),
             neighbors.into_iter(),
         ));
+    }
+}
+
+/// Direct unit coverage for the pure core of `Ring::most_keyward_hosting_neighbor`
+/// (piece D, computed-upstream selection). Building a full `Ring` fixture is
+/// heavyweight (async `Ring::new` spawns background tasks) and a peer's ring
+/// location is derived from its (masked) socket address, so distances aren't
+/// freely settable through a real `ConnectionManager`. The strict-closer +
+/// deterministic-tiebreak selection is therefore factored into the pure
+/// `most_keyward_among` helper and tested here with distances supplied directly;
+/// the pub-key resolution / own-location glue is a thin wrapper covered
+/// end-to-end by the computed-upstream simulation proofs (later keystone steps).
+#[cfg(test)]
+mod most_keyward_tests {
+    use super::most_keyward_among;
+    use crate::ring::PeerKeyLocation;
+    use crate::ring::location::{Distance, Location};
+    use crate::transport::TransportKeypair;
+    use std::net::SocketAddr;
+
+    // Contract at 0.50; "me" hosting it at distance 0.10 (I'm at 0.60).
+    const CONTRACT: f64 = 0.50;
+    fn my_distance() -> Distance {
+        Location::new(0.60).distance(Location::new(CONTRACT))
+    }
+
+    /// A candidate peer at `addr` whose distance-to-contract is `dist`. The
+    /// distance is supplied directly (the helper takes it pre-computed), so it is
+    /// decoupled from the address — the address only drives the tiebreak.
+    fn candidate(addr: &str, dist: f64) -> (PeerKeyLocation, Distance) {
+        let addr: SocketAddr = addr.parse().unwrap();
+        let pk = TransportKeypair::new().public().clone();
+        (PeerKeyLocation::new(pk, addr), Distance::new(dist))
+    }
+
+    #[test]
+    fn picks_closest_strictly_closer_neighbor() {
+        // Two neighbors, both strictly closer than my 0.10: one at 0.05, one at
+        // 0.02. The most-keyward (smallest distance) wins.
+        let near = candidate("127.0.0.1:9001", 0.02);
+        let mid = candidate("127.0.0.1:9002", 0.05);
+        let want = near.0.clone();
+        let picked = most_keyward_among(my_distance(), [mid, near].into_iter());
+        assert_eq!(
+            picked,
+            Some(want),
+            "the neighbor closest to the key (0.02) must be chosen over the farther-but-still-closer one (0.05)"
+        );
+    }
+
+    #[test]
+    fn excludes_farther_or_equal_neighbors() {
+        // A strictly-closer neighbor (0.02) coexists with one at EXACTLY my
+        // distance (0.10) and one FARTHER (0.15). Only the strictly-closer one is
+        // eligible, so it is chosen — the equal and farther peers are excluded.
+        let closer = candidate("127.0.0.1:9001", 0.02);
+        let equal = candidate("127.0.0.1:9002", 0.10);
+        let farther = candidate("127.0.0.1:9003", 0.15);
+        let want = closer.0.clone();
+        let picked = most_keyward_among(my_distance(), [equal, farther, closer].into_iter());
+        assert_eq!(
+            picked,
+            Some(want),
+            "only the strictly-closer neighbor is eligible"
+        );
+
+        // With ONLY an equal-distance neighbor present, the strict `<` excludes
+        // it → None (a peer at our exact distance never becomes our upstream, the
+        // acyclicity guarantee).
+        let equal_only = candidate("127.0.0.1:9002", 0.10);
+        assert_eq!(
+            most_keyward_among(my_distance(), std::iter::once(equal_only)),
+            None,
+            "a neighbor at exactly our distance is farther-or-equal and must be excluded"
+        );
+    }
+
+    #[test]
+    fn none_when_no_strictly_closer_neighbor() {
+        // Empty candidate set → None.
+        assert_eq!(
+            most_keyward_among(my_distance(), std::iter::empty()),
+            None,
+            "no candidates → no computed upstream"
+        );
+        // All candidates farther than us → None (we are the terminus / stranded).
+        let far_a = candidate("127.0.0.1:9001", 0.15);
+        let far_b = candidate("127.0.0.1:9002", 0.30);
+        assert_eq!(
+            most_keyward_among(my_distance(), [far_a, far_b].into_iter()),
+            None,
+            "every candidate farther than us → no strictly-closer upstream"
+        );
+    }
+
+    #[test]
+    fn deterministic_tiebreak_on_equal_distance() {
+        // Two neighbors equidistant from the key (both 0.03, both strictly closer
+        // than 0.10) but with different socket addresses. The tiebreak picks the
+        // smaller socket address, and the result is independent of iteration
+        // order.
+        let low = candidate("127.0.0.1:9001", 0.03);
+        let high = candidate("127.0.0.1:9002", 0.03);
+        let want = low.0.clone();
+
+        let picked_fwd = most_keyward_among(my_distance(), [low.clone(), high.clone()].into_iter());
+        let picked_rev = most_keyward_among(my_distance(), [high, low].into_iter());
+
+        assert_eq!(
+            picked_fwd,
+            Some(want.clone()),
+            "equidistant tie must resolve to the smaller socket address"
+        );
+        assert_eq!(
+            picked_rev, picked_fwd,
+            "the tiebreak must be deterministic regardless of iteration order"
+        );
     }
 }
 

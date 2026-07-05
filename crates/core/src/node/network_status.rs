@@ -188,6 +188,30 @@ pub struct NetworkStatus {
     pub nat_stats: NatStats,
     /// Terminal advertisement-consult counters (hosting redesign piece C).
     pub terminal_consult_stats: TerminalConsultStats,
+    /// Computed-upstream vs. stored-`is_upstream`-flag divergence counters
+    /// (hosting redesign piece D, #4642 / #4671).
+    pub upstream_divergence_stats: UpstreamDivergenceStats,
+}
+
+/// Per-node counters measuring how often the demand-driven-hosting **computed
+/// upstream** (`Ring::most_keyward_hosting_neighbor`) disagrees with the stored
+/// `is_upstream` interest flag at the site that still consults the flag
+/// (`OpManager::send_unsubscribe_upstream`).
+///
+/// The reconcile-core keystone (#4642 piece D) replaces the stored flag — which
+/// drifts under interest-sync gossip (#4671) — with the computed upstream. This
+/// first, behavior-preserving step computes upstream in parallel and records
+/// whether the two agree, so the flag's real-world drift rate is legible in
+/// production telemetry (via `router_snapshot`) before the flag is deleted. The
+/// stored flag still drives the actual decision; these counters observe only.
+#[derive(Default)]
+pub struct UpstreamDivergenceStats {
+    /// Times the computed upstream was compared against the stored `is_upstream`
+    /// flag (the denominator — one per `send_unsubscribe_upstream` call).
+    pub comparisons: u64,
+    /// Of those, the times the computed upstream DISAGREED with the stored flag
+    /// (different peer, or one `Some`/the other `None`).
+    pub divergences: u64,
 }
 
 /// Per-node counters for the terminal advertisement consult (invariant 5:
@@ -350,6 +374,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         op_stats: OperationStats::default(),
         nat_stats: NatStats::default(),
         terminal_consult_stats: TerminalConsultStats::default(),
+        upstream_divergence_stats: UpstreamDivergenceStats::default(),
     };
     match NETWORK_STATUS.get() {
         // Already initialized: overwrite the existing tracker in place so
@@ -558,6 +583,44 @@ pub fn terminal_consult_counts() -> Option<(u64, u64, u64, u64)> {
     let s = status.read().ok()?;
     let c = &s.terminal_consult_stats;
     Some((c.attempts, c.hits, c.resolved_found, c.still_not_found))
+}
+
+/// Record one computed-upstream vs. stored-`is_upstream`-flag comparison
+/// (hosting redesign piece D, #4642 / #4671). Increments the `comparisons`
+/// denominator every call and the `divergences` numerator when `diverged`.
+///
+/// Called from `OpManager::send_unsubscribe_upstream`, the site that still
+/// consults the stored flag: it computes the upstream in parallel via
+/// `Ring::most_keyward_hosting_neighbor` and reports whether the two disagree.
+/// Behavior-preserving — the stored flag still drives the decision; this only
+/// measures the flag's drift so it is legible in production telemetry before the
+/// reconcile-core keystone deletes the flag.
+pub fn record_upstream_divergence_comparison(diverged: bool) {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.upstream_divergence_stats.comparisons =
+                s.upstream_divergence_stats.comparisons.saturating_add(1);
+            if diverged {
+                s.upstream_divergence_stats.divergences =
+                    s.upstream_divergence_stats.divergences.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Read the current computed-upstream vs. stored-flag divergence counters
+/// (piece D, #4642 / #4671) for export to the `router_snapshot` telemetry event.
+///
+/// Returns `(comparisons, divergences)` — the per-node monotonic totals — or
+/// `None` before the `NETWORK_STATUS` singleton is initialized. `Ring` polls this
+/// on the snapshot cadence and copies the values onto `RouterSnapshotInfo` so the
+/// stored-flag drift rate is visible in central telemetry, not just the internal
+/// singleton, giving field evidence for the flag's removal.
+pub fn upstream_divergence_counts() -> Option<(u64, u64)> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    let d = &s.upstream_divergence_stats;
+    Some((d.comparisons, d.divergences))
 }
 
 /// Record a NAT traversal attempt.
@@ -1324,6 +1387,40 @@ mod tests {
             terminal_consult_counts(),
             Some((3, 2, 1, 4)),
             "getter returns (attempts, hits, resolved_found, still_not_found)"
+        );
+    }
+
+    /// End-to-end for piece D (#4642 / #4671): the divergence record site must
+    /// feed the `upstream_divergence_counts()` getter that `Ring` polls for the
+    /// `router_snapshot` export. `comparisons` bumps every call, `divergences`
+    /// only when `diverged`, and the getter returns them in
+    /// `(comparisons, divergences)` order — so a dropped increment or transposed
+    /// tuple fails here rather than silently emitting zeros in production.
+    #[test]
+    fn upstream_divergence_counts_reflect_recorded_events() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        // Fresh singleton state for a deterministic baseline (init overwrites
+        // the process-global tracker in place, zeroing the counters).
+        init(31337, HashSet::new(), "test".to_string());
+
+        assert_eq!(
+            upstream_divergence_counts(),
+            Some((0, 0)),
+            "counters start at zero after init"
+        );
+
+        // 5 comparisons, 2 of them divergent → distinct so a transposition fails.
+        record_upstream_divergence_comparison(false);
+        record_upstream_divergence_comparison(true);
+        record_upstream_divergence_comparison(false);
+        record_upstream_divergence_comparison(true);
+        record_upstream_divergence_comparison(false);
+
+        assert_eq!(
+            upstream_divergence_counts(),
+            Some((5, 2)),
+            "getter returns (comparisons, divergences); every call bumps comparisons, \
+             only diverged calls bump divergences"
         );
     }
 
