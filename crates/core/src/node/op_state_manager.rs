@@ -806,6 +806,48 @@ impl OpManager {
             .into_iter()
             .find(|(_, interest)| interest.is_upstream);
 
+        // Behavior-preserving divergence telemetry (#4642 piece D / #4671).
+        // Compute the demand-driven-hosting upstream in PARALLEL and record how
+        // often it disagrees with the stored `is_upstream` flag this function
+        // still consults. The stored flag continues to drive the decision below;
+        // the reconcile-core keystone will later compute upstream everywhere and
+        // delete the drifting flag — this first step only measures the drift so
+        // it is legible in production telemetry (`router_snapshot`). Computed
+        // before the stored-flag early-return so the "stored None but computed
+        // Some" (and vice-versa) cases are also counted. Cheap: this path runs on
+        // client-unsubscribe / chain-collapse, not a hot loop.
+        //
+        // CAVEAT — the recorded divergence rate is NOISY AT THE EDGES. A counted
+        // divergence means genuine stored-flag drift (#4671) OR one of two edge
+        // artifacts: (a) a transient `own_location == None` (early startup / a
+        // dropped self-location) makes `most_keyward_hosting_neighbor` return
+        // `None` while the stored flag is still `Some`, and (b) the `comparisons`
+        // denominator also counts non-divergent `None == None` calls (no upstream
+        // either way), diluting the ratio. So do NOT read
+        // `upstream_computed_vs_stored_*` as pure flag-drift: attribute startup /
+        // edge noise before concluding the flag has drifted.
+        {
+            let instance_id = *contract.id();
+            let hosting_neighbors = self
+                .neighbor_hosting
+                .neighbors_with_contract_id(&instance_id);
+            let computed = self
+                .ring
+                .most_keyward_hosting_neighbor(&instance_id, &hosting_neighbors);
+            let stored_pk = upstream.as_ref().map(|(peer_key, _)| &peer_key.0);
+            let computed_pk = computed.as_ref().map(|pkl| &pkl.pub_key);
+            let diverged = stored_pk != computed_pk;
+            crate::node::network_status::record_upstream_divergence_comparison(diverged);
+            if diverged {
+                tracing::debug!(
+                    contract = %contract,
+                    stored_upstream = ?stored_pk,
+                    computed_upstream = ?computed_pk,
+                    "computed upstream diverges from stored is_upstream flag (#4642 piece D / #4671)"
+                );
+            }
+        }
+
         let Some((peer_key, _)) = upstream else {
             tracing::debug!(
                 contract = %contract,

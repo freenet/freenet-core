@@ -2212,6 +2212,21 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "terminal_consult_still_not_found".to_string(),
                     serde_json::json!(snapshot.terminal_consult_still_not_found),
                 );
+                // Computed-upstream vs. stored-flag divergence counters (piece D,
+                // #4642 / #4671) — same hand-mirror footgun: a new
+                // `RouterSnapshotInfo` field is invisible to the collector unless
+                // added here. These give production field evidence for the stored
+                // `is_upstream` flag's drift ahead of the reconcile-core keystone
+                // deleting it. Pinned by
+                // `router_snapshot_json_includes_upstream_divergence_counters`.
+                obj.insert(
+                    "upstream_computed_vs_stored_comparisons".to_string(),
+                    serde_json::json!(snapshot.upstream_computed_vs_stored_comparisons),
+                );
+                obj.insert(
+                    "upstream_computed_vs_stored_divergences".to_string(),
+                    serde_json::json!(snapshot.upstream_computed_vs_stored_divergences),
+                );
             }
             body
         }
@@ -2454,6 +2469,29 @@ mod tests {
             ("terminal_consult_hits", 313),
             ("terminal_consult_resolved_found", 317),
             ("terminal_consult_still_not_found", 331),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the computed-upstream vs. stored-flag divergence counters (piece D,
+    /// #4642 / #4671) must also reach the hand-mirrored OTLP body — same footgun
+    /// as the terminal-consult counters above. These give production field
+    /// evidence for the stored `is_upstream` flag's drift ahead of the
+    /// reconcile-core keystone deleting it; a silent drop would re-blind central
+    /// telemetry to that drift — the exact gap this change closes.
+    #[test]
+    fn router_snapshot_json_includes_upstream_divergence_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.upstream_computed_vs_stored_comparisons = Some(337);
+        info.upstream_computed_vs_stored_divergences = Some(347);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("upstream_computed_vs_stored_comparisons", 337),
+            ("upstream_computed_vs_stored_divergences", 347),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
