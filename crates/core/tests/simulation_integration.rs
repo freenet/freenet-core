@@ -12219,8 +12219,33 @@ fn test_scripted_node_crash_mid_run() {
         result.turmoil_result.err()
     );
 
-    // The contract must still be hosted somewhere in the surviving network
-    // (the gateway hosts it, and node1.s crash must not take it down).
+    for label in result.captured_node_labels() {
+        tracing::info!(
+            node = %label,
+            hosting = result.node_hosting_count(&label),
+            subscriptions = result.node_subscription_count(&label),
+            upstream = ?result.node_upstream_count(&label, &contract_key),
+            "post-crash measurement snapshot"
+        );
+    }
+
+    // DISCRIMINATING assertion: the crash must have actually taken effect.
+    // `CrashNode` installs the sim's packet-delivery callback and marks node1
+    // crashed in the fault injector; every packet to/from node1 is then dropped
+    // and counted. node1 held an established subscription (keep-alive traffic +
+    // renewals + update fan-out), so post-crash traffic to/from it is inevitable
+    // — `crash_packets_dropped() > 0` therefore holds ONLY if the crash really
+    // blocked node1's packets. Before this harness fix the callback was never
+    // installed, so a "crashed" node kept exchanging packets and this count
+    // stayed 0 (the false-green the fix closes). See #4642 piece F.
+    assert!(
+        result.crash_packets_dropped() > 0,
+        "scripted CrashNode must actually drop packets to/from the crashed node \
+         (crash_packets_dropped == 0 means the crash was a silent no-op)"
+    );
+
+    // The contract must still be hosted somewhere in the surviving network:
+    // the gateway hosts it, and node1's crash must not take it down.
     let hosted_somewhere = result
         .captured_node_labels()
         .iter()
@@ -12229,16 +12254,6 @@ fn test_scripted_node_crash_mid_run() {
         hosted_somewhere,
         "contract should remain hosted on a surviving node after node1 was crashed"
     );
-
-    for label in result.captured_node_labels() {
-        tracing::info!(
-            node = %label,
-            hosting = result.node_hosting_count(&label),
-            subscriptions = result.node_subscription_count(&label),
-            upstream = result.node_upstream_count(&label, &contract_key),
-            "post-crash measurement snapshot"
-        );
-    }
 }
 
 /// Error-path coverage for the controllable-clock harness: scheduling

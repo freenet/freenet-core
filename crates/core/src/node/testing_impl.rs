@@ -387,6 +387,34 @@ impl ScheduledOperation {
     }
 }
 
+/// Packet-delivery decision consulted by every `SimulationSocket` (via the
+/// global delivery callback set in `run_controlled_simulation`) so a scripted
+/// node crash actually drops packets instead of being a silent no-op.
+///
+/// Per-network: it looks up the fault injector for the socket's own network and,
+/// only if that network opted in (`enforce_crash_drops`), DROPS any packet whose
+/// source or destination is a crashed node — counting it in
+/// `stats.messages_dropped_crash`. Every other packet (and every network that
+/// did not opt in) is delivered unchanged, so installing this callback cannot
+/// alter fault behavior for the direct-runner churn driver or any other path.
+/// See #4642 piece F.
+#[cfg(any(test, feature = "testing"))]
+fn fault_injection_delivery_decision(
+    network_name: &str,
+    from: SocketAddr,
+    to: SocketAddr,
+) -> crate::transport::in_memory_socket::PacketDeliveryDecision {
+    use crate::transport::in_memory_socket::PacketDeliveryDecision;
+    if let Some(injector) = crate::node::network_bridge::get_fault_injector(network_name) {
+        let mut inj = injector.lock().unwrap();
+        if inj.enforce_crash_drops && (inj.config.is_crashed(&from) || inj.config.is_crashed(&to)) {
+            inj.stats.messages_dropped_crash += 1;
+            return PacketDeliveryDecision::Drop;
+        }
+    }
+    PacketDeliveryDecision::Deliver
+}
+
 /// Result of a controlled simulation, including topology snapshots.
 ///
 /// This struct captures the simulation result along with topology snapshots
@@ -419,6 +447,14 @@ pub struct ControlledSimulationResult {
     /// returns. See `crate::ring::topology_registry::RenewalMetrics` (#4440).
     pub renewal_metrics:
         HashMap<std::net::SocketAddr, crate::ring::topology_registry::RenewalMetrics>,
+    /// Number of packets DROPPED because their source or destination was a
+    /// crashed node (`SimOperation::CrashNode`), captured from the fault
+    /// injector's `stats.messages_dropped_crash` before the `SimNetwork` is
+    /// dropped. A discriminating signal that a scripted crash actually took
+    /// effect: it is `> 0` only if a crash was scheduled AND real traffic
+    /// to/from the crashed node was subsequently blocked. `0` when no crash was
+    /// scheduled. See #4642 piece F.
+    pub crash_packets_dropped: u64,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -509,6 +545,14 @@ impl ControlledSimulationResult {
                 acc
             },
         )
+    }
+
+    /// Number of packets dropped because a `SimOperation::CrashNode` marked
+    /// their source or destination crashed. `> 0` proves a scripted crash
+    /// actually blocked real traffic (discriminating signal for piece-F crash
+    /// tests); `0` when no crash was scheduled. See #4642 piece F.
+    pub fn crash_packets_dropped(&self) -> u64 {
+        self.crash_packets_dropped
     }
 }
 
@@ -4115,6 +4159,22 @@ impl SimNetwork {
         // Save network name for topology retrieval after simulation
         let network_name = self.name.clone();
 
+        // Make `SimOperation::CrashNode` a REAL crash: install the global
+        // packet-delivery callback that consults each network's fault injector
+        // and DROPS every packet to/from a crashed node, then opt THIS network
+        // in via `enforce_crash_drops`. The callback is per-network aware (keyed
+        // on the network name it is handed) and inert for any network that did
+        // not opt in, so the direct-runner churn driver's crash semantics stay
+        // unchanged. `SimNetwork::Drop` clears the callback. Without this, a
+        // "crashed" node kept exchanging packets and piece-F crash tests were
+        // false-green (#4642 piece F).
+        crate::transport::in_memory_socket::set_packet_delivery_callback(Some(
+            std::sync::Arc::new(fault_injection_delivery_decision),
+        ));
+        if let Some(injector) = crate::node::network_bridge::get_fault_injector(&network_name) {
+            injector.lock().unwrap().enforce_crash_drops = true;
+        }
+
         // Build Turmoil simulation with seeded RNG for deterministic execution
         let mut sim = turmoil::Builder::new()
             .simulation_duration(simulation_duration)
@@ -4597,6 +4657,14 @@ impl SimNetwork {
         let renewal_metrics =
             crate::ring::topology_registry::get_all_renewal_metrics(&network_name);
 
+        // Capture the crash-drop count BEFORE self drops (Drop clears the fault
+        // injector via `set_fault_injector(None)`). `> 0` proves a scripted
+        // `CrashNode` actually blocked traffic — the discriminating signal for
+        // piece-F crash tests.
+        let crash_packets_dropped = crate::node::network_bridge::get_fault_injector(&network_name)
+            .map(|inj| inj.lock().unwrap().stats.messages_dropped_crash)
+            .unwrap_or(0);
+
         // Extract the live Rings captured during the run BEFORE self drops.
         let node_rings: HashMap<NodeLabel, Arc<crate::ring::Ring>> = self
             .shared_rings
@@ -4610,6 +4678,7 @@ impl SimNetwork {
             node_storages,
             node_rings,
             renewal_metrics,
+            crash_packets_dropped,
         }
     }
 
