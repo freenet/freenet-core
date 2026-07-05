@@ -175,6 +175,25 @@ pub struct ConfigArgs {
     #[arg(long, env = "SHUTDOWN_DRAIN_SECS")]
     pub shutdown_drain_secs: Option<u64>,
 
+    /// Disable the node's automatic self-update check. Default: **false** — a
+    /// normal release node auto-updates and MUST NOT set this, or it stops
+    /// receiving security/protocol updates (which Freenet ships frequently).
+    ///
+    /// Intended ONLY for bespoke from-source deployments that intentionally run
+    /// *ahead* of the latest release (e.g. try.freenet.org). Such a build would
+    /// otherwise detect the newer published release, exit 42 to request an
+    /// update, and either be reinstalled as the stock release (clobbering its
+    /// unreleased build) or crash-loop under a plain restart-on-failure unit.
+    /// A dirty/dev build is already exempt via `build_info::GIT_DIRTY`; this
+    /// covers the clean-but-unofficial case that `GIT_DIRTY` misses (#4690).
+    ///
+    /// Plain boolean flag with no `env` binding: a truthy env value is easy to
+    /// leave set by accident, and silently disabling auto-update fleet-wide is
+    /// the exact failure this must avoid. The one bespoke deployment sets it
+    /// explicitly in its service `ExecStart`.
+    #[arg(long = "disable-auto-update")]
+    pub disable_auto_update: bool,
+
     #[command(flatten)]
     pub telemetry: TelemetryArgs,
 }
@@ -232,6 +251,7 @@ impl Default for ConfigArgs {
             inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
             shutdown_drain_secs: None,
+            disable_auto_update: false,
             telemetry: Default::default(),
         }
     }
@@ -983,6 +1003,7 @@ impl ConfigArgs {
             shutdown_drain_secs: self
                 .shutdown_drain_secs
                 .unwrap_or_else(default_shutdown_drain_secs),
+            disable_auto_update: self.disable_auto_update,
             telemetry: TelemetryConfig {
                 enabled: self.telemetry.enabled,
                 endpoint: self
@@ -1186,6 +1207,16 @@ pub struct Config {
         rename = "shutdown-drain-secs"
     )]
     pub shutdown_drain_secs: u64,
+
+    /// Operator opt-out of the automatic self-update check. RUNTIME-ONLY, NOT
+    /// persisted (`#[serde(skip)]`, like `secrets_dir` /
+    /// `TelemetryConfig::is_test_environment`): it is set from the
+    /// `--disable-auto-update` CLI flag in `build()`. Default `false`, so a
+    /// release node auto-updates exactly as before. See the flag's rustdoc on
+    /// `ConfigArgs::disable_auto_update` for why a from-source deployment
+    /// (try.freenet.org) needs it (#4690).
+    #[serde(skip)]
+    pub disable_auto_update: bool,
 }
 
 /// Default graceful-shutdown drain window.
@@ -4319,8 +4350,45 @@ mod tests {
             inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
             shutdown_drain_secs: None,
+            disable_auto_update: false,
             telemetry: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn disable_auto_update_flag_wires_through_build() {
+        // The default (no flag) MUST leave auto-update ENABLED (disable=false).
+        // This is the load-bearing default (#4690): a release node must keep
+        // updating automatically. Paired with the freenet.rs bin test on the
+        // gate helper, this covers the clap-arg -> Config plumbing end.
+        let temp = tempfile::tempdir().unwrap();
+        let default_cfg = clap_bare_args(temp.path()).build().await.unwrap();
+        assert!(
+            !default_cfg.disable_auto_update,
+            "default must keep auto-update ON"
+        );
+
+        // With the flag set on ConfigArgs, it reaches the built Config.
+        let temp2 = tempfile::tempdir().unwrap();
+        let mut args = clap_bare_args(temp2.path());
+        args.disable_auto_update = true;
+        let cfg = args.build().await.unwrap();
+        assert!(
+            cfg.disable_auto_update,
+            "--disable-auto-update must reach Config"
+        );
+    }
+
+    #[test]
+    fn disable_auto_update_flag_parses_from_cli() {
+        use clap::Parser;
+        // Absent → false (auto-update ON — the load-bearing default, #4690).
+        let none = ConfigArgs::try_parse_from(["freenet"]).expect("bare parse");
+        assert!(!none.disable_auto_update, "no flag → auto-update ON");
+        // Present → true (bespoke from-source deployment opt-out).
+        let set =
+            ConfigArgs::try_parse_from(["freenet", "--disable-auto-update"]).expect("flag parse");
+        assert!(set.disable_auto_update, "--disable-auto-update → OFF");
     }
 
     #[tokio::test]
@@ -4401,6 +4469,7 @@ mod tests {
                 iface_tx_enabled: true,
             },
             shutdown_drain_secs: 77,
+            disable_auto_update: true, // #[serde(skip)] — see destructure below
         };
 
         std::fs::write(
@@ -4431,6 +4500,10 @@ mod tests {
             module_cache_budget_bytes,
             telemetry,
             shutdown_drain_secs,
+            // #[serde(skip)] runtime CLI/env flag — set from --disable-auto-update
+            // at build() time, intentionally not persisted, so it does not
+            // round-trip through config.toml (#4690).
+            disable_auto_update: _,
         } = rebuilt;
 
         assert_eq!(mode, seed.mode, "mode");
