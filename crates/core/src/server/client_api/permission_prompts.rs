@@ -74,10 +74,11 @@
 //! standalone page and the in-page overlay are both regression-tested.
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use axum::extract::Path;
+use axum::extract::{ConnectInfo, Path};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse};
@@ -89,7 +90,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::client_events::websocket::{
-    host_header_ip_in_cidrs, is_allowed_host, is_localhost_origin,
+    host_header_ip_in_cidrs, is_allowed_host, is_localhost_origin, is_loopback_source,
 };
 use crate::contract::user_input::{
     CallerIdentity, PendingPrompts, PromptEvent, PromptSnapshot, emit_prompt_event, prompt_events,
@@ -103,6 +104,32 @@ pub(super) fn routes() -> Router {
         .route("/permission/events", get(permission_events))
         .route("/permission/{nonce}", get(permission_page))
         .route("/permission/{nonce}/respond", post(permission_respond))
+}
+
+/// The permission-prompt surface (`/permission/pending`, `/permission/events`,
+/// `/permission/{nonce}/respond`) leaks/forges capabilities: `pending` and
+/// `events` disclose the raw permission nonce, and `respond` approves a prompt.
+///
+/// These MUST be reachable only from the local host, regardless of whether the
+/// node's main HTTP listener binds `0.0.0.0` for network mode. Origin /
+/// `Sec-Fetch-Site` / RFC1918 source-CIDR checks are all insufficient here: a
+/// non-browser LAN client (e.g. `curl` with no `Origin`) passes every one of
+/// them while still connecting from an off-box address (issue #3819).
+///
+/// The peer socket address is the kernel-observed source of the TCP connection.
+/// Unlike `Origin` it cannot be forged at the HTTP layer — an off-box LAN peer's
+/// address is never loopback. `into_make_service_with_connect_info::<SocketAddr>`
+/// (see `server.rs`) injects the `ConnectInfo<SocketAddr>` extension for every
+/// connection, so it is present on the production serve path.
+///
+/// Fail closed: a MISSING `ConnectInfo` cannot prove loopback and is rejected.
+/// (It is absent only in unit tests that build a request without connect-info;
+/// those tests inject it explicitly to exercise both sides of this boundary.)
+fn peer_is_loopback(connect_info: Option<&ConnectInfo<SocketAddr>>) -> bool {
+    match connect_info {
+        Some(ConnectInfo(addr)) => is_loopback_source(addr.ip()),
+        None => false,
+    }
 }
 
 /// Cap on simultaneous SSE subscribers. A single browser typically opens one
@@ -228,11 +255,17 @@ fn caller_to_json(caller: &CallerIdentity) -> serde_json::Value {
 /// The state-changing `/permission/{nonce}/respond` endpoint retains
 /// its strict Origin check independently of this read endpoint.
 async fn pending_prompts(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     allowed_hosts: Option<Extension<AllowedHosts>>,
     allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
     Extension(pending): Extension<PendingPrompts>,
 ) -> axum::response::Response {
+    // Loopback-only boundary (#3819): this endpoint discloses raw nonces, so a
+    // LAN peer must not reach it even when the main listener binds 0.0.0.0.
+    if !peer_is_loopback(connect_info.as_ref().map(|Extension(ci)| ci)) {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
     let allowed_hosts = allowed_hosts.as_ref().map(|Extension(v)| v);
     let allowed_source_cidrs = allowed_source_cidrs.as_ref().map(|Extension(v)| v);
 
@@ -374,13 +407,22 @@ struct PermissionResponse {
 
 /// Handle the user's response to a permission prompt.
 async fn permission_respond(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     Path(nonce): Path<String>,
     headers: HeaderMap,
     allowed_hosts: Option<Extension<AllowedHosts>>,
     allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
     Extension(pending): Extension<PendingPrompts>,
     Json(body): Json<PermissionResponse>,
-) -> impl IntoResponse {
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    // Loopback-only boundary (#3819): approving a prompt is a capability, so a
+    // LAN peer must not reach it even when the main listener binds 0.0.0.0.
+    if !peer_is_loopback(connect_info.as_ref().map(|Extension(ci)| ci)) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "forbidden"})),
+        );
+    }
     let allowed_hosts = allowed_hosts.as_ref().map(|Extension(v)| v);
     let allowed_source_cidrs = allowed_source_cidrs.as_ref().map(|Extension(v)| v);
 
@@ -669,11 +711,18 @@ fn snapshot_to_json(snapshot: &PromptSnapshot) -> serde_json::Value {
 /// entry); the shell-page renderer keys on `nonce`, so duplicates are
 /// idempotent.
 async fn permission_events(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     allowed_hosts: Option<Extension<AllowedHosts>>,
     allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
     Extension(pending): Extension<PendingPrompts>,
 ) -> axum::response::Response {
+    // Loopback-only boundary (#3819): the SSE stream emits raw nonces in
+    // `prompt_added` events, so a LAN peer must not reach it even when the main
+    // listener binds 0.0.0.0. Reject BEFORE subscribing / consuming a slot.
+    if !peer_is_loopback(connect_info.as_ref().map(|Extension(ci)| ci)) {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
     let allowed_hosts = allowed_hosts.as_ref().map(|Extension(v)| v);
     let allowed_source_cidrs = allowed_source_cidrs.as_ref().map(|Extension(v)| v);
 
@@ -934,9 +983,33 @@ mod tests {
         allowed_hosts: Option<AllowedHosts>,
         allowed_source_cidrs: Option<AllowedSourceCidrs>,
     ) -> (axum::http::StatusCode, HeaderMap, serde_json::Value) {
+        call_pending_full_with_policy_from(
+            loopback_connect_info(),
+            headers,
+            pending,
+            allowed_hosts,
+            allowed_source_cidrs,
+        )
+        .await
+    }
+
+    /// A loopback `ConnectInfo` extension — the default peer address for tests
+    /// that model a legitimate same-host UI. Port is arbitrary.
+    fn loopback_connect_info() -> Extension<ConnectInfo<SocketAddr>> {
+        Extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+    }
+
+    async fn call_pending_full_with_policy_from(
+        connect_info: Extension<ConnectInfo<SocketAddr>>,
+        headers: HeaderMap,
+        pending: PendingPrompts,
+        allowed_hosts: Option<AllowedHosts>,
+        allowed_source_cidrs: Option<AllowedSourceCidrs>,
+    ) -> (axum::http::StatusCode, HeaderMap, serde_json::Value) {
         use axum::body::to_bytes;
         use axum::response::IntoResponse;
         let resp = pending_prompts(
+            Some(connect_info),
             headers,
             allowed_hosts.map(Extension),
             allowed_source_cidrs.map(Extension),
@@ -1221,6 +1294,7 @@ mod tests {
         // Answer A.
         let (status, _) = {
             let resp = permission_respond(
+                Some(loopback_connect_info()),
                 Path("a".to_string()),
                 trusted_header(),
                 None,
@@ -1251,6 +1325,7 @@ mod tests {
         // Responding to A again 404s — the shell JS treats this as "another
         // tab already answered" and hides its overlay card.
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path("a".to_string()),
             trusted_header(),
             None,
@@ -1283,6 +1358,7 @@ mod tests {
         );
 
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path("n".to_string()),
             trusted_header(),
             None,
@@ -1482,9 +1558,15 @@ mod tests {
         if let Some(s) = sec_fetch_site {
             headers.insert("sec-fetch-site", s.parse().unwrap());
         }
-        let resp = permission_events(headers, None, None, Extension(pending))
-            .await
-            .into_response();
+        let resp = permission_events(
+            Some(loopback_connect_info()),
+            headers,
+            None,
+            None,
+            Extension(pending),
+        )
+        .await
+        .into_response();
         let stream = resp
             .into_body()
             .into_data_stream()
@@ -1939,6 +2021,7 @@ mod tests {
         let mut rx = prompt_events().subscribe();
 
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path(nonce.clone()),
             trusted_header(),
             None,
@@ -2012,6 +2095,7 @@ mod tests {
         let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
 
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path("n".to_string()),
             lan_browser_headers("192.168.1.42", 7509),
             None,
@@ -2039,6 +2123,7 @@ mod tests {
 
         let cidrs = allowed_cidrs_with(&["100.64.0.0/10"]);
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path("n".to_string()),
             lan_browser_headers("100.64.0.1", 7509),
             None,
@@ -2064,6 +2149,7 @@ mod tests {
         headers.insert("host", "192.168.1.42:7509".parse().unwrap());
         headers.insert("origin", "https://evil.com".parse().unwrap());
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path("n".to_string()),
             headers,
             None,
@@ -2088,6 +2174,7 @@ mod tests {
         headers.insert("host", "8.8.8.8:7509".parse().unwrap());
         headers.insert("origin", "http://8.8.8.8:7509".parse().unwrap());
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path("n".to_string()),
             headers,
             None,
@@ -2112,6 +2199,7 @@ mod tests {
         headers.insert("host", "mynode.example.com:7509".parse().unwrap());
         headers.insert("origin", "http://mynode.example.com:7509".parse().unwrap());
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path("n".to_string()),
             headers,
             Some(Extension(hosts)),
@@ -2140,6 +2228,7 @@ mod tests {
         headers.insert("host", "mynode.example.com:7509".parse().unwrap());
         headers.insert("origin", "https://evil.com".parse().unwrap());
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path("n".to_string()),
             headers,
             Some(Extension(hosts)),
@@ -2163,6 +2252,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("host", "192.168.1.42:7509".parse().unwrap());
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path("n".to_string()),
             headers,
             None,
@@ -2340,6 +2430,7 @@ mod tests {
         headers.insert("host", "100.64.1.5:7509".parse().unwrap());
         headers.insert("origin", "null".parse().unwrap());
         let resp = permission_respond(
+            Some(loopback_connect_info()),
             Path("n".to_string()),
             headers,
             None,
@@ -2392,6 +2483,7 @@ mod tests {
         use axum::response::IntoResponse;
         let pending = crate::contract::user_input::pending_prompts();
         let resp = permission_events(
+            Some(loopback_connect_info()),
             headers,
             allowed_hosts.map(Extension),
             allowed_source_cidrs.map(Extension),
@@ -2496,21 +2588,26 @@ mod tests {
         let pending = empty_pending();
         let _rx = insert_prompt(&pending, "rt", "m", vec!["OK"], "d", webapp_caller("c"));
 
-        let hosts = allowed_hosts_with(&["192.168.1.42"], 7509);
+        let hosts = allowed_hosts_with(&["127.0.0.1"], 7509);
         let cidrs = AllowedSourceCidrs::default();
         let app = super::routes()
             .layer(Extension(pending))
             .layer(Extension(hosts))
             .layer(Extension(cidrs));
 
-        let req = Request::builder()
+        // A legitimate same-host UI: loopback peer address + loopback origin.
+        // (The loopback boundary from #3819 gates on the peer address; a LAN
+        // host/origin is covered by test_router_rejects_lan_peer_respond below.)
+        let mut req = Request::builder()
             .method("POST")
             .uri("/permission/rt/respond")
-            .header("host", "192.168.1.42:7509")
-            .header("origin", "http://192.168.1.42:7509")
+            .header("host", "127.0.0.1:7509")
+            .header("origin", "http://127.0.0.1:7509")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"index":0}"#))
             .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 55000))));
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(
@@ -2548,5 +2645,242 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ====================================================================
+    // Loopback-only boundary for the permission surface (issue #3819).
+    //
+    // The three endpoints leak/forge capabilities to a LAN peer that
+    // passes every Origin / Sec-Fetch-Site / RFC1918-CIDR check by simply
+    // sending no Origin (e.g. `curl` from another machine). The fix binds
+    // them to loopback via the kernel-observed peer socket address, which
+    // — unlike Origin — cannot be forged at the HTTP layer.
+    //
+    // These tests model the REAL threat: they drive the handlers with a
+    // non-loopback peer `SocketAddr` and assert rejection, and with a
+    // loopback peer and assert the request is served.
+    // ====================================================================
+
+    /// Build a router request that carries a `ConnectInfo` peer address, so
+    /// the loopback guard sees the same source IP the kernel would set.
+    fn request_from_peer(
+        method: &str,
+        uri: &str,
+        peer: SocketAddr,
+        body: &'static str,
+    ) -> axum::http::Request<axum::body::Body> {
+        // No Origin header: this is exactly the non-browser client (curl) the
+        // issue proves bypasses the Origin/Sec-Fetch checks. The loopback guard
+        // must reject it regardless.
+        let mut req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        req
+    }
+
+    /// `peer_is_loopback` is the load-bearing decision. Assert both sides plus
+    /// the fail-closed missing-ConnectInfo case directly, independent of any
+    /// HTTP plumbing.
+    #[test]
+    fn test_peer_is_loopback_decision() {
+        let lo_v4 = ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1)));
+        let lo_v6 = ConnectInfo(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 1)));
+        let lan = ConnectInfo(SocketAddr::from(([192, 168, 1, 50], 1)));
+        let public = ConnectInfo(SocketAddr::from(([8, 8, 8, 8], 1)));
+        // IPv4-mapped loopback (::ffff:127.0.0.1) must count as loopback.
+        let mapped_lo = ConnectInfo(SocketAddr::from((
+            "127.0.0.1"
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap()
+                .to_ipv6_mapped(),
+            1,
+        )));
+
+        assert!(peer_is_loopback(Some(&lo_v4)));
+        assert!(peer_is_loopback(Some(&lo_v6)));
+        assert!(peer_is_loopback(Some(&mapped_lo)));
+        assert!(!peer_is_loopback(Some(&lan)));
+        assert!(!peer_is_loopback(Some(&public)));
+        // Fail closed: a missing ConnectInfo cannot prove loopback.
+        assert!(!peer_is_loopback(None));
+    }
+
+    #[tokio::test]
+    async fn test_pending_rejects_lan_peer_serves_loopback_peer() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "leak", "m", vec!["OK"], "d", webapp_caller("c"));
+        let build_app = || {
+            super::routes()
+                .layer(Extension(pending.clone()))
+                .layer(Extension::<AllowedHosts>(Arc::new(HashSet::new())))
+                .layer(Extension(AllowedSourceCidrs::default()))
+        };
+
+        // Attacker: off-box LAN peer, no Origin. Must be rejected and must NOT
+        // see the nonce.
+        let lan = SocketAddr::from(([192, 168, 1, 50], 40000));
+        let resp = build_app()
+            .oneshot(request_from_peer("GET", "/permission/pending", lan, ""))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "LAN peer must be rejected from /permission/pending"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body).contains("leak"),
+            "rejected response must not disclose the nonce"
+        );
+
+        // Legitimate same-host UI: loopback peer. Must be served the nonce.
+        let lo = SocketAddr::from(([127, 0, 0, 1], 55000));
+        let resp = build_app()
+            .oneshot(request_from_peer("GET", "/permission/pending", lo, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("leak"),
+            "loopback peer must still receive pending nonces"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respond_rejects_lan_peer_serves_loopback_peer() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        // Attacker: forge an approval from an off-box LAN peer (no Origin).
+        let pending = empty_pending();
+        let rx = insert_prompt(&pending, "forge", "m", vec!["OK"], "d", webapp_caller("c"));
+        let app = super::routes()
+            .layer(Extension(pending.clone()))
+            .layer(Extension::<AllowedHosts>(Arc::new(HashSet::new())))
+            .layer(Extension(AllowedSourceCidrs::default()));
+        let lan = SocketAddr::from(([192, 168, 1, 50], 40000));
+        let resp = app
+            .oneshot(request_from_peer(
+                "POST",
+                "/permission/forge/respond",
+                lan,
+                r#"{"index":0}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "LAN peer must not be able to approve a prompt"
+        );
+        // The prompt must still be pending (not consumed by the rejected forge).
+        assert!(pending.contains_key("forge"));
+        drop(rx);
+
+        // Legitimate same-host UI over loopback: approval goes through.
+        let pending = empty_pending();
+        let rx = insert_prompt(&pending, "ok", "m", vec!["OK"], "d", webapp_caller("c"));
+        let app = super::routes()
+            .layer(Extension(pending.clone()))
+            .layer(Extension(allowed_hosts_with(&["127.0.0.1"], 7509)))
+            .layer(Extension(AllowedSourceCidrs::default()));
+        let mut req = request_from_peer(
+            "POST",
+            "/permission/ok/respond",
+            SocketAddr::from(([127, 0, 0, 1], 55000)),
+            r#"{"index":0}"#,
+        );
+        req.headers_mut()
+            .insert("host", "127.0.0.1:7509".parse().unwrap());
+        req.headers_mut()
+            .insert("origin", "http://127.0.0.1:7509".parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            rx.await.unwrap(),
+            0,
+            "loopback approval must reach the delegate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_events_rejects_lan_peer() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+
+        let pending = empty_pending();
+        let _rx = insert_prompt(
+            &pending,
+            "sse-leak",
+            "m",
+            vec!["OK"],
+            "d",
+            webapp_caller("c"),
+        );
+        let app = super::routes()
+            .layer(Extension(pending.clone()))
+            .layer(Extension::<AllowedHosts>(Arc::new(HashSet::new())))
+            .layer(Extension(AllowedSourceCidrs::default()));
+
+        // Off-box LAN peer, no Origin: the SSE stream must be refused outright
+        // (403), not opened — so the raw nonce in `prompt_added` never streams.
+        let lan = SocketAddr::from(([192, 168, 1, 50], 40000));
+        let resp = app
+            .oneshot(request_from_peer("GET", "/permission/events", lan, ""))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "LAN peer must be rejected from the SSE nonce stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_router_rejects_lan_peer_respond() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        // Even with an allowed LAN host + matching Origin (the config the old
+        // behavior accepted), an off-box LAN peer address must now be rejected.
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "rt3", "m", vec!["OK"], "d", webapp_caller("c"));
+        let app = super::routes()
+            .layer(Extension(pending))
+            .layer(Extension(allowed_hosts_with(&["192.168.1.42"], 7509)))
+            .layer(Extension(AllowedSourceCidrs::default()));
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/permission/rt3/respond")
+            .header("host", "192.168.1.42:7509")
+            .header("origin", "http://192.168.1.42:7509")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"index":0}"#))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 42], 40000))));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an off-box LAN peer must not approve prompts even with an allowed \
+             Host/Origin — the loopback boundary is the #3819 fix"
+        );
     }
 }
