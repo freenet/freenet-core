@@ -53,11 +53,20 @@ impl Announcer {
     /// the script either kept running past the 1s probe or exited 0 within
     /// it; returns `Err` for immediate non-zero exit so the HTTP layer
     /// returns 500 and the caller can retry.
-    pub async fn run(&self, message: &str) -> Result<()> {
+    ///
+    /// `target_version`, when `Some`, is the release version this
+    /// announcement is for (bare semver, no leading `v`). It is appended to the
+    /// script's argv as `--target-version <v>` (see below for why a flag rather
+    /// than an env var) so `announce-to-river.sh` can gate the post on the
+    /// RESTARTED node reporting that version — the deterministic fix for the
+    /// #4496 announce/update race. `None` (a caller that predates the plumbing)
+    /// omits the flag and the script falls back to its read-streak heuristic.
+    pub async fn run(&self, message: &str, target_version: Option<&str>) -> Result<()> {
         if self.dry_run {
             tracing::info!(
                 command = %self.command.display(),
                 len = message.len(),
+                target_version = target_version.unwrap_or("<none>"),
                 "dry-run: would invoke `sudo -n -u {} {} <message>`",
                 self.run_as_user,
                 self.command.display()
@@ -68,15 +77,29 @@ impl Announcer {
         tracing::info!(
             command = %self.command.display(),
             len = message.len(),
+            target_version = target_version.unwrap_or("<none>"),
             "spawning announce command"
         );
 
-        let mut child = Command::new(&self.sudo_command)
-            .arg("--non-interactive")
+        let mut cmd = Command::new(&self.sudo_command);
+        cmd.arg("--non-interactive")
             .arg("-u")
-            .arg(&self.run_as_user)
-            .arg(&self.command)
-            .arg(message)
+            .arg(&self.run_as_user);
+        // The target version is forwarded as a `--target-version <v>` flag on
+        // the SCRIPT's own argv, not via env. The sudoers rule pins the
+        // command to the script path with a trailing `*` wildcard that matches
+        // the whole argv, so extra script arguments are allowed — but a
+        // `sudo env VAR=... script` prefix would change the matched command to
+        // `env` and break the sudoers match, and sudo strips the process
+        // environment by default so a plain `.env()` would not survive either.
+        // Passing it as a script flag keeps the sudoers match on the script
+        // and reaches the shell as a normal positional (no shell eval — each
+        // `.arg` is its own execve slot).
+        cmd.arg(&self.command).arg(message);
+        if let Some(v) = target_version {
+            cmd.arg("--target-version").arg(v);
+        }
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -122,7 +145,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_does_not_execute() {
         let a = Announcer::new_with_sudo(PathBuf::from("/nonexistent/announce.sh"), true, "nobody");
-        a.run("test message")
+        a.run("test message", Some("0.2.90"))
             .await
             .expect("dry_run must not invoke");
     }

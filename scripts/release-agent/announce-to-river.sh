@@ -46,15 +46,70 @@ LOG_FILE="${LOG_FILE:-}"
 # READ_PROBE_TIMEOUT keeps the worst case bounded: roughly
 # ATTEMPTS * (READ_PROBE_TIMEOUT + INTERVAL). With the defaults that is
 # ~60 * (15s + 5s) = ~20 min worst case if the node never recovers, while the
-# happy path (room readable) returns in well under a second. The budget is
-# comfortably over the ~90s gateway down-window observed on the v0.2.61
-# release. Overridable (e.g. NODE_WAIT_INTERVAL=0 in tests).
+# happy path returns quickly once the node is ready. The budget is comfortably
+# over the ~90s gateway down-window observed on the v0.2.61 release.
+#
+# Happy-path cost differs by readiness mode (see wait_for_room()):
+#   - Version-aware (#4496): the gate returns on the FIRST attempt where the
+#     node reports the target version AND the room reads — one extra cheap
+#     `freenet --version` fork per probe, negligible next to the room GET.
+#   - Streak fallback: the gate needs READ_STABLE_COUNT (default 3) consecutive
+#     successful reads, so the happy path costs up to ~READ_STABLE_COUNT extra
+#     room reads / intervals (a few seconds at the defaults) beyond a single
+#     success. Both are well within the budget above.
+# Overridable (e.g. NODE_WAIT_INTERVAL=0 in tests).
 NODE_WAIT_ATTEMPTS="${NODE_WAIT_ATTEMPTS:-60}"
 NODE_WAIT_INTERVAL="${NODE_WAIT_INTERVAL:-5}"
 # Per-probe timeout for each room read (readiness probe and post-send verify).
 # Bounds the legacy-generation walk a failing GET performs during the
 # down-window; the happy-path read is far faster. Overridable in tests.
 READ_PROBE_TIMEOUT="${READ_PROBE_TIMEOUT:-15}"
+# Target release version this announcement is for, WITHOUT a leading `v`
+# (e.g. "0.2.90"). Plumbed end-to-end from release-announce.yml's `resolve`
+# job → the nova release-agent (ANNOUNCE_TARGET_VERSION env on the sudo
+# invocation) → here. This is the #4496 fix: it lets wait_for_room() gate the
+# post on the RESTARTED node reporting the TARGET version, deterministically
+# closing the race instead of merely narrowing it with a read-streak heuristic.
+#
+# release-announce.yml and gateway-update.yml both fire on the same
+# `release: published` event with no ordering between them. Without the target
+# version, an early room read served by the OLD node (moments before the
+# concurrent gateway self-update stops the service) looks identical to a read
+# served by the restarted node, so the announce can drop straight into the
+# teardown window it was meant to ride out. With the target version we require
+# the running node's version to EQUAL the target before proceeding — and the
+# gateway update deploys stop→swap-binary→start, so while the old node still
+# serves the room the on-disk binary is still the OLD version. The old-node
+# read therefore fails the version gate and the poll waits for the restart.
+#
+# Empty (the default, and what a legacy release-agent that predates this
+# plumbing passes) falls back to the READ_STABLE_COUNT streak heuristic below,
+# which narrows but does not fully close the race — see wait_for_room().
+ANNOUNCE_TARGET_VERSION="${ANNOUNCE_TARGET_VERSION:-}"
+# Strip an accidental leading `v` so "v0.2.90" and "0.2.90" both work.
+ANNOUNCE_TARGET_VERSION="${ANNOUNCE_TARGET_VERSION#v}"
+# Command whose `--version` output reports the version of the LOCALLY RUNNING
+# freenet node. The gateway update swaps this on-disk binary during the
+# restart, so once it reports the target version the swap has completed. The
+# node runs from this same binary, so its version is the running node's
+# version once the service has been restarted onto it. Overridable in tests
+# (stubbed) and for non-default install layouts.
+FREENET_BIN="${FREENET_BIN:-freenet}"
+# Number of CONSECUTIVE successful room reads wait_for_room() must observe
+# before it declares the node ready when NO target version is available
+# (legacy fallback path only). A single successful read is NOT enough: an
+# early read can be served by the OLD node before the concurrent gateway
+# self-update stops the service (issue #4496). Requiring several successes
+# SPANNING at least one NODE_WAIT_INTERVAL means a teardown that begins after
+# the first probe resets the streak. This is a HEURISTIC — it narrows the race
+# but cannot fully close it (a teardown that has not yet begun when the streak
+# completes is not caught). The version gate above is the real fix; this only
+# runs when the target version was not plumbed through. Overridable in tests.
+#
+# INVARIANT: READ_STABLE_COUNT must be <= NODE_WAIT_ATTEMPTS, otherwise the
+# streak can never reach threshold and wait_for_room() would always fail on
+# the fallback path. Clamped at use (see wait_for_room()).
+READ_STABLE_COUNT="${READ_STABLE_COUNT:-3}"
 # Set to any non-empty value to skip the post-send convergence re-read (the
 # read that confirms the message actually landed in room state). Off by
 # default; primarily a test hook.
@@ -153,8 +208,41 @@ verify_converged() {
     grep -qF -- "$MESSAGE" <<<"$listing"
 }
 
-# Poll until the room is actually READABLE, or NODE_WAIT_ATTEMPTS is reached.
-# Returns 0 once a room GET succeeds, 1 if it never did.
+# Report the version of the locally running freenet node by parsing
+# `FREENET_BIN --version`. Echoes a bare semver (e.g. "0.2.90") on stdout, or
+# nothing if the binary is missing / the output is unparseable (treated by the
+# caller as "not yet the target"). Never fails the script.
+node_version() {
+    local out
+    out="$("$FREENET_BIN" --version 2>/dev/null)" || return 0
+    grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$out" | head -1
+}
+
+# Poll until the local node is ready to receive the announcement, or
+# NODE_WAIT_ATTEMPTS is reached. Returns 0 once ready, 1 if it never became
+# ready within the budget.
+#
+# Readiness has two definitions depending on whether the TARGET VERSION was
+# plumbed through (ANNOUNCE_TARGET_VERSION):
+#
+#   1. Version-aware (the #4496 fix, taken whenever ANNOUNCE_TARGET_VERSION is
+#      set): ready == the running node reports the target version AND the room
+#      is readable. release-announce.yml and gateway-update.yml fire on the
+#      same `release: published` event with no ordering, so an early room read
+#      can be served by the OLD node moments before the concurrent gateway
+#      self-update stops the service. But the update deploys
+#      stop→swap-binary→start, so while the OLD node still serves the room the
+#      on-disk binary is still the OLD version — the version check rejects that
+#      read and the poll waits for the restarted, target-version node. This
+#      closes the race deterministically rather than heuristically.
+#
+#   2. Streak fallback (only when ANNOUNCE_TARGET_VERSION is empty — e.g. a
+#      release-agent that predates the version plumbing): ready == the room has
+#      been readable for READ_STABLE_COUNT consecutive probes. This narrows the
+#      race (a teardown beginning after an early success resets the streak) but
+#      does NOT fully close it: if teardown has not yet begun when the streak
+#      completes, the read still runs against the old node. It is a best-effort
+#      heuristic for the legacy path, not a guarantee.
 #
 # A WS-port check is NOT sufficient. A release announcement runs concurrently
 # with the gateway update that restarts the local node (down ~90s, issue
@@ -181,18 +269,62 @@ verify_converged() {
 # acceptable; surfacing late failures to the workflow would need a
 # release-agent change.
 wait_for_room() {
-    local attempt
+    local attempt streak=0 stable_count="$READ_STABLE_COUNT"
+    # Clamp the streak threshold to the attempt budget. A configuration with
+    # READ_STABLE_COUNT > NODE_WAIT_ATTEMPTS could never reach the streak, so
+    # the fallback path would ALWAYS fail regardless of node health. Clamping
+    # keeps the gate satisfiable; the version-aware path does not use it.
+    if (( stable_count > NODE_WAIT_ATTEMPTS )); then
+        log "READ_STABLE_COUNT ($stable_count) > NODE_WAIT_ATTEMPTS ($NODE_WAIT_ATTEMPTS); clamping streak threshold to $NODE_WAIT_ATTEMPTS"
+        stable_count="$NODE_WAIT_ATTEMPTS"
+    fi
+    if (( stable_count < 1 )); then
+        stable_count=1
+    fi
+
+    if [[ -n "$ANNOUNCE_TARGET_VERSION" ]]; then
+        log "waiting for the node to report target version $ANNOUNCE_TARGET_VERSION and the room to become readable (#4496 version-aware gate)"
+    fi
+
     for ((attempt = 1; attempt <= NODE_WAIT_ATTEMPTS; attempt++)); do
-        if read_room_state; then
-            if (( attempt > 1 )); then
-                log "room readable after $attempt attempts"
+        if [[ -n "$ANNOUNCE_TARGET_VERSION" ]]; then
+            # ── Version-aware readiness (#4496 fix) ──
+            # Require BOTH the running node on the target version AND the room
+            # readable. The old node still serving the room reports the OLD
+            # version (deploy swaps the binary only after stopping it), so its
+            # read is rejected here and cannot satisfy the gate.
+            local running
+            running="$(node_version)"
+            if [[ "$running" == "$ANNOUNCE_TARGET_VERSION" ]] && read_room_state; then
+                log "node reports target version $ANNOUNCE_TARGET_VERSION and room is readable after $attempt attempts"
+                return 0
             fi
-            return 0
-        fi
-        if [[ "$attempt" -eq 1 ]]; then
-            log "room not yet readable via $FREENET_NODE_URL — waiting (the node is restarted by the concurrent gateway update)"
-        elif (( attempt % 12 == 0 )); then
-            log "still waiting for room to become readable ($attempt/$NODE_WAIT_ATTEMPTS)"
+            if [[ "$attempt" -eq 1 ]]; then
+                log "node not yet on target version $ANNOUNCE_TARGET_VERSION (running: ${running:-unknown}) or room not readable — waiting for the gateway update to restart it"
+            elif (( attempt % 12 == 0 )); then
+                log "still waiting for target version $ANNOUNCE_TARGET_VERSION + readable room ($attempt/$NODE_WAIT_ATTEMPTS, running: ${running:-unknown})"
+            fi
+        else
+            # ── Streak fallback (legacy, no target version) ──
+            if read_room_state; then
+                streak=$((streak + 1))
+                if (( streak >= stable_count )); then
+                    if (( attempt > stable_count )); then
+                        log "room readable for $stable_count consecutive probes after $attempt attempts"
+                    fi
+                    return 0
+                fi
+            else
+                if (( streak > 0 )); then
+                    log "room read failed after $streak readable probe(s) — resetting streak (node likely mid-teardown for the gateway update)"
+                fi
+                streak=0
+            fi
+            if [[ "$attempt" -eq 1 ]]; then
+                log "room not yet stably readable via $FREENET_NODE_URL — waiting (no target version plumbed; using streak heuristic)"
+            elif (( attempt % 12 == 0 )); then
+                log "still waiting for room to become stably readable ($attempt/$NODE_WAIT_ATTEMPTS, streak $streak/$stable_count)"
+            fi
         fi
         # No sleep after the final attempt — nothing follows it.
         if (( attempt < NODE_WAIT_ATTEMPTS )); then
@@ -254,11 +386,50 @@ send_message_checked() {
     return 0
 }
 
-if [[ $# -ne 1 ]]; then
-    usage
-fi
+# Argument parsing. The FIRST positional is the message; an optional
+# `--target-version <v>` flag (passed by the release-agent, see announcer.rs)
+# supplies the release version this announcement is for and enables the #4496
+# version-aware readiness gate. The flag overrides any ANNOUNCE_TARGET_VERSION
+# inherited from the environment. Parsing tolerates the flag appearing before
+# or after the message so callers need not fix an ordering.
+#
+# Extracted into a function (setting the MESSAGE / ANNOUNCE_TARGET_VERSION
+# globals) so announce-to-river_test.sh can drive it directly — the
+# order-tolerance and error branches are otherwise untestable. `usage` exits
+# non-zero on a malformed invocation.
+parse_args() {
+    MESSAGE=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --target-version)
+                if [[ $# -lt 2 ]]; then
+                    log "ERROR: --target-version requires an argument"
+                    usage
+                fi
+                ANNOUNCE_TARGET_VERSION="${2#v}"
+                shift 2
+                ;;
+            --)
+                shift
+                if [[ -n "$MESSAGE" || $# -ne 1 ]]; then
+                    usage
+                fi
+                MESSAGE="$1"
+                shift
+                ;;
+            *)
+                if [[ -n "$MESSAGE" ]]; then
+                    log "ERROR: unexpected extra argument: $1"
+                    usage
+                fi
+                MESSAGE="$1"
+                shift
+                ;;
+        esac
+    done
+}
 
-MESSAGE="$1"
+parse_args "$@"
 
 # Defense in depth: empty/oversized payloads should have been rejected
 # upstream, but the privilege-boundary script re-checks. The cap matches

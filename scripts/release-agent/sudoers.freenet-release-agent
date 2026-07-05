@@ -30,8 +30,12 @@ freenet-update ALL=(root) NOPASSWD: /usr/local/bin/gateway-auto-update.sh --forc
 # nova; absent on vega — that install simply omits this entry).
 #
 # The `*` after the script path is a sudoers wildcard matching the
-# entire message argv. As with --target-version above, the safety comes
-# from the agent's validation (length cap + NUL rejection in
-# server.rs::announce_river_handler) plus the script's own length check;
-# not from sudoers.
+# entire argv: the message plus an optional trailing
+# `--target-version <vX.Y.Z>` flag the agent appends for the #4496
+# version-aware readiness gate. As with --target-version above, the
+# safety comes from the agent's validation (message length cap + NUL
+# rejection AND strict `semver::Version::parse` on the version, both in
+# server.rs::announce_river_handler) plus the script's own re-parsing of
+# the flag (it strips a leading `v` and only ever string-compares the
+# value); not from sudoers.
 freenet-update ALL=(ian) NOPASSWD: /usr/local/bin/announce-to-river.sh *

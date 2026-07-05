@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034,SC2317
+# shellcheck disable=SC2034,SC2317,SC2329
 # ^ SC2034: FREENET_NODE_URL / NODE_WAIT_* / LOG_FILE are read by the functions
 #   extracted from announce-to-river.sh via `eval`; shellcheck cannot see
 #   into the eval and would otherwise flag them all as unused.
@@ -45,7 +45,13 @@ trap 'rm -rf "$TMP"' EXIT
 # Pull the two functions verbatim so the test runs the real code, not a
 # copy that could drift. Mirrors scripts/release_state_restore_test.sh.
 eval "$(awk '/^log\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+eval "$(awk '/^node_version\(\) \{/,/^}/' "$ANNOUNCE_SH")"
 eval "$(awk '/^wait_for_room\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+eval "$(awk '/^parse_args\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+
+# Default: no target version plumbed, so the streak-fallback tests below run
+# the fallback path. The version-aware section sets it explicitly.
+ANNOUNCE_TARGET_VERSION=""
 
 FAILURES=0
 check() {
@@ -123,27 +129,78 @@ read_room_state() {
     (( READ_CALLS > READ_FAIL_COUNT ))
 }
 
-# Room already readable: succeeds on the first probe.
+# ══════════════════════════════════════════════════════════════════════
+# Streak-fallback path (ANNOUNCE_TARGET_VERSION empty): the read-streak
+# heuristic used only when the target version was NOT plumbed through (a
+# legacy release-agent). It NARROWS the #4496 race but does not fully close
+# it; the version-aware section further below is the deterministic fix.
+# ══════════════════════════════════════════════════════════════════════
+ANNOUNCE_TARGET_VERSION=""
+
+# Room continuously readable: wait_for_room() must observe READ_STABLE_COUNT
+# consecutive successes before returning (the streak heuristic), so with a
+# clean node it probes exactly READ_STABLE_COUNT times.
+READ_STABLE_COUNT=3
 NODE_WAIT_ATTEMPTS=60
 READ_CALLS=0
 READ_FAIL_COUNT=0
 rc=0
 wait_for_room 2>/dev/null || rc=$?
-check "wait_for_room() succeeds when the room is already readable" "$rc" "0"
-check "wait_for_room() probes once when the room is readable" "$READ_CALLS" "1"
+check "wait_for_room() succeeds when the room is continuously readable" "$rc" "0"
+check "wait_for_room() requires READ_STABLE_COUNT consecutive readable probes" "$READ_CALLS" "3"
 
 # Room unreadable then readable: the poll bridges the restart window. This is
 # the case the old port-only probe got wrong — the read fails while the node
 # is mid-teardown, and only succeeds once the restarted node has the room.
+# With READ_STABLE_COUNT=3 and 3 leading failures it needs 3 fails + 3
+# successes = 6 probes.
+READ_STABLE_COUNT=3
 NODE_WAIT_ATTEMPTS=60
 READ_CALLS=0
 READ_FAIL_COUNT=3
 rc=0
 wait_for_room 2>/dev/null || rc=$?
-check "wait_for_room() succeeds once the room becomes readable" "$rc" "0"
-check "wait_for_room() keeps probing across the down-window" "$READ_CALLS" "4"
+check "wait_for_room() succeeds once the room becomes stably readable" "$rc" "0"
+check "wait_for_room() keeps probing across the down-window" "$READ_CALLS" "6"
+
+# ── #4496: early success against the OLD node must NOT satisfy the gate ──
+#
+# The residual race: release-announce and the gateway self-update fire on the
+# same event with no ordering. A lone successful read can be served by the OLD
+# node moments before the update stops the service. wait_for_room() must NOT
+# proceed on that transient success — the mid-teardown failure that follows
+# has to reset the streak so the post lands against the RESTARTED node.
+#
+# Stub the exact interleaving: success (old node) → 2 failures (teardown /
+# restart) → sustained successes (restarted node). A first-success gate
+# (pre-#4496) would return after probe 1 (READ_CALLS=1) and drop into the
+# teardown window. The sustained gate must ride through: 1 (old) + 2 (down)
+# + 3 (restarted streak) = 6 probes, and crucially MORE than 1.
+READ_STABLE_COUNT=3
+NODE_WAIT_ATTEMPTS=60
+# Custom stub: readable on probe 1, unreadable on 2-3, readable thereafter.
+read_room_state() {
+    READ_CALLS=$((READ_CALLS + 1))
+    if (( READ_CALLS == 1 )); then return 0; fi          # old node still up
+    if (( READ_CALLS <= 3 )); then return 1; fi          # teardown window
+    return 0                                             # restarted node
+}
+READ_CALLS=0
+rc=0
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() rides out a teardown that follows an early success (#4496)" "$rc" "0"
+check "wait_for_room() does not return on the first (old-node) success (#4496)" \
+    "$( (( READ_CALLS > 1 )) && echo yes || echo no )" "yes"
+check "wait_for_room() resets its streak on the teardown failure (#4496)" "$READ_CALLS" "6"
+
+# Restore the simple counting stub for the remaining cases.
+read_room_state() {
+    READ_CALLS=$((READ_CALLS + 1))
+    (( READ_CALLS > READ_FAIL_COUNT ))
+}
 
 # Room never readable: the poll gives up after NODE_WAIT_ATTEMPTS.
+READ_STABLE_COUNT=3
 NODE_WAIT_ATTEMPTS=3
 READ_CALLS=0
 READ_FAIL_COUNT=9999
@@ -151,6 +208,139 @@ rc=0
 wait_for_room 2>/dev/null || rc=$?
 check "wait_for_room() fails when the room never becomes readable" "$rc" "1"
 check "wait_for_room() honours NODE_WAIT_ATTEMPTS as the bound" "$READ_CALLS" "3"
+
+# A room readable only intermittently (never a full streak) must never satisfy
+# the gate — a flapping node is treated as not ready. Alternating pass/fail
+# with READ_STABLE_COUNT=3 can never reach a streak of 3.
+READ_STABLE_COUNT=3
+NODE_WAIT_ATTEMPTS=10
+READ_CALLS=0
+read_room_state() {
+    READ_CALLS=$((READ_CALLS + 1))
+    (( READ_CALLS % 2 == 0 ))   # fail, pass, fail, pass, ...
+}
+rc=0
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() never proceeds on a flapping (never-sustained) node (fallback)" "$rc" "1"
+# Restore the counting stub.
+read_room_state() {
+    READ_CALLS=$((READ_CALLS + 1))
+    (( READ_CALLS > READ_FAIL_COUNT ))
+}
+
+# Clamp invariant: READ_STABLE_COUNT > NODE_WAIT_ATTEMPTS must NOT make the
+# fallback gate unsatisfiable. Without the clamp the streak could never reach
+# threshold and a perfectly healthy, continuously-readable node would be
+# reported as never-ready. With the clamp the gate returns success.
+READ_STABLE_COUNT=100
+NODE_WAIT_ATTEMPTS=5
+READ_CALLS=0
+READ_FAIL_COUNT=0
+rc=0
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() clamps READ_STABLE_COUNT to NODE_WAIT_ATTEMPTS (satisfiable)" "$rc" "0"
+check "wait_for_room() returns at the clamped threshold, not the raw count" "$READ_CALLS" "5"
+
+# ══════════════════════════════════════════════════════════════════════
+# Version-aware path (ANNOUNCE_TARGET_VERSION set): the #4496 deterministic
+# fix. Readiness == the running node reports the TARGET version AND the room
+# is readable. The key property: an early read served by the OLD node — which
+# still reports the OLD version because the gateway update swaps the binary
+# only after stopping the service — MUST NOT satisfy the gate.
+# ══════════════════════════════════════════════════════════════════════
+
+TARGET="0.2.90"
+OLD="0.2.89"
+
+# NODE_VERSION_SEQ drives the node_version stub: one entry consumed per call.
+# The index is kept in a FILE, not a variable, because wait_for_room() invokes
+# node_version() via command substitution (`running="$(node_version)"`), which
+# runs in a subshell — a variable increment would be lost, but a file write
+# survives. read_room_state is stubbed per scenario.
+NV_IDX_FILE="$TMP/nv_idx"
+NODE_VERSION_SEQ=()
+node_version() {
+    local idx
+    idx="$(cat "$NV_IDX_FILE" 2>/dev/null || echo 0)"
+    printf '%s' "${NODE_VERSION_SEQ[$idx]:-}"
+    echo $((idx + 1)) > "$NV_IDX_FILE"
+}
+# Helper: reset the version-sequence cursor before each scenario.
+nv_reset() { echo 0 > "$NV_IDX_FILE"; }
+
+# Scenario A — the exact #4496 interleaving. The room is READABLE the whole
+# time (old node up, then restarted node up), but the version transitions
+# OLD → OLD → TARGET. A version-blind gate (or the streak heuristic if the
+# teardown never dropped the read) would post against the OLD node on probe 1.
+# The version gate must reject probes 1-2 (old version) and only proceed on
+# probe 3, when the node reports TARGET.
+ANNOUNCE_TARGET_VERSION="$TARGET"
+NODE_WAIT_ATTEMPTS=60
+READ_CALLS=0
+read_room_state() { READ_CALLS=$((READ_CALLS + 1)); return 0; }   # always readable
+NODE_VERSION_SEQ=("$OLD" "$OLD" "$TARGET" "$TARGET")
+nv_reset
+rc=0
+wait_for_room 2>/dev/null || rc=$?
+# node_version is checked FIRST and short-circuits read_room_state, so on the
+# OLD-version probes 1-2 the room read is never even attempted — the announce
+# provably cannot land against the old node. read_room_state fires only on
+# probe 3 (version now TARGET), so exactly one read occurs.
+check "wait_for_room() proceeds once the node reports the TARGET version (#4496)" "$rc" "0"
+check "wait_for_room() does NOT read/post against the OLD-version node (#4496)" "$READ_CALLS" "1"
+check "wait_for_room() consumed 3 version probes before proceeding (#4496)" \
+    "$(cat "$NV_IDX_FILE")" "3"
+
+# Scenario B — the room is readable AND the version is TARGET on probe 1 (the
+# announce arrives after the update already finished). Must return immediately,
+# on the very first probe — no gratuitous extra waiting once the node is on the
+# target version.
+ANNOUNCE_TARGET_VERSION="$TARGET"
+NODE_WAIT_ATTEMPTS=60
+READ_CALLS=0
+read_room_state() { READ_CALLS=$((READ_CALLS + 1)); return 0; }
+NODE_VERSION_SEQ=("$TARGET" "$TARGET")
+nv_reset
+rc=0
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() returns immediately when already on TARGET + readable (#4496)" "$rc" "0"
+check "wait_for_room() does not over-poll once ready (#4496)" "$READ_CALLS" "1"
+
+# Scenario C — node reaches TARGET version but the room is not YET readable
+# (restarted, still loading room state). The gate must keep waiting until BOTH
+# hold, not proceed on version alone.
+ANNOUNCE_TARGET_VERSION="$TARGET"
+NODE_WAIT_ATTEMPTS=60
+READ_CALLS=0
+# Room readable only from the 3rd probe; version is TARGET throughout.
+read_room_state() { READ_CALLS=$((READ_CALLS + 1)); (( READ_CALLS >= 3 )); }
+NODE_VERSION_SEQ=("$TARGET" "$TARGET" "$TARGET" "$TARGET")
+nv_reset
+rc=0
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() waits for the room even when version is TARGET (#4496)" "$rc" "0"
+check "wait_for_room() proceeds only once the room is also readable (#4496)" "$READ_CALLS" "3"
+
+# Scenario D — the node never reaches the target version within the budget
+# (update stalled). The gate must fail (exit 1) rather than posting against the
+# stuck old node.
+ANNOUNCE_TARGET_VERSION="$TARGET"
+NODE_WAIT_ATTEMPTS=4
+READ_CALLS=0
+read_room_state() { READ_CALLS=$((READ_CALLS + 1)); return 0; }   # readable but wrong version
+NODE_VERSION_SEQ=("$OLD" "$OLD" "$OLD" "$OLD" "$OLD")
+nv_reset
+rc=0
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() fails if the node never reaches TARGET (#4496)" "$rc" "1"
+
+# Restore the streak-fallback stubs / state for any later cases.
+ANNOUNCE_TARGET_VERSION=""
+node_version() { printf ''; }
+read_room_state() {
+    READ_CALLS=$((READ_CALLS + 1))
+    (( READ_CALLS > READ_FAIL_COUNT ))
+}
 
 # ── post_message() ───────────────────────────────────────────────────
 #
@@ -274,6 +464,54 @@ post_message() { return 0; }
 rc=0
 send_message_checked 2>/dev/null || rc=$?
 check "send_message_checked() returns 0 on a successful send" "$rc" "0"
+
+# ── parse_args(): --target-version flag + positional message (#4496) ──
+#
+# The version-aware readiness gate hinges on ANNOUNCE_TARGET_VERSION being
+# populated from the `--target-version <v>` flag the release-agent passes.
+# These drive the REAL extracted parser (not a copy), covering order-
+# tolerance, the leading-`v` strip, the `--` separator, and the two error
+# branches. `usage` exits 1 in production; the tests stub it to exit 42 so a
+# malformed invocation is observable as that code from a subshell without
+# printing the usage banner.
+
+# Flag BEFORE the message.
+MESSAGE=""; ANNOUNCE_TARGET_VERSION=""
+parse_args --target-version 0.2.90 "hello world"
+check "parse_args: flag before message sets the message" "$MESSAGE" "hello world"
+check "parse_args: flag before message sets the target version" "$ANNOUNCE_TARGET_VERSION" "0.2.90"
+
+# Flag AFTER the message (order-tolerance).
+MESSAGE=""; ANNOUNCE_TARGET_VERSION=""
+parse_args "second msg" --target-version 0.2.91
+check "parse_args: flag after message sets the message" "$MESSAGE" "second msg"
+check "parse_args: flag after message sets the target version" "$ANNOUNCE_TARGET_VERSION" "0.2.91"
+
+# Leading `v` is stripped (the agent may send `v0.2.92`).
+MESSAGE=""; ANNOUNCE_TARGET_VERSION=""
+parse_args --target-version v0.2.92 "msg"
+check "parse_args: leading 'v' is stripped from the target version" "$ANNOUNCE_TARGET_VERSION" "0.2.92"
+
+# No flag at all: message set, target version left empty (fallback path).
+MESSAGE=""; ANNOUNCE_TARGET_VERSION=""
+parse_args "plain message"
+check "parse_args: bare message leaves target version empty" "$ANNOUNCE_TARGET_VERSION" ""
+check "parse_args: bare message is captured" "$MESSAGE" "plain message"
+
+# `--` separator: the following token is the message even if flag-shaped.
+MESSAGE=""; ANNOUNCE_TARGET_VERSION=""
+parse_args --target-version 0.2.93 -- "--looks-like-a-flag"
+check "parse_args: -- lets a flag-shaped message through" "$MESSAGE" "--looks-like-a-flag"
+
+# Error branch: --target-version with no argument → usage (exit).
+rc=0
+( usage() { exit 42; }; parse_args --target-version ) >/dev/null 2>&1 || rc=$?
+check "parse_args: --target-version without an argument exits via usage" "$rc" "42"
+
+# Error branch: a second positional → usage (exit).
+rc=0
+( usage() { exit 42; }; parse_args "first" "second" ) >/dev/null 2>&1 || rc=$?
+check "parse_args: unexpected extra positional exits via usage" "$rc" "42"
 
 # ── result ───────────────────────────────────────────────────────────
 

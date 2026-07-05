@@ -141,6 +141,7 @@ jobs:
         env:
           SECRET: ${{ secrets.RELEASE_AGENT_HMAC_NOVA }}
           MESSAGE: ${{ needs.resolve.outputs.message }}
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
           if [[ -z "$SECRET" ]]; then
@@ -148,10 +149,19 @@ jobs:
             exit 0
           fi
           ISSUED_AT=$(date +%s)
+          # Forward the already-resolved target version so the nova
+          # release-agent can gate the River post on the RESTARTED node
+          # reporting this version (issue #4496). release-announce.yml and
+          # gateway-update.yml both fire on `release: published` with no
+          # ordering, so without the version the announce can read the room off
+          # the OLD node moments before the concurrent self-update tears it
+          # down. The agent re-validates VERSION as strict semver before
+          # forwarding it to announce-to-river.sh.
           BODY=$(jq -nc \
             --arg msg "$MESSAGE" \
+            --arg ver "$VERSION" \
             --argjson t "$ISSUED_AT" \
-            '{message: $msg, issued_at: $t}')
+            '{message: $msg, issued_at: $t, version: $ver}')
           SIG=$(printf '%s' "$BODY" \
             | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$SECRET" \
             | awk '{print $NF}')
