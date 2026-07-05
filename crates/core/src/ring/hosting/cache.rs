@@ -302,11 +302,10 @@ pub struct HostedContract {
     /// The abandonment hook drops the entry's `keep_score` to the current
     /// `eviction_floor` (stripping its demand credit) so that under budget
     /// pressure it is evicted before still-active entries, whose `keep_score` is
-    /// `floor + demand >= floor`. With strictly positive demand it sorts strictly
-    /// below them; when demand is zero (a far contract under a trained prior) it
-    /// ties an active entry at the floor, and the least-recently-accessed
-    /// tiebreak (`last_access_seq`) still tends to evict the abandoned entry
-    /// first (it has not been read since it lost its subscribers). Once past TTL,
+    /// `floor + demand`. The proximity prior (`predict`) is strictly positive, so
+    /// an active entry sorts strictly above an abandoned one at the floor; a
+    /// zero-demand tie is unreachable through the estimator (it could only arise
+    /// from an explicit zero handed in by a caller). Once past TTL,
     /// `evict_over_budget` picks the lowest `keep_score` first. Refreshing the
     /// entry via a read (`record_access` / `touch`) clears this field and
     /// restores its `keep_score` to `floor + predicted_demand`.
@@ -697,14 +696,25 @@ impl<T: TimeSource> HostingCache<T> {
             .unwrap_or(false)
     }
 
-    /// Touch/refresh a contract's demand without adding it if missing.
+    /// Touch/refresh a contract's demand without adding it if missing, using an
+    /// explicit freshly-derived `predicted_demand` (the proximity-prior estimate
+    /// for this contract's ring distance).
     ///
     /// Called when a user GET serves a hosted contract from local cache — the
     /// dominant read path for hot contracts. This is read-demand: it refreshes
-    /// the TTL clock and floats the contract's `keep_score` back to the frontier
-    /// (`eviction_floor + predicted_demand`, using the demand estimate stored at
-    /// the last `record_access`), counts the read, and clears any abandonment —
-    /// so actively requested contracts stay in the cache.
+    /// the TTL clock, updates the stored demand estimate to `predicted_demand`,
+    /// floats the contract's `keep_score` back to the frontier
+    /// (`eviction_floor + predicted_demand`), counts the read, and clears any
+    /// abandonment — so actively requested contracts stay in the cache.
+    ///
+    /// Refreshing the stored estimate (rather than reusing the old one) is what
+    /// lets a **restart-loaded entry** — inserted at `NEUTRAL_DEMAND` by
+    /// `load_persisted_entry` because this peer's location was unknown at load —
+    /// pick up the distance prior on its first local-serve read, exactly as
+    /// `record_access_with_demand` already does for the network-refetch path.
+    /// Without this, a persisted entry served only from local cache would sit at
+    /// neutral demand indefinitely and the cold-start distance prior would never
+    /// reach it (the restart-drift this fix closes).
     ///
     /// Returns the observed read-rate training sample (`read_count / residency`)
     /// the same way `record_access_with_demand` does, so the caller
@@ -712,7 +722,7 @@ impl<T: TimeSource> HostingCache<T> {
     /// local-serve path too — otherwise the prior would train only on network
     /// refetches and stay blind to the reads A3 is meant to model. `None` when
     /// the contract is absent or residency is zero.
-    pub fn touch(&mut self, key: &ContractKey) -> Option<f64> {
+    pub fn touch_with_demand(&mut self, key: &ContractKey, predicted_demand: f64) -> Option<f64> {
         let floor = self.eviction_floor;
         let seq = self.next_seq();
         let now = self.time_source.now();
@@ -720,14 +730,28 @@ impl<T: TimeSource> HostingCache<T> {
             existing.last_accessed = now;
             existing.last_access_seq = seq;
             existing.read_count = existing.read_count.saturating_add(1);
-            // A fresh touch is evidence of demand — clear any abandoned marker
-            // and refresh keep_score to the current frontier.
+            // A fresh touch is evidence of demand — clear any abandoned marker,
+            // refresh the stored demand estimate to the caller's freshly-derived
+            // prior, and float keep_score to the current frontier.
             existing.abandoned_at = None;
-            existing.keep_score = floor + existing.predicted_demand;
+            existing.predicted_demand = predicted_demand;
+            existing.keep_score = floor + predicted_demand;
             Self::rate_sample(existing.read_count, now, existing.inserted_at)
         } else {
             None
         }
+    }
+
+    /// Neutral-path convenience wrapper over
+    /// [`touch_with_demand`](Self::touch_with_demand) that reuses the entry's
+    /// STORED demand estimate (no fresh prior). Production goes through
+    /// `touch_with_demand` (the `HostingManager` supplies the proximity-prior
+    /// estimate); this wrapper serves the cache's own unit tests and any caller
+    /// that has no estimator handy.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn touch(&mut self, key: &ContractKey) -> Option<f64> {
+        let stored = self.contracts.get(key)?.predicted_demand;
+        self.touch_with_demand(key, stored)
     }
 
     /// Mark `key` as recently abandoned and strip its demand credit so it is the
@@ -738,11 +762,10 @@ impl<T: TimeSource> HostingCache<T> {
     /// in use" — the moment its `contract_in_use` predicate flips from
     /// `true` to `false`. The entry's `keep_score` is dropped to the current
     /// `eviction_floor` (zero demand credit), so among the credited band it
-    /// sorts first: a still-active entry keeps `floor + demand >= floor`, strictly
-    /// above when demand is positive, tying at the floor only when demand is zero
-    /// (there the least-recently-accessed tiebreak still favors evicting the
-    /// abandoned entry). The TTL gate in `evict_over_budget` still applies: an
-    /// abandoned entry within
+    /// sorts first: a still-active entry keeps `floor + demand`, and since the
+    /// proximity prior (`predict`) is strictly positive it sorts strictly above
+    /// the abandoned entry at the floor. The TTL gate in `evict_over_budget`
+    /// still applies: an abandoned entry within
     /// `min_ttl` of its last access is not yet eligible.
     ///
     /// No-op when `key` is absent (already evicted). Idempotent: calling
@@ -922,23 +945,38 @@ impl<T: TimeSource> HostingCache<T> {
         self.evict_over_budget(&should_retain)
     }
 
-    /// Load a contract entry from persisted data during startup.
+    /// Load a contract entry from persisted data during startup, using an
+    /// explicit cold `predicted_demand`.
     ///
     /// Unlike `record_access`, this uses a pre-computed last_accessed time
     /// and doesn't evict other contracts (we may be over budget after loading).
+    ///
+    /// A restart-loaded entry has no per-contract read evidence for this run, so
+    /// the **distance prior is its correct cold estimate** — the same estimate a
+    /// fresh contract at that ring distance would receive. The caller
+    /// (`HostingManager`) passes `predict(distance)` when this peer's own location
+    /// is already known at load, and `NEUTRAL_DEMAND` otherwise. At a cold
+    /// restart the location is typically not yet known, so this resolves to
+    /// neutral and the prior is applied lazily on the entry's first read
+    /// (`touch_with_demand` / `record_access_with_demand`); once the location is
+    /// known it seeds the prior at load directly.
     ///
     /// # Arguments
     /// * `key` - The contract key
     /// * `size_bytes` - Size of the contract state
     /// * `access_type` - How the contract was last accessed (GET/PUT/SUBSCRIBE)
     /// * `last_access_age` - How long ago the contract was last accessed
-    pub fn load_persisted_entry(
+    /// * `local_client_access` - Whether a local client accessed it pre-restart
+    /// * `predicted_demand` - Cold demand estimate (the distance prior, or
+    ///   `NEUTRAL_DEMAND` when this peer's location is unknown at load)
+    pub fn load_persisted_entry_with_demand(
         &mut self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
         last_access_age: Duration,
         local_client_access: bool,
+        predicted_demand: f64,
     ) {
         // Skip if already loaded (shouldn't happen, but defensive)
         if self.contracts.contains_key(&key) {
@@ -960,13 +998,14 @@ impl<T: TimeSource> HostingCache<T> {
             // Assigned a proper order by `finalize_loading` once all entries are
             // loaded (sorted by persisted recency). Temporary 0 until then.
             last_access_seq: 0,
-            // Loaded entries start with the neutral demand estimate at the
-            // current floor; the first live access re-scores them against the
-            // proximity prior. `last_accessed` (from the persisted age) is the
-            // tiebreak, so among equal (neutral) scores the oldest evicts first —
-            // the same recency ordering the old LRU load path produced.
-            keep_score: self.eviction_floor + NEUTRAL_DEMAND,
-            predicted_demand: NEUTRAL_DEMAND,
+            // Loaded entries start at the caller-supplied cold demand (the
+            // distance prior when this peer's location is known at load, else
+            // neutral). The first live read re-scores against the current prior.
+            // `last_accessed` (from the persisted age) is the tiebreak, so among
+            // equal scores the oldest evicts first — the same recency ordering
+            // the old LRU load path produced.
+            keep_score: self.eviction_floor + predicted_demand,
+            predicted_demand,
             // Reads observed this run start at zero; the persisted access_type
             // reflects the last pre-restart access, not this run's read count.
             read_count: 0,
@@ -987,6 +1026,30 @@ impl<T: TimeSource> HostingCache<T> {
 
         self.contracts.insert(key, contract);
         self.current_bytes = self.current_bytes.saturating_add(size_bytes);
+    }
+
+    /// Neutral-demand convenience wrapper over
+    /// [`load_persisted_entry_with_demand`](Self::load_persisted_entry_with_demand).
+    /// Production goes through the `_with_demand` form (the `HostingManager`
+    /// supplies the distance prior when its own location is known at load); this
+    /// wrapper serves callers/tests that have no demand estimate.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn load_persisted_entry(
+        &mut self,
+        key: ContractKey,
+        size_bytes: u64,
+        access_type: AccessType,
+        last_access_age: Duration,
+        local_client_access: bool,
+    ) {
+        self.load_persisted_entry_with_demand(
+            key,
+            size_bytes,
+            access_type,
+            last_access_age,
+            local_client_access,
+            NEUTRAL_DEMAND,
+        )
     }
 
     /// Finalize bulk loading: assign each loaded entry an access sequence in
@@ -1915,6 +1978,68 @@ mod tests {
         );
         assert!(cache.contains(&high), "high-demand contract must survive");
         assert!(!cache.contains(&low));
+    }
+
+    /// Cold-start ordering: with ZERO observed samples, two contracts at
+    /// different ring distances are separated purely by the analytic distance
+    /// prior, so under budget pressure the NEAR-key contract out-survives the
+    /// FAR-key one. This pins the intended cold-start eviction ordering that the
+    /// distance prior exists to produce (the restart-drift / under-retention fix)
+    /// AND documents the accepted demand-blind tradeoff behaviorally: because
+    /// neither contract has any per-contract read evidence yet (A4 is deferred),
+    /// a FAR-but-GET-hot contract could likewise be out-scored by an unread NEAR
+    /// one once past `min_ttl` — bounded by `min_ttl`, resolved when A4 lands.
+    #[test]
+    fn fuel_gauge_cold_start_keeps_near_key_over_far_key() {
+        // The demand values come straight from the cold estimator (no samples),
+        // so this exercises the real distance prior rather than hand-picked
+        // magic numbers.
+        let prior = super::super::demand::ProximityPrior::new();
+        assert_eq!(prior.len(), 0, "cold estimator has no samples");
+        let near_demand = prior.predict(0.02); // near this peer's key
+        let far_demand = prior.predict(0.45); // far from the key
+        assert!(
+            near_demand > far_demand,
+            "cold distance prior must slope down: near={near_demand}, far={far_demand}"
+        );
+
+        // Budget for exactly two 100-byte contracts.
+        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let near = make_key(1);
+        let far = make_key(2);
+        let trigger = make_key(3);
+
+        // Insert both cold (zero samples), scored only by the distance prior.
+        cache.record_access_with_demand(near, 100, AccessType::Get, 0, near_demand, |_| false);
+        cache.record_access_with_demand(far, 100, AccessType::Get, 0, far_demand, |_| false);
+        assert_eq!(cache.current_bytes(), 200);
+        assert!(
+            cache.get(&near).unwrap().keep_score > cache.get(&far).unwrap().keep_score,
+            "near-key contract must carry more cold demand credit than far-key"
+        );
+
+        // Age both past min_ttl so they are eviction-eligible; the trigger is
+        // age-0 and cannot be evicted by its own insert.
+        time.advance_time(Duration::from_secs(61));
+
+        let result = cache.record_access_with_demand(
+            trigger,
+            100,
+            AccessType::Get,
+            0,
+            NEUTRAL_DEMAND,
+            |_| false,
+        );
+        assert_eq!(
+            result.evicted,
+            vec![(far, 0)],
+            "cold start must evict the FAR-key contract (lower distance prior) first"
+        );
+        assert!(
+            cache.contains(&near),
+            "the NEAR-key contract out-survives the FAR-key one at cold start"
+        );
+        assert!(!cache.contains(&far));
     }
 
     /// The #4338 check at the cache level, written to actually DISCRIMINATE
