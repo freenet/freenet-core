@@ -40,6 +40,24 @@
 //! Hosting is BINARY throughout: [`ReconcileInputs::state_present`] means this
 //! peer holds the FULL contract (code + params + state), never a partial tier.
 //!
+//! ## Expected-by-design divergences (do NOT read as anomalies)
+//!
+//! Several divergence classes are EXPECTED because the on-`main` sites do not yet
+//! implement the controller's model — they are the delta the keystone closes, not
+//! bugs:
+//! - **`retract` / `reroot_search`**: no on-`main` driver retracts a hosting
+//!   advertisement on teardown or re-roots on upstream loss, so the controller
+//!   emits these where production does nothing.
+//! - **`renew` / `subscribe` / `unsubscribe`**: the controller's STRICT
+//!   downstream-demand gate (a downstream subscriber counts only when strictly
+//!   FARTHER from the key) and its lease-aware split (`Renew` iff we hold a
+//!   lease, else `Subscribe`) legitimately disagree with today's ANY-downstream,
+//!   renew-everything renewal path — that disagreement is the signal.
+//! - **`announce`**: a subscribed, state-present host that has not yet advertised
+//!   is a controller `Announce` with no per-tick production counterpart.
+//!
+//! Read the counters as the reconcile-vs-today delta, never as a health alarm.
+//!
 //! # Notes for the shadow-compare wiring (next sub-task)
 //!
 //! - **`Collapse` is the LOCAL teardown** (drop our lease, `ring.unsubscribe`);
@@ -383,16 +401,38 @@ pub(crate) fn action_set_divergence(
     reconcile_actions: &[Action],
     actual_actions: &[Action],
 ) -> ReconcileActionDivergence {
-    let differs = |a: Action| reconcile_actions.contains(&a) != actual_actions.contains(&a);
-    ReconcileActionDivergence {
-        subscribe: differs(Action::Subscribe),
-        renew: differs(Action::Renew),
-        unsubscribe: differs(Action::Unsubscribe),
-        collapse: differs(Action::Collapse),
-        announce: differs(Action::Announce),
-        retract: differs(Action::Retract),
-        reroot_search: differs(Action::ReRootSearch),
+    // Set the divergence flag for one Action class. The exhaustive `match` (NO
+    // wildcard) is load-bearing: adding a new `Action` variant fails to COMPILE
+    // here until it is wired into the flags, so a future action can never be
+    // silently left unmeasured by the shadow telemetry.
+    fn flag(div: &mut ReconcileActionDivergence, action: Action) {
+        match action {
+            Action::Subscribe => div.subscribe = true,
+            Action::Renew => div.renew = true,
+            Action::Unsubscribe => div.unsubscribe = true,
+            Action::Collapse => div.collapse = true,
+            Action::Announce => div.announce = true,
+            Action::Retract => div.retract = true,
+            Action::ReRootSearch => div.reroot_search = true,
+        }
     }
+
+    let mut div = ReconcileActionDivergence::default();
+    // Symmetric difference: an action in exactly one of the two sets. The two
+    // passes together cover both directions; an action in BOTH sets is flagged
+    // by neither, and duplicates within a slice are idempotent (`flag` just
+    // re-sets the same bool).
+    for &a in reconcile_actions {
+        if !actual_actions.contains(&a) {
+            flag(&mut div, a);
+        }
+    }
+    for &a in actual_actions {
+        if !reconcile_actions.contains(&a) {
+            flag(&mut div, a);
+        }
+    }
+    div
 }
 
 #[cfg(test)]

@@ -192,9 +192,13 @@ pub struct NetworkStatus {
     /// Computed-upstream vs. stored-`is_upstream`-flag divergence counters
     /// (hosting redesign piece D, #4642 / #4671).
     pub upstream_divergence_stats: UpstreamDivergenceStats,
-    /// Reconcile-controller SHADOW comparison counters (hosting redesign
-    /// keystone step-2, #4642).
-    pub reconcile_shadow_stats: ReconcileShadowStats,
+    /// Reconcile-controller SHADOW comparison counters, split PER SITE (hosting
+    /// redesign keystone step-2, #4642). The FLIP is site-by-site (collapse
+    /// first, then renewal), so each site's divergence must be separately
+    /// gate-able — a single global tally would be dominated by the renewal set
+    /// size and hide the collapse-site signal.
+    pub reconcile_shadow_collapse: ReconcileShadowStats,
+    pub reconcile_shadow_renewal: ReconcileShadowStats,
 }
 
 /// Per-node counters measuring how often the demand-driven-hosting **computed
@@ -218,8 +222,19 @@ pub struct UpstreamDivergenceStats {
     pub divergences: u64,
 }
 
-/// Per-node counters for the reconcile-controller SHADOW comparison (hosting
-/// redesign keystone step-2, #4642).
+/// Which decision site a reconcile shadow comparison came from. The FLIP is
+/// site-by-site, so the counters are split per site (keystone step-2, #4642).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileShadowSite {
+    /// The interest-gated collapse (`OpManager::send_unsubscribe_upstream`).
+    Collapse,
+    /// The subscription-renewal set (`Ring::contracts_needing_renewal`, driven
+    /// by the recovery loop).
+    Renewal,
+}
+
+/// Per-node counters for the reconcile-controller SHADOW comparison AT ONE SITE
+/// (hosting redesign keystone step-2, #4642).
 ///
 /// At each on-`main` hosting decision site the shadow wiring builds a
 /// `ReconcileInputs` snapshot, computes what the pure `reconcile` controller
@@ -228,7 +243,8 @@ pub struct UpstreamDivergenceStats {
 /// real-world divergence from today's scattered decisions is legible in
 /// production telemetry (via `router_snapshot`) BEFORE any decision is flipped
 /// to the controller. The current code still drives every decision; these
-/// observe only.
+/// observe only. Held once PER SITE (`ReconcileShadowSite`) because the flip is
+/// site-by-site and each site must be separately gate-able.
 ///
 /// Volume-conscious: the decision sites increment these local counters
 /// in-process (NO per-event telemetry emission); only the aggregate totals are
@@ -236,15 +252,26 @@ pub struct UpstreamDivergenceStats {
 ///
 /// The per-action counters are SYMMETRIC-DIFFERENCE tallies: each counts the
 /// comparisons in which that action was present in exactly one of the
-/// {reconcile, actual} sets. Because the on-`main` sites do not yet implement
-/// several controller actions (a collapse never `Retract`s a hosting
-/// advertisement; nothing re-roots on upstream loss), a nonzero divergence on
-/// those classes is EXPECTED field evidence of the gap the keystone closes, not
-/// a health alarm — read them as the reconcile-vs-today delta.
+/// {reconcile, actual} sets. Several classes diverge BY DESIGN and are field
+/// evidence of the gap the keystone closes, NOT a health alarm — read them as
+/// the reconcile-vs-today delta:
+/// - `retract` / `reroot_search`: no on-`main` driver retracts on teardown or
+///   re-roots on upstream loss.
+/// - `renew` / `subscribe` / `unsubscribe`: the controller's strict
+///   downstream-demand gate and lease-aware `Renew`-vs-`Subscribe` split
+///   legitimately disagree with today's ANY-downstream, renew-everything path.
+/// - `announce`: a subscribed, state-present, not-yet-advertised host.
+///
+/// `retract_diffs` CAVEAT: it measures collapse/renewal of a contract that was
+/// EVER announced, not one with a currently-live advertisement — `is_advertised`
+/// (`NeighborHostingManager::is_hosted_locally`) is effectively MONOTONIC in
+/// production today, because its only clearer (`on_contract_unhosted`) is
+/// dead/test-only until the flip wires the `Retract` action. So a nonzero
+/// `retract_diffs` reflects the missing retraction driver, as intended.
 #[derive(Default, Clone, Copy)]
 pub struct ReconcileShadowStats {
-    /// Total shadow comparisons performed (the denominator — one per decision
-    /// site invocation).
+    /// Total shadow comparisons performed at this site (the denominator — one
+    /// per decision site invocation).
     pub comparisons: u64,
     /// Of those, the comparisons whose reconcile action set differed from the
     /// actual behavior's set in ANY action class.
@@ -421,7 +448,8 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         nat_stats: NatStats::default(),
         terminal_consult_stats: TerminalConsultStats::default(),
         upstream_divergence_stats: UpstreamDivergenceStats::default(),
-        reconcile_shadow_stats: ReconcileShadowStats::default(),
+        reconcile_shadow_collapse: ReconcileShadowStats::default(),
+        reconcile_shadow_renewal: ReconcileShadowStats::default(),
     };
     match NETWORK_STATUS.get() {
         // Already initialized: overwrite the existing tracker in place so
@@ -670,20 +698,25 @@ pub fn upstream_divergence_counts() -> Option<(u64, u64)> {
     Some((d.comparisons, d.divergences))
 }
 
-/// Record one reconcile-controller SHADOW comparison (keystone step-2, #4642).
+/// Record one reconcile-controller SHADOW comparison AT `site` (keystone
+/// step-2, #4642).
 ///
-/// Increments the `comparisons` denominator every call, the `divergences`
-/// numerator when the reconcile action set differed from the actual behavior's
-/// set in any action class, and each per-action tally whose class was in the
-/// symmetric difference. Behavior-preserving — the current code drives the
-/// decision; this only measures how far the controller WOULD diverge, so the
-/// gap is legible in production telemetry ahead of the flip. Called from the
-/// on-`main` hosting decision sites (collapse `send_unsubscribe_upstream`,
-/// renewal `contracts_needing_renewal`).
-pub fn record_reconcile_shadow_comparison(divergence: ReconcileActionDivergence) {
+/// Increments that site's `comparisons` denominator every call, its
+/// `divergences` numerator when the reconcile action set differed from the
+/// actual behavior's set in any action class, and each per-action tally whose
+/// class was in the symmetric difference. Behavior-preserving — the current code
+/// drives the decision; this only measures how far the controller WOULD diverge,
+/// so the gap is legible in production telemetry ahead of the site-by-site flip.
+pub fn record_reconcile_shadow_comparison(
+    site: ReconcileShadowSite,
+    divergence: ReconcileActionDivergence,
+) {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
-            let r = &mut s.reconcile_shadow_stats;
+            let r = match site {
+                ReconcileShadowSite::Collapse => &mut s.reconcile_shadow_collapse,
+                ReconcileShadowSite::Renewal => &mut s.reconcile_shadow_renewal,
+            };
             r.comparisons = r.comparisons.saturating_add(1);
             if divergence.any() {
                 r.divergences = r.divergences.saturating_add(1);
@@ -713,15 +746,15 @@ pub fn record_reconcile_shadow_comparison(divergence: ReconcileActionDivergence)
     }
 }
 
-/// Read the reconcile-controller SHADOW counters (keystone step-2, #4642) for
-/// export to the `router_snapshot` telemetry event. Returns a copy of the
-/// per-node monotonic totals, or `None` before the `NETWORK_STATUS` singleton is
-/// initialized. `Ring` polls this on the snapshot cadence and copies the values
-/// onto `RouterSnapshotInfo`.
-pub fn reconcile_shadow_counts() -> Option<ReconcileShadowStats> {
+/// Read the per-site reconcile-controller SHADOW counters (keystone step-2,
+/// #4642) for export to the `router_snapshot` telemetry event. Returns
+/// `(collapse, renewal)` copies of the per-node monotonic totals, or `None`
+/// before the `NETWORK_STATUS` singleton is initialized. `Ring` polls this on the
+/// snapshot cadence and copies the values onto `RouterSnapshotInfo`.
+pub fn reconcile_shadow_counts() -> Option<(ReconcileShadowStats, ReconcileShadowStats)> {
     let status = NETWORK_STATUS.get()?;
     let s = status.read().ok()?;
-    Some(s.reconcile_shadow_stats)
+    Some((s.reconcile_shadow_collapse, s.reconcile_shadow_renewal))
 }
 
 /// Record a NAT traversal attempt.
@@ -1525,53 +1558,65 @@ mod tests {
         );
     }
 
-    /// End-to-end for the reconcile-controller SHADOW counters (keystone step-2,
-    /// #4642): the record site must feed the `reconcile_shadow_counts()` getter
-    /// that `Ring` polls for the `router_snapshot` export. `comparisons` bumps
-    /// every call, `divergences` only when any action class diverged, and each
+    /// End-to-end for the per-site reconcile-controller SHADOW counters (keystone
+    /// step-2, #4642): the record site must feed the `reconcile_shadow_counts()`
+    /// getter that `Ring` polls for the `router_snapshot` export. `comparisons`
+    /// bumps every call, `divergences` only when any action class diverged, each
     /// per-action tally bumps only when that class is in the symmetric
-    /// difference — so a dropped increment or a mis-wired per-action field fails
+    /// difference, and — crucially — the two SITES are tallied INDEPENDENTLY (a
+    /// collapse-site record must not bleed into the renewal-site counters). So a
+    /// dropped increment, a mis-wired per-action field, or a crossed site fails
     /// here rather than silently emitting zeros in production.
     #[test]
     fn reconcile_shadow_counts_reflect_recorded_events() {
+        use ReconcileShadowSite::*;
         let _lock = TEST_MUTEX.lock().unwrap();
         init(31337, HashSet::new(), "test".to_string());
 
-        let zero = reconcile_shadow_counts().expect("counters present after init");
+        let (collapse0, renewal0) = reconcile_shadow_counts().expect("counters present after init");
         assert_eq!(
-            (zero.comparisons, zero.divergences),
+            (collapse0.comparisons, renewal0.comparisons),
             (0, 0),
-            "counters start at zero after init"
+            "both sites start at zero after init"
         );
 
-        // No divergence: bumps comparisons only.
-        record_reconcile_shadow_comparison(ReconcileActionDivergence::default());
-        // Retract-only divergence (the collapse-site gap).
-        record_reconcile_shadow_comparison(ReconcileActionDivergence {
-            retract: true,
-            ..Default::default()
-        });
-        // Subscribe + Renew divergence (the renewal-site not-subscribed case).
-        record_reconcile_shadow_comparison(ReconcileActionDivergence {
-            subscribe: true,
-            renew: true,
-            ..Default::default()
-        });
+        // Collapse site: 2 comparisons, 1 diverging (retract-only gap).
+        record_reconcile_shadow_comparison(Collapse, ReconcileActionDivergence::default());
+        record_reconcile_shadow_comparison(
+            Collapse,
+            ReconcileActionDivergence {
+                retract: true,
+                ..Default::default()
+            },
+        );
+        // Renewal site: 1 comparison, diverging (not-subscribed → Subscribe+Renew).
+        record_reconcile_shadow_comparison(
+            Renewal,
+            ReconcileActionDivergence {
+                subscribe: true,
+                renew: true,
+                ..Default::default()
+            },
+        );
 
-        let c = reconcile_shadow_counts().expect("counters present");
-        assert_eq!(c.comparisons, 3, "every call bumps comparisons");
+        let (collapse, renewal) = reconcile_shadow_counts().expect("counters present");
+
+        // Collapse site tallies only the collapse-site records.
+        assert_eq!(collapse.comparisons, 2, "collapse site: every call bumps");
+        assert_eq!(collapse.divergences, 1, "collapse site: one diverging call");
+        assert_eq!(collapse.retract_diffs, 1);
+        assert_eq!(collapse.subscribe_diffs, 0);
+        assert_eq!(collapse.renew_diffs, 0);
+
+        // Renewal site is independent — the collapse records must not bleed in.
         assert_eq!(
-            c.divergences, 2,
-            "only the two diverging calls bump divergences"
+            renewal.comparisons, 1,
+            "renewal site independent of collapse"
         );
-        assert_eq!(c.retract_diffs, 1);
-        assert_eq!(c.subscribe_diffs, 1);
-        assert_eq!(c.renew_diffs, 1);
-        // Untouched classes stay at zero.
-        assert_eq!(c.unsubscribe_diffs, 0);
-        assert_eq!(c.collapse_diffs, 0);
-        assert_eq!(c.announce_diffs, 0);
-        assert_eq!(c.reroot_search_diffs, 0);
+        assert_eq!(renewal.divergences, 1);
+        assert_eq!(renewal.subscribe_diffs, 1);
+        assert_eq!(renewal.renew_diffs, 1);
+        assert_eq!(renewal.retract_diffs, 0);
     }
 
     #[test]

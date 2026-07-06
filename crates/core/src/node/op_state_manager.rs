@@ -815,16 +815,30 @@ impl OpManager {
     }
 
     /// Build a [`reconcile::ReconcileInputs`] snapshot for `contract` from live
-    /// node state (keystone step-2, #4642, shadow-mode wiring).
+    /// node state (keystone step-2, #4642, shadow-mode wiring), or `None` when
+    /// the snapshot would be DISTANCE-BLIND and therefore unmeasurable.
     ///
     /// Reads the live maps ONCE into plain values so `reconcile` stays a pure
     /// function. Behavior-preserving: this only reads state; it drives nothing.
     /// Hosting is binary — `state_present` is `true` only when this peer holds
     /// the FULL contract (code + params + state), never a partial tier.
+    ///
+    /// Returns `None` when our OWN ring location is unknown (startup / no observed
+    /// address yet): without it the distance-derived fields — the computed
+    /// upstream, the verified-root check, and the strict-farther downstream gate —
+    /// are ALL unmeasurable. Defaulting the strict gate in that state would MASK
+    /// the mutual-co-host divergence the telemetry exists to reveal, so the caller
+    /// SKIPS the shadow comparison for that contract this tick rather than
+    /// recording noise. A later flip-time builder must handle unknown-location
+    /// explicitly (e.g. defer the reconcile), never count-all.
     pub(crate) fn build_reconcile_inputs(
         &self,
         contract: &ContractKey,
-    ) -> reconcile::ReconcileInputs {
+    ) -> Option<reconcile::ReconcileInputs> {
+        // Distance-blind guard: resolve our own location once up front; if it is
+        // unknown the whole snapshot is unmeasurable (see doc above).
+        let my_location = self.ring.connection_manager.own_location().location()?;
+
         let instance_id = *contract.id();
         let hosting_neighbors = self
             .neighbor_hosting
@@ -833,10 +847,11 @@ impl OpManager {
             .ring
             .most_keyward_hosting_neighbor(&instance_id, &hosting_neighbors);
 
-        reconcile::ReconcileInputs {
+        Some(reconcile::ReconcileInputs {
             computed_upstream,
             has_local_client: self.ring.has_client_subscriptions(contract),
-            has_farther_downstream_subscriber: self.has_farther_downstream_subscriber(contract),
+            has_farther_downstream_subscriber: self
+                .has_farther_downstream_subscriber(contract, my_location),
             state_present: self.ring.contract_state_present(contract),
             is_subscribed: self.ring.is_subscribed(contract),
             is_advertised: self.neighbor_hosting.is_hosted_locally(contract),
@@ -846,40 +861,36 @@ impl OpManager {
             // addition), so this is always false in shadow mode. See
             // `ReconcileInputs::actively_acquiring`.
             actively_acquiring: false,
-        }
+        })
     }
 
     /// Whether at least one lease-valid downstream subscriber is STRICTLY FARTHER
     /// from the contract key than this peer — the piece-D H2 interest gate.
     ///
-    /// Resolves each lease-valid downstream subscriber to its location and keeps
-    /// only those strictly farther from the key than us (the closer/upstream peer
-    /// is excluded, so mutual co-hosts cannot perpetuate each other's leases; see
+    /// `my_location` is this peer's ring location, resolved ONCE by the caller
+    /// ([`build_reconcile_inputs`](Self::build_reconcile_inputs), which returns
+    /// `None` and skips the whole comparison when it is unknown). Resolves each
+    /// lease-valid downstream subscriber to its location and keeps only those
+    /// strictly farther from the key than us (the closer/upstream peer is
+    /// EXCLUDED, so mutual co-hosts cannot perpetuate each other's leases; see
     /// [`has_strictly_farther`]). The distance filter uses EXACT `Distance`
     /// ordering, never epsilon `==`.
-    fn has_farther_downstream_subscriber(&self, contract: &ContractKey) -> bool {
+    fn has_farther_downstream_subscriber(
+        &self,
+        contract: &ContractKey,
+        my_location: Location,
+    ) -> bool {
         let subscribers = self.ring.downstream_subscriber_peers(contract);
         if subscribers.is_empty() {
             return false;
         }
         let contract_location = Location::from(contract);
-        // Own location, derived from our observed socket address — the same
-        // source `most_keyward_hosting_neighbor` / `is_subscription_root` use.
-        // When it is unknown (startup / no observed address yet) we cannot apply
-        // the strict distance filter, so fall back to "any lease-valid downstream
-        // subscriber present" (the current-code `has_downstream_subscribers`
-        // semantics) to avoid a spurious collapse divergence during that
-        // transient — the same own_location edge-noise the #4671 upstream-
-        // divergence caveat documents.
-        let Some(my_location) = self.ring.connection_manager.own_location().location() else {
-            return true;
-        };
         let my_distance: Distance = my_location.distance(contract_location);
         // A subscriber we can't currently resolve to a connected location (it
         // disconnected but its lease has not expired) is skipped, not assumed
-        // farther. Known dilution edge, same noise class as own_location above:
-        // the case the strict filter targets — a CONNECTED closer co-host that is
-        // our upstream — always resolves, so skipping stragglers is safe.
+        // farther. Known dilution edge: the case the strict filter targets — a
+        // CONNECTED closer co-host that is our upstream — always resolves, so
+        // skipping stragglers is safe.
         let subscriber_distances = subscribers.iter().filter_map(|peer| {
             self.ring
                 .connection_manager
@@ -946,32 +957,44 @@ impl OpManager {
         }
 
         // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
-        // COLLAPSE site. This function is the interest-gated collapse: every
-        // path drops the local lease (`ring.unsubscribe` = `Collapse`) and, when
-        // a stored upstream exists, sends a wire `Unsubscribe`. Build the
+        // COLLAPSE site. This function is the interest-gated collapse. Build the
         // reconcile snapshot, compute what the pure controller would do, and
         // compare BY SET MEMBERSHIP. DRIVES NOTHING — the teardown below runs
-        // unchanged.
+        // unchanged. Skipped when the snapshot is distance-blind
+        // (`build_reconcile_inputs` returns `None`: own-location unknown), so a
+        // startup transient does not pollute the collapse-site signal.
         //
-        // Actual→Action mapping (intent-level): `{Collapse, Unsubscribe}` when a
-        // stored upstream was located, else `{Collapse}`. The rare edge where a
-        // located upstream fails later address resolution still collapses
-        // locally (no wire send) but is folded into `{Collapse, Unsubscribe}`
-        // here — it is not worth a separate terminal-point mapping. This site
-        // NEVER retracts a hosting advertisement, so reconcile's `Retract`
-        // (emitted when `is_advertised`) is a genuine gap this shadow records,
-        // not an artifact; likewise the `Unsubscribe` diff captures the stored-
-        // vs-computed upstream disagreement (#4671) at action granularity.
-        {
-            let inputs = self.build_reconcile_inputs(contract);
+        // Actual→Action mapping (mirrors what this function actually EFFECTS):
+        //   - `Collapse` iff we hold a lease at snapshot (`is_subscribed`):
+        //     `ring.unsubscribe` is a NO-OP when not subscribed (hosting.rs), and
+        //     reconcile likewise emits `Collapse` only for a held lease — so a
+        //     verified-root / hosted-only (not-subscribed) contract collapsing on
+        //     last-client-leave must NOT record a false `collapse` diff, keeping
+        //     `collapse_diffs` the clean "controller would collapse a real lease"
+        //     signal.
+        //   - `Unsubscribe` iff a stored upstream was located (`upstream.is_some()`):
+        //     the wire `Unsubscribe` is sent whenever the stored flag resolves an
+        //     upstream, regardless of `is_subscribed`. The rare edge where a
+        //     located upstream fails later address resolution still counts as the
+        //     intent to unsubscribe. The `unsubscribe` diff thus captures the
+        //     stored-vs-computed upstream disagreement (#4671) at action
+        //     granularity.
+        // This site NEVER retracts a hosting advertisement, so reconcile's
+        // `Retract` (emitted when `is_advertised`) is a genuine recorded gap.
+        if let Some(inputs) = self.build_reconcile_inputs(contract) {
             let reconcile_actions = reconcile::reconcile(&inputs);
-            let actual_actions: &[reconcile::Action] = if upstream.is_some() {
-                &[reconcile::Action::Collapse, reconcile::Action::Unsubscribe]
-            } else {
-                &[reconcile::Action::Collapse]
-            };
-            let divergence = reconcile::action_set_divergence(&reconcile_actions, actual_actions);
-            crate::node::network_status::record_reconcile_shadow_comparison(divergence);
+            let mut actual_actions: Vec<reconcile::Action> = Vec::new();
+            if inputs.is_subscribed {
+                actual_actions.push(reconcile::Action::Collapse);
+            }
+            if upstream.is_some() {
+                actual_actions.push(reconcile::Action::Unsubscribe);
+            }
+            let divergence = reconcile::action_set_divergence(&reconcile_actions, &actual_actions);
+            crate::node::network_status::record_reconcile_shadow_comparison(
+                crate::node::network_status::ReconcileShadowSite::Collapse,
+                divergence,
+            );
             if divergence.any() {
                 tracing::debug!(
                     contract = %contract,

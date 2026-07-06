@@ -402,6 +402,67 @@ fn most_keyward_among(
         .map(|(pkl, _)| pkl)
 }
 
+/// Map a renewal-loop per-tick outcome to the Action set the reconcile
+/// controller is compared against in shadow mode (keystone step-2, #4642).
+///
+/// `acted` = the loop spawned a fresh SUBSCRIBE for this contract THIS TICK (vs
+/// skipped/deferred → nothing). `run_renewal_subscribe` issues a real SUBSCRIBE,
+/// which per [`reconcile::Action`]'s docs is `Renew` when we already hold the
+/// lease and `Subscribe` when we do not — so a section-2/3 not-subscribed entry
+/// maps to `Subscribe`, never a phantom `Renew`.
+fn renewal_shadow_actual(acted: bool, is_subscribed: bool) -> &'static [reconcile::Action] {
+    match (acted, is_subscribed) {
+        (false, _) => &[],
+        (true, true) => &[reconcile::Action::Renew],
+        (true, false) => &[reconcile::Action::Subscribe],
+    }
+}
+
+/// Record one reconcile-controller SHADOW comparison for the RENEWAL site
+/// (keystone step-2, #4642), respecting the per-tick sample `budget`. DRIVES
+/// NOTHING: it builds a [`reconcile::ReconcileInputs`] snapshot, computes what
+/// the controller WOULD do, maps the loop's per-tick outcome to an Action set
+/// via [`renewal_shadow_actual`], and records only the set-membership
+/// divergence.
+///
+/// Skips (without consuming budget) when the snapshot is distance-blind — an
+/// unknown own-location makes the computed upstream / verified-root / strict
+/// downstream-demand fields unmeasurable, so recording then would be noise
+/// (`build_reconcile_inputs` returns `None`). Otherwise consumes one unit of
+/// `budget`; when the budget is exhausted the remaining contracts this tick are
+/// left unmeasured (they rotate in on later ticks via the renewal-set shuffle).
+fn record_renewal_shadow(
+    op_manager: &crate::node::OpManager,
+    budget: &mut usize,
+    contract: &ContractKey,
+    acted: bool,
+) {
+    if *budget == 0 {
+        return;
+    }
+    let Some(inputs) = op_manager.build_reconcile_inputs(contract) else {
+        // Distance-blind snapshot (own-location unknown): unmeasurable this tick,
+        // don't pollute the signal. Not counted against the budget.
+        return;
+    };
+    *budget -= 1;
+    let reconcile_actions = reconcile::reconcile(&inputs);
+    let actual = renewal_shadow_actual(acted, inputs.is_subscribed);
+    let divergence = reconcile::action_set_divergence(&reconcile_actions, actual);
+    crate::node::network_status::record_reconcile_shadow_comparison(
+        crate::node::network_status::ReconcileShadowSite::Renewal,
+        divergence,
+    );
+    if divergence.any() {
+        tracing::debug!(
+            %contract,
+            ?reconcile_actions,
+            ?actual,
+            "reconcile shadow diverges from actual renewal outcome (#4642 keystone step-2)"
+        );
+    }
+}
+
 /// Race an `.await` point in a background loop against the Ring shutdown
 /// token. Returns `true` if shutdown fired (the caller should stop its loop)
 /// and `false` if the wrapped future completed first (carry on).
@@ -1639,29 +1700,46 @@ impl Ring {
                 snapshot.upstream_computed_vs_stored_divergences = Some(divergences);
             }
 
-            // Reconcile-controller SHADOW comparison counters (keystone step-2,
-            // #4642). Recorded at the on-`main` hosting decision sites (collapse
-            // via `send_unsubscribe_upstream`, renewal via
+            // Reconcile-controller SHADOW comparison counters, split PER SITE
+            // (keystone step-2, #4642). Recorded at the on-`main` hosting decision
+            // sites (collapse via `send_unsubscribe_upstream`, renewal via
             // `contracts_needing_renewal`) where the pure `reconcile` controller
             // is run in parallel and compared BY SET MEMBERSHIP to the current
             // behavior; exported here so the controller's real-world divergence
             // from today's scattered decisions is legible in central telemetry
-            // BEFORE any decision is flipped to it. Same hand-mirror footgun as
-            // the counters above — a new `RouterSnapshotInfo` field is invisible
-            // to the collector unless added here AND in `event_kind_to_json`
-            // (pinned by `router_snapshot_json_includes_reconcile_shadow_counters`).
-            // Read from the per-node network_status singleton; `None` only before
-            // it is initialized.
-            if let Some(r) = crate::node::network_status::reconcile_shadow_counts() {
-                snapshot.reconcile_shadow_comparisons = Some(r.comparisons);
-                snapshot.reconcile_shadow_divergences = Some(r.divergences);
-                snapshot.reconcile_shadow_subscribe_diffs = Some(r.subscribe_diffs);
-                snapshot.reconcile_shadow_renew_diffs = Some(r.renew_diffs);
-                snapshot.reconcile_shadow_unsubscribe_diffs = Some(r.unsubscribe_diffs);
-                snapshot.reconcile_shadow_collapse_diffs = Some(r.collapse_diffs);
-                snapshot.reconcile_shadow_announce_diffs = Some(r.announce_diffs);
-                snapshot.reconcile_shadow_retract_diffs = Some(r.retract_diffs);
-                snapshot.reconcile_shadow_reroot_search_diffs = Some(r.reroot_search_diffs);
+            // BEFORE any decision is flipped to it. Split per site because the
+            // flip is site-by-site and each must be separately gate-able. Same
+            // hand-mirror footgun as the counters above — a new
+            // `RouterSnapshotInfo` field is invisible to the collector unless
+            // added here AND in `event_kind_to_json` (pinned by
+            // `router_snapshot_json_includes_reconcile_shadow_counters`). Read
+            // from the per-node network_status singleton; `None` only before it is
+            // initialized.
+            if let Some((collapse, renewal)) =
+                crate::node::network_status::reconcile_shadow_counts()
+            {
+                snapshot.reconcile_shadow_collapse_comparisons = Some(collapse.comparisons);
+                snapshot.reconcile_shadow_collapse_divergences = Some(collapse.divergences);
+                snapshot.reconcile_shadow_collapse_subscribe_diffs = Some(collapse.subscribe_diffs);
+                snapshot.reconcile_shadow_collapse_renew_diffs = Some(collapse.renew_diffs);
+                snapshot.reconcile_shadow_collapse_unsubscribe_diffs =
+                    Some(collapse.unsubscribe_diffs);
+                snapshot.reconcile_shadow_collapse_collapse_diffs = Some(collapse.collapse_diffs);
+                snapshot.reconcile_shadow_collapse_announce_diffs = Some(collapse.announce_diffs);
+                snapshot.reconcile_shadow_collapse_retract_diffs = Some(collapse.retract_diffs);
+                snapshot.reconcile_shadow_collapse_reroot_search_diffs =
+                    Some(collapse.reroot_search_diffs);
+                snapshot.reconcile_shadow_renewal_comparisons = Some(renewal.comparisons);
+                snapshot.reconcile_shadow_renewal_divergences = Some(renewal.divergences);
+                snapshot.reconcile_shadow_renewal_subscribe_diffs = Some(renewal.subscribe_diffs);
+                snapshot.reconcile_shadow_renewal_renew_diffs = Some(renewal.renew_diffs);
+                snapshot.reconcile_shadow_renewal_unsubscribe_diffs =
+                    Some(renewal.unsubscribe_diffs);
+                snapshot.reconcile_shadow_renewal_collapse_diffs = Some(renewal.collapse_diffs);
+                snapshot.reconcile_shadow_renewal_announce_diffs = Some(renewal.announce_diffs);
+                snapshot.reconcile_shadow_renewal_retract_diffs = Some(renewal.retract_diffs);
+                snapshot.reconcile_shadow_renewal_reroot_search_diffs =
+                    Some(renewal.reroot_search_diffs);
             }
 
             // Keep the hosting manager's copy of our own ring location current so
@@ -2098,37 +2176,6 @@ impl Ring {
                 continue;
             };
 
-            // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
-            // RENEWAL site — the highest-signal one: it exercises the #3763
-            // interest gate. For every contract the current renewal set wants
-            // renewed, the actual behavior maps to the Action set `{Renew}`; we
-            // build the reconcile snapshot, compute what the pure controller
-            // would do, and record the set-membership divergence. DRIVES
-            // NOTHING — the batch renewal loop below is unchanged. A renewal the
-            // controller would NOT keep alive (e.g. a section-2/3 not-subscribed
-            // contract the controller would `Subscribe`/`ReRootSearch` instead,
-            // or one in use only via a strictly-CLOSER downstream subscriber) is
-            // exactly the drift the computed-upstream / strict-farther model
-            // corrects — expected, recorded, not a bug. Bounded per tick (30s
-            // cadence × renewal-set size); local counter increments only, no
-            // per-event telemetry emission.
-            for contract in &contracts_needing_renewal {
-                let inputs = op_manager.build_reconcile_inputs(contract);
-                let reconcile_actions = reconcile::reconcile(&inputs);
-                let divergence = reconcile::action_set_divergence(
-                    &reconcile_actions,
-                    &[reconcile::Action::Renew],
-                );
-                crate::node::network_status::record_reconcile_shadow_comparison(divergence);
-                if divergence.any() {
-                    tracing::debug!(
-                        %contract,
-                        ?reconcile_actions,
-                        "reconcile shadow diverges from actual renewal ({{Renew}}) (#4642 keystone step-2)"
-                    );
-                }
-            }
-
             // Backpressure: reduce batch size when the notification channel is
             // congested, but never skip entirely. Renewals are critical-path —
             // skipping a full cycle when the channel is busy lets subscriptions
@@ -2157,6 +2204,22 @@ impl Ring {
 
             let mut attempted = 0;
             let mut skipped = 0;
+
+            // Reconcile-controller SHADOW comparison budget (keystone step-2,
+            // #4642), RENEWAL site. The shadow compare is INLINED into this loop
+            // (below) so the recorded "actual" equals what production actually did
+            // THIS TICK — `{}` for a skipped/deferred contract, else the fresh
+            // SUBSCRIBE the loop spawns (mapped to `Renew` vs `Subscribe` by
+            // whether we hold a lease; see `renewal_shadow_actual`). It DRIVES
+            // NOTHING. Gated by the same `batch_limit` as the real renewal work:
+            // each sample builds a `ReconcileInputs` snapshot (a synchronous redb
+            // state-store read + an `is_subscription_root` scan that clones the
+            // connections map, i.e. redb read + O(neighbors) per sample), so
+            // bounding the sample count keeps the per-tick cost from scaling with
+            // the whole renewal set on near-key gateways. The shuffle above
+            // rotates which contracts get sampled across ticks; contracts past the
+            // budget or past a `break` gate are simply unmeasured this tick.
+            let mut shadow_budget = batch_limit;
 
             for contract in contracts_needing_renewal {
                 // Limit concurrent renewal attempts to avoid overwhelming the network
@@ -2196,12 +2259,18 @@ impl Ring {
                         phase = "subscription_renewal_banned_skip",
                         "skipping subscription renewal for banned contract"
                     );
+                    // Shadow: production does NOTHING for a banned contract this
+                    // tick → actual is `{}`.
+                    record_renewal_shadow(&op_manager, &mut shadow_budget, &contract, false);
                     skipped += 1;
                     continue;
                 }
 
                 // Check spam prevention (respects exponential backoff and pending checks)
                 if !ring.can_request_subscription(&contract) {
+                    // Shadow: backoff/pending gate → production does NOTHING this
+                    // tick → actual is `{}`.
+                    record_renewal_shadow(&op_manager, &mut shadow_budget, &contract, false);
                     skipped += 1;
                     continue;
                 }
@@ -2209,6 +2278,10 @@ impl Ring {
                 // Mark as pending and spawn subscription request
                 if ring.mark_subscription_pending(contract) {
                     attempted += 1;
+                    // Shadow: production spawns a fresh SUBSCRIBE
+                    // (`run_renewal_subscribe`) for this contract this tick →
+                    // actual is `{Renew}` if we hold a lease, else `{Subscribe}`.
+                    record_renewal_shadow(&op_manager, &mut shadow_budget, &contract, true);
 
                     // Spread tasks across the interval to avoid thundering-herd bursts.
                     let jitter_ms = GlobalRng::random_range(0u64..=15_000);
@@ -2327,6 +2400,11 @@ impl Ring {
                             }),
                         );
                     });
+                } else {
+                    // `mark_subscription_pending` returned false: a renewal for
+                    // this contract is already in flight, so production does
+                    // NOTHING more this tick → shadow actual is `{}`.
+                    record_renewal_shadow(&op_manager, &mut shadow_budget, &contract, false);
                 }
             }
 
@@ -2962,9 +3040,18 @@ impl Ring {
 
     /// Whether the FULL contract state (code + params + state) is present on
     /// disk for `contract` — the cheap on-disk state-store existence check, NOT
-    /// the in-memory hosting cache. Hosting is binary: this is `true` only when
-    /// this peer holds the whole contract. Used by the reconcile input-builder
-    /// (keystone step-2, #4642) for `ReconcileInputs::state_present`.
+    /// the in-memory hosting cache. Hosting is binary: a `true` from a healthy
+    /// store means this peer holds the whole contract.
+    ///
+    /// CAVEAT — conservative assume-present fallback: this returns `true` (not
+    /// `false`) when the state store is transiently unavailable — a redb read
+    /// error, an unset storage handle before startup, or a non-redb build. So a
+    /// `true` is "present, OR presence currently unknowable", never a hard
+    /// guarantee. In the reconcile shadow (keystone step-2, #4642) that can
+    /// slightly INFLATE the renewal-site `announce` divergence during a transient
+    /// store outage (the controller would `Announce` a host we can't confirm has
+    /// the body); it is a startup/outage transient, documented so the counter is
+    /// read correctly rather than mistaken for a real anomaly.
     pub(crate) fn contract_state_present(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.contract_state_present(contract)
     }
@@ -6016,6 +6103,66 @@ mod k_closest_source_tests {
              not-ready peers, so a not-ready closer neighbor is still a valid route \
              target and must keep this node from short-circuiting its renewal (#4440)."
         );
+    }
+
+    /// Source-scrape pin (keystone step-2, #4642): the RENEWAL-site reconcile
+    /// shadow (`record_renewal_shadow`) must feed the controller's output ONLY
+    /// into the set-membership divergence comparator + the per-site counter — it
+    /// must DRIVE NOTHING. Symmetric to the collapse-site pin
+    /// (`send_unsubscribe_upstream_still_drives_and_shadow_is_record_only`). A
+    /// future edit that consumes the renewal-site controller output as a control
+    /// signal must trip this guard.
+    #[test]
+    fn renewal_shadow_is_record_only_not_drive() {
+        let src = production_source();
+        let body = extract_fn_body(src, "fn record_renewal_shadow(");
+        assert!(
+            body.contains("action_set_divergence"),
+            "record_renewal_shadow must compare via action_set_divergence"
+        );
+        assert!(
+            body.contains("record_reconcile_shadow_comparison"),
+            "record_renewal_shadow must record the per-site divergence"
+        );
+        // Record-only: the shadow helper must NOT drive any renewal/subscription
+        // action off the controller's output.
+        for driver in [
+            "mark_subscription_pending",
+            "run_renewal_subscribe",
+            "ring.subscribe",
+            ".unsubscribe(",
+        ] {
+            assert!(
+                !body.contains(driver),
+                "record_renewal_shadow must not drive `{driver}` — the renewal shadow is record-only"
+            );
+        }
+        // The real renewal loop still drives the actual renewal (unchanged) and
+        // wires the record-only shadow helper.
+        let loop_body = extract_fn_body(src, "async fn recover_orphaned_subscriptions(");
+        assert!(
+            loop_body.contains("mark_subscription_pending"),
+            "the renewal loop still drives the real renewal via mark_subscription_pending"
+        );
+        assert!(
+            loop_body.contains("record_renewal_shadow"),
+            "the renewal loop wires the record-only shadow helper"
+        );
+    }
+
+    /// Unit (keystone step-2, #4642): `renewal_shadow_actual` maps the renewal
+    /// loop's per-tick outcome to the Action set the controller is compared
+    /// against. A not-acted (skipped/deferred) contract maps to `{}`; an acted
+    /// contract maps to `Renew` iff we already hold the lease, else `Subscribe` —
+    /// so a section-2/3 not-subscribed entry never records a phantom `Renew`.
+    #[test]
+    fn renewal_shadow_actual_maps_by_lease() {
+        use super::reconcile::Action::{Renew, Subscribe};
+        let empty: &[super::reconcile::Action] = &[];
+        assert_eq!(super::renewal_shadow_actual(false, true), empty);
+        assert_eq!(super::renewal_shadow_actual(false, false), empty);
+        assert_eq!(super::renewal_shadow_actual(true, true), &[Renew]);
+        assert_eq!(super::renewal_shadow_actual(true, false), &[Subscribe]);
     }
 }
 
