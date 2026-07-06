@@ -400,6 +400,85 @@ mod messages {
             /// classification.
             cause: String,
         },
+
+        /// **Summary-first PUT — Phase-1 probe. INERT wire scaffolding
+        /// (#4642, step 3-bis; NOT yet emitted — see below).**
+        ///
+        /// Instead of shipping the full [`WrappedState`] up front (as
+        /// [`Request`](Self::Request) does), a summary-first PUT routes a
+        /// probe hop-by-hop toward the contract key carrying only a
+        /// contract-defined [`StateSummary`] — opaque bytes that Freenet
+        /// moves but the contract's `summarize_state` defines, reused
+        /// verbatim from the InterestSync anti-entropy path. Each hop can
+        /// reveal whether an existing holder is present, so the initiator
+        /// need not know in advance whether the contract is genuinely new
+        /// (ship full state) or already held (reconcile a delta).
+        ///
+        /// # NOT YET EMITTED (inert scaffolding)
+        ///
+        /// No producer constructs this variant and no send path emits it.
+        /// It is merged inert: the probe→dispatch driver, the body-fetch
+        /// flow, and the emission gate are a LATER piece paired with
+        /// every-hop placement (#4642). When emission is added it MUST be
+        /// version-gated via `version_supports_summary_first_put` (in
+        /// `node::network_bridge::p2p_protoc`) — a pre-floor peer cannot
+        /// bincode-deserialize this appended tag and would drop the
+        /// connection, so it must never receive the probe. Because nothing
+        /// emits it yet, nothing is committed on the wire and the field
+        /// layout stays refinable until first emission ships in a release.
+        #[allow(dead_code)]
+        ProbeRequest {
+            id: Transaction,
+            /// Key of the contract being probed.
+            contract_key: ContractKey,
+            /// Contract-defined opaque state summary (`summarize_state`).
+            /// Deserialized owned (`'static`) via `deser_state_summary`,
+            /// matching the `RelatedContracts` wire pattern: a borrowed
+            /// `StateSummary<'de>` is not `DeserializeOwned` and cannot
+            /// cross the bincode boundary as a plain field.
+            #[serde(deserialize_with = "StateSummary::deser_state_summary")]
+            summary: StateSummary<'static>,
+            /// Hops to live — decremented at each hop (mirrors `Request.htl`).
+            htl: usize,
+            /// Addresses to skip when selecting next hop (loop prevention).
+            skip_list: HashSet<std::net::SocketAddr>,
+        },
+
+        /// **Summary-first PUT — Phase-2 dispatch reply. INERT wire
+        /// scaffolding (#4642, step 3-bis; NOT yet emitted — see
+        /// [`ProbeRequest`](Self::ProbeRequest)).**
+        ///
+        /// Routed hop-by-hop back to the initiator, signalling whether the
+        /// probe found an existing holder:
+        ///
+        /// - `holder_found == false` → no holder → the contract is treated
+        ///   as genuinely new and full state ships hop-by-hop along the
+        ///   route (the [`Request`](Self::Request) path) — exactly where
+        ///   every-hop placement acquires its bytes.
+        /// - `holder_found == true` → a holder exists → the two copies
+        ///   reconcile bidirectionally via the contract's summary/delta
+        ///   primitives (a later piece); full state does NOT re-travel a
+        ///   mesh that already holds it. Not "ahead/behind": divergent
+        ///   copies merge via the commutative monoid.
+        ///
+        /// The reconcile message exchange is deliberately NOT modelled
+        /// here — this variant is only the new-vs-existing dispatch signal.
+        /// INERT: see [`ProbeRequest`](Self::ProbeRequest).
+        #[allow(dead_code)]
+        ProbeResponse {
+            id: Transaction,
+            /// Key of the probed contract.
+            key: ContractKey,
+            /// Whether the probe found an existing holder along the route.
+            holder_found: bool,
+            /// Forward-path hop count — same semantics as
+            /// [`Response`](Self::Response)'s `hop_count`.
+            /// `#[serde(default)]` is for source-level clarity; bincode is
+            /// positional, so cross-version compat rides the handshake
+            /// `MIN_COMPATIBLE_VERSION` gate, not the serde default.
+            #[serde(default)]
+            hop_count: usize,
+        },
     }
 
     impl InnerMessage for PutMsg {
@@ -410,7 +489,9 @@ mod messages {
                 | Self::RequestStreaming { id, .. }
                 | Self::ResponseStreaming { id, .. }
                 | Self::ForwardingAck { id, .. }
-                | Self::Error { id, .. } => id,
+                | Self::Error { id, .. }
+                | Self::ProbeRequest { id, .. }
+                | Self::ProbeResponse { id, .. } => id,
             }
         }
 
@@ -427,6 +508,8 @@ mod messages {
                 // already knows the key it requested; the failure is keyed
                 // by tx only.
                 Self::Error { .. } => None,
+                Self::ProbeRequest { contract_key, .. } => Some(Location::from(contract_key.id())),
+                Self::ProbeResponse { key, .. } => Some(Location::from(key.id())),
             }
         }
     }
@@ -479,6 +562,34 @@ mod messages {
                 }
                 Self::Error { id, cause } => {
                     write!(f, "PutError(id: {}, cause: {})", id, cause)
+                }
+                Self::ProbeRequest {
+                    id,
+                    contract_key,
+                    summary,
+                    htl,
+                    ..
+                } => {
+                    write!(
+                        f,
+                        "PutProbeRequest(id: {}, key: {}, summary_len: {}, htl: {})",
+                        id,
+                        contract_key,
+                        summary.size(),
+                        htl
+                    )
+                }
+                Self::ProbeResponse {
+                    id,
+                    key,
+                    holder_found,
+                    ..
+                } => {
+                    write!(
+                        f,
+                        "PutProbeResponse(id: {}, key: {}, holder_found: {})",
+                        id, key, holder_found
+                    )
                 }
             }
         }
@@ -594,7 +705,7 @@ mod tests {
         let tx = Transaction::new::<PutMsg>();
         let key = make_contract_key(0);
         // One minimal instance per variant, in declaration order.
-        let samples: [(u32, PutMsg); 6] = [
+        let samples: [(u32, PutMsg); 8] = [
             (
                 0,
                 PutMsg::Request {
@@ -649,6 +760,31 @@ mod tests {
                     cause: String::new(),
                 },
             ),
+            // Tags 6/7: summary-first PUT scaffolding (INERT, #4642).
+            // Appended AFTER every existing variant so tags 0-5 stay
+            // byte-identical — old peers keep deserializing them
+            // unchanged. Emission is version-gated (never sent to a
+            // pre-floor peer), so these tags never reach a node that
+            // can't decode them.
+            (
+                6,
+                PutMsg::ProbeRequest {
+                    id: tx,
+                    contract_key: key,
+                    summary: StateSummary::from(Vec::new()),
+                    htl: 0,
+                    skip_list: Default::default(),
+                },
+            ),
+            (
+                7,
+                PutMsg::ProbeResponse {
+                    id: tx,
+                    key,
+                    holder_found: false,
+                    hop_count: 0,
+                },
+            ),
         ];
         for (expected_tag, msg) in samples {
             let bytes = bincode::serialize(&msg).expect("serialize");
@@ -664,6 +800,111 @@ mod tests {
                  coordinate the upgrade."
             );
         }
+    }
+
+    /// Summary-first PUT probe (INERT scaffolding, #4642): the
+    /// `StateSummary` payload survives a bincode round-trip through the
+    /// `deser_state_summary` owned-deserialize path. A borrowed
+    /// `StateSummary<'de>` is not `DeserializeOwned`; this asserts the
+    /// `#[serde(deserialize_with = ...)]` attribute makes the variant
+    /// cross the wire intact (the wire is what a future emitting piece
+    /// will send once version-gated on).
+    #[test]
+    fn put_msg_probe_request_serde_roundtrip() {
+        let tx = Transaction::new::<PutMsg>();
+        let key = make_contract_key(3);
+        let summary_bytes = vec![0xAB, 0xCD, 0xEF, 0x01, 0x02];
+        let mut skip_list = std::collections::HashSet::new();
+        skip_list.insert(std::net::SocketAddr::from(([127, 0, 0, 1], 8080)));
+        let msg = PutMsg::ProbeRequest {
+            id: tx,
+            contract_key: key,
+            summary: StateSummary::from(summary_bytes.clone()),
+            htl: 7,
+            skip_list: skip_list.clone(),
+        };
+
+        let bytes = bincode::serialize(&msg).expect("serialize");
+        let decoded: PutMsg = bincode::deserialize(&bytes).expect("deserialize");
+        match decoded {
+            PutMsg::ProbeRequest {
+                id,
+                contract_key,
+                summary,
+                htl,
+                skip_list: decoded_skip,
+            } => {
+                assert_eq!(id, tx);
+                assert_eq!(contract_key, key);
+                assert_eq!(
+                    summary.as_ref(),
+                    summary_bytes.as_slice(),
+                    "opaque summary bytes must survive the bincode round-trip"
+                );
+                assert_eq!(htl, 7);
+                assert_eq!(decoded_skip, skip_list);
+            }
+            other => panic!("expected ProbeRequest, got {other}"),
+        }
+    }
+
+    /// Summary-first PUT dispatch reply (INERT scaffolding, #4642): the
+    /// new-vs-existing signal (`holder_found`) and `hop_count` round-trip
+    /// through bincode for both boolean cases.
+    #[test]
+    fn put_msg_probe_response_serde_roundtrip() {
+        let key = make_contract_key(4);
+        for (holder_found, hop_count) in [(false, 0usize), (true, 5usize)] {
+            let tx = Transaction::new::<PutMsg>();
+            let msg = PutMsg::ProbeResponse {
+                id: tx,
+                key,
+                holder_found,
+                hop_count,
+            };
+            let bytes = bincode::serialize(&msg).expect("serialize");
+            let decoded: PutMsg = bincode::deserialize(&bytes).expect("deserialize");
+            match decoded {
+                PutMsg::ProbeResponse {
+                    id,
+                    key: decoded_key,
+                    holder_found: decoded_holder,
+                    hop_count: decoded_hops,
+                } => {
+                    assert_eq!(id, tx);
+                    assert_eq!(decoded_key, key);
+                    assert_eq!(decoded_holder, holder_found);
+                    assert_eq!(decoded_hops, hop_count);
+                }
+                other => panic!("expected ProbeResponse, got {other}"),
+            }
+        }
+    }
+
+    /// `id()` and `requested_location()` cover the summary-first
+    /// scaffolding variants: the probe/dispatch reply carry the tx and a
+    /// key-derived location like every other addressed PUT variant.
+    #[test]
+    fn put_msg_probe_variants_id_and_location() {
+        let tx = Transaction::new::<PutMsg>();
+        let key = make_contract_key(9);
+        let req = PutMsg::ProbeRequest {
+            id: tx,
+            contract_key: key,
+            summary: StateSummary::from(Vec::new()),
+            htl: 1,
+            skip_list: Default::default(),
+        };
+        let resp = PutMsg::ProbeResponse {
+            id: tx,
+            key,
+            holder_found: true,
+            hop_count: 0,
+        };
+        assert_eq!(*req.id(), tx);
+        assert_eq!(*resp.id(), tx);
+        assert!(req.requested_location().is_some());
+        assert!(resp.requested_location().is_some());
     }
 
     /// `bound_cause` keeps short strings byte-identical and truncates
