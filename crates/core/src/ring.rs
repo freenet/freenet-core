@@ -3105,6 +3105,21 @@ impl Ring {
         self.hosting_manager.get_subscribed_contracts()
     }
 
+    /// Bounded, sort-free lookup of currently-subscribed `ContractKey`s whose
+    /// instance-id is in `wanted` (see
+    /// [`hosting::HostingManager::subscribed_keys_in`]). Used by the reconcile
+    /// connection-drop shadow (keystone step-2, #4642) to avoid the O(S log S)
+    /// full-set scan of [`Self::get_subscribed_contracts`] per disconnect.
+    pub(crate) fn subscribed_keys_in(
+        &self,
+        wanted: &std::collections::HashSet<ContractInstanceId>,
+        scan_cap: usize,
+        max_matches: usize,
+    ) -> Vec<ContractKey> {
+        self.hosting_manager
+            .subscribed_keys_in(wanted, scan_cap, max_matches)
+    }
+
     /// Force-expire a contract's subscription so it gets renewed through the
     /// current best route on the next recovery cycle.
     fn force_subscription_renewal(&self, contract: &ContractKey) {

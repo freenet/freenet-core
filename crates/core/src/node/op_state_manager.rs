@@ -75,14 +75,23 @@ impl Ops {
     }
 }
 
-/// Max number of reconcile connection-drop SHADOW comparisons to sample per
-/// dropped connection (keystone step-2, #4642). Each sample builds a
+/// Max number of reconcile connection-drop SHADOW comparisons to BUILD per
+/// dropped connection (keystone step-2, #4642). Each build is a
 /// `ReconcileInputs` snapshot (a redb read + an `is_subscription_root`
-/// connection-map scan), so this bounds the per-drop cost on a near-key gateway
-/// whose subscribed set is large. The dropped peer's co-hosted set (the natural
-/// bound) is usually small; this is a belt-and-suspenders cap. Contracts past
-/// the cap are simply unmeasured for that drop.
+/// connection-map scan), so this bounds the expensive per-drop work. Contracts
+/// past the cap are unmeasured for that drop.
 const CONNECTION_DROP_SHADOW_SAMPLE_CAP: usize = 32;
+
+/// Max number of our active-subscription entries to EXAMINE per dropped
+/// connection while looking for the ≤`CONNECTION_DROP_SHADOW_SAMPLE_CAP` matches
+/// (keystone step-2, #4642). Bounds the SCAN itself (not just the recording): a
+/// near-key gateway with a large subscribed set must not turn one co-host
+/// disconnect into an O(S) membership sweep. Examining is cheap (a DashMap step
+/// plus a `HashSet::contains`), so this is generous enough to fully cover a
+/// realistic subscribed set while hard-capping the pathological case; a set
+/// larger than this is sampled (a slight, arbitrary undercount for a one-sided
+/// diagnostic counter).
+const CONNECTION_DROP_SHADOW_SCAN_CAP: usize = 1024;
 
 /// Pure core of the piece-D **strictly-farther** downstream-subscriber filter
 /// (keystone step-2, #4642): `true` iff at least one subscriber distance is
@@ -1437,31 +1446,39 @@ impl OpManager {
             .schedule_deferred_removal(&PeerKey::from(pub_key.clone()));
 
         // Shadow: production does NO re-root on a connection drop (the F/#4655
-        // hook), so for each contract WE subscribe to that the dropped peer
-        // co-hosted, ask whether the controller WOULD re-root (upstream lost,
-        // demand intact) — actual is always `{}`, focused on `ReRootSearch`. Run
-        // AFTER `on_peer_disconnected` so the computed upstream already excludes
-        // the dropped peer. Iterate OUR subscribed contracts and keep those the
-        // dropped peer co-hosted: this sidesteps reconstructing a full
-        // `ContractKey` from the reverse index's bare `ContractInstanceId`, and
-        // a contract we do NOT subscribe to can't be in-use so the controller
-        // wouldn't re-root anyway. Bounded per drop.
+        // hook), so for each dropped-peer-co-hosted contract we hold, ask whether
+        // the controller WOULD re-root (upstream lost, demand intact) — actual is
+        // always `{}`, focused on `ReRootSearch`. Run AFTER `on_peer_disconnected`
+        // so the computed upstream already excludes the dropped peer.
+        //
+        // We resolve the dropped peer's co-hosted instance-ids to OUR
+        // `ContractKey`s via `subscribed_keys_in` (a bounded, sort-free scan of
+        // active subscriptions). The reason is purely mechanical: there is no
+        // instance-id → `ContractKey` index in this crate, and lease-holders are
+        // the cheapest set that yields the full key without reconstruction. It is
+        // NOT a completeness claim — `contract_in_use = has_local_client ||
+        // has_farther_downstream_subscriber` is INDEPENDENT of `is_subscribed`
+        // (reconcile.rs), so a state-present, in-use, no-upstream, non-root
+        // contract we host WITHOUT an active lease (e.g. a former host whose
+        // upstream lease just lapsed while a local client is still subscribed)
+        // would also be a re-root candidate and is MISSED here. That is a narrow,
+        // transient case that biases this one-sided count slightly LOW; acceptable
+        // for a diagnostic counter, and it goes away when the flip drives re-root
+        // from the reconcile snapshot directly. Both the scan and the build count
+        // are bounded per drop (see the two caps above).
         if !dropped_contracts.is_empty() {
-            let mut budget = CONNECTION_DROP_SHADOW_SAMPLE_CAP;
-            for key in self.ring.get_subscribed_contracts() {
-                if budget == 0 {
-                    break;
-                }
-                if dropped_contracts.contains(key.id()) {
-                    budget -= 1;
-                    self.record_reconcile_shadow_event(
-                        crate::node::network_status::ReconcileShadowSite::ConnectionDrop,
-                        &key,
-                        &[reconcile::Action::ReRootSearch],
-                        // Production never re-roots on a connection drop today.
-                        |_| Vec::new(),
-                    );
-                }
+            for key in self.ring.subscribed_keys_in(
+                &dropped_contracts,
+                CONNECTION_DROP_SHADOW_SCAN_CAP,
+                CONNECTION_DROP_SHADOW_SAMPLE_CAP,
+            ) {
+                self.record_reconcile_shadow_event(
+                    crate::node::network_status::ReconcileShadowSite::ConnectionDrop,
+                    &key,
+                    &[reconcile::Action::ReRootSearch],
+                    // Production never re-roots on a connection drop today.
+                    |_| Vec::new(),
+                );
             }
         }
     }
