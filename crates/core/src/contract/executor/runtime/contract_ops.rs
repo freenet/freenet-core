@@ -430,7 +430,15 @@ impl Executor<Runtime> {
         key: &ContractKey,
     ) -> Result<ReclaimOutcome, ExecutorError> {
         let state_result = match self.state_store.delete(key).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Disk-usage accounting (#4683): drop this contract's state
+                // contribution from the aggregate on-disk total. Observational
+                // only in this PR. No-op until the tracker is seeded.
+                if let Some(op_manager) = &self.op_manager {
+                    op_manager.ring.record_state_removed(key);
+                }
+                Ok(())
+            }
             Err(e) => {
                 tracing::warn!(
                     contract = %key,

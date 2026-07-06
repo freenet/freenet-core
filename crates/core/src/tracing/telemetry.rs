@@ -2188,6 +2188,26 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_local_misses_total".to_string(),
                     serde_json::json!(snapshot.hosting_local_misses_total),
                 );
+                // Aggregate on-disk usage gauges (#4683). Same hand-mirrored
+                // footgun as the gauges above: a new `RouterSnapshotInfo` field
+                // is invisible to the collector unless added here. Pinned by
+                // `router_snapshot_json_includes_hosting_disk_gauges`.
+                obj.insert(
+                    "hosting_disk_state_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_disk_state_bytes),
+                );
+                obj.insert(
+                    "hosting_disk_wasm_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_disk_wasm_bytes),
+                );
+                obj.insert(
+                    "hosting_disk_compile_cache_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_disk_compile_cache_bytes),
+                );
+                obj.insert(
+                    "hosting_disk_total_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_disk_total_bytes),
+                );
                 // Terminal advertisement-consult counters (hosting redesign
                 // piece C, #4646; exported per #4658). Same hand-mirrored
                 // footgun as the gauges above: a new `RouterSnapshotInfo` field
@@ -2440,6 +2460,31 @@ mod tests {
             ("hosting_evictions_of_recently_read_total", 277),
             ("hosting_local_hits_total", 281),
             ("hosting_local_misses_total", 283),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the aggregate on-disk usage gauges (#4683) must also reach the
+    /// hand-mirrored OTLP body — same footgun as the gauges above. A silent drop
+    /// would blind central telemetry to the disk-budget accounting this PR
+    /// introduces (the measurement the eviction floor + admission gate build on).
+    #[test]
+    fn router_snapshot_json_includes_hosting_disk_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_disk_state_bytes = Some(401);
+        info.hosting_disk_wasm_bytes = Some(409);
+        info.hosting_disk_compile_cache_bytes = Some(419);
+        info.hosting_disk_total_bytes = Some(1229);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hosting_disk_state_bytes", 401),
+            ("hosting_disk_wasm_bytes", 409),
+            ("hosting_disk_compile_cache_bytes", 419),
+            ("hosting_disk_total_bytes", 1229),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

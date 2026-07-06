@@ -218,6 +218,18 @@ pub(crate) struct RouterSnapshotInfo {
     pub hosting_evictions_of_recently_read_total: Option<u64>,
     pub hosting_local_hits_total: Option<u64>,
     pub hosting_local_misses_total: Option<u64>,
+    /// Aggregate on-disk usage gauges (#4683), populated by `Ring` from the
+    /// `HostingManager`'s `DiskUsageTracker` on the snapshot cadence.
+    /// `hosting_disk_state_bytes` is the delta-tracked persisted-state total;
+    /// `hosting_disk_wasm_bytes` is the `du`-measured WASM-blob total;
+    /// `hosting_disk_compile_cache_bytes` is the relocated wasmtime compile-cache
+    /// total; `hosting_disk_total_bytes` is their sum — the aggregate the future
+    /// disk budget will bound. `None` until the tracker is configured and seeded
+    /// (early startup). Per-node aggregate scalars.
+    pub hosting_disk_state_bytes: Option<u64>,
+    pub hosting_disk_wasm_bytes: Option<u64>,
+    pub hosting_disk_compile_cache_bytes: Option<u64>,
+    pub hosting_disk_total_bytes: Option<u64>,
     /// Terminal advertisement-consult counters (hosting redesign piece C,
     /// #4646; exported to central telemetry per #4658), populated by `Ring`
     /// from the per-node `network_status` singleton on the snapshot cadence.
@@ -1155,6 +1167,12 @@ impl Router {
             hosting_evictions_of_recently_read_total: None,
             hosting_local_hits_total: None,
             hosting_local_misses_total: None,
+            // Aggregate on-disk usage gauges, populated by Ring from the
+            // DiskUsageTracker on the snapshot cadence (#4683).
+            hosting_disk_state_bytes: None,
+            hosting_disk_wasm_bytes: None,
+            hosting_disk_compile_cache_bytes: None,
+            hosting_disk_total_bytes: None,
             // Terminal advertisement-consult counters (piece C, #4646),
             // populated by Ring from the network_status singleton on the
             // snapshot cadence (#4658).

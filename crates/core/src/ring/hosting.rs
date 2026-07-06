@@ -31,6 +31,7 @@
 
 mod cache;
 mod demand;
+mod disk_usage;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
@@ -53,6 +54,8 @@ use cache::{DEFAULT_MIN_TTL, HostingCache, HostingCacheStats};
 pub(crate) use cache::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
 use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
+pub(crate) use disk_usage::DiskUsageStats;
+use disk_usage::DiskUsageTracker;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -336,6 +339,15 @@ pub(crate) struct HostingManager {
     /// Behind an `Arc` so the periodic sweep snapshot can iterate
     /// without re-entering the `HostingManager` borrow.
     pending_reclamation: std::sync::Arc<DashMap<ContractKey, u64>>,
+
+    /// Aggregate on-disk usage accounting (#4683): hosted state + WASM blobs +
+    /// wasmtime compile cache. `None` until [`Self::configure_disk_tracker`]
+    /// installs it with the node's real paths (done once at startup alongside
+    /// `set_storage`, since `with_time_source` has no path access). Populated
+    /// and observable in this PR but does not yet drive admission or eviction —
+    /// that is PR 2 (eviction floor) and PR 3 (admission gate). Behind an
+    /// `RwLock` for the same late-binding reason as `storage`.
+    disk_tracker: RwLock<Option<DiskUsageTracker>>,
 }
 
 impl HostingManager {
@@ -378,6 +390,7 @@ impl HostingManager {
             storage: RwLock::new(None),
             state_generation: DashMap::new(),
             pending_reclamation: std::sync::Arc::new(DashMap::new()),
+            disk_tracker: RwLock::new(None),
         }
     }
 
@@ -443,6 +456,127 @@ impl HostingManager {
     /// Called on node shutdown to help free the on-disk file lock (issue #4401).
     pub(crate) fn clear_storage(&self) {
         *self.storage.write() = None;
+    }
+
+    // =========================================================================
+    // Disk-usage accounting (#4683)
+    // =========================================================================
+
+    /// Install the aggregate disk-usage tracker with the node's real paths.
+    /// Called once at startup (alongside `set_storage`), since `with_time_source`
+    /// has no path access. The tracker starts unseeded; the first sweep tick
+    /// seeds it lazily off the hot path.
+    pub(crate) fn configure_disk_tracker(
+        &self,
+        contracts_dir: std::path::PathBuf,
+        wasmtime_cache_dir: std::path::PathBuf,
+    ) {
+        *self.disk_tracker.write() = Some(DiskUsageTracker::new(contracts_dir, wasmtime_cache_dir));
+    }
+
+    /// Lazily seed the disk tracker on first use (like the hosting-cache
+    /// `seed_if_absent`), summing the true on-disk state total from redb rows.
+    /// No-op if the tracker is absent or already seeded. Runs OUTSIDE any cache
+    /// write lock (the caller — the 60s sweep — invokes it off the hot path).
+    ///
+    /// The state seed is intentionally fail-loud on I/O error (a too-low seed
+    /// would defeat the future admission gate): a read failure leaves the
+    /// tracker UNSEEDED so the next tick retries, rather than committing an
+    /// under-count.
+    #[cfg(feature = "redb")]
+    pub(crate) fn seed_disk_tracker_if_absent(&self) {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        {
+            let guard = self.disk_tracker.read();
+            match guard.as_ref() {
+                Some(t) if t.is_seeded() => return,
+                Some(_) => {}
+                None => return,
+            }
+        }
+
+        // Read the exact per-contract state sizes from redb before taking the
+        // tracker lock, so no storage I/O happens under it.
+        let rows = {
+            let storage = self.storage.read();
+            let Some(storage) = storage.as_ref() else {
+                return;
+            };
+            match storage.load_all_hosting_metadata() {
+                Ok(entries) => entries,
+                Err(e) => {
+                    // Fail-loud: leave the tracker unseeded so the next sweep
+                    // retries rather than seeding from an under-count.
+                    tracing::warn!(error = %e, "disk tracker seed deferred: failed to read hosting metadata");
+                    return;
+                }
+            }
+        };
+
+        let state_rows = rows.into_iter().filter_map(|(key_bytes, metadata)| {
+            if key_bytes.len() != 32 {
+                return None;
+            }
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&key_bytes);
+            let key = ContractKey::from_id_and_code(
+                ContractInstanceId::new(id),
+                CodeHash::new(metadata.code_hash),
+            );
+            Some((key, metadata.size_bytes))
+        });
+
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.seed(state_rows);
+        }
+    }
+
+    /// Apply a state-write delta to the disk tracker at a state-write chokepoint.
+    /// Wired from `Ring::commit_state_write` (the single infallible post-write
+    /// funnel for all four executor chokepoints + the V2 delegate callback), so
+    /// the counter only moves after the bytes actually landed.
+    ///
+    /// Calls through even when the tracker is not yet seeded (only skipping when
+    /// absent). An unseeded write buffers its post-write size into the tracker's
+    /// per-key map so the lazy seed picks it up instead of dropping it — this is
+    /// what closes the seed/write TOCTOU (a write racing the first sweep tick's
+    /// redb snapshot would otherwise permanently under-count that key). See
+    /// [`DiskUsageTracker::record_state_write`].
+    pub(crate) fn record_state_write(&self, key: &ContractKey, new_size: u64) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.record_state_write(key, new_size);
+        }
+    }
+
+    /// Subtract a contract's state contribution from the disk tracker on
+    /// eviction/reclamation. Wired from the reclaim path. No-op when the tracker
+    /// is absent. Like [`Self::record_state_write`], calls through even while
+    /// unseeded so the per-key buffer stays consistent with the seed.
+    pub(crate) fn record_state_removed(&self, key: &ContractKey) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.record_state_removed(key);
+        }
+    }
+
+    /// Re-walk the WASM-blob and compile-cache totals. Called on the telemetry
+    /// cadence (the 60s sweep) since both are `du`-measured, not delta-tracked.
+    pub(crate) fn refresh_disk_usage(&self) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.refresh_wasm();
+            tracker.refresh_compile_cache();
+        }
+    }
+
+    /// Snapshot the disk-usage gauges for per-node telemetry, or `None` before
+    /// the tracker is configured/seeded (early startup). Aggregate scalars only.
+    pub(crate) fn disk_usage_stats(&self) -> Option<DiskUsageStats> {
+        let guard = self.disk_tracker.read();
+        let tracker = guard.as_ref()?;
+        if !tracker.is_seeded() {
+            return None;
+        }
+        Some(tracker.stats())
     }
 
     // =========================================================================

@@ -1028,7 +1028,21 @@ impl WasmtimeEngine {
         // Module::new() skips compilation entirely and deserializes — ~100x faster.
         // This eliminates WASM compilation as a contributor to OPERATION_TTL timeouts
         // on slow CI runners and during cold starts in production.
-        match Cache::new(CacheConfig::new()) {
+        // Build the cache config, optionally relocating it onto the data-dir
+        // mount and pinning its soft-size limit (#4683). `with_directory`
+        // requires an ABSOLUTE path (wasmtime `create_dir_all`s + canonicalizes
+        // it); `RuntimeConfig::wasmtime_cache_dir` is `Some` only on the
+        // production path, which passes the absolute data-dir sibling. When
+        // `None` (tests/sim), the cache keeps wasmtime's default OS-cache
+        // location + 512 MiB soft limit — unchanged behavior.
+        let mut cache_config = CacheConfig::new();
+        if let Some(dir) = &config.wasmtime_cache_dir {
+            cache_config.with_directory(dir);
+        }
+        if let Some(limit) = config.wasmtime_cache_size_bytes {
+            cache_config.with_files_total_size_soft_limit(limit);
+        }
+        match Cache::new(cache_config) {
             Ok(cache) => {
                 wasmtime_config.cache(Some(cache));
                 tracing::info!("Wasmtime compilation cache enabled");
@@ -1905,7 +1919,7 @@ mod tests {
         // The build path that constructs the wasmtime Config must install a
         // disk cache via `wasmtime_config.cache(Some(...))`.
         assert!(
-            body.contains("Cache::new(CacheConfig::new())"),
+            body.contains("CacheConfig::new()") && body.contains("Cache::new(cache_config)"),
             "create_backend_engine must construct the wasmtime disk compilation cache"
         );
         assert!(
