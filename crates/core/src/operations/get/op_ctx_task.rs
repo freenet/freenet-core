@@ -2182,15 +2182,52 @@ where
 /// Local fallback tuple: key, state, optional contract code.
 type LocalFallback = (ContractKey, WrappedState, Option<ContractContainer>);
 
-/// Relay-side local cache lookup with interest gate.
+/// Decide how a relay disposes of a locally-held copy, given whether that copy
+/// is genuinely fresh (`Ring::is_receiving_updates` — an active network
+/// subscription or a local client subscription).
+///
+/// Returns `(local_value, local_fallback)`:
+/// - fresh → `(Some(local), None)`: serve immediately, the copy is kept current
+///   by the update mesh.
+/// - not fresh → `(None, Some(local))`: an unsubscribed / possibly-stale cached
+///   copy. Defer to the network so a fresh copy is preferred, but keep this
+///   copy as the R10 last-resort fallback served if the network search exhausts
+///   (worst case degrades to the pre-guard behavior, never a new dead-end).
+///
+/// Freshness — NOT mere cache presence — is the correct gate: a hosting-LRU copy
+/// can outlive its subscription and go stale (hosting-invariants.md invariant 1;
+/// #3340). The old gate keyed on `InterestManager::has_local_interest`, which is
+/// true whenever the cache-presence `hosting` flag is set, so it served
+/// unsubscribed stale copies first. 0.2.92 activated that bug by stopping GET
+/// auto-subscribe (E-GET, #4689) and lapsing idle subscriptions (interest-gated
+/// renewal, #4697), turning formerly-fresh cached copies unsubscribed.
+///
+/// Pure helper so the freshness gate is unit-testable without a real
+/// `OpManager` / contract handler. Mirrors the local-client GET path, which
+/// already gates on `is_receiving_updates` (client_events.rs, #2388/#3340).
+fn interest_gate_disposition(
+    is_fresh: bool,
+    local: LocalFallback,
+) -> (Option<LocalFallback>, Option<LocalFallback>) {
+    if is_fresh {
+        // Receiving updates — the copy is fresh, serve it immediately.
+        (Some(local), None)
+    } else {
+        // Unsubscribed / possibly-stale cache — defer to network, keep as
+        // fallback.
+        (None, Some(local))
+    }
+}
+
+/// Relay-side local cache lookup with freshness gate.
 ///
 /// Mirrors `GetMsg::Request` match arm at `get.rs:1369-1433`.
 ///
 /// Returns `(local_value, local_fallback)`:
-/// - `local_value`: Some if we should serve immediately (active interest or
-///   originator).  None if we should forward.
-/// - `local_fallback`: Some if we have stale local state with no active
-///   interest — used as a fallback if all downstream peers return NotFound.
+/// - `local_value`: Some if we should serve immediately (fresh copy — actively
+///   receiving updates).  None if we should forward.
+/// - `local_fallback`: Some if we have an unsubscribed / possibly-stale local
+///   copy — used as a fallback if all downstream peers return NotFound.
 async fn check_local_with_interest_gate(
     op_manager: &OpManager,
     instance_id: &ContractInstanceId,
@@ -2226,21 +2263,24 @@ async fn check_local_with_interest_gate(
     match raw_local {
         None => (None, None),
         Some((key, state, contract)) => {
-            // Interest gate (mirrors get.rs:1408-1433):
-            // Relay peers actively hosting serve immediately.
-            // Peers with only stale LRU cache (no active interest) defer to
-            // the network but keep the local value as fallback.
-            if !op_manager.interest_manager.has_local_interest(&key) {
-                // Stale cache only — defer to network, keep as fallback.
+            // Freshness gate (hosting-invariants.md invariant 1): only a copy we
+            // are actively receiving updates for (an active network subscription
+            // or a local client subscription) is guaranteed fresh and served
+            // immediately. A hosting-LRU copy without a live subscription can be
+            // stale — it forwards and is served only as the R10 last-resort
+            // fallback. This mirrors the local-client GET path (client_events.rs,
+            // #2388/#3340) and replaces the old cache-presence gate
+            // (`has_local_interest`), which served unsubscribed stale copies
+            // first (bug activated by 0.2.92's E-GET #4689 + interest-gated
+            // renewal #4697).
+            let is_fresh = op_manager.ring.is_receiving_updates(&key);
+            if !is_fresh {
                 tracing::debug!(
                     %instance_id,
-                    "GET relay: stale cache (no local interest), will forward"
+                    "GET relay: unsubscribed cache (not receiving updates), will forward"
                 );
-                (None, Some((key, state, contract)))
-            } else {
-                // Actively hosting with interest — serve immediately.
-                (Some((key, state, contract)), None)
             }
+            interest_gate_disposition(is_fresh, (key, state, contract))
         }
     }
 }
@@ -4541,23 +4581,37 @@ mod tests {
         );
     }
 
-    /// T3: Interest gate in `check_local_with_interest_gate` — stale cache
-    /// (no local interest) must NOT return a local_value (must go to fallback).
+    /// T3: `check_local_with_interest_gate` must gate on FRESHNESS
+    /// (`is_receiving_updates`), NOT mere cache presence (`has_local_interest`).
+    /// An unsubscribed cached copy can be stale, so it must forward and be
+    /// served only as the last-resort fallback (hosting-invariants.md invariant
+    /// 1; #2388/#3340). Guards against re-introducing the old cache-presence
+    /// gate the interim stale-read guard replaced.
     #[test]
-    fn check_local_with_interest_gate_has_interest_check() {
+    fn check_local_with_interest_gate_uses_freshness_gate() {
         let src = production_source();
         let body = extract_fn_body(src, "async fn check_local_with_interest_gate(");
         assert!(
-            body.contains("has_local_interest"),
-            "check_local_with_interest_gate must call `has_local_interest` to gate \
-             whether stale cache is served immediately or deferred to network"
+            body.contains("is_receiving_updates"),
+            "check_local_with_interest_gate must gate on `is_receiving_updates` \
+             (freshness) — an active network/client subscription — to decide \
+             whether the local copy is served immediately or deferred to network"
         );
-        // The stale-cache branch must put the value into the fallback slot,
-        // not into local_value.
+        // Assert on the CALL syntax (`has_local_interest(`), not the bare token,
+        // so the explanatory comment in the gate body may still reference the
+        // old gate by name.
         assert!(
-            body.contains("None, Some("),
-            "check_local_with_interest_gate must return (None, Some(fallback)) \
-             when there is local state but no active interest"
+            !body.contains("has_local_interest("),
+            "check_local_with_interest_gate must NOT gate on `has_local_interest` \
+             (cache presence) — that served unsubscribed stale copies first, the \
+             bug the freshness gate fixes"
+        );
+        // The disposition (fresh → serve, stale → fallback) is delegated to the
+        // pure `interest_gate_disposition` helper (unit-tested behaviorally).
+        assert!(
+            body.contains("interest_gate_disposition"),
+            "check_local_with_interest_gate must delegate the serve-vs-fallback \
+             decision to `interest_gate_disposition`"
         );
     }
 
@@ -4978,33 +5032,68 @@ mod tests {
         );
     }
 
-    /// `check_local_with_interest_gate` must return the local state in
-    /// the fallback slot (not `local_value`) when the relay holds state
-    /// but `has_local_interest` is false. This locks down the interest
-    /// gate: hosting relays serve immediately, stale-cache relays defer
-    /// to the network and hold local state as a fallback.
+    /// `interest_gate_disposition` must map freshness to the right slot: a fresh
+    /// copy (`is_fresh`) → `local_value` (serve immediately); an unsubscribed /
+    /// possibly-stale copy → the `local_fallback` slot (defer to network, serve
+    /// only as last resort). Locks down the disposition source structure; the
+    /// behavioral mapping is exercised in
+    /// `interest_gate_disposition_serves_fresh_defers_stale`.
     #[test]
-    fn interest_gate_returns_fallback_when_not_actively_hosting() {
+    fn interest_gate_disposition_gates_serve_on_freshness() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn check_local_with_interest_gate(");
-        // The interest-gated branch structure must be:
-        //   if !has_local_interest(&key) {
-        //     (None, Some((key, state, contract)))
+        let body = extract_fn_body(src, "fn interest_gate_disposition(");
+        // The disposition branch structure must be:
+        //   if is_fresh {
+        //     (Some(local), None)       // fresh → serve immediately
         //   } else {
-        //     (Some((key, state, contract)), None)
+        //     (None, Some(local))       // stale → fallback slot
         //   }
-        let neg_gate = body
-            .find("if !op_manager.interest_manager.has_local_interest(&key)")
-            .expect("interest gate must check `!has_local_interest` branch explicitly");
-        let tail = &body[neg_gate..];
-        let stale_pos = tail.find("(None, Some(").expect("stale branch must exist");
-        let active_pos = tail.find("(Some(").expect("active branch must exist");
-        // active branch (Some(...), None) must come AFTER the stale branch in
-        // the `else` arm.
+        let fresh_gate = body
+            .find("if is_fresh")
+            .expect("disposition must gate the serve-vs-fallback decision on `is_fresh`");
+        let tail = &body[fresh_gate..];
+        let serve_pos = tail
+            .find("(Some(local), None)")
+            .expect("fresh branch (serve immediately) must exist");
+        let fallback_pos = tail
+            .find("(None, Some(local))")
+            .expect("stale branch (fallback slot) must exist");
         assert!(
-            stale_pos < active_pos,
-            "`if !has_local_interest` arm (stale → fallback slot) must appear \
-             before the `else` arm (active → local_value slot) in source order."
+            serve_pos < fallback_pos,
+            "`if is_fresh` arm (fresh → local_value slot) must appear before the \
+             `else` arm (stale → fallback slot) in source order."
+        );
+    }
+
+    /// Behavioral test for the interim stale-read guard: the freshness gate must
+    /// serve a genuinely fresh copy immediately, but defer an unsubscribed /
+    /// possibly-stale copy to the network (keeping it only as the R10 last-resort
+    /// fallback). A relay holding a cached copy it is NOT receiving updates for
+    /// must NOT serve it as its first choice (hosting-invariants.md invariant 1;
+    /// #2388/#3340). This is the disposition that `check_local_with_interest_gate`
+    /// computes from `Ring::is_receiving_updates`; the freshness truth-table
+    /// itself is covered in `ring/hosting.rs`.
+    #[test]
+    fn interest_gate_disposition_serves_fresh_defers_stale() {
+        let local: LocalFallback = (dummy_key(), WrappedState::new(vec![1u8, 2, 3]), None);
+
+        // Fresh (actively receiving updates) → serve immediately: local_value
+        // is populated, no fallback.
+        let (serve, fallback) = interest_gate_disposition(true, local.clone());
+        assert!(
+            serve.is_some() && fallback.is_none(),
+            "a fresh (receiving-updates) copy must be served immediately \
+             (local_value = Some, fallback = None)"
+        );
+
+        // Unsubscribed / possibly-stale → defer to network: no immediate serve,
+        // copy retained in the fallback slot for the exhaustion last resort.
+        let (serve, fallback) = interest_gate_disposition(false, local);
+        assert!(
+            serve.is_none() && fallback.is_some(),
+            "an unsubscribed (not-receiving-updates) copy must NOT be served \
+             immediately; it defers to the network and is kept as the \
+             last-resort fallback (local_value = None, fallback = Some)"
         );
     }
 
