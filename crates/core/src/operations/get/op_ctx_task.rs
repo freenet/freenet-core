@@ -766,6 +766,10 @@ impl RetryDriver for GetRetryDriver<'_> {
             htl: self.htl,
             visited: self.attempt_visited.clone(),
             subscribe: false,
+            // Each originator attempt seeds a fresh per-request backtracking
+            // budget; the relays thread and decrement it (see
+            // `operations::DEFAULT_BACKTRACK_BUDGET`).
+            backtrack_budget: crate::operations::DEFAULT_BACKTRACK_BUDGET,
         })
     }
 
@@ -1975,6 +1979,7 @@ pub(crate) async fn start_relay_get<CB>(
     visited: VisitedPeers,
     fetch_contract: bool,
     subscribe: bool,
+    backtrack_budget: u32,
 ) -> Result<(), OpError>
 where
     CB: NetworkBridge + Clone + Send + 'static,
@@ -2024,6 +2029,7 @@ where
         visited,
         fetch_contract,
         subscribe,
+        backtrack_budget,
     ));
     Ok(())
 }
@@ -2059,6 +2065,7 @@ async fn run_relay_get<CB>(
     visited: VisitedPeers,
     fetch_contract: bool,
     subscribe: bool,
+    backtrack_budget: u32,
 ) where
     CB: NetworkBridge + Clone + Send + 'static,
 {
@@ -2079,6 +2086,7 @@ async fn run_relay_get<CB>(
         visited,
         fetch_contract,
         subscribe,
+        backtrack_budget,
     )
     .await;
 
@@ -2137,6 +2145,7 @@ async fn drive_relay_get<CB>(
     visited: VisitedPeers,
     fetch_contract: bool,
     subscribe: bool,
+    backtrack_budget: u32,
 ) -> Result<(), OpError>
 where
     CB: NetworkBridge + Clone + Send + 'static,
@@ -2151,6 +2160,7 @@ where
         visited,
         fetch_contract,
         subscribe,
+        backtrack_budget,
     )
     .await
     {
@@ -2164,7 +2174,14 @@ where
                 "GET relay: inner driver returned error; sending NotFound upstream"
             );
             // On infrastructure error, send NotFound upstream so the upstream
-            // doesn't time out waiting for us.
+            // doesn't time out waiting for us. Echo budget 0, NOT the incoming
+            // budget: the inner driver may have already forwarded and fanned out
+            // a subtree (spending budget) before erroring, and we cannot tell.
+            // Reporting the un-spent incoming budget would let the upstream
+            // re-spend what a partial subtree already spent — the same
+            // monotonicity guard the no-reply arms apply, keeping fan-out
+            // bounded (#4630). A pre-forward error simply forgoes this relay's
+            // backtracking, which is safe (the upstream still has its own).
             let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
             relay_send_not_found(
                 op_manager,
@@ -2172,6 +2189,7 @@ where
                 instance_id,
                 upstream_addr,
                 hop_count,
+                0,
             )
             .await;
             Err(err)
@@ -2253,29 +2271,67 @@ async fn check_local_with_interest_gate(
 /// for retry-count tracking and to ensure we don't revisit peers we've
 /// explicitly attempted in this driver invocation.
 ///
-/// Returns None when exhausted (`retries >= MAX_RELAY_RETRIES`).
+/// Peek the `remaining_backtrack_budget` carried by a downstream
+/// `GetMsg::Response{NotFound}` reply, if this reply is one. Returns None for
+/// any other reply (Found / Streaming / etc. do not thread the budget). Used
+/// by the relay loop to adopt the downstream subtree's post-backtracking
+/// budget before deciding whether to try another candidate.
+fn notfound_remaining_backtrack_budget(reply: &NetMessage) -> Option<u32> {
+    match reply {
+        NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+            result: GetMsgResult::NotFound,
+            remaining_backtrack_budget,
+            ..
+        })) => Some(*remaining_backtrack_budget),
+        _ => None,
+    }
+}
+
+/// Returns None when this relay has no next candidate to try — either the
+/// per-request backtracking budget is exhausted / disallowed, or
+/// `k_closest_potentially_hosting` yields nothing new.
+///
+/// Budget model (hosting redesign routing-robustness; see
+/// `operations::DEFAULT_BACKTRACK_BUDGET`): the FIRST forward at this relay is
+/// the greedy base-path hop and is always free. Every SUBSEQUENT forward is a
+/// BACKTRACK — an alternative next-hop tried after the greedy child (or a prior
+/// alternative) returned NotFound. Each backtrack draws one unit from the
+/// shared per-request `budget` and is only permitted when `backtrack_allowed`
+/// (the previous downstream returned a CLEAN NotFound; a transport
+/// failure/timeout leaves the reused tx open to a late reply, so we do not
+/// retry routing there — preserving the pre-backtrack give-up-on-failure
+/// behaviour). Because `budget` is threaded through the wire (forward in the
+/// Request, back in the NotFound Response) and each relay awaits its downstream
+/// synchronously, the counter bounds total alternative forwards across the
+/// ENTIRE request, keeping worst-case fan-out linear (NOT the per-hop
+/// multiplicative `k^HTL` blow-up the old `MAX_RELAY_RETRIES = 1` guarded).
 fn relay_advance_to_next_peer(
     op_manager: &OpManager,
     instance_id: &ContractInstanceId,
     tried: &mut Vec<SocketAddr>,
     retries: &mut usize,
+    budget: &mut u32,
+    backtrack_allowed: bool,
     new_visited: &VisitedPeers,
 ) -> Option<(PeerKeyLocation, SocketAddr)> {
-    // Legacy relay does NOT retry alternative peers at each hop — it
-    // forwards once and bubbles back whatever downstream returned. The
-    // phase-5 migration introduced a 3-peer retry loop here
-    // that compounded fan-out to 3^HTL per origination under virtual
-    // time (ci-fault-loss run 24602255580 showed 16.9M spawns in 95s
-    // with single-use tx reuse still in place). Cap at 1 to match
-    // legacy semantics exactly. If downstream fails, we bubble
-    // NotFound to upstream and let the originator's client driver
-    // handle cross-peer retries (which IS legitimate in
-    // `drive_client_get_inner`'s retry loop).
-    const MAX_RELAY_RETRIES: usize = 1;
-    if *retries >= MAX_RELAY_RETRIES {
+    // A backtrack (retries > 0) is gated on a clean prior NotFound and on
+    // remaining budget. do NOT re-add a per-hop retry cap here — the linear
+    // fan-out bound depends on this being the shared per-request budget, not a
+    // per-hop multiplier (see hosting-invariants #4630 / DEFAULT_BACKTRACK_BUDGET).
+    // The budget is CHARGED only when a usable candidate is actually returned
+    // (`charge` closure), NOT here: a no-candidate / addressless / already-tried
+    // terminus makes no forward and must echo its budget unchanged, so it must
+    // not "spend" a unit it never used.
+    let is_backtrack = *retries > 0;
+    if is_backtrack && (!backtrack_allowed || *budget == 0) {
         return None;
     }
-    *retries += 1;
+    let charge = |retries: &mut usize, budget: &mut u32| {
+        if is_backtrack {
+            *budget -= 1;
+        }
+        *retries += 1;
+    };
 
     // Use new_visited as the skip list so upstream's visited set and our own
     // marks are both respected.
@@ -2291,9 +2347,10 @@ fn relay_advance_to_next_peer(
             // configured gateway instead of silently exhausting. Respects
             // both the request's visited bloom (cross-hop loop prevention —
             // a gateway the request already traversed is never re-picked)
-            // and `tried` (exact local exclusion). Stays within
-            // MAX_RELAY_RETRIES, so the 3^HTL fan-out guard above is
-            // unaffected.
+            // and `tried` (exact local exclusion). This selection is still
+            // gated by the per-request backtracking budget (a gateway retry
+            // after a prior forward costs one budget unit like any other
+            // alternative), so the linear fan-out bound is unaffected.
             return match bootstrap_gateway_target(op_manager, |addr| {
                 tried.contains(&addr) || new_visited.probably_visited(addr)
             }) {
@@ -2304,6 +2361,7 @@ fn relay_advance_to_next_peer(
                         "GET relay advance: ring empty — forwarding to configured gateway"
                     );
                     tried.push(addr);
+                    charge(retries, budget);
                     Some((gw, addr))
                 }
                 None => {
@@ -2337,6 +2395,7 @@ fn relay_advance_to_next_peer(
         return None;
     }
     tried.push(addr);
+    charge(retries, budget);
     Some((peer, addr))
 }
 
@@ -2347,18 +2406,25 @@ fn relay_advance_to_next_peer(
 /// exhaustion), this is `max_htl - incoming_htl`. For an originator-side
 /// originator-loopback NotFound from `start_client_get` after exhaustion,
 /// pass 0 (no remote hops traversed).
+///
+/// `remaining_backtrack_budget` carries the per-request backtracking budget
+/// left after this relay's subtree finished, so the upstream relay can adopt
+/// it before deciding whether to try another next-hop candidate (see
+/// `operations::DEFAULT_BACKTRACK_BUDGET`).
 async fn relay_send_not_found(
     op_manager: &OpManager,
     tx: Transaction,
     instance_id: ContractInstanceId,
     upstream_addr: SocketAddr,
     hop_count: usize,
+    remaining_backtrack_budget: u32,
 ) {
     let msg = NetMessage::from(GetMsg::Response {
         id: tx,
         instance_id,
         result: GetMsgResult::NotFound,
         hop_count,
+        remaining_backtrack_budget,
     });
     let mut ctx = op_manager.op_ctx(tx);
     // Originator-loopback: when this driver runs on the originator's
@@ -2426,6 +2492,9 @@ where
                 },
             },
             hop_count,
+            // Backtracking budget is only meaningful on NotFound (the upstream
+            // has found the contract and will not backtrack).
+            remaining_backtrack_budget: 0,
         });
         return ctx
             .send_local_loopback(msg)
@@ -2530,6 +2599,8 @@ where
                 value: StoreResponse { state, contract },
             },
             hop_count,
+            // Backtracking budget is only meaningful on NotFound.
+            remaining_backtrack_budget: 0,
         });
         ctx.send_fire_and_forget(upstream_addr, msg)
             .await
@@ -2548,6 +2619,7 @@ async fn drive_relay_get_inner<CB>(
     visited: VisitedPeers,
     fetch_contract: bool,
     subscribe: bool,
+    backtrack_budget: u32,
 ) -> Result<(), OpError>
 where
     CB: NetworkBridge + Clone + Send + 'static,
@@ -2580,12 +2652,15 @@ where
         // meaning the request traversed the full max_htl forward hops to get
         // here. hop_count = max_htl - 0 = max_htl.
         let hop_count = op_manager.ring.max_hops_to_live;
+        // This terminus forwarded nothing, so it consumed no backtracking
+        // budget — return the incoming budget unchanged.
         relay_send_not_found(
             op_manager,
             incoming_tx,
             instance_id,
             upstream_addr,
             hop_count,
+            backtrack_budget,
         )
         .await;
         return Ok(());
@@ -2705,6 +2780,16 @@ where
 
     let mut retries: usize = 0;
 
+    // Per-request backtracking budget (hosting redesign routing-robustness;
+    // see `operations::DEFAULT_BACKTRACK_BUDGET`). Seeded from the incoming
+    // Request, adopted from each downstream's NotFound reply, decremented per
+    // alternative next-hop tried, and echoed back in this relay's own NotFound
+    // Response. `backtrack_allowed` gates a retry on a CLEAN downstream
+    // NotFound (never after a transport failure/timeout — the reused tx could
+    // still get a late reply).
+    let mut budget = backtrack_budget;
+    let mut backtrack_allowed = false;
+
     // Terminal advertisement consult (hosting redesign piece C, invariant 5).
     // Lazily built the first time location routing is exhausted; each entry
     // is an advertised host to forward to (off the direct routing path).
@@ -2727,7 +2812,7 @@ where
     // that k_closest deliberately skips — so we skip the consult there for
     // counter accuracy and parity with SUBSCRIBE's `candidates.is_empty()`
     // branch. The consult's value is reaching an unvisited advertised neighbor
-    // the single greedy forward (MAX_RELAY_RETRIES) skipped, which requires a
+    // that greedy routing + bounded backtracking skipped, which requires a
     // routing forward to have occurred.
     let mut did_forward = false;
 
@@ -2738,6 +2823,8 @@ where
             &instance_id,
             &mut tried,
             &mut retries,
+            &mut budget,
+            backtrack_allowed,
             &new_visited,
         ) {
             Some(p) => {
@@ -2782,9 +2869,10 @@ where
                     return Ok(());
                 }
 
-                // This relay has exhausted its single greedy routing forward
-                // (MAX_RELAY_RETRIES = 1) without finding the contract, and
-                // holds no local copy. Before declaring a findability
+                // This relay has exhausted its greedy routing forward plus any
+                // bounded backtracking (per-request budget spent, or no more
+                // candidates) without finding the contract, and holds no local
+                // copy. Before declaring a findability
                 // dead-end, consult the host advertisements our neighbors
                 // broadcast for this key (invariant 5) and try the closest
                 // UNVISITED advertised hosts the retry cap skipped — the "one
@@ -2895,6 +2983,9 @@ where
                         instance_id,
                         upstream_addr,
                         hop_count,
+                        // Echo the budget left after our subtree's backtracking
+                        // so the upstream can decide whether to try alternatives.
+                        budget,
                     )
                     .await;
                     return Ok(());
@@ -2960,6 +3051,9 @@ where
             htl: new_htl,
             visited: new_visited.clone(),
             subscribe,
+            // Forward the budget we currently hold; the downstream subtree
+            // draws from and returns it (threaded depth-first).
+            backtrack_budget: budget,
         });
 
         // Originator-loopback: when the relay driver runs on the
@@ -3028,8 +3122,23 @@ where
                     crate::node::network_status::OpType::Get,
                 );
                 // No reply received — the awaited peer may reply late on the
-                // reused tx, so do NOT consult after this (Codex P2).
+                // reused tx, so do NOT consult after this (Codex P2). For the
+                // same reason we do NOT backtrack (retry routing) after a
+                // no-reply: a late reply could satisfy the alternative's reused
+                // waiter. This preserves the pre-backtrack give-up-on-failure
+                // behaviour (the terminus/notfound path handles it below).
+                //
+                // ZERO the budget: we handed this child the current `budget` and
+                // it may have spent all of it fanning out before the reply was
+                // lost. We cannot prove otherwise, so — to keep the budget
+                // monotone and the fan-out bound intact (#4630) — treat the
+                // handed budget as consumed. Echoing the un-adopted budget
+                // upstream would let each lost reply DUPLICATE the shared
+                // counter (parent re-spends what the child already spent),
+                // re-opening k^HTL amplification.
                 last_forward_failed = true;
+                backtrack_allowed = false;
+                budget = 0;
                 // Continue loop to try next peer.
                 new_visited.mark_visited(peer_addr);
                 continue;
@@ -3049,8 +3158,15 @@ where
                     crate::node::network_status::OpType::Get,
                 );
                 // Timed out with no reply — the peer may reply late on the
-                // reused tx, so do NOT consult after this (Codex P2).
+                // reused tx, so do NOT consult after this (Codex P2), and do
+                // NOT backtrack (retry routing) for the same reason. ZERO the
+                // budget: the timed-out child was handed `budget` and may have
+                // spent it fanning out (a malicious relay can fan out then
+                // withhold its reply); echoing it upstream would duplicate the
+                // shared counter and re-open k^HTL amplification (#4630).
                 last_forward_failed = true;
+                backtrack_allowed = false;
+                budget = 0;
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
@@ -3061,6 +3177,23 @@ where
         // safe to consult after this attempt (Codex P2). Reset regardless of
         // how the reply classifies below.
         last_forward_failed = false;
+
+        // If the downstream returned a clean NotFound, ADOPT the budget it
+        // reports (threaded depth-first): the downstream subtree already spent
+        // some of the shared per-request budget on its own backtracking, so our
+        // subsequent alternatives must respect what's left. Peeked before
+        // `classify` consumes `reply`.
+        //
+        // CLAMP with `.min(budget)`: `remaining` is an UNTRUSTED wire value. The
+        // linear fan-out bound (#4630) depends on the budget being monotonically
+        // non-increasing — a subtree may only SPEND budget, never MINT it. A
+        // buggy/malicious downstream that returns an inflated
+        // `remaining_backtrack_budget` (e.g. u32::MAX) must NOT be able to raise
+        // our budget above what we handed it. `budget` here still holds the
+        // value we forwarded, so `min` enforces exactly that.
+        if let Some(remaining) = notfound_remaining_backtrack_budget(&reply) {
+            budget = remaining.min(budget);
+        }
 
         // Classify the reply.
         let attempt_outcome = classify(reply);
@@ -3444,6 +3577,13 @@ where
                     %instance_id,
                     "GET relay: unexpected LocalCompletion (Request-echo) — trying next peer"
                 );
+                // Not a clean downstream NotFound — do not spend backtracking
+                // budget on a protocol anomaly. Zero the budget: this child may
+                // have fanned out before replying with the anomalous variant, so
+                // echoing the un-adopted budget upstream could duplicate the
+                // shared counter (same monotonicity guard as the no-reply arms).
+                backtrack_allowed = false;
+                budget = 0;
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
@@ -3457,7 +3597,8 @@ where
                 tracing::debug!(
                     tx = %incoming_tx,
                     target = %peer,
-                    "GET relay: downstream returned NotFound; advancing to next peer"
+                    remaining_backtrack_budget = budget,
+                    "GET relay: downstream returned NotFound; backtracking to next candidate"
                 );
                 crate::operations::record_relay_route_event(
                     op_manager,
@@ -3466,6 +3607,12 @@ where
                     crate::router::RouteOutcome::SuccessUntimed,
                     crate::node::network_status::OpType::Get,
                 );
+                // Clean downstream NotFound → this relay MAY backtrack to its
+                // next-closest candidate, drawing from the (already-adopted)
+                // per-request budget. `relay_advance_to_next_peer` enforces the
+                // budget; when it hits 0 the loop falls through to the
+                // consult / terminus NotFound below.
+                backtrack_allowed = true;
                 // Mark the failed peer so future iterations don't re-select it.
                 new_visited.mark_visited(peer_addr);
                 // Loop iterates to next peer.
@@ -3481,6 +3628,11 @@ where
                     target = %peer,
                     "GET relay: unexpected reply variant; advancing to next peer"
                 );
+                // Not a clean downstream NotFound — do not spend backtracking
+                // budget on an unexpected variant. Zero the budget for the same
+                // monotonicity reason as the no-reply / anomaly arms above.
+                backtrack_allowed = false;
+                budget = 0;
                 new_visited.mark_visited(peer_addr);
                 continue;
             }
@@ -3683,6 +3835,7 @@ mod tests {
                 },
             },
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         }));
         assert!(matches!(
             classify(msg),
@@ -3714,6 +3867,7 @@ mod tests {
                     },
                 },
                 hop_count: hc,
+                remaining_backtrack_budget: 0,
             }));
             match classify(msg) {
                 AttemptOutcome::Terminal(Terminal::InlineFound { hop_count, .. }) => {
@@ -3740,8 +3894,201 @@ mod tests {
             instance_id: *key.id(),
             result: GetMsgResult::NotFound,
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         }));
         assert!(matches!(classify(msg), AttemptOutcome::Retry));
+    }
+
+    // ── Routing backtracking (hosting-invariants §E, #4642) ──────────────────
+
+    #[test]
+    fn notfound_remaining_budget_extracted_from_notfound_reply() {
+        let tx = dummy_tx();
+        let key = dummy_key();
+        let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+            id: tx,
+            instance_id: *key.id(),
+            result: GetMsgResult::NotFound,
+            hop_count: 2,
+            remaining_backtrack_budget: 3,
+        }));
+        assert_eq!(
+            notfound_remaining_backtrack_budget(&msg),
+            Some(3),
+            "the relay must read the downstream's returned budget so it threads \
+             the per-request counter depth-first"
+        );
+    }
+
+    #[test]
+    fn notfound_remaining_budget_none_for_non_notfound() {
+        let tx = dummy_tx();
+        let key = dummy_key();
+        // A Found reply carries no meaningful backtrack budget.
+        let found = NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+            id: tx,
+            instance_id: *key.id(),
+            result: GetMsgResult::Found {
+                key,
+                value: StoreResponse {
+                    state: Some(WrappedState::new(vec![1])),
+                    contract: None,
+                },
+            },
+            hop_count: 0,
+            remaining_backtrack_budget: 9,
+        }));
+        assert_eq!(
+            notfound_remaining_backtrack_budget(&found),
+            None,
+            "a Found reply must not be treated as carrying a backtrack budget"
+        );
+        // A Request is not a reply at all.
+        let req = NetMessage::V1(NetMessageV1::Get(GetMsg::Request {
+            id: tx,
+            instance_id: *key.id(),
+            fetch_contract: true,
+            htl: 5,
+            visited: VisitedPeers::new(&tx),
+            subscribe: false,
+            backtrack_budget: 4,
+        }));
+        assert_eq!(notfound_remaining_backtrack_budget(&req), None);
+    }
+
+    /// Pin: the relay loop must THREAD the per-request budget, not reset it
+    /// per hop. A per-hop reset (or a per-hop retry cap) reintroduces the
+    /// `k^HTL` fan-out blow-up the old `MAX_RELAY_RETRIES = 1` guarded (#4630).
+    #[test]
+    fn relay_get_threads_backtrack_budget_depth_first() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        // Seeded from the incoming Request, not a local constant.
+        assert!(
+            body.contains("let mut budget = backtrack_budget;"),
+            "drive_relay_get_inner must seed its budget from the incoming \
+             Request's backtrack_budget (threaded), not a per-hop constant"
+        );
+        // Adopts the downstream subtree's returned budget on a clean NotFound,
+        // CLAMPED with `.min(budget)` so an untrusted downstream cannot MINT
+        // budget (monotonicity — the #4630 fan-out bound depends on it).
+        assert!(
+            body.contains("notfound_remaining_backtrack_budget(&reply)")
+                && body.contains("budget = remaining.min(budget)"),
+            "the relay must ADOPT (clamped via .min(budget)) the budget its \
+             downstream returned; a bare `budget = remaining` would let a \
+             malicious peer inflate the budget and re-open k^HTL fan-out (#4630)"
+        );
+        // Forwards the CURRENT budget downstream (not the originator default).
+        assert!(
+            body.contains("backtrack_budget: budget"),
+            "the relay must forward the budget it currently holds so the \
+             downstream subtree draws from the same shared counter"
+        );
+        // Echoes the remaining budget upstream on its own NotFound.
+        assert!(
+            body.contains("budget,\n                    )\n                    .await;")
+                || body.contains("relay_send_not_found(") && body.contains("budget,"),
+            "the terminus NotFound must echo the remaining budget upstream"
+        );
+    }
+
+    /// Pin: only a CLEAN downstream NotFound may spend backtracking budget.
+    /// A transport failure / timeout must NOT retry routing (the reused tx
+    /// could still get a late reply — Codex P2), preserving the pre-backtrack
+    /// give-up-on-failure behaviour.
+    #[test]
+    fn relay_get_backtrack_gated_on_clean_notfound() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        // The Retry (clean NotFound) arm enables backtracking.
+        let retry_pos = body
+            .find("downstream returned NotFound; backtracking")
+            .expect("Retry arm log message must exist");
+        let retry_after = &body[retry_pos..retry_pos + 1500.min(body.len() - retry_pos)];
+        assert!(
+            retry_after.contains("backtrack_allowed = true"),
+            "the clean-NotFound arm must set backtrack_allowed = true"
+        );
+        // The transport-failure arms disable backtracking.
+        assert!(
+            body.matches("backtrack_allowed = false").count() >= 2,
+            "the send-failure and timeout arms must set backtrack_allowed = \
+             false so a no-reply forward does not spend budget on a retry"
+        );
+    }
+
+    /// Pin (#4630 monotonicity): every relay arm that forwarded but did NOT get
+    /// a clean downstream NotFound (no reply, timeout, anomalous variant) MUST
+    /// zero the budget. Echoing the un-adopted budget upstream would let a lost
+    /// reply DUPLICATE the shared counter (a malicious relay can fan out then
+    /// withhold its reply), re-opening the k^HTL fan-out the budget bounds.
+    #[test]
+    fn relay_get_zeroes_budget_when_no_clean_notfound() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        // send-failure, timeout, LocalCompletion, Unexpected = 4 non-adopt arms.
+        assert!(
+            body.matches("budget = 0;").count() >= 4,
+            "each forwarded-but-no-clean-NotFound arm (send-fail, timeout, \
+             LocalCompletion, Unexpected) must set `budget = 0;` — found {}",
+            body.matches("budget = 0;").count()
+        );
+        // The wrapper's infra-error path must echo 0, not the incoming budget.
+        let wrapper = extract_fn_body(src, "async fn drive_relay_get<CB>(");
+        assert!(
+            wrapper.contains("hop_count,\n                0,\n            )")
+                || wrapper.contains("relay_send_not_found(")
+                    && !wrapper.contains("backtrack_budget,\n            )"),
+            "drive_relay_get infra-error path must echo budget 0 (inner driver \
+             may have fanned out before erroring), not the incoming budget"
+        );
+    }
+
+    /// Pin: the advance helper gates alternatives on the shared budget, and the
+    /// first (greedy) forward is free. Guards against re-introducing a per-hop
+    /// multiplicative cap.
+    #[test]
+    fn relay_advance_gates_alternatives_on_shared_budget() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "fn relay_advance_to_next_peer(");
+        assert!(
+            body.contains("let is_backtrack = *retries > 0;"),
+            "the first forward (retries == 0) must be free; only subsequent \
+             forwards are budget-gated backtracks"
+        );
+        assert!(
+            body.contains("*budget == 0") && body.contains("*budget -= 1"),
+            "an alternative forward must require budget > 0 and decrement it"
+        );
+        // The budget must be charged only when a usable candidate is actually
+        // returned (via the `charge` closure at each Some(...) site), NOT
+        // unconditionally before candidate selection — otherwise a
+        // no-candidate / addressless / already-tried terminus echoes a budget
+        // that is one too low (Codex finding).
+        assert!(
+            body.contains("charge(retries, budget)"),
+            "budget must be charged at the Some(...) return sites, not before \
+             confirming a usable candidate"
+        );
+        assert!(
+            !body.contains("MAX_RELAY_RETRIES"),
+            "the per-hop MAX_RELAY_RETRIES cap must be gone — backtracking is \
+             bounded by the shared per-request budget, not a per-hop multiplier"
+        );
+    }
+
+    /// Pin: the originator seeds a real (non-zero) budget so backtracking can
+    /// actually fire. A regression to 0 would silently disable the mechanism.
+    #[test]
+    fn originator_get_seeds_default_backtrack_budget() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "fn build_request(&mut self, attempt_tx: Transaction)");
+        assert!(
+            body.contains("backtrack_budget: crate::operations::DEFAULT_BACKTRACK_BUDGET"),
+            "the originator GET must seed backtrack_budget with \
+             DEFAULT_BACKTRACK_BUDGET so relays have budget to backtrack with"
+        );
     }
 
     #[test]
@@ -3800,6 +4147,7 @@ mod tests {
             htl: 5,
             visited: VisitedPeers::new(&tx),
             subscribe: false,
+            backtrack_budget: 0,
         }));
         assert!(matches!(
             classify(msg),
@@ -3825,6 +4173,7 @@ mod tests {
                 },
             },
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         }));
         assert!(matches!(classify(msg), AttemptOutcome::Unexpected));
     }
@@ -6022,7 +6371,7 @@ mod tests {
         // The Retry/NotFound arm must record SuccessUntimed too — see
         // the outcome-attribution rationale in operations.rs::record_relay_route_event
         // rustdoc. A peer answering NotFound has not failed.
-        let pos = body.unwrap_or_default_pos("downstream returned NotFound; advancing");
+        let pos = body.unwrap_or_default_pos("downstream returned NotFound; backtracking");
         let after = &body[pos..pos + 1500.min(body.len() - pos)];
         assert!(
             after.contains("record_relay_route_event")

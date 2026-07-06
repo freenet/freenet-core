@@ -33,6 +33,56 @@ pub(crate) use visited_peers::VisitedPeers;
 // `result_router_tx` (see `op_ctx_task::*`); no central carrier
 // is required.
 
+/// Total per-request backtracking budget for GET/SUBSCRIBE routing
+/// (hosting redesign, routing-robustness prerequisite for piece E —
+/// `.claude/rules/hosting-invariants.md` §E, `docs/design/demand-driven-hosting.md`).
+///
+/// Greedy single-path routing toward a *sparse* near-key host dead-ends
+/// when the greedy descent stalls at a local minimum more than one hop
+/// from the lone holder (6/8 dead-ends in a 16-peer sparse-ring sim once
+/// relay-caching's scattered copies are gone). The fix is bounded
+/// backtracking: on a NotFound from the greedy next-hop, a relay tries the
+/// next-closest `k_closest` candidates it already computed.
+///
+/// The budget is a **single per-request counter**, NOT a per-hop cap. It is
+/// carried forward in `GetMsg::Request.backtrack_budget` /
+/// `SubscribeMsg::Request.backtrack_budget` and returned in the NotFound
+/// reply (`GetMsg::Response.remaining_backtrack_budget` /
+/// `SubscribeMsg::Response.remaining_backtrack_budget`). Because the relay
+/// awaits each downstream synchronously, the counter threads the whole
+/// traversal in depth-first order: a relay adopts the budget its downstream
+/// subtree returned before deciding whether to backtrack further.
+///
+/// That keeps the worst-case fan-out LINEAR (at most `max_htl * (1 + budget)`
+/// forwards: the greedy spine plus one bounded greedy sub-spine per backtrack)
+/// instead of the `k^HTL` blow-up a per-hop retry cap of `k` would produce (the
+/// #4630 DoS surface the previous `MAX_RELAY_RETRIES = 1` guarded). The bound
+/// holds ONLY because the budget is **monotonically non-increasing**: it is
+/// CLAMPED (`.min`) when adopting a downstream's returned value (an untrusted
+/// wire field, so a subtree can only SPEND, never MINT budget), and a forward
+/// that yields no clean `NotFound` reply (timeout / send-failure / anomalous
+/// variant / mid-op error) contributes ZERO budget onward, since the un-replied
+/// child may have fanned out its handed budget before its reply was lost. Drop
+/// either guard and the counter can be duplicated or inflated, and the `k^HTL`
+/// amplification returns.
+///
+/// The terminal-advertisement consult (piece C, `consult_advertised_hosts`) is
+/// deliberately OUTSIDE this budget: it is a separate, independently-bounded
+/// findability mechanism (at most `MAX_TERMINAL_CONSULT_HOSTS` / `1` off-path
+/// forward per relay, gated on routing being fully exhausted). So the overall
+/// worst-case per-request fan-out is `backtrack bound + consult bound`, both
+/// linear. The consult forward carries the CURRENT (post-backtrack) budget, so
+/// its own subtree is still budget-bounded and cannot mint (its returned budget
+/// is clamped like any other).
+///
+/// `4` is a conservative starting value (§E suggested raising the per-hop cap
+/// to 2-3; a shared budget of 4 leaves headroom). It should be tuned against a
+/// sparse-ring findability sim that reproduces a genuine greedy stall (holder
+/// alive but the greedy descent stalls more than one hop from it); the
+/// demand-driven-hosting Delta churn sim (freenet-core#4665) is the intended
+/// vehicle once its dead-ending gate lands.
+pub(crate) const DEFAULT_BACKTRACK_BUDGET: u32 = 4;
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) enum OpOutcome<'a> {

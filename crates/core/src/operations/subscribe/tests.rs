@@ -462,6 +462,7 @@ fn test_subscribe_msg_response_hop_count_roundtrip() {
             instance_id,
             result: SubscribeMsgResult::Subscribed { key },
             hop_count,
+            remaining_backtrack_budget: 0,
         };
         let bytes = bincode::serialize(&subscribed).expect(label);
         let restored: SubscribeMsg = bincode::deserialize(&bytes).expect(label);
@@ -483,6 +484,7 @@ fn test_subscribe_msg_response_hop_count_roundtrip() {
             instance_id,
             result: SubscribeMsgResult::NotFound,
             hop_count,
+            remaining_backtrack_budget: 0,
         };
         let bytes = bincode::serialize(&notfound).expect(label);
         let restored: SubscribeMsg = bincode::deserialize(&bytes).expect(label);

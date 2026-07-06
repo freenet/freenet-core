@@ -844,6 +844,10 @@ async fn drive_client_subscribe_inner(
             htl,
             visited: visited.clone(),
             is_renewal,
+            // Each originator attempt seeds a fresh per-request backtracking
+            // budget; relays thread and decrement it (see
+            // `operations::DEFAULT_BACKTRACK_BUDGET`).
+            backtrack_budget: crate::operations::DEFAULT_BACKTRACK_BUDGET,
         };
 
         // Dispatch via `send_to_and_await` so the Request reaches `current_target_addr`
@@ -1454,6 +1458,7 @@ pub static RELAY_SUBSCRIBE_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
 /// - Cross-peer retries are NOT attempted at the relay — the relay
 ///   breadth/retry loop was the memory-explosion amplifier (see
 ///   `project_1454_phase5_memory.md`). Originator owns retry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_relay_subscribe(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
@@ -1462,6 +1467,7 @@ pub(crate) async fn start_relay_subscribe(
     visited: VisitedPeers,
     is_renewal: bool,
     upstream_addr: std::net::SocketAddr,
+    backtrack_budget: u32,
 ) -> Result<(), OpError> {
     #[cfg(any(test, feature = "testing"))]
     RELAY_SUBSCRIBE_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1496,6 +1502,9 @@ pub(crate) async fn start_relay_subscribe(
             instance_id,
             result: SubscribeMsgResult::NotFound,
             hop_count,
+            // Dedup reject forwards nothing new — return the incoming budget
+            // unchanged so the upstream can still backtrack.
+            remaining_backtrack_budget: backtrack_budget,
         });
         let mut ctx = op_manager.op_ctx(incoming_tx);
         if let Err(err) = ctx.send_fire_and_forget(upstream_addr, response).await {
@@ -1540,6 +1549,7 @@ pub(crate) async fn start_relay_subscribe(
         visited,
         is_renewal,
         upstream_addr,
+        backtrack_budget,
     ));
     Ok(())
 }
@@ -1572,6 +1582,7 @@ async fn run_relay_subscribe(
     visited: VisitedPeers,
     is_renewal: bool,
     upstream_addr: std::net::SocketAddr,
+    backtrack_budget: u32,
 ) {
     let _guard = guard;
 
@@ -1583,6 +1594,7 @@ async fn run_relay_subscribe(
         visited,
         is_renewal,
         upstream_addr,
+        backtrack_budget,
     )
     .await
     {
@@ -1631,6 +1643,7 @@ async fn run_relay_subscribe(
 /// without originating traffic), extend `OpCtx::send_to_and_await`
 /// to emit a stat update on `Err(_elapsed)` via a hook rather than
 /// reintroducing the signal on each relay driver.
+#[allow(clippy::too_many_arguments)]
 async fn drive_relay_subscribe(
     op_manager: &Arc<OpManager>,
     incoming_tx: Transaction,
@@ -1639,6 +1652,7 @@ async fn drive_relay_subscribe(
     visited: VisitedPeers,
     is_renewal: bool,
     upstream_addr: std::net::SocketAddr,
+    backtrack_budget: u32,
 ) -> Result<(), OpError> {
     tracing::info!(
         tx = %incoming_tx,
@@ -1692,6 +1706,8 @@ async fn drive_relay_subscribe(
             SubscribeMsgResult::Subscribed { key },
             upstream_addr,
             hop_count,
+            // Subscribed: budget is irrelevant (upstream won't backtrack).
+            0,
         )
         .await;
     }
@@ -1726,6 +1742,8 @@ async fn drive_relay_subscribe(
             SubscribeMsgResult::NotFound,
             upstream_addr,
             hop_count,
+            // HTL-exhaustion terminus forwarded nothing — return budget unchanged.
+            backtrack_budget,
         )
         .await;
     }
@@ -1773,6 +1791,8 @@ async fn drive_relay_subscribe(
             SubscribeMsgResult::NotFound,
             upstream_addr,
             hop_count,
+            // No-candidates terminus forwarded nothing — budget unchanged.
+            backtrack_budget,
         )
         .await;
     }
@@ -1794,13 +1814,26 @@ async fn drive_relay_subscribe(
             SubscribeMsgResult::NotFound,
             upstream_addr,
             hop_count,
+            // Addressless next-hop terminus forwarded nothing — budget unchanged.
+            backtrack_budget,
         )
         .await;
     };
     new_visited.mark_visited(next_addr);
 
-    // ── Step 3: Forward the single greedy routing hop, await Response ─────
-    let outcome = relay_subscribe_forward_once(
+    // ── Step 3: Forward the greedy routing hop, await Response, then
+    //    BACKTRACK to the next-closest candidates on a clean NotFound. ─────
+    // The greedy hop is the free base-path forward. Each subsequent
+    // alternative draws one unit from the shared per-request backtracking
+    // budget (threaded via `SubscribeMsg::Request.backtrack_budget` forward and
+    // `SubscribeMsg::Response.remaining_backtrack_budget` back), so total
+    // alternative forwards across the whole request stay linear — NOT the
+    // per-hop `k^HTL` blow-up (hosting-invariants §E, #4630). Only a CLEAN
+    // downstream NotFound is backtracked; a `Failed` (no reply) stops here to
+    // avoid a late reply satisfying a reused-tx waiter (Codex P2). See
+    // `operations::DEFAULT_BACKTRACK_BUDGET`.
+    let mut budget = backtrack_budget;
+    let mut outcome = relay_subscribe_forward_once(
         op_manager,
         incoming_tx,
         instance_id,
@@ -1810,8 +1843,59 @@ async fn drive_relay_subscribe(
         next_hop,
         next_addr,
         upstream_addr,
+        budget,
     )
     .await;
+
+    // ── Step 3b: Bounded backtracking over the remaining k_closest
+    //    candidates. On a CLEAN downstream NotFound, adopt the budget it
+    //    returned and, while budget remains and unvisited candidates remain,
+    //    try the next-closest candidate. This routes around a greedy local
+    //    minimum that stranded the request more than one hop from a sparse
+    //    near-key host (hosting-invariants §E). `Failed`/`Subscribed` stop the
+    //    loop (no retry after a no-reply; success needs no alternative).
+    while let SubscribeForwardOutcome::NotFound {
+        remaining_budget, ..
+    } = outcome
+    {
+        // CLAMP with `.min(budget)`: `remaining_budget` is an UNTRUSTED wire
+        // value. The linear fan-out bound (#4630) requires the budget to be
+        // monotonically non-increasing — a subtree may only SPEND, never MINT.
+        // `budget` still holds the value we forwarded, so `min` forbids a
+        // downstream from raising it above what we handed it.
+        budget = remaining_budget.min(budget);
+        if budget == 0 || candidates.is_empty() {
+            break;
+        }
+        // Next-closest candidate (k_closest returned them closest-first).
+        let alt_hop = candidates.remove(0);
+        let Some(alt_addr) = alt_hop.socket_addr() else {
+            break;
+        };
+        // This alternative next-hop is a backtrack — spend one budget unit.
+        budget -= 1;
+        new_visited.mark_visited(alt_addr);
+        tracing::debug!(
+            tx = %incoming_tx,
+            %instance_id,
+            target = %alt_addr,
+            remaining_backtrack_budget = budget,
+            "SUBSCRIBE relay: backtracking to next-closest candidate after NotFound"
+        );
+        outcome = relay_subscribe_forward_once(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            htl,
+            &new_visited,
+            is_renewal,
+            alt_hop,
+            alt_addr,
+            upstream_addr,
+            budget,
+        )
+        .await;
+    }
 
     // ── Step 4: Terminal advertisement consult (piece C, invariant 5) ─────
     // Like GET, the SUBSCRIBE relay forwards a SINGLE greedy hop toward the
@@ -1831,68 +1915,106 @@ async fn drive_relay_subscribe(
     // succeeds (below), never here — a consult that subscribed but whose
     // fire-and-forget reply then fails leaves the requester to time out, so it
     // did NOT close the dead-end (Codex P2 — record after delivery).
-    let (result, bubble_hop_count, consult_outcome): (SubscribeMsgResult, usize, Option<bool>) =
-        match outcome {
-            SubscribeForwardOutcome::Subscribed { key, hop_count } => {
-                (SubscribeMsgResult::Subscribed { key }, hop_count, None)
-            }
-            SubscribeForwardOutcome::NotFound { hop_count } => {
-                let visited_snapshot = new_visited.clone();
-                let consult = crate::operations::consult_advertised_hosts(
-                    op_manager,
-                    &instance_id,
-                    TERMINAL_CONSULT_HOSTS,
-                    move |addr| visited_snapshot.probably_visited(addr),
-                );
-                match consult.into_iter().next() {
-                    Some((consult_hop, consult_addr)) => {
-                        new_visited.mark_visited(consult_addr);
-                        tracing::debug!(
-                            tx = %incoming_tx,
-                            %instance_id,
-                            target = %consult_addr,
-                            "SUBSCRIBE relay: consulting advertised host off routing path after \
-                             downstream NotFound"
-                        );
-                        let consult_outcome = relay_subscribe_forward_once(
-                            op_manager,
-                            incoming_tx,
-                            instance_id,
-                            htl,
-                            &new_visited,
-                            is_renewal,
-                            consult_hop,
-                            consult_addr,
-                            upstream_addr,
-                        )
-                        .await;
-                        match consult_outcome {
-                            SubscribeForwardOutcome::Subscribed { key, hop_count } => (
-                                SubscribeMsgResult::Subscribed { key },
-                                hop_count,
-                                Some(true),
-                            ),
-                            SubscribeForwardOutcome::NotFound { hop_count }
-                            | SubscribeForwardOutcome::Failed { hop_count } => {
-                                (SubscribeMsgResult::NotFound, hop_count, Some(false))
-                            }
+    // `final_budget` is the per-request backtracking budget left after this
+    // relay's greedy hop + backtracking (+ consult), echoed back to the
+    // upstream so it can decide whether to backtrack further.
+    let (result, bubble_hop_count, consult_outcome, final_budget): (
+        SubscribeMsgResult,
+        usize,
+        Option<bool>,
+        u32,
+    ) = match outcome {
+        SubscribeForwardOutcome::Subscribed { key, hop_count } => {
+            // Subscribed: budget is irrelevant (upstream won't backtrack).
+            (SubscribeMsgResult::Subscribed { key }, hop_count, None, 0)
+        }
+        SubscribeForwardOutcome::NotFound { hop_count, .. } => {
+            // `budget` already holds this NotFound's remaining budget (adopted
+            // and clamped by the backtrack loop above).
+            let visited_snapshot = new_visited.clone();
+            let consult = crate::operations::consult_advertised_hosts(
+                op_manager,
+                &instance_id,
+                TERMINAL_CONSULT_HOSTS,
+                move |addr| visited_snapshot.probably_visited(addr),
+            );
+            match consult.into_iter().next() {
+                Some((consult_hop, consult_addr)) => {
+                    new_visited.mark_visited(consult_addr);
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        %instance_id,
+                        target = %consult_addr,
+                        "SUBSCRIBE relay: consulting advertised host off routing path after \
+                         downstream NotFound"
+                    );
+                    // The consult forward is OUTSIDE the backtrack budget
+                    // (piece C is separately bounded) but still carries the
+                    // current post-backtrack budget so its own subtree stays
+                    // budget-bounded and cannot mint (see
+                    // `operations::DEFAULT_BACKTRACK_BUDGET`).
+                    let consult_outcome = relay_subscribe_forward_once(
+                        op_manager,
+                        incoming_tx,
+                        instance_id,
+                        htl,
+                        &new_visited,
+                        is_renewal,
+                        consult_hop,
+                        consult_addr,
+                        upstream_addr,
+                        budget,
+                    )
+                    .await;
+                    match consult_outcome {
+                        SubscribeForwardOutcome::Subscribed { key, hop_count } => (
+                            SubscribeMsgResult::Subscribed { key },
+                            hop_count,
+                            Some(true),
+                            0,
+                        ),
+                        SubscribeForwardOutcome::NotFound {
+                            hop_count,
+                            remaining_budget,
+                        } => (
+                            SubscribeMsgResult::NotFound,
+                            hop_count,
+                            Some(false),
+                            // CLAMP: the consult host's returned budget is an
+                            // untrusted wire value; it may only spend the budget
+                            // we handed it, never mint (monotonicity, #4630).
+                            remaining_budget.min(budget),
+                        ),
+                        SubscribeForwardOutcome::Failed { hop_count } => {
+                            // Consult forward got no reply. Echo budget 0: the
+                            // consulted host was handed `budget` and may have
+                            // fanned out before the reply was lost, so treating
+                            // it as consumed keeps the shared counter monotone
+                            // (#4630). Same guard as the greedy Failed arm below.
+                            (SubscribeMsgResult::NotFound, hop_count, Some(false), 0)
                         }
                     }
-                    None => {
-                        // No advertised host to try: the downstream NotFound stands.
-                        (SubscribeMsgResult::NotFound, hop_count, Some(false))
-                    }
+                }
+                None => {
+                    // No advertised host to try: the downstream NotFound stands.
+                    (SubscribeMsgResult::NotFound, hop_count, Some(false), budget)
                 }
             }
-            SubscribeForwardOutcome::Failed { hop_count } => {
-                // The greedy routing forward received NO reply (timeout / send
-                // failure / unexpected variant). Consulting would install a new
-                // waiter on the reused tx that a late reply from the timed-out
-                // peer could satisfy (Codex P2), so bubble NotFound WITHOUT
-                // consulting — the same outcome as before the consult existed.
-                (SubscribeMsgResult::NotFound, hop_count, None)
-            }
-        };
+        }
+        SubscribeForwardOutcome::Failed { hop_count } => {
+            // The greedy/backtrack routing forward received NO reply (timeout /
+            // send failure / unexpected variant). Consulting would install a new
+            // waiter on the reused tx that a late reply from the timed-out
+            // peer could satisfy (Codex P2), so bubble NotFound WITHOUT
+            // consulting. Echo budget 0, NOT the current `budget`: the
+            // un-replied child was handed `budget` and may have fanned out a
+            // subtree before its reply was lost (a malicious relay can fan out
+            // then withhold). Echoing the un-consumed budget upstream would
+            // duplicate the shared counter and re-open k^HTL amplification
+            // (#4630) — so treat the handed budget as consumed.
+            (SubscribeMsgResult::NotFound, hop_count, None, 0)
+        }
+    };
 
     let send_result = relay_subscribe_send_response(
         op_manager,
@@ -1901,6 +2023,7 @@ async fn drive_relay_subscribe(
         result,
         upstream_addr,
         bubble_hop_count,
+        final_budget,
     )
     .await;
 
@@ -1926,8 +2049,14 @@ enum SubscribeForwardOutcome {
         hop_count: usize,
     },
     /// Downstream cleanly answered NotFound (a reply WAS received). Safe to
-    /// fall back to the terminal advertisement consult on the reused tx.
-    NotFound { hop_count: usize },
+    /// fall back to the terminal advertisement consult on the reused tx, or to
+    /// backtrack to the next-closest candidate. `remaining_budget` carries the
+    /// per-request backtracking budget the downstream subtree returned (see
+    /// `operations::DEFAULT_BACKTRACK_BUDGET`).
+    NotFound {
+        hop_count: usize,
+        remaining_budget: u32,
+    },
     /// The forward received NO reply (timeout / send-failure) or an
     /// unexpected variant. The awaited peer may reply late on the reused tx,
     /// so the caller MUST bubble NotFound WITHOUT consulting (Codex P2).
@@ -1953,6 +2082,7 @@ async fn relay_subscribe_forward_once(
     next_hop: PeerKeyLocation,
     next_addr: std::net::SocketAddr,
     upstream_addr: std::net::SocketAddr,
+    budget: u32,
 ) -> SubscribeForwardOutcome {
     let new_htl = htl.saturating_sub(1);
     // Forward-failure / unexpected-variant depth for THIS relay.
@@ -1986,6 +2116,9 @@ async fn relay_subscribe_forward_once(
         htl: new_htl,
         visited: new_visited.clone(),
         is_renewal,
+        // Forward the budget we currently hold; the downstream subtree draws
+        // from and returns it (threaded depth-first).
+        backtrack_budget: budget,
     });
 
     let mut ctx = op_manager.op_ctx(incoming_tx);
@@ -2079,6 +2212,7 @@ async fn relay_subscribe_forward_once(
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
             result: SubscribeMsgResult::NotFound,
             hop_count: downstream_hop_count,
+            remaining_backtrack_budget: downstream_remaining,
             ..
         })) => {
             // Downstream peer correctly answered NotFound. The peer behaved
@@ -2087,6 +2221,7 @@ async fn relay_subscribe_forward_once(
             tracing::debug!(
                 tx = %incoming_tx,
                 %instance_id,
+                remaining_backtrack_budget = downstream_remaining,
                 phase = "relay_subscribe_bubble_not_found",
                 "SUBSCRIBE relay: downstream NotFound"
             );
@@ -2099,6 +2234,9 @@ async fn relay_subscribe_forward_once(
             );
             SubscribeForwardOutcome::NotFound {
                 hop_count: downstream_hop_count,
+                // Adopt the budget the downstream subtree returned. The caller
+                // clamps it against what it forwarded (monotonicity, #4630).
+                remaining_budget: downstream_remaining,
             }
         }
         other => {
@@ -2138,12 +2276,14 @@ async fn relay_subscribe_send_response(
     result: SubscribeMsgResult,
     upstream_addr: std::net::SocketAddr,
     hop_count: usize,
+    remaining_backtrack_budget: u32,
 ) -> Result<(), OpError> {
     let response = NetMessage::from(SubscribeMsg::Response {
         id: incoming_tx,
         instance_id,
         result,
         hop_count,
+        remaining_backtrack_budget,
     });
     let mut ctx = op_manager.op_ctx(incoming_tx);
     ctx.send_fire_and_forget(upstream_addr, response).await
@@ -2280,6 +2420,7 @@ mod tests {
             instance_id: *key.id(),
             result: SubscribeMsgResult::Subscribed { key },
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         }));
         match classify_reply(&msg) {
             ReplyClass::Subscribed { key: got } => assert_eq!(got, key),
@@ -2298,6 +2439,7 @@ mod tests {
             instance_id,
             result: SubscribeMsgResult::NotFound,
             hop_count: 0,
+            remaining_backtrack_budget: 0,
         }));
         assert!(matches!(classify_reply(&msg), ReplyClass::NotFound));
     }
@@ -2324,6 +2466,7 @@ mod tests {
                 instance_id: *key.id(),
                 result: SubscribeMsgResult::Subscribed { key },
                 hop_count: hc,
+                remaining_backtrack_budget: 0,
             }));
             assert!(
                 matches!(classify_reply(&msg), ReplyClass::Subscribed { .. }),
@@ -2350,6 +2493,7 @@ mod tests {
                 instance_id,
                 result: SubscribeMsgResult::NotFound,
                 hop_count: hc,
+                remaining_backtrack_budget: 0,
             }));
             assert!(
                 matches!(classify_reply(&msg), ReplyClass::NotFound),
@@ -2379,6 +2523,7 @@ mod tests {
             htl: 5,
             visited: super::VisitedPeers::new(&tx),
             is_renewal: false,
+            backtrack_budget: 0,
         }));
         assert!(matches!(classify_reply(&msg), ReplyClass::Unexpected));
     }
@@ -2796,6 +2941,76 @@ mod tests {
         assert!(
             driver_src.contains("ctx.send_to_and_await("),
             "drive_relay_subscribe must forward downstream via send_to_and_await"
+        );
+    }
+
+    // ── Routing backtracking (hosting-invariants §E, #4642) ──────────────────
+
+    /// Pin: the SUBSCRIBE relay backtracks over its remaining k_closest
+    /// candidates on a clean downstream NotFound, bounded by the shared
+    /// per-request budget it threads (forward in the Request, back in the
+    /// NotFound reply). A per-hop cap would reintroduce the `k^HTL` blow-up.
+    #[test]
+    fn drive_relay_subscribe_backtracks_within_shared_budget() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let driver_end = src[driver_start..]
+            .find("\n/// Outcome of a single SUBSCRIBE relay forward")
+            .map(|p| p + driver_start)
+            .unwrap_or(src.len());
+        let body = &src[driver_start..driver_end];
+        // Seeded from the incoming Request (threaded), not a per-hop constant.
+        assert!(
+            body.contains("let mut budget = backtrack_budget;"),
+            "drive_relay_subscribe must seed its budget from the incoming \
+             Request's backtrack_budget"
+        );
+        // A backtrack loop over the remaining candidates, gated on NotFound.
+        assert!(
+            body.contains("while let SubscribeForwardOutcome::NotFound"),
+            "drive_relay_subscribe must loop over remaining candidates while the \
+             outcome is a clean NotFound"
+        );
+        // Adopts the downstream's returned budget CLAMPED with .min(budget)
+        // (monotonicity — a downstream cannot MINT budget, #4630), then spends
+        // one unit per alternative.
+        assert!(
+            body.contains("budget = remaining_budget.min(budget)") && body.contains("budget -= 1"),
+            "each backtrack must adopt the downstream's remaining budget CLAMPED \
+             (.min(budget)) and spend one unit per alternative; a bare adopt \
+             would let a malicious peer inflate the budget (#4630)"
+        );
+        // A no-reply forward (Failed outcome) must echo budget 0, not the
+        // un-consumed budget, so a lost reply cannot duplicate the counter.
+        assert!(
+            body.contains("SubscribeMsgResult::NotFound, hop_count, None, 0"),
+            "the greedy/backtrack Failed (no-reply) arm must echo final_budget 0 \
+             (the un-replied child may have fanned out its handed budget)"
+        );
+        // Stops at 0 or when candidates run out (bounded fan-out).
+        assert!(
+            body.contains("budget == 0 || candidates.is_empty()"),
+            "backtracking must stop when the shared budget hits 0 or no more \
+             candidates remain"
+        );
+        // Forwards the current budget and echoes the final budget upstream.
+        assert!(
+            body.contains("relay_subscribe_forward_once(") && body.contains("final_budget"),
+            "the relay must forward the current budget and echo the final \
+             remaining budget on its NotFound Response"
+        );
+    }
+
+    /// Pin: the originator SUBSCRIBE seeds a real (non-zero) budget.
+    #[test]
+    fn originator_subscribe_seeds_default_backtrack_budget() {
+        let src = include_str!("op_ctx_task.rs");
+        assert!(
+            src.contains("backtrack_budget: crate::operations::DEFAULT_BACKTRACK_BUDGET"),
+            "the originator SUBSCRIBE must seed backtrack_budget with \
+             DEFAULT_BACKTRACK_BUDGET so relays have budget to backtrack with"
         );
     }
 
