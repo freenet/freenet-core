@@ -11674,15 +11674,15 @@ fn test_subscription_root_renewal_does_not_storm() {
 /// must let its `active_subscriptions` lease **lapse** rather than refresh it on
 /// the root-satisfied renewal path.
 ///
-/// Why this matters: `contracts_needing_renewal` section 1 re-selects ANY live
-/// active subscription with no interest re-check. If the root-satisfied path
-/// refreshed the lease unconditionally, a no-interest root would re-select
-/// itself every renewal cycle forever — an unbounded `is_subscribed`-only
-/// retention exemption that the `contract_in_use` rustdoc and the AGENTS.md
-/// time-bounded-exemption rule forbid. The fix gates the lease refresh on
-/// `contract_in_use`, so a no-interest root does NOT refresh and the lease
-/// lapses (`SUBSCRIPTION_LEASE_DURATION` = 8 min) — after which it drops out of
-/// the renewal set entirely.
+/// Why this matters: the root-satisfied renewal path must not refresh the lease
+/// of a root with no genuine interest. If it refreshed the lease
+/// unconditionally, a no-interest root would keep its `active_subscriptions`
+/// lease alive forever — an unbounded `is_subscribed`-only retention exemption
+/// that the `contract_in_use` rustdoc and the AGENTS.md time-bounded-exemption
+/// rule forbid. Both the root-satisfied path and `contracts_needing_renewal`
+/// section 1 gate renewal on `contract_in_use`, so a no-interest root does NOT
+/// refresh and the lease lapses (`SUBSCRIPTION_LEASE_DURATION` = 8 min) — after
+/// which it drops out of the renewal set entirely.
 ///
 /// This test seeds a hosted contract on a body-holding root with NO client
 /// subscription, runs past the lease window, and asserts the root's final

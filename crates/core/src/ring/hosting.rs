@@ -1013,16 +1013,20 @@ impl HostingManager {
     ///
     /// **Why `is_subscribed` (this node's own upstream subscription) is NOT
     /// included.** It would seem natural to also exempt contracts the node
-    /// is actively subscribed to. The problem is `contracts_needing_renewal`
-    /// section 1 renews ANY soon-to-expire active subscription
-    /// unconditionally, with no gate on local interest. So an
-    /// `is_subscribed`-only exemption is effectively unbounded — the renewal
-    /// machinery would keep extending the lease forever, blocking
-    /// reclamation indefinitely. That would violate the cleanup-exemption
-    /// rule in `AGENTS.md` (exemptions must be time-bounded). Local-client
-    /// subscriptions and downstream subscribers ARE both time-bounded:
-    /// client subscriptions expire on disconnect; downstream subscribers
-    /// expire via `expire_stale_downstream_subscribers` after
+    /// is actively subscribed to. But `contract_in_use` now *gates* renewal:
+    /// `contracts_needing_renewal` section 1 renews a soon-to-expire lease
+    /// only while `contract_in_use` is true. If `is_subscribed` counted as
+    /// in-use, a subscribed contract would renew its own lease, which keeps
+    /// the subscription alive, which keeps `is_subscribed` (and therefore
+    /// `contract_in_use`) true — a self-renewing loop with no external
+    /// demand. That is exactly the #3763 renewal storm the interest gate
+    /// exists to stop, reintroduced through the back door; the exemption
+    /// would also be effectively unbounded, blocking reclamation
+    /// indefinitely, which violates the cleanup-exemption rule in `AGENTS.md`
+    /// (exemptions must be time-bounded). Local-client subscriptions and
+    /// downstream subscribers ARE both time-bounded and represent real
+    /// external demand: client subscriptions expire on disconnect; downstream
+    /// subscribers expire via `expire_stale_downstream_subscribers` after
     /// `SUBSCRIPTION_LEASE_DURATION` without renewal.
     ///
     /// The narrow case "subscribed but no local interest" should be handled
@@ -3687,11 +3691,12 @@ mod tests {
     /// A contract with ONLY an active upstream network subscription (no
     /// local client, no downstream subscriber) is NOT in use for
     /// reclamation purposes. Documented in `contract_in_use`'s rustdoc:
-    /// `contracts_needing_renewal` renews active subscriptions
-    /// unconditionally, so including `is_subscribed` here would be an
-    /// effectively unbounded GC exemption (AGENTS.md cleanup-exemption
-    /// rule). Local-client subscriptions and downstream-peer subscribers
-    /// are both time-bounded and remain in the predicate.
+    /// `contracts_needing_renewal` section 1 now gates renewal on
+    /// `contract_in_use`, so including `is_subscribed` here would make a
+    /// subscribed contract renew its own lease indefinitely — a self-renewing
+    /// loop and an effectively unbounded GC exemption (AGENTS.md
+    /// cleanup-exemption rule). Local-client subscriptions and downstream-peer
+    /// subscribers are both time-bounded and remain in the predicate.
     #[test]
     fn test_contract_in_use_excludes_network_subscription_only() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
