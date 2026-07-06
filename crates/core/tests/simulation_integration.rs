@@ -12472,3 +12472,440 @@ fn test_injected_hosting_clock_drives_undemanded_eviction() {
          test guards against)"
     );
 }
+
+// =============================================================================
+// Interest-gated renewal — #3763 storm fix (demand-driven-hosting §5a / §7)
+// =============================================================================
+//
+// These two simulations are SYSTEM-LEVEL behavioral coverage of the two
+// demand-driven properties the interest-gated renewal predicate contributes to:
+// (1) no-storm — the surviving subscription set tracks active DEMAND, not cache
+// size; and (2) chain-collapse — a subscription mesh collapses to zero once all
+// client interest ends. Each runs across ≥3 seeds (design note requirement),
+// using the merged #4657 sim-harness: `enable_hosting_time_control` (a
+// controllable clock so the 8-minute lease/TTL can be crossed deterministically),
+// `with_hosting_budget` (cache pressure), `SimOperation::AdvanceHostingClock`,
+// and the `node_subscription_count` / `node_active_demand_count` /
+// `node_hosting_count` accessors.
+//
+// SCOPE NOTE (honest): on the CURRENT main codebase these two sims pass with OR
+// without the `contract_in_use` gate in `contracts_needing_renewal` §1 —
+// verified empirically. They therefore validate the end-to-end properties but do
+// NOT, on their own, isolate the §1 predicate change. Two reasons: (a) main has
+// already removed GET-auto-subscribe (#4689), so a GET-only contract never
+// acquires a §1 active-subscription lease for the gate to act on; and (b) the
+// collapse sim's 20-minute clock jump EXPIRES the leases outright, so the
+// pre-existing `expires_at > now` lower-bound guard lapses them regardless of the
+// gate. The DISCRIMINATING, deterministic proof of the predicate — a within-
+// renewal-window, not-yet-expired, demand-less lease that is renewed iff
+// `contract_in_use` — is the unit test
+// `ring::hosting::tests::test_active_lease_renewed_iff_contract_in_use` (it FAILS
+// without the gate, passes with it). These sims are the system-level regression
+// companions to that unit proof; they will also catch a future regression that
+// reintroduces unconditional renewal once piece-D chain-hosting re-enables the
+// storm precondition.
+
+/// Proof 1 (no-storm, design §7 / #3763): under sustained cache/GET load the
+/// surviving subscription set must track active DEMAND, not cache size.
+///
+/// The hub SUBSCRIBES to a small demand set (real, pinned interest) and GETs a
+/// larger cache-only set (fills its hosting cache, no subscription). Advancing
+/// the hosting clock 20 virtual minutes ages every cache-only lease past both
+/// the 8-minute lease and the 8-minute recent-local-access renewal window (§3),
+/// so those leases lose their renewal source and lapse, while the
+/// client-subscribed demand contracts keep their leases via the §1/§2
+/// `contract_in_use` (client-subscription) path. The surviving subscription
+/// count must therefore track demand, not cache.
+///
+/// This is the no-storm END-TO-END property. See the section SCOPE NOTE above:
+/// on current main it holds with or without the §1 `contract_in_use` gate
+/// (GET-auto-subscribe is already removed, so cache-only contracts never acquire
+/// a §1 lease); the discriminating proof of the gate itself is the unit test
+/// `test_active_lease_renewed_iff_contract_in_use`.
+#[test_log::test]
+fn test_subscription_count_tracks_demand_not_cache() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEEDS: [u64; 3] = [0x4642_D101, 0x4642_D102, 0x4642_D103];
+    const DEMAND: usize = 2; // contracts the hub SUBSCRIBES to (active demand)
+    const CACHE: usize = 8; // contracts the hub only GETs (cache-only)
+
+    for seed in SEEDS {
+        setup_deterministic_state(seed);
+        let rt = create_runtime();
+        let network = format!("subcount-demand-{seed:x}");
+
+        let gateway = NodeLabel::gateway(&network, 0);
+        let hub = NodeLabel::node(&network, 1);
+
+        let demand_contracts: Vec<_> = (0..DEMAND)
+            .map(|i| SimOperation::create_test_contract(0x40 + i as u8))
+            .collect();
+        let cache_contracts: Vec<_> = (0..CACHE)
+            .map(|i| SimOperation::create_test_contract(0x60 + i as u8))
+            .collect();
+        // Instance-id sets so we can categorize surviving subscription leases
+        // network-wide as demand-backed vs cache-only.
+        let demand_ids: HashSet<_> = demand_contracts.iter().map(|c| *c.key().id()).collect();
+        let cache_ids: HashSet<_> = cache_contracts.iter().map(|c| *c.key().id()).collect();
+
+        // Dense 3-peer ring so every GET/SUBSCRIBE reliably completes — this
+        // test is about renewal accounting, not routing/findability.
+        let (sim, _clock) = rt.block_on(async {
+            let mut sim = SimNetwork::new(&network, 1, 2, 7, 3, 10, 2, seed).await;
+            let clock = sim.enable_hosting_time_control();
+            // Deliberately reduced budget (1 MiB vs the ~1 GiB default) — still
+            // comfortably holds the ~10 tiny test contracts, so the cache load
+            // is observable as hosting_count >> subscription_count.
+            sim.with_hosting_budget(1024 * 1024);
+            (sim, clock)
+        });
+
+        let mut ops = Vec::new();
+        // Gateway PUTs (and announces) every contract so the hub can fetch them.
+        for c in demand_contracts.iter().chain(cache_contracts.iter()) {
+            ops.push(ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Put {
+                    contract: c.clone(),
+                    state: SimOperation::create_test_state(1),
+                    subscribe: false,
+                },
+            ));
+        }
+        // Hub SUBSCRIBES to the demand contracts (real, pinned demand).
+        for c in &demand_contracts {
+            ops.push(ScheduledOperation::new(
+                hub.clone(),
+                SimOperation::Subscribe {
+                    contract_id: *c.key().id(),
+                },
+            ));
+        }
+        // Hub GETs the cache-only contracts (fills its hosting cache, no subscribe).
+        for c in &cache_contracts {
+            ops.push(ScheduledOperation::new(
+                hub.clone(),
+                SimOperation::Get {
+                    contract_id: *c.key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+        // Jump the hosting clock 20 minutes — well past the 8-minute lease AND
+        // the 8-minute recent-local-access window (§3) — so any GET-only lease
+        // that §3 transiently installed loses its renewal source and lapses,
+        // while the client-subscribed demand contracts keep their leases via the
+        // §1/§2 `contract_in_use` (client-subscription) renewal path.
+        ops.push(ScheduledOperation::new(
+            hub.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: Duration::from_secs(20 * 60),
+            },
+        ));
+
+        let result = sim.run_controlled_simulation(
+            seed,
+            ops,
+            Duration::from_secs(300),
+            Duration::from_secs(120),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "seed={seed:x}: sim failed: {:?}",
+            result.turmoil_result.err()
+        );
+
+        let hosting = result.node_hosting_count(&hub);
+        let subs = result.node_subscription_count(&hub);
+        let demand = result.node_active_demand_count(&hub);
+        let metrics = result.aggregate_renewal_metrics();
+
+        // Categorize every surviving subscription lease NETWORK-WIDE as
+        // demand-backed (one of the hub's client subscriptions) vs cache-only
+        // (one of the GET-only contracts). This is the strongest form of the
+        // no-storm property: after demand fades, cache-only contracts hold ZERO
+        // leases anywhere, while client-subscribed contracts keep theirs.
+        let mut demand_leases = 0usize;
+        let mut cache_leases = 0usize;
+        for snap in &result.topology_snapshots {
+            for id in &snap.active_subscription_keys {
+                if demand_ids.contains(id) {
+                    demand_leases += 1;
+                } else if cache_ids.contains(id) {
+                    cache_leases += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[proof1 seed={seed:x}] hub hosting_count={hosting} subscription_count={subs} \
+             active_demand_count={demand:?} | network leases: demand={demand_leases} \
+             cache={cache_leases} | max_cycle_batch={}",
+            metrics.max_cycle_batch
+        );
+
+        // Scenario sanity: the cache load actually landed (not a degenerate run
+        // where GETs never cached), so hosting_count >> lease-set is meaningful.
+        assert!(
+            hosting >= DEMAND + CACHE / 2,
+            "seed={seed:x}: hub hosting_count ({hosting}) too low — the GET cache-load \
+             did not land; test would be degenerate"
+        );
+
+        // CORE no-storm property (design §7 / #3763): the cache-only contracts —
+        // which the hub GET-accessed but never subscribed, and stopped accessing
+        // 20 virtual minutes ago — hold ZERO subscription leases anywhere in the
+        // network. Interest-gated renewal must NOT let cache accrete leases.
+        assert_eq!(
+            cache_leases, 0,
+            "seed={seed:x}: #3763 storm signature — {cache_leases} cache-only contract lease(s) \
+             survived network-wide after demand faded. Subscriptions must track active demand, \
+             NOT accumulated cache (hub hosting_count={hosting})."
+        );
+
+        // The hub's OWN lease set is bounded by the demand it actually created
+        // (2 client subscriptions), never by its 10-contract cache.
+        assert!(
+            subs <= DEMAND + 1,
+            "seed={seed:x}: hub subscription_count ({subs}) exceeds the demand it created \
+             ({DEMAND}) + 1 — leases must not track the {hosting}-contract cache."
+        );
+        assert!(
+            hosting > subs,
+            "seed={seed:x}: hub hosting_count ({hosting}) must exceed subscription_count \
+             ({subs}) — the separation between cache and leases must be real."
+        );
+
+        // Non-degeneracy: the demand subscriptions genuinely persisted (this is
+        // NOT a run where everything simply lapsed).
+        assert!(
+            demand_leases >= 1,
+            "seed={seed:x}: no demand-backed lease survived — the run is degenerate \
+             (subscribes never took or all lapsed), so the cache==0 result is vacuous"
+        );
+
+        // Renewal batch cap (#4601): no node fans out more than 10 renewals per
+        // 30s cycle, regardless of how many contracts are eligible.
+        assert!(
+            metrics.max_cycle_batch <= 10,
+            "seed={seed:x}: max_cycle_batch ({}) exceeded the renewal cap of 10",
+            metrics.max_cycle_batch
+        );
+    }
+}
+
+/// Per-run observation for the subscription-mesh collapse proof. Primitives
+/// only, so the proof shares a driver without naming the sim-result type.
+struct MeshObservation {
+    /// Peers holding the contract in `active_subscriptions` at the end. In a
+    /// FORMATION run this is the size of the subscription mesh; in a COLLAPSE
+    /// run it is the set of survivors (must be empty).
+    subscribed_peers: Vec<SocketAddr>,
+    /// Nodes still hosting the contract in their cache at the end.
+    hosting_nodes: usize,
+    /// Max recorded upstreams at any node (subscription-tree parent edges).
+    max_upstreams: usize,
+    /// Total snapshots captured (guards against an empty-registry false read).
+    total_snapshots: usize,
+}
+
+/// Shared driver for the subscription-mesh collapse proof.
+///
+/// Builds a moderately-connected ring, PUTs + announces a contract on the
+/// gateway, and has `subscriber_ids` nodes subscribe — forming a connected mesh
+/// of subscribed hosts toward the key. When `collapse` is set it then ends ALL
+/// client interest (disconnect the PUT originator AND every subscriber) and
+/// jumps the hosting clock 20 minutes past the 8-minute lease, so interest-gated
+/// renewal must let every lease lapse.
+///
+/// The FORMATION run (`collapse=false`) and the COLLAPSE run (`collapse=true`)
+/// share the same seed, topology, and subscribe prefix, so the mesh the
+/// formation run measures at its end is deterministically the same mesh the
+/// collapse run tears down — this is how a single end-of-run snapshot proves
+/// "formed THEN collapsed" without a mid-run measurement.
+fn run_subscription_mesh(
+    seed: u64,
+    network: &str,
+    subscriber_ids: &[usize],
+    collapse: bool,
+) -> MeshObservation {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(network, 0);
+    let contract = SimOperation::create_test_contract(0xC0);
+    let contract_key = contract.key();
+    let contract_id = *contract.key().id();
+
+    // Moderately connected so distant subscribes reliably reach the holder
+    // (the terminal-advertisement consult only sees direct-neighbor hosts, so
+    // too-sparse a ring dead-ends multi-hop subscribes) while still large enough
+    // to build a real multi-node mesh.
+    let sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(network, 1, 15, 10, 3, 5, 3, seed).await;
+        sim.enable_hosting_time_control();
+        sim
+    });
+
+    let mut ops = vec![ScheduledOperation::new(
+        gateway.clone(),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_test_state(1),
+            subscribe: true,
+        },
+    )];
+    for id in subscriber_ids {
+        ops.push(ScheduledOperation::new(
+            NodeLabel::node(network, *id),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    if collapse {
+        // End ALL client interest: disconnect the PUT originator AND every
+        // subscriber (Disconnect is ordered last for its node).
+        ops.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Disconnect,
+        ));
+        for id in subscriber_ids {
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, *id),
+                SimOperation::Disconnect,
+            ));
+        }
+        // Jump 20 minutes — past the 8-minute lease AND the recent-access window
+        // — so no renewal branch keeps an un-demanded lease alive.
+        ops.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::AdvanceHostingClock {
+                duration: Duration::from_secs(20 * 60),
+            },
+        ));
+    }
+
+    // Generous settle (120s ≈ 4 renewal/expiry cycles at 30s each) so the
+    // expire-sweep + interest-gated non-renewal removes every lapsed lease
+    // before the final snapshot.
+    let result = sim.run_controlled_simulation(
+        seed,
+        ops,
+        Duration::from_secs(360),
+        Duration::from_secs(120),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x} collapse={collapse}: sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let subscribed_peers: Vec<SocketAddr> = result
+        .topology_snapshots
+        .iter()
+        .filter(|s| s.active_subscription_keys.contains(&contract_id))
+        .map(|s| s.peer_addr)
+        .collect();
+    let hosting_nodes = result
+        .captured_node_labels()
+        .iter()
+        .filter(|l| result.is_node_hosting(l, &contract_key))
+        .count();
+    let max_upstreams = result
+        .captured_node_labels()
+        .iter()
+        .map(|l| result.node_upstream_count(l, &contract_key).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+
+    MeshObservation {
+        subscribed_peers,
+        hosting_nodes,
+        max_upstreams,
+        total_snapshots: result.topology_snapshots.len(),
+    }
+}
+
+/// Subscriber set used by the collapse proof — a spread of nodes across the
+/// ring so a genuine multi-node mesh forms.
+const MESH_SUBSCRIBERS: [usize; 8] = [1, 3, 5, 7, 9, 11, 13, 15];
+
+/// Proof 2 (chain collapse on client leave, design §5a/§6). Two phases sharing
+/// one seed + topology + subscribe prefix (so determinism makes the FORMATION
+/// run's mesh identical to what the COLLAPSE run tears down):
+///
+///   * FORMATION run: a genuine multi-node subscription mesh forms.
+///   * COLLAPSE run: after ALL clients leave + a 20-minute clock jump, EVERY
+///     lease lapses — interest-gated renewal keeps none alive.
+///
+/// Formation is proved by the mesh SIZE measured at the end of the FORMATION
+/// run (the shared seed/topology guarantees the COLLAPSE run tears down that
+/// same mesh); collapse is proved by ZERO surviving `active_subscriptions`
+/// anywhere in the COLLAPSE run. This is the chain-collapse END-TO-END property.
+/// See the section SCOPE NOTE above: on current main the collapse also holds
+/// without the §1 gate, because the 20-minute clock jump expires the leases
+/// outright (the pre-existing `expires_at > now` guard lapses them); the
+/// discriminating proof of the gate itself is the unit test
+/// `test_active_lease_renewed_iff_contract_in_use`.
+#[test_log::test]
+fn test_subscription_chain_collapses_on_client_leave() {
+    const SEEDS: [u64; 3] = [0x4642_D201, 0x4642_D202, 0x4642_D203];
+    // The mesh must be non-trivial for a collapse-to-zero to be meaningful.
+    const MIN_MESH: usize = 3;
+
+    for seed in SEEDS {
+        // Phase A — formation baseline (no disconnect / no clock jump).
+        let form = run_subscription_mesh(
+            seed,
+            &format!("chain-form-{seed:x}"),
+            &MESH_SUBSCRIBERS,
+            false,
+        );
+        eprintln!(
+            "[proof2 seed={seed:x} FORM] mesh_size={} hosting_nodes={} \
+             max_upstreams={} total_snapshots={}",
+            form.subscribed_peers.len(),
+            form.hosting_nodes,
+            form.max_upstreams,
+            form.total_snapshots,
+        );
+        assert!(
+            form.subscribed_peers.len() >= MIN_MESH,
+            "seed={seed:x}: formation degenerate — only {} peer(s) in the subscription mesh \
+             (need >= {MIN_MESH}); the collapse below would be vacuous. \
+             Requested {} subscribers.",
+            form.subscribed_peers.len(),
+            MESH_SUBSCRIBERS.len(),
+        );
+
+        // Phase B — collapse (same seed/topology + disconnect-all + 20-min jump).
+        let coll = run_subscription_mesh(
+            seed,
+            &format!("chain-collapse-{seed:x}"),
+            &MESH_SUBSCRIBERS,
+            true,
+        );
+        eprintln!(
+            "[proof2 seed={seed:x} COLLAPSE] survivors={} hosting_nodes={} total_snapshots={} {:?}",
+            coll.subscribed_peers.len(),
+            coll.hosting_nodes,
+            coll.total_snapshots,
+            coll.subscribed_peers,
+        );
+        assert!(
+            coll.total_snapshots > 0,
+            "seed={seed:x}: no snapshots captured in collapse run — cannot judge collapse"
+        );
+        assert!(
+            coll.subscribed_peers.is_empty(),
+            "seed={seed:x}: chain did NOT collapse — {} peer(s) still hold the contract in \
+             active_subscriptions after all client interest ended + a 20-min clock jump: {:?}. \
+             Interest-gated renewal must let every un-demanded lease lapse.",
+            coll.subscribed_peers.len(),
+            coll.subscribed_peers,
+        );
+    }
+}
