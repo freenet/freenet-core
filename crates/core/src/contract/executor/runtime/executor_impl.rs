@@ -208,6 +208,26 @@ where
                         "Storing new contract"
                     );
 
+                    // Disk-budget admission gate for the NEW (deduped) code blob
+                    // (#4683): the code was not already on disk
+                    // (`fetch_contract_code` returned None), so charge its bytes.
+                    // Reject before the store so nothing lands; no rollback of the
+                    // blob is needed since it was never written.
+                    if let Some(op_manager) = &self.op_manager {
+                        let blob_len = contract_code.data().len();
+                        if let Err(over) = op_manager.ring.admit_wasm_write(blob_len) {
+                            tracing::warn!(
+                                contract = %key,
+                                %over,
+                                "Rejecting PUT: disk budget exceeded (contract code)"
+                            );
+                            return Err(ExecutorError::request(StdContractError::Put {
+                                key,
+                                cause: over.to_string().into(),
+                            }));
+                        }
+                    }
+
                     self.runtime
                         .store_contract(contract_code.clone())
                         .map_err(ExecutorError::other)?;
@@ -353,6 +373,46 @@ where
                             );
                             let state_to_store = incoming_state.clone();
                             let written_bytes = state_to_store.as_ref().len();
+                            // Disk-budget admission gate (#4683): reject BEFORE
+                            // the store if this write would push aggregate disk
+                            // past the budget. No bytes have landed yet, so we
+                            // only roll back the contract code we just stored and
+                            // the init tracker; the rejection rides `PutMsg::Error`
+                            // to the client and network via the non-fatal
+                            // `StdContractError::Put`.
+                            if let Some(op_manager) = &self.op_manager {
+                                if let Err(over) =
+                                    op_manager.ring.admit_state_write(&key, written_bytes)
+                                {
+                                    tracing::warn!(
+                                        contract = %key,
+                                        %over,
+                                        "Rejecting PUT: disk budget exceeded"
+                                    );
+                                    if remove_if_fail {
+                                        if let Err(e) = self.runtime.remove_contract(&key) {
+                                            tracing::warn!(
+                                                contract = %key,
+                                                error = %e,
+                                                "failed to remove contract after disk-budget rejection"
+                                            );
+                                        }
+                                    }
+                                    if let Some(dropped) =
+                                        self.init_tracker.fail_initialization(&key)
+                                    {
+                                        tracing::warn!(
+                                            contract = %key,
+                                            dropped_operations = dropped,
+                                            "Disk-budget rejection dropped queued operations"
+                                        );
+                                    }
+                                    return Err(ExecutorError::request(StdContractError::Put {
+                                        key,
+                                        cause: over.to_string().into(),
+                                    }));
+                                }
+                            }
                             self.state_store
                                 .store(key, state_to_store, params.clone())
                                 .await
@@ -1530,6 +1590,25 @@ where
                 )
                 .into(),
             }));
+        }
+
+        // Disk-budget admission gate (#4683, PR 3): reject BEFORE the store if
+        // this write would push aggregate disk past the budget. Nothing has
+        // landed, so no rollback is needed. PR 4 relaxes this UPDATE path to a
+        // soft, growth-only check (admission control belongs on admission, not
+        // mutation); PR 3 installs the hard gate at every chokepoint uniformly.
+        if let Some(op_manager) = &self.op_manager {
+            if let Err(over) = op_manager.ring.admit_state_write(key, state_size) {
+                tracing::warn!(
+                    contract = %key,
+                    %over,
+                    "Rejecting UPDATE: disk budget exceeded"
+                );
+                return Err(ExecutorError::request(StdContractError::Update {
+                    key: *key,
+                    cause: over.to_string().into(),
+                }));
+            }
         }
 
         self.state_store

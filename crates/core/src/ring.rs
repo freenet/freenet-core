@@ -88,6 +88,10 @@ pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
 pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
+/// Pre-write admission-gate rejection type (#4683, PR 3). Surfaced to the
+/// executor chokepoints so a write that would overflow the aggregate disk
+/// budget is refused before any bytes land.
+pub(crate) use hosting::DiskBudgetExceeded;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
 /// instead of keeping the historically-pinned default (#4565).
@@ -3040,6 +3044,37 @@ impl Ring {
     /// pattern in `.claude/rules/bug-prevention-patterns.md` lists this
     /// exact failure mode: one site drops the report and governance
     /// silently undercounts that path for months before anyone notices.
+    /// Pre-write admission gate for a state write (#4683, PR 3). Call this
+    /// BEFORE the `state_store.{store,update}` at every chokepoint: it rejects a
+    /// write that would push aggregate on-disk usage past the disk budget, so no
+    /// bytes ever land for a rejected write (no rollback needed for the write
+    /// itself). Read-only — the `+delta` is applied by
+    /// [`Self::commit_state_write`] only on the post-write success path, so a
+    /// rejected or later-failed write never mutates the tracker.
+    ///
+    /// A no-op admit until the disk tracker is seeded (early startup), so it
+    /// never spuriously blocks a write before the aggregate is meaningful.
+    ///
+    /// On rejection the chokepoint converts the error to a non-fatal
+    /// `ExecutorError::request(StdContractError::Put/Update)` → `new_value: Err`,
+    /// which for PUT rides `PutMsg::Error` to the client and the network.
+    pub(crate) fn admit_state_write(
+        &self,
+        contract: &ContractKey,
+        new_size: usize,
+    ) -> Result<(), DiskBudgetExceeded> {
+        self.hosting_manager
+            .admit_state_write(contract, new_size as u64)
+    }
+
+    /// Pre-write admission gate for a newly-stored (deduped) WASM code blob
+    /// (#4683, PR 3). Call this BEFORE `runtime.store_contract` for a blob that
+    /// is not already on disk. See [`Self::admit_state_write`] for the
+    /// deferred-delta / rollback discipline.
+    pub(crate) fn admit_wasm_write(&self, blob_len: usize) -> Result<(), DiskBudgetExceeded> {
+        self.hosting_manager.admit_wasm_write(blob_len as u64)
+    }
+
     pub(crate) fn commit_state_write(&self, contract: &ContractKey, state_size: usize) {
         let new_gen = self.hosting_manager.bump_state_generation(contract);
         self.hosting_manager

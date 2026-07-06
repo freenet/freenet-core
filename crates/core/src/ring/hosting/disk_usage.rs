@@ -42,6 +42,33 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use freenet_stdlib::prelude::ContractKey;
 use parking_lot::Mutex;
 
+/// A pre-write admission check rejected a state/code write because it would
+/// push aggregate on-disk usage past the disk budget (#4683, PR 3).
+///
+/// Carries the numbers that made the decision so the caller can surface a
+/// human-readable cause on the client `Err` and (for PUT) the `PutMsg::Error`
+/// network abort. The write MUST NOT have touched disk when this is returned:
+/// the gate runs BEFORE the store call, so no rollback is needed for the
+/// rejected write itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiskBudgetExceeded {
+    /// Aggregate on-disk bytes projected AFTER the rejected write would land
+    /// (`total − old_for_key + new`). Strictly greater than `budget_bytes`.
+    pub projected_bytes: u64,
+    /// The aggregate disk budget the projection exceeded.
+    pub budget_bytes: u64,
+}
+
+impl std::fmt::Display for DiskBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "disk budget exceeded: write would use {} bytes on disk, budget is {} bytes",
+            self.projected_bytes, self.budget_bytes
+        )
+    }
+}
+
 /// Point-in-time on-disk usage gauges, one snapshot for telemetry.
 ///
 /// Aggregate scalars only, emitted on the existing `RouterSnapshot` cadence
@@ -110,7 +137,6 @@ impl DiskUsageTracker {
     /// The eviction floor (PR 2) and admission gate (PR 3) are the first
     /// runtime readers; in this accounting-only PR it is exercised by tests and
     /// the telemetry snapshot path.
-    #[allow(dead_code)]
     pub(crate) fn total_bytes(&self) -> u64 {
         self.state_bytes
             .load(Ordering::Relaxed)
@@ -297,6 +323,74 @@ impl DiskUsageTracker {
                 Ok(_) => break,
                 Err(observed) => cur = observed,
             }
+        }
+    }
+
+    /// Pre-write admission check for a state write (#4683, PR 3). Computes the
+    /// aggregate on-disk bytes that WOULD result from replacing `key`'s current
+    /// tracked state size with `new_size`
+    /// (`projected = total − old_for_key + new_size`) and rejects if that
+    /// exceeds `budget_bytes`.
+    ///
+    /// **Read-only.** The `+delta` is NOT applied here — it is deferred to the
+    /// post-write success path ([`Self::record_state_write`], invoked from
+    /// `Ring::commit_state_write`), mirroring the secrets `quota_commit`
+    /// discipline (#4561): a rejected OR later-failed write never mutates the
+    /// counter, so it leaves no phantom bytes behind.
+    ///
+    /// `old_for_key` is read from the same `state_sizes` index the delta path
+    /// maintains, so the caller does not have to supply the previous size. A key
+    /// not present in the index (fresh PUT) has `old = 0`, so the full `new_size`
+    /// is charged.
+    ///
+    /// The boundary is inclusive-admit: `projected == budget_bytes` is admitted;
+    /// only `projected > budget_bytes` rejects.
+    pub(crate) fn admit_state_write(
+        &self,
+        key: &ContractKey,
+        new_size: u64,
+        budget_bytes: u64,
+    ) -> Result<(), DiskBudgetExceeded> {
+        // Hold the same lock the delta path takes so `total_bytes()` and the
+        // per-key old size are read against a consistent snapshot: a concurrent
+        // `record_state_write` cannot land its delta between our `old` read and
+        // our `total` read and make the projection inconsistent.
+        let sizes = self.state_sizes.lock();
+        let old = sizes.get(key).copied().unwrap_or(0);
+        let total = self.total_bytes();
+        drop(sizes);
+        // projected = total − old + new (saturating so it can never wrap).
+        let projected = total.saturating_sub(old).saturating_add(new_size);
+        if projected > budget_bytes {
+            Err(DiskBudgetExceeded {
+                projected_bytes: projected,
+                budget_bytes,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Pre-write admission check for a WASM code-blob write (#4683, PR 3).
+    /// Charges `blob_len` on top of current aggregate usage
+    /// (`projected = total + blob_len`) and rejects if it exceeds
+    /// `budget_bytes`. Used only for a NEWLY-stored (deduped) code blob — a
+    /// re-PUT of already-stored code adds nothing on disk and the caller skips
+    /// the check for that case. Read-only, same inclusive-admit boundary as
+    /// [`Self::admit_state_write`].
+    pub(crate) fn admit_wasm_write(
+        &self,
+        blob_len: u64,
+        budget_bytes: u64,
+    ) -> Result<(), DiskBudgetExceeded> {
+        let projected = self.total_bytes().saturating_add(blob_len);
+        if projected > budget_bytes {
+            Err(DiskBudgetExceeded {
+                projected_bytes: projected,
+                budget_bytes,
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -629,6 +723,86 @@ mod tests {
                 "seed/write race under-counted or double-counted"
             );
         }
+    }
+
+    // --- Admission gate boundary (#4683, PR 3) --------------------------------
+
+    #[test]
+    fn admit_state_write_boundary_projected_equals_budget_admits() {
+        let t = tracker();
+        // Seed 100 bytes used across one key.
+        t.seed([(test_key(1), 100)]);
+        // Fresh PUT of key(2): projected = 100 (old for key(2)=0) + 100 = 200.
+        // Budget exactly 200 → projected == budget → ADMIT (inclusive).
+        assert!(t.admit_state_write(&test_key(2), 100, 200).is_ok());
+    }
+
+    #[test]
+    fn admit_state_write_boundary_projected_over_budget_rejects() {
+        let t = tracker();
+        t.seed([(test_key(1), 100)]);
+        // projected = 100 + 100 = 200; budget 199 → 200 > 199 → REJECT.
+        let err = t
+            .admit_state_write(&test_key(2), 100, 199)
+            .expect_err("over budget must reject");
+        assert_eq!(err.projected_bytes, 200);
+        assert_eq!(err.budget_bytes, 199);
+    }
+
+    #[test]
+    fn admit_state_write_uses_old_size_for_existing_key() {
+        let t = tracker();
+        // key(1) already holds 100 bytes (total = 100).
+        t.seed([(test_key(1), 100)]);
+        // UPDATE key(1) to 150: projected = 100 − 100 + 150 = 150. Budget 150 →
+        // admit; the OLD size is subtracted so an update is charged only its
+        // delta, not its full new size.
+        assert!(t.admit_state_write(&test_key(1), 150, 150).is_ok());
+        // Same update against budget 149 → 150 > 149 → reject.
+        assert!(t.admit_state_write(&test_key(1), 150, 149).is_err());
+    }
+
+    #[test]
+    fn admit_state_write_shrink_always_within_budget() {
+        let t = tracker();
+        t.seed([(test_key(1), 300)]);
+        // Shrinking update: projected = 300 − 300 + 50 = 50, well under a tiny
+        // budget. A shrink can never be rejected (delta <= 0).
+        assert!(t.admit_state_write(&test_key(1), 50, 60).is_ok());
+    }
+
+    #[test]
+    fn admit_wasm_write_boundary() {
+        let t = tracker();
+        t.seed([(test_key(1), 100)]);
+        // Charging a 100-byte blob: projected = 100 + 100 = 200.
+        assert!(t.admit_wasm_write(100, 200).is_ok()); // == budget admits
+        let err = t
+            .admit_wasm_write(100, 199)
+            .expect_err("over budget rejects");
+        assert_eq!(err.projected_bytes, 200);
+        assert_eq!(err.budget_bytes, 199);
+    }
+
+    #[test]
+    fn admit_is_read_only_no_mutation() {
+        let t = tracker();
+        t.seed([(test_key(1), 100)]);
+        // A rejected admit must not move the counter (deferred-delta discipline:
+        // the +delta is applied later by record_state_write on success only).
+        assert!(t.admit_state_write(&test_key(2), 1000, 200).is_err());
+        assert_eq!(
+            t.stats().state_bytes,
+            100,
+            "admit must not mutate state_bytes"
+        );
+        // An accepted admit is likewise read-only.
+        assert!(t.admit_state_write(&test_key(2), 50, 1000).is_ok());
+        assert_eq!(
+            t.stats().state_bytes,
+            100,
+            "admit must not mutate state_bytes"
+        );
     }
 
     #[test]
