@@ -2515,6 +2515,16 @@ mod tests {
     // now orders by (subscriber_count, real-GET recency); demand/distance/
     // abandonment no longer drive eviction order. Retained as historical
     // documentation of the demoted demand machinery.
+    //
+    // Specifically, the #4338 "a repeatedly-read contract survives junk" guard
+    // is INTENTIONALLY removed, not accidentally dropped (Ian, 2026-07):
+    // frequency protection for UNSUBSCRIBED contracts is gone — the tiebreak is
+    // RECENCY-ONLY (time since the last real GET), with no per-contract
+    // read-frequency signal. In the demand-driven model, real demand is
+    // expressed by SUBSCRIBING, which pins the contract; a "heavily-read but
+    // never-subscribed" contract is transient-by-design cruft, so it is not
+    // protected against eviction by re-reads alone. See
+    // docs/design/demand-driven-hosting.md §9 (Piece A).
     #[ignore]
     #[test]
     fn fuel_gauge_keeps_repeatedly_read_contract_over_junk() {
