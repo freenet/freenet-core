@@ -39,19 +39,27 @@ pub(crate) use cache::HostingContractScore;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` (see the constant's docs).
 pub(crate) use cache::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
+/// Upper clamp re-exported only for the config-default round-trip test, which
+/// asserts the resolved default lands within [MIN, MAX] without hardcoding the
+/// byte values. Gated to test builds so the re-export isn't an unused import
+/// under `-D warnings` in release.
+#[cfg(test)]
+pub(crate) use cache::MAX_DEFAULT_HOSTING_BUDGET_BYTES;
+/// The shared MIN budget floor (#4683 eviction floor uses it as the disk-budget
+/// clamp lower bound; the config round-trip test asserts the RAM default lands
+/// within [MIN, MAX]). `pub(crate)` so `ring` can re-export it for that test.
+pub(crate) use cache::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
 /// Re-exported as the single source of truth for the default hosting storage
 /// budget. `config::default_max_hosting_storage()` resolves to this function so
 /// the operator-facing default and the in-code fallback can never drift. The
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use cache::default_hosting_budget_bytes;
 pub use cache::{AccessType, RecordAccessResult};
-use cache::{DEFAULT_MIN_TTL, HostingCache, HostingCacheStats};
-/// Clamp bounds re-exported only for the config-default round-trip test, which
-/// asserts the resolved default lands within [MIN, MAX] without hardcoding the
-/// byte values. Gated to test builds so the re-export isn't an unused import
-/// under `-D warnings` in release.
-#[cfg(test)]
-pub(crate) use cache::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
+/// Aggregate disk-budget sizing defaults + pure clamp math (#4683). Re-exported
+/// so `config` can resolve the persisted `hosting-disk-pct` / `max-hosting-disk`
+/// defaults and `ring`/`HostingManager` can size the eviction floor.
+pub(crate) use cache::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
+use cache::{DEFAULT_MIN_TTL, HostingCache, HostingCacheStats, disk_budget_for_clamped};
 use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
 pub(crate) use disk_usage::DiskUsageStats;
@@ -348,6 +356,25 @@ pub(crate) struct HostingManager {
     /// that is PR 2 (eviction floor) and PR 3 (admission gate). Behind an
     /// `RwLock` for the same late-binding reason as `storage`.
     disk_tracker: RwLock<Option<DiskUsageTracker>>,
+
+    /// The RAM-derived hosting budget the manager was constructed with (#4683).
+    /// Preserved separately from the live `hosting_cache.budget_bytes` because
+    /// the 60s recompute OVERWRITES the cache budget with the effective floor
+    /// `min(ram_budget, disk_budget)`; keeping the original RAM budget here means
+    /// a later recompute (after the disk budget grows) can restore the RAM floor
+    /// instead of ratcheting only downward.
+    ram_budget_bytes: AtomicU64,
+
+    /// Fraction of Freenet-reachable disk capacity (`used + free`) the disk
+    /// budget is sized at (#4683). Defaults to
+    /// [`cache::DEFAULT_HOSTING_DISK_PCT`]; overridden from config at startup via
+    /// [`Self::configure_disk_budget`]. Stored as bits so it lives in an
+    /// `AtomicU64` (the recompute reads it off the sweep task without a lock).
+    disk_pct_bits: AtomicU64,
+
+    /// Hard upper clamp (bytes) for the disk budget (#4683), the `--max-hosting-disk`
+    /// override. Defaults to [`cache::DEFAULT_MAX_HOSTING_DISK_BYTES`].
+    max_hosting_disk_bytes: AtomicU64,
 }
 
 impl HostingManager {
@@ -391,6 +418,9 @@ impl HostingManager {
             state_generation: DashMap::new(),
             pending_reclamation: std::sync::Arc::new(DashMap::new()),
             disk_tracker: RwLock::new(None),
+            ram_budget_bytes: AtomicU64::new(budget_bytes),
+            disk_pct_bits: AtomicU64::new(DEFAULT_HOSTING_DISK_PCT.to_bits()),
+            max_hosting_disk_bytes: AtomicU64::new(DEFAULT_MAX_HOSTING_DISK_BYTES),
         }
     }
 
@@ -472,6 +502,52 @@ impl HostingManager {
         wasmtime_cache_dir: std::path::PathBuf,
     ) {
         *self.disk_tracker.write() = Some(DiskUsageTracker::new(contracts_dir, wasmtime_cache_dir));
+    }
+
+    /// Install the operator-configured disk-budget sizing knobs (#4683): the
+    /// fraction of Freenet-reachable disk capacity and the hard cap. Called once
+    /// at startup alongside [`Self::configure_disk_tracker`] (the config is only
+    /// reachable there). If never called, the defaults set in the ctor apply.
+    pub(crate) fn configure_disk_budget(&self, disk_pct: f64, max_hosting_disk: u64) {
+        self.disk_pct_bits
+            .store(disk_pct.to_bits(), Ordering::Relaxed);
+        self.max_hosting_disk_bytes
+            .store(max_hosting_disk, Ordering::Relaxed);
+    }
+
+    /// Recompute the effective hosting-cache budget as `min(ram_budget,
+    /// disk_budget)` and install it via [`HostingCache::set_budget_bytes`] (#4683,
+    /// eviction floor). Run on the 60s sweep AFTER the du-walks refresh, and
+    /// crucially OUTSIDE any prior cache write lock: only the O(1)
+    /// `set_budget_bytes` touches the cache lock here.
+    ///
+    /// `available` is the free bytes on the data-dir mount, injected as a
+    /// parameter (prod passes `available_bytes(dir).unwrap_or(u64::MAX)`; tests
+    /// pass a fixed value) — the determinism seam. When the tracker is absent or
+    /// unseeded the aggregate `used` is not yet meaningful, so this is a no-op and
+    /// the cache keeps its RAM budget until the first seed.
+    ///
+    /// Returns the effective budget it installed (for telemetry/tests), or `None`
+    /// when it was a no-op.
+    pub(crate) fn recompute_effective_budget(&self, available: u64) -> Option<u64> {
+        let used = {
+            let guard = self.disk_tracker.read();
+            let tracker = guard.as_ref()?;
+            if !tracker.is_seeded() {
+                return None;
+            }
+            tracker.total_bytes()
+        };
+        let pct = f64::from_bits(self.disk_pct_bits.load(Ordering::Relaxed));
+        let cap = self.max_hosting_disk_bytes.load(Ordering::Relaxed);
+        let ram = self.ram_budget_bytes.load(Ordering::Relaxed);
+        let disk_budget =
+            disk_budget_for_clamped(used, available, pct, MIN_DEFAULT_HOSTING_BUDGET_BYTES, cap);
+        let effective = ram.min(disk_budget);
+        // O(1) under the cache write lock; the expensive du-walk already ran
+        // OUTSIDE any lock before this call.
+        self.hosting_cache.write().set_budget_bytes(effective);
+        Some(effective)
     }
 
     /// Lazily seed the disk tracker on first use (like the hosting-cache
@@ -559,6 +635,13 @@ impl HostingManager {
         }
     }
 
+    /// Free bytes on the data-dir mount (the `available` term the disk budget
+    /// sizes against, #4683). `None` when the tracker is absent or the platform
+    /// query fails; the sweep caller falls back to `u64::MAX`.
+    pub(crate) fn disk_available_bytes(&self) -> Option<u64> {
+        self.disk_tracker.read().as_ref()?.available_bytes()
+    }
+
     /// Re-walk the WASM-blob and compile-cache totals. Called on the telemetry
     /// cadence (the 60s sweep) since both are `du`-measured, not delta-tracked.
     pub(crate) fn refresh_disk_usage(&self) {
@@ -577,6 +660,24 @@ impl HostingManager {
             return None;
         }
         Some(tracker.stats())
+    }
+
+    /// Test-only: install a disk tracker on nonexistent paths (so the du-walks
+    /// contribute 0 and the free-space read returns `None`) and seed its state
+    /// counter from `rows`. Lets `recompute_effective_budget` be driven with a
+    /// known `used` and an injected `available`, no filesystem required.
+    #[cfg(test)]
+    pub(crate) fn seed_disk_tracker_for_test<I>(&self, rows: I)
+    where
+        I: IntoIterator<Item = (ContractKey, u64)>,
+    {
+        self.configure_disk_tracker(
+            std::path::PathBuf::from("/nonexistent/contracts"),
+            std::path::PathBuf::from("/nonexistent/cache"),
+        );
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.seed(rows);
+        }
     }
 
     // =========================================================================
@@ -5340,5 +5441,119 @@ mod tests {
             "once the client subscription is gone the lease is no longer renewed \
              and lapses (chain collapse on interest loss)"
         );
+    }
+
+    // --- Eviction floor: effective = min(ram_budget, disk_budget) (#4683) ---
+
+    /// When disk is the tighter resource, the recompute lowers the cache budget
+    /// to the disk budget; when RAM is tighter, the RAM budget wins; when equal,
+    /// either (the shared value) is installed. Drives `recompute_effective_budget`
+    /// with a known `used` and an injected `available`, no filesystem.
+    #[test]
+    fn recompute_installs_min_of_ram_and_disk() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // RAM budget = 4 GiB (ctor). pct = 0.5.
+        let manager = HostingManager::new(4 * GIB);
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        // Seed disk `used` = 2 GiB.
+        manager.seed_disk_tracker_for_test([(make_contract_key(1), 2 * GIB)]);
+
+        // Case DISK WINS: available small → disk_budget = 0.5*(2+2)=2 GiB < 4 GiB RAM.
+        let eff = manager
+            .recompute_effective_budget(2 * GIB)
+            .expect("seeded → recompute runs");
+        assert_eq!(eff, 2 * GIB, "disk is tighter → disk budget wins");
+        assert_eq!(manager.hosting_budget_bytes(), 2 * GIB);
+
+        // Case RAM WINS: available huge → disk_budget clamps to cap (32 GiB) > 4
+        // GiB RAM, so RAM floor wins.
+        let eff = manager
+            .recompute_effective_budget(u64::MAX)
+            .expect("seeded → recompute runs");
+        assert_eq!(eff, 4 * GIB, "RAM is tighter → RAM budget wins");
+        assert_eq!(manager.hosting_budget_bytes(), 4 * GIB);
+
+        // Case EQUAL: choose available so disk_budget == RAM budget exactly.
+        // 0.5*(used=2 GiB + available) = 4 GiB → available = 6 GiB.
+        let eff = manager
+            .recompute_effective_budget(6 * GIB)
+            .expect("seeded → recompute runs");
+        assert_eq!(eff, 4 * GIB, "equal budgets install the shared value");
+        assert_eq!(manager.hosting_budget_bytes(), 4 * GIB);
+
+        // Below the MIN floor: a tiny disk budget can never drop below the 128
+        // MiB floor even when RAM is also small.
+        let small = HostingManager::new(64 * MIB);
+        small.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        small.seed_disk_tracker_for_test(std::iter::empty());
+        let eff = small.recompute_effective_budget(0).expect("seeded");
+        assert_eq!(
+            eff,
+            64 * MIB,
+            "RAM budget (64 MiB) is below the disk MIN floor and wins as the min"
+        );
+    }
+
+    /// An unseeded (or absent) tracker makes the recompute a no-op: the cache
+    /// keeps its RAM budget until the first seed, so early startup never installs
+    /// a bogus zero/under-counted floor.
+    #[test]
+    fn recompute_is_noop_until_seeded() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let manager = HostingManager::new(GIB);
+
+        // No tracker configured at all → None, budget untouched.
+        assert_eq!(manager.recompute_effective_budget(0), None);
+        assert_eq!(manager.hosting_budget_bytes(), GIB);
+
+        // Tracker configured but NOT seeded → still None.
+        manager.configure_disk_tracker(
+            std::path::PathBuf::from("/nonexistent/contracts"),
+            std::path::PathBuf::from("/nonexistent/cache"),
+        );
+        assert_eq!(manager.recompute_effective_budget(0), None);
+        assert_eq!(manager.hosting_budget_bytes(), GIB);
+    }
+
+    /// The recompute takes only the O(1) `set_budget_bytes` cache write lock, so
+    /// it cannot deadlock against a concurrent `record_access_with_demand` (which
+    /// also takes the cache write lock). Interleave many recomputes with many
+    /// cache accesses from another thread and require completion.
+    #[test]
+    fn recompute_does_not_deadlock_against_cache_writes() {
+        use std::sync::Arc;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let manager = Arc::new(HostingManager::new(4 * GIB));
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        manager.seed_disk_tracker_for_test([(make_contract_key(1), GIB)]);
+
+        let m2 = manager.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 0..500u64 {
+                // record_contract_access takes the hosting_cache write lock.
+                m2.record_contract_access(
+                    make_contract_key((i % 250) as u8),
+                    i % 4096,
+                    AccessType::Get,
+                );
+            }
+        });
+
+        for i in 0..500u64 {
+            // Alternate the injected available so the installed floor varies,
+            // exercising the set_budget_bytes path each iteration.
+            let available = (i % 8) * GIB;
+            manager.recompute_effective_budget(available);
+        }
+        writer
+            .join()
+            .expect("writer thread must not deadlock/panic");
+
+        // Sanity: after the storm the cache budget is a valid min(ram, disk).
+        let b = manager.hosting_budget_bytes();
+        assert!(b <= 4 * GIB, "effective budget never exceeds the RAM floor");
     }
 }

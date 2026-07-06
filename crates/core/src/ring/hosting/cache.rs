@@ -119,6 +119,87 @@ fn budget_for_ram(total_ram: u64) -> u64 {
     )
 }
 
+/// Default fraction of the disk capacity *available to Freenet* used to size the
+/// aggregate disk budget (#4683): 50%. Sized against `used + free` (capacity the
+/// node can actually reach), NOT a naive live free-space read that shrinks as it
+/// fills. Operator-overridable via `--hosting-disk-pct`.
+pub const DEFAULT_HOSTING_DISK_PCT: f64 = 0.5;
+
+/// Default hard upper clamp for the aggregate disk budget (#4683): 32 GiB.
+///
+/// Distinct from [`MAX_DEFAULT_HOSTING_BUDGET_BYTES`] (the 1 GiB RAM-scaled
+/// ceiling) on purpose: a disk budget legitimately dwarfs the RAM budget on a
+/// host with a large data disk, so this cap is far higher. Operator-overridable
+/// via `--max-hosting-disk`; the shared MIN floor is
+/// [`MIN_DEFAULT_HOSTING_BUDGET_BYTES`] so even a tiny disk still gets a usable
+/// allowance.
+pub const DEFAULT_MAX_HOSTING_DISK_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
+/// Pure clamp math for the aggregate disk budget (#4683), the disk analogue of
+/// [`budget_for_ram`]. Split out with no filesystem dependency so the
+/// zero/huge/overflow boundary behavior is unit-testable without a real disk.
+///
+/// Returns `clamp(pct * (freenet_used + available), MIN, max_hosting_disk)`,
+/// where the basis is the disk capacity *reachable by Freenet* (bytes it already
+/// occupies plus bytes still free on the same mount), NOT a bare free-space read.
+/// Anchoring on `used + available` keeps the budget stable as the disk fills
+/// (a naive free-space basis would shrink the budget toward zero exactly when
+/// the node needs the eviction floor most).
+///
+/// `pct` is clamped to `[0.0, 1.0]` and non-finite / negative values collapse to
+/// `0.0`, so a mis-set config can only ever produce a valid budget. All fixed-
+/// point conversion saturates rather than wrapping, so a huge `used + available`
+/// cannot overflow into a small budget.
+///
+// Default-bound convenience entry: the recompute path uses
+// `disk_budget_for_clamped` with the operator cap, so this constant-bound form
+// is exercised by tests and reserved for the PR 3 admission gate.
+#[allow(dead_code)]
+pub fn disk_budget_for(freenet_used: u64, available: u64, pct: f64) -> u64 {
+    disk_budget_for_clamped(
+        freenet_used,
+        available,
+        pct,
+        MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+        DEFAULT_MAX_HOSTING_DISK_BYTES,
+    )
+}
+
+/// [`disk_budget_for`] with explicit MIN/MAX clamp bounds, so the operator
+/// override (`--max-hosting-disk`) can supply the ceiling. Kept separate from
+/// the constant-bound wrapper so the pure math has one implementation.
+pub fn disk_budget_for_clamped(
+    freenet_used: u64,
+    available: u64,
+    pct: f64,
+    min_bytes: u64,
+    max_bytes: u64,
+) -> u64 {
+    // A non-finite or negative pct is meaningless — collapse to 0 (which the
+    // clamp then lifts to the MIN floor), never NaN-propagate into the budget.
+    let pct = if pct.is_finite() {
+        pct.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let basis = freenet_used.saturating_add(available);
+    // f64 has 52 bits of mantissa; a basis above 2^52 loses precision but the
+    // result is clamped to `max_bytes` anyway, so the loss is immaterial.
+    let raw = (basis as f64) * pct;
+    // Saturating fixed-point conversion: a raw value beyond u64::MAX (only
+    // reachable via precision noise near the top of the range) clamps down
+    // rather than wrapping. `as u64` on a non-finite/negative f64 is 0 in Rust,
+    // but `raw` is already non-negative and finite here.
+    let budget = if raw >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        raw as u64
+    };
+    // If the operator set max below min, MIN wins (a usable floor beats an
+    // inconsistent zero cap): clamp lower bound last.
+    budget.min(max_bytes).max(min_bytes)
+}
+
 /// Point-in-time hosting-cache resource gauges for per-node telemetry.
 ///
 /// Aggregate scalars only (never per-contract), emitted on the existing
@@ -847,6 +928,16 @@ impl<T: TimeSource> HostingCache<T> {
     #[allow(dead_code)] // Public API for introspection
     pub fn budget_bytes(&self) -> u64 {
         self.budget_bytes
+    }
+
+    /// Overwrite the byte budget (#4683 eviction floor). The ONLY writer after
+    /// the constructor: the 60s recompute sets this to
+    /// `min(ram_budget, disk_budget)` so the existing Greedy-Dual over-budget
+    /// walk sheds the least-valuable contracts down to the tighter of the two
+    /// resource floors. O(1) and does NOT itself evict — the next
+    /// `evict_over_budget` (on sweep or cache insert) enforces the new value.
+    pub(crate) fn set_budget_bytes(&mut self, budget_bytes: u64) {
+        self.budget_bytes = budget_bytes;
     }
 
     /// Snapshot the cache's aggregate resource gauges under a single read for
@@ -1865,6 +1956,112 @@ mod tests {
         // give distinct budgets.
         assert_ne!(budget_for_ram(2 * GIB), budget_for_ram(3 * GIB));
         assert_ne!(budget_for_ram(3 * GIB), budget_for_ram(4 * GIB));
+    }
+
+    // --- Aggregate disk budget sizing (#4683) ---
+
+    /// `disk_budget_for` clamps at both ends and scales linearly in between.
+    #[test]
+    fn disk_budget_for_scales_and_clamps() {
+        // pct * (used + avail) below the MIN floor clamps up.
+        assert_eq!(
+            disk_budget_for(0, 100 * MIB, 0.5),
+            MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+            "50 MiB budget is below the 128 MiB floor"
+        );
+        // Mid-range scales linearly: 0.5 * (used=4 GiB + avail=4 GiB) = 4 GiB.
+        assert_eq!(disk_budget_for(4 * GIB, 4 * GIB, 0.5), 4 * GIB);
+        // used counts toward the basis, not just free space.
+        assert_eq!(disk_budget_for(2 * GIB, 0, 0.5), GIB);
+        // Above the MAX cap clamps down.
+        assert_eq!(
+            disk_budget_for(200 * GIB, 200 * GIB, 0.5),
+            DEFAULT_MAX_HOSTING_DISK_BYTES,
+            "200 GiB budget is above the 32 GiB cap"
+        );
+    }
+
+    /// pct=0 and pct=1 are the degenerate endpoints; both stay within the clamp.
+    #[test]
+    fn disk_budget_for_pct_endpoints() {
+        // pct=0 → 0, clamped up to MIN.
+        assert_eq!(
+            disk_budget_for(10 * GIB, 10 * GIB, 0.0),
+            MIN_DEFAULT_HOSTING_BUDGET_BYTES
+        );
+        // pct=1 → full basis, clamped down to MAX when the basis is large.
+        assert_eq!(
+            disk_budget_for(100 * GIB, 0, 1.0),
+            DEFAULT_MAX_HOSTING_DISK_BYTES
+        );
+        // pct=1 with a small in-band basis passes through unclamped.
+        assert_eq!(disk_budget_for(GIB, GIB, 1.0), 2 * GIB);
+    }
+
+    /// Zero free / zero used degenerate inputs never panic and honor the floor.
+    #[test]
+    fn disk_budget_for_zero_and_huge_free() {
+        // Everything zero → MIN floor.
+        assert_eq!(disk_budget_for(0, 0, 0.5), MIN_DEFAULT_HOSTING_BUDGET_BYTES);
+        // Huge free (the `available_bytes` MAX-fallback case) does NOT overflow;
+        // it clamps to the MAX cap.
+        assert_eq!(
+            disk_budget_for(0, u64::MAX, 0.5),
+            DEFAULT_MAX_HOSTING_DISK_BYTES
+        );
+    }
+
+    /// A non-finite / out-of-range pct collapses to a valid budget rather than
+    /// propagating NaN or a nonsense value into the eviction floor.
+    #[test]
+    fn disk_budget_for_rejects_bad_pct() {
+        // NaN / infinity → 0 → clamped up to MIN.
+        assert_eq!(
+            disk_budget_for(10 * GIB, 10 * GIB, f64::NAN),
+            MIN_DEFAULT_HOSTING_BUDGET_BYTES
+        );
+        assert_eq!(
+            disk_budget_for(10 * GIB, 10 * GIB, f64::INFINITY),
+            MIN_DEFAULT_HOSTING_BUDGET_BYTES
+        );
+        // Negative pct clamps to 0 → MIN.
+        assert_eq!(
+            disk_budget_for(10 * GIB, 10 * GIB, -1.0),
+            MIN_DEFAULT_HOSTING_BUDGET_BYTES
+        );
+        // pct > 1 clamps to 1.0 (full basis), then to MAX.
+        assert_eq!(
+            disk_budget_for(100 * GIB, 0, 5.0),
+            DEFAULT_MAX_HOSTING_DISK_BYTES
+        );
+    }
+
+    /// Saturating fixed-point: `used + available` overflow saturates the basis
+    /// at `u64::MAX` (never wraps to a tiny basis), then the pct+clamp bound it.
+    #[test]
+    fn disk_budget_for_saturating_overflow() {
+        // used + avail overflows u64 → basis saturates at u64::MAX, budget
+        // clamps to the MAX cap rather than wrapping to something small.
+        assert_eq!(
+            disk_budget_for(u64::MAX, u64::MAX, 0.5),
+            DEFAULT_MAX_HOSTING_DISK_BYTES
+        );
+    }
+
+    /// Explicit clamp bounds (the operator `--max-hosting-disk` override) win,
+    /// and an inconsistent max<min still yields the usable MIN floor (never 0).
+    #[test]
+    fn disk_budget_for_clamped_honors_explicit_bounds() {
+        // Custom max below the computed value clamps down to it.
+        assert_eq!(
+            disk_budget_for_clamped(4 * GIB, 4 * GIB, 0.5, MIN_DEFAULT_HOSTING_BUDGET_BYTES, GIB),
+            GIB
+        );
+        // max < min → MIN floor wins (no panic, no zero cap).
+        assert_eq!(
+            disk_budget_for_clamped(100 * GIB, 0, 0.5, 512 * MIB, 128 * MIB),
+            512 * MIB
+        );
     }
 
     /// The real resolved default always lands within the documented clamp,

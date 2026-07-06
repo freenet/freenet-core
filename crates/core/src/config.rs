@@ -120,6 +120,19 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
+    /// Fraction (0.0–1.0) of the disk capacity *available to Freenet*
+    /// (`used + free` on the data-dir mount) used to size the aggregate disk
+    /// budget (#4683). The disk budget is the second floor on hosting eviction:
+    /// `effective_budget = min(ram_budget, disk_budget)`. Default: 0.5.
+    #[arg(long, env = "HOSTING_DISK_PCT")]
+    pub hosting_disk_pct: Option<f64>,
+
+    /// Hard upper clamp in bytes for the aggregate disk budget (#4683). Mirrors
+    /// `--max-hosting-storage` for disk: the disk budget never exceeds this even
+    /// on a host with a very large data disk. Default: 32 GiB.
+    #[arg(long, env = "MAX_HOSTING_DISK")]
+    pub max_hosting_disk: Option<u64>,
+
     /// Per-user secret-storage quota in bytes for HOSTED mode (#4561, P5 of
     /// #4381). Bounds a single hosted user's (one `userToken`) TOTAL on-disk
     /// footprint under their `users/<user_id>/` tree, summed across every
@@ -246,6 +259,8 @@ impl Default for ConfigArgs {
             version: false,
             max_blocking_threads: None,
             max_hosting_storage: None,
+            hosting_disk_pct: None,
+            max_hosting_disk: None,
             per_user_secret_quota_bytes: None,
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
@@ -517,6 +532,11 @@ impl ConfigArgs {
                 self.max_hosting_storage
                     .get_or_insert(cfg.max_hosting_storage);
             }
+            // #4683 disk-budget sizing knobs — persisted, so merge them back from
+            // the file (the #3890/#4275 silent-revert class). No legacy sentinel:
+            // these are new fields, so a plain get_or_insert is correct.
+            self.hosting_disk_pct.get_or_insert(cfg.hosting_disk_pct);
+            self.max_hosting_disk.get_or_insert(cfg.max_hosting_disk);
             self.per_user_secret_quota_bytes
                 .get_or_insert(cfg.per_user_secret_quota_bytes);
             self.per_user_inactive_ttl_secs
@@ -977,6 +997,12 @@ impl ConfigArgs {
             max_hosting_storage: self
                 .max_hosting_storage
                 .unwrap_or_else(crate::ring::default_hosting_budget_bytes),
+            hosting_disk_pct: self
+                .hosting_disk_pct
+                .unwrap_or(crate::ring::DEFAULT_HOSTING_DISK_PCT),
+            max_hosting_disk: self
+                .max_hosting_disk
+                .unwrap_or(crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES),
             per_user_secret_quota_bytes: self
                 .per_user_secret_quota_bytes
                 .unwrap_or(crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64),
@@ -1140,6 +1166,19 @@ pub struct Config {
         skip_serializing_if = "is_default_hosting_budget"
     )]
     pub max_hosting_storage: u64,
+    /// Fraction (0.0–1.0) of the data-dir mount's Freenet-reachable capacity
+    /// (`used + free`) used to size the aggregate disk budget (#4683). The disk
+    /// budget is the second floor on hosting eviction
+    /// (`effective = min(ram_budget, disk_budget)`). Default 0.5. Persisted so an
+    /// operator override survives a flag-less restart.
+    #[serde(default = "default_hosting_disk_pct", rename = "hosting-disk-pct")]
+    pub hosting_disk_pct: f64,
+    /// Hard upper clamp in bytes for the aggregate disk budget (#4683), the disk
+    /// analogue of `max-hosting-storage`. The disk budget never exceeds this even
+    /// on a host with a very large data disk. Default 32 GiB. Persisted so an
+    /// operator override survives a flag-less restart.
+    #[serde(default = "default_max_hosting_disk", rename = "max-hosting-disk")]
+    pub max_hosting_disk: u64,
     /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
     /// #4381). Bounds a single hosted user's TOTAL on-disk footprint (active
     /// secret-value blobs + the `.keys` enumeration registry) under their
@@ -1242,6 +1281,19 @@ fn default_max_blocking_threads() -> usize {
 /// budget (addresses #4565); an explicit value always overrides it.
 fn default_max_hosting_storage() -> u64 {
     crate::ring::default_hosting_budget_bytes()
+}
+
+/// Default fraction of Freenet-reachable disk capacity for the aggregate disk
+/// budget (#4683): resolves to [`crate::ring::DEFAULT_HOSTING_DISK_PCT`] (0.5),
+/// the single source of truth shared with the sizing math.
+fn default_hosting_disk_pct() -> f64 {
+    crate::ring::DEFAULT_HOSTING_DISK_PCT
+}
+
+/// Default hard cap for the aggregate disk budget (#4683): resolves to
+/// [`crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES`] (32 GiB).
+fn default_max_hosting_disk() -> u64 {
+    crate::ring::DEFAULT_MAX_HOSTING_DISK_BYTES
 }
 
 /// `skip_serializing_if` predicate for [`Config::max_hosting_storage`]: true
@@ -4374,6 +4426,8 @@ mod tests {
             version: false,
             max_blocking_threads: None,
             max_hosting_storage: None,
+            hosting_disk_pct: None,
+            max_hosting_disk: None,
             per_user_secret_quota_bytes: None,
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
@@ -4485,6 +4539,8 @@ mod tests {
             location: Some(0.5),
             max_blocking_threads: 7,
             max_hosting_storage: 123_456_789,
+            hosting_disk_pct: 0.37,
+            max_hosting_disk: 9_876_543_210,
             per_user_secret_quota_bytes: 7_654_321,
             per_user_inactive_ttl_secs: 1_234_567,
             inactive_user_sweep_interval_secs: 7_200,
@@ -4523,6 +4579,8 @@ mod tests {
             location,
             max_blocking_threads,
             max_hosting_storage,
+            hosting_disk_pct,
+            max_hosting_disk,
             per_user_secret_quota_bytes,
             per_user_inactive_ttl_secs,
             inactive_user_sweep_interval_secs,
@@ -4547,6 +4605,8 @@ mod tests {
             max_hosting_storage, seed.max_hosting_storage,
             "max_hosting_storage"
         );
+        assert_eq!(hosting_disk_pct, seed.hosting_disk_pct, "hosting_disk_pct");
+        assert_eq!(max_hosting_disk, seed.max_hosting_disk, "max_hosting_disk");
         assert_eq!(
             per_user_secret_quota_bytes, seed.per_user_secret_quota_bytes,
             "per_user_secret_quota_bytes"
