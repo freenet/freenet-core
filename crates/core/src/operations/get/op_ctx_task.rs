@@ -2223,6 +2223,11 @@ fn interest_gate_disposition(
 ///
 /// Mirrors `GetMsg::Request` match arm at `get.rs:1369-1433`.
 ///
+/// Note: the `_interest_gate` / `interest_gate_disposition` names are retained
+/// to bound this interim-guard diff, but the gate is now FRESHNESS
+/// (`is_receiving_updates`), not interest/cache-presence. A rename is deferred
+/// to piece E, which removes the unsubscribed copies these names describe.
+///
 /// Returns `(local_value, local_fallback)`:
 /// - `local_value`: Some if we should serve immediately (fresh copy — actively
 ///   receiving updates).  None if we should forward.
@@ -2273,14 +2278,51 @@ async fn check_local_with_interest_gate(
             // (`has_local_interest`), which served unsubscribed stale copies
             // first (bug activated by 0.2.92's E-GET #4689 + interest-gated
             // renewal #4697).
+            //
+            // STRICTER than the local-client path on purpose: the local-client
+            // gate (client_events.rs:933) also serves when `connection_count == 0`
+            // (isolated node) or `is_locally_hosted` (a local client requested
+            // this contract, so a subscription is likely in flight). The relay
+            // path deliberately drops both OR-terms and gates on freshness ALONE:
+            // an isolated relay has no client to answer, and "a local client
+            // wants it" is not evidence THIS relayed copy is fresh. Do NOT
+            // "reconcile" the two gates by copying those OR-terms here — that
+            // re-opens the stale-serve hole this guard closes.
+            //
+            // Deferral intentionally does NOT register the requester's interest
+            // at this hop: registering a downstream subscriber at a peer that is
+            // NOT itself in the update mesh would create a HOLLOW relay link
+            // (invariant 1 / piece D remove exactly this). The `subscribe` flag
+            // is still forwarded downstream (see the GetMsg::Request build in the
+            // retry loop), so a real fresh host registers the subscriber. The R4
+            // requester-registration below runs ONLY on the fresh-serve branch,
+            // where registering is backed by a real hosting/subscription. In the
+            // R10-exhaustion case, serving the stale copy without registration is
+            // correct too: no fresh host was found, so there is nowhere valid to
+            // register the requester anyway.
+            //
+            // Originator-loopback verdict (no NotFound-where-stale regression):
+            // a local client's own GET is gated first by client_events.rs:933; a
+            // loopback request only reaches here after that gate already declined
+            // to serve locally. Even the inconsistent-state case (store has state,
+            // `is_hosting_contract == false`, not receiving updates, stale
+            // `InterestManager.hosting == true`) is safe: this deferral keeps the
+            // copy in `local_fallback`, which R10 serves if the network search
+            // exhausts. So the client still receives the local copy as last resort
+            // (today's behavior) when nothing fresher exists, and a fresher copy
+            // when one does — the change only reorders WHEN the stale copy is
+            // served (last-resort vs first), never turns a stale-serve into a
+            // NotFound.
             let is_fresh = op_manager.ring.is_receiving_updates(&key);
-            if !is_fresh {
+            let (local_value, local_fallback) =
+                interest_gate_disposition(is_fresh, (key, state, contract));
+            if local_fallback.is_some() {
                 tracing::debug!(
                     %instance_id,
                     "GET relay: unsubscribed cache (not receiving updates), will forward"
                 );
             }
-            interest_gate_disposition(is_fresh, (key, state, contract))
+            (local_value, local_fallback)
         }
     }
 }
@@ -2648,10 +2690,15 @@ where
             %instance_id,
             contract = %key,
             phase = "complete",
-            "GET relay: contract found locally (active interest) — sending Found upstream"
+            "GET relay: contract found locally (fresh / receiving updates) — sending Found upstream"
         );
 
         // Register interest for the requester (mirrors get.rs:1447-1476).
+        // Reached ONLY on the fresh-serve branch (`local_value` is Some), so
+        // this registration is backed by a real hosting/subscription — not a
+        // hollow relay. The deferred/fallback path intentionally does NOT
+        // register here; see the freshness-gate comment in
+        // `check_local_with_interest_gate` for why.
         if subscribe {
             crate::operations::subscribe::register_downstream_subscriber(
                 op_manager,
@@ -4587,15 +4634,44 @@ mod tests {
     /// served only as the last-resort fallback (hosting-invariants.md invariant
     /// 1; #2388/#3340). Guards against re-introducing the old cache-presence
     /// gate the interim stale-read guard replaced.
+    ///
+    /// This pin is deliberately TIGHT on the composition (the behavioral test
+    /// only exercises the pure `interest_gate_disposition` helper with hardcoded
+    /// `true`/`false`, so it can't catch a wiring INVERSION here). It requires
+    /// the exact un-negated binding and call literals and forbids both inversion
+    /// forms — either `let is_fresh = !op_manager.ring.is_receiving_updates(...)`
+    /// or `interest_gate_disposition(!is_fresh, ...)` would flip the gate to
+    /// serve stale first / defer fresh (the exact bug this PR fixes) while the
+    /// helper-only behavioral test still passed.
     #[test]
     fn check_local_with_interest_gate_uses_freshness_gate() {
         let src = production_source();
         let body = extract_fn_body(src, "async fn check_local_with_interest_gate(");
+        // Un-negated freshness binding: `is_fresh` must be the value of
+        // `is_receiving_updates`, not its negation.
         assert!(
-            body.contains("is_receiving_updates"),
-            "check_local_with_interest_gate must gate on `is_receiving_updates` \
-             (freshness) — an active network/client subscription — to decide \
-             whether the local copy is served immediately or deferred to network"
+            body.contains("let is_fresh = op_manager.ring.is_receiving_updates("),
+            "check_local_with_interest_gate must bind `is_fresh` directly to \
+             `op_manager.ring.is_receiving_updates(...)` (freshness — an active \
+             network/client subscription)"
+        );
+        assert!(
+            !body.contains("!op_manager.ring.is_receiving_updates"),
+            "check_local_with_interest_gate must NOT negate the freshness signal \
+             — `let is_fresh = !op_manager.ring.is_receiving_updates(...)` inverts \
+             the gate (serve stale first, defer fresh)"
+        );
+        // Un-negated disposition call: the freshness value flows into the helper
+        // un-inverted.
+        assert!(
+            body.contains("interest_gate_disposition(is_fresh,"),
+            "check_local_with_interest_gate must delegate the serve-vs-fallback \
+             decision to `interest_gate_disposition(is_fresh, ...)`"
+        );
+        assert!(
+            !body.contains("interest_gate_disposition(!is_fresh"),
+            "check_local_with_interest_gate must pass `is_fresh` (not `!is_fresh`) \
+             to the disposition helper — negating it inverts the gate"
         );
         // Assert on the CALL syntax (`has_local_interest(`), not the bare token,
         // so the explanatory comment in the gate body may still reference the
@@ -4605,13 +4681,6 @@ mod tests {
             "check_local_with_interest_gate must NOT gate on `has_local_interest` \
              (cache presence) — that served unsubscribed stale copies first, the \
              bug the freshness gate fixes"
-        );
-        // The disposition (fresh → serve, stale → fallback) is delegated to the
-        // pure `interest_gate_disposition` helper (unit-tested behaviorally).
-        assert!(
-            body.contains("interest_gate_disposition"),
-            "check_local_with_interest_gate must delegate the serve-vs-fallback \
-             decision to `interest_gate_disposition`"
         );
     }
 
