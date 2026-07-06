@@ -319,6 +319,15 @@ impl DiskUsageTracker {
         self.compile_cache_bytes
             .store(du_walk(&self.compile_cache_dir), Ordering::Relaxed);
     }
+
+    /// Free bytes on the mount holding the tracked `contracts_dir` — the
+    /// `available` term the disk budget sizes against (#4683). `None` when the
+    /// platform query fails; the caller falls back to `u64::MAX`. The contracts
+    /// dir shares the data-dir mount, which is where all tracked bytes (state,
+    /// wasm, relocated compile cache) land, so it is the correct mount to probe.
+    pub(crate) fn available_bytes(&self) -> Option<u64> {
+        available_bytes(&self.contracts_dir)
+    }
 }
 
 /// Recursively sum the byte size of every regular file under `dir`. A missing
@@ -375,6 +384,80 @@ fn du_walk_wasm(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Free bytes on the filesystem mount that holds `path`, as seen by an
+/// unprivileged process (#4683). This is the `available` term the disk budget
+/// adds to `freenet_used` to size itself against total reachable capacity.
+///
+/// Returns `None` when the platform query fails or the platform is unsupported;
+/// the caller then falls back to `u64::MAX`, which makes `disk_budget_for` clamp
+/// to its MAX cap (a free-space read that cannot be trusted must not silently
+/// shrink the budget — the eviction floor degrades to "cap only" rather than to
+/// zero). The value is `f_bavail * f_frsize` (blocks available to non-root ×
+/// fragment size) — NOT `f_bfree`, so root-reserved blocks are excluded, matching
+/// what the node can actually write.
+///
+/// The `path` must live on the SAME mount as the data dir the budget accounts
+/// for: `statvfs` is per-mount, so the free-space basis has to be measured on
+/// the mount the tracked bytes land on (this is why PR 1 relocated the wasmtime
+/// cache onto the data-dir mount).
+pub fn available_bytes(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        // SAFETY: `statvfs` is an FFI call that reads the filesystem stats for a
+        // NUL-terminated path into a caller-owned `libc::statvfs` buffer. We pass
+        // a valid `CString` pointer (owned by `c_path`, alive for the call) and a
+        // zeroed, correctly-sized, stack-owned out-buffer. It writes only into
+        // that buffer and returns 0 on success / -1 on error (checked below); it
+        // borrows no memory past the call. No aliasing or lifetime hazards.
+        let stat = unsafe {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+                return None;
+            }
+            stat
+        };
+        // `f_bavail`/`f_frsize` are `c_ulong`/`fsblkcnt_t`; widen to u64 and
+        // saturate the multiply so a pathological fs report can't overflow.
+        let avail = stat.f_bavail as u64;
+        let frsize = stat.f_frsize as u64;
+        Some(avail.saturating_mul(frsize))
+    }
+    #[cfg(all(windows, not(unix)))]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        // GetDiskFreeSpaceExW wants a wide, NUL-terminated path.
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let mut free_bytes_available: u64 = 0;
+        // SAFETY: FFI call into the Win32 API. `wide` is a valid NUL-terminated
+        // UTF-16 buffer alive for the call; the three out-pointers are to
+        // stack-owned u64s. We read only `free_bytes_available` and only on a
+        // nonzero (success) return.
+        let ok = unsafe {
+            winapi::um::fileapi::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_bytes_available as *mut u64 as *mut _,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            None
+        } else {
+            Some(free_bytes_available)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 #[cfg(test)]
@@ -570,5 +653,30 @@ mod tests {
         t.refresh_compile_cache();
         assert_eq!(t.stats().compile_cache_bytes, 600);
         assert_eq!(t.total_bytes(), 600);
+    }
+
+    /// `available_bytes` on a real, existing mount returns a plausible positive
+    /// value; a nonexistent path returns `None` (the MAX-fallback case). We can't
+    /// assert an exact figure (it's the live disk), only the shape.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn available_bytes_reports_free_space_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let avail = available_bytes(dir.path());
+        assert!(
+            avail.map(|v| v > 0).unwrap_or(true),
+            "existing mount should report positive free space (or None if the \
+             query is unsupported), got {avail:?}"
+        );
+        // A path that does not exist has no mount stats → None on unix (statvfs
+        // fails); the caller treats None as u64::MAX.
+        let missing = available_bytes(Path::new("/nonexistent/does/not/exist/xyz"));
+        #[cfg(unix)]
+        assert!(
+            missing.is_none(),
+            "statvfs on a nonexistent path should fail → None, got {missing:?}"
+        );
+        #[cfg(not(unix))]
+        let _ = missing;
     }
 }

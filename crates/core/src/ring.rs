@@ -102,6 +102,10 @@ pub(crate) use hosting::default_hosting_budget_bytes;
 /// build inputs and run the shadow compare (keystone step-2, #4642).
 pub(crate) use hosting::reconcile;
 pub use hosting::{AccessType, RecordAccessResult};
+/// Aggregate disk-budget defaults (#4683). `config` resolves the persisted
+/// `hosting-disk-pct` / `max-hosting-disk` defaults from these so the operator-
+/// facing defaults and the in-code sizing math share one source of truth.
+pub(crate) use hosting::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
 /// Clamp bounds re-exported only for the config-default round-trip test.
 #[cfg(test)]
 pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
@@ -2660,7 +2664,7 @@ impl Ring {
             // compile-cache totals so telemetry stays fresh. Observational only
             // in this PR — no admission/eviction decision reads these yet.
             //
-            // Both operations are synchronous, blocking disk I/O: a recursive
+            // The seed + refresh are synchronous, blocking disk I/O: a recursive
             // `std::fs` walk of `contracts_dir` + the wasmtime cache dir on every
             // tick, plus a one-time sync redb `load_all_hosting_metadata` on the
             // seeding tick. `contracts_dir` is unbounded and non-self-pruning, so
@@ -2680,6 +2684,22 @@ impl Ring {
                 // sweep loop, but it must not be swallowed silently either.
                 tracing::warn!(%err, "disk-usage accounting maintenance task failed");
             }
+
+            // Eviction floor (#4683, PR 2): recompute
+            // `effective = min(ram_budget, disk_budget)` and install it as the
+            // hosting-cache budget so the next `evict_over_budget` sheds state
+            // down to the tighter of the two resource floors. The free-space read
+            // is the determinism seam — production reads the data-dir mount; a
+            // failed read falls back to `u64::MAX`, which makes the disk budget
+            // clamp to its cap (degrade to "cap only", never to zero). The
+            // du-walks above already ran OUTSIDE any cache lock (in the blocking
+            // task); only the O(1) `set_budget_bytes` inside
+            // `recompute_effective_budget` takes the cache write lock.
+            let available = ring
+                .hosting_manager
+                .disk_available_bytes()
+                .unwrap_or(u64::MAX);
+            ring.hosting_manager.recompute_effective_budget(available);
         }
     }
 
@@ -2817,9 +2837,15 @@ impl Ring {
         &self,
         contracts_dir: std::path::PathBuf,
         wasmtime_cache_dir: std::path::PathBuf,
+        hosting_disk_pct: f64,
+        max_hosting_disk: u64,
     ) {
         self.hosting_manager
             .configure_disk_tracker(contracts_dir, wasmtime_cache_dir);
+        // #4683 eviction-floor sizing knobs (mirrors the disk paths install; the
+        // config is only reachable here). The 60s sweep's recompute reads them.
+        self.hosting_manager
+            .configure_disk_budget(hosting_disk_pct, max_hosting_disk);
     }
 
     /// Drop the ring's clones of the redb `Storage` handle (hosting metadata +

@@ -127,9 +127,12 @@ impl ContractHandler for NetworkContractHandler {
         // Aggregate disk-usage tracker paths (#4683): the mode-resolved
         // contracts dir (WASM blobs) and the relocated wasmtime compile-cache
         // dir. Seeded lazily on the first sweep tick.
-        op_manager
-            .ring
-            .set_hosting_disk_paths(config.contracts_dir(), config.wasmtime_cache_dir());
+        op_manager.ring.set_hosting_disk_paths(
+            config.contracts_dir(),
+            config.wasmtime_cache_dir(),
+            config.hosting_disk_pct,
+            config.max_hosting_disk,
+        );
         // Hydrate broken-invariants flags from the same backing store so a
         // node that previously detected a non-idempotent contract doesn't
         // re-engage its broadcast storm after restart.
