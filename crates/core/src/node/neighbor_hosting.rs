@@ -379,6 +379,24 @@ impl NeighborHostingManager {
         neighbors
     }
 
+    /// The set of contract instance-ids `pub_key` currently advertises hosting.
+    ///
+    /// Read-only reverse lookup (does NOT mutate, unlike
+    /// [`Self::on_peer_disconnected`]). The reconcile connection-drop shadow
+    /// (keystone step-2, #4642) calls this BEFORE `on_peer_disconnected` clears
+    /// the entry, to learn which contracts a dropped peer co-hosted so it can ask
+    /// whether the controller would re-root. Returns an empty set for an unknown
+    /// peer.
+    pub(crate) fn contracts_for_peer(
+        &self,
+        pub_key: &TransportPublicKey,
+    ) -> HashSet<ContractInstanceId> {
+        self.neighbor_contracts
+            .get(pub_key)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_default()
+    }
+
     /// Handle peer disconnection by removing their hosting state.
     pub fn on_peer_disconnected(&self, pub_key: &TransportPublicKey) {
         if let Some((_, removed_cache)) = self.neighbor_contracts.remove(pub_key) {

@@ -193,12 +193,20 @@ pub struct NetworkStatus {
     /// (hosting redesign piece D, #4642 / #4671).
     pub upstream_divergence_stats: UpstreamDivergenceStats,
     /// Reconcile-controller SHADOW comparison counters, split PER SITE (hosting
-    /// redesign keystone step-2, #4642). The FLIP is site-by-site (collapse
-    /// first, then renewal), so each site's divergence must be separately
-    /// gate-able — a single global tally would be dominated by the renewal set
-    /// size and hide the collapse-site signal.
+    /// redesign keystone step-2, #4642). The FLIP is site-by-site, so each
+    /// site's divergence must be separately gate-able — a single global tally
+    /// would be dominated by the renewal set size and hide the other signals.
+    ///
+    /// `collapse` and `renewal` are the MAINTENANCE sites (full action-set
+    /// comparison). The other three are single-aspect EDGE sites (focused
+    /// comparison on one action class): `inbound_unsubscribe` (teardown on a
+    /// downstream leave), `connection_drop` (re-root on an upstream loss),
+    /// `host_formation` (announce on first host).
     pub reconcile_shadow_collapse: ReconcileShadowStats,
     pub reconcile_shadow_renewal: ReconcileShadowStats,
+    pub reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats,
+    pub reconcile_shadow_connection_drop: ReconcileShadowStats,
+    pub reconcile_shadow_host_formation: ReconcileShadowStats,
 }
 
 /// Per-node counters measuring how often the demand-driven-hosting **computed
@@ -224,6 +232,10 @@ pub struct UpstreamDivergenceStats {
 
 /// Which decision site a reconcile shadow comparison came from. The FLIP is
 /// site-by-site, so the counters are split per site (keystone step-2, #4642).
+///
+/// `Collapse` / `Renewal` are the MAINTENANCE sites (full action-set
+/// comparison). The other three are single-aspect EDGE sites, each compared on
+/// ONE focused action class (see `action_set_divergence_focused`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileShadowSite {
     /// The interest-gated collapse (`OpManager::send_unsubscribe_upstream`).
@@ -231,6 +243,19 @@ pub enum ReconcileShadowSite {
     /// The subscription-renewal set (`Ring::contracts_needing_renewal`, driven
     /// by the recovery loop).
     Renewal,
+    /// A downstream peer unsubscribed (`subscribe::handle_unsubscribe_inbound`):
+    /// did that leave us not-in-use (strict-farther), i.e. would the controller
+    /// tear down? Focused on `Collapse`.
+    InboundUnsubscribe,
+    /// A ring connection dropped (`OpManager::on_ring_connection_lost`): for a
+    /// contract that peer co-hosted, would the controller re-root (upstream
+    /// lost, demand intact)? Production does nothing today. Focused on
+    /// `ReRootSearch`.
+    ConnectionDrop,
+    /// A peer finished host formation and announced hosting
+    /// (`finalize_originator_subscribe`, GET `cache_contract_locally`): does the
+    /// controller agree it should announce? Focused on `Announce`.
+    HostFormation,
 }
 
 /// Per-node counters for the reconcile-controller SHADOW comparison AT ONE SITE
@@ -456,6 +481,9 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         upstream_divergence_stats: UpstreamDivergenceStats::default(),
         reconcile_shadow_collapse: ReconcileShadowStats::default(),
         reconcile_shadow_renewal: ReconcileShadowStats::default(),
+        reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats::default(),
+        reconcile_shadow_connection_drop: ReconcileShadowStats::default(),
+        reconcile_shadow_host_formation: ReconcileShadowStats::default(),
     };
     match NETWORK_STATUS.get() {
         // Already initialized: overwrite the existing tracker in place so
@@ -722,6 +750,11 @@ pub fn record_reconcile_shadow_comparison(
             let r = match site {
                 ReconcileShadowSite::Collapse => &mut s.reconcile_shadow_collapse,
                 ReconcileShadowSite::Renewal => &mut s.reconcile_shadow_renewal,
+                ReconcileShadowSite::InboundUnsubscribe => {
+                    &mut s.reconcile_shadow_inbound_unsubscribe
+                }
+                ReconcileShadowSite::ConnectionDrop => &mut s.reconcile_shadow_connection_drop,
+                ReconcileShadowSite::HostFormation => &mut s.reconcile_shadow_host_formation,
             };
             r.comparisons = r.comparisons.saturating_add(1);
             if divergence.any() {
@@ -752,15 +785,32 @@ pub fn record_reconcile_shadow_comparison(
     }
 }
 
+/// A copy of all per-site reconcile-controller SHADOW counters, for export to
+/// the `router_snapshot` telemetry event (keystone step-2, #4642).
+#[derive(Clone, Copy)]
+pub struct ReconcileShadowSnapshot {
+    pub collapse: ReconcileShadowStats,
+    pub renewal: ReconcileShadowStats,
+    pub inbound_unsubscribe: ReconcileShadowStats,
+    pub connection_drop: ReconcileShadowStats,
+    pub host_formation: ReconcileShadowStats,
+}
+
 /// Read the per-site reconcile-controller SHADOW counters (keystone step-2,
-/// #4642) for export to the `router_snapshot` telemetry event. Returns
-/// `(collapse, renewal)` copies of the per-node monotonic totals, or `None`
-/// before the `NETWORK_STATUS` singleton is initialized. `Ring` polls this on the
-/// snapshot cadence and copies the values onto `RouterSnapshotInfo`.
-pub fn reconcile_shadow_counts() -> Option<(ReconcileShadowStats, ReconcileShadowStats)> {
+/// #4642) for export to the `router_snapshot` telemetry event. Returns copies of
+/// the per-node monotonic totals for every site, or `None` before the
+/// `NETWORK_STATUS` singleton is initialized. `Ring` polls this on the snapshot
+/// cadence and copies the values onto `RouterSnapshotInfo`.
+pub fn reconcile_shadow_counts() -> Option<ReconcileShadowSnapshot> {
     let status = NETWORK_STATUS.get()?;
     let s = status.read().ok()?;
-    Some((s.reconcile_shadow_collapse, s.reconcile_shadow_renewal))
+    Some(ReconcileShadowSnapshot {
+        collapse: s.reconcile_shadow_collapse,
+        renewal: s.reconcile_shadow_renewal,
+        inbound_unsubscribe: s.reconcile_shadow_inbound_unsubscribe,
+        connection_drop: s.reconcile_shadow_connection_drop,
+        host_formation: s.reconcile_shadow_host_formation,
+    })
 }
 
 /// Record a NAT traversal attempt.
@@ -1579,11 +1629,17 @@ mod tests {
         let _lock = TEST_MUTEX.lock().unwrap();
         init(31337, HashSet::new(), "test".to_string());
 
-        let (collapse0, renewal0) = reconcile_shadow_counts().expect("counters present after init");
+        let z = reconcile_shadow_counts().expect("counters present after init");
         assert_eq!(
-            (collapse0.comparisons, renewal0.comparisons),
-            (0, 0),
-            "both sites start at zero after init"
+            (
+                z.collapse.comparisons,
+                z.renewal.comparisons,
+                z.inbound_unsubscribe.comparisons,
+                z.connection_drop.comparisons,
+                z.host_formation.comparisons,
+            ),
+            (0, 0, 0, 0, 0),
+            "all sites start at zero after init"
         );
 
         // Collapse site: 2 comparisons, 1 diverging (retract-only gap).
@@ -1604,25 +1660,42 @@ mod tests {
                 ..Default::default()
             },
         );
+        // Connection-drop site (an EDGE site): 1 comparison, diverging (reroot).
+        record_reconcile_shadow_comparison(
+            ConnectionDrop,
+            ReconcileActionDivergence {
+                reroot_search: true,
+                ..Default::default()
+            },
+        );
 
-        let (collapse, renewal) = reconcile_shadow_counts().expect("counters present");
+        let c = reconcile_shadow_counts().expect("counters present");
 
         // Collapse site tallies only the collapse-site records.
-        assert_eq!(collapse.comparisons, 2, "collapse site: every call bumps");
-        assert_eq!(collapse.divergences, 1, "collapse site: one diverging call");
-        assert_eq!(collapse.retract_diffs, 1);
-        assert_eq!(collapse.subscribe_diffs, 0);
-        assert_eq!(collapse.renew_diffs, 0);
+        assert_eq!(c.collapse.comparisons, 2, "collapse site: every call bumps");
+        assert_eq!(
+            c.collapse.divergences, 1,
+            "collapse site: one diverging call"
+        );
+        assert_eq!(c.collapse.retract_diffs, 1);
+        assert_eq!(c.collapse.subscribe_diffs, 0);
 
         // Renewal site is independent — the collapse records must not bleed in.
         assert_eq!(
-            renewal.comparisons, 1,
+            c.renewal.comparisons, 1,
             "renewal site independent of collapse"
         );
-        assert_eq!(renewal.divergences, 1);
-        assert_eq!(renewal.subscribe_diffs, 1);
-        assert_eq!(renewal.renew_diffs, 1);
-        assert_eq!(renewal.retract_diffs, 0);
+        assert_eq!(c.renewal.subscribe_diffs, 1);
+        assert_eq!(c.renewal.renew_diffs, 1);
+        assert_eq!(c.renewal.retract_diffs, 0);
+
+        // Connection-drop site is independent of the maintenance sites.
+        assert_eq!(c.connection_drop.comparisons, 1);
+        assert_eq!(c.connection_drop.reroot_search_diffs, 1);
+        assert_eq!(c.connection_drop.renew_diffs, 0);
+        // Sites never touched stay zero.
+        assert_eq!(c.inbound_unsubscribe.comparisons, 0);
+        assert_eq!(c.host_formation.comparisons, 0);
     }
 
     #[test]

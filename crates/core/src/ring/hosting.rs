@@ -580,6 +580,44 @@ impl HostingManager {
         contracts
     }
 
+    /// Up to `max_matches` currently-subscribed (non-expired) `ContractKey`s
+    /// whose instance-id is in `wanted`, examining AT MOST `scan_cap` active
+    /// subscription entries.
+    ///
+    /// Single pass, UNSORTED, no full-set materialization — unlike
+    /// [`Self::get_subscribed_contracts`] (which allocates the whole set and
+    /// sorts it, O(S log S)). The reconcile connection-drop shadow (keystone
+    /// step-2, #4642) uses this so one co-host disconnect can't burst into an
+    /// O(S log S) scan on a near-key gateway with a large subscribed set: BOTH
+    /// the scan (`scan_cap`) and the match/build count (`max_matches`) are
+    /// hard-bounded. A subscribed set larger than `scan_cap` is SAMPLED rather
+    /// than fully enumerated — an acceptable slight undercount for a one-sided
+    /// diagnostic counter (DashMap iteration order is unspecified, so the sample
+    /// is arbitrary, not adversarially controllable). Returning the `ContractKey`
+    /// directly also avoids reconstructing it from the reverse index's bare
+    /// `ContractInstanceId` (no instance-id → `ContractKey` index exists in this
+    /// crate — every resolver scans, as the comment at `ring.rs` ~895 notes).
+    pub(crate) fn subscribed_keys_in(
+        &self,
+        wanted: &HashSet<ContractInstanceId>,
+        scan_cap: usize,
+        max_matches: usize,
+    ) -> Vec<ContractKey> {
+        let now = self.time_source.now();
+        let mut out = Vec::new();
+        // `.take(scan_cap)` bounds the entries EXAMINED (the scan); the inner
+        // break bounds the MATCHES kept (the expensive build count downstream).
+        for entry in self.active_subscriptions.iter().take(scan_cap) {
+            if out.len() >= max_matches {
+                break;
+            }
+            if entry.value().expires_at > now && wanted.contains(entry.key().id()) {
+                out.push(*entry.key());
+            }
+        }
+        out
+    }
+
     /// Snapshot of every active subscription for the local-peer dashboard.
     ///
     /// Reads directly from the canonical lease map (no parallel
@@ -2263,6 +2301,63 @@ mod tests {
 
         assert!(result.is_new);
         assert!(manager.is_subscribed(&contract));
+    }
+
+    /// `subscribed_keys_in` (the bounded connection-drop-shadow lookup, #4642)
+    /// returns only subscribed matches, and both caps hard-bound the work.
+    #[test]
+    fn subscribed_keys_in_matches_and_bounds() {
+        use std::collections::HashSet;
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        for seed in 1..=6u8 {
+            manager.subscribe(make_contract_key(seed));
+        }
+        // wanted = instance-ids of two subscribed contracts + one we never
+        // subscribed to (seed 99).
+        let wanted: HashSet<ContractInstanceId> = [
+            *make_contract_key(2).id(),
+            *make_contract_key(4).id(),
+            *make_contract_key(99).id(),
+        ]
+        .into_iter()
+        .collect();
+
+        // Generous caps: exactly the two subscribed matches (99 excluded).
+        let mut got = manager.subscribed_keys_in(&wanted, 1024, 32);
+        got.sort_by(|a, b| a.id().as_bytes().cmp(b.id().as_bytes()));
+        assert_eq!(got, vec![make_contract_key(2), make_contract_key(4)]);
+
+        // `max_matches` caps the result (bounds the expensive build count).
+        assert_eq!(manager.subscribed_keys_in(&wanted, 1024, 1).len(), 1);
+
+        // `scan_cap` bounds the scan itself: examine zero entries → find none.
+        assert!(manager.subscribed_keys_in(&wanted, 0, 32).is_empty());
+    }
+
+    /// `subscribed_keys_in` excludes expired leases (same freshness semantics as
+    /// `get_subscribed_contracts`), driven purely by the injected clock.
+    #[tokio::test]
+    async fn subscribed_keys_in_excludes_expired_leases() {
+        use std::collections::HashSet;
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let contract = make_contract_key(7);
+        manager.subscribe(contract);
+        let wanted: HashSet<ContractInstanceId> = [*contract.id()].into_iter().collect();
+        assert_eq!(
+            manager.subscribed_keys_in(&wanted, 1024, 32),
+            vec![contract],
+            "a fresh lease is matched"
+        );
+
+        clock.advance_time(SUBSCRIPTION_LEASE_DURATION + Duration::from_secs(1));
+        assert!(
+            manager.subscribed_keys_in(&wanted, 1024, 32).is_empty(),
+            "an expired lease must not be matched"
+        );
     }
 
     /// The injected time source (`with_time_source`) drives the manager's

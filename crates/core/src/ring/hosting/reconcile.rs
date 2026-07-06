@@ -435,6 +435,39 @@ pub(crate) fn action_set_divergence(
     div
 }
 
+/// Like [`action_set_divergence`] but restricted to the `relevant` action
+/// classes: any action NOT in `relevant` is filtered out of BOTH sets before
+/// comparing, so it can never flag.
+///
+/// Used by the single-aspect EDGE decision sites (keystone step-2 completion,
+/// #4642) — inbound-unsubscribe collapse, connection-drop re-root, and
+/// host-formation announce. Those sites each decide ONE thing (tear down? /
+/// re-root? / announce?) at an event, whereas [`reconcile`] returns the FULL
+/// level-triggered desired-state set (which for a maintained in-use contract
+/// always includes `Renew`). A full-set comparison at an event site would
+/// therefore be dominated by `Renew` cross-talk that the event does not decide
+/// (renewal is measured at the renewal site). Focusing on the class the site is
+/// responsible for keeps each per-site signal trustworthy. The
+/// collapse/renewal MAINTENANCE sites keep the full comparison — they ARE the
+/// drivers for their whole action set.
+pub(crate) fn action_set_divergence_focused(
+    reconcile_actions: &[Action],
+    actual_actions: &[Action],
+    relevant: &[Action],
+) -> ReconcileActionDivergence {
+    let r: Vec<Action> = reconcile_actions
+        .iter()
+        .copied()
+        .filter(|a| relevant.contains(a))
+        .collect();
+    let a: Vec<Action> = actual_actions
+        .iter()
+        .copied()
+        .filter(|a| relevant.contains(a))
+        .collect();
+    action_set_divergence(&r, &a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +785,47 @@ mod tests {
         // Renewal agreement (steady-state in-use host) ⇒ no divergence.
         let d = action_set_divergence(&[Renew], &[Renew]);
         assert!(!d.any());
+    }
+
+    /// `action_set_divergence_focused` restricts the comparison to the relevant
+    /// action classes — the single-aspect edge sites use it so level-triggered
+    /// `Renew` cross-talk (which the event does not decide) can't flag.
+    #[test]
+    fn action_set_divergence_focused_ignores_irrelevant_classes() {
+        use Action::*;
+
+        // Connection-drop shape: reconcile wants {Renew, ReRootSearch}, the site
+        // does nothing ({}). Focused on {ReRootSearch}: only reroot flags; the
+        // level-triggered Renew is ignored (it's the renewal site's concern).
+        let d = action_set_divergence_focused(&[Renew, ReRootSearch], &[], &[ReRootSearch]);
+        assert_eq!(
+            d,
+            ReconcileActionDivergence {
+                reroot_search: true,
+                ..Default::default()
+            },
+            "focused compare must ignore the irrelevant Renew and flag only ReRootSearch"
+        );
+
+        // Host-formation shape: reconcile wants {Renew, Announce}, production
+        // announces ({Announce}). Focused on {Announce}: agree, no divergence.
+        let d = action_set_divergence_focused(&[Renew, Announce], &[Announce], &[Announce]);
+        assert!(
+            !d.any(),
+            "focused Announce compare agrees; the Renew is out of scope"
+        );
+
+        // Inbound-unsubscribe shape: reconcile would tear down ({Collapse}), the
+        // site kept hosting ({}). Focused on {Collapse}: collapse flags (the
+        // strict-farther mutual-co-host signal), Renew ignored.
+        let d = action_set_divergence_focused(&[Renew, Collapse], &[], &[Collapse]);
+        assert_eq!(
+            d,
+            ReconcileActionDivergence {
+                collapse: true,
+                ..Default::default()
+            }
+        );
     }
 
     /// Pin for the `Distance` Eq/Ord gotcha (`ring/location.rs:223-243`): two

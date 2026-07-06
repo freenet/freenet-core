@@ -2322,6 +2322,33 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "reconcile_shadow_renewal_reroot_search_diffs",
                         snapshot.reconcile_shadow_renewal_reroot_search_diffs,
                     ),
+                    // Single-aspect edge sites (keystone step-2 completion,
+                    // #4642): comparisons + divergences only (focused on one
+                    // class each).
+                    (
+                        "reconcile_shadow_inbound_unsubscribe_comparisons",
+                        snapshot.reconcile_shadow_inbound_unsubscribe_comparisons,
+                    ),
+                    (
+                        "reconcile_shadow_inbound_unsubscribe_divergences",
+                        snapshot.reconcile_shadow_inbound_unsubscribe_divergences,
+                    ),
+                    (
+                        "reconcile_shadow_connection_drop_comparisons",
+                        snapshot.reconcile_shadow_connection_drop_comparisons,
+                    ),
+                    (
+                        "reconcile_shadow_connection_drop_divergences",
+                        snapshot.reconcile_shadow_connection_drop_divergences,
+                    ),
+                    (
+                        "reconcile_shadow_host_formation_comparisons",
+                        snapshot.reconcile_shadow_host_formation_comparisons,
+                    ),
+                    (
+                        "reconcile_shadow_host_formation_divergences",
+                        snapshot.reconcile_shadow_host_formation_divergences,
+                    ),
                 ] {
                     obj.insert(key.to_string(), serde_json::json!(value));
                 }
@@ -2648,6 +2675,12 @@ mod tests {
         info.reconcile_shadow_renewal_announce_diffs = Some(491);
         info.reconcile_shadow_renewal_retract_diffs = Some(499);
         info.reconcile_shadow_renewal_reroot_search_diffs = Some(503);
+        info.reconcile_shadow_inbound_unsubscribe_comparisons = Some(509);
+        info.reconcile_shadow_inbound_unsubscribe_divergences = Some(521);
+        info.reconcile_shadow_connection_drop_comparisons = Some(523);
+        info.reconcile_shadow_connection_drop_divergences = Some(541);
+        info.reconcile_shadow_host_formation_comparisons = Some(547);
+        info.reconcile_shadow_host_formation_divergences = Some(557);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("reconcile_shadow_collapse_comparisons", 401),
@@ -2668,6 +2701,12 @@ mod tests {
             ("reconcile_shadow_renewal_announce_diffs", 491),
             ("reconcile_shadow_renewal_retract_diffs", 499),
             ("reconcile_shadow_renewal_reroot_search_diffs", 503),
+            ("reconcile_shadow_inbound_unsubscribe_comparisons", 509),
+            ("reconcile_shadow_inbound_unsubscribe_divergences", 521),
+            ("reconcile_shadow_connection_drop_comparisons", 523),
+            ("reconcile_shadow_connection_drop_divergences", 541),
+            ("reconcile_shadow_host_formation_comparisons", 547),
+            ("reconcile_shadow_host_formation_divergences", 557),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
