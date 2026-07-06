@@ -1013,16 +1013,20 @@ impl HostingManager {
     ///
     /// **Why `is_subscribed` (this node's own upstream subscription) is NOT
     /// included.** It would seem natural to also exempt contracts the node
-    /// is actively subscribed to. The problem is `contracts_needing_renewal`
-    /// section 1 renews ANY soon-to-expire active subscription
-    /// unconditionally, with no gate on local interest. So an
-    /// `is_subscribed`-only exemption is effectively unbounded — the renewal
-    /// machinery would keep extending the lease forever, blocking
-    /// reclamation indefinitely. That would violate the cleanup-exemption
-    /// rule in `AGENTS.md` (exemptions must be time-bounded). Local-client
-    /// subscriptions and downstream subscribers ARE both time-bounded:
-    /// client subscriptions expire on disconnect; downstream subscribers
-    /// expire via `expire_stale_downstream_subscribers` after
+    /// is actively subscribed to. But `contract_in_use` now *gates* renewal:
+    /// `contracts_needing_renewal` section 1 renews a soon-to-expire lease
+    /// only while `contract_in_use` is true. If `is_subscribed` counted as
+    /// in-use, a subscribed contract would renew its own lease, which keeps
+    /// the subscription alive, which keeps `is_subscribed` (and therefore
+    /// `contract_in_use`) true — a self-renewing loop with no external
+    /// demand. That is exactly the #3763 renewal storm the interest gate
+    /// exists to stop, reintroduced through the back door; the exemption
+    /// would also be effectively unbounded, blocking reclamation
+    /// indefinitely, which violates the cleanup-exemption rule in `AGENTS.md`
+    /// (exemptions must be time-bounded). Local-client subscriptions and
+    /// downstream subscribers ARE both time-bounded and represent real
+    /// external demand: client subscriptions expire on disconnect; downstream
+    /// subscribers expire via `expire_stale_downstream_subscribers` after
     /// `SUBSCRIPTION_LEASE_DURATION` without renewal.
     ///
     /// The narrow case "subscribed but no local interest" should be handled
@@ -1664,7 +1668,22 @@ impl HostingManager {
         // Use HashSet for O(1) deduplication instead of O(n) Vec::contains
         let mut needs_renewal_set = HashSet::new();
 
-        // 1. Contracts with soon-to-expire subscriptions
+        // 1. Contracts with soon-to-expire subscriptions AND active demand.
+        //
+        //    The `contract_in_use` gate is load-bearing (demand-driven-hosting
+        //    design §5a / §7). A subscribed host renews its lease only while
+        //    something still depends on it hosting the contract: a local client,
+        //    or a registered downstream subscriber. Both are time-bounded
+        //    (clients disconnect, downstream registrations lease-expire), so when
+        //    demand fades the peer stops renewing, its lease lapses, and the
+        //    chain collapses inward toward the key. Without this gate every
+        //    subscribed host self-renews forever regardless of interest, so live
+        //    subscriptions grow with accumulated cache rather than active demand
+        //    — the #3763 renewal storm. The eviction budget (piece A) does NOT
+        //    bound this: an in-use, actively-subscribed contract is
+        //    eviction-exempt AND self-renewing, so the storm set is exactly the
+        //    set the budget may not touch.
+        //
         // Collect and sort for deterministic iteration order
         let mut active_subs: Vec<_> = self
             .active_subscriptions
@@ -1674,7 +1693,11 @@ impl HostingManager {
         active_subs.sort_by(|(a, _), (b, _)| a.id().as_bytes().cmp(b.id().as_bytes()));
 
         for (key, expires_at) in active_subs {
-            if expires_at <= renewal_threshold && expires_at > now {
+            // `contract_in_use` reads only the client-subscription and
+            // downstream-subscriber maps (never `hosting_cache`), and `active_subs`
+            // is already materialized above, so no active_subscriptions shard guard
+            // is held across this call.
+            if expires_at <= renewal_threshold && expires_at > now && self.contract_in_use(&key) {
                 needs_renewal_set.insert(key);
             }
         }
@@ -3668,11 +3691,12 @@ mod tests {
     /// A contract with ONLY an active upstream network subscription (no
     /// local client, no downstream subscriber) is NOT in use for
     /// reclamation purposes. Documented in `contract_in_use`'s rustdoc:
-    /// `contracts_needing_renewal` renews active subscriptions
-    /// unconditionally, so including `is_subscribed` here would be an
-    /// effectively unbounded GC exemption (AGENTS.md cleanup-exemption
-    /// rule). Local-client subscriptions and downstream-peer subscribers
-    /// are both time-bounded and remain in the predicate.
+    /// `contracts_needing_renewal` section 1 now gates renewal on
+    /// `contract_in_use`, so including `is_subscribed` here would make a
+    /// subscribed contract renew its own lease indefinitely — a self-renewing
+    /// loop and an effectively unbounded GC exemption (AGENTS.md
+    /// cleanup-exemption rule). Local-client subscriptions and downstream-peer
+    /// subscribers are both time-bounded and remain in the predicate.
     #[test]
     fn test_contract_in_use_excludes_network_subscription_only() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
@@ -5011,24 +5035,38 @@ mod tests {
              bounded by active interest, not cache size (#3763 storm)"
         );
 
-        // Positive/negative control pair that pins the `expires_at > now`
-        // lower-bound guard in Branch 1 (line ~1368). Both contracts carry a
-        // backdated/forward-dated lease in `active_subscriptions`; the ONLY
-        // thing distinguishing them is which side of `now` the lease sits on.
+        // Branch-1 control set. All three carry a lease in `active_subscriptions`;
+        // what distinguishes them is (a) which side of `now` the lease sits on and
+        // (b) whether the contract has active demand (the demand-driven-hosting
+        // §5a `contract_in_use` renewal gate: a live client OR downstream
+        // subscriber).
         //
-        // - `within_window`: lease expires inside the renewal window but still
-        //   in the future (now < expires_at <= now + SUBSCRIPTION_RENEWAL_INTERVAL).
-        //   Branch 1 returns the lease key directly, so this contract MUST be
-        //   counted. Without it the expired-lease assertion alone is inert: a
-        //   fresh `subscribe()` lease is now + 8min (excluded by the window's
-        //   upper bound) and 0xE0 isn't in the 0..50 cache for Branch 2, so the
-        //   expired-lease guard could be deleted with the test still passing.
-        // - `expired`: lease is in the past. It must NOT be counted, otherwise
-        //   the renewal set would refill itself from stale leases (the AGENTS.md
+        // - `within_window`: lease expires inside the renewal window and in the
+        //   future (now < expires_at <= now + SUBSCRIPTION_RENEWAL_INTERVAL), AND
+        //   it has a downstream subscriber (active interest). Branch 1 returns it,
+        //   so it MUST be counted — it pins the `expires_at > now` lower-bound
+        //   guard AND the `contract_in_use` gate together. Without it the
+        //   expired-lease assertion alone is inert: a fresh `subscribe()` lease is
+        //   now + 8min (excluded by the window's upper bound) and 0xE0 isn't in
+        //   the 0..50 cache for Branch 2, so the expired-lease guard could be
+        //   deleted with the test still passing.
+        // - `no_interest`: an identical within-window lease but with NO client and
+        //   NO downstream subscriber. Under the interest gate it must NOT be
+        //   counted: an un-demanded subscription LAPSES instead of self-renewing.
+        //   This is the #3763 bound (renewal tracks active demand, not accumulated
+        //   leases) and is what collapses a chain once demand ends.
+        // - `expired`: lease is in the past. It must NOT be counted, otherwise the
+        //   renewal set would refill itself from stale leases (the AGENTS.md
         //   time-bounded GC rule — an expired lease grants no renewal exemption).
         let within_window = make_contract_key(0xA0);
         manager.subscribe(within_window);
+        manager.add_downstream_subscriber(&within_window, make_peer_key(0xA1));
         if let Some(mut lease) = manager.active_subscriptions.get_mut(&within_window) {
+            lease.expires_at = Instant::now() + Duration::from_secs(30);
+        }
+        let no_interest = make_contract_key(0xB0);
+        manager.subscribe(no_interest);
+        if let Some(mut lease) = manager.active_subscriptions.get_mut(&no_interest) {
             lease.expires_at = Instant::now() + Duration::from_secs(30);
         }
         let expired = make_contract_key(0xE0);
@@ -5040,8 +5078,14 @@ mod tests {
         let within_window_renewal = manager.contracts_needing_renewal();
         assert!(
             within_window_renewal.contains(&within_window),
-            "a lease expiring inside the renewal window but still in the future \
-             MUST be counted (Branch 1 `expires_at > now` lower-bound guard)"
+            "a within-window lease WITH active downstream interest MUST be counted \
+             (Branch 1 `expires_at > now` guard + `contract_in_use` gate)"
+        );
+        assert!(
+            !within_window_renewal.contains(&no_interest),
+            "a within-window lease with NO client and NO downstream subscriber must \
+             NOT be counted — an un-demanded subscription lapses instead of \
+             self-renewing (#3763 interest-gated renewal bound)"
         );
         assert!(
             !within_window_renewal.contains(&expired),
@@ -5075,5 +5119,92 @@ mod tests {
         assert!(needs_renewal.contains(&want_a));
         assert!(needs_renewal.contains(&want_b));
         assert!(needs_renewal.contains(&within_window));
+    }
+
+    /// Regression for the interest-gated §1 renewal predicate (#3763): a live
+    /// active lease is renewed **iff** the contract is `contract_in_use` — a
+    /// live client subscription OR a downstream subscriber. This pins that the
+    /// gate does NOT false-lapse a demanded contract, and that a demand-less
+    /// lease correctly lapses:
+    ///
+    ///  - **No false-lapse for demand-backed contracts.** Every WS-client
+    ///    subscribe entry point (a plain SUBSCRIBE and a GET-with-`subscribe:true`)
+    ///    registers `client_subscriptions` via the listener-registration handler
+    ///    (`ring.add_client_subscription`) — which is exactly the map
+    ///    `contract_in_use` reads. So a genuinely client-subscribed contract's
+    ///    lease is always selected by §1. A chain host is renewed via its
+    ///    downstream subscriber.
+    ///  - **A bare lease with no demand LAPSES, correctly.**
+    ///    `run_executor_subscribe` installs an `active_subscriptions` lease but
+    ///    registers interest only in the InterestManager (`add_local_client`),
+    ///    NOT `client_subscriptions`. With no accompanying WS-client subscription
+    ///    or downstream (a PUT/seed with no ongoing interest), the lease is NOT
+    ///    renewed and lapses. Per design §1 a PUT only *seeds* a contract and is
+    ///    not demand, so an idle seed must evaporate — this is the intended
+    ///    behavior, not a false-lapse. Any real demand behind an executor
+    ///    subscribe is the WS client that PUT/subscribed, tracked separately in
+    ///    `client_subscriptions`.
+    #[test]
+    fn test_active_lease_renewed_iff_contract_in_use() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Move a lease into the renewal window (§1 only considers soon-to-expire
+        // leases; a fresh `subscribe()` lease is now+8min, outside the window).
+        let into_window = |m: &HostingManager, key: &ContractKey| {
+            if let Some(mut lease) = m.active_subscriptions.get_mut(key) {
+                lease.expires_at = Instant::now() + Duration::from_secs(30);
+            }
+        };
+
+        // (a) Bare lease — the `run_executor_subscribe` / PUT-seed shape: an
+        //     active lease with no client subscription and no downstream. Must
+        //     NOT be renewed → lapses.
+        let seed = make_contract_key(1);
+        manager.subscribe(seed);
+        into_window(&manager, &seed);
+        assert!(!manager.contract_in_use(&seed));
+        assert!(
+            !manager.contracts_needing_renewal().contains(&seed),
+            "a bare active lease with no client subscription and no downstream (a \
+             PUT / executor seed) must NOT be renewed — it lapses (design §1: a \
+             seed is not demand)"
+        );
+
+        // (b) Demand-backed by a client subscription — the WS-subscribe entry
+        //     point populates this via `add_client_subscription`. Must be renewed.
+        let client_backed = make_contract_key(2);
+        manager.subscribe(client_backed);
+        into_window(&manager, &client_backed);
+        let client_id = crate::client_events::ClientId::next();
+        manager.add_client_subscription(client_backed.id(), client_id);
+        assert!(manager.contract_in_use(&client_backed));
+        assert!(
+            manager.contracts_needing_renewal().contains(&client_backed),
+            "a client-subscribed contract's lease MUST be renewed — no false-lapse \
+             for a demand-backed subscription"
+        );
+
+        // (c) Demand-backed by a downstream subscriber — a chain host. Must be
+        //     renewed.
+        let downstream_backed = make_contract_key(3);
+        manager.subscribe(downstream_backed);
+        into_window(&manager, &downstream_backed);
+        manager.add_downstream_subscriber(&downstream_backed, make_peer_key(7));
+        assert!(manager.contract_in_use(&downstream_backed));
+        assert!(
+            manager
+                .contracts_needing_renewal()
+                .contains(&downstream_backed),
+            "a chain host (downstream subscriber) lease MUST be renewed"
+        );
+
+        // (d) Removing the client subscription makes the once-demanded lease
+        //     lapse — the collapse trigger.
+        manager.remove_client_subscription(client_backed.id(), client_id);
+        assert!(!manager.contract_in_use(&client_backed));
+        assert!(
+            !manager.contracts_needing_renewal().contains(&client_backed),
+            "once the client subscription is gone the lease is no longer renewed \
+             and lapses (chain collapse on interest loss)"
+        );
     }
 }

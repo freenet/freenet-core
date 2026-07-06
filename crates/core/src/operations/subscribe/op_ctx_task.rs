@@ -382,15 +382,16 @@ pub(crate) async fn run_renewal_subscribe(
     //
     //   * Root that is NOT `contract_in_use`: DO NOT refresh. Refreshing an
     //     `is_subscribed`-only lease unconditionally would be an UNBOUNDED
-    //     retention exemption — `contracts_needing_renewal` section 1 renews any
-    //     live active subscription with no interest re-check, so an
-    //     unconditional refresh would re-select a no-interest root forever and
-    //     keep its lease (and thus the contract) alive indefinitely. That is
-    //     exactly the unbounded-`is_subscribed` retention the `contract_in_use`
-    //     rustdoc and the AGENTS.md time-bounded-exemption rule forbid. Letting
-    //     the lease lapse is correct: a no-interest root then drops out of the
-    //     renewal set entirely (no live active sub for path 1; no client
-    //     sub/recent access for paths 2/3), bounded and quiet.
+    //     retention exemption — it would locally keep a no-interest root's
+    //     lease (and thus the contract) alive indefinitely, defeating the
+    //     `contract_in_use` gate that `contracts_needing_renewal` section 1 now
+    //     applies (that section renews a soon-to-expire lease only while in
+    //     use). That is exactly the unbounded-`is_subscribed` retention the
+    //     `contract_in_use` rustdoc and the AGENTS.md time-bounded-exemption
+    //     rule forbid. Letting the lease lapse is correct: a no-interest root
+    //     then drops out of the renewal set entirely (no live active sub for
+    //     path 1; no client sub/recent access for paths 2/3), bounded and
+    //     quiet.
     //
     // This is NOT `complete_local_subscription`, whose semantics differ (it
     // emits `LocalSubscribeComplete` and registers client interest); the
@@ -3169,9 +3170,10 @@ mod tests {
             branch.contains("contract_in_use(&key)"),
             "the local lease refresh MUST be gated on contract_in_use — an unconditional \
              refresh of an is_subscribed-only lease is an unbounded retention exemption \
-             (contracts_needing_renewal section 1 re-selects any live active sub with no \
-             interest re-check), violating the contract_in_use rustdoc + AGENTS.md \
-             time-bounded-exemption rule"
+             (contracts_needing_renewal section 1 renews a soon-to-expire lease only while \
+             contract_in_use, so an unconditional local refresh would keep a no-interest \
+             root's lease alive behind that gate), violating the contract_in_use rustdoc + \
+             AGENTS.md time-bounded-exemption rule"
         );
         // The short-circuit must NOT reuse complete_local_subscription (different
         // semantics — it emits LocalSubscribeComplete and was the wrong vehicle
