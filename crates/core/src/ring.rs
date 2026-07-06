@@ -1581,6 +1581,15 @@ impl Ring {
             // contracts). Per-node aggregate scalar on the same cadence.
             snapshot.hosting_evictions_of_recently_read_total =
                 Some(hosting.evictions_of_recently_read_total);
+            // PUT-durability falsifier (#4642): unread-seed evictions (a PUT
+            // seed evicted before its first reader) and their running age sum,
+            // on the same periodic cadence. Differenced against
+            // `hosting_budget_evictions_total` (the total-eviction denominator)
+            // this measures whether the "PUT is not read-demand" decision is
+            // discarding fresh content before it can be found.
+            snapshot.hosting_evicted_unread_total = Some(hosting.evicted_unread_total);
+            snapshot.hosting_evicted_unread_age_secs_sum =
+                Some(hosting.evicted_unread_age_secs_sum);
             // Local-client GET hit-rate (#4642 A3): served-locally vs routed to
             // the network. Driven by the real serve/forward decision in the
             // client GET handler, so it is read from the manager counters (not

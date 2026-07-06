@@ -148,6 +148,24 @@ pub(crate) struct HostingCacheStats {
     /// [`Self::budget_evictions_total`]) is the alarm that the demand estimate
     /// is mis-ordering the working set.
     pub evictions_of_recently_read_total: u64,
+    /// Monotonic count of over-budget evictions whose victim had NEVER been read
+    /// (`read_count == 0`) — a seed (PUT) or restart-loaded entry evicted before
+    /// any GET/SUBSCRIBE ever arrived for it. This is the field falsifier for the
+    /// "a PUT seeds a contract but does NOT count as read-demand" design decision
+    /// (freenet/freenet-core#4642): if seeds are routinely evicted before their
+    /// first reader, the demand-driven policy is discarding fresh content before
+    /// it can be found. Differenced against [`Self::budget_evictions_total`] this
+    /// gives the fraction of evictions that killed an unread seed. Disjoint from
+    /// [`Self::evictions_of_recently_read_total`] (`read_count >= 2`): the
+    /// `read_count == 1` band is counted by neither.
+    pub evicted_unread_total: u64,
+    /// Running sum, in whole seconds, of the age-at-eviction (`now - inserted_at`)
+    /// of every eviction counted by [`Self::evicted_unread_total`]. Mean unread-
+    /// seed lifetime = this / `evicted_unread_total`; carried as a sum (not a
+    /// pre-divided mean) so the collector can difference both across the snapshot
+    /// cadence and recover the windowed mean. Answers "HOW YOUNG do seeds die?" —
+    /// a small mean means seeds are evicted almost immediately after the PUT.
+    pub evicted_unread_age_secs_sum: u64,
 }
 
 /// Per-contract Greedy-Dual priority row for the local-peer dashboard.
@@ -376,6 +394,13 @@ pub struct HostingCache<T: TimeSource> {
     /// (genuine repeat demand). The #4338 miscalibration signal — see
     /// [`HostingCacheStats::evictions_of_recently_read_total`].
     evictions_of_recently_read_total: u64,
+    /// Monotonic count of over-budget evictions whose victim had `read_count == 0`
+    /// (an unread seed). The PUT-durability field falsifier — see
+    /// [`HostingCacheStats::evicted_unread_total`].
+    evicted_unread_total: u64,
+    /// Running sum (whole seconds) of the age-at-eviction of unread-seed evictions.
+    /// See [`HostingCacheStats::evicted_unread_age_secs_sum`].
+    evicted_unread_age_secs_sum: u64,
     /// Time source for testability
     time_source: T,
 }
@@ -392,6 +417,8 @@ impl<T: TimeSource> HostingCache<T> {
             eviction_floor: 0.0,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
+            evicted_unread_total: 0,
+            evicted_unread_age_secs_sum: 0,
             time_source,
         }
     }
@@ -475,6 +502,16 @@ impl<T: TimeSource> HostingCache<T> {
                 if entry.read_count >= 2 {
                     self.evictions_of_recently_read_total =
                         self.evictions_of_recently_read_total.saturating_add(1);
+                }
+                if entry.read_count == 0 {
+                    // Unread seed evicted before its first reader — the
+                    // PUT-durability falsifier. Record it and its age (bounded
+                    // by `budget_evictions_total`, the shared denominator) so
+                    // the field can tell whether seeds die young.
+                    self.evicted_unread_total = self.evicted_unread_total.saturating_add(1);
+                    let age_secs = now.saturating_duration_since(entry.inserted_at).as_secs();
+                    self.evicted_unread_age_secs_sum =
+                        self.evicted_unread_age_secs_sum.saturating_add(age_secs);
                 }
                 // Greedy-Dual aging: ratchet the floor up to the victim's score
                 // (never down — an entry whose stale score is below the current
@@ -858,6 +895,8 @@ impl<T: TimeSource> HostingCache<T> {
             contract_count: self.contracts.len() as u64,
             budget_evictions_total: self.budget_evictions_total,
             evictions_of_recently_read_total: self.evictions_of_recently_read_total,
+            evicted_unread_total: self.evicted_unread_total,
+            evicted_unread_age_secs_sum: self.evicted_unread_age_secs_sum,
         }
     }
 
@@ -1924,6 +1963,57 @@ mod tests {
             cache.stats().budget_evictions_total,
             1,
             "counter must not advance with no budget pressure"
+        );
+    }
+
+    /// The unread-seed eviction counter (PUT-durability falsifier) increments
+    /// only when a `read_count == 0` victim (a PUT seed never GET/SUBSCRIBEd) is
+    /// evicted over budget, and records its age-at-eviction. A victim that was
+    /// read even once must NOT count as an unread seed.
+    #[test]
+    fn test_evicted_unread_counts_only_never_read_seeds() {
+        // Budget 100 bytes: only one 100-byte entry fits, so each insert past
+        // TTL evicts the resident one.
+        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+        let key3 = make_key(3);
+
+        // Seed key1 via PUT (read_count == 0 — an unread seed).
+        cache.record_access(key1, 100, AccessType::Put, 0, |_| false);
+        assert_eq!(cache.stats().evicted_unread_total, 0);
+
+        // Past TTL, insert key2 (also a seed). key1 is evicted: never read, so
+        // it counts as an unread-seed eviction and its age (~61s) is recorded.
+        time.advance_time(Duration::from_secs(61));
+        let result = cache.record_access(key2, 100, AccessType::Put, 0, |_| false);
+        assert_eq!(result.evicted, vec![(key1, 0)]);
+        let stats = cache.stats();
+        assert_eq!(stats.budget_evictions_total, 1);
+        assert_eq!(stats.evicted_unread_total, 1, "an unread seed was evicted");
+        assert_eq!(
+            stats.evicted_unread_age_secs_sum, 61,
+            "age-at-eviction of the unread seed is recorded"
+        );
+
+        // Read key2 once (GET) so read_count == 1 — no longer an unread seed.
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| false);
+
+        // Past TTL, insert key3 to evict key2. key2 was read once, so it is
+        // neither an unread seed nor a recently-read (>=2) victim: the unread
+        // counter and age sum both hold.
+        time.advance_time(Duration::from_secs(61));
+        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| false);
+        assert_eq!(result.evicted, vec![(key2, 0)]);
+        let stats = cache.stats();
+        assert_eq!(stats.budget_evictions_total, 2);
+        assert_eq!(
+            stats.evicted_unread_total, 1,
+            "a victim read at least once must NOT count as an unread seed"
+        );
+        assert_eq!(
+            stats.evicted_unread_age_secs_sum, 61,
+            "age sum unchanged when the eviction is not an unread seed"
         );
     }
 
