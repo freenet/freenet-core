@@ -1292,6 +1292,29 @@ async fn cache_contract_locally(
         crate::operations::reclaim_evicted_contract(op_manager, *evicted_key, *expected_generation);
     }
 
+    // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
+    // HOST-FORMATION site (GET cache path). About to (conditionally) announce
+    // hosting; does the controller agree? Focused on `Announce`. Actual =
+    // `{Announce}` iff production announces a NOT-yet-advertised host this event
+    // (`is_new && put_persisted` AND not already advertised — the announce is
+    // idempotent), else `{}`. Built BEFORE the announce so `is_advertised`
+    // reflects the pre-announce state. DRIVES NOTHING.
+    {
+        let will_announce = access_result.is_new && put_persisted;
+        op_manager.record_reconcile_shadow_event(
+            crate::node::network_status::ReconcileShadowSite::HostFormation,
+            &key,
+            &[crate::ring::reconcile::Action::Announce],
+            |inputs| {
+                if will_announce && !inputs.is_advertised {
+                    vec![crate::ring::reconcile::Action::Announce]
+                } else {
+                    Vec::new()
+                }
+            },
+        );
+    }
+
     // (4) Newly-hosted announcement gates on BOTH first-time access
     // AND the fact that we actually persisted new state. Without
     // persistence there's nothing to announce hosting for.

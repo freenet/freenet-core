@@ -591,6 +591,26 @@ pub(super) async fn finalize_originator_subscribe(
             }
         };
 
+    // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
+    // HOST-FORMATION site (subscribe originator). About to (conditionally)
+    // announce hosting; does the controller agree? Focused on `Announce`. Actual
+    // = `{Announce}` iff production announces a NOT-yet-advertised host this event
+    // (`have_body` AND not already advertised — `announce_contract_hosted` is
+    // idempotent), else `{}`. Built BEFORE the announce so `is_advertised`
+    // reflects the pre-announce state. DRIVES NOTHING.
+    op_manager.record_reconcile_shadow_event(
+        crate::node::network_status::ReconcileShadowSite::HostFormation,
+        &key,
+        &[crate::ring::reconcile::Action::Announce],
+        |inputs| {
+            if have_body && !inputs.is_advertised {
+                vec![crate::ring::reconcile::Action::Announce]
+            } else {
+                Vec::new()
+            }
+        },
+    );
+
     if have_body {
         super::announce_contract_hosted(op_manager, &key).await;
     }
@@ -743,6 +763,32 @@ pub(crate) async fn handle_unsubscribe_inbound(
             %instance_id,
             ?source_addr,
             "Unsubscribe: could not resolve sender peer, downstream entry not removed"
+        );
+    }
+
+    // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
+    // INBOUND-UNSUBSCRIBE site. The downstream peer just left (removal above is
+    // complete, so the strict-farther gate reflects it); does that leave us
+    // not-in-use, i.e. would the controller tear down our lease? Focused on
+    // `Collapse`. Actual = `{Collapse}` iff production tears down the lease THIS
+    // event (`should_unsubscribe_upstream` AND we actually hold a lease —
+    // `ring.unsubscribe` is a no-op otherwise), else `{}`. The strict-farther
+    // "still-in-use by a CLOSER downstream, so keep hosting" case where the
+    // controller would collapse shows up here as a `collapse` diff. DRIVES
+    // NOTHING — the real decision below re-reads the gate and is unchanged.
+    {
+        let will_collapse = op_manager.ring.should_unsubscribe_upstream(&key);
+        op_manager.record_reconcile_shadow_event(
+            crate::node::network_status::ReconcileShadowSite::InboundUnsubscribe,
+            &key,
+            &[crate::ring::reconcile::Action::Collapse],
+            |inputs| {
+                if will_collapse && inputs.is_subscribed {
+                    vec![crate::ring::reconcile::Action::Collapse]
+                } else {
+                    Vec::new()
+                }
+            },
         );
     }
 

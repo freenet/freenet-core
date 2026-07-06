@@ -75,6 +75,15 @@ impl Ops {
     }
 }
 
+/// Max number of reconcile connection-drop SHADOW comparisons to sample per
+/// dropped connection (keystone step-2, #4642). Each sample builds a
+/// `ReconcileInputs` snapshot (a redb read + an `is_subscription_root`
+/// connection-map scan), so this bounds the per-drop cost on a near-key gateway
+/// whose subscribed set is large. The dropped peer's co-hosted set (the natural
+/// bound) is usually small; this is a belt-and-suspenders cap. Contracts past
+/// the cap are simply unmeasured for that drop.
+const CONNECTION_DROP_SHADOW_SAMPLE_CAP: usize = 32;
+
 /// Pure core of the piece-D **strictly-farther** downstream-subscriber filter
 /// (keystone step-2, #4642): `true` iff at least one subscriber distance is
 /// STRICTLY greater than `my_distance` (both measured to the contract key).
@@ -901,6 +910,44 @@ impl OpManager {
         has_strictly_farther(my_distance, subscriber_distances)
     }
 
+    /// Record one reconcile-controller SHADOW comparison at a single-aspect EDGE
+    /// site (keystone step-2 completion, #4642): inbound-unsubscribe collapse,
+    /// connection-drop re-root, or host-formation announce.
+    ///
+    /// DRIVES NOTHING. Builds the [`reconcile::ReconcileInputs`] snapshot,
+    /// computes what the controller WOULD do, maps the caller's per-event actual
+    /// behavior (`actual_of(&inputs)`), and records the divergence FOCUSED on the
+    /// `relevant` action class(es) — so level-triggered actions the event does
+    /// not decide (notably `Renew`, which is the renewal site's concern) can't
+    /// pollute this site's signal. Skipped (no record) when the snapshot is
+    /// distance-blind (`build_reconcile_inputs` returns `None`: own-location
+    /// unknown), same as the maintenance sites.
+    pub(crate) fn record_reconcile_shadow_event(
+        &self,
+        site: crate::node::network_status::ReconcileShadowSite,
+        contract: &ContractKey,
+        relevant: &[reconcile::Action],
+        actual_of: impl FnOnce(&reconcile::ReconcileInputs) -> Vec<reconcile::Action>,
+    ) {
+        let Some(inputs) = self.build_reconcile_inputs(contract) else {
+            return;
+        };
+        let reconcile_actions = reconcile::reconcile(&inputs);
+        let actual = actual_of(&inputs);
+        let divergence =
+            reconcile::action_set_divergence_focused(&reconcile_actions, &actual, relevant);
+        crate::node::network_status::record_reconcile_shadow_comparison(site, divergence);
+        if divergence.any() {
+            tracing::debug!(
+                contract = %contract,
+                ?site,
+                ?reconcile_actions,
+                ?actual,
+                "reconcile shadow diverges from actual behavior (#4642 keystone step-2)"
+            );
+        }
+    }
+
     /// Send an Unsubscribe message to the upstream peer for a contract.
     ///
     /// Finds the upstream peer from the interest manager, resolves its address,
@@ -1379,9 +1426,44 @@ impl OpManager {
     /// interest manager's `downstream_subscriber_count` and triggers upstream
     /// unsubscribe when appropriate.
     pub(crate) fn on_ring_connection_lost(&self, pub_key: &TransportPublicKey) {
+        // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
+        // CONNECTION-DROP re-root site. Capture the contracts the dropped peer
+        // co-hosted BEFORE `on_peer_disconnected` clears them. DRIVES NOTHING.
+        let dropped_contracts = self.neighbor_hosting.contracts_for_peer(pub_key);
+
+        // Production disconnect bookkeeping (unchanged).
         self.neighbor_hosting.on_peer_disconnected(pub_key);
         self.interest_manager
             .schedule_deferred_removal(&PeerKey::from(pub_key.clone()));
+
+        // Shadow: production does NO re-root on a connection drop (the F/#4655
+        // hook), so for each contract WE subscribe to that the dropped peer
+        // co-hosted, ask whether the controller WOULD re-root (upstream lost,
+        // demand intact) — actual is always `{}`, focused on `ReRootSearch`. Run
+        // AFTER `on_peer_disconnected` so the computed upstream already excludes
+        // the dropped peer. Iterate OUR subscribed contracts and keep those the
+        // dropped peer co-hosted: this sidesteps reconstructing a full
+        // `ContractKey` from the reverse index's bare `ContractInstanceId`, and
+        // a contract we do NOT subscribe to can't be in-use so the controller
+        // wouldn't re-root anyway. Bounded per drop.
+        if !dropped_contracts.is_empty() {
+            let mut budget = CONNECTION_DROP_SHADOW_SAMPLE_CAP;
+            for key in self.ring.get_subscribed_contracts() {
+                if budget == 0 {
+                    break;
+                }
+                if dropped_contracts.contains(key.id()) {
+                    budget -= 1;
+                    self.record_reconcile_shadow_event(
+                        crate::node::network_status::ReconcileShadowSite::ConnectionDrop,
+                        &key,
+                        &[reconcile::Action::ReRootSearch],
+                        // Production never re-roots on a connection drop today.
+                        |_| Vec::new(),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -2070,6 +2152,36 @@ mod tests {
         assert!(!has_strictly_farther(my, std::iter::empty()));
     }
 
+    /// Extract the brace-matched `{...}` block that immediately follows `anchor`
+    /// in `src` (source-scrape helper for the drives-nothing pins). Panics if the
+    /// anchor is absent or the braces are unbalanced.
+    fn braced_block_after<'a>(src: &'a str, anchor: &str) -> &'a str {
+        let start = src
+            .find(anchor)
+            .unwrap_or_else(|| panic!("anchor not found: {anchor}"));
+        let brace = src[start..]
+            .find('{')
+            .expect("anchor must be followed by a block");
+        let body_start = start + brace + 1;
+        let bytes = src.as_bytes();
+        let mut depth = 1i32;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces after anchor: {anchor}");
+    }
+
     /// Behavior-preserving guard (keystone step-2, #4642): the collapse site
     /// `send_unsubscribe_upstream` must STILL drive its decision off the stored
     /// `is_upstream` flag and the local `ring.unsubscribe`, and the reconcile
@@ -2110,6 +2222,101 @@ mod tests {
             body.contains("action_set_divergence(&reconcile_actions"),
             "reconcile output must flow ONLY into the set-membership divergence \
              comparator (record-only), not into a driver/wire send"
+        );
+
+        // NEGATIVE assertion (mirroring the renewal / edge-site pins): the shadow
+        // BLOCK itself must contain no driver call — reconcile's output can only
+        // be compared, never applied. Extract just the `if let Some(inputs) =
+        // self.build_reconcile_inputs(contract) { ... }` block so the function's
+        // real teardown drivers (which live OUTSIDE the block) don't trip it.
+        let block = braced_block_after(
+            SRC,
+            "if let Some(inputs) = self.build_reconcile_inputs(contract)",
+        );
+        for driver in [
+            ".send(",
+            "self.ring.subscribe",
+            "self.ring.unsubscribe",
+            "send_unsubscribe",
+            "remove_peer_interest",
+            "on_contract_hosted",
+            "on_contract_unhosted",
+            "mark_subscription_pending",
+        ] {
+            assert!(
+                !block.contains(driver),
+                "collapse shadow block must not drive `{driver}` — it records only"
+            );
+        }
+    }
+
+    /// Hardening pin (keystone step-2 completion, #4642): the shared edge-site
+    /// helper `record_reconcile_shadow_event` DRIVES NOTHING — reconcile's output
+    /// flows only into the focused divergence comparator + the per-site counter.
+    /// One pin covers all four edge sites (inbound-unsubscribe, connection-drop,
+    /// host-formation) since they all route through this helper.
+    #[test]
+    fn record_reconcile_shadow_event_drives_nothing() {
+        const SRC: &str = include_str!("op_state_manager.rs");
+        let body = braced_block_after(SRC, "pub(crate) fn record_reconcile_shadow_event(");
+        assert!(
+            body.contains("action_set_divergence_focused"),
+            "the edge-site helper must compare via action_set_divergence_focused"
+        );
+        assert!(
+            body.contains("record_reconcile_shadow_comparison"),
+            "the edge-site helper must record the per-site divergence"
+        );
+        for driver in [
+            ".send(",
+            "self.ring.subscribe",
+            "self.ring.unsubscribe",
+            "send_unsubscribe",
+            "mark_subscription_pending",
+            "announce_contract_hosted",
+            "on_contract_hosted",
+            "on_contract_unhosted",
+            "notify_node_event",
+        ] {
+            assert!(
+                !body.contains(driver),
+                "record_reconcile_shadow_event must not drive `{driver}` — it records only"
+            );
+        }
+    }
+
+    /// Hardening pin (keystone step-2 completion, #4642): each of the four
+    /// EDGE decision sites is wired to the record-only helper with its own
+    /// `ReconcileShadowSite`, and the connection-drop site still runs the
+    /// production disconnect bookkeeping unchanged. A future edit that drops a
+    /// site's shadow (or the production bookkeeping) fails here.
+    #[test]
+    fn edge_sites_wire_the_record_only_helper() {
+        // Inbound-unsubscribe + host-formation live in operations/subscribe.rs.
+        let sub = include_str!("../operations/subscribe.rs");
+        assert!(sub.contains("ReconcileShadowSite::InboundUnsubscribe"));
+        assert!(sub.contains("ReconcileShadowSite::HostFormation"));
+        assert!(sub.contains("record_reconcile_shadow_event"));
+        // Host-formation GET path lives in operations/get/op_ctx_task.rs.
+        let get = include_str!("../operations/get/op_ctx_task.rs");
+        assert!(get.contains("ReconcileShadowSite::HostFormation"));
+        assert!(get.contains("record_reconcile_shadow_event"));
+        // Connection-drop lives here, in on_ring_connection_lost.
+        const SRC: &str = include_str!("op_state_manager.rs");
+        let drop_body = braced_block_after(SRC, "pub(crate) fn on_ring_connection_lost(");
+        assert!(
+            drop_body.contains("ReconcileShadowSite::ConnectionDrop"),
+            "connection-drop shadow must be wired in on_ring_connection_lost"
+        );
+        assert!(
+            drop_body.contains("record_reconcile_shadow_event"),
+            "connection-drop must route through the record-only helper"
+        );
+        // Production disconnect bookkeeping must remain (behavior-preserving).
+        assert!(
+            drop_body.contains("on_peer_disconnected")
+                && drop_body.contains("schedule_deferred_removal"),
+            "on_ring_connection_lost must still do the production disconnect bookkeeping"
         );
     }
 

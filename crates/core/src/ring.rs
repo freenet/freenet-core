@@ -1715,31 +1715,59 @@ impl Ring {
             // `router_snapshot_json_includes_reconcile_shadow_counters`). Read
             // from the per-node network_status singleton; `None` only before it is
             // initialized.
-            if let Some((collapse, renewal)) =
-                crate::node::network_status::reconcile_shadow_counts()
-            {
-                snapshot.reconcile_shadow_collapse_comparisons = Some(collapse.comparisons);
-                snapshot.reconcile_shadow_collapse_divergences = Some(collapse.divergences);
-                snapshot.reconcile_shadow_collapse_subscribe_diffs = Some(collapse.subscribe_diffs);
-                snapshot.reconcile_shadow_collapse_renew_diffs = Some(collapse.renew_diffs);
+            if let Some(shadow) = crate::node::network_status::reconcile_shadow_counts() {
+                // Every assignment reads uniformly from `shadow.<site>.<field>`
+                // (NO aliasing), so the mirror-seam pin
+                // `reconcile_shadow_export_maps_each_field_to_its_own_site` can
+                // verify each snapshot field is fed from its OWN site — a
+                // field-swap here would silently emit the wrong per-site value.
+                //
+                // MAINTENANCE sites (collapse, renewal): full per-action export
+                // (all 9 counters).
+                snapshot.reconcile_shadow_collapse_comparisons = Some(shadow.collapse.comparisons);
+                snapshot.reconcile_shadow_collapse_divergences = Some(shadow.collapse.divergences);
+                snapshot.reconcile_shadow_collapse_subscribe_diffs =
+                    Some(shadow.collapse.subscribe_diffs);
+                snapshot.reconcile_shadow_collapse_renew_diffs = Some(shadow.collapse.renew_diffs);
                 snapshot.reconcile_shadow_collapse_unsubscribe_diffs =
-                    Some(collapse.unsubscribe_diffs);
-                snapshot.reconcile_shadow_collapse_collapse_diffs = Some(collapse.collapse_diffs);
-                snapshot.reconcile_shadow_collapse_announce_diffs = Some(collapse.announce_diffs);
-                snapshot.reconcile_shadow_collapse_retract_diffs = Some(collapse.retract_diffs);
+                    Some(shadow.collapse.unsubscribe_diffs);
+                snapshot.reconcile_shadow_collapse_collapse_diffs =
+                    Some(shadow.collapse.collapse_diffs);
+                snapshot.reconcile_shadow_collapse_announce_diffs =
+                    Some(shadow.collapse.announce_diffs);
+                snapshot.reconcile_shadow_collapse_retract_diffs =
+                    Some(shadow.collapse.retract_diffs);
                 snapshot.reconcile_shadow_collapse_reroot_search_diffs =
-                    Some(collapse.reroot_search_diffs);
-                snapshot.reconcile_shadow_renewal_comparisons = Some(renewal.comparisons);
-                snapshot.reconcile_shadow_renewal_divergences = Some(renewal.divergences);
-                snapshot.reconcile_shadow_renewal_subscribe_diffs = Some(renewal.subscribe_diffs);
-                snapshot.reconcile_shadow_renewal_renew_diffs = Some(renewal.renew_diffs);
+                    Some(shadow.collapse.reroot_search_diffs);
+                snapshot.reconcile_shadow_renewal_comparisons = Some(shadow.renewal.comparisons);
+                snapshot.reconcile_shadow_renewal_divergences = Some(shadow.renewal.divergences);
+                snapshot.reconcile_shadow_renewal_subscribe_diffs =
+                    Some(shadow.renewal.subscribe_diffs);
+                snapshot.reconcile_shadow_renewal_renew_diffs = Some(shadow.renewal.renew_diffs);
                 snapshot.reconcile_shadow_renewal_unsubscribe_diffs =
-                    Some(renewal.unsubscribe_diffs);
-                snapshot.reconcile_shadow_renewal_collapse_diffs = Some(renewal.collapse_diffs);
-                snapshot.reconcile_shadow_renewal_announce_diffs = Some(renewal.announce_diffs);
-                snapshot.reconcile_shadow_renewal_retract_diffs = Some(renewal.retract_diffs);
+                    Some(shadow.renewal.unsubscribe_diffs);
+                snapshot.reconcile_shadow_renewal_collapse_diffs =
+                    Some(shadow.renewal.collapse_diffs);
+                snapshot.reconcile_shadow_renewal_announce_diffs =
+                    Some(shadow.renewal.announce_diffs);
+                snapshot.reconcile_shadow_renewal_retract_diffs =
+                    Some(shadow.renewal.retract_diffs);
                 snapshot.reconcile_shadow_renewal_reroot_search_diffs =
-                    Some(renewal.reroot_search_diffs);
+                    Some(shadow.renewal.reroot_search_diffs);
+                // EDGE sites: focused on one class each, so comparisons +
+                // divergences fully capture the signal.
+                snapshot.reconcile_shadow_inbound_unsubscribe_comparisons =
+                    Some(shadow.inbound_unsubscribe.comparisons);
+                snapshot.reconcile_shadow_inbound_unsubscribe_divergences =
+                    Some(shadow.inbound_unsubscribe.divergences);
+                snapshot.reconcile_shadow_connection_drop_comparisons =
+                    Some(shadow.connection_drop.comparisons);
+                snapshot.reconcile_shadow_connection_drop_divergences =
+                    Some(shadow.connection_drop.divergences);
+                snapshot.reconcile_shadow_host_formation_comparisons =
+                    Some(shadow.host_formation.comparisons);
+                snapshot.reconcile_shadow_host_formation_divergences =
+                    Some(shadow.host_formation.divergences);
             }
 
             // Keep the hosting manager's copy of our own ring location current so
@@ -6163,6 +6191,61 @@ mod k_closest_source_tests {
         assert_eq!(super::renewal_shadow_actual(false, false), empty);
         assert_eq!(super::renewal_shadow_actual(true, true), &[Renew]);
         assert_eq!(super::renewal_shadow_actual(true, false), &[Subscribe]);
+    }
+
+    /// Hardening pin (keystone step-2 completion, #4642): the
+    /// network_status → router_snapshot MIRROR SEAM. The export block hand-copies
+    /// each per-site counter into a matching `RouterSnapshotInfo` field; a field
+    /// swap (e.g. feeding `reconcile_shadow_collapse_comparisons` from
+    /// `shadow.renewal`) would silently emit the wrong per-site value to the
+    /// collector with no compile error. This asserts every one of the 24 export
+    /// assignments reads from `shadow.<SITE>.<FIELD>` for its OWN site, so a swap
+    /// fails CI here. Whitespace-normalized so rustfmt line-wrapping is irrelevant.
+    #[test]
+    fn reconcile_shadow_export_maps_each_field_to_its_own_site() {
+        let src = production_source();
+        let block = extract_fn_body(
+            src,
+            "if let Some(shadow) = crate::node::network_status::reconcile_shadow_counts()",
+        );
+        // Normalize all runs of whitespace to single spaces.
+        let norm = block.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let full: &[&str] = &[
+            "comparisons",
+            "divergences",
+            "subscribe_diffs",
+            "renew_diffs",
+            "unsubscribe_diffs",
+            "collapse_diffs",
+            "announce_diffs",
+            "retract_diffs",
+            "reroot_search_diffs",
+        ];
+        let edge: &[&str] = &["comparisons", "divergences"];
+        let sites: [(&str, &[&str]); 5] = [
+            ("collapse", full),
+            ("renewal", full),
+            ("inbound_unsubscribe", edge),
+            ("connection_drop", edge),
+            ("host_formation", edge),
+        ];
+
+        let mut checked = 0usize;
+        for (site, fields) in sites {
+            for field in fields {
+                let expected = format!(
+                    "snapshot.reconcile_shadow_{site}_{field} = Some(shadow.{site}.{field});"
+                );
+                assert!(
+                    norm.contains(&expected),
+                    "mirror-seam: export must contain `{expected}` — a field-swap here \
+                     silently emits the wrong per-site value to the collector"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 24, "expected exactly 24 export assignments");
     }
 }
 

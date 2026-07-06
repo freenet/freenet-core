@@ -302,6 +302,22 @@ pub(crate) struct RouterSnapshotInfo {
     pub reconcile_shadow_renewal_announce_diffs: Option<u64>,
     pub reconcile_shadow_renewal_retract_diffs: Option<u64>,
     pub reconcile_shadow_renewal_reroot_search_diffs: Option<u64>,
+    /// Reconcile-controller SHADOW counters for the single-aspect EDGE sites
+    /// (keystone step-2 completion, #4642). Each edge site is compared FOCUSED on
+    /// one action class, so `comparisons` + `divergences` fully captures it (the
+    /// per-action split would be redundant — a single relevant class): the FLIP
+    /// hook for `inbound_unsubscribe` is `Collapse` (would the controller tear
+    /// down on a downstream leave?), for `connection_drop` is `ReRootSearch`
+    /// (would it re-root on an upstream loss? production does nothing today —
+    /// one-sided count), for `host_formation` is `Announce` (does it agree a
+    /// freshly-hosted contract should be advertised?). Monotonic lifetime totals,
+    /// `None` until the ring's snapshot task populates them.
+    pub reconcile_shadow_inbound_unsubscribe_comparisons: Option<u64>,
+    pub reconcile_shadow_inbound_unsubscribe_divergences: Option<u64>,
+    pub reconcile_shadow_connection_drop_comparisons: Option<u64>,
+    pub reconcile_shadow_connection_drop_divergences: Option<u64>,
+    pub reconcile_shadow_host_formation_comparisons: Option<u64>,
+    pub reconcile_shadow_host_formation_divergences: Option<u64>,
     /// Interest-weighted (two-tier) module-cache SHADOW gauges (#4441/#4534),
     /// populated by `Ring` from the same per-node `ModuleCacheMetrics` `Arc`.
     /// These are ALWAYS ON, independent of the `FREENET_MODULE_CACHE_INTEREST_TIERED`
@@ -1242,6 +1258,14 @@ impl Router {
             reconcile_shadow_renewal_announce_diffs: None,
             reconcile_shadow_renewal_retract_diffs: None,
             reconcile_shadow_renewal_reroot_search_diffs: None,
+            // Reconcile-controller shadow counters for the single-aspect edge
+            // sites (keystone step-2 completion, #4642).
+            reconcile_shadow_inbound_unsubscribe_comparisons: None,
+            reconcile_shadow_inbound_unsubscribe_divergences: None,
+            reconcile_shadow_connection_drop_comparisons: None,
+            reconcile_shadow_connection_drop_divergences: None,
+            reconcile_shadow_host_formation_comparisons: None,
+            reconcile_shadow_host_formation_divergences: None,
             // Interest-weighted (two-tier) module-cache shadow gauges,
             // populated by Ring on the snapshot cadence (#4441/#4534).
             contract_module_cache_cold_evictable_bytes: None,
