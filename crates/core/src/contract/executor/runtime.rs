@@ -382,12 +382,18 @@ impl Executor<Runtime> {
         // writing. No-op admit until the disk tracker is seeded.
         let op_manager_for_admit = op_manager.clone();
         if let Some(op_manager) = op_manager_for_admit {
-            rt.set_state_admit_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
-                op_manager
-                    .ring
-                    .admit_state_write(key, state_size)
-                    .map_err(|over| over.to_string())
-            }));
+            rt.set_state_admit_callback(Arc::new(
+                move |key: &ContractKey, state_size: usize, is_update: bool| {
+                    // V2 PUT → hard gate; V2 UPDATE → growth-only gate (#4683).
+                    // A shrinking/holding V2 UPDATE must never block convergence.
+                    let result = if is_update {
+                        op_manager.ring.admit_state_update(key, state_size)
+                    } else {
+                        op_manager.ring.admit_state_write(key, state_size)
+                    };
+                    result.map_err(|over| over.to_string())
+                },
+            ));
         }
         Executor::new(
             state_store,
@@ -487,12 +493,18 @@ impl Executor<Runtime> {
         // chokepoints apply, restored for the V2 bypass.
         let op_manager_for_admit = op_manager.clone();
         if let Some(op_manager) = op_manager_for_admit {
-            rt.set_state_admit_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
-                op_manager
-                    .ring
-                    .admit_state_write(key, state_size)
-                    .map_err(|over| over.to_string())
-            }));
+            rt.set_state_admit_callback(Arc::new(
+                move |key: &ContractKey, state_size: usize, is_update: bool| {
+                    // V2 PUT → hard gate; V2 UPDATE → growth-only gate (#4683).
+                    // A shrinking/holding V2 UPDATE must never block convergence.
+                    let result = if is_update {
+                        op_manager.ring.admit_state_update(key, state_size)
+                    } else {
+                        op_manager.ring.admit_state_write(key, state_size)
+                    };
+                    result.map_err(|over| over.to_string())
+                },
+            ));
         }
         Executor::new(
             shared_state_store,

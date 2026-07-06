@@ -3385,12 +3385,45 @@ impl Ring {
             .admit_state_write(contract, new_size as u64)
     }
 
+    /// Pre-write admission gate for a state **UPDATE** to an already-hosted
+    /// contract (#4683). Growth-only: a shrinking or size-holding UPDATE
+    /// (`new_size <= old`) is admitted unconditionally, even when the aggregate
+    /// is over budget, because an UPDATE mutates an already-counted footprint and
+    /// rejecting it would stall CRDT convergence without freeing any bytes (and a
+    /// relayed UPDATE rejection is silently dropped — no one would learn of the
+    /// stall). Only genuine growth is subjected to the aggregate bound. Use this
+    /// at UPDATE / re-PUT-merge chokepoints; PUT of a NEW contract keeps the hard
+    /// [`Self::admit_state_write`] gate.
+    pub(crate) fn admit_state_update(
+        &self,
+        contract: &ContractKey,
+        new_size: usize,
+    ) -> Result<(), DiskBudgetExceeded> {
+        self.hosting_manager
+            .admit_state_update(contract, new_size as u64)
+    }
+
     /// Pre-write admission gate for a newly-stored (deduped) WASM code blob
     /// (#4683, PR 3). Call this BEFORE `runtime.store_contract` for a blob that
     /// is not already on disk. See [`Self::admit_state_write`] for the
     /// deferred-delta / rollback discipline.
     pub(crate) fn admit_wasm_write(&self, blob_len: usize) -> Result<(), DiskBudgetExceeded> {
         self.hosting_manager.admit_wasm_write(blob_len as u64)
+    }
+
+    /// Charge a newly-stored (deduped) WASM code blob to the disk tracker on the
+    /// post-store success path (#4683). Call this AFTER a successful
+    /// `runtime.store_contract` for a blob that was not already on disk, so the
+    /// aggregate reflects it immediately (burst protection + so the state gate on
+    /// the same PUT sees it). See [`super::hosting::HostingManager::record_wasm_write`].
+    pub(crate) fn record_wasm_write(&self, blob_len: usize) {
+        self.hosting_manager.record_wasm_write(blob_len as u64);
+    }
+
+    /// Subtract a WASM code blob's contribution from the disk tracker on contract
+    /// removal (#4683). Mirror of [`Self::record_wasm_write`].
+    pub(crate) fn record_wasm_removed(&self, blob_len: usize) {
+        self.hosting_manager.record_wasm_removed(blob_len as u64);
     }
 
     pub(crate) fn commit_state_write(&self, contract: &ContractKey, state_size: usize) {

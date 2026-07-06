@@ -330,6 +330,65 @@ impl DiskUsageTracker {
         }
     }
 
+    /// Record a newly-written (deduped) WASM code blob on the post-store success
+    /// path: add `blob_len` to `wasm_bytes` so the aggregate reflects it
+    /// immediately, WITHOUT waiting for the next 60s `refresh_wasm` du-walk
+    /// (#4683). This closes two gaps the sweep-window-only accounting left open:
+    ///
+    /// 1. **Burst overrun:** within a single sweep window a burst of PUTs, each
+    ///    carrying a distinct large code blob, would otherwise all see the same
+    ///    stale `wasm_bytes` and each pass the gate, letting cumulative wasm
+    ///    overrun the budget until the next sweep. Live accounting makes each
+    ///    successive blob in the burst visible to the next admission check.
+    /// 2. **Per-PUT double-count:** charging the blob here (before the state gate
+    ///    runs on the same PUT) makes the state gate's `total_bytes()` include
+    ///    the wasm just stored, so a PUT can no longer pass both the wasm gate
+    ///    and the state gate independently and overshoot by `min(blob, state)`.
+    ///
+    /// Called ONLY for a blob that was not already on disk (the caller dedups via
+    /// `fetch_contract_code`); a re-PUT of existing code adds nothing. The next
+    /// `refresh_wasm` re-walk reconciles the counter against ground truth, so a
+    /// missed/double delta self-heals within one sweep. Idempotency is the
+    /// caller's responsibility (charge exactly once per newly-written blob).
+    ///
+    /// Applied even while unseeded: unlike state (whose per-key sizes are
+    /// buffered in `state_sizes` and summed at seed time), the seed measures wasm
+    /// with a fresh `du_walk_wasm` that already includes any blob written before
+    /// the seed. To avoid double-counting a pre-seed blob (once here, once in the
+    /// seed walk), skip the delta while unseeded — the seed walk is authoritative.
+    pub(crate) fn record_wasm_write(&self, blob_len: u64) {
+        if !self.seeded.load(Ordering::Acquire) {
+            return;
+        }
+        self.wasm_bytes.fetch_add(blob_len, Ordering::Relaxed);
+    }
+
+    /// Remove a WASM code blob's contribution on contract removal: subtract
+    /// `blob_len` from `wasm_bytes` (floored at 0). Mirror of
+    /// [`Self::record_wasm_write`]; the next `refresh_wasm` reconciles. No-op
+    /// while unseeded (the seed walk is authoritative, same as the write path).
+    pub(crate) fn record_wasm_removed(&self, blob_len: u64) {
+        if !self.seeded.load(Ordering::Acquire) {
+            return;
+        }
+        if blob_len == 0 {
+            return;
+        }
+        let mut cur = self.wasm_bytes.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(blob_len);
+            match self.wasm_bytes.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
     /// Pre-write admission check for a state write (#4683, PR 3). Computes the
     /// aggregate on-disk bytes that WOULD result from replacing `key`'s current
     /// tracked state size with `new_size`
@@ -364,6 +423,50 @@ impl DiskUsageTracker {
         let total = self.total_bytes();
         drop(sizes);
         // projected = total − old + new (saturating so it can never wrap).
+        let projected = total.saturating_sub(old).saturating_add(new_size);
+        if projected > budget_bytes {
+            Err(DiskBudgetExceeded {
+                projected_bytes: projected,
+                budget_bytes,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Pre-write admission check for a state **UPDATE** to an already-hosted
+    /// contract (#4683, PR 4 growth-only rule). Unlike [`Self::admit_state_write`]
+    /// (used for a fresh PUT), an UPDATE is a mutation of an *existing*
+    /// footprint, not a new admission. A CRDT merge frequently shrinks or holds
+    /// the state size (`delta <= 0`); rejecting such a write would stall
+    /// convergence without freeing any bytes (the old footprint is already on
+    /// disk and counted), and for a relayed UPDATE the rejection is silently
+    /// dropped, so nothing would signal the stall to anyone.
+    ///
+    /// Therefore this check is **growth-only**: when `new_size <= old_for_key`
+    /// (the delta is non-positive) it admits unconditionally, even when the
+    /// aggregate is already over budget. Only genuine growth (`new_size >
+    /// old_for_key`) is subjected to the same projected-aggregate bound as
+    /// `admit_state_write`.
+    ///
+    /// Read-only, same deferred-`+delta` discipline and inclusive-admit boundary
+    /// as [`Self::admit_state_write`].
+    pub(crate) fn admit_state_update(
+        &self,
+        key: &ContractKey,
+        new_size: u64,
+        budget_bytes: u64,
+    ) -> Result<(), DiskBudgetExceeded> {
+        // Hold the delta-path lock so the `old` read and the `total` read are a
+        // consistent snapshot (same rationale as `admit_state_write`).
+        let sizes = self.state_sizes.lock();
+        let old = sizes.get(key).copied().unwrap_or(0);
+        // Non-positive delta (shrink or hold) never blocks convergence.
+        if new_size <= old {
+            return Ok(());
+        }
+        let total = self.total_bytes();
+        drop(sizes);
         let projected = total.saturating_sub(old).saturating_add(new_size);
         if projected > budget_bytes {
             Err(DiskBudgetExceeded {
@@ -807,6 +910,123 @@ mod tests {
             100,
             "admit must not mutate state_bytes"
         );
+    }
+
+    // --- UPDATE growth-only admission (#4683, finding #1) ---------------------
+
+    #[test]
+    fn admit_state_update_shrink_over_budget_still_admits() {
+        // The core convergence-safety property: when the aggregate is ALREADY
+        // over budget, a shrinking (delta<0) UPDATE must still admit — rejecting
+        // it would stall CRDT convergence without freeing any bytes, and a
+        // relayed UPDATE rejection is silently dropped so nothing would signal
+        // the stall. Concretely: total=300, budget=250 (over budget), key old=100
+        // → new=60 projects to 260 > 250, which the HARD gate would reject, but
+        // the growth-only UPDATE gate admits because delta = 60 − 100 <= 0.
+        let t = tracker();
+        t.seed([(test_key(1), 100), (test_key(2), 200)]);
+        assert_eq!(t.total_bytes(), 300);
+        // Hard gate would reject (projected 260 > 250)...
+        assert!(t.admit_state_write(&test_key(1), 60, 250).is_err());
+        // ...but the growth-only UPDATE gate admits the shrink.
+        assert!(t.admit_state_update(&test_key(1), 60, 250).is_ok());
+    }
+
+    #[test]
+    fn admit_state_update_hold_over_budget_still_admits() {
+        // A size-holding UPDATE (delta == 0) is also non-positive → always admit,
+        // even over budget.
+        let t = tracker();
+        t.seed([(test_key(1), 100), (test_key(2), 200)]);
+        assert!(t.admit_state_update(&test_key(1), 100, 250).is_ok());
+    }
+
+    #[test]
+    fn admit_state_update_growth_is_bounded() {
+        // Genuine growth (delta > 0) is still subject to the aggregate bound.
+        let t = tracker();
+        t.seed([(test_key(1), 100)]);
+        // Grow key(1) 100 → 150: projected = 100 − 100 + 150 = 150.
+        assert!(t.admit_state_update(&test_key(1), 150, 150).is_ok()); // == budget
+        let err = t
+            .admit_state_update(&test_key(1), 150, 149)
+            .expect_err("growth over budget must reject");
+        assert_eq!(err.projected_bytes, 150);
+        assert_eq!(err.budget_bytes, 149);
+    }
+
+    #[test]
+    fn admit_state_update_is_read_only() {
+        // Like admit_state_write, the growth-only check never mutates the counter.
+        let t = tracker();
+        t.seed([(test_key(1), 100)]);
+        assert!(t.admit_state_update(&test_key(1), 50, 250).is_ok());
+        assert_eq!(t.stats().state_bytes, 100);
+        assert!(t.admit_state_update(&test_key(1), 5000, 200).is_err());
+        assert_eq!(t.stats().state_bytes, 100);
+    }
+
+    // --- Live wasm delta accounting (#4683, finding #3) -----------------------
+
+    #[test]
+    fn record_wasm_write_makes_burst_visible_within_window() {
+        // Without live accounting, a burst of distinct-code PUTs within one
+        // du-walk window would all see the same stale wasm total and each pass
+        // the gate, overrunning the budget. Live charging makes each blob visible
+        // to the next admission check.
+        let t = tracker();
+        t.seed(std::iter::empty()); // 0 bytes on disk, seeded.
+        let budget = 250u64;
+        // First 100-byte blob: projected 0 + 100 = 100 <= 250 → admit, then charge.
+        assert!(t.admit_wasm_write(100, budget).is_ok());
+        t.record_wasm_write(100);
+        // Second blob now sees 100 already charged: projected 100 + 100 = 200 → admit.
+        assert!(t.admit_wasm_write(100, budget).is_ok());
+        t.record_wasm_write(100);
+        assert_eq!(t.stats().wasm_bytes, 200);
+        // Third blob would overrun (200 + 100 = 300 > 250) → correctly rejected,
+        // whereas stale accounting would have let it through.
+        assert!(t.admit_wasm_write(100, budget).is_err());
+    }
+
+    #[test]
+    fn record_wasm_write_prevents_per_put_double_count() {
+        // On one PUT the wasm gate and the state gate each check independently
+        // against the aggregate. Charging the wasm blob before the state gate
+        // makes the state gate see it, so a PUT whose blob AND state individually
+        // fit but jointly overshoot is caught. total=0, budget=250, blob=150,
+        // state=150: each fits alone (150<=250) but 150+150=300 overshoots.
+        let t = tracker();
+        t.seed(std::iter::empty());
+        let budget = 250u64;
+        assert!(t.admit_wasm_write(150, budget).is_ok());
+        t.record_wasm_write(150); // charge before the state gate, like the PUT path.
+        // Now the state gate sees wasm=150: projected = 150 − 0 + 150 = 300 > 250.
+        assert!(t.admit_state_write(&test_key(1), 150, budget).is_err());
+    }
+
+    #[test]
+    fn record_wasm_removed_reverses_charge() {
+        let t = tracker();
+        t.seed(std::iter::empty());
+        t.record_wasm_write(200);
+        assert_eq!(t.stats().wasm_bytes, 200);
+        t.record_wasm_removed(200);
+        assert_eq!(t.stats().wasm_bytes, 0);
+        // Floors at zero (over-removal cannot underflow).
+        t.record_wasm_removed(500);
+        assert_eq!(t.stats().wasm_bytes, 0);
+    }
+
+    #[test]
+    fn record_wasm_write_noop_while_unseeded() {
+        // Before seeding, the seed du-walk is authoritative for wasm; a pre-seed
+        // delta would double-count against the walk. So charging while unseeded
+        // must be a no-op.
+        let t = tracker();
+        t.record_wasm_write(100);
+        assert!(!t.is_seeded());
+        assert_eq!(t.stats().wasm_bytes, 0);
     }
 
     #[test]

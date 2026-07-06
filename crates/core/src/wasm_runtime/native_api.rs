@@ -723,12 +723,14 @@ impl DelegateCallEnv {
         // would silently undercount StateBytesWritten for V2 delegate PUT.
         let state_size = state.len();
 
-        // Disk-budget admission gate (#4683, PR 3): the V2 path bypasses the
-        // executor `state_store` chokepoint where the gate normally runs, so
-        // apply it here BEFORE the raw write. On rejection nothing lands, so no
-        // rollback is needed. No-op admit until the disk tracker is seeded.
+        // Disk-budget admission gate (#4683): the V2 path bypasses the executor
+        // `state_store` chokepoint where the gate normally runs, so apply it here
+        // BEFORE the raw write. This is a V2 PUT — the HARD gate (`is_update =
+        // false`): a new footprint entering, rejected if it would push the
+        // aggregate over budget. On rejection nothing lands, so no rollback is
+        // needed. No-op admit until the disk tracker is seeded.
         if let Some(admit) = &self.state_admit_callback {
-            if let Err(cause) = admit(&contract_key, state_size) {
+            if let Err(cause) = admit(&contract_key, state_size, false) {
                 return Err(DelegateEnvError::DiskBudgetExceeded(cause));
             }
         }
@@ -770,11 +772,15 @@ impl DelegateCallEnv {
         // put_contract_state_sync above.
         let state_size = state.len();
 
-        // Disk-budget admission gate (#4683, PR 3): apply the executor-chokepoint
-        // gate that the V2 path bypasses, BEFORE the raw write. Nothing lands on
-        // rejection. No-op admit until the disk tracker is seeded.
+        // Disk-budget admission gate (#4683): apply the executor-chokepoint gate
+        // that the V2 path bypasses, BEFORE the raw write. This is a V2 UPDATE —
+        // the GROWTH-ONLY gate (`is_update = true`): a mutation of an
+        // already-counted footprint. A shrinking or size-holding write always
+        // admits, even over budget, so a CRDT merge never blocks convergence;
+        // only genuine growth is bounded. Nothing lands on rejection. No-op admit
+        // until the disk tracker is seeded.
         if let Some(admit) = &self.state_admit_callback {
-            if let Err(cause) = admit(&contract_key, state_size) {
+            if let Err(cause) = admit(&contract_key, state_size, true) {
                 return Err(DelegateEnvError::DiskBudgetExceeded(cause));
             }
         }
@@ -1710,7 +1716,7 @@ pub(super) mod delegate_contracts {
     }
 
     /// Map a `DelegateEnvError` to the appropriate contract error code.
-    fn delegate_env_error_to_code(err: &DelegateEnvError) -> i64 {
+    pub(crate) fn delegate_env_error_to_code(err: &DelegateEnvError) -> i64 {
         match err {
             DelegateEnvError::StoreNotConfigured => contract_error_codes::ERR_STORE_ERROR as i64,
             DelegateEnvError::ContractCodeNotRegistered => {
