@@ -12909,3 +12909,676 @@ fn test_subscription_chain_collapses_on_client_leave() {
         );
     }
 }
+
+// =============================================================================
+// Piece E (remove relay-caching) — findability + stale-serve baseline GATE
+// (demand-driven-hosting redesign; epic freenet/freenet-core#4642, piece E;
+//  interim relay-GET freshness guard PR freenet/freenet-core#4709)
+// =============================================================================
+//
+// WHY THIS EXISTS
+// ---------------
+// Piece E removes relay-caching (PUT storing at every hop; GET caching on the
+// return path as a durable/advertised host). Relay-caching was DOUBLE-DUTY: the
+// anti-pattern the redesign kills AND a *findability crutch* — its scattered
+// copies made greedy single-path routing robust because a copy was almost
+// always ~1 hop from any requester. Removing it therefore risks regressing two
+// distinct properties, which the two tests below MEASURE on current `main` so a
+// future piece-E branch can be compared against these baseline numbers:
+//
+//   1. FINDABILITY (hosting-invariant 5): a distant node can GET a contract
+//      whose greedy descent can dead-end >1 hop from a holder — the "distant
+//      unfindable contract" that BLOCKED piece E (6/8 dead-ends in the 16-peer
+//      sparse-ring sim noted in `.claude/rules/hosting-invariants.md`, piece E).
+//      Test A PUTs a contract from a far node; on main, relay-caching's PUT half
+//      scatters copies toward the key so distant GETs stay findable (mean ~0.85
+//      over 6 seeds). The gate is that this MASKED rate must NOT drop when piece
+//      E removes the scatter (E ships bounded backtracking + a PUT seed-chain to
+//      hold it up). Companion finding (reported in the PR, not a separate test):
+//      a SEEDED lone holder scatters nothing and is already ~0-findable on main
+//      across 5/6 seeds — that near-zero is the post-E-like weakness, and it is
+//      why a single-seed floor is meaningless and the gate is MULTI-SEED.
+//
+//   2. STALE-SERVE / invariant 1: "a served copy is fresh; no durable
+//      UNSUBSCRIBED copy answers reads." On main, `check_local_with_interest_gate`
+//      (`operations/get/op_ctx_task.rs`) serves ANY cached copy whose
+//      cache-presence `hosting` flag is set — so a relay holding an unsubscribed
+//      copy that went stale after an UPDATE serves the STALE bytes. PR #4709
+//      changes that relay gate to `Ring::is_receiving_updates` (freshness).
+//      HONEST SCOPE: this cannot be reproduced as a discriminating sim gate — in
+//      the harness an UPDATE converges to every REACHABLE cache holder, so a
+//      durable unsubscribed stale copy never survives to be served (the metric
+//      reads 0 whether or not #4709 is present). #4709's real validation is its
+//      own `interest_gate_disposition` UNIT TESTS. Test B is therefore an
+//      invariant-1 STRUCTURAL guard plus a forced-stale DETECTOR positive control
+//      (a crash-isolated copy is proven flagged stale), NOT a stale-serve gate.
+//
+// These are TEST/sim infrastructure — they change no production behavior. Both
+// use the #4657 controlled-sim runner (`run_controlled_simulation`), which is
+// deterministic (seeded turmoil + virtual time; NO wall-clock/sleep dependence —
+// the `tokio::time::sleep`s inside are turmoil-virtual) and CI-runnable. NOTE on
+// runner choice: the direct runner (`run_simulation_direct`) is deterministic
+// too but drives RANDOM events only — it cannot script "PUT at A, GET from
+// distant F", which both scenarios require — so the controlled runner is the
+// correct deterministic vehicle here. Churn = scripted node DEPARTURE
+// (`SimOperation::CrashNode`); the controlled path cannot script mid-run JOIN.
+//
+// HARNESS LIMITATION (reported precisely): the production GET path registers
+// `GetEvent::GetSuccess` with `state_hash: None` (wire-message path), so the
+// per-GET RETURNED state is NOT in the event log. Freshness is therefore
+// measured STRUCTURALLY from each node's end-of-run local store
+// (`MockStateStorage`) after a deterministic propagation wait: a requester's
+// post-GET cached copy IS the state it was served (GET-return caching is active
+// on main), and any node still holding pre-UPDATE bytes after convergence is a
+// stale copy. This is mechanism-stable across the piece-E change.
+
+/// Baseline metrics for the piece-E findability + stale-serve gates. Computed
+/// from one controlled-sim run and both logged and returned so a future
+/// piece-E / #4709 branch can diff against the numbers printed on `main`.
+#[derive(Debug, Clone)]
+struct PieceEGateMetrics {
+    // ---- Findability (wire per-tx, the codebase's own GET-reliability metric) ----
+    get_attempts: u64,
+    get_successes: u64,
+    get_not_found: u64,
+    get_failures: u64,
+    get_timeouts: u64,
+    /// Successes whose GET traversed the network (hop_count >= 1).
+    network_successes: u64,
+    /// wire successes / attempts, in [0, 1].
+    findability_rate: f64,
+    // ---- Findability (client-visible: requester ended up holding the state) ----
+    requesters_total: usize,
+    /// Requesters whose end-of-run store holds the contract (a completed GET
+    /// caches the returned copy) — the client-visible findability numerator.
+    requesters_with_state: usize,
+    /// requesters_with_state / requesters_total, in [0, 1]. PRIMARY findability
+    /// number (client-visible; the wire rate can over-count relay hops).
+    client_findability_rate: f64,
+    /// Health metric: elapsed_ms of the fastest successful GET (time-to-first-op).
+    time_to_first_success_ms: Option<u64>,
+    // ---- Subscription-tree formation (health metric) ----
+    hosting_nodes: usize,
+    // ---- Freshness / stale-serve (hosting-invariant 1; PR #4709) ----
+    /// Nodes holding ANY stored state for the key at end of run.
+    total_holders: usize,
+    /// Holders whose stored state matches the source-of-truth's current state.
+    fresh_holders: usize,
+    /// Holders whose stored state differs from current — durable stale copies.
+    stale_holders: usize,
+    /// Requesters that ended holding the CURRENT state (served fresh).
+    requesters_fresh: usize,
+    /// Requesters that ended holding a NON-current state (SERVED STALE) — the
+    /// direct #4709 signal.
+    requesters_stale: usize,
+    /// requesters_stale / (requesters_fresh + requesters_stale), in [0, 1].
+    /// PRIMARY stale-serve number. `None` if no requester obtained any state.
+    stale_serve_rate: Option<f64>,
+    /// Mesh subscribers, and how many ended fresh (invariant-1 positive control).
+    subscribers_total: usize,
+    subscribers_fresh: usize,
+}
+
+/// Compute [`PieceEGateMetrics`] from a finished controlled-sim run.
+///
+/// `current_source` is the node whose end-of-run stored state defines "current"
+/// (the seeded/updated source of truth); `get_requesters` issued the GETs whose
+/// findability + served-freshness we measure; `subscribers` joined the update
+/// mesh (freshness positive control).
+#[allow(clippy::too_many_arguments)]
+fn compute_piece_e_metrics(
+    result: &freenet::dev_tool::ControlledSimulationResult,
+    logs: &[freenet::tracing::NetLogMessage],
+    contract_key: &freenet_stdlib::prelude::ContractKey,
+    current_source: &freenet::dev_tool::NodeLabel,
+    get_requesters: &[freenet::dev_tool::NodeLabel],
+    subscribers: &[freenet::dev_tool::NodeLabel],
+) -> PieceEGateMetrics {
+    // --- Findability: wire per-tx GET outcomes (dedup per attempt tx) ---
+    let summary = freenet::tracing::summarize_get_outcomes_per_tx(logs);
+    let get_attempts = summary.total();
+    let findability_rate = if get_attempts == 0 {
+        0.0
+    } else {
+        summary.successes as f64 / get_attempts as f64
+    };
+    let time_to_first_success_ms = summary.success_elapsed_ms.first().copied();
+
+    // --- "current" = the source-of-truth node's end-of-run state hash. ---
+    let current_hash = result
+        .node_storages
+        .get(current_source)
+        .and_then(|s| s.get_stored_state(contract_key))
+        .map(|ws| freenet::tracing::state_hash_short(&ws));
+
+    let hash_of = |label: &freenet::dev_tool::NodeLabel| -> Option<String> {
+        result
+            .node_storages
+            .get(label)
+            .and_then(|s| s.get_stored_state(contract_key))
+            .map(|ws| freenet::tracing::state_hash_short(&ws))
+    };
+
+    // --- Findability (client-visible) + served-freshness, per requester. ---
+    let requesters_total = get_requesters.len();
+    let mut requesters_with_state = 0usize;
+    let mut requesters_fresh = 0usize;
+    let mut requesters_stale = 0usize;
+    for r in get_requesters {
+        if let Some(h) = hash_of(r) {
+            requesters_with_state += 1;
+            if current_hash.as_deref() == Some(h.as_str()) {
+                requesters_fresh += 1;
+            } else {
+                requesters_stale += 1;
+            }
+        }
+    }
+    let client_findability_rate = if requesters_total == 0 {
+        0.0
+    } else {
+        requesters_with_state as f64 / requesters_total as f64
+    };
+    let served = requesters_fresh + requesters_stale;
+    let stale_serve_rate = if served == 0 {
+        None
+    } else {
+        Some(requesters_stale as f64 / served as f64)
+    };
+
+    // --- Subscription-tree formation ---
+    let hosting_nodes = result
+        .captured_node_labels()
+        .iter()
+        .filter(|l| result.is_node_hosting(l, contract_key))
+        .count();
+
+    // --- Freshness across ALL holders (structural invariant-1 surface) ---
+    let mut total_holders = 0usize;
+    let mut fresh_holders = 0usize;
+    let mut stale_holders = 0usize;
+    for (_label, storage) in result.node_storages.iter() {
+        let Some(state) = storage.get_stored_state(contract_key) else {
+            continue;
+        };
+        total_holders += 1;
+        if current_hash.as_deref() == Some(freenet::tracing::state_hash_short(&state).as_str()) {
+            fresh_holders += 1;
+        } else {
+            stale_holders += 1;
+        }
+    }
+
+    let subscribers_total = subscribers.len();
+    let subscribers_fresh = subscribers
+        .iter()
+        .filter(|l| hash_of(l).as_deref() == current_hash.as_deref())
+        .count();
+
+    PieceEGateMetrics {
+        get_attempts,
+        get_successes: summary.successes,
+        get_not_found: summary.not_found,
+        get_failures: summary.failures,
+        get_timeouts: summary.timeouts,
+        network_successes: summary.network_successes,
+        findability_rate,
+        requesters_total,
+        requesters_with_state,
+        client_findability_rate,
+        time_to_first_success_ms,
+        hosting_nodes,
+        total_holders,
+        fresh_holders,
+        stale_holders,
+        requesters_fresh,
+        requesters_stale,
+        stale_serve_rate,
+        subscribers_total,
+        subscribers_fresh,
+    }
+}
+
+/// Rank the regular nodes by ring distance to `key_loc`, nearest first.
+/// Returns node_no (1..=nodes) in ascending distance order. `locs` is
+/// `get_peer_locations()` = [gateway, node_1 .. node_N].
+fn nodes_by_distance_to_key(locs: &[f64], num_nodes: usize, key_loc: f64) -> Vec<usize> {
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let mut ranked: Vec<(usize, f64)> = (1..=num_nodes)
+        .map(|i| (i, ring_dist(locs[i], key_loc)))
+        .collect();
+    ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+    ranked.into_iter().map(|(n, _)| n).collect()
+}
+
+/// One findability run at `seed` on the sparse ring. Returns the metrics,
+/// whether the PUT origin still hosts at end, and the crash-drop count (proof
+/// the scripted churn actually took effect this seed).
+///
+/// Uses a real PUT (not a seed): on main, relay-caching's PUT half scatters the
+/// contract toward the key as it routes, so distant GETs find a copy ~1 hop away
+/// — this is the masked, high findability that piece E must PRESERVE when it
+/// removes that scatter. (A *seeded* lone holder scatters nothing and is already
+/// ~0-findable on main across most seeds; that is the post-E-like weakness, not
+/// the property to floor here.)
+fn run_findability_seed(seed: u64) -> (PieceEGateMetrics, bool, u64) {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+    const NUM_NODES: usize = 15; // + 1 gateway = 16 peers
+
+    setup_deterministic_state(seed);
+    let network = format!("piece-e-find-{seed:x}");
+
+    let contract = SimOperation::create_test_contract(0xA5);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let state_v1 = SimOperation::create_test_state(1);
+
+    // Evenly spread NUM_NODES around the whole ring, offset from the key.
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let node_locations: Vec<f64> = (0..NUM_NODES)
+        .map(|i| wrap(key_loc + i as f64 / NUM_NODES as f64))
+        .collect();
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network,
+            1,
+            NUM_NODES,
+            10, // ring_max_htl
+            7,  // rnd_if_htl_above
+            5,  // max_connections (deliberately sparse ring)
+            2,  // min_connections
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+    // Migration OFF (sim default = production). Relay-caching + piece-C consult
+    // ACTIVE on main — records current PUT-scattered findability behavior.
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    // PUT origin: farthest from the key, so the PUT routes across the ring toward
+    // the key and (on main) scatters copies along the way.
+    let holder_no = ranked[14];
+    // Churn victims: near-key nodes on the descent path.
+    let churn_nos = [ranked[3], ranked[4]];
+    // Requesters: the mid/far nodes (excluding the PUT origin).
+    let requester_nos: Vec<usize> = [6usize, 7, 8, 9, 10, 11, 12, 13]
+        .iter()
+        .map(|&i| ranked[i])
+        .collect();
+
+    let holder = NodeLabel::node(&network, holder_no);
+    let get_requesters: Vec<NodeLabel> = requester_nos
+        .iter()
+        .map(|n| NodeLabel::node(&network, *n))
+        .collect();
+
+    let mut operations = Vec::new();
+    operations.push(ScheduledOperation::new(
+        holder.clone(),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: state_v1.clone(),
+            subscribe: true,
+        },
+    ));
+    for c in &churn_nos {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(&network, *c),
+            SimOperation::CrashNode,
+        ));
+    }
+    for r in &get_requesters {
+        operations.push(ScheduledOperation::new(
+            r.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let logs_handle = sim.event_logs_handle();
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x}: findability sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let metrics =
+        compute_piece_e_metrics(&result, &logs, &contract_key, &holder, &get_requesters, &[]);
+    let holder_hosting = result.is_node_hosting(&holder, &contract_key);
+    let crash_dropped = result.crash_packets_dropped();
+    (metrics, holder_hosting, crash_dropped)
+}
+
+/// GATE A — sparse-ring, PUT-scattered FINDABILITY under churn (MULTI-SEED).
+///
+/// A contract is PUT from a far node and, on main, relay-caching's PUT half
+/// scatters copies toward the key as the PUT routes; distant requesters then GET
+/// under scripted churn. This is the MASKED, high findability that piece E must
+/// PRESERVE when it removes that scatter — the property whose regression this
+/// gate guards. (Note the companion finding reported in the PR: a *seeded* lone
+/// holder scatters nothing and is already ~0-findable on main across most seeds
+/// — that near-zero is the post-E-like weakness, which is exactly why a
+/// single-seed floor is meaningless here.)
+///
+/// Sparse-ring findability is seed-sensitive, so a single-seed floor would be
+/// both flaky and pass-by-luck. The gate is an AGGREGATE floor over several
+/// independent topologies (>= 5 seeds): the mean client-findability must clear
+/// `MEAN_FLOOR`, and all-but-one seed must clear `PER_SEED_FLOOR`. Floors are set
+/// robustly below the observed main baseline spread (reported in the PR body) and
+/// above a real regression.
+///
+/// Topology per seed: 1 gateway + 15 nodes evenly spread on the ring (16 peers,
+/// matching the `hosting-invariants.md` 16-peer sparse-ring figure), max 5
+/// connections (deliberately sparse).
+#[test_log::test]
+fn test_piece_e_findability_sparse_ring_gate() {
+    const SEEDS: [u64; 6] = [
+        0x4642_E0A0_5A1D,
+        0x4642_E0A0_0002,
+        0x4642_E0A0_0003,
+        0x4642_E0A0_0005,
+        0x4642_E0A0_0007,
+        0x4642_E0A0_000B,
+    ];
+    // POST-E GATE floors — must still hold once relay-caching's masking scatter
+    // is removed. Set below the observed main baseline spread (see PR body).
+    const MEAN_FLOOR: f64 = 0.60;
+    const PER_SEED_FLOOR: f64 = 0.50;
+
+    let mut rates = Vec::new();
+    let mut total_crash = 0u64;
+    tracing::info!(target: "piece_e_gate",
+        "===== PIECE-E FINDABILITY BASELINE (sparse 15+1 PUT-scattered, main, {} seeds) =====",
+        SEEDS.len());
+    for seed in SEEDS {
+        let (m, holder_hosting, crash_dropped) = run_findability_seed(seed);
+        assert!(m.get_attempts > 0, "seed={seed:x}: no GET attempts");
+        assert!(
+            holder_hosting,
+            "seed={seed:x}: PUT origin must still host the contract"
+        );
+        total_crash += crash_dropped;
+        rates.push(m.client_findability_rate);
+        tracing::info!(target: "piece_e_gate",
+            "  seed=0x{seed:X}: client_findability={:.3} ({}/{}) wire={:.3} hosting_nodes={} ttf_ms={:?}",
+            m.client_findability_rate, m.requesters_with_state, m.requesters_total,
+            m.findability_rate, m.hosting_nodes, m.time_to_first_success_ms);
+    }
+    let n = rates.len() as f64;
+    let mean = rates.iter().sum::<f64>() / n;
+    let min = rates.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = rates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let above = rates.iter().filter(|&&r| r >= PER_SEED_FLOOR).count();
+    tracing::info!(target: "piece_e_gate",
+        "  MEAN client_findability = {mean:.3} (min={min:.3} max={max:.3}); \
+         {above}/{} seeds >= per-seed floor {PER_SEED_FLOOR}; rates={rates:?}",
+        SEEDS.len());
+    tracing::info!(target: "piece_e_gate", "===== END PIECE-E FINDABILITY BASELINE =====");
+
+    assert!(
+        total_crash > 0,
+        "scripted CrashNode dropped no packets across any seed — churn had no effect"
+    );
+    // REAL GATE (not a comment): mean findability across seeds must clear the floor.
+    assert!(
+        mean >= MEAN_FLOOR,
+        "FINDABILITY REGRESSION: mean client-findability {mean:.3} across {} seeds \
+         < floor {MEAN_FLOOR} (rates={rates:?})",
+        SEEDS.len()
+    );
+    // ...and all but at most one seed must individually clear the per-seed floor,
+    // so one unlucky topology can't be masked by a high mean.
+    assert!(
+        above >= SEEDS.len() - 1,
+        "FINDABILITY REGRESSION: only {above}/{} seeds reached the per-seed floor \
+         {PER_SEED_FLOOR} (rates={rates:?})",
+        SEEDS.len()
+    );
+}
+
+/// GATE B — invariant-1 STRUCTURAL guard + forced-stale DETECTOR positive control.
+///
+/// HONEST SCOPE (do not mistake this for a discriminating stale-serve gate): a
+/// full-sim reproduction of relay stale-serve is NOT achievable with this
+/// harness. In-sim, an UPDATE converges to every reachable cache holder
+/// (broadcast + proximity), so a durable UNSUBSCRIBED stale copy does not
+/// survive to be served — the metric reads 0 whether or not the #4709 relay
+/// freshness guard is present. The REAL stale-serve validation for #4709 is its
+/// own `interest_gate_disposition` UNIT TESTS, not a sim.
+///
+/// What this test DOES prove, with assertions:
+///   * the UPDATE is a real state change (v1 != v2) and applied at HOST;
+///   * update propagation + the freshness detector work — the mesh subscribers
+///     end fresh (invariant-1 positive control);
+///   * the stale DETECTOR can read NON-ZERO — a node deliberately CRASH-ISOLATED
+///     from the UPDATE after caching v1 is flagged stale. A detector that can
+///     only ever read 0 is untrustworthy; this forces the non-zero case.
+///
+/// Timeline (1 gateway + 8 nodes):
+///   0. HOST near the key seeds v1 (subscribed, fresh, reachable).
+///   1. REACHABLE + ISOLATED nodes GET(subscribe=false) v1 → cache v1.
+///   2. MESH nodes GET(subscribe=true) v1 → join the update mesh (positive control).
+///   3. CRASH-ISOLATE the ISOLATED node (message-block) so the UPDATE cannot reach it.
+///   4. HOST UPDATEs to v2 (CRDT-versioned, so v2 genuinely wins) → HOST + mesh +
+///      REACHABLE refresh to v2; the isolated copy stays v1 = provably stale.
+#[test_log::test]
+fn test_piece_e_unsubscribed_stale_serve_gate() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0x4642_E0B0_57A1;
+    const NETWORK_NAME: &str = "piece-e-stale-serve";
+    const NUM_NODES: usize = 8;
+
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0xB7);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    // CRDT-versioned states so the UPDATE is a REAL state change: MockRuntime's
+    // default byte-merge of two arbitrary states is a no-op (keeps existing
+    // bytes), which would make the UPDATE invisible and every read trivially
+    // "fresh". CRDT mode makes the higher version win, so v2 genuinely replaces v1.
+    freenet::dev_tool::register_crdt_contract(contract_id);
+    let state_v1 = SimOperation::create_crdt_state(1, 0x11);
+    let state_v2 = SimOperation::create_crdt_state(2, 0x22);
+
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let node_locations: Vec<f64> = (0..NUM_NODES)
+        .map(|i| wrap(key_loc + i as f64 / NUM_NODES as f64))
+        .collect();
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,
+            NUM_NODES,
+            10,
+            7,
+            8,
+            3,
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    let host_no = ranked[0]; // nearest key: source of truth
+    let reachable_no = ranked[1]; // caches v1, stays reachable → refreshes to v2
+    let isolated_no = ranked[2]; // caches v1, then crash-isolated → forced stale
+    let mesh_nos = [ranked[3], ranked[4]]; // join the update mesh (positive control)
+
+    let host = NodeLabel::node(NETWORK_NAME, host_no);
+    let reachable = NodeLabel::node(NETWORK_NAME, reachable_no);
+    let isolated = NodeLabel::node(NETWORK_NAME, isolated_no);
+    let mesh: Vec<NodeLabel> = mesh_nos
+        .iter()
+        .map(|n| NodeLabel::node(NETWORK_NAME, *n))
+        .collect();
+
+    tracing::info!(
+        key_loc,
+        host = host_no,
+        reachable = reachable_no,
+        isolated = isolated_no,
+        mesh = ?mesh_nos,
+        "piece-E stale-serve gate: roles by ring distance to key"
+    );
+
+    let mut operations = Vec::new();
+    // 0. Source of truth near the key.
+    operations.push(ScheduledOperation::new(
+        host.clone(),
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state: state_v1.clone(),
+        },
+    ));
+    // 1. Two read-only GETs cache v1 (unsubscribed).
+    for n in [&reachable, &isolated] {
+        operations.push(ScheduledOperation::new(
+            n.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+    // 2. Mesh: GET-with-subscribe joins the update mesh (fetch + subscribe; a bare
+    //    Subscribe is rejected client-side until the WASM is cached locally).
+    for m in &mesh {
+        operations.push(ScheduledOperation::new(
+            m.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
+        ));
+    }
+    // 3. Crash-isolate the ISOLATED node BEFORE the UPDATE so it cannot receive
+    //    it — this manufactures the known-stale copy the detector must flag.
+    operations.push(ScheduledOperation::new(
+        isolated.clone(),
+        SimOperation::CrashNode,
+    ));
+    // 4. UPDATE to v2: HOST + reachable + mesh refresh; the isolated copy stays v1.
+    operations.push(ScheduledOperation::new(
+        host.clone(),
+        SimOperation::Update {
+            key: contract_key,
+            data: state_v2.clone(),
+        },
+    ));
+
+    let logs_handle = sim.event_logs_handle();
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "stale-serve gate sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    // No probe requesters (stale-serve is not reproducible end-to-end — see doc);
+    // mesh is the positive control; HOST defines "current" (= v2 after the UPDATE).
+    let metrics = compute_piece_e_metrics(&result, &logs, &contract_key, &host, &[], &mesh);
+
+    let v1_hash = freenet::tracing::state_hash_short(&freenet_stdlib::prelude::WrappedState::new(
+        state_v1.clone(),
+    ));
+    let v2_hash = freenet::tracing::state_hash_short(&freenet_stdlib::prelude::WrappedState::new(
+        state_v2.clone(),
+    ));
+    let hash_of = |label: &NodeLabel| -> Option<String> {
+        result
+            .node_storages
+            .get(label)
+            .and_then(|s| s.get_stored_state(&contract_key))
+            .map(|ws| freenet::tracing::state_hash_short(&ws))
+    };
+    let host_current = hash_of(&host);
+    let isolated_hash = hash_of(&isolated);
+    let reachable_hash = hash_of(&reachable);
+    // DETECTOR positive control: the crash-isolated node cached v1 and never saw
+    // the UPDATE, so it MUST be flagged stale (holds non-current state).
+    let forced_stale_detected =
+        isolated_hash.is_some() && isolated_hash.as_deref() != host_current.as_deref();
+
+    tracing::info!(target: "piece_e_gate",
+        "===== PIECE-E INVARIANT-1 STRUCTURAL GUARD + STALE-DETECTOR CONTROL (seed=0x{SEED:X}, main) =====");
+    tracing::info!(target: "piece_e_gate", "  v1={v1_hash} v2={v2_hash} host_current={host_current:?}");
+    tracing::info!(target: "piece_e_gate",
+        "  FORCED-STALE positive control: isolated node hash={isolated_hash:?} flagged_stale={forced_stale_detected}");
+    tracing::info!(target: "piece_e_gate",
+        "  reachable (non-isolated) cache hash={reachable_hash:?}  (main refreshes reachable caches -> expect v2)");
+    tracing::info!(target: "piece_e_gate",
+        "  durable stale copies (all nodes): {} of {} holders (fresh={})",
+        metrics.stale_holders, metrics.total_holders, metrics.fresh_holders);
+    tracing::info!(target: "piece_e_gate",
+        "  mesh subscribers fresh after UPDATE (positive control): {}/{}",
+        metrics.subscribers_fresh, metrics.subscribers_total);
+    tracing::info!(target: "piece_e_gate", "===== END =====");
+
+    // --- Honest, discriminating assertions ---
+    // (1) The UPDATE is a real state change — else the freshness detector is hollow.
+    assert_ne!(
+        v1_hash, v2_hash,
+        "v1 and v2 must differ — the UPDATE must be a real state change"
+    );
+    // (2) The UPDATE actually applied at HOST (a real check, replacing the old
+    //     fresh+stale==total tautology).
+    assert_eq!(
+        host_current.as_deref(),
+        Some(v2_hash.as_str()),
+        "UPDATE must apply at HOST (host_current should equal v2)"
+    );
+    // (3) Positive control: update propagation + freshness detection work — the
+    //     mesh subscribers received the update and read fresh.
+    assert_eq!(
+        metrics.subscribers_fresh, metrics.subscribers_total,
+        "mesh subscribers must all be fresh after the UPDATE (invariant-1 positive control)"
+    );
+    // (4) DETECTOR positive control: crash-isolation took effect AND the isolated
+    //     copy is provably flagged stale. Proves the detector can read non-zero.
+    assert!(
+        result.crash_packets_dropped() > 0,
+        "crash-isolation of the stale node had no effect (no packets dropped)"
+    );
+    assert!(
+        forced_stale_detected,
+        "FORCED-STALE positive control FAILED: the crash-isolated node cached v1 and never \
+         received the UPDATE, so it must be flagged stale (isolated_hash={isolated_hash:?}, \
+         current={host_current:?})"
+    );
+
+    // Avoid leaking the CRDT registration into other tests sharing this process.
+    freenet::dev_tool::clear_crdt_contracts();
+}
