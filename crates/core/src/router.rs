@@ -218,6 +218,19 @@ pub(crate) struct RouterSnapshotInfo {
     pub hosting_evictions_of_recently_read_total: Option<u64>,
     pub hosting_local_hits_total: Option<u64>,
     pub hosting_local_misses_total: Option<u64>,
+    /// PUT-durability falsifier gauges (#4642): are freshly-seeded contracts
+    /// evicted before their first reader? Populated by `Ring` from the
+    /// `HostingManager` on the snapshot cadence, alongside the A2/A3 gauges above.
+    /// `hosting_evicted_unread_total` counts over-budget evictions whose victim
+    /// was never read (`read_count == 0` — a PUT seed); differenced against
+    /// `hosting_budget_evictions_total` (the total-eviction denominator) it gives
+    /// the unread-seed eviction fraction. `hosting_evicted_unread_age_secs_sum` is
+    /// the running sum of those victims' age-at-eviction (whole seconds); divided
+    /// by `hosting_evicted_unread_total` it is the mean unread-seed lifetime (how
+    /// young seeds die). Monotonic counters the collector differences. `None`
+    /// until the ring is built. Per-node aggregate scalars.
+    pub hosting_evicted_unread_total: Option<u64>,
+    pub hosting_evicted_unread_age_secs_sum: Option<u64>,
     /// Terminal advertisement-consult counters (hosting redesign piece C,
     /// #4646; exported to central telemetry per #4658), populated by `Ring`
     /// from the per-node `network_status` singleton on the snapshot cadence.
@@ -1155,6 +1168,8 @@ impl Router {
             hosting_evictions_of_recently_read_total: None,
             hosting_local_hits_total: None,
             hosting_local_misses_total: None,
+            hosting_evicted_unread_total: None,
+            hosting_evicted_unread_age_secs_sum: None,
             // Terminal advertisement-consult counters (piece C, #4646),
             // populated by Ring from the network_status singleton on the
             // snapshot cadence (#4658).

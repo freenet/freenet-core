@@ -2188,6 +2188,21 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_local_misses_total".to_string(),
                     serde_json::json!(snapshot.hosting_local_misses_total),
                 );
+                // PUT-durability falsifier gauges (#4642). Same hand-mirrored
+                // footgun as the gauges above: a new `RouterSnapshotInfo` field is
+                // invisible to the collector unless added here. These answer
+                // whether freshly-seeded contracts are evicted before their first
+                // reader — the field check for the "PUT is not read-demand"
+                // decision. Pinned by
+                // `router_snapshot_json_includes_put_durability_gauges`.
+                obj.insert(
+                    "hosting_evicted_unread_total".to_string(),
+                    serde_json::json!(snapshot.hosting_evicted_unread_total),
+                );
+                obj.insert(
+                    "hosting_evicted_unread_age_secs_sum".to_string(),
+                    serde_json::json!(snapshot.hosting_evicted_unread_age_secs_sum),
+                );
                 // Terminal advertisement-consult counters (hosting redesign
                 // piece C, #4646; exported per #4658). Same hand-mirrored
                 // footgun as the gauges above: a new `RouterSnapshotInfo` field
@@ -2440,6 +2455,29 @@ mod tests {
             ("hosting_evictions_of_recently_read_total", 277),
             ("hosting_local_hits_total", 281),
             ("hosting_local_misses_total", 283),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the PUT-durability falsifier gauges (#4642) must also reach the
+    /// hand-mirrored OTLP body — same footgun as the A2/A3 gauges above. These are
+    /// the field check for the "a PUT seeds a contract but does NOT count as
+    /// read-demand" decision (are seeds evicted before their first reader?); a
+    /// silent drop would re-blind central telemetry to that question — the exact
+    /// gap this change closes.
+    #[test]
+    fn router_snapshot_json_includes_put_durability_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_evicted_unread_total = Some(349);
+        info.hosting_evicted_unread_age_secs_sum = Some(353);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hosting_evicted_unread_total", 349),
+            ("hosting_evicted_unread_age_secs_sum", 353),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

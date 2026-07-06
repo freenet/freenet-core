@@ -148,6 +148,32 @@ pub(crate) struct HostingCacheStats {
     /// [`Self::budget_evictions_total`]) is the alarm that the demand estimate
     /// is mis-ordering the working set.
     pub evictions_of_recently_read_total: u64,
+    /// Monotonic count of over-budget evictions whose victim was a genuine
+    /// fresh-THIS-run PUT seed evicted before any read — `read_count == 0 &&
+    /// seeded_this_run` (a live `record_access` insert, NOT a reload from
+    /// persistence). This is the field falsifier for the "a PUT seeds a contract
+    /// but does NOT count as read-demand" design decision
+    /// (freenet/freenet-core#4642): if seeds are routinely evicted before their
+    /// first reader, the demand-driven policy is discarding fresh content before
+    /// it can be found. Differenced against [`Self::budget_evictions_total`] this
+    /// gives the fraction of evictions that killed an unread seed. Disjoint from
+    /// [`Self::evictions_of_recently_read_total`] (`read_count >= 2`): the
+    /// `read_count == 1` band is counted by neither.
+    ///
+    /// The `seeded_this_run` restriction is load-bearing: a restart reloads the
+    /// whole persisted hosted set with `read_count` reset to 0 and `inserted_at`
+    /// reset to `now`, so a long-hosted, previously-read contract shed in the
+    /// post-load over-budget burst would otherwise masquerade as an unread seed
+    /// dying at age ≈ 0 — a false positive for this exact alarm on every restart.
+    /// See [`HostedContract::seeded_this_run`].
+    pub evicted_unread_total: u64,
+    /// Running sum, in whole seconds, of the age-at-eviction (`now - inserted_at`)
+    /// of every eviction counted by [`Self::evicted_unread_total`]. Mean unread-
+    /// seed lifetime = this / `evicted_unread_total`; carried as a sum (not a
+    /// pre-divided mean) so the collector can difference both across the snapshot
+    /// cadence and recover the windowed mean. Answers "HOW YOUNG do seeds die?" —
+    /// a small mean means seeds are evicted almost immediately after the PUT.
+    pub evicted_unread_age_secs_sum: u64,
 }
 
 /// Per-contract Greedy-Dual priority row for the local-peer dashboard.
@@ -277,6 +303,24 @@ pub struct HostedContract {
     /// When this entry was first inserted. Used with `read_count` to derive an
     /// observed read-rate training sample for the proximity prior.
     pub inserted_at: Instant,
+    /// Whether this entry was inserted fresh during THIS process run (a live
+    /// `record_access`), as opposed to reloaded from persisted state at startup
+    /// (`load_persisted_entry_with_demand`).
+    ///
+    /// Sole purpose: keep the PUT-durability `evicted_unread_total` falsifier
+    /// honest across restarts. A reload resets `read_count` to 0 and
+    /// `inserted_at` to `now` for the ENTIRE persisted hosted set, so a
+    /// long-hosted, previously-read contract looks identical to a brand-new
+    /// unread seed (`read_count == 0`, age ≈ 0) the moment it is reloaded. Since
+    /// load does not evict but the node is frequently over budget afterwards, the
+    /// first `record_access` sheds a burst of the oldest reloaded entries — which
+    /// would otherwise register as a false "unread seeds die instantly" spike on
+    /// every restart (and restarts are frequent under the auto-update cadence).
+    /// Gating the unread-seed counter on `read_count == 0 && seeded_this_run`
+    /// excludes reloaded entries from the falsifier. Keying on
+    /// `access_type == Put` is NOT sufficient: a reloaded entry whose last
+    /// pre-restart access was a PUT still has `access_type == Put`.
+    pub seeded_this_run: bool,
     /// Type of the last access
     pub access_type: AccessType,
     /// Whether a local client (HTTP/WebSocket) accessed this contract.
@@ -376,6 +420,13 @@ pub struct HostingCache<T: TimeSource> {
     /// (genuine repeat demand). The #4338 miscalibration signal — see
     /// [`HostingCacheStats::evictions_of_recently_read_total`].
     evictions_of_recently_read_total: u64,
+    /// Monotonic count of over-budget evictions whose victim had `read_count == 0`
+    /// (an unread seed). The PUT-durability field falsifier — see
+    /// [`HostingCacheStats::evicted_unread_total`].
+    evicted_unread_total: u64,
+    /// Running sum (whole seconds) of the age-at-eviction of unread-seed evictions.
+    /// See [`HostingCacheStats::evicted_unread_age_secs_sum`].
+    evicted_unread_age_secs_sum: u64,
     /// Time source for testability
     time_source: T,
 }
@@ -392,6 +443,8 @@ impl<T: TimeSource> HostingCache<T> {
             eviction_floor: 0.0,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
+            evicted_unread_total: 0,
+            evicted_unread_age_secs_sum: 0,
             time_source,
         }
     }
@@ -475,6 +528,19 @@ impl<T: TimeSource> HostingCache<T> {
                 if entry.read_count >= 2 {
                     self.evictions_of_recently_read_total =
                         self.evictions_of_recently_read_total.saturating_add(1);
+                }
+                if entry.read_count == 0 && entry.seeded_this_run {
+                    // A genuine fresh-this-run PUT seed evicted before its first
+                    // reader — the PUT-durability falsifier. Record it and its
+                    // age (bounded by `budget_evictions_total`, the shared
+                    // denominator) so the field can tell whether seeds die young.
+                    // `seeded_this_run` excludes reloaded entries, whose restart
+                    // reset of read_count/inserted_at would otherwise fake an
+                    // "unread seeds die instantly" spike on every restart.
+                    self.evicted_unread_total = self.evicted_unread_total.saturating_add(1);
+                    let age_secs = now.saturating_duration_since(entry.inserted_at).as_secs();
+                    self.evicted_unread_age_secs_sum =
+                        self.evicted_unread_age_secs_sum.saturating_add(age_secs);
                 }
                 // Greedy-Dual aging: ratchet the floor up to the victim's score
                 // (never down — an entry whose stale score is below the current
@@ -630,6 +696,9 @@ impl<T: TimeSource> HostingCache<T> {
                 predicted_demand,
                 read_count: if is_read { 1 } else { 0 },
                 inserted_at: now,
+                // Fresh insert this run: a genuine live PUT/GET seed, so it is
+                // eligible for the unread-seed falsifier (gated on read_count==0).
+                seeded_this_run: true,
                 access_type,
                 local_client_access: false,
                 local_client_last_access: None,
@@ -858,6 +927,8 @@ impl<T: TimeSource> HostingCache<T> {
             contract_count: self.contracts.len() as u64,
             budget_evictions_total: self.budget_evictions_total,
             evictions_of_recently_read_total: self.evictions_of_recently_read_total,
+            evicted_unread_total: self.evicted_unread_total,
+            evicted_unread_age_secs_sum: self.evicted_unread_age_secs_sum,
         }
     }
 
@@ -1010,6 +1081,10 @@ impl<T: TimeSource> HostingCache<T> {
             // reflects the last pre-restart access, not this run's read count.
             read_count: 0,
             inserted_at: now,
+            // Reloaded from persistence, NOT seeded this run: excluded from the
+            // unread-seed falsifier so a restart's reset read_count/inserted_at
+            // cannot masquerade as fresh unread seeds dying young.
+            seeded_this_run: false,
             access_type,
             local_client_access,
             local_client_last_access,
@@ -1924,6 +1999,101 @@ mod tests {
             cache.stats().budget_evictions_total,
             1,
             "counter must not advance with no budget pressure"
+        );
+    }
+
+    /// The unread-seed eviction counter (PUT-durability falsifier) increments
+    /// only when a `read_count == 0` victim (a PUT seed never GET/SUBSCRIBEd) is
+    /// evicted over budget, and records its age-at-eviction. A victim that was
+    /// read even once must NOT count as an unread seed.
+    #[test]
+    fn test_evicted_unread_counts_only_never_read_seeds() {
+        // Budget 100 bytes: only one 100-byte entry fits, so each insert past
+        // TTL evicts the resident one.
+        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+        let key3 = make_key(3);
+
+        // Seed key1 via PUT (read_count == 0 — an unread seed).
+        cache.record_access(key1, 100, AccessType::Put, 0, |_| false);
+        assert_eq!(cache.stats().evicted_unread_total, 0);
+
+        // Past TTL, insert key2 (also a seed). key1 is evicted: never read, so
+        // it counts as an unread-seed eviction and its age (~61s) is recorded.
+        time.advance_time(Duration::from_secs(61));
+        let result = cache.record_access(key2, 100, AccessType::Put, 0, |_| false);
+        assert_eq!(result.evicted, vec![(key1, 0)]);
+        let stats = cache.stats();
+        assert_eq!(stats.budget_evictions_total, 1);
+        assert_eq!(stats.evicted_unread_total, 1, "an unread seed was evicted");
+        assert_eq!(
+            stats.evicted_unread_age_secs_sum, 61,
+            "age-at-eviction of the unread seed is recorded"
+        );
+
+        // Read key2 once (GET) so read_count == 1 — no longer an unread seed.
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| false);
+
+        // Past TTL, insert key3 to evict key2. key2 was read once, so it is
+        // neither an unread seed nor a recently-read (>=2) victim: the unread
+        // counter and age sum both hold.
+        time.advance_time(Duration::from_secs(61));
+        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| false);
+        assert_eq!(result.evicted, vec![(key2, 0)]);
+        let stats = cache.stats();
+        assert_eq!(stats.budget_evictions_total, 2);
+        assert_eq!(
+            stats.evicted_unread_total, 1,
+            "a victim read at least once must NOT count as an unread seed"
+        );
+        assert_eq!(
+            stats.evicted_unread_age_secs_sum, 61,
+            "age sum unchanged when the eviction is not an unread seed"
+        );
+    }
+
+    /// A reloaded (persisted) entry with `read_count == 0` must NOT count as an
+    /// unread seed when evicted. Restart pollution regression: a restart resets
+    /// `read_count` to 0 and `inserted_at` to `now` for the WHOLE persisted set,
+    /// then the post-load over-budget burst sheds the oldest reloaded entries —
+    /// which, without the `seeded_this_run` gate, would fake an "unread seeds die
+    /// instantly" spike (age ≈ 0) on every restart, a false positive for the very
+    /// alarm this counter raises. Restarts are frequent under auto-update.
+    #[test]
+    fn test_reloaded_entry_eviction_does_not_count_as_unread_seed() {
+        // Budget 100 bytes: one 100-byte entry fits.
+        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+
+        // Reload key1 from persistence with read_count 0 — the exact shape of a
+        // long-hosted entry after a restart resets its counters. (A PUT was its
+        // last pre-restart access, so access_type == Put, proving the counter
+        // cannot key on access_type instead of the explicit marker.)
+        cache.load_persisted_entry(key1, 100, AccessType::Put, Duration::from_secs(1), false);
+        cache.finalize_loading();
+        assert!(cache.contains(&key1));
+        assert_eq!(cache.stats().evicted_unread_total, 0);
+
+        // Advance past min_ttl so the reloaded entry is eviction-eligible, then a
+        // fresh insert pushes over budget and sheds it (the post-load burst).
+        time.advance_time(Duration::from_secs(61));
+        let result = cache.record_access(key2, 100, AccessType::Get, 0, |_| false);
+        assert_eq!(
+            result.evicted,
+            vec![(key1, 0)],
+            "the reloaded entry is evicted in the post-load over-budget burst"
+        );
+        let stats = cache.stats();
+        assert_eq!(stats.budget_evictions_total, 1, "it WAS evicted");
+        assert_eq!(
+            stats.evicted_unread_total, 0,
+            "a reloaded entry (not seeded this run) must NOT count as an unread seed"
+        );
+        assert_eq!(
+            stats.evicted_unread_age_secs_sum, 0,
+            "no age is recorded for a reloaded (non-unread-seed) eviction"
         );
     }
 
