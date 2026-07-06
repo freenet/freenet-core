@@ -34,8 +34,8 @@ use crate::{
         stream_progress::StreamProgressRegistry,
     },
     ring::{
-        ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff, PeerKey, PeerKeyLocation,
-        Ring,
+        ConnectionManager, Distance, LiveTransactionTracker, Location, PeerConnectionBackoff,
+        PeerKey, PeerKeyLocation, Ring, reconcile,
     },
     transport::TransportPublicKey,
     util::time_source::InstantTimeSrc,
@@ -73,6 +73,27 @@ impl Ops {
             under_progress: self.under_progress.len(),
         }
     }
+}
+
+/// Pure core of the piece-D **strictly-farther** downstream-subscriber filter
+/// (keystone step-2, #4642): `true` iff at least one subscriber distance is
+/// STRICTLY greater than `my_distance` (both measured to the contract key).
+///
+/// Load-bearing: the comparison uses EXACT `Distance` ordering (`Ord::cmp`),
+/// NEVER the epsilon-fuzzy `PartialEq` (`ring/location.rs:223-243`, where `==`
+/// treats one-ULP-apart distances as equal while `cmp` still orders them). A
+/// subscriber at exactly `my_distance` (bit-identical) is EXCLUDED — that
+/// exclusion of the closer/equal (upstream) peer is what stops two mutual
+/// co-hosts from perpetuating each other's leases so collapse can terminate
+/// (hosting-invariants piece-D, design §4/§6). Mixing epsilon-`==` here with the
+/// exact-`<` selection used by `most_keyward_among` is the exact bug the guard
+/// prevents, hence `cmp(..) == Greater`, not `>` or `==`.
+fn has_strictly_farther(
+    my_distance: Distance,
+    subscriber_distances: impl Iterator<Item = Distance>,
+) -> bool {
+    let mut subscriber_distances = subscriber_distances;
+    subscriber_distances.any(|d| d.cmp(&my_distance) == std::cmp::Ordering::Greater)
 }
 
 /// Thread safe and friendly data structure to maintain state of the different operations
@@ -793,6 +814,93 @@ impl OpManager {
             .collect()
     }
 
+    /// Build a [`reconcile::ReconcileInputs`] snapshot for `contract` from live
+    /// node state (keystone step-2, #4642, shadow-mode wiring), or `None` when
+    /// the snapshot would be DISTANCE-BLIND and therefore unmeasurable.
+    ///
+    /// Reads the live maps ONCE into plain values so `reconcile` stays a pure
+    /// function. Behavior-preserving: this only reads state; it drives nothing.
+    /// Hosting is binary — `state_present` is `true` only when this peer holds
+    /// the FULL contract (code + params + state), never a partial tier.
+    ///
+    /// Returns `None` when our OWN ring location is unknown (startup / no observed
+    /// address yet): without it the distance-derived fields — the computed
+    /// upstream, the verified-root check, and the strict-farther downstream gate —
+    /// are ALL unmeasurable. Defaulting the strict gate in that state would MASK
+    /// the mutual-co-host divergence the telemetry exists to reveal, so the caller
+    /// SKIPS the shadow comparison for that contract this tick rather than
+    /// recording noise. A later flip-time builder must handle unknown-location
+    /// explicitly (e.g. defer the reconcile), never count-all.
+    pub(crate) fn build_reconcile_inputs(
+        &self,
+        contract: &ContractKey,
+    ) -> Option<reconcile::ReconcileInputs> {
+        // Distance-blind guard: resolve our own location once up front; if it is
+        // unknown the whole snapshot is unmeasurable (see doc above).
+        let my_location = self.ring.connection_manager.own_location().location()?;
+
+        let instance_id = *contract.id();
+        let hosting_neighbors = self
+            .neighbor_hosting
+            .neighbors_with_contract_id(&instance_id);
+        let computed_upstream = self
+            .ring
+            .most_keyward_hosting_neighbor(&instance_id, &hosting_neighbors);
+
+        Some(reconcile::ReconcileInputs {
+            computed_upstream,
+            has_local_client: self.ring.has_client_subscriptions(contract),
+            has_farther_downstream_subscriber: self
+                .has_farther_downstream_subscriber(contract, my_location),
+            state_present: self.ring.contract_state_present(contract),
+            is_subscribed: self.ring.is_subscribed(contract),
+            is_advertised: self.neighbor_hosting.is_hosted_locally(contract),
+            is_verified_root: self.ring.is_subscription_root(contract),
+            // STEP-3 / piece-D hook: no on-`main` source for the acquiring-
+            // transient state yet (`spawn_host_state_sync_retry` is a piece-D
+            // addition), so this is always false in shadow mode. See
+            // `ReconcileInputs::actively_acquiring`.
+            actively_acquiring: false,
+        })
+    }
+
+    /// Whether at least one lease-valid downstream subscriber is STRICTLY FARTHER
+    /// from the contract key than this peer — the piece-D H2 interest gate.
+    ///
+    /// `my_location` is this peer's ring location, resolved ONCE by the caller
+    /// ([`build_reconcile_inputs`](Self::build_reconcile_inputs), which returns
+    /// `None` and skips the whole comparison when it is unknown). Resolves each
+    /// lease-valid downstream subscriber to its location and keeps only those
+    /// strictly farther from the key than us (the closer/upstream peer is
+    /// EXCLUDED, so mutual co-hosts cannot perpetuate each other's leases; see
+    /// [`has_strictly_farther`]). The distance filter uses EXACT `Distance`
+    /// ordering, never epsilon `==`.
+    fn has_farther_downstream_subscriber(
+        &self,
+        contract: &ContractKey,
+        my_location: Location,
+    ) -> bool {
+        let subscribers = self.ring.downstream_subscriber_peers(contract);
+        if subscribers.is_empty() {
+            return false;
+        }
+        let contract_location = Location::from(contract);
+        let my_distance: Distance = my_location.distance(contract_location);
+        // A subscriber we can't currently resolve to a connected location (it
+        // disconnected but its lease has not expired) is skipped, not assumed
+        // farther. Known dilution edge: the case the strict filter targets — a
+        // CONNECTED closer co-host that is our upstream — always resolves, so
+        // skipping stragglers is safe.
+        let subscriber_distances = subscribers.iter().filter_map(|peer| {
+            self.ring
+                .connection_manager
+                .get_peer_by_pub_key(&peer.0)
+                .and_then(|pkl| pkl.location())
+                .map(|loc| loc.distance(contract_location))
+        });
+        has_strictly_farther(my_distance, subscriber_distances)
+    }
+
     /// Send an Unsubscribe message to the upstream peer for a contract.
     ///
     /// Finds the upstream peer from the interest manager, resolves its address,
@@ -844,6 +952,55 @@ impl OpManager {
                     stored_upstream = ?stored_pk,
                     computed_upstream = ?computed_pk,
                     "computed upstream diverges from stored is_upstream flag (#4642 piece D / #4671)"
+                );
+            }
+        }
+
+        // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
+        // COLLAPSE site. This function is the interest-gated collapse. Build the
+        // reconcile snapshot, compute what the pure controller would do, and
+        // compare BY SET MEMBERSHIP. DRIVES NOTHING — the teardown below runs
+        // unchanged. Skipped when the snapshot is distance-blind
+        // (`build_reconcile_inputs` returns `None`: own-location unknown), so a
+        // startup transient does not pollute the collapse-site signal.
+        //
+        // Actual→Action mapping (mirrors what this function actually EFFECTS):
+        //   - `Collapse` iff we hold a lease at snapshot (`is_subscribed`):
+        //     `ring.unsubscribe` is a NO-OP when not subscribed (hosting.rs), and
+        //     reconcile likewise emits `Collapse` only for a held lease — so a
+        //     verified-root / hosted-only (not-subscribed) contract collapsing on
+        //     last-client-leave must NOT record a false `collapse` diff, keeping
+        //     `collapse_diffs` the clean "controller would collapse a real lease"
+        //     signal.
+        //   - `Unsubscribe` iff a stored upstream was located (`upstream.is_some()`):
+        //     the wire `Unsubscribe` is sent whenever the stored flag resolves an
+        //     upstream, regardless of `is_subscribed`. The rare edge where a
+        //     located upstream fails later address resolution still counts as the
+        //     intent to unsubscribe. The `unsubscribe` diff thus captures the
+        //     stored-vs-computed upstream disagreement (#4671) at action
+        //     granularity.
+        // This site NEVER retracts a hosting advertisement, so reconcile's
+        // `Retract` (emitted when `is_advertised`) is a genuine recorded gap.
+        if let Some(inputs) = self.build_reconcile_inputs(contract) {
+            let reconcile_actions = reconcile::reconcile(&inputs);
+            let mut actual_actions: Vec<reconcile::Action> = Vec::new();
+            if inputs.is_subscribed {
+                actual_actions.push(reconcile::Action::Collapse);
+            }
+            if upstream.is_some() {
+                actual_actions.push(reconcile::Action::Unsubscribe);
+            }
+            let divergence = reconcile::action_set_divergence(&reconcile_actions, &actual_actions);
+            crate::node::network_status::record_reconcile_shadow_comparison(
+                crate::node::network_status::ReconcileShadowSite::Collapse,
+                divergence,
+            );
+            if divergence.any() {
+                tracing::debug!(
+                    contract = %contract,
+                    ?reconcile_actions,
+                    ?actual_actions,
+                    "reconcile shadow diverges from actual collapse behavior (#4642 keystone step-2)"
                 );
             }
         }
@@ -1852,6 +2009,109 @@ mod tests {
     use crate::node::network_bridge::EventLoopNotificationsReceiver;
     use either::Either;
     use tokio::time::{Duration, Instant, timeout};
+
+    /// Piece-D H2 pin (keystone step-2, #4642): the strictly-farther
+    /// downstream-subscriber filter the reconcile input-builder delegates to
+    /// (`has_farther_downstream_subscriber` → [`has_strictly_farther`]) MUST
+    /// EXCLUDE a subscriber at exactly our distance (bit-identical) and use
+    /// EXACT `Distance` ordering, never the epsilon-fuzzy `PartialEq`. A
+    /// closer/equal (upstream) peer counting as farther demand would let mutual
+    /// co-hosts perpetuate each other's leases so collapse never terminates
+    /// (hosting-invariants piece-D, design §4/§6). Feeds bit-identical distances
+    /// exactly as the H2 obligation on the builder requires.
+    #[test]
+    fn has_strictly_farther_excludes_equal_uses_exact_ordering() {
+        let my = Distance::new(0.3);
+
+        // Bit-identical (exactly our distance) ⇒ excluded.
+        assert!(
+            !has_strictly_farther(my, std::iter::once(Distance::new(0.3))),
+            "a subscriber at exactly our distance must be excluded (the closer/upstream peer)"
+        );
+        // Strictly closer ⇒ excluded.
+        assert!(
+            !has_strictly_farther(my, std::iter::once(Distance::new(0.2))),
+            "a strictly-closer subscriber must be excluded"
+        );
+        // Strictly farther ⇒ included.
+        assert!(
+            has_strictly_farther(my, std::iter::once(Distance::new(0.4))),
+            "a strictly-farther subscriber must be included"
+        );
+
+        // Epsilon boundary: one ULP FARTHER than `my` is epsilon-`==` to it (a
+        // fuzzy `==` filter would wrongly treat it as equal ⇒ excluded) but
+        // EXACT `cmp` orders it Greater ⇒ included. This is the exact-vs-epsilon
+        // bug the guard prevents (`ring/location.rs:223-243`).
+        let one_ulp_farther = Distance::new(f64::from_bits(0.3_f64.to_bits() + 1));
+        assert_eq!(
+            one_ulp_farther, my,
+            "one ULP apart is epsilon-equal under Distance PartialEq"
+        );
+        assert!(
+            has_strictly_farther(my, std::iter::once(one_ulp_farther)),
+            "exact cmp includes a one-ULP-farther subscriber that a fuzzy `==` would exclude"
+        );
+
+        // Mixed sets: any strictly-farther member triggers; equal + closer alone
+        // do not.
+        assert!(
+            has_strictly_farther(
+                my,
+                [Distance::new(0.3), Distance::new(0.2), Distance::new(0.45)].into_iter()
+            ),
+            "any strictly-farther subscriber in the set triggers"
+        );
+        assert!(
+            !has_strictly_farther(my, [Distance::new(0.3), Distance::new(0.1)].into_iter()),
+            "equal + closer only ⇒ no farther demand"
+        );
+        // Empty ⇒ false.
+        assert!(!has_strictly_farther(my, std::iter::empty()));
+    }
+
+    /// Behavior-preserving guard (keystone step-2, #4642): the collapse site
+    /// `send_unsubscribe_upstream` must STILL drive its decision off the stored
+    /// `is_upstream` flag and the local `ring.unsubscribe`, and the reconcile
+    /// controller must only RECORD a shadow comparison there — its `Vec<Action>`
+    /// flows ONLY into the set-membership divergence comparator, never into a
+    /// driver. This source-scrape pin fails if the flip lands (drive the action)
+    /// without a deliberate update, keeping the "drives nothing" invariant honest.
+    #[test]
+    fn send_unsubscribe_upstream_still_drives_and_shadow_is_record_only() {
+        const SRC: &str = include_str!("op_state_manager.rs");
+        let start = SRC
+            .find("pub async fn send_unsubscribe_upstream(")
+            .expect("send_unsubscribe_upstream must exist");
+        // Bound the scan to this function so later functions can't satisfy the
+        // markers by accident (next `\n    pub ` item after the signature).
+        let rest = &SRC[start + 1..];
+        let end = rest
+            .find("\n    pub ")
+            .map(|e| start + 1 + e)
+            .unwrap_or(SRC.len());
+        let body = &SRC[start..end];
+
+        // Production still drives the collapse:
+        assert!(
+            body.contains("interest.is_upstream"),
+            "collapse must still locate the upstream via the stored is_upstream flag"
+        );
+        assert!(
+            body.contains("self.ring.unsubscribe(contract)"),
+            "collapse must still drop the local lease via ring.unsubscribe"
+        );
+        // Reconcile is wired in SHADOW mode here and is record-only:
+        assert!(
+            body.contains("record_reconcile_shadow_comparison"),
+            "the reconcile shadow comparison must be wired at the collapse site"
+        );
+        assert!(
+            body.contains("action_set_divergence(&reconcile_actions"),
+            "reconcile output must flow ONLY into the set-membership divergence \
+             comparator (record-only), not into a driver/wire send"
+        );
+    }
 
     #[tokio::test]
     async fn notify_timeout_succeeds_when_receiver_alive() {

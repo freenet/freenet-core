@@ -263,6 +263,45 @@ pub(crate) struct RouterSnapshotInfo {
     /// lifetime totals, `None` until the ring's snapshot task populates them.
     pub upstream_computed_vs_stored_comparisons: Option<u64>,
     pub upstream_computed_vs_stored_divergences: Option<u64>,
+    /// Reconcile-controller SHADOW comparison counters, split PER SITE (hosting
+    /// redesign keystone step-2, #4642). Populated by `Ring` from the per-node
+    /// `network_status` singleton on the snapshot cadence. Per site,
+    /// `comparisons` is the denominator (one per shadow comparison at that
+    /// hosting decision site), `divergences` the count whose reconcile action set
+    /// differed from the actual behavior's set; the `*_diffs` are per-action
+    /// symmetric-difference tallies. The FLIP is site-by-site (collapse first,
+    /// then renewal), so the counters are split so each site is separately
+    /// gate-able. Monotonic lifetime totals, `None` until the ring's snapshot task
+    /// populates them.
+    ///
+    /// Several divergence classes are EXPECTED BY DESIGN, not anomalies: the
+    /// `retract` / `reroot_search` classes (no on-`main` driver retracts on
+    /// teardown or re-roots on upstream loss), the strict-demand-gated `renew` /
+    /// `subscribe` / `unsubscribe` classes (the controller's strict-farther
+    /// downstream gate and lease-aware `Renew`-vs-`Subscribe` split legitimately
+    /// disagree with today's ANY-downstream renewal path), and `announce` (a
+    /// subscribed, state-present, not-yet-advertised host). Read them as the
+    /// reconcile-vs-today delta. `retract_diffs` in particular reflects the
+    /// missing retraction driver (`is_hosted_locally` is monotonic in production
+    /// today), not a live-advertisement leak.
+    pub reconcile_shadow_collapse_comparisons: Option<u64>,
+    pub reconcile_shadow_collapse_divergences: Option<u64>,
+    pub reconcile_shadow_collapse_subscribe_diffs: Option<u64>,
+    pub reconcile_shadow_collapse_renew_diffs: Option<u64>,
+    pub reconcile_shadow_collapse_unsubscribe_diffs: Option<u64>,
+    pub reconcile_shadow_collapse_collapse_diffs: Option<u64>,
+    pub reconcile_shadow_collapse_announce_diffs: Option<u64>,
+    pub reconcile_shadow_collapse_retract_diffs: Option<u64>,
+    pub reconcile_shadow_collapse_reroot_search_diffs: Option<u64>,
+    pub reconcile_shadow_renewal_comparisons: Option<u64>,
+    pub reconcile_shadow_renewal_divergences: Option<u64>,
+    pub reconcile_shadow_renewal_subscribe_diffs: Option<u64>,
+    pub reconcile_shadow_renewal_renew_diffs: Option<u64>,
+    pub reconcile_shadow_renewal_unsubscribe_diffs: Option<u64>,
+    pub reconcile_shadow_renewal_collapse_diffs: Option<u64>,
+    pub reconcile_shadow_renewal_announce_diffs: Option<u64>,
+    pub reconcile_shadow_renewal_retract_diffs: Option<u64>,
+    pub reconcile_shadow_renewal_reroot_search_diffs: Option<u64>,
     /// Interest-weighted (two-tier) module-cache SHADOW gauges (#4441/#4534),
     /// populated by `Ring` from the same per-node `ModuleCacheMetrics` `Arc`.
     /// These are ALWAYS ON, independent of the `FREENET_MODULE_CACHE_INTEREST_TIERED`
@@ -1182,6 +1221,27 @@ impl Router {
             // singleton on the snapshot cadence.
             upstream_computed_vs_stored_comparisons: None,
             upstream_computed_vs_stored_divergences: None,
+            // Reconcile-controller shadow comparison counters, split per site
+            // (keystone step-2, #4642), populated by Ring from the network_status
+            // singleton on the snapshot cadence.
+            reconcile_shadow_collapse_comparisons: None,
+            reconcile_shadow_collapse_divergences: None,
+            reconcile_shadow_collapse_subscribe_diffs: None,
+            reconcile_shadow_collapse_renew_diffs: None,
+            reconcile_shadow_collapse_unsubscribe_diffs: None,
+            reconcile_shadow_collapse_collapse_diffs: None,
+            reconcile_shadow_collapse_announce_diffs: None,
+            reconcile_shadow_collapse_retract_diffs: None,
+            reconcile_shadow_collapse_reroot_search_diffs: None,
+            reconcile_shadow_renewal_comparisons: None,
+            reconcile_shadow_renewal_divergences: None,
+            reconcile_shadow_renewal_subscribe_diffs: None,
+            reconcile_shadow_renewal_renew_diffs: None,
+            reconcile_shadow_renewal_unsubscribe_diffs: None,
+            reconcile_shadow_renewal_collapse_diffs: None,
+            reconcile_shadow_renewal_announce_diffs: None,
+            reconcile_shadow_renewal_retract_diffs: None,
+            reconcile_shadow_renewal_reroot_search_diffs: None,
             // Interest-weighted (two-tier) module-cache shadow gauges,
             // populated by Ring on the snapshot cadence (#4441/#4534).
             contract_module_cache_cold_evictable_bytes: None,
