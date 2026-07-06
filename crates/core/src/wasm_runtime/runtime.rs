@@ -246,8 +246,17 @@ pub type StateWriteCallback =
 /// it is plumbed via a trait object to keep `wasm_runtime` ring-independent.
 /// The `Err` payload is a human-readable cause string surfaced to the delegate
 /// caller.
+///
+/// The `is_update` flag selects the admission semantics (#4683): `false` for a
+/// V2 PUT (`put_contract_state_sync`) applies the HARD gate (any write that
+/// would push the aggregate over budget is rejected); `true` for a V2 UPDATE
+/// (`update_contract_state_sync`) applies the GROWTH-ONLY gate (a shrinking or
+/// size-holding write is always admitted, even over budget, so a CRDT merge
+/// never blocks convergence — only genuine growth is bounded). This mirrors the
+/// executor-side split between `admit_state_write` (PUT) and
+/// `admit_state_update` (UPDATE / re-PUT merge).
 pub type StateAdmitCallback = Arc<
-    dyn Fn(&freenet_stdlib::prelude::ContractKey, usize) -> Result<(), String>
+    dyn Fn(&freenet_stdlib::prelude::ContractKey, usize, bool) -> Result<(), String>
         + Send
         + Sync
         + 'static,

@@ -589,6 +589,30 @@ impl HostingManager {
         tracker.admit_state_write(key, new_size, budget)
     }
 
+    /// Pre-write admission gate for a state **UPDATE** to an already-hosted
+    /// contract (#4683, PR 4 growth-only rule). Unlike [`Self::admit_state_write`]
+    /// (fresh PUT), a shrinking or size-holding UPDATE (`new_size <= old`) is
+    /// admitted unconditionally — even when the aggregate is over budget —
+    /// because an UPDATE mutates an already-counted footprint and rejecting it
+    /// would stall CRDT convergence without freeing any bytes. Only genuine
+    /// growth is subjected to the aggregate bound. No-op admit when the tracker
+    /// is absent or unseeded, same as [`Self::admit_state_write`].
+    pub(crate) fn admit_state_update(
+        &self,
+        key: &ContractKey,
+        new_size: u64,
+    ) -> Result<(), DiskBudgetExceeded> {
+        let guard = self.disk_tracker.read();
+        let Some(tracker) = guard.as_ref() else {
+            return Ok(());
+        };
+        if !tracker.is_seeded() {
+            return Ok(());
+        }
+        let budget = self.disk_budget_bytes.load(Ordering::Relaxed);
+        tracker.admit_state_update(key, new_size, budget)
+    }
+
     /// Pre-write admission gate for a newly-stored (deduped) WASM code blob
     /// (#4683, PR 3): reject if charging `blob_len` on top of current aggregate
     /// usage would exceed the disk budget. Caller invokes this ONLY for a blob
@@ -696,6 +720,27 @@ impl HostingManager {
     pub(crate) fn record_state_removed(&self, key: &ContractKey) {
         if let Some(tracker) = self.disk_tracker.read().as_ref() {
             tracker.record_state_removed(key);
+        }
+    }
+
+    /// Charge a newly-written (deduped) WASM code blob to the disk tracker on the
+    /// post-store success path (#4683). Live-accounts wasm between 60s du-walks
+    /// so a burst of distinct-code PUTs can't overrun the budget within a sweep
+    /// window, and so the state gate on the same PUT sees the wasm just stored.
+    /// No-op when the tracker is absent. Caller charges exactly once per
+    /// newly-written blob (dedup handled at the call site via `fetch_contract_code`).
+    pub(crate) fn record_wasm_write(&self, blob_len: u64) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.record_wasm_write(blob_len);
+        }
+    }
+
+    /// Subtract a WASM code blob's contribution from the disk tracker on contract
+    /// removal (#4683). Mirror of [`Self::record_wasm_write`]. No-op when the
+    /// tracker is absent.
+    pub(crate) fn record_wasm_removed(&self, blob_len: u64) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.record_wasm_removed(blob_len);
         }
     }
 
@@ -5713,5 +5758,64 @@ mod tests {
             .state_bytes;
         assert_eq!(before, after, "rejected admit must not move state_bytes");
         assert_eq!(before, 200 * MIB);
+    }
+
+    /// #4683 finding #1 regression: on a disk-constrained node the aggregate can
+    /// legitimately sit OVER the disk budget (disk_budget = clamp(0.5*(used+avail),
+    /// MIN, MAX) can be < used when free space is scarce). In that state a
+    /// shrinking or size-holding UPDATE must still be admitted — the hard PUT gate
+    /// (`admit_state_write`) would reject it, stalling CRDT convergence, but the
+    /// growth-only UPDATE gate (`admit_state_update`) admits it. Only genuine
+    /// growth stays bounded.
+    #[test]
+    fn admit_state_update_shrinking_over_budget_admits() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let manager = HostingManager::new(64 * GIB);
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        // Seed used = 400 MiB across two keys.
+        manager.seed_disk_tracker_for_test([
+            (make_contract_key(1), 200 * MIB),
+            (make_contract_key(2), 200 * MIB),
+        ]);
+        // available small so disk_budget = 0.5*(400+0) = 200 MiB but the MIN
+        // floor (128 MiB) is below that → 200 MiB installed, while used = 400 MiB.
+        // The node is now OVER budget (400 > 200).
+        manager.recompute_effective_budget(0);
+        let budget = manager.disk_budget_bytes();
+        assert!(
+            manager.disk_usage_stats().unwrap().total_bytes > budget,
+            "test precondition: node must be over budget (used {} > budget {budget})",
+            manager.disk_usage_stats().unwrap().total_bytes
+        );
+
+        // Hard PUT gate rejects a shrinking write of key(1) to 100 MiB
+        // (projected = 400 − 200 + 100 = 300 MiB > 200 MiB budget)...
+        assert!(
+            manager
+                .admit_state_write(&make_contract_key(1), 100 * MIB)
+                .is_err(),
+            "hard gate would reject the shrink and stall convergence"
+        );
+        // ...but the growth-only UPDATE gate admits it (delta = 100 − 200 <= 0).
+        assert!(
+            manager
+                .admit_state_update(&make_contract_key(1), 100 * MIB)
+                .is_ok(),
+            "shrinking UPDATE must admit even over budget (convergence safety)"
+        );
+        // A size-holding UPDATE (delta == 0) also admits over budget.
+        assert!(
+            manager
+                .admit_state_update(&make_contract_key(1), 200 * MIB)
+                .is_ok()
+        );
+        // Genuine growth of key(1) beyond its current size is still bounded.
+        assert!(
+            manager
+                .admit_state_update(&make_contract_key(1), 300 * MIB)
+                .is_err(),
+            "growth over budget must still reject"
+        );
     }
 }
