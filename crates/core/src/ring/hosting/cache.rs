@@ -190,12 +190,14 @@ pub(crate) struct HostingCacheStats {
     /// cadence and recover the windowed mean. Answers "HOW YOUNG do seeds die?" —
     /// a small mean means seeds are evicted almost immediately after the PUT.
     pub evicted_unread_age_secs_sum: u64,
-    /// Monotonic count of OOM-valve evictions — subscribed (`subscriber_count >=
-    /// 1`) contracts shed under [`MemoryPressure::Overflow`], piercing the
-    /// in-use pin. The Overflow trigger is intentionally unwired in production
-    /// (see [`MemoryPressure`]), so this stays 0 in the field today; once the
-    /// RSS trigger is plumbed, a nonzero differenced rate is the alarm that the
-    /// node is shedding real subscriber demand to avoid OOM.
+    /// Monotonic count of OOM-valve evictions — any eviction performed under
+    /// [`MemoryPressure::Overflow`] (counted by pressure, so a concurrent
+    /// subscription change cannot perturb it). Under Overflow the sweep sheds
+    /// fewest-subscriber-first and pierces the in-use pin, so these MAY be
+    /// subscribed contracts shed to avoid OOM. The Overflow trigger is
+    /// intentionally unwired in production (see [`MemoryPressure`]), so this
+    /// stays 0 in the field today; once the RSS trigger is plumbed, a nonzero
+    /// differenced rate is the alarm that the node is shedding to avoid OOM.
     pub oom_valve_evictions_total: u64,
 }
 
@@ -295,6 +297,21 @@ pub enum MemoryPressure {
     /// (a genuine RSS/A1 resource signal) is intentionally unwired for this PR,
     /// so only the valve-mechanism unit tests construct `Overflow`. Remove the
     /// allow when the trigger is plumbed in a later, separately-validated step.
+    ///
+    /// OWED when the trigger is wired (NOT done here — the mechanism is
+    /// deliberately unwired this release):
+    /// 1. **Rank the valve by the LEASE-FILTERED downstream count**
+    ///    (`HostingManager::downstream_subscriber_peers`, which drops leases
+    ///    older than `SUBSCRIPTION_LEASE_DURATION`), NOT the unfiltered
+    ///    `subscriber_count` used for the normal-op pin. The unfiltered count
+    ///    includes stale-unswept leases, which is fine for the pin (it must equal
+    ///    `contract_in_use`) but would let the valve mis-rank "real demand" when
+    ///    it is actually shedding under overflow.
+    /// 2. **Clean up the shed contract's subscription state.** Valve-evicting a
+    ///    subscribed contract MUST also remove its `client_subscriptions` /
+    ///    `downstream_subscribers` entries, or `subscriber_count` immediately
+    ///    reports it in-use again and the eviction is undone in practice
+    ///    (the entry is gone from the cache but still pinned by phantom demand).
     #[cfg_attr(not(test), allow(dead_code))]
     Overflow,
 }
@@ -328,11 +345,15 @@ pub struct HostedContract {
     /// TTL gate (an entry is not eviction-eligible until `min_ttl` since this).
     pub last_accessed: Instant,
     /// Monotonic access sequence number stamped on every access (insert / read /
-    /// seed / touch). Retained as the dashboard display order and a stable
-    /// per-entry stamp; the EVICTION tiebreak is now [`Self::last_get_seq`]
-    /// (real-GET recency), not this. A dedicated counter, not `last_accessed`,
-    /// so the ordering is exact even when several accesses share a mock-clock
-    /// instant.
+    /// seed / touch).
+    ///
+    /// UNUSED, pending deletion: it was the old eviction tiebreak, which the
+    /// subscriber-primary rework (#4642) replaced with [`Self::last_get_seq`]
+    /// (real-GET recency). No production reader remains (only a `#[cfg(test)]`
+    /// assertion via the `get()` accessor keeps it from tripping dead-code). It
+    /// is still maintained here to avoid churning the write sites in this PR;
+    /// slated for removal with the rest of the demoted machinery once
+    /// subscriber-primary is field-validated. Do NOT add new readers.
     pub last_access_seq: u64,
     /// Monotonic access sequence at this entry's most recent **real GET read**
     /// — the eviction recency tiebreak (subscriber-primary rework, #4642).
@@ -507,13 +528,16 @@ pub struct HostingCache<T: TimeSource> {
     /// Running sum (whole seconds) of the age-at-eviction of unread-seed evictions.
     /// See [`HostingCacheStats::evicted_unread_age_secs_sum`].
     evicted_unread_age_secs_sum: u64,
-    /// Monotonic count of evictions performed by the OOM valve — i.e. under
-    /// [`MemoryPressure::Overflow`], where a subscribed (`subscriber_count >= 1`)
-    /// contract was shed, piercing the in-use pin. Because the Overflow trigger
-    /// is intentionally unwired in production (see [`MemoryPressure`]), this
-    /// stays 0 in the field today; it is exercised only by the valve-mechanism
-    /// unit tests and, once the RSS trigger is plumbed, becomes the alarm for
-    /// how often the node is shedding real demand to avoid OOM.
+    /// Monotonic count of evictions performed by the OOM valve — i.e. any
+    /// eviction under [`MemoryPressure::Overflow`], counted by PRESSURE (not by
+    /// the victim's subscriber count) so a concurrent subscription change can
+    /// never perturb it. Under Overflow the sweep sheds fewest-subscriber-first
+    /// and pierces the in-use pin, so these evictions MAY be subscribed
+    /// contracts (real demand) shed to avoid OOM. Because the Overflow trigger is
+    /// intentionally unwired in production (see [`MemoryPressure`]), this stays 0
+    /// in the field today; it is exercised only by the valve-mechanism unit tests
+    /// and, once the RSS trigger is plumbed, becomes the alarm for how often the
+    /// node is shedding to avoid OOM.
     oom_valve_evictions_total: u64,
     /// Time source for testability
     time_source: T,
@@ -602,17 +626,28 @@ impl<T: TimeSource> HostingCache<T> {
         // - AtCapacity: past-TTL AND zero-subscriber (subscribed = pinned).
         // - Overflow (OOM valve): every entry — pierce the in-use pin AND
         //   bypass min_ttl to survive genuine RAM overflow.
+        //
+        // `subscriber_count(key)` reads the unlocked subscription DashMaps, so it
+        // is evaluated EXACTLY ONCE per entry here and reused for both the filter
+        // decision and the sort key. Reading it twice (once to filter, once to
+        // build the sort key) would open a TOCTOU window: a subscription
+        // registered between the two reads could make an entry that passed the
+        // `== 0` AtCapacity filter carry `subs >= 1` in the sort key. (The valve
+        // counter is separately made airtight below by gating on `pressure`.)
         let mut candidates: Vec<(ContractKey, usize, u64)> = self
             .contracts
             .iter()
-            .filter(|(key, entry)| match pressure {
-                MemoryPressure::AtCapacity => {
-                    let age = now.saturating_duration_since(entry.last_accessed);
-                    age >= self.min_ttl && subscriber_count(key) == 0
-                }
-                MemoryPressure::Overflow => true,
+            .filter_map(|(key, entry)| {
+                let subs = subscriber_count(key);
+                let eligible = match pressure {
+                    MemoryPressure::AtCapacity => {
+                        let age = now.saturating_duration_since(entry.last_accessed);
+                        age >= self.min_ttl && subs == 0
+                    }
+                    MemoryPressure::Overflow => true,
+                };
+                eligible.then_some((*key, subs, entry.last_get_seq))
             })
-            .map(|(key, entry)| (*key, subscriber_count(key), entry.last_get_seq))
             .collect();
 
         // Ascending by subscriber_count (fewest first), then by last_get_seq
@@ -626,17 +661,22 @@ impl<T: TimeSource> HostingCache<T> {
         });
 
         let mut evicted = Vec::new();
-        for (key, sub_count, _) in candidates {
+        for (key, _subs, _) in candidates {
             if self.current_bytes <= self.budget_bytes {
                 break; // back under budget, stop evicting
             }
             if let Some(entry) = self.contracts.remove(&key) {
                 self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
                 self.budget_evictions_total = self.budget_evictions_total.saturating_add(1);
-                if sub_count >= 1 {
-                    // Only reachable under Overflow (AtCapacity filters out any
-                    // subscribed contract): the OOM valve pierced the in-use pin
-                    // and shed a subscribed contract to relieve genuine overflow.
+                // Count OOM-valve evictions by PRESSURE, not by the entry's
+                // subscriber count. Gating on `pressure == Overflow` is airtight:
+                // it cannot be perturbed by a concurrent subscription change, so
+                // the "stays 0 in the field while the Overflow trigger is unwired"
+                // guarantee holds by construction. (Under Overflow the sweep sheds
+                // fewest-subscriber-first, so these evictions MAY be subscribed
+                // contracts — the valve piercing the in-use pin — which is exactly
+                // the riskiest behavior this counter exists to surface.)
+                if matches!(pressure, MemoryPressure::Overflow) {
                     self.oom_valve_evictions_total =
                         self.oom_valve_evictions_total.saturating_add(1);
                 }
@@ -1226,13 +1266,13 @@ impl<T: TimeSource> HostingCache<T> {
             // Assigned a proper order by `finalize_loading` once all entries are
             // loaded (sorted by persisted recency). Temporary 0 until then.
             last_access_seq: 0,
-            // Also assigned by `finalize_loading` in persisted-recency order, so
-            // a restart doesn't scramble the eviction order into an arbitrary
-            // key-byte tiebreak (all-zero last_get_seq). This is a restart-
-            // stability approximation: persisted recency is last-ACCESS recency,
-            // which may reflect a PUT rather than a GET, but it preserves the
-            // pre-restart eviction order rather than resetting it. A live GET
-            // after restart re-stamps it to a true real-GET value.
+            // Reloaded entries stay at 0 ("never GET-read since restart") and are
+            // NOT re-stamped by `finalize_loading`: persistence records only a
+            // generic last-ACCESS time that can't distinguish a real GET from a
+            // PUT/SUBSCRIBE, so stamping real-GET recency from it would fabricate
+            // demand (a never-read PUT seed out-surviving a genuinely GET-read
+            // entry). A live GET after restart re-stamps it to a true value. See
+            // `finalize_loading`.
             last_get_seq: 0,
             // Loaded entries start at the caller-supplied cold demand (the
             // distance prior when this peer's location is known at load, else
@@ -1292,18 +1332,21 @@ impl<T: TimeSource> HostingCache<T> {
         )
     }
 
-    /// Finalize bulk loading: assign each loaded entry an access sequence in
-    /// persisted-recency order (oldest last-access -> lowest sequence), so the
-    /// eviction tiebreak evicts the least-recently-accessed loaded contract
-    /// first — the same recency ordering the old LRU load path produced. The
-    /// running access counter is advanced past the assigned range so subsequent
-    /// live accesses keep sorting after loaded entries.
+    /// Finalize bulk loading: assign each loaded entry a general access sequence
+    /// (`last_access_seq`) in persisted-recency order, advancing the running
+    /// access counter past the assigned range so subsequent live accesses keep
+    /// sorting after loaded entries.
     ///
-    /// Both `last_access_seq` and `last_get_seq` (the eviction recency key) are
-    /// stamped to the same persisted-recency sequence, so a restart preserves
-    /// the pre-restart eviction order instead of collapsing every reloaded
-    /// entry to an all-zero `last_get_seq` (which would then evict by arbitrary
-    /// key bytes). See the `last_get_seq` note in `load_persisted_entry_with_demand`.
+    /// It deliberately does NOT stamp `last_get_seq` (the eviction recency key):
+    /// persistence records only a generic LAST-ACCESS time, which does not
+    /// distinguish a real GET from a PUT/SUBSCRIBE, so stamping `last_get_seq`
+    /// from it would FABRICATE real-GET recency — a never-GET-read PUT seed
+    /// persisted just before restart would then out-survive an entry that had
+    /// genuine GET demand. Instead every reloaded entry keeps `last_get_seq == 0`
+    /// (treated as "never GET-read since restart"); a live GET after restart
+    /// re-stamps it to a real value. Reloaded entries therefore tie at the front
+    /// of the eviction order (0), broken by key bytes, until a real GET lifts
+    /// them out — the conservative, non-fabricating choice.
     ///
     /// Call this after `load_persisted_entry` calls are complete.
     pub fn finalize_loading(&mut self) {
@@ -1318,7 +1361,6 @@ impl<T: TimeSource> HostingCache<T> {
             let seq = self.next_seq();
             if let Some(entry) = self.contracts.get_mut(&key) {
                 entry.last_access_seq = seq;
-                entry.last_get_seq = seq;
             }
         }
     }
@@ -2278,6 +2320,57 @@ mod tests {
         assert_eq!(
             stats.evicted_unread_age_secs_sum, 0,
             "no age is recorded for a reloaded (non-unread-seed) eviction"
+        );
+    }
+
+    /// Restart must NOT fabricate real-GET recency (#4642 review fix): a reloaded
+    /// entry keeps `last_get_seq == 0` regardless of its persisted access type,
+    /// because persistence records only a generic last-ACCESS time and cannot
+    /// distinguish a real GET from a PUT/SUBSCRIBE. Stamping `last_get_seq` from
+    /// last-access order would let a never-GET-read PUT seed out-survive an entry
+    /// with genuine GET demand after a restart.
+    #[test]
+    fn reloaded_entry_has_zero_get_recency_regardless_of_access_type() {
+        let (mut cache, _) = make_cache(10_000, Duration::from_secs(60));
+        let put_seed = make_key(1);
+        let subscribed = make_key(2);
+
+        // Both reloaded from persistence with different pre-restart access types
+        // and different persisted recency (so finalize_loading's last_access_seq
+        // ordering differs) — neither may fabricate a nonzero last_get_seq.
+        cache.load_persisted_entry(
+            put_seed,
+            100,
+            AccessType::Put,
+            Duration::from_secs(30),
+            false,
+        );
+        cache.load_persisted_entry(
+            subscribed,
+            100,
+            AccessType::Subscribe,
+            Duration::from_secs(10),
+            false,
+        );
+        cache.finalize_loading();
+
+        assert_eq!(
+            cache.get(&put_seed).unwrap().last_get_seq,
+            0,
+            "a reloaded PUT entry must have last_get_seq == 0 (never GET-read since restart)"
+        );
+        assert_eq!(
+            cache.get(&subscribed).unwrap().last_get_seq,
+            0,
+            "a reloaded SUBSCRIBE entry must also have last_get_seq == 0"
+        );
+
+        // A real GET after restart re-stamps it to a genuine (nonzero) value,
+        // lifting it out of the never-GET-read front of the eviction order.
+        cache.record_access(put_seed, 100, AccessType::Get, 0, |_| 0);
+        assert!(
+            cache.get(&put_seed).unwrap().last_get_seq > 0,
+            "a real GET after restart must re-stamp last_get_seq to a real value"
         );
     }
 

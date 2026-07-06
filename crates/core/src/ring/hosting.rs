@@ -1773,10 +1773,15 @@ impl HostingManager {
 
     /// Sweep for expired entries in the hosting cache.
     ///
-    /// Contracts are protected from eviction while `contract_in_use` returns
-    /// true — i.e. they have client subscriptions, downstream subscribers, or
-    /// an active upstream network subscription. This is the same predicate
-    /// used by `record_contract_access`, so all eviction paths agree.
+    /// Under normal (`AtCapacity`) pressure a contract is PINNED — never evicted
+    /// — while `subscriber_count(key) >= 1`, i.e. it has client subscriptions OR
+    /// downstream subscribers (the two sources `contract_in_use` checks; note an
+    /// active *upstream* network subscription is deliberately NOT one of them —
+    /// see `contract_in_use`). This is the same `subscriber_count` closure
+    /// `record_contract_access` passes, so all eviction paths agree. Only the OOM
+    /// valve (`MemoryPressure::Overflow`) pierces this pin, and its trigger is
+    /// intentionally unwired in production (see `cache::MemoryPressure`), so
+    /// nothing sheds a subscribed contract in the field yet.
     /// The downstream subscriber exemption is time-bounded: stale entries are
     /// removed by `expire_stale_downstream_subscribers()` (called periodically)
     /// after `SUBSCRIPTION_LEASE_DURATION` without renewal.

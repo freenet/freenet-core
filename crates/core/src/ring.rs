@@ -2537,8 +2537,11 @@ impl Ring {
             }
 
             // Clean up local subscription state for each expired contract.
-            // Note: contracts with client subscriptions are protected from eviction
-            // by the should_retain predicate in sweep_expired_hosting().
+            // Note: contracts with subscribers (client subscriptions or
+            // downstream subscribers) are PINNED from eviction by the
+            // subscriber_count closure in sweep_expired_hosting() under normal
+            // AtCapacity pressure; only the deliberately-unwired OOM valve
+            // (MemoryPressure::Overflow) can pierce that pin.
             // The `expected_generation` snapshot is captured atomically with
             // the eviction decision in `HostingCache::record_access` /
             // `sweep_expired`; it is re-checked at deletion time by
