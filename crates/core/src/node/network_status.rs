@@ -262,6 +262,12 @@ pub enum ReconcileShadowSite {
 ///   legitimately disagree with today's ANY-downstream, renew-everything path.
 /// - `announce`: a subscribed, state-present, not-yet-advertised host.
 ///
+/// RENEWAL-site reading: the recorded "actual" is what production did THIS TICK,
+/// so a contract the loop SKIPPED or DEFERRED (banned, spam-backoff, already
+/// pending) records `{}`. A `renew` / `subscribe` diff therefore also counts
+/// contracts the controller would keep alive but production merely deferred this
+/// tick — the intended per-tick reading, not a bug.
+///
 /// `retract_diffs` CAVEAT: it measures collapse/renewal of a contract that was
 /// EVER announced, not one with a currently-live advertisement — `is_advertised`
 /// (`NeighborHostingManager::is_hosted_locally`) is effectively MONOTONIC in
