@@ -398,6 +398,11 @@ pub(super) struct DelegateCallEnv {
     /// without this hook the V2 path leaves the race open. See
     /// `super::runtime::StateWriteCallback`.
     state_write_callback: Option<super::runtime::StateWriteCallback>,
+    /// Pre-write disk-budget admission gate for V2 delegate writes (#4683,
+    /// PR 3). Runs BEFORE the raw `Storage` write in
+    /// `put_contract_state_sync` / `update_contract_state_sync` and can abort
+    /// it. See `super::runtime::StateAdmitCallback`.
+    state_admit_callback: Option<super::runtime::StateAdmitCallback>,
     /// Interior-mutable pointer to the runtime's DelegateStore. Valid only during
     /// synchronous `process()` call. Used for creating child delegates.
     delegate_store: std::cell::UnsafeCell<*mut DelegateStore>,
@@ -434,6 +439,8 @@ pub(super) enum DelegateEnvError {
     NoExistingState,
     /// ReDb read/write error.
     StorageError(String),
+    /// Pre-write disk-budget admission gate rejected the V2 write (#4683).
+    DiskBudgetExceeded(String),
 }
 
 /// Errors that can occur during delegate creation via `create_delegate_sync`.
@@ -466,6 +473,7 @@ impl DelegateCallEnv {
         contract_store: &ContractStore,
         state_store_db: Option<Storage>,
         state_write_callback: Option<super::runtime::StateWriteCallback>,
+        state_admit_callback: Option<super::runtime::StateAdmitCallback>,
         delegate_key: DelegateKey,
         delegate_store: &mut DelegateStore,
         creation_depth: u32,
@@ -480,6 +488,7 @@ impl DelegateCallEnv {
             contract_store: contract_store as *const ContractStore,
             state_store_db,
             state_write_callback,
+            state_admit_callback,
             delegate_store: std::cell::UnsafeCell::new(delegate_store as *mut DelegateStore),
             creation_depth,
             creations_this_call: std::cell::Cell::new(0),
@@ -714,6 +723,16 @@ impl DelegateCallEnv {
         // would silently undercount StateBytesWritten for V2 delegate PUT.
         let state_size = state.len();
 
+        // Disk-budget admission gate (#4683, PR 3): the V2 path bypasses the
+        // executor `state_store` chokepoint where the gate normally runs, so
+        // apply it here BEFORE the raw write. On rejection nothing lands, so no
+        // rollback is needed. No-op admit until the disk tracker is seeded.
+        if let Some(admit) = &self.state_admit_callback {
+            if let Err(cause) = admit(&contract_key, state_size) {
+                return Err(DelegateEnvError::DiskBudgetExceeded(cause));
+            }
+        }
+
         db.store_state_sync(
             &contract_key,
             freenet_stdlib::prelude::WrappedState::new(state),
@@ -750,6 +769,15 @@ impl DelegateCallEnv {
         // Capture byte count BEFORE the move — same reason as
         // put_contract_state_sync above.
         let state_size = state.len();
+
+        // Disk-budget admission gate (#4683, PR 3): apply the executor-chokepoint
+        // gate that the V2 path bypasses, BEFORE the raw write. Nothing lands on
+        // rejection. No-op admit until the disk tracker is seeded.
+        if let Some(admit) = &self.state_admit_callback {
+            if let Err(cause) = admit(&contract_key, state_size) {
+                return Err(DelegateEnvError::DiskBudgetExceeded(cause));
+            }
+        }
 
         // Atomic check-and-write in a single ReDb write transaction.
         match db.update_state_sync(
@@ -1692,6 +1720,9 @@ pub(super) mod delegate_contracts {
                 contract_error_codes::ERR_CONTRACT_NOT_FOUND as i64
             }
             DelegateEnvError::StorageError(_) => contract_error_codes::ERR_STORE_ERROR as i64,
+            // A disk-budget rejection is a store-capacity failure from the
+            // delegate's perspective — map to the generic store-error code.
+            DelegateEnvError::DiskBudgetExceeded(_) => contract_error_codes::ERR_STORE_ERROR as i64,
         }
     }
 

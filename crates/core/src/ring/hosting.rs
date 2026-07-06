@@ -68,8 +68,8 @@ pub(crate) use cache::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES}
 use cache::{DEFAULT_MIN_TTL, HostingCache, HostingCacheStats, disk_budget_for_clamped};
 use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
-pub(crate) use disk_usage::DiskUsageStats;
 use disk_usage::DiskUsageTracker;
+pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -381,6 +381,15 @@ pub(crate) struct HostingManager {
     /// Hard upper clamp (bytes) for the disk budget (#4683), the `--max-hosting-disk`
     /// override. Defaults to [`cache::DEFAULT_MAX_HOSTING_DISK_BYTES`].
     max_hosting_disk_bytes: AtomicU64,
+
+    /// Last aggregate disk budget computed by [`Self::recompute_effective_budget`]
+    /// (#4683, PR 3 admission gate). This is the *aggregate* bound the pre-write
+    /// gate checks projected disk against — distinct from the effective eviction
+    /// floor `min(ram, disk)` that governs the state cache. Initialised to
+    /// `u64::MAX` so the gate admits everything until the first 60s recompute
+    /// installs a real value (the tracker is also unseeded before then, so the
+    /// gate is a no-op regardless).
+    disk_budget_bytes: AtomicU64,
 }
 
 impl HostingManager {
@@ -427,6 +436,7 @@ impl HostingManager {
             ram_budget_bytes: AtomicU64::new(budget_bytes),
             disk_pct_bits: AtomicU64::new(DEFAULT_HOSTING_DISK_PCT.to_bits()),
             max_hosting_disk_bytes: AtomicU64::new(DEFAULT_MAX_HOSTING_DISK_BYTES),
+            disk_budget_bytes: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -549,11 +559,65 @@ impl HostingManager {
         let ram = self.ram_budget_bytes.load(Ordering::Relaxed);
         let disk_budget =
             disk_budget_for_clamped(used, available, pct, MIN_DEFAULT_HOSTING_BUDGET_BYTES, cap);
+        // Publish the aggregate disk budget for the PR-3 admission gate. The gate
+        // checks projected disk against THIS value (the aggregate bound), not the
+        // effective floor installed on the cache below.
+        self.disk_budget_bytes.store(disk_budget, Ordering::Relaxed);
         let effective = ram.min(disk_budget);
         // O(1) under the cache write lock; the expensive du-walk already ran
         // OUTSIDE any lock before this call.
         self.hosting_cache.write().set_budget_bytes(effective);
         Some(effective)
+    }
+
+    /// Pre-write admission gate for a state write (#4683, PR 3): reject the write
+    /// if replacing `key`'s tracked state size with `new_size` would push
+    /// aggregate on-disk usage past the current disk budget. Read-only; the
+    /// `+delta` is applied later by [`Self::record_state_write`] on the post-write
+    /// success path.
+    ///
+    /// No-op admit (`Ok`) when the tracker is absent or unseeded: before the first
+    /// 60s recompute the aggregate is not yet meaningful and `disk_budget_bytes`
+    /// is `u64::MAX`, so early-startup writes are never spuriously rejected.
+    pub(crate) fn admit_state_write(
+        &self,
+        key: &ContractKey,
+        new_size: u64,
+    ) -> Result<(), DiskBudgetExceeded> {
+        let guard = self.disk_tracker.read();
+        let Some(tracker) = guard.as_ref() else {
+            return Ok(());
+        };
+        if !tracker.is_seeded() {
+            return Ok(());
+        }
+        let budget = self.disk_budget_bytes.load(Ordering::Relaxed);
+        tracker.admit_state_write(key, new_size, budget)
+    }
+
+    /// Pre-write admission gate for a newly-stored (deduped) WASM code blob
+    /// (#4683, PR 3): reject if charging `blob_len` on top of current aggregate
+    /// usage would exceed the disk budget. Caller invokes this ONLY for a blob
+    /// that is not already on disk (a re-PUT of existing code adds nothing).
+    /// No-op admit when the tracker is absent or unseeded, same as
+    /// [`Self::admit_state_write`].
+    pub(crate) fn admit_wasm_write(&self, blob_len: u64) -> Result<(), DiskBudgetExceeded> {
+        let guard = self.disk_tracker.read();
+        let Some(tracker) = guard.as_ref() else {
+            return Ok(());
+        };
+        if !tracker.is_seeded() {
+            return Ok(());
+        }
+        let budget = self.disk_budget_bytes.load(Ordering::Relaxed);
+        tracker.admit_wasm_write(blob_len, budget)
+    }
+
+    /// The current aggregate disk budget the admission gate checks against
+    /// (#4683). `u64::MAX` until the first 60s recompute installs a real value.
+    #[cfg(test)]
+    pub(crate) fn disk_budget_bytes(&self) -> u64 {
+        self.disk_budget_bytes.load(Ordering::Relaxed)
     }
 
     /// Lazily seed the disk tracker on first use (like the hosting-cache
@@ -5721,5 +5785,99 @@ mod tests {
         // Sanity: after the storm the cache budget is a valid min(ram, disk).
         let b = manager.hosting_budget_bytes();
         assert!(b <= 4 * GIB, "effective budget never exceeds the RAM floor");
+    }
+
+    // --- Admission gate: HostingManager level (#4683, PR 3) -------------------
+
+    /// Before the first recompute the aggregate disk budget is `u64::MAX` and the
+    /// tracker may be unseeded, so the gate admits everything — early-startup
+    /// writes are never spuriously rejected.
+    #[test]
+    fn admit_is_noop_before_recompute_and_seed() {
+        let manager = HostingManager::new(1024 * 1024 * 1024);
+        // No tracker at all → admit.
+        assert!(
+            manager
+                .admit_state_write(&make_contract_key(1), 999)
+                .is_ok()
+        );
+        assert!(manager.admit_wasm_write(999).is_ok());
+        // Tracker seeded but no recompute yet → disk_budget_bytes is u64::MAX,
+        // so still admit even a huge write.
+        manager.seed_disk_tracker_for_test(std::iter::empty());
+        assert_eq!(manager.disk_budget_bytes(), u64::MAX);
+        assert!(
+            manager
+                .admit_state_write(&make_contract_key(1), u64::MAX / 2)
+                .is_ok()
+        );
+    }
+
+    /// After a recompute installs a real aggregate disk budget, the gate enforces
+    /// it: a projected-over-budget write rejects, a projected-at-budget write
+    /// admits. Drives a known `used` + injected `available` so the disk budget is
+    /// deterministic (no filesystem).
+    #[test]
+    fn admit_enforces_recomputed_disk_budget() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // RAM budget huge so the effective floor never masks the disk budget.
+        let manager = HostingManager::new(64 * GIB);
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        // Seed used = 200 MiB across one key.
+        manager.seed_disk_tracker_for_test([(make_contract_key(1), 200 * MIB)]);
+        // available = 200 MiB → disk_budget = 0.5*(200+200) MiB = 200 MiB, but
+        // the MIN floor (128 MiB) is below that so the raw 200 MiB stands.
+        let budget = manager
+            .recompute_effective_budget(200 * MIB)
+            .map(|_| manager.disk_budget_bytes())
+            .expect("seeded → recompute runs");
+        assert_eq!(budget, 200 * MIB, "disk budget = pct*(used+available)");
+
+        // Current used = 200 MiB. A fresh PUT of key(2) sized so projected ==
+        // budget admits: projected = 200 + new == 200 MiB → new = 0 admits; new
+        // that makes projected exactly budget is the boundary. Use headroom = 0.
+        // A write of 0 extra bytes trivially admits.
+        assert!(manager.admit_state_write(&make_contract_key(2), 0).is_ok());
+        // Any positive fresh write pushes projected over the (already-at) budget.
+        let err = manager
+            .admit_state_write(&make_contract_key(2), 1)
+            .expect_err("projected 200MiB+1 > budget 200MiB rejects");
+        assert_eq!(err.projected_bytes, 200 * MIB + 1);
+        assert_eq!(err.budget_bytes, 200 * MIB);
+
+        // An UPDATE that shrinks key(1) always admits (delta <= 0), even at the
+        // budget ceiling.
+        assert!(
+            manager
+                .admit_state_write(&make_contract_key(1), 100 * MIB)
+                .is_ok()
+        );
+    }
+
+    /// A rejected admit must not mutate the tracker (deferred-delta discipline):
+    /// the counter only moves on the post-write success path via
+    /// `record_state_write`, so a rejected write leaves no phantom bytes.
+    #[test]
+    fn rejected_admit_does_not_change_tracked_bytes() {
+        const MIB: u64 = 1024 * 1024;
+        let manager = HostingManager::new(64 * 1024 * MIB);
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        manager.seed_disk_tracker_for_test([(make_contract_key(1), 200 * MIB)]);
+        manager.recompute_effective_budget(200 * MIB);
+        let before = manager
+            .disk_usage_stats()
+            .expect("tracker present")
+            .state_bytes;
+        assert!(
+            manager.admit_state_write(&make_contract_key(2), 1).is_err(),
+            "the write under test must be rejected for this assertion to be meaningful"
+        );
+        let after = manager
+            .disk_usage_stats()
+            .expect("tracker present")
+            .state_bytes;
+        assert_eq!(before, after, "rejected admit must not move state_bytes");
+        assert_eq!(before, 200 * MIB);
     }
 }

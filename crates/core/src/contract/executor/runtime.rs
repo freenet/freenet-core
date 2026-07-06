@@ -375,6 +375,20 @@ impl Executor<Runtime> {
                 op_manager.ring.commit_state_write(key, state_size);
             }
         }));
+        // Disk-budget admission gate for the V2 delegate write path (#4683,
+        // PR 3): V2 PUT/UPDATE bypass the executor's `state_store` chokepoints
+        // (and hence the gate installed there), so install the same pre-write
+        // gate here. Returns Err(cause) → the native-API method aborts without
+        // writing. No-op admit until the disk tracker is seeded.
+        let op_manager_for_admit = op_manager.clone();
+        if let Some(op_manager) = op_manager_for_admit {
+            rt.set_state_admit_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
+                op_manager
+                    .ring
+                    .admit_state_write(key, state_size)
+                    .map_err(|over| over.to_string())
+            }));
+        }
         Executor::new(
             state_store,
             move || {
@@ -468,6 +482,18 @@ impl Executor<Runtime> {
                 op_manager.ring.commit_state_write(key, state_size);
             }
         }));
+        // Disk-budget admission gate for the V2 delegate write path (#4683,
+        // PR 3) — see `from_config` for the rationale. Same gate the executor
+        // chokepoints apply, restored for the V2 bypass.
+        let op_manager_for_admit = op_manager.clone();
+        if let Some(op_manager) = op_manager_for_admit {
+            rt.set_state_admit_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
+                op_manager
+                    .ring
+                    .admit_state_write(key, state_size)
+                    .map_err(|over| over.to_string())
+            }));
+        }
         Executor::new(
             shared_state_store,
             || Ok(()),

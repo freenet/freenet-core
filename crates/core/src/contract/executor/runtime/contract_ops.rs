@@ -71,6 +71,22 @@ impl Executor<Runtime> {
 
             // Commit locally
             let written_bytes = new_state.as_ref().len();
+            // Disk-budget admission gate (#4683, PR 3): reject the re-PUT merge
+            // before the store if it would push aggregate disk past the budget.
+            // Nothing has landed → no rollback needed. Rides `PutMsg::Error`.
+            if let Some(op_manager) = &self.op_manager {
+                if let Err(over) = op_manager.ring.admit_state_write(&key, written_bytes) {
+                    tracing::warn!(
+                        contract = %key,
+                        %over,
+                        "Rejecting re-PUT: disk budget exceeded"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: over.to_string().into(),
+                    }));
+                }
+            }
             self.state_store
                 .update(&key, new_state.clone())
                 .await
@@ -323,6 +339,31 @@ impl Executor<Runtime> {
             "starting contract verification and storage"
         );
 
+        // Disk-budget admission gate for the code blob (#4683, PR 3): charge the
+        // blob only if it is not already on disk (dedup — a re-PUT of existing
+        // code adds nothing). Reject before storing; nothing has landed.
+        let code_already_stored = self
+            .runtime
+            .contract_store
+            .fetch_contract(&key, &params)
+            .is_some();
+        if !code_already_stored {
+            if let Some(op_manager) = &self.op_manager {
+                let blob_len = contract.data().len();
+                if let Err(over) = op_manager.ring.admit_wasm_write(blob_len) {
+                    tracing::warn!(
+                        contract = %key,
+                        %over,
+                        "Rejecting PUT: disk budget exceeded (contract code)"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: over.to_string().into(),
+                    }));
+                }
+            }
+        }
+
         // Store contract code in runtime store
         self.runtime
             .contract_store
@@ -374,6 +415,26 @@ impl Executor<Runtime> {
             "storing contract state"
         );
         let written_bytes = state.as_ref().len();
+        // Disk-budget admission gate for the state (#4683, PR 3): reject before
+        // the store. Roll back the contract code we stored above (reuse the same
+        // `remove_contract` rollback the validation-failure paths use) so a
+        // rejected PUT leaves no partial state on disk.
+        if let Some(op_manager) = &self.op_manager {
+            if let Err(over) = op_manager.ring.admit_state_write(&key, written_bytes) {
+                tracing::warn!(
+                    contract = %key,
+                    %over,
+                    "Rejecting PUT: disk budget exceeded"
+                );
+                if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
+                    tracing::warn!(contract = %key, error = %e, "failed to remove contract after disk-budget rejection");
+                }
+                return Err(ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: over.to_string().into(),
+                }));
+            }
+        }
         self.state_store
             .store(key, state, params)
             .await
