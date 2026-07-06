@@ -1628,22 +1628,29 @@ where
             }));
         }
 
-        // Disk-budget admission gate (#4683): UPDATE is a mutation of an
-        // already-hosted, already-counted footprint, NOT a new admission. Use the
-        // GROWTH-ONLY check: a shrinking or size-holding CRDT merge (`delta <= 0`)
-        // is admitted unconditionally, even when the aggregate is over budget —
-        // rejecting it would stall convergence without freeing any bytes, and a
-        // relayed UPDATE rejection is silently dropped (fire-and-forget, no
-        // `UpdateMsg::Error`), so no one would learn of the stall. Only genuine
-        // growth is subjected to the aggregate bound. Fresh PUTs keep the hard
-        // `admit_state_write` gate (they are where new footprints enter and carry
-        // `PutMsg::Error` propagation). Nothing has landed, so no rollback needed.
+        // Disk-budget admission gate (#4683, PR 4): admission control belongs on
+        // admission (PUT), not on mutation (UPDATE). An UPDATE mutates an
+        // already-hosted, already-counted footprint, so `admit_state_update` is
+        // asymmetric to the hard PUT gate: (1) a shrinking or size-holding CRDT
+        // merge (`delta <= 0`) is admitted unconditionally — even over budget —
+        // because rejecting it would stall convergence without freeing any bytes,
+        // and a relayed UPDATE rejection is silently dropped (fire-and-forget, no
+        // `UpdateMsg::Error`), so no one would learn of the stall; (2) genuine
+        // growth over budget is admitted anyway while OTHER low-value contracts
+        // are evicted to make room. Only when there is NOT enough sheddable
+        // capacity (everything else retained/in-use) does this return Err —
+        // option (a): the local client sees this Err; a relayed UPDATE is silently
+        // dropped and the originator reconciles via CRDT/interest-sync. Fresh PUTs
+        // keep the hard `admit_state_write` gate (they are where new footprints
+        // enter and carry `PutMsg::Error` propagation). Nothing has landed here, so
+        // no rollback is needed on the reject.
         if let Some(op_manager) = &self.op_manager {
             if let Err(over) = op_manager.ring.admit_state_update(key, state_size) {
                 tracing::warn!(
                     contract = %key,
                     %over,
-                    "Rejecting UPDATE: disk budget exceeded (growth over budget)"
+                    "Rejecting UPDATE: disk budget exceeded and eviction of other \
+                     low-value contracts could not free enough (growth over budget)"
                 );
                 return Err(ExecutorError::request(StdContractError::Update {
                     key: *key,

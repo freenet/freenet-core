@@ -590,27 +590,94 @@ impl HostingManager {
     }
 
     /// Pre-write admission gate for a state **UPDATE** to an already-hosted
-    /// contract (#4683, PR 4 growth-only rule). Unlike [`Self::admit_state_write`]
-    /// (fresh PUT), a shrinking or size-holding UPDATE (`new_size <= old`) is
-    /// admitted unconditionally — even when the aggregate is over budget —
-    /// because an UPDATE mutates an already-counted footprint and rejecting it
-    /// would stall CRDT convergence without freeing any bytes. Only genuine
-    /// growth is subjected to the aggregate bound. No-op admit when the tracker
-    /// is absent or unseeded, same as [`Self::admit_state_write`].
+    /// contract (#4683, PR 4 growth-only rule with eviction escalation).
+    ///
+    /// **The rule: admission control belongs on admission (PUT), not on mutation
+    /// (UPDATE).** An UPDATE mutates an already-hosted, already-counted footprint;
+    /// it is not a new admission. So this gate is asymmetric to the hard
+    /// [`Self::admit_state_write`] PUT gate on two axes:
+    ///
+    /// 1. **Growth-only.** A shrinking or size-holding UPDATE (`new_size <= old`)
+    ///    is admitted unconditionally — even when the aggregate is already over
+    ///    budget — because rejecting it would stall CRDT convergence without
+    ///    freeing any bytes (the old footprint is already on disk and counted),
+    ///    and for a relayed UPDATE the rejection is silently dropped
+    ///    (fire-and-forget, no `UpdateMsg::Error`) so nothing would even signal
+    ///    the stall. Only genuine growth (`new_size > old`) is bounded at all.
+    ///
+    /// 2. **Evict-others before rejecting.** When genuine growth WOULD exceed the
+    ///    aggregate disk budget, we do NOT reject outright (evicting the contract
+    ///    to fit its own UPDATE would lose it entirely). Instead we admit the
+    ///    growth and shed *other* low-value contracts to make room — the lowest
+    ///    `keep_score`, past-TTL, not-in-use, non-target contracts, exactly the
+    ///    victims the over-budget sweep would pick. Only if there is not enough
+    ///    sheddable capacity (everything else is retained/in-use) does the UPDATE
+    ///    reject — option (a): the local client sees `HostResult::Err`; a relayed
+    ///    UPDATE is silently dropped and the originator reconciles via
+    ///    CRDT/interest-sync.
+    ///
+    /// The shed removes the victims from the hosting cache synchronously and
+    /// queues them for asynchronous on-disk reclamation (the same
+    /// `pending_reclamation` queue the 60s sweep already drains via
+    /// `reclaim_evicted_contract`). Their state bytes drop from the disk tracker
+    /// when that async delete lands, so the admission decision is soft and
+    /// self-correcting: the freed bytes are not visible to the *next* projection
+    /// until reclamation completes, matching the plan's soft-floor framing.
+    ///
+    /// No-op admit when the tracker is absent or unseeded, same as
+    /// [`Self::admit_state_write`].
     pub(crate) fn admit_state_update(
         &self,
         key: &ContractKey,
         new_size: u64,
     ) -> Result<(), DiskBudgetExceeded> {
-        let guard = self.disk_tracker.read();
-        let Some(tracker) = guard.as_ref() else {
-            return Ok(());
+        let over = {
+            let guard = self.disk_tracker.read();
+            let Some(tracker) = guard.as_ref() else {
+                return Ok(());
+            };
+            if !tracker.is_seeded() {
+                return Ok(());
+            }
+            let budget = self.disk_budget_bytes.load(Ordering::Relaxed);
+            match tracker.admit_state_update(key, new_size, budget) {
+                Ok(()) => return Ok(()),
+                Err(over) => over,
+            }
+            // disk_tracker read guard released here before we take the
+            // hosting-cache write lock for the shed (no nested lock order).
         };
-        if !tracker.is_seeded() {
-            return Ok(());
+
+        // Genuine growth over budget. Try to make room by evicting OTHER
+        // low-value contracts rather than rejecting the mutation.
+        let needed = over.projected_bytes.saturating_sub(over.budget_bytes);
+        let evicted = {
+            let mut cache = self.hosting_cache.write();
+            // Not enough sheddable capacity → reject without evicting anything
+            // (a pointless eviction that still overflows helps no one).
+            if cache.evictable_bytes_excluding(key, &|k| self.contract_in_use(k)) < needed {
+                return Err(over);
+            }
+            cache.evict_lowest_value_to_free(needed, key, &|k| self.contract_in_use(k))
+        };
+
+        // Queue each evicted victim for asynchronous on-disk reclamation. The
+        // cache entry is already gone, so nothing else would emit an
+        // `EvictContract` for it — without queueing, its on-disk state/code would
+        // leak. The 60s sweep drains this queue through `reclaim_evicted_contract`
+        // (which re-checks `contract_in_use` and emits the deletion event).
+        for (victim, generation) in &evicted {
+            self.pending_reclamation_add(*victim, *generation);
         }
-        let budget = self.disk_budget_bytes.load(Ordering::Relaxed);
-        tracker.admit_state_update(key, new_size, budget)
+
+        tracing::info!(
+            contract = %key,
+            needed_bytes = needed,
+            evicted_count = evicted.len(),
+            "UPDATE growth over disk budget: admitted, evicted other low-value \
+             contracts to make room (#4683)"
+        );
+        Ok(())
     }
 
     /// Pre-write admission gate for a newly-stored (deduped) WASM code blob
@@ -5811,11 +5878,196 @@ mod tests {
                 .is_ok()
         );
         // Genuine growth of key(1) beyond its current size is still bounded.
+        // There are NO other contracts in the hosting cache to evict here (the
+        // disk tracker was seeded directly, not via the cache), so the eviction
+        // escalation finds nothing to shed and the growth is rejected.
         assert!(
             manager
                 .admit_state_update(&make_contract_key(1), 300 * MIB)
                 .is_err(),
-            "growth over budget must still reject"
+            "growth over budget with no sheddable others must still reject"
+        );
+    }
+
+    // --- UPDATE growth escalation: evict OTHERS, not reject (#4683, PR 4) ------
+
+    /// Advance a shared mock clock and populate the hosting cache with an
+    /// eviction-eligible contract of the given size (past `min_ttl`, no
+    /// subscribers). Helper for the escalation tests.
+    #[cfg(test)]
+    fn seed_evictable_cache_contract(
+        manager: &HostingManager,
+        clock: &crate::util::time_source::SharedMockTimeSource,
+        key: ContractKey,
+        size: u64,
+    ) {
+        // A GET access adds it to the cache at `size` bytes; advancing past
+        // DEFAULT_MIN_TTL makes it past-TTL, and with no client/downstream
+        // subscriber `contract_in_use` is false → eviction-eligible.
+        manager.record_contract_access(key, size, AccessType::Get);
+        clock.advance_time(DEFAULT_MIN_TTL + std::time::Duration::from_secs(1));
+    }
+
+    /// The core PR-4 rule: a growing UPDATE that would exceed the disk budget is
+    /// NOT rejected when there is a DIFFERENT, lower-value contract that can be
+    /// evicted to make room — it is admitted and the other contract is shed.
+    /// Evicting the contract to fit its own UPDATE would lose it entirely, so the
+    /// victim MUST be a different contract, and it must be queued for reclamation.
+    #[test]
+    fn admit_state_update_growth_evicts_other_contract_not_rejects() {
+        use crate::util::time_source::SharedMockTimeSource;
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let clock = SharedMockTimeSource::new();
+        let manager =
+            HostingManager::with_time_source(64 * GIB, std::sync::Arc::new(clock.clone()));
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+
+        // Keep the disk `used` small (target = 100 MiB) so the effective cache
+        // floor stays at the 128 MiB MIN — comfortably above the total bytes we
+        // put in the hosting cache below, so the cache does NOT self-evict our
+        // victims when they are inserted (that eviction floor is a SEPARATE bound
+        // from the aggregate disk budget the admission gate enforces).
+        let target = make_contract_key(1);
+        let victim = make_contract_key(2);
+        manager.seed_disk_tracker_for_test([(target, 100 * MIB)]);
+        // available = 0 → disk_budget = max(0.5*100 MiB, 128 MiB MIN) = 128 MiB.
+        manager.recompute_effective_budget(0);
+        assert_eq!(manager.disk_budget_bytes(), 128 * MIB);
+
+        // Two eviction-eligible OTHER contracts in the cache, 50 MiB each
+        // (total 100 MiB < the 128 MiB cache floor → never self-evicted).
+        seed_evictable_cache_contract(&manager, &clock, victim, 50 * MIB);
+        let victim2 = make_contract_key(3);
+        seed_evictable_cache_contract(&manager, &clock, victim2, 50 * MIB);
+        assert!(
+            manager.pending_reclamation_snapshot().is_empty(),
+            "no reclamations queued before the escalation"
+        );
+
+        // Reject boundary: grow the TARGET 100 → 300 MiB:
+        // projected = 100 − 100 + 300 = 300 MiB > 128 MiB budget → needed = 172
+        // MiB, but only 100 MiB is sheddable (both victims) → reject, evict
+        // nothing (all-or-nothing).
+        assert!(
+            manager.admit_state_update(&target, 300 * MIB).is_err(),
+            "growth needing 172 MiB freed but only 100 MiB sheddable must reject"
+        );
+        assert!(
+            manager.pending_reclamation_snapshot().is_empty(),
+            "a rejected escalation must NOT evict/queue anything (all-or-nothing)"
+        );
+
+        // Admit case: grow the TARGET only to 200 MiB:
+        // projected = 100 − 100 + 200 = 200 MiB > 128 MiB → needed = 72 MiB.
+        // Sheddable others = 100 MiB ≥ 72 MiB → ADMIT + evict enough others.
+        assert!(
+            manager.admit_state_update(&target, 200 * MIB).is_ok(),
+            "growth with enough sheddable others must be admitted, not rejected"
+        );
+        let queued: Vec<ContractKey> = manager
+            .pending_reclamation_snapshot()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            !queued.is_empty(),
+            "the escalation must evict at least one OTHER contract"
+        );
+        assert!(
+            !queued.contains(&target),
+            "the escalation must NEVER evict the contract being updated (would lose it)"
+        );
+        for k in &queued {
+            assert!(
+                *k == victim || *k == victim2,
+                "only the seeded victims are eligible to be evicted"
+            );
+        }
+    }
+
+    /// Escalation reject path: when the ONLY other contract is in-use (has a
+    /// downstream subscriber), it is NOT eligible for eviction, so a growing
+    /// over-budget UPDATE has nothing to shed and rejects. This is the option-(a)
+    /// terminal case (local client → Err; relayed → silently dropped).
+    #[test]
+    fn admit_state_update_growth_rejects_when_only_other_is_in_use() {
+        use crate::util::time_source::SharedMockTimeSource;
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        let clock = SharedMockTimeSource::new();
+        let manager =
+            HostingManager::with_time_source(64 * GIB, std::sync::Arc::new(clock.clone()));
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+
+        let target = make_contract_key(1);
+        let pinned = make_contract_key(2);
+        manager.seed_disk_tracker_for_test([(target, 200 * MIB), (pinned, 200 * MIB)]);
+        manager.recompute_effective_budget(0);
+
+        // The other contract is past-TTL AND large enough to cover the growth,
+        // but it is IN USE (downstream subscriber) → `contract_in_use` true →
+        // NOT eviction-eligible.
+        seed_evictable_cache_contract(&manager, &clock, pinned, 400 * MIB);
+        manager.add_downstream_subscriber(&pinned, make_peer_key(9));
+        assert!(
+            manager.contract_in_use(&pinned),
+            "test precondition: the only other contract must be in use"
+        );
+
+        // Grow target 200 → 300 MiB (needed 300 MiB). The only shed candidate is
+        // retained → escalation cannot free enough → reject.
+        assert!(
+            manager.admit_state_update(&target, 300 * MIB).is_err(),
+            "growth over budget with only an in-use other must reject (option a)"
+        );
+        assert!(
+            manager.pending_reclamation_snapshot().is_empty(),
+            "a rejected escalation must not evict the retained contract"
+        );
+    }
+
+    /// Pin test documenting the PR-4 rule at the gate: admission control belongs
+    /// on admission (PUT), not on mutation (UPDATE). A NON-positive-delta UPDATE
+    /// (shrink or hold) is ALWAYS admitted, even over budget and even with no
+    /// sheddable others — convergence must never block. This is the invariant a
+    /// future refactor must not regress; if it fails, the growth-only asymmetry
+    /// has been lost and CRDT convergence can stall.
+    #[test]
+    fn update_shrink_never_blocks_convergence_pin() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let manager = HostingManager::new(64 * GIB);
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        let key = make_contract_key(1);
+        // Seed WAY over budget with a single large contract and nothing else to
+        // evict — the hostile case for a naive "reject when over budget" gate.
+        manager.seed_disk_tracker_for_test([(key, 10 * GIB)]);
+        manager.recompute_effective_budget(0);
+        assert!(
+            manager.disk_usage_stats().unwrap().total_bytes > manager.disk_budget_bytes(),
+            "test precondition: deeply over budget"
+        );
+
+        // Shrink: delta < 0 → admit unconditionally.
+        assert!(
+            manager.admit_state_update(&key, 5 * GIB).is_ok(),
+            "a shrinking UPDATE must ALWAYS admit (convergence safety) — the rule"
+        );
+        // Hold: delta == 0 → admit unconditionally.
+        assert!(
+            manager.admit_state_update(&key, 10 * GIB).is_ok(),
+            "a size-holding UPDATE must ALWAYS admit — the rule"
+        );
+        // Contrast: a fresh PUT of a NEW contract is the hard-gate path and IS
+        // rejected over budget (admission belongs on admission).
+        assert!(
+            manager
+                .admit_state_write(&make_contract_key(2), MIB)
+                .is_err(),
+            "a fresh PUT keeps the hard admission gate — the asymmetry"
         );
     }
 }

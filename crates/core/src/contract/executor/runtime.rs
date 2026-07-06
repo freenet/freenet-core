@@ -384,8 +384,10 @@ impl Executor<Runtime> {
         if let Some(op_manager) = op_manager_for_admit {
             rt.set_state_admit_callback(Arc::new(
                 move |key: &ContractKey, state_size: usize, is_update: bool| {
-                    // V2 PUT → hard gate; V2 UPDATE → growth-only gate (#4683).
-                    // A shrinking/holding V2 UPDATE must never block convergence.
+                    // V2 PUT → hard admission gate; V2 UPDATE → growth-only gate
+                    // with eviction escalation (#4683 PR 4). A shrinking/holding
+                    // V2 UPDATE must never block convergence; a growing one evicts
+                    // OTHER low-value contracts before it can reject.
                     let result = if is_update {
                         op_manager.ring.admit_state_update(key, state_size)
                     } else {
@@ -495,8 +497,10 @@ impl Executor<Runtime> {
         if let Some(op_manager) = op_manager_for_admit {
             rt.set_state_admit_callback(Arc::new(
                 move |key: &ContractKey, state_size: usize, is_update: bool| {
-                    // V2 PUT → hard gate; V2 UPDATE → growth-only gate (#4683).
-                    // A shrinking/holding V2 UPDATE must never block convergence.
+                    // V2 PUT → hard admission gate; V2 UPDATE → growth-only gate
+                    // with eviction escalation (#4683 PR 4). A shrinking/holding
+                    // V2 UPDATE must never block convergence; a growing one evicts
+                    // OTHER low-value contracts before it can reject.
                     let result = if is_update {
                         op_manager.ring.admit_state_update(key, state_size)
                     } else {

@@ -71,18 +71,22 @@ impl Executor<Runtime> {
 
             // Commit locally
             let written_bytes = new_state.as_ref().len();
-            // Disk-budget admission gate (#4683): a re-PUT into an ALREADY-hosted
-            // contract is a CRDT merge — a mutation of an already-counted
-            // footprint, not a new admission. Use the GROWTH-ONLY check so a
-            // shrinking/holding merge (`delta <= 0`) always admits even over
-            // budget (rejecting would stall convergence without freeing bytes);
-            // only genuine growth is bounded. Nothing has landed → no rollback.
+            // Disk-budget admission gate (#4683, PR 4): a re-PUT into an
+            // ALREADY-hosted contract is a CRDT merge — a mutation of an
+            // already-counted footprint, not a new admission. Use the growth-only
+            // `admit_state_update`: a shrinking/holding merge (`delta <= 0`) always
+            // admits even over budget (rejecting would stall convergence without
+            // freeing bytes); genuine growth over budget is admitted while OTHER
+            // low-value contracts are evicted to make room, and only rejects when
+            // there is not enough sheddable capacity. Nothing has landed → no
+            // rollback on the reject.
             if let Some(op_manager) = &self.op_manager {
                 if let Err(over) = op_manager.ring.admit_state_update(&key, written_bytes) {
                     tracing::warn!(
                         contract = %key,
                         %over,
-                        "Rejecting re-PUT: disk budget exceeded (growth over budget)"
+                        "Rejecting re-PUT: disk budget exceeded and eviction of other \
+                         low-value contracts could not free enough (growth over budget)"
                     );
                     return Err(ExecutorError::request(StdContractError::Put {
                         key,

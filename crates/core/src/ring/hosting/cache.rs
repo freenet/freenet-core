@@ -570,6 +570,116 @@ impl<T: TimeSource> HostingCache<T> {
         evicted
     }
 
+    /// Evict the lowest-value OTHER contracts to free at least `bytes_to_free`
+    /// state bytes, for the growth-only UPDATE escalation (#4683, PR 4).
+    ///
+    /// When an UPDATE grows an already-hosted contract past the aggregate disk
+    /// budget, admission control belongs on admission (PUT), not on mutation:
+    /// rejecting the growing UPDATE would stall CRDT convergence and (for a
+    /// relayed UPDATE) be silently dropped. Instead we admit the growth and make
+    /// room by shedding *other* low-value contracts. This is that shed.
+    ///
+    /// Unlike [`Self::evict_over_budget`] this is NOT driven by `budget_bytes`
+    /// (the state-cache eviction floor) — it frees a caller-supplied byte target
+    /// against the *aggregate* disk budget the admission gate enforces, which is
+    /// a different bound. It evicts eligible (past-`min_ttl`, `!should_retain`)
+    /// contracts lowest-`keep_score`-first (same victim order and Greedy-Dual
+    /// floor ratchet as the over-budget walk), skipping `exclude` (the contract
+    /// being updated — evicting it to fit its own UPDATE would lose it entirely),
+    /// and stops as soon as the cumulative freed bytes reach `bytes_to_free`.
+    ///
+    /// Returns the evicted `(key, write_generation)` pairs (generation captured
+    /// under the write lock for the `EvictContract` re-host guard, exactly as the
+    /// sweep does). The caller routes each through the reclamation queue so the
+    /// on-disk state/code is deleted asynchronously and the disk tracker's state
+    /// bytes drop on that async delete — NOT here — so this must NOT itself touch
+    /// the disk tracker (double-subtraction).
+    ///
+    /// `bytes_to_free == 0` evicts nothing (returns empty).
+    pub(crate) fn evict_lowest_value_to_free<F>(
+        &mut self,
+        bytes_to_free: u64,
+        exclude: &ContractKey,
+        should_retain: &F,
+    ) -> Vec<(ContractKey, u64)>
+    where
+        F: Fn(&ContractKey) -> bool,
+    {
+        if bytes_to_free == 0 {
+            return Vec::new();
+        }
+
+        let now = self.time_source.now();
+
+        // Eviction-eligible OTHER contracts (past TTL, not retained, not the
+        // target), lowest-value-first — the same filter and ordering as
+        // `evict_over_budget`.
+        let mut candidates: Vec<(ContractKey, f64, u64)> = self
+            .contracts
+            .iter()
+            .filter(|(key, entry)| {
+                *key != exclude
+                    && now.saturating_duration_since(entry.last_accessed) >= self.min_ttl
+                    && !should_retain(key)
+            })
+            .map(|(key, entry)| (*key, entry.keep_score, entry.last_access_seq))
+            .collect();
+        candidates.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+        });
+
+        let mut freed: u64 = 0;
+        let mut evicted = Vec::new();
+        for (key, keep_score, _) in candidates {
+            if freed >= bytes_to_free {
+                break;
+            }
+            if let Some(entry) = self.contracts.remove(&key) {
+                freed = freed.saturating_add(entry.size_bytes);
+                self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
+                self.budget_evictions_total = self.budget_evictions_total.saturating_add(1);
+                if entry.read_count >= 2 {
+                    self.evictions_of_recently_read_total =
+                        self.evictions_of_recently_read_total.saturating_add(1);
+                }
+                // Greedy-Dual aging: ratchet the floor up to the victim's score.
+                if keep_score > self.eviction_floor {
+                    self.eviction_floor = keep_score;
+                }
+                evicted.push((key, entry.write_generation));
+            }
+        }
+
+        evicted
+    }
+
+    /// Total state bytes held by eviction-eligible OTHER contracts — the ceiling
+    /// [`Self::evict_lowest_value_to_free`] could free (#4683, PR 4). Used by the
+    /// UPDATE growth-only escalation to decide, BEFORE evicting anything, whether
+    /// there is enough sheddable capacity to admit the growth; if not (everything
+    /// else is retained/in-use), the UPDATE is rejected rather than pointlessly
+    /// evicting and still overflowing. Same eligibility filter as the shed.
+    pub(crate) fn evictable_bytes_excluding<F>(
+        &self,
+        exclude: &ContractKey,
+        should_retain: &F,
+    ) -> u64
+    where
+        F: Fn(&ContractKey) -> bool,
+    {
+        let now = self.time_source.now();
+        self.contracts
+            .iter()
+            .filter(|(key, entry)| {
+                *key != exclude
+                    && now.saturating_duration_since(entry.last_accessed) >= self.min_ttl
+                    && !should_retain(key)
+            })
+            .fold(0u64, |acc, (_, entry)| acc.saturating_add(entry.size_bytes))
+    }
+
     /// Record an access to a contract, adding or refreshing it in the cache.
     ///
     /// If the contract is already cached, this refreshes its LRU position and timestamp.
@@ -2445,5 +2555,93 @@ mod tests {
         );
         assert!(cache.contains(&pinned));
         assert!(!cache.contains(&other));
+    }
+
+    // --- evict_lowest_value_to_free / evictable_bytes_excluding (#4683 PR 4) ---
+
+    #[test]
+    fn evict_lowest_value_to_free_excludes_target_and_stops_at_needed() {
+        let (mut cache, time) = make_cache(10_000, Duration::from_secs(60));
+        let target = make_key(1);
+        let v_lo = make_key(2);
+        let v_mid = make_key(3);
+        // Distinct demands so keep_score order is deterministic: v_lo lowest.
+        cache.record_access_with_demand(target, 100, AccessType::Get, 0, 9.0, |_| false);
+        cache.record_access_with_demand(v_lo, 60, AccessType::Get, 0, 1.0, |_| false);
+        cache.record_access_with_demand(v_mid, 60, AccessType::Get, 0, 5.0, |_| false);
+        // Past TTL so all are eligible.
+        time.advance_time(Duration::from_secs(61));
+
+        // Need 50 bytes: the single lowest-value victim (v_lo, 60 bytes) suffices,
+        // so the walk stops after one eviction and never touches v_mid.
+        let evicted = cache.evict_lowest_value_to_free(50, &target, &|_| false);
+        assert_eq!(evicted.len(), 1, "should stop as soon as `needed` is met");
+        assert_eq!(evicted[0].0, v_lo, "lowest keep_score evicts first");
+        assert!(cache.contains(&target), "the target is never evicted");
+        assert!(
+            cache.contains(&v_mid),
+            "higher-value victim untouched once satisfied"
+        );
+        assert!(!cache.contains(&v_lo));
+        // current_bytes dropped by exactly the evicted size.
+        assert_eq!(cache.current_bytes(), 100 + 60);
+    }
+
+    #[test]
+    fn evict_lowest_value_to_free_skips_retained_and_respects_ttl() {
+        let (mut cache, time) = make_cache(10_000, Duration::from_secs(60));
+        let target = make_key(1);
+        let retained = make_key(2);
+        let fresh = make_key(3);
+        cache.record_access_with_demand(target, 100, AccessType::Get, 0, 9.0, |_| false);
+        cache.record_access_with_demand(retained, 500, AccessType::Get, 0, 1.0, |_| false);
+        // `fresh` added AFTER the time advance below so it stays within TTL.
+        time.advance_time(Duration::from_secs(61));
+        cache.record_access_with_demand(fresh, 500, AccessType::Get, 0, 1.0, |_| false);
+
+        // Want to free 400 bytes, but `retained` is pinned (should_retain) and
+        // `fresh` is within min_ttl → neither is eligible → nothing evicted.
+        let evicted = cache.evict_lowest_value_to_free(400, &target, &|k| *k == retained);
+        assert!(
+            evicted.is_empty(),
+            "a retained + a within-TTL contract are both ineligible → no eviction"
+        );
+        assert!(cache.contains(&retained) && cache.contains(&fresh));
+    }
+
+    #[test]
+    fn evict_lowest_value_to_free_zero_is_noop() {
+        let (mut cache, time) = make_cache(10_000, Duration::from_secs(60));
+        let target = make_key(1);
+        let other = make_key(2);
+        cache.record_access_with_demand(target, 100, AccessType::Get, 0, 9.0, |_| false);
+        cache.record_access_with_demand(other, 100, AccessType::Get, 0, 1.0, |_| false);
+        time.advance_time(Duration::from_secs(61));
+        assert!(
+            cache
+                .evict_lowest_value_to_free(0, &target, &|_| false)
+                .is_empty()
+        );
+        assert!(cache.contains(&other), "zero bytes-to-free evicts nothing");
+    }
+
+    #[test]
+    fn evictable_bytes_excluding_sums_only_eligible_others() {
+        let (mut cache, time) = make_cache(10_000, Duration::from_secs(60));
+        let target = make_key(1);
+        let eligible = make_key(2);
+        let retained = make_key(3);
+        cache.record_access_with_demand(target, 100, AccessType::Get, 0, 1.0, |_| false);
+        cache.record_access_with_demand(eligible, 70, AccessType::Get, 0, 1.0, |_| false);
+        cache.record_access_with_demand(retained, 500, AccessType::Get, 0, 1.0, |_| false);
+        let fresh = make_key(4);
+        // Advance past TTL for the first three, then add a within-TTL contract.
+        time.advance_time(Duration::from_secs(61));
+        cache.record_access_with_demand(fresh, 999, AccessType::Get, 0, 1.0, |_| false);
+
+        // Only `eligible` counts: `target` is excluded, `retained` is pinned,
+        // `fresh` is within TTL.
+        let bytes = cache.evictable_bytes_excluding(&target, &|k| *k == retained);
+        assert_eq!(bytes, 70);
     }
 }

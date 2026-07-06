@@ -1025,6 +1025,46 @@ mod tests {
     use super::*;
     use crate::operations::test_utils::make_contract_key;
 
+    /// Pin for the #4683 PR-4 rule: UPDATE has NO wire error-abort variant.
+    ///
+    /// Unlike PUT (`PutMsg::Error { id, cause }`, which carries a disk-budget or
+    /// other rejection back to the originator and hop-by-hop upstream), UPDATE is
+    /// fire-and-forget end-to-end: a relayed UPDATE that fails to persist (e.g. a
+    /// growth-over-budget rejection that the eviction escalation could not
+    /// satisfy) is SILENTLY DROPPED, and the originator reconciles via
+    /// CRDT/interest-sync. The disk-budget design (#4683 PR 4) deliberately does
+    /// NOT add `UpdateMsg::Error`: a wire-format change would fight the
+    /// intentional fire-and-forget design and is disproportionate to the benefit.
+    ///
+    /// This exhaustive match is a COMPILE-TIME guard: adding an `Error`-shaped
+    /// abort variant to `UpdateMsg` (or otherwise growing the wire enum) forces a
+    /// non-compiling change here, so the decision is revisited deliberately rather
+    /// than by a silent wire-format addition. If you are here because a new
+    /// variant broke this arm, confirm it is NOT a client/relay-visible error
+    /// abort before extending the match — the relayed-over-budget UPDATE path must
+    /// remain "no wire error variant".
+    #[test]
+    fn update_has_no_wire_error_abort_variant_pin() {
+        fn assert_no_error_variant(msg: &UpdateMsg) -> &'static str {
+            match msg {
+                UpdateMsg::RequestUpdate { .. } => "request",
+                UpdateMsg::BroadcastTo { .. } => "broadcast",
+                UpdateMsg::RequestUpdateStreaming { .. } => "request-streaming",
+                UpdateMsg::BroadcastToStreaming { .. } => "broadcast-streaming",
+                // Intentionally NO wildcard arm and NO `Error` arm: the four
+                // variants above are the entire wire surface. A fifth variant
+                // (especially an error-abort) breaks compilation here on purpose.
+            }
+        }
+        let msg = UpdateMsg::RequestUpdateStreaming {
+            id: Transaction::new::<UpdateMsg>(),
+            stream_id: crate::transport::StreamId::next(),
+            key: make_contract_key(1),
+            total_size: 0,
+        };
+        assert_eq!(assert_no_error_variant(&msg), "request-streaming");
+    }
+
     /// Source-level pin for the UPDATE_PROPAGATION NO_TARGETS log site.
     /// Originally INFO; briefly promoted to WARN in PR #4252 commit 2;
     /// then demoted back to DEBUG in commit 3 because
