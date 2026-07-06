@@ -243,6 +243,16 @@ pub(crate) struct RouterSnapshotInfo {
     pub hosting_disk_wasm_bytes: Option<u64>,
     pub hosting_disk_compile_cache_bytes: Option<u64>,
     pub hosting_disk_total_bytes: Option<u64>,
+    /// OOM-valve falsifier (subscriber-primary hosting rework, #4642): monotonic
+    /// count of evictions that shed a SUBSCRIBED contract (subscriber_count >= 1)
+    /// under genuine RAM overflow, piercing the in-use pin. The Overflow trigger
+    /// is intentionally unwired in this release (the valve mechanism lands, but
+    /// nothing fires it until the RSS/A1 resource signal is plumbed), so this
+    /// stays 0 in the field today; once the trigger lands, a nonzero differenced
+    /// rate is the alarm that the node is shedding real subscriber demand to
+    /// avoid OOM. Populated by `Ring` on the snapshot cadence. `None` until the
+    /// ring is built. Per-node aggregate scalar.
+    pub hosting_oom_valve_evictions_total: Option<u64>,
     /// Terminal advertisement-consult counters (hosting redesign piece C,
     /// #4646; exported to central telemetry per #4658), populated by `Ring`
     /// from the per-node `network_status` singleton on the snapshot cadence.
@@ -1243,6 +1253,7 @@ impl Router {
             hosting_disk_wasm_bytes: None,
             hosting_disk_compile_cache_bytes: None,
             hosting_disk_total_bytes: None,
+            hosting_oom_valve_evictions_total: None,
             // Terminal advertisement-consult counters (piece C, #4646),
             // populated by Ring from the network_status singleton on the
             // snapshot cadence (#4658).

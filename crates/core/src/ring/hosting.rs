@@ -1242,6 +1242,29 @@ impl HostingManager {
         self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
     }
 
+    /// Count of genuine demand pinning `contract`: local client subscriptions
+    /// PLUS downstream subscribers. This is the subscriber-primary eviction key
+    /// (#4642). Aligned with [`contract_in_use`](Self::contract_in_use) BY
+    /// CONSTRUCTION — it counts the exact same two sources, so
+    /// `subscriber_count(k) == 0` iff `!contract_in_use(k)`, keeping retention
+    /// and the collapse/renewal decision in agreement (per the piece-D source).
+    /// Counts ALL downstream entries (matching `has_downstream_subscribers`, no
+    /// lease filter) so the pin equals `contract_in_use` exactly; the periodic
+    /// `expire_stale_downstream_subscribers` sweep keeps the map fresh.
+    pub(crate) fn subscriber_count(&self, contract: &ContractKey) -> usize {
+        let clients = self
+            .client_subscriptions
+            .get(contract.id())
+            .map(|c| c.len())
+            .unwrap_or(0);
+        let downstream = self
+            .downstream_subscribers
+            .get(contract)
+            .map(|peers| peers.len())
+            .unwrap_or(0);
+        clients + downstream
+    }
+
     /// Hook called from every code path that removes an "in-use" signal
     /// (client subscription, downstream subscriber, or stale-expiry of
     /// either). If the contract has just transitioned to no-longer-in-use,
@@ -1413,7 +1436,7 @@ impl HostingManager {
             access_type,
             current_generation,
             predicted_demand,
-            |k: &ContractKey| self.contract_in_use(k),
+            |k: &ContractKey| self.subscriber_count(k),
         );
 
         // Train the proximity prior from this peer's own observed read rate for
@@ -1764,10 +1787,13 @@ impl HostingManager {
     /// the `EvictContract` event so the deletion-time guard can detect a
     /// re-host race.
     pub fn sweep_expired_hosting(&self) -> Vec<(ContractKey, u64)> {
-        let expired = self
-            .hosting_cache
-            .write()
-            .sweep_expired(|key| self.contract_in_use(key));
+        // AtCapacity: the OOM-valve Overflow trigger is intentionally unwired in
+        // production (see cache::MemoryPressure); nothing sheds a subscribed
+        // contract in the field yet.
+        let expired = self.hosting_cache.write().sweep_expired(
+            |key| self.subscriber_count(key),
+            cache::MemoryPressure::AtCapacity,
+        );
 
         // Clean up persisted metadata for expired contracts
         if !expired.is_empty() {
@@ -4506,8 +4532,8 @@ mod tests {
         let protected = make_contract_key(1);
         let unprotected = make_contract_key(2);
 
-        cache.record_access(protected, 100, AccessType::Get, 0, |_| false);
-        cache.record_access(unprotected, 100, AccessType::Get, 0, |_| false);
+        cache.record_access(protected, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(unprotected, 100, AccessType::Get, 0, |_| 0);
         assert_eq!(cache.current_bytes(), 200); // over budget
 
         // Advance past TTL
@@ -4515,7 +4541,10 @@ mod tests {
 
         // Sweep with predicate that protects the first contract
         // (simulates has_downstream_subscribers returning true)
-        let evicted = cache.sweep_expired(|k| *k == protected);
+        let evicted = cache.sweep_expired(
+            |k| (*k == protected) as usize,
+            cache::MemoryPressure::AtCapacity,
+        );
 
         assert!(
             !evicted.iter().any(|(k, _)| *k == protected),
@@ -4543,11 +4572,11 @@ mod tests {
         let mut cache = HostingCache::new(80, min_ttl, time.clone());
 
         let contract = make_contract_key(100);
-        cache.record_access(contract, 100, AccessType::Get, 0, |_| false);
+        cache.record_access(contract, 100, AccessType::Get, 0, |_| 0);
         assert!(cache.contains(&contract));
 
         // Under TTL: should not be evicted even though over budget
-        let evicted = cache.sweep_expired(|_| false);
+        let evicted = cache.sweep_expired(|_| 0, cache::MemoryPressure::AtCapacity);
         assert!(
             evicted.is_empty(),
             "Contract within TTL should not be evicted"
@@ -4557,7 +4586,7 @@ mod tests {
         time.advance_time(Duration::from_secs(61));
 
         // Now should be evicted (over budget + past TTL + no retain predicate)
-        let evicted = cache.sweep_expired(|_| false);
+        let evicted = cache.sweep_expired(|_| 0, cache::MemoryPressure::AtCapacity);
         assert!(
             evicted.iter().any(|(k, _)| *k == contract),
             "Contract past TTL with no subscribers should be evicted"
