@@ -31,6 +31,7 @@
 
 mod cache;
 mod demand;
+mod reconcile;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
