@@ -177,6 +177,17 @@ pub struct RuntimeConfig {
     /// deterministic in the `current_thread` + `start_paused` sim runner even
     /// if set. Production sets it `true`; tests/sim leave it `false`.
     pub offload_compilation: bool,
+    /// Directory for the wasmtime compile cache (#4683). `Some` relocates the
+    /// cache onto the data-dir mount (so it shares the mount that sizes the disk
+    /// budget and is measurable as freenet's own usage). `None` keeps wasmtime's
+    /// default OS-cache location — every test / `default()` site leaves it
+    /// unset, so their behavior is unchanged. An absolute path is required by
+    /// wasmtime's `CacheConfig::with_directory`.
+    pub wasmtime_cache_dir: Option<std::path::PathBuf>,
+    /// Soft size limit (bytes) for the wasmtime compile cache (#4683). `Some`
+    /// overrides wasmtime's 512 MiB default via
+    /// `CacheConfig::with_files_total_size_soft_limit`; `None` keeps the default.
+    pub wasmtime_cache_size_bytes: Option<u64>,
 }
 
 impl Default for RuntimeConfig {
@@ -192,6 +203,11 @@ impl Default for RuntimeConfig {
             // inline compile. Production opts in explicitly — see
             // `RuntimePool::new` / `from_config_with_shared_modules`.
             offload_compilation: false,
+            // Default: keep wasmtime's own OS-cache location + 512 MiB soft
+            // limit. Only the production `from_config*` path relocates + sizes
+            // it, so tests and sims see unchanged wasmtime cache behavior.
+            wasmtime_cache_dir: None,
+            wasmtime_cache_size_bytes: None,
         }
     }
 }

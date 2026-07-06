@@ -2386,6 +2386,11 @@ impl ConfigPathsArgs {
         let delegates_dir = app_data_dir.join("delegates");
         let secrets_dir = app_data_dir.join("secrets");
         let db_dir = app_data_dir.join("db");
+        // Wasmtime's compile cache is relocated onto the data-dir mount (#4683)
+        // so it (a) shares the mount whose free space sizes the disk budget and
+        // (b) is measurable as freenet's own on-disk usage. Its default OS-cache
+        // location is neither. A sibling of the data dirs, created below.
+        let wasmtime_cache_dir = app_data_dir.join("wasmtime-cache");
 
         if !contracts_dir.exists() {
             fs::create_dir_all(&contracts_dir)?;
@@ -2405,6 +2410,10 @@ impl ConfigPathsArgs {
         if !db_dir.exists() {
             fs::create_dir_all(&db_dir)?;
             fs::create_dir_all(db_dir.join("local"))?;
+        }
+
+        if !wasmtime_cache_dir.exists() {
+            fs::create_dir_all(&wasmtime_cache_dir)?;
         }
 
         let event_log = app_data_dir.join("_EVENT_LOG");
@@ -2435,6 +2444,7 @@ impl ConfigPathsArgs {
             delegates_dir,
             secrets_dir,
             db_dir,
+            wasmtime_cache_dir,
             event_log,
             log_dir,
         })
@@ -2452,6 +2462,12 @@ pub struct ConfigPaths {
     config_dir: PathBuf,
     #[serde(default = "get_log_dir")]
     log_dir: Option<PathBuf>,
+    /// Relocated wasmtime compile-cache directory (#4683). `#[serde(default)]`
+    /// so a `config.toml` persisted before this field existed deserializes with
+    /// an empty path; `build()` always re-derives the real one from the data
+    /// dir, so the persisted value is never load-bearing.
+    #[serde(default)]
+    wasmtime_cache_dir: PathBuf,
 }
 
 impl ConfigPaths {
@@ -2497,6 +2513,13 @@ impl ConfigPaths {
 
     pub fn data_dir(&self) -> PathBuf {
         self.data_dir.clone()
+    }
+
+    /// Relocated wasmtime compile-cache directory (#4683). Not mode-split: the
+    /// compile cache is keyed by (engine config + WASM bytes) and shared across
+    /// local/network runtimes on the same node.
+    pub fn wasmtime_cache_dir(&self) -> PathBuf {
+        self.wasmtime_cache_dir.clone()
     }
 
     pub fn secrets_dir(&self, mode: OperationMode) -> PathBuf {
@@ -2547,11 +2570,12 @@ impl ConfigPaths {
             4 => (true, &self.data_dir),
             5 => (false, &self.event_log),
             6 => (true, &self.config_dir),
+            7 => (true, &self.wasmtime_cache_dir),
             _ => panic!("invalid path index"),
         }
     }
 
-    const MAX_PATH_INDEX: usize = 6;
+    const MAX_PATH_INDEX: usize = 7;
 }
 
 pub struct ConfigPathsIter<'a> {
@@ -2587,6 +2611,11 @@ impl Config {
 
     pub fn contracts_dir(&self) -> PathBuf {
         self.config_paths.contracts_dir(self.mode)
+    }
+
+    /// Relocated wasmtime compile-cache directory (#4683). Not mode-split.
+    pub fn wasmtime_cache_dir(&self) -> PathBuf {
+        self.config_paths.wasmtime_cache_dir()
     }
 
     pub fn delegates_dir(&self) -> PathBuf {

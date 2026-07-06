@@ -124,6 +124,12 @@ impl ContractHandler for NetworkContractHandler {
         // This must be done before loading the cache so evictions work correctly
         let storage = executor.state_store().inner().clone();
         op_manager.ring.set_hosting_storage(storage.clone());
+        // Aggregate disk-usage tracker paths (#4683): the mode-resolved
+        // contracts dir (WASM blobs) and the relocated wasmtime compile-cache
+        // dir. Seeded lazily on the first sweep tick.
+        op_manager
+            .ring
+            .set_hosting_disk_paths(config.contracts_dir(), config.wasmtime_cache_dir());
         // Hydrate broken-invariants flags from the same backing store so a
         // node that previously detected a non-idempotent contract doesn't
         // re-engage its broadcast storm after restart.

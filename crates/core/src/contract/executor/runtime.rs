@@ -20,6 +20,14 @@ const MAX_RELATED_CONTRACTS_PER_REQUEST: usize = 10;
 /// Timeout for fetching all related contracts during validation.
 const RELATED_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Soft size limit for the relocated wasmtime compile cache (#4683), pinned to
+/// wasmtime's own historical default (512 MiB). Pinned explicitly rather than
+/// left implicit so the cache's on-disk ceiling is a legible, single-sourced
+/// value the disk-budget accounting can reason about. Wasmtime self-prunes the
+/// cache to this soft limit on its 1h cleanup, so for accounting the cache is a
+/// near-fixed ceiling (re-walked on the telemetry cadence).
+const WASMTIME_CACHE_SIZE_SOFT_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Probability that a given state-changing merge is checked for
 /// `update_state` idempotency. One re-invocation of WASM per sample, so
 /// the per-merge cost is ~`p * average_update_state_us`. At 1/32 ≈ 3%
@@ -417,6 +425,13 @@ impl Executor<Runtime> {
         let runtime_config = RuntimeConfig {
             offload_compilation: production_offload_compilation(),
             module_cache_budget_bytes: config.module_cache_budget_bytes,
+            // Relocate the wasmtime compile cache onto the data-dir mount and
+            // pin its soft-size limit (#4683) so it lives on the mount whose
+            // free space sizes the disk budget and is measurable as freenet's
+            // own on-disk usage. `with_directory` requires an absolute path;
+            // the data dir is absolute.
+            wasmtime_cache_dir: Some(config.wasmtime_cache_dir()),
+            wasmtime_cache_size_bytes: Some(WASMTIME_CACHE_SIZE_SOFT_LIMIT_BYTES),
             ..RuntimeConfig::default()
         };
         let mut rt = Runtime::build_with_shared_module_caches(
