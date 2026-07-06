@@ -2242,6 +2242,49 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "upstream_computed_vs_stored_divergences".to_string(),
                     serde_json::json!(snapshot.upstream_computed_vs_stored_divergences),
                 );
+                // Reconcile-controller SHADOW comparison counters (keystone
+                // step-2, #4642) — same hand-mirror footgun: a new
+                // `RouterSnapshotInfo` field is invisible to the collector unless
+                // added here. These give production field evidence for how far
+                // the pure `reconcile` controller diverges from today's scattered
+                // decisions ahead of the flip. Pinned by
+                // `router_snapshot_json_includes_reconcile_shadow_counters`.
+                obj.insert(
+                    "reconcile_shadow_comparisons".to_string(),
+                    serde_json::json!(snapshot.reconcile_shadow_comparisons),
+                );
+                obj.insert(
+                    "reconcile_shadow_divergences".to_string(),
+                    serde_json::json!(snapshot.reconcile_shadow_divergences),
+                );
+                obj.insert(
+                    "reconcile_shadow_subscribe_diffs".to_string(),
+                    serde_json::json!(snapshot.reconcile_shadow_subscribe_diffs),
+                );
+                obj.insert(
+                    "reconcile_shadow_renew_diffs".to_string(),
+                    serde_json::json!(snapshot.reconcile_shadow_renew_diffs),
+                );
+                obj.insert(
+                    "reconcile_shadow_unsubscribe_diffs".to_string(),
+                    serde_json::json!(snapshot.reconcile_shadow_unsubscribe_diffs),
+                );
+                obj.insert(
+                    "reconcile_shadow_collapse_diffs".to_string(),
+                    serde_json::json!(snapshot.reconcile_shadow_collapse_diffs),
+                );
+                obj.insert(
+                    "reconcile_shadow_announce_diffs".to_string(),
+                    serde_json::json!(snapshot.reconcile_shadow_announce_diffs),
+                );
+                obj.insert(
+                    "reconcile_shadow_retract_diffs".to_string(),
+                    serde_json::json!(snapshot.reconcile_shadow_retract_diffs),
+                );
+                obj.insert(
+                    "reconcile_shadow_reroot_search_diffs".to_string(),
+                    serde_json::json!(snapshot.reconcile_shadow_reroot_search_diffs),
+                );
             }
             body
         }
@@ -2530,6 +2573,43 @@ mod tests {
         for (key, want) in [
             ("upstream_computed_vs_stored_comparisons", 337),
             ("upstream_computed_vs_stored_divergences", 347),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the reconcile-controller SHADOW comparison counters (keystone
+    /// step-2, #4642) must also reach the hand-mirrored OTLP body — same footgun
+    /// as the divergence counters above. These are the production field evidence
+    /// for how far the pure `reconcile` controller diverges from today's
+    /// scattered decisions before the flip; a silent drop would re-blind central
+    /// telemetry to the exact signal this change adds.
+    #[test]
+    fn router_snapshot_json_includes_reconcile_shadow_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.reconcile_shadow_comparisons = Some(401);
+        info.reconcile_shadow_divergences = Some(409);
+        info.reconcile_shadow_subscribe_diffs = Some(419);
+        info.reconcile_shadow_renew_diffs = Some(421);
+        info.reconcile_shadow_unsubscribe_diffs = Some(431);
+        info.reconcile_shadow_collapse_diffs = Some(433);
+        info.reconcile_shadow_announce_diffs = Some(439);
+        info.reconcile_shadow_retract_diffs = Some(443);
+        info.reconcile_shadow_reroot_search_diffs = Some(449);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("reconcile_shadow_comparisons", 401),
+            ("reconcile_shadow_divergences", 409),
+            ("reconcile_shadow_subscribe_diffs", 419),
+            ("reconcile_shadow_renew_diffs", 421),
+            ("reconcile_shadow_unsubscribe_diffs", 431),
+            ("reconcile_shadow_collapse_diffs", 433),
+            ("reconcile_shadow_announce_diffs", 439),
+            ("reconcile_shadow_retract_diffs", 443),
+            ("reconcile_shadow_reroot_search_diffs", 449),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

@@ -31,7 +31,9 @@
 
 mod cache;
 mod demand;
-mod reconcile;
+// `pub(crate)` so `ring.rs` can re-export the reconcile controller to the node
+// layer for the shadow-mode wiring (keystone step-2, #4642).
+pub(crate) mod reconcile;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
@@ -884,6 +886,37 @@ impl HostingManager {
         self.downstream_subscribers
             .get(contract)
             .is_some_and(|peers| !peers.is_empty())
+    }
+
+    /// Lease-valid downstream subscriber peer keys for `contract`.
+    ///
+    /// Returns the `PeerKey`s of downstream peers whose subscription lease is
+    /// still active (renewed within `SUBSCRIPTION_LEASE_DURATION`), WITHOUT
+    /// mutating the map — mirrors the read-only lease check in
+    /// [`downstream_subscriber_count`](Self::downstream_subscriber_count) /
+    /// `expire_stale_downstream_subscribers`, so a contract whose leases have all
+    /// gone stale (but not yet been swept) reports none.
+    ///
+    /// Used by the reconcile input-builder (keystone step-2, #4642) to apply the
+    /// piece-D **strictly-farther** filter: a downstream subscriber counts as
+    /// live demand only if it is farther from the contract key than this peer
+    /// (the closer/upstream one is excluded, so mutual co-hosts cannot perpetuate
+    /// each other's leases). This accessor returns the raw lease-valid set; the
+    /// caller resolves each peer's location and applies the distance filter.
+    pub(crate) fn downstream_subscriber_peers(&self, contract: &ContractKey) -> Vec<PeerKey> {
+        let now = self.time_source.now();
+        self.downstream_subscribers
+            .get(contract)
+            .map(|peers| {
+                peers
+                    .iter()
+                    .filter(|(_, last_renewed)| {
+                        now.duration_since(**last_renewed) < SUBSCRIPTION_LEASE_DURATION
+                    })
+                    .map(|(peer, _)| peer.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Number of local (WebSocket) clients currently subscribed to this

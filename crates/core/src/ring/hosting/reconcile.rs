@@ -18,15 +18,27 @@
 //! the desired action set from current inputs, so a missed event is caught by the
 //! next tick and the whole stale-flag bug class disappears.
 //!
-//! # Not yet wired
+//! # Wired in SHADOW mode (drives nothing)
 //!
-//! This is **sub-task 1** of the keystone: the pure core + its types + unit tests,
-//! additive and behavior-preserving. Nothing in production calls [`reconcile`]
-//! yet. The next sub-task wires it in **shadow mode** at the ~6 on-`main` decision
-//! sites (compute what it WOULD do, compare to what the current code does, record
-//! divergence — current code still drives). The FLIP (controller actually drives)
-//! is a later step. Because it is unwired, the items here are `#[allow(dead_code)]`
-//! until that shadow wiring lands.
+//! Sub-task 1 landed the pure core + types + unit tests. Sub-task 2 (this
+//! change) wires it in **shadow mode** at the highest-signal on-`main` hosting
+//! decision sites: the interest-gated COLLAPSE (`OpManager::send_unsubscribe_
+//! upstream`) and the RENEWAL set (`Ring::contracts_needing_renewal`, driven by
+//! the recovery loop). At each site the wiring builds a [`ReconcileInputs`]
+//! snapshot from live node state, computes what [`reconcile`] WOULD do, and
+//! compares it — BY SET MEMBERSHIP — to what the current code actually does,
+//! recording the divergence in aggregate telemetry
+//! ([`action_set_divergence`] → `node::network_status::ReconcileShadowStats`).
+//! **The current scattered code still drives every decision**; nothing consumes
+//! [`reconcile`]'s output as a control signal. The FLIP (controller actually
+//! drives) is a later step, as are the remaining sites (inbound-unsubscribe
+//! collapse, connection-drop re-root, host-formation announce). Because the
+//! driver and those hooks are still unwired, some surface here is exercised only
+//! by the shadow compare and tests, so `#[allow(dead_code)]` stays until the
+//! flip.
+//!
+//! Hosting is BINARY throughout: [`ReconcileInputs::state_present`] means this
+//! peer holds the FULL contract (code + params + state), never a partial tier.
 //!
 //! # Notes for the shadow-compare wiring (next sub-task)
 //!
@@ -68,9 +80,11 @@
 //! selection. See the pin test `distance_partialeq_is_fuzzy_but_cmp_is_exact` and
 //! `ring/location.rs:223-243`.
 
-// Wired to production (in shadow mode) by the next keystone sub-task; the pure
-// core + types + tests land here first, unused by any production path, so
-// dead_code is expected and allowed until that wiring exists.
+// Wired to production in SHADOW mode by keystone sub-task 2 (compare-only, drives
+// nothing). The driver that would apply a `Vec<Action>`, and the forward-looking
+// hooks (Retract's `on_contract_unhosted`, `actively_acquiring`, the not-yet-wired
+// decision sites) remain unexercised by any control path, so dead_code stays
+// allowed until the flip.
 #![allow(dead_code)]
 
 use crate::ring::PeerKeyLocation;
@@ -323,6 +337,62 @@ pub(crate) fn reconcile(inputs: &ReconcileInputs) -> Vec<Action> {
     }
 
     actions
+}
+
+/// Per-[`Action`]-class flags marking which actions were in the SYMMETRIC
+/// DIFFERENCE of one shadow comparison — present in the reconcile controller's
+/// desired set XOR in the actual behavior's set. Plain flags so the telemetry
+/// layer (`node::network_status`) can accumulate per-action divergence counters
+/// without depending on the comparison internals or the `Action` enum shape.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReconcileActionDivergence {
+    pub subscribe: bool,
+    pub renew: bool,
+    pub unsubscribe: bool,
+    pub collapse: bool,
+    pub announce: bool,
+    pub retract: bool,
+    pub reroot_search: bool,
+}
+
+impl ReconcileActionDivergence {
+    /// True iff any action class diverged (the two sets were not equal).
+    pub fn any(&self) -> bool {
+        self.subscribe
+            || self.renew
+            || self.unsubscribe
+            || self.collapse
+            || self.announce
+            || self.retract
+            || self.reroot_search
+    }
+}
+
+/// Compare the reconcile controller's desired action set against the actual
+/// behavior's action set BY SET MEMBERSHIP (order- and duplicate-insensitive),
+/// returning which action classes diverge. Pure; the shadow-mode wiring
+/// (keystone step-2, #4642) records the result but drives nothing.
+///
+/// An action "diverges" when it is present in exactly one of the two sets — the
+/// controller wanted it but the site did not do it, or the site did it but the
+/// controller would not. Set membership (not exact-`Vec` equality) is the right
+/// comparison: a single production site maps to a fixed Action SET (e.g.
+/// `send_unsubscribe_upstream` = `{Collapse, Unsubscribe}`), and the
+/// controller's internal emission ORDER is irrelevant to whether the two agree.
+pub(crate) fn action_set_divergence(
+    reconcile_actions: &[Action],
+    actual_actions: &[Action],
+) -> ReconcileActionDivergence {
+    let differs = |a: Action| reconcile_actions.contains(&a) != actual_actions.contains(&a);
+    ReconcileActionDivergence {
+        subscribe: differs(Action::Subscribe),
+        renew: differs(Action::Renew),
+        unsubscribe: differs(Action::Unsubscribe),
+        collapse: differs(Action::Collapse),
+        announce: differs(Action::Announce),
+        retract: differs(Action::Retract),
+        reroot_search: differs(Action::ReRootSearch),
+    }
 }
 
 #[cfg(test)]
@@ -589,6 +659,61 @@ mod tests {
         }
     }
 
+    /// `action_set_divergence` is the set-membership comparator the shadow
+    /// wiring feeds the divergence telemetry. Pin its semantics: order- and
+    /// duplicate-insensitive, per-action symmetric difference, `any()` iff the
+    /// sets differ.
+    #[test]
+    fn action_set_divergence_by_membership() {
+        use Action::*;
+
+        // Identical sets ⇒ no divergence.
+        let d = action_set_divergence(&[Collapse, Unsubscribe], &[Collapse, Unsubscribe]);
+        assert!(!d.any(), "identical sets must not diverge");
+
+        // Order- and duplicate-insensitive: same members, different order/dups.
+        let d = action_set_divergence(&[Unsubscribe, Collapse, Collapse], &[Collapse, Unsubscribe]);
+        assert!(!d.any(), "set membership ignores order and duplicates");
+
+        // The collapse Retract gap: reconcile wants Retract, the actual site
+        // does not ⇒ retract diverges, nothing else.
+        let d = action_set_divergence(&[Collapse, Unsubscribe, Retract], &[Collapse, Unsubscribe]);
+        assert_eq!(
+            d,
+            ReconcileActionDivergence {
+                retract: true,
+                ..Default::default()
+            },
+            "only Retract should diverge (present in reconcile, absent in actual)"
+        );
+
+        // Renewal disagreement: reconcile would Subscribe (not-yet-subscribed),
+        // actual renews ⇒ both Subscribe and Renew are in the symmetric diff.
+        let d = action_set_divergence(&[Subscribe], &[Renew]);
+        assert_eq!(
+            d,
+            ReconcileActionDivergence {
+                subscribe: true,
+                renew: true,
+                ..Default::default()
+            }
+        );
+
+        // Empty reconcile vs a single actual action ⇒ that action diverges.
+        let d = action_set_divergence(&[], &[Collapse]);
+        assert_eq!(
+            d,
+            ReconcileActionDivergence {
+                collapse: true,
+                ..Default::default()
+            }
+        );
+
+        // Renewal agreement (steady-state in-use host) ⇒ no divergence.
+        let d = action_set_divergence(&[Renew], &[Renew]);
+        assert!(!d.any());
+    }
+
     /// Pin for the `Distance` Eq/Ord gotcha (`ring/location.rs:223-243`): two
     /// distances one ULP apart are epsilon-`==` yet cmp-unequal. `reconcile`
     /// consumes a pre-resolved `Option<PeerKeyLocation>` precisely so no epsilon
@@ -617,5 +742,26 @@ mod tests {
             Ordering::Equal,
             "exact cmp does NOT — reconcile must never mix epsilon `==` with this ordering"
         );
+    }
+
+    /// Behavior-preserving guard (keystone step-2, #4642): reconcile is a PURE
+    /// decision core wired only in SHADOW mode. No code in this module may apply
+    /// its `Vec<Action>` to the wire/state — the controller drives NOTHING until
+    /// the deliberate FLIP (a later step). This source-scrape pin fails if a
+    /// driver/apply entry point is added here without updating the shadow-vs-drive
+    /// story, keeping the "drives nothing" invariant of this sub-task honest.
+    #[test]
+    fn reconcile_controller_has_no_driver_yet() {
+        const SRC: &str = include_str!("reconcile.rs");
+        // Scan only the PRODUCTION portion (before the test module) so this
+        // test's own forbidden-string literals don't self-match.
+        let prod = &SRC[..SRC.find("#[cfg(test)]").unwrap_or(SRC.len())];
+        for forbidden in ["fn drive", "fn apply_action", "fn apply_actions"] {
+            assert!(
+                !prod.contains(forbidden),
+                "reconcile.rs must not define `{forbidden}` in shadow mode — the \
+                 controller records divergence only and drives nothing until the flip"
+            );
+        }
     }
 }

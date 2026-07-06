@@ -263,6 +263,26 @@ pub(crate) struct RouterSnapshotInfo {
     /// lifetime totals, `None` until the ring's snapshot task populates them.
     pub upstream_computed_vs_stored_comparisons: Option<u64>,
     pub upstream_computed_vs_stored_divergences: Option<u64>,
+    /// Reconcile-controller SHADOW comparison counters (hosting redesign
+    /// keystone step-2, #4642). Populated by `Ring` from the per-node
+    /// `network_status` singleton on the snapshot cadence. `comparisons` is the
+    /// denominator (one per shadow comparison at a hosting decision site),
+    /// `divergences` the count whose reconcile action set differed from the
+    /// actual behavior's set; the `*_diffs` are per-action symmetric-difference
+    /// tallies. Field evidence for how far the pure `reconcile` controller
+    /// diverges from today's scattered decisions BEFORE the flip — monotonic
+    /// lifetime totals, `None` until the ring's snapshot task populates them. A
+    /// nonzero `retract` / `reroot_search` divergence is EXPECTED (those
+    /// controller actions have no on-`main` driver yet), not an alarm.
+    pub reconcile_shadow_comparisons: Option<u64>,
+    pub reconcile_shadow_divergences: Option<u64>,
+    pub reconcile_shadow_subscribe_diffs: Option<u64>,
+    pub reconcile_shadow_renew_diffs: Option<u64>,
+    pub reconcile_shadow_unsubscribe_diffs: Option<u64>,
+    pub reconcile_shadow_collapse_diffs: Option<u64>,
+    pub reconcile_shadow_announce_diffs: Option<u64>,
+    pub reconcile_shadow_retract_diffs: Option<u64>,
+    pub reconcile_shadow_reroot_search_diffs: Option<u64>,
     /// Interest-weighted (two-tier) module-cache SHADOW gauges (#4441/#4534),
     /// populated by `Ring` from the same per-node `ModuleCacheMetrics` `Arc`.
     /// These are ALWAYS ON, independent of the `FREENET_MODULE_CACHE_INTEREST_TIERED`
@@ -1182,6 +1202,18 @@ impl Router {
             // singleton on the snapshot cadence.
             upstream_computed_vs_stored_comparisons: None,
             upstream_computed_vs_stored_divergences: None,
+            // Reconcile-controller shadow comparison counters (keystone step-2,
+            // #4642), populated by Ring from the network_status singleton on the
+            // snapshot cadence.
+            reconcile_shadow_comparisons: None,
+            reconcile_shadow_divergences: None,
+            reconcile_shadow_subscribe_diffs: None,
+            reconcile_shadow_renew_diffs: None,
+            reconcile_shadow_unsubscribe_diffs: None,
+            reconcile_shadow_collapse_diffs: None,
+            reconcile_shadow_announce_diffs: None,
+            reconcile_shadow_retract_diffs: None,
+            reconcile_shadow_reroot_search_diffs: None,
             // Interest-weighted (two-tier) module-cache shadow gauges,
             // populated by Ring on the snapshot cadence (#4441/#4534).
             contract_module_cache_cold_evictable_bytes: None,

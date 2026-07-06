@@ -97,6 +97,10 @@ pub(crate) use hosting::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
 /// operator-facing default and the in-code fallback can never drift. The
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use hosting::default_hosting_budget_bytes;
+/// Re-export the reconcile controller (pure decision core, its input/action
+/// types, and the shadow-mode set-membership comparator) so the node layer can
+/// build inputs and run the shadow compare (keystone step-2, #4642).
+pub(crate) use hosting::reconcile;
 pub use hosting::{AccessType, RecordAccessResult};
 /// Clamp bounds re-exported only for the config-default round-trip test.
 #[cfg(test)]
@@ -846,7 +850,12 @@ impl Ring {
 
     /// Returns true if this peer is the closest to the contract among its connected neighbors
     /// (i.e., it's a subscription root for this contract).
-    fn is_subscription_root(&self, contract_key: &ContractKey) -> bool {
+    ///
+    /// `pub(crate)` so the reconcile input-builder (keystone step-2, #4642) can
+    /// populate `ReconcileInputs::is_verified_root`. Note the `is_hosting_contract`
+    /// precondition below: a peer that does not yet hold the body is not reported
+    /// as root (the builder inherits that binary hosting semantics).
+    pub(crate) fn is_subscription_root(&self, contract_key: &ContractKey) -> bool {
         if !self.is_hosting_contract(contract_key) {
             return false;
         }
@@ -1630,6 +1639,31 @@ impl Ring {
                 snapshot.upstream_computed_vs_stored_divergences = Some(divergences);
             }
 
+            // Reconcile-controller SHADOW comparison counters (keystone step-2,
+            // #4642). Recorded at the on-`main` hosting decision sites (collapse
+            // via `send_unsubscribe_upstream`, renewal via
+            // `contracts_needing_renewal`) where the pure `reconcile` controller
+            // is run in parallel and compared BY SET MEMBERSHIP to the current
+            // behavior; exported here so the controller's real-world divergence
+            // from today's scattered decisions is legible in central telemetry
+            // BEFORE any decision is flipped to it. Same hand-mirror footgun as
+            // the counters above — a new `RouterSnapshotInfo` field is invisible
+            // to the collector unless added here AND in `event_kind_to_json`
+            // (pinned by `router_snapshot_json_includes_reconcile_shadow_counters`).
+            // Read from the per-node network_status singleton; `None` only before
+            // it is initialized.
+            if let Some(r) = crate::node::network_status::reconcile_shadow_counts() {
+                snapshot.reconcile_shadow_comparisons = Some(r.comparisons);
+                snapshot.reconcile_shadow_divergences = Some(r.divergences);
+                snapshot.reconcile_shadow_subscribe_diffs = Some(r.subscribe_diffs);
+                snapshot.reconcile_shadow_renew_diffs = Some(r.renew_diffs);
+                snapshot.reconcile_shadow_unsubscribe_diffs = Some(r.unsubscribe_diffs);
+                snapshot.reconcile_shadow_collapse_diffs = Some(r.collapse_diffs);
+                snapshot.reconcile_shadow_announce_diffs = Some(r.announce_diffs);
+                snapshot.reconcile_shadow_retract_diffs = Some(r.retract_diffs);
+                snapshot.reconcile_shadow_reroot_search_diffs = Some(r.reroot_search_diffs);
+            }
+
             // Keep the hosting manager's copy of our own ring location current so
             // the proximity-prior demand estimate (#4642 A3) can turn a contract
             // key into a distance. Best-effort: only push a known location.
@@ -2063,6 +2097,37 @@ impl Ring {
                 tracing::debug!("OpManager not available for subscription renewal");
                 continue;
             };
+
+            // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
+            // RENEWAL site — the highest-signal one: it exercises the #3763
+            // interest gate. For every contract the current renewal set wants
+            // renewed, the actual behavior maps to the Action set `{Renew}`; we
+            // build the reconcile snapshot, compute what the pure controller
+            // would do, and record the set-membership divergence. DRIVES
+            // NOTHING — the batch renewal loop below is unchanged. A renewal the
+            // controller would NOT keep alive (e.g. a section-2/3 not-subscribed
+            // contract the controller would `Subscribe`/`ReRootSearch` instead,
+            // or one in use only via a strictly-CLOSER downstream subscriber) is
+            // exactly the drift the computed-upstream / strict-farther model
+            // corrects — expected, recorded, not a bug. Bounded per tick (30s
+            // cadence × renewal-set size); local counter increments only, no
+            // per-event telemetry emission.
+            for contract in &contracts_needing_renewal {
+                let inputs = op_manager.build_reconcile_inputs(contract);
+                let reconcile_actions = reconcile::reconcile(&inputs);
+                let divergence = reconcile::action_set_divergence(
+                    &reconcile_actions,
+                    &[reconcile::Action::Renew],
+                );
+                crate::node::network_status::record_reconcile_shadow_comparison(divergence);
+                if divergence.any() {
+                    tracing::debug!(
+                        %contract,
+                        ?reconcile_actions,
+                        "reconcile shadow diverges from actual renewal ({{Renew}}) (#4642 keystone step-2)"
+                    );
+                }
+            }
 
             // Backpressure: reduce batch size when the notification channel is
             // congested, but never skip entirely. Renewals are critical-path —
@@ -2893,6 +2958,31 @@ impl Ring {
     /// Check if we have an active (non-expired) subscription to a contract.
     pub fn is_subscribed(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.is_subscribed(contract)
+    }
+
+    /// Whether the FULL contract state (code + params + state) is present on
+    /// disk for `contract` — the cheap on-disk state-store existence check, NOT
+    /// the in-memory hosting cache. Hosting is binary: this is `true` only when
+    /// this peer holds the whole contract. Used by the reconcile input-builder
+    /// (keystone step-2, #4642) for `ReconcileInputs::state_present`.
+    pub(crate) fn contract_state_present(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.contract_state_present(contract)
+    }
+
+    /// Whether at least one LOCAL WebSocket client is currently subscribed to
+    /// `contract` (real local demand, distinct from downstream peer
+    /// subscribers). Used by the reconcile input-builder (keystone step-2,
+    /// #4642) for `ReconcileInputs::has_local_client`.
+    pub(crate) fn has_client_subscriptions(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.has_client_subscriptions(contract.id())
+    }
+
+    /// Lease-valid downstream subscriber peer keys for `contract` (see
+    /// [`hosting::HostingManager::downstream_subscriber_peers`]). Used by the
+    /// reconcile input-builder (keystone step-2, #4642) to apply the piece-D
+    /// strictly-farther filter.
+    pub(crate) fn downstream_subscriber_peers(&self, contract: &ContractKey) -> Vec<PeerKey> {
+        self.hosting_manager.downstream_subscriber_peers(contract)
     }
 
     /// Get all contracts with active subscriptions.
