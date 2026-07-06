@@ -28,6 +28,25 @@
 //! is a later step. Because it is unwired, the items here are `#[allow(dead_code)]`
 //! until that shadow wiring lands.
 //!
+//! # Notes for the shadow-compare wiring (next sub-task)
+//!
+//! - **`Collapse` is the LOCAL teardown** (drop our lease, `ring.unsubscribe`);
+//!   **`Unsubscribe` is the WIRE message** to the computed upstream; **`Retract`
+//!   withdraws the hosting advertisement** (the on-`main` primitive is
+//!   `neighbor_hosting.on_contract_unhosted`, `node/neighbor_hosting.rs:131`,
+//!   currently dead code a later flip must wire). The current code's
+//!   `send_unsubscribe_upstream` does the first two together ("send Unsubscribe +
+//!   `ring.unsubscribe`") in one call, so the shadow-compare must map it onto the
+//!   `{Collapse, Unsubscribe}` PAIR by SET membership, not exact-`Vec` equality.
+//! - **`ReRootSearch` covers BOTH** "upstream lost" (we were a host and the
+//!   closer co-host vanished) AND "never rooted / first formation" (in use, no
+//!   upstream yet, not a root). Both route keyward via the same consult-equipped
+//!   search, so shadow-mapping does not need to distinguish them.
+//! - **`Renew` is level-triggered desired-state, not "renew now"** (see its action
+//!   doc). The shadow-compare checks the PRESENCE of the renewal desire against
+//!   the (renewing) current code; the driver later owns when a renewal is actually
+//!   due, so do not shadow-map it onto an edge-timed send.
+//!
 //! # The `Distance` equality guard (load-bearing — read before editing)
 //!
 //! [`reconcile`] deliberately consumes an already-resolved
@@ -57,39 +76,53 @@ use crate::ring::PeerKeyLocation;
 /// contract. The driver that applies a `Vec<Action>` to the wire/state is a
 /// later step; here the actions are pure values.
 ///
-/// The minimal set the on-`main` decision sites actually exercise is
-/// `Subscribe`, `Unsubscribe`, `Collapse`, `Announce`, `ReRootSearch`.
-/// `Retract` is kept for the enum's eventual shape (advertisement withdrawal),
-/// but has no driving site on `main` — retraction is dead code per spec — so it
-/// is never emitted in shadow mode. (Evict-to-admit is a separate later piece
-/// (7-bis) and is intentionally absent.)
+/// The set the on-`main` decision sites exercise is `Subscribe`, `Unsubscribe`,
+/// `Collapse`, `Announce`, `Renew`, `ReRootSearch`, and `Retract`. (Evict-to-admit
+/// is a separate later piece (7-bis) and is intentionally absent.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
     /// Desired to host via a known (computed) upstream, but we hold no active
     /// subscription yet → link to the upstream by subscribing toward the key.
     Subscribe,
+    /// Level-triggered DESIRED-STATE that an in-use subscription lease we hold
+    /// should be kept alive. This is NOT an edge "renew now" command — it means
+    /// "this lease should stay alive"; the DRIVER owns the actual renewal timing
+    /// (when a lease is due, its backoff, its dedup). Emitted whenever the
+    /// contract is in use (a local client OR a strictly-farther downstream
+    /// subscriber) AND we hold a lease (`is_subscribed`), and — crucially — NOT
+    /// emitted once the last interest goes, so subscriptions track active demand
+    /// rather than cache size. That interest-gating is the #3763 renewal-storm
+    /// fix; without a `Renew` action the controller could not express it, so a
+    /// shadow-compare against the (renewing) current code would show false
+    /// divergence and a future flip would break-before-make.
+    Renew,
     /// Send an `Unsubscribe` to the (computed) upstream, collapsing the chain one
-    /// hop keyward. Emitted alongside `Collapse` when demand is gone AND a
-    /// computed upstream exists to notify.
+    /// hop keyward. The WIRE message, distinct from `Collapse` (the local
+    /// teardown). Emitted alongside `Collapse` when demand is gone AND a computed
+    /// upstream exists to notify.
     Unsubscribe,
     /// Last interest is gone (interest-gated collapse): tear down our own
-    /// subscription lease and stop hosting inward. Distinct from `Unsubscribe`,
-    /// which is the wire message to the upstream; `Collapse` is the local
-    /// teardown and fires even when there is no upstream to notify (e.g. a root
-    /// whose demand lapsed).
+    /// subscription lease and stop hosting inward. The LOCAL teardown, distinct
+    /// from `Unsubscribe` (the wire message to the upstream); `Collapse` fires
+    /// even when there is no upstream to notify (e.g. a root whose demand lapsed).
     Collapse,
-    /// We host (state present + a reason to host) but have not advertised it to
+    /// We host (state present + a settled host role) but have not advertised it to
     /// our neighbors yet → advertise hosting so co-hosts can fan out updates and
-    /// upstream selection can find us.
+    /// upstream selection can find us. Emitted only once the body is actually
+    /// present, never merely "desired" (reconcile-before-announce).
     Announce,
-    /// Withdraw a hosting advertisement. Kept for enum shape only — no on-`main`
-    /// site drives retraction (dead code per spec), so it is never emitted in
-    /// shadow mode.
+    /// Withdraw a hosting advertisement (on-`main` primitive:
+    /// `neighbor_hosting.on_contract_unhosted`, currently dead code). Emitted on
+    /// the collapse branch when we were advertising, so a torn-down contract does
+    /// not keep advertising — a stale co-host advertisement poisons fan-out and
+    /// upstream selection.
     Retract,
     /// Demand is intact but our upstream vanished (or was never found) and we are
     /// not the verified root → search keyward to re-establish a place in the
     /// mesh. This is the partition-vs-collapse distinction: with demand present a
-    /// lost upstream means re-root, NOT collapse a still-wanted chain.
+    /// lost upstream means re-root, NOT collapse a still-wanted chain. Covers both
+    /// "upstream lost" and "never rooted / first formation". Suppressed while
+    /// `actively_acquiring` (a search is already in flight).
     ReRootSearch,
 }
 
@@ -115,29 +148,44 @@ pub(crate) struct ReconcileInputs {
     /// A local client is subscribed to this contract — real local demand.
     pub has_local_client: bool,
 
-    /// At least one downstream peer holds a live (lease-valid) subscription to us
-    /// for this contract — real forwarded demand. Together with
-    /// [`has_local_client`](Self::has_local_client) this is `contract_in_use`
-    /// (`ring/hosting.rs::contract_in_use`), the interest gate for renewal /
-    /// collapse.
+    /// At least one downstream peer STRICTLY FARTHER from the contract key than us
+    /// holds a live (lease-valid) subscription to us — real forwarded demand from
+    /// a peer we are the upstream of. Together with
+    /// [`has_local_client`](Self::has_local_client) this is `contract_in_use`, the
+    /// interest gate for renewal / collapse.
     ///
-    /// STEP-3 / piece-D hook: D refines this to "downstream STRICTLY farther from
-    /// the key" (the §6 guard); modeled here as a plain bool so D can tighten the
-    /// input without touching [`reconcile`].
-    pub has_downstream_subscriber: bool,
+    /// # LOAD-BEARING NAMING — must count only STRICTLY-FARTHER subscribers
+    ///
+    /// Per `hosting-invariants.md` (piece-D converged model), the in-use / renewal
+    /// gate MUST count only downstream subscribers **strictly farther** from the
+    /// contract key (EXCLUDE the closer / upstream peer). If two mutual co-hosts
+    /// each counted the OTHER as a downstream subscriber, each would keep the
+    /// other's lease renewed forever and neither chain would ever collapse —
+    /// breaking the strict distance-to-key total order that guarantees acyclicity
+    /// and collapse termination (design §6 point 2, §4 point 2).
+    ///
+    /// The pure core cannot enforce the filter — it only consumes this bool. The
+    /// **SHADOW-WIRING input-builder (next sub-task) MUST filter the
+    /// downstream-subscriber set to peers strictly farther from the key before
+    /// setting this**, and OWES a pin test on that builder asserting the
+    /// closer/upstream peer is excluded. Named loudly so that obligation is not
+    /// silently dropped when the builder is written.
+    pub has_farther_downstream_subscriber: bool,
 
     /// We have the contract state locally (code + state present). Hosting requires
-    /// state; without it there is nothing to host, announce, or collapse, and the
-    /// acquire/GET path — not this controller — is responsible for fetching it.
+    /// state; a `Subscribe`/`Renew`/`ReRootSearch` may still be desired without it
+    /// (they maintain the subscription/link, not the body), but `Announce` never
+    /// fires without it (reconcile-before-announce).
     pub state_present: bool,
 
     /// We hold an active upstream subscription lease for this contract (we are a
-    /// host wired into the update mesh), as opposed to holding a cached-only copy.
+    /// host wired into the update mesh), as opposed to holding a cached-only copy
+    /// or nothing at all.
     pub is_subscribed: bool,
 
     /// We currently advertise hosting this contract to our neighbors
     /// (`neighbor_hosting.is_hosted_locally`). Gates whether an `Announce` is
-    /// still needed.
+    /// still needed and whether a collapse must also `Retract`.
     pub is_advertised: bool,
 
     /// We are the **locally-verified root/terminus** for this key: a bounded
@@ -152,8 +200,9 @@ pub(crate) struct ReconcileInputs {
     ///
     /// STEP-3 / piece-D hook: no on-`main` source exists yet
     /// (`spawn_host_state_sync_retry` is a D addition), so this is always `false`
-    /// in shadow mode. The desired-hosting predicate keeps the arm so D can wire
-    /// it without touching [`reconcile`].
+    /// in shadow mode. It suppresses a redundant `ReRootSearch` (a search is
+    /// already in flight) and does NOT by itself authorize an `Announce` (that
+    /// waits for the body). D can wire it without touching [`reconcile`].
     pub actively_acquiring: bool,
 }
 
@@ -164,37 +213,45 @@ pub(crate) struct ReconcileInputs {
 ///
 /// Desired-state model (spec "Freshness & Propagation" + "The maintenance /
 /// reconcile loop"):
+/// - **Reconcile maintains hosting we already have.** If we neither hold the
+///   state nor a subscription lease, there is nothing to maintain — initial
+///   acquisition is the client GET/PUT/SUBSCRIBE op path's job, not this
+///   controller's.
+/// - **Renewal / collapse is interest-gated:** `contract_in_use` = a local client
+///   OR a strictly-farther downstream subscriber. While in use with a held lease
+///   we `Renew`; when the last interest goes, we `Collapse` inward (this is the
+///   #3763 storm fix — subscriptions track active demand, not cache size).
 /// - **Hosting** is desired iff we have the state AND one of {a computed upstream,
 ///   actively acquiring one, being the locally-verified root}.
-/// - **Renewal / collapse** is interest-gated: `contract_in_use` = a local client
-///   OR a downstream subscriber. When the last interest goes, the chain collapses
-///   inward (this is the #3763 storm fix — subscriptions track active demand, not
-///   cache size).
-/// - **Partition vs. collapse**: with demand intact but no computed upstream and
+/// - **Partition vs. collapse:** with demand intact but no computed upstream and
 ///   not the root, the upstream vanished → re-root keyward, never collapse.
 ///
 /// The returned actions are a diff of desired-vs-actual and are emitted in a
-/// deterministic order (`Collapse` before `Unsubscribe`; `ReRootSearch` before
-/// `Subscribe` before `Announce`). `ReRootSearch` and `Subscribe` are mutually
-/// exclusive by construction (one needs `computed_upstream.is_none()`, the other
-/// `is_some()`).
+/// deterministic order: on collapse, `Collapse` → `Unsubscribe` → `Retract`;
+/// otherwise `Renew` → `Subscribe` → `ReRootSearch` → `Announce`. `Renew`/`Subscribe`
+/// and `Subscribe`/`ReRootSearch` are each mutually exclusive by construction.
 pub(crate) fn reconcile(inputs: &ReconcileInputs) -> Vec<Action> {
-    // No local state ⇒ nothing to host, announce, or collapse. A missing body is
-    // the acquire/GET path's job, not the reconcile controller's.
-    if !inputs.state_present {
+    // Reconcile maintains hosting we already have. If we neither hold the state
+    // nor a subscription lease, there is nothing to maintain — initial acquisition
+    // is driven by the client GET/PUT/SUBSCRIBE op path, not this controller.
+    //
+    // (H1) This guard must NOT blanket-return on `!state_present`: a peer that IS
+    // subscribed but is still awaiting its first body must reach the collapse
+    // branch when demand ends, or the upstream subscription leaks. So it only
+    // short-circuits when we are ALSO not subscribed.
+    if !inputs.state_present && !inputs.is_subscribed {
         return Vec::new();
     }
 
-    let contract_in_use = inputs.has_local_client || inputs.has_downstream_subscriber;
+    let contract_in_use = inputs.has_local_client || inputs.has_farther_downstream_subscriber;
 
-    // Interest-gated collapse: the last interest is gone → tear down inward. Drop
-    // our own subscription lease (`Collapse`); if a computed upstream exists, also
-    // send it an `Unsubscribe` so the chain collapses one hop keyward. Nothing to
-    // collapse if we never held a subscription — a cached idle copy is left to the
-    // eviction path, not reconcile. This mirrors the on-`main`
-    // `should_unsubscribe_upstream` + `send_unsubscribe_upstream` behavior, which
-    // acts only when subscribed and only sends the wire message when an upstream
-    // is located.
+    // Interest-gated collapse: the last interest is gone → tear down inward. This
+    // runs regardless of `state_present` (H1). Only a held lease can be torn down;
+    // a cached idle copy with no lease is left to the eviction path, not reconcile
+    // (mirrors on-`main` `should_unsubscribe_upstream`, which acts only when
+    // subscribed). Collapse = local teardown; Unsubscribe = wire message to the
+    // upstream (only when one exists to notify); Retract = withdraw a live
+    // advertisement so the torn-down contract stops advertising.
     if !contract_in_use {
         let mut actions = Vec::new();
         if inputs.is_subscribed {
@@ -202,34 +259,53 @@ pub(crate) fn reconcile(inputs: &ReconcileInputs) -> Vec<Action> {
             if inputs.computed_upstream.is_some() {
                 actions.push(Action::Unsubscribe);
             }
+            if inputs.is_advertised {
+                actions.push(Action::Retract);
+            }
         }
         return actions;
     }
 
     // `contract_in_use == true` below.
 
-    // Desired hosting: state present (guaranteed above) AND a reason to host.
-    let desired_hosting =
-        inputs.computed_upstream.is_some() || inputs.actively_acquiring || inputs.is_verified_root;
+    // A settled host role: we have an upstream link or we are the verified root.
+    // Deliberately EXCLUDES `actively_acquiring` — an in-flight acquisition is not
+    // yet a host, so it must not gate `Announce` (M1: announce AFTER the body is
+    // acquired and we actually hold a host role).
+    let has_host_role = inputs.computed_upstream.is_some() || inputs.is_verified_root;
 
     let mut actions = Vec::new();
 
-    // Upstream lost or never found, demand intact, and we are not the root →
-    // re-root keyward (partition, not collapse). Mutually exclusive with
-    // `Subscribe`, which requires a `Some` upstream.
-    if inputs.computed_upstream.is_none() && !inputs.is_verified_root {
-        actions.push(Action::ReRootSearch);
+    // Level-triggered renewal (H3): an in-use lease we hold should be kept alive.
+    // DESIRED-STATE, not edge "renew now" — the driver owns when a renewal is due.
+    // Interest-gated: only while in use, so the collapse branch above (not this
+    // one) fires once demand ends — the #3763 renewal-storm fix.
+    if inputs.is_subscribed {
+        actions.push(Action::Renew);
     }
 
-    // Want to host via a known upstream but hold no subscription yet → subscribe.
+    // Subscribe: a known upstream exists but we hold no lease yet → link to it.
+    // Mutually exclusive with `Renew` (needs `!is_subscribed`) and with
+    // `ReRootSearch` (needs a `Some` upstream).
     if inputs.computed_upstream.is_some() && !inputs.is_subscribed {
         actions.push(Action::Subscribe);
     }
 
-    // We host (desired) but have not advertised it → announce. STEP-3 will order
-    // this AFTER acquisition (reconcile-before-announce); here we only compute the
-    // action SET, not its application order.
-    if desired_hosting && !inputs.is_advertised {
+    // Re-root (partition, not collapse): no strictly-closer connected co-host, we
+    // are not the root, and demand is intact → search keyward to re-establish a
+    // place. Suppressed while `actively_acquiring` (M2) so we do not kick a fresh
+    // search on top of one already in flight. Covers both "upstream lost" and
+    // "never rooted / first formation".
+    if inputs.computed_upstream.is_none() && !inputs.is_verified_root && !inputs.actively_acquiring
+    {
+        actions.push(Action::ReRootSearch);
+    }
+
+    // Announce: only once the body is actually present AND we hold a settled host
+    // role (upstream or verified-root), and we are not already advertising (M1:
+    // announce AFTER the body is acquired — reconcile-before-announce — never
+    // merely because hosting is desired or acquisition is in flight).
+    if inputs.state_present && has_host_role && !inputs.is_advertised {
         actions.push(Action::Announce);
     }
 
@@ -260,7 +336,7 @@ mod tests {
         ReconcileInputs {
             computed_upstream: None,
             has_local_client: false,
-            has_downstream_subscriber: false,
+            has_farther_downstream_subscriber: false,
             state_present: true,
             is_subscribed: false,
             is_advertised: false,
@@ -275,7 +351,8 @@ mod tests {
         let cases: Vec<(&str, ReconcileInputs, Vec<Action>)> = vec![
             // --- Empty / no-op edges ---
             (
-                "no state ⇒ no actions (nothing to host), even with demand + upstream",
+                "no state, not subscribed, even with demand+upstream ⇒ [] \
+                 (initial acquisition is the op path's job, not reconcile)",
                 ReconcileInputs {
                     state_present: false,
                     has_local_client: true,
@@ -285,7 +362,7 @@ mod tests {
                 vec![],
             ),
             (
-                "cached idle copy: no demand, not subscribed ⇒ no actions \
+                "cached idle copy: no demand, not subscribed, advertised ⇒ [] \
                  (left to eviction, not reconcile)",
                 ReconcileInputs {
                     is_advertised: true,
@@ -294,7 +371,25 @@ mod tests {
                 vec![],
             ),
             (
-                "steady-state host: upstream, subscribed, advertised, in use ⇒ no actions",
+                "demand gone, not subscribed ⇒ [] (nothing to tear down)",
+                ReconcileInputs { ..base() },
+                vec![],
+            ),
+            // --- H1: subscribed but awaiting first state, demand ends ⇒ must collapse ---
+            (
+                "H1: no state, SUBSCRIBED, demand gone, has upstream ⇒ collapse + unsubscribe \
+                 (do NOT leak the upstream subscription)",
+                ReconcileInputs {
+                    state_present: false,
+                    is_subscribed: true,
+                    computed_upstream: upstream(),
+                    ..base()
+                },
+                vec![Collapse, Unsubscribe],
+            ),
+            // --- Renew: level-triggered, in-use held lease ---
+            (
+                "steady-state host: upstream, subscribed, advertised, in use ⇒ [Renew]",
                 ReconcileInputs {
                     computed_upstream: upstream(),
                     has_local_client: true,
@@ -302,7 +397,7 @@ mod tests {
                     is_advertised: true,
                     ..base()
                 },
-                vec![],
+                vec![Renew],
             ),
             // --- Subscribe + Announce (host formation via upstream) ---
             (
@@ -318,25 +413,25 @@ mod tests {
                 "host-with-upstream, not subscribed, already advertised ⇒ subscribe only",
                 ReconcileInputs {
                     computed_upstream: upstream(),
-                    has_downstream_subscriber: true,
+                    has_farther_downstream_subscriber: true,
                     is_advertised: true,
                     ..base()
                 },
                 vec![Subscribe],
             ),
             (
-                "host-with-upstream, subscribed, not advertised ⇒ announce only",
+                "host-with-upstream, subscribed, not advertised ⇒ renew + announce",
                 ReconcileInputs {
                     computed_upstream: upstream(),
                     has_local_client: true,
                     is_subscribed: true,
                     ..base()
                 },
-                vec![Announce],
+                vec![Renew, Announce],
             ),
             // --- Root (no upstream, verified terminus) ---
             (
-                "verified root, in use, advertised ⇒ no actions \
+                "verified root, in use, subscribed, advertised ⇒ [Renew] \
                  (no subscribe, no collapse while in use)",
                 ReconcileInputs {
                     has_local_client: true,
@@ -345,21 +440,42 @@ mod tests {
                     is_verified_root: true,
                     ..base()
                 },
-                vec![],
+                vec![Renew],
             ),
             (
-                "verified root, in use, not advertised ⇒ announce (root still advertises)",
+                "verified root, in use, subscribed, not advertised ⇒ renew + announce",
                 ReconcileInputs {
                     has_local_client: true,
                     is_subscribed: true,
                     is_verified_root: true,
                     ..base()
                 },
+                vec![Renew, Announce],
+            ),
+            (
+                "L1: verified root, in use, NOT subscribed, not advertised ⇒ [Announce] \
+                 (root has body + demand, advertises; no lease to renew)",
+                ReconcileInputs {
+                    has_local_client: true,
+                    is_verified_root: true,
+                    ..base()
+                },
                 vec![Announce],
             ),
-            // --- Collapse / Unsubscribe (interest-gated teardown) ---
+            // --- Collapse / Unsubscribe / Retract (interest-gated teardown) ---
             (
-                "demand gone, subscribed, has upstream ⇒ collapse + unsubscribe",
+                "M3/L1: demand gone, subscribed, has upstream, advertised \
+                 ⇒ collapse + unsubscribe + retract",
+                ReconcileInputs {
+                    computed_upstream: upstream(),
+                    is_subscribed: true,
+                    is_advertised: true,
+                    ..base()
+                },
+                vec![Collapse, Unsubscribe, Retract],
+            ),
+            (
+                "demand gone, subscribed, has upstream, not advertised ⇒ collapse + unsubscribe",
                 ReconcileInputs {
                     computed_upstream: upstream(),
                     is_subscribed: true,
@@ -368,48 +484,57 @@ mod tests {
                 vec![Collapse, Unsubscribe],
             ),
             (
-                "demand gone, subscribed, no upstream (root lapsing) ⇒ collapse only",
+                "demand gone, subscribed, no upstream (root lapsing), advertised \
+                 ⇒ collapse + retract (no wire unsubscribe with no upstream)",
                 ReconcileInputs {
                     is_subscribed: true,
                     is_verified_root: true,
+                    is_advertised: true,
                     ..base()
                 },
-                vec![Collapse],
-            ),
-            (
-                "demand gone, not subscribed ⇒ no actions (nothing to tear down)",
-                ReconcileInputs { ..base() },
-                vec![],
+                vec![Collapse, Retract],
             ),
             // --- ReRootSearch (partition vs. collapse) ---
             (
-                "had upstream (subscribed), upstream now None, demand intact, not root \
-                 ⇒ re-root (NOT collapse)",
+                "re-root: had upstream (subscribed), upstream now None, demand intact, not root \
+                 ⇒ renew + re-root (serve-during: keep lease AND re-find, NOT collapse)",
                 ReconcileInputs {
                     has_local_client: true,
                     is_subscribed: true,
                     ..base()
                 },
-                vec![ReRootSearch],
+                vec![Renew, ReRootSearch],
             ),
             (
-                "demand intact, no upstream, not subscribed, not root ⇒ re-root (find a place)",
+                "re-root fresh: demand intact, no upstream, not subscribed, not root \
+                 ⇒ [ReRootSearch] (first formation / never rooted)",
                 ReconcileInputs {
-                    has_downstream_subscriber: true,
+                    has_farther_downstream_subscriber: true,
                     ..base()
                 },
                 vec![ReRootSearch],
             ),
-            // --- Piece-D hook: actively_acquiring keeps the host arm alive ---
+            // --- M2 + M1: actively_acquiring suppresses re-root AND announce ---
             (
-                "acquiring (D-hook), no upstream, not root, in use, not advertised \
-                 ⇒ re-root + announce",
+                "M2/M1: acquiring, in use, no upstream, not root, not subscribed \
+                 ⇒ [] (re-root suppressed while acquiring; no announce during acquisition)",
                 ReconcileInputs {
                     has_local_client: true,
                     actively_acquiring: true,
                     ..base()
                 },
-                vec![ReRootSearch, Announce],
+                vec![],
+            ),
+            (
+                "acquiring + subscribed: in use, upstream lost, acquiring \
+                 ⇒ [Renew] (keep lease, wait for acquisition — no re-root, no announce)",
+                ReconcileInputs {
+                    has_local_client: true,
+                    is_subscribed: true,
+                    actively_acquiring: true,
+                    ..base()
+                },
+                vec![Renew],
             ),
         ];
 
