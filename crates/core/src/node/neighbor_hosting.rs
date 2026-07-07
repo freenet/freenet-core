@@ -32,6 +32,23 @@ use tracing::{debug, info, trace};
 use crate::message::NeighborHostingMessage;
 use crate::transport::TransportPublicKey;
 
+// Advertisement-layer anti-entropy cadence (#4642 spec step 1, "Fix 1").
+//
+// The on-connect `HostingStateRequest`/`HostingStateResponse` exchange and the
+// per-eviction retraction broadcast are both best-effort; a dropped one leaves a
+// co-host with a stale view of what its neighbor hosts (a missed add ⇒ lost
+// fan-out; a missed retraction ⇒ a phantom host that poisons fan-out and
+// read-routing, invariant 1). The reliability backstop is a periodic full-set
+// re-request: it is PIGGYBACKED on the InterestSync `interest_heartbeat` loop
+// (`ring.rs`), so it runs on that loop's `INTEREST_HEARTBEAT_INTERVAL` (~5 min)
+// cadence and shares its RNG-free scheduling — a separate task with its own
+// `GlobalRng` initial-delay draw would perturb the deterministic simulation
+// harness. The `HostingStateResponse` handler REPLACES our view of the responding
+// neighbor, so both a dropped add and a dropped retraction self-heal within one
+// interval. That interval is also the advertisement-staleness / reconcile TOCTOU
+// bound the spec calls out: a co-host advertisement can be stale for at most one
+// heartbeat interval after a dropped update.
+
 /// Result from handling a neighbor hosting message.
 ///
 /// Contains an optional response message to send back, plus any contracts
@@ -123,11 +140,24 @@ impl NeighborHostingManager {
         }
     }
 
-    /// Called when we stop hosting a contract (eviction).
+    /// Called when we STOP hosting a contract — the state has left this node
+    /// (background eviction; and, once built, evict-to-admit displacement and
+    /// interest-gated collapse-then-evict, which all funnel through the same disk
+    /// reclamation path). Removes the contract from our advertised set and returns
+    /// a retraction `HostingAnnounce{removed}` to broadcast to connected co-hosts,
+    /// or `None` if we were not advertising it (idempotent).
     ///
-    /// Returns a `HostingAnnounce` message to broadcast to neighbors if the
-    /// contract was hosted, or `None` if it wasn't.
-    #[allow(dead_code)]
+    /// Wiring this is Fix 1's retraction half (#4642 spec step 1). Without it a
+    /// co-host keeps a phantom advertisement for a contract we evicted, so it
+    /// fans updates to us and routes reads to us for state we no longer hold — the
+    /// stale-advertisement failure class (invariant 1: advertise iff a fresh
+    /// in-mesh host). Idempotent by construction (`DashSet::remove` returns `None`
+    /// on a repeat), so the pending-reclamation retry path at the call site can
+    /// re-fire safely; the broadcast only happens on the transition.
+    ///
+    /// Best-effort like its `on_contract_hosted` sibling: a dropped retraction is
+    /// healed by the periodic full-set re-request (piggybacked on the interest
+    /// heartbeat, ~5 min).
     pub fn on_contract_unhosted(
         &self,
         contract_key: &ContractKey,
@@ -137,8 +167,9 @@ impl NeighborHostingManager {
         if self.my_contracts.remove(&contract_id).is_some() {
             debug!(
                 contract = %contract_key,
-                "NEIGHBOR_HOSTING: Removed contract from locally hosted"
+                "NEIGHBOR_HOSTING: Removed contract from locally hosted (retracting advertisement)"
             );
+            crate::config::GlobalTestMetrics::record_neighbor_hosting_retraction();
 
             Some(NeighborHostingMessage::HostingAnnounce {
                 added: vec![],
@@ -277,17 +308,44 @@ impl NeighborHostingManager {
             NeighborHostingMessage::HostingStateResponse { contracts } => {
                 let count = contracts.len();
 
-                // Find contracts that overlap with our local cache BEFORE storing.
-                // We need to announce these back so the peer knows we also have them.
+                // Capture what we previously knew this peer hosted BEFORE the full
+                // replace below, so `overlapping` (which drives the proactive
+                // state sync) is computed only over NEWLY-learned shared contracts,
+                // mirroring the `HostingAnnounce` arm's `previously_known` diff.
+                //
+                // This is what makes the periodic full-set re-request
+                // (piggybacked on the interest heartbeat, Fix 1) cheap and purely
+                // advertisement-layer: without the diff, every re-request would
+                // re-trigger a targeted state sync for EVERY actively-served shared
+                // contract every interval — redundant with the InterestSync STATE
+                // anti-entropy and a needless per-interval fetch load. On a fresh
+                // connection (or a reconnect, where `on_peer_disconnected` cleared
+                // this peer's entry) `previously_known` is empty, so every shared
+                // contract counts as new and the reconnection-recovery sync is
+                // preserved exactly.
+                let previously_known: HashSet<ContractInstanceId> = self
+                    .neighbor_contracts
+                    .get(from)
+                    .map(|entry| entry.value().clone())
+                    .unwrap_or_default();
+
+                // A `HostingStateResponse` is a FULL SNAPSHOT: it REPLACES our
+                // whole view of this peer, so a contract the peer stopped hosting
+                // silently disappears from our view here. That full-replace is what
+                // lets the periodic re-request heal a dropped retraction (Fix 1).
+                self.neighbor_contracts
+                    .insert(from.clone(), contracts.iter().copied().collect());
+                crate::config::GlobalTestMetrics::record_neighbor_hosting_update();
+
+                // Announce back only the NEWLY-learned overlaps so the peer can
+                // include us in its UPDATE targets for shared contracts it did not
+                // previously know we host.
                 let overlapping: Vec<ContractInstanceId> = contracts
                     .iter()
-                    .filter(|id| self.my_contracts.contains(*id))
+                    .filter(|id| !previously_known.contains(*id)) // Only NEW from this peer
+                    .filter(|id| self.my_contracts.contains(*id)) // That we also host
                     .copied()
                     .collect();
-
-                self.neighbor_contracts
-                    .insert(from.clone(), contracts.into_iter().collect());
-                crate::config::GlobalTestMetrics::record_neighbor_hosting_update();
 
                 info!(
                     peer = %from,
@@ -449,7 +507,7 @@ impl NeighborHostingManager {
         self.my_contracts.contains(contract_key.id())
     }
 
-    /// Get the number of contracts we're hosting locally.
+    /// Get the number of contracts we advertise hosting locally (`my_contracts`).
     #[allow(dead_code)]
     pub fn local_hosted_count(&self) -> usize {
         self.my_contracts.len()
@@ -1222,5 +1280,176 @@ mod tests {
 
         // Hosting an already-initialized contract should return None (no duplicate announcement)
         assert!(manager.on_contract_hosted(&key1).is_none());
+    }
+
+    // === Advertisement-layer retraction + reliability (Fix 1, #4642 step 1) ===
+
+    #[test]
+    fn test_removed_announce_converges_at_receiver() {
+        // Fix 1 retraction propagation: a `HostingAnnounce{removed}` drops the
+        // contract from our view of the neighbor, so we stop treating it as a
+        // host for Source-1 fan-out and terminal read-routing.
+        let manager = NeighborHostingManager::new();
+        let key = test_contract_key();
+        let neighbor = make_pub_key(1);
+
+        manager.handle_message(
+            &neighbor,
+            NeighborHostingMessage::HostingAnnounce {
+                added: vec![*key.id()],
+                removed: vec![],
+                is_response: false,
+            },
+        );
+        assert_eq!(
+            manager.neighbors_with_contract(&key),
+            vec![neighbor.clone()]
+        );
+
+        // The neighbor retracts (stopped hosting) → we must drop it.
+        let result = manager.handle_message(
+            &neighbor,
+            NeighborHostingMessage::HostingAnnounce {
+                added: vec![],
+                removed: vec![*key.id()],
+                is_response: false,
+            },
+        );
+        assert!(
+            manager.neighbors_with_contract(&key).is_empty(),
+            "a removed-announce must retract the neighbor's advertisement"
+        );
+        // A pure retraction has no overlap to sync back and needs no response.
+        assert!(result.response.is_none());
+        assert!(result.overlapping_contracts.is_empty());
+    }
+
+    #[test]
+    fn test_hosting_state_response_full_replace_drops_stale() {
+        // The periodic full-set re-request (piggybacked on `interest_heartbeat`,
+        // Fix 1) heals a DROPPED retraction: a `HostingStateResponse` is a full snapshot
+        // that REPLACES our view of the peer, so a contract the peer stopped
+        // hosting disappears even though we never saw its removed-announce.
+        let manager = NeighborHostingManager::new();
+        let key_x = test_contract_key();
+        let key_y = test_contract_key_2();
+        let neighbor = make_pub_key(1);
+
+        // We believe the neighbor hosts X and Y (from earlier announces).
+        manager.handle_message(
+            &neighbor,
+            NeighborHostingMessage::HostingAnnounce {
+                added: vec![*key_x.id(), *key_y.id()],
+                removed: vec![],
+                is_response: false,
+            },
+        );
+        assert_eq!(
+            manager.neighbors_with_contract(&key_x),
+            vec![neighbor.clone()]
+        );
+        assert_eq!(
+            manager.neighbors_with_contract(&key_y),
+            vec![neighbor.clone()]
+        );
+
+        // A periodic re-request response shows the neighbor now hosts only X (it
+        // evicted Y and our retraction was dropped). Full-replace drops Y.
+        manager.handle_message(
+            &neighbor,
+            NeighborHostingMessage::HostingStateResponse {
+                contracts: vec![*key_x.id()],
+            },
+        );
+        assert_eq!(
+            manager.neighbors_with_contract(&key_x),
+            vec![neighbor.clone()]
+        );
+        assert!(
+            manager.neighbors_with_contract(&key_y).is_empty(),
+            "a full-set re-request must drop a contract the peer stopped hosting \
+             (the dropped-retraction heal)"
+        );
+    }
+
+    #[test]
+    fn test_hosting_state_response_overlap_only_for_newly_learned() {
+        // The periodic re-request must NOT re-trigger the proactive state sync for
+        // an already-known overlap every interval (that would duplicate the
+        // InterestSync STATE anti-entropy and re-arm needless per-interval fetch
+        // load). `overlapping` is computed only over NEWLY-learned shared
+        // contracts, mirroring the `HostingAnnounce` path.
+        let manager = NeighborHostingManager::new();
+        let key = test_contract_key();
+        let neighbor = make_pub_key(1);
+
+        manager.on_contract_hosted(&key);
+
+        // First response (fresh view): the shared contract is new → overlap.
+        let first = manager.handle_message(
+            &neighbor,
+            NeighborHostingMessage::HostingStateResponse {
+                contracts: vec![*key.id()],
+            },
+        );
+        assert_eq!(
+            first.overlapping_contracts,
+            vec![*key.id()],
+            "first response must report the shared contract as a new overlap"
+        );
+
+        // Second (periodic) response with the SAME set: already known → no
+        // overlap, so no redundant per-interval state sync.
+        let second = manager.handle_message(
+            &neighbor,
+            NeighborHostingMessage::HostingStateResponse {
+                contracts: vec![*key.id()],
+            },
+        );
+        assert!(
+            second.overlapping_contracts.is_empty(),
+            "a periodic re-request of an already-known overlap must NOT re-sync state"
+        );
+        assert!(second.response.is_none());
+
+        // Reconnection recovery preserved: after a disconnect clears our view, the
+        // same shared contract is new again → overlap re-reported (fast recovery).
+        manager.on_peer_disconnected(&neighbor);
+        let after_reconnect = manager.handle_message(
+            &neighbor,
+            NeighborHostingMessage::HostingStateResponse {
+                contracts: vec![*key.id()],
+            },
+        );
+        assert_eq!(
+            after_reconnect.overlapping_contracts,
+            vec![*key.id()],
+            "after reconnect (view cleared) the overlap must be re-reported"
+        );
+    }
+
+    #[test]
+    fn test_on_contract_unhosted_is_idempotent() {
+        // The eviction call site (`reclaim_evicted_contract`) can re-fire on the
+        // pending-reclamation retry, so the retraction primitive must be
+        // idempotent: it emits the retraction once and returns `None` thereafter.
+        let manager = NeighborHostingManager::new();
+        let key = test_contract_key();
+
+        manager.on_contract_hosted(&key);
+        assert!(manager.is_hosted_locally(&key), "advertised after hosting");
+
+        assert!(
+            manager.on_contract_unhosted(&key).is_some(),
+            "first unhost emits a retraction"
+        );
+        assert!(
+            !manager.is_hosted_locally(&key),
+            "no longer advertised after retraction"
+        );
+        assert!(
+            manager.on_contract_unhosted(&key).is_none(),
+            "repeat unhost is a no-op (idempotent) — the retry path must not re-broadcast"
+        );
     }
 }
