@@ -241,7 +241,13 @@ pub enum ReconcileShadowSite {
     /// The interest-gated collapse (`OpManager::send_unsubscribe_upstream`).
     Collapse,
     /// The subscription-renewal set (`Ring::contracts_needing_renewal`, driven
-    /// by the recovery loop).
+    /// by the recovery loop). **FLIPPED (keystone sub-task 3, #4642):** this site
+    /// no longer records a shadow — it DRIVES (`OpManager::reconcile_wants_renewal`
+    /// gates the renewal spawn). The counter is retained but its meaning shifted:
+    /// `comparisons` now counts renewal-gate decisions and `divergences`/`renew`
+    /// count the times the STRICT-farther interest gate SUPPRESSED a renewal the
+    /// old ANY-downstream set would have done — the "renewal tracks active demand,
+    /// not cache size" ship-gate falsifier (design §5a / #3763), not a divergence.
     Renewal,
     /// A downstream peer unsubscribed (`subscribe::handle_unsubscribe_inbound`):
     /// did that leave us not-in-use (strict-farther), i.e. would the controller

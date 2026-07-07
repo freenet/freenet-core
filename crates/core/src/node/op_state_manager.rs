@@ -963,6 +963,60 @@ impl OpManager {
         }
     }
 
+    /// Reconcile-controller FLIP of the RENEWAL-site interest gate (#4642
+    /// keystone, sub-task 3 "the flip"; demand-driven-hosting design doc §5a).
+    ///
+    /// This is the first driver-backed reconcile decision: it no longer records a
+    /// shadow divergence, it DRIVES. Given a contract the renewal loop is about to
+    /// renew, it builds a FRESH [`reconcile::ReconcileInputs`] snapshot AT EMISSION
+    /// time (the TOCTOU revalidation guard — the decision is made from the live
+    /// maps at the instant the renewal would fire, never a stale earlier read) and
+    /// applies the controller's interest gate [`reconcile::wants_renewal`] =
+    /// design §5a `contract_in_use`: renew iff a **local client** OR a
+    /// **STRICTLY-farther** downstream subscriber depends on this peer hosting
+    /// (piece D: a downstream counts only when strictly farther from the key, so
+    /// two mutual co-hosts cannot renew each other forever).
+    ///
+    /// Returns `false` when the contract is no longer `contract_in_use` under that
+    /// strict gate. The renewal loop then SKIPS the spawn; the lease lapses and the
+    /// chain collapses inward. This is the load-bearing piece-D behavior:
+    /// **non-renewal IS the collapse primitive** (§5a), so live subscriptions track
+    /// ACTIVE demand rather than accumulated cache — the #3763 renewal-storm fix.
+    /// The previous (ANY-downstream, renew-everything) gate is what
+    /// `contracts_needing_renewal` still uses to build the candidate set; this
+    /// narrows it to the strict gate at drive time. It gates on DEMAND only, never
+    /// on lease/upstream/root state, so an in-use keyward root (or a peer still
+    /// acquiring its first lease) renews too — dropping those would strand a
+    /// demanded contract's lease.
+    ///
+    /// Fails **SAFE** (`true`, keep renewing) when the snapshot is distance-blind
+    /// (own ring location unknown at startup): collapsing a chain on an
+    /// unmeasurable snapshot is exactly the last-holder-on-a-stale-snapshot bug the
+    /// spec's at-emission-revalidation hardening exists to prevent. Behavior at
+    /// startup is therefore unchanged (renew everything in the set).
+    ///
+    /// # Per-contract rate cap
+    ///
+    /// The renewal wire action is already per-contract rate-capped by the two gates
+    /// the loop applies before this one: `can_request_subscription` (per-contract
+    /// exponential backoff) and `mark_subscription_pending` (blocks a second
+    /// concurrent renewal for the same contract until the prior one's guard
+    /// releases). Those ARE the "per-contract wire-action rate cap" the spec's
+    /// reconcile hardening requires for the driven renewal, so this flip adds no
+    /// redundant cap. (A dedicated cap is still owed for the destructive
+    /// `Unsubscribe` wire action when it is later flipped, since that path does not
+    /// pass through `can_request_subscription`.)
+    pub(crate) fn reconcile_wants_renewal(&self, contract: &ContractKey) -> bool {
+        let Some(inputs) = self.build_reconcile_inputs(contract) else {
+            // Distance-blind snapshot: never collapse a chain on a blind read.
+            return true;
+        };
+        // The controller's interest gate (design §5a `contract_in_use`), computed
+        // from the fresh at-emission snapshot. This wrapper only supplies the
+        // snapshot; the decision lives in the pure reconcile core.
+        reconcile::wants_renewal(&inputs)
+    }
+
     /// Send an Unsubscribe message to the upstream peer for a contract.
     ///
     /// Finds the upstream peer from the interest manager, resolves its address,
