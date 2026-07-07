@@ -1135,4 +1135,71 @@ mod tests {
             "the import must be behind an explicit user gesture, not auto-run"
         );
     }
+
+    /// Regression test: the confirmation page must ship anti-framing headers so
+    /// a remote page cannot frame it and steal the import-confirmation click
+    /// (clickjacking), plus `no-store` so the `pt`-bearing URL isn't cached.
+    #[tokio::test]
+    async fn import_page_sets_anti_framing_headers() {
+        let resp = import_page().await.into_response();
+        let h = resp.headers();
+        assert_eq!(
+            h.get("x-frame-options").expect("X-Frame-Options present"),
+            "DENY"
+        );
+        assert_eq!(
+            h.get("cache-control").expect("Cache-Control present"),
+            "no-store"
+        );
+        assert_eq!(
+            h.get("cross-origin-opener-policy").expect("COOP present"),
+            "same-origin"
+        );
+        let csp = h
+            .get("content-security-policy")
+            .expect("CSP present")
+            .to_str()
+            .unwrap();
+        assert!(
+            csp.contains("frame-ancestors 'none'"),
+            "CSP must forbid framing, got: {csp}"
+        );
+    }
+
+    /// Regression test: the pull response must carry `Cache-Control: no-store`
+    /// (it returns the encrypted bundle plus the ephemeral key header over a
+    /// single-use `pt` URL, which a shared/proxy cache must never persist),
+    /// alongside the bundle-key header the local import forwards.
+    #[tokio::test]
+    async fn pull_response_is_no_store_and_carries_key() {
+        let store = MigratePullStore::default();
+        let token = store
+            .insert(
+                user(1),
+                b"bundle-bytes".to_vec(),
+                "ephemeral-key".to_owned(),
+            )
+            .expect("mint");
+        let req = axum::http::Request::builder()
+            .uri(format!("/v1/hosted/migrate/pull?pt={token}"))
+            .extension(store)
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = pull_handler(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = resp.headers();
+        assert_eq!(
+            h.get("cache-control").expect("Cache-Control present"),
+            "no-store"
+        );
+        assert_eq!(
+            h.get(BUNDLE_KEY_HEADER).expect("bundle key header present"),
+            "ephemeral-key"
+        );
+        assert_eq!(
+            h.get(BUNDLE_KEY_KIND_HEADER).expect("kind header present"),
+            "token"
+        );
+    }
 }
