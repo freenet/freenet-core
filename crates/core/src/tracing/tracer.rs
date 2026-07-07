@@ -10,19 +10,25 @@ use tracing_subscriber::{Layer, Registry};
 /// At typical gateway log rates (~500KB/hour), 72 hours ≈ 36MB.
 const LOG_RETENTION_HOURS: usize = 72;
 
-/// Startup-only backstop on the total bytes the freenet log directory
-/// may occupy. When log volume spikes above the steady-state assumption
-/// baked into `LOG_RETENTION_HOURS` (e.g., the executor-queue overflow
-/// in issue #4251 producing thousands of events per second), the
-/// time-based retention alone cannot bound disk usage within a single
-/// session. This cap deletes oldest-first after the time pass to bring
-/// the directory back under the limit on every restart.
+/// Backstop on the total bytes the freenet log directory may occupy.
+/// When log volume spikes above the steady-state assumption baked into
+/// `LOG_RETENTION_HOURS` (e.g., the executor-queue overflow in issue
+/// #4251 producing thousands of events per second), the time-based
+/// retention alone cannot bound disk usage within a single session.
+/// This cap deletes oldest-first after the time pass to bring the
+/// directory back under the limit.
 ///
-/// Caveat: enforcement runs only when the tracer initializes (i.e.,
-/// node start). A long-uptime node under sustained runaway logging can
-/// still exceed this cap until its next restart. Periodic enforcement
-/// is a candidate follow-up.
-const LOG_DIR_MAX_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// Enforcement runs both at tracer init (node start) AND periodically
+/// on the background prune loop spawned by `init_tracer` (issue #4699),
+/// so a long-uptime node under sustained runaway logging is bounded
+/// without needing a restart.
+const LOG_DIR_MAX_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+
+/// How often the background prune loop re-applies `cleanup_old_logs`.
+/// Matches the hourly rotation cadence: a fresh file is sealed every
+/// hour, so re-checking the time + size passes hourly keeps the
+/// directory bounded between restarts without wasteful churn.
+const LOG_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Match the rolling-appender naming convention used by
 /// `RollingFileAppender::Rotation::HOURLY` for the `freenet` /
@@ -131,6 +137,34 @@ fn cleanup_old_logs(log_dir: &std::path::Path) {
     }
 
     enforce_log_dir_size_cap(survivors, LOG_DIR_MAX_BYTES);
+}
+
+/// Background loop that re-invokes [`cleanup_old_logs`] on an hourly
+/// cadence so the time-based retention and the `LOG_DIR_MAX_BYTES` size
+/// cap are enforced for the whole lifetime of a long-uptime node, not
+/// just at startup (issue #4699).
+///
+/// Modeled on the ring subscription sweep (`ring.rs`): a jittered initial
+/// delay avoids synchronized prunes across peers, then a `tokio::time::interval`
+/// drives the loop with the first immediate tick skipped (startup cleanup
+/// already ran).
+///
+/// Wall-clock (`SystemTime`, via `cleanup_old_logs`) is intentional here:
+/// log retention is inherently wall-clock and is not a simulation surface,
+/// so `TimeSource` does not apply.
+async fn periodic_log_prune(log_dir: PathBuf) {
+    // ±25% jitter around a 60s base to desynchronize the first prune across
+    // peers without depending on node-level wiring.
+    let jitter_secs = crate::config::GlobalRng::random_range(45u64..=75u64);
+    tokio::time::sleep(std::time::Duration::from_secs(jitter_secs)).await;
+
+    let mut interval = tokio::time::interval(LOG_PRUNE_INTERVAL);
+    interval.tick().await; // Skip the first immediate tick — startup already pruned.
+
+    loop {
+        interval.tick().await;
+        cleanup_old_logs(&log_dir);
+    }
 }
 
 /// Delete oldest log files until the total size of the supplied list is
@@ -290,6 +324,13 @@ pub fn init_tracer(
 
             // Clean up old log files (including legacy daily logs) on startup
             cleanup_old_logs(log_dir);
+
+            // Spawn a background loop that re-applies the same cleanup on an
+            // hourly cadence so the size cap is enforced continuously, not only
+            // at startup. A long-uptime node under runaway logging would
+            // otherwise exceed `LOG_DIR_MAX_BYTES` until its next restart
+            // (issue #4699). Tracer-owned: it needs only the log dir path.
+            crate::config::GlobalExecutor::spawn(periodic_log_prune(log_dir.to_path_buf()));
 
             // Create rolling file appender for main log (hourly rotation)
             let main_appender = RollingFileAppender::builder()
@@ -505,7 +546,9 @@ fn init_stdout_tracer(
 
 #[cfg(test)]
 mod cleanup_tests {
-    use super::{cleanup_old_logs, enforce_log_dir_size_cap};
+    use super::{
+        LOG_DIR_MAX_BYTES, cleanup_old_logs, enforce_log_dir_size_cap, periodic_log_prune,
+    };
     use std::fs;
     use std::time::{Duration, SystemTime};
 
@@ -681,5 +724,108 @@ mod cleanup_tests {
             scratch.exists(),
             "transient freenet.error.log.last must not be deleted (wrapper-owned)"
         );
+    }
+
+    /// The size cap must engage exactly at the `LOG_DIR_MAX_BYTES`
+    /// boundary (now 512 MiB, lowered from 1 GiB in issue #4699).
+    /// Clock-free: exercises the pure size math on a synthetic list with
+    /// no filesystem entries, so it asserts the boundary regardless of
+    /// how large the const is. `budget + 1` total must trigger a delete;
+    /// `budget` exactly must not. The newest file is always preserved.
+    #[test]
+    fn size_cap_engages_at_512mib_boundary() {
+        let cap = LOG_DIR_MAX_BYTES;
+        assert_eq!(cap, 512 * 1024 * 1024, "cap must be 512 MiB (#4699)");
+
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+
+        // Two files. Sized so that live + old == cap + 1 → over by one
+        // byte → the old (non-live) file must be deleted to get back to
+        // the cap. Split the budget so the live file alone is under cap.
+        let live_size = cap / 2;
+        let old_size = cap - live_size + 1; // total = cap + 1
+        let old = dir.path().join("freenet.2026-05-25-12.log");
+        let live = dir.path().join("freenet.2026-05-25-13.log");
+        write_with_mtime(&old, old_size as usize, now - Duration::from_secs(3600));
+        write_with_mtime(&live, live_size as usize, now);
+
+        let over_by_one = vec![
+            (old.clone(), now - Duration::from_secs(3600), old_size),
+            (live.clone(), now, live_size),
+        ];
+        enforce_log_dir_size_cap(over_by_one, cap);
+        assert!(!old.exists(), "cap+1 must delete the oldest non-live file");
+        assert!(live.exists(), "live file must always survive");
+
+        // Rewrite the old file and feed a list totalling exactly `cap`:
+        // no deletion may occur (boundary is inclusive: total <= cap).
+        write_with_mtime(
+            &old,
+            (cap - live_size) as usize,
+            now - Duration::from_secs(3600),
+        );
+        let exactly_cap = vec![
+            (
+                old.clone(),
+                now - Duration::from_secs(3600),
+                cap - live_size,
+            ),
+            (live.clone(), now, live_size),
+        ];
+        enforce_log_dir_size_cap(exactly_cap, cap);
+        assert!(old.exists(), "total == cap must NOT delete anything");
+        assert!(live.exists(), "live file must survive at the boundary");
+    }
+
+    /// The periodic prune loop (issue #4699) must apply the same
+    /// oldest-first, size-capped cleanup as the startup path while
+    /// preserving the live (newest) file. Driven with tokio
+    /// `start_paused` so the hourly interval advances in virtual time —
+    /// no real sleeps. The loop runs forever, so it is spawned and the
+    /// test awaits enough virtual time for exactly one prune, then drops
+    /// the task.
+    #[tokio::test(start_paused = true)]
+    async fn periodic_prune_deletes_oldest_first_and_keeps_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+
+        // 4 KiB each, total 12 KiB. We cannot pass a custom cap into the
+        // loop (it uses the const), so instead we rely on the time pass:
+        // make the two older files past the 72h retention window and the
+        // newest within it. The periodic cleanup must delete the two old
+        // ones and keep the live file, proving the loop actually invokes
+        // cleanup_old_logs on its tick.
+        let old_ts = SystemTime::now() - Duration::from_secs(100 * 24 * 3600);
+        let oldest = dir.path().join("freenet.2026-02-14-00.log");
+        let middle = dir.path().join("freenet.2026-02-14-01.log");
+        let live = dir.path().join("freenet.2026-05-25-14.log");
+        write_with_mtime(&oldest, 4096, old_ts);
+        write_with_mtime(&middle, 4096, old_ts + Duration::from_secs(3600));
+        write_with_mtime(&live, 4096, now);
+
+        let handle = tokio::spawn(periodic_log_prune(dir.path().to_path_buf()));
+
+        // Let the spawned task run up to its first `.await` (the jittered
+        // initial sleep) so its timer is registered before we advance.
+        tokio::task::yield_now().await;
+
+        // Advance past the jittered initial delay (max 75s). Yield so the
+        // task wakes, skips the immediate interval tick, and parks on the
+        // hourly interval.
+        tokio::time::advance(Duration::from_secs(76)).await;
+        tokio::task::yield_now().await;
+
+        // Advance one full hourly interval so the loop reaches its first
+        // prune tick, then yield so the tick body runs cleanup_old_logs.
+        tokio::time::advance(Duration::from_secs(3601)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        handle.abort();
+
+        assert!(!oldest.exists(), "oldest file must be pruned by the loop");
+        assert!(!middle.exists(), "middle file must be pruned by the loop");
+        assert!(live.exists(), "live (newest) file must be preserved");
     }
 }
