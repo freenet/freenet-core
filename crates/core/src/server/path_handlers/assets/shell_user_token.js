@@ -27,6 +27,13 @@ var __freenet_user_token = (function () {
   // error-prone, and it matches the bs58 (Bitcoin alphabet) used by the rest of
   // Freenet's identifiers. This encoder is byte-for-byte compatible with the
   // `bs58` crate's BITCOIN alphabet output.
+  //
+  // The BEGIN/END markers below let base58_encode.test.mjs extract this exact
+  // function and unit-test its output against known bs58 vectors + edge cases
+  // (this repo has no browser JS test runner, and the shell page's browser-only
+  // globals make the surrounding IIFE non-executable under Node). Keep the
+  // function self-contained (no free variables) so the extraction stays valid.
+  // base58-encoder:BEGIN
   function base58Encode(bytes) {
     var ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
     // Leading zero bytes carry no numeric value but must survive as leading
@@ -71,6 +78,7 @@ var __freenet_user_token = (function () {
     }
     return out;
   }
+  // base58-encoder:END
 
   try {
     var KEY = '__freenet_user_token__';

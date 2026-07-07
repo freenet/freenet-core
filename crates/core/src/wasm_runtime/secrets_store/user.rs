@@ -199,20 +199,28 @@ pub fn user_dek_secret(token: &[u8]) -> Zeroizing<[u8; 32]> {
 mod tests {
     use super::*;
 
-    /// The user token is an OPAQUE bearer string: the namespace is
-    /// `blake3(domain || raw_token_bytes)`, with NO hex decode and NO
-    /// length/charset validation anywhere on the path. That is the property the
-    /// shell's hex -> base58 access-key change relies on — both encodings are
-    /// just different UTF-8 strings, so:
+    /// Pins the DERIVATION-level opacity invariant: `from_token` / [`user_id`] /
+    /// [`user_dek_secret`] treat the token as raw opaque bytes
+    /// (`blake3(domain || raw_token_bytes)`) with NO hex decode and NO
+    /// length/charset validation. This derivation is the single load-bearing
+    /// construction site for a per-user namespace (see the `UserSecretContext`
+    /// security invariant), so it is the place that must stay format-agnostic.
+    ///
+    /// That is the property the shell's hex -> base58 access-key change relies
+    /// on — both encodings are just different UTF-8 strings, so:
     ///
     /// - a NEW base58 token is honored exactly like a hex one (no backend change
     ///   was needed for the switch), and
     /// - an EXISTING user's stored hex token keeps mapping to the same namespace
     ///   (back-compat: their data stays reachable).
     ///
-    /// This pins that contract so a future "validate the token is 32-byte hex"
-    /// well-meaning tightening would fail CI instead of silently locking every
-    /// pre-existing hex user out of their data.
+    /// This pins the derivation contract so a future "validate the token is
+    /// 32-byte hex" tightening added HERE would fail CI instead of silently
+    /// locking every pre-existing hex user out of their data. Note the scope: it
+    /// exercises the derivation directly, not the WS-handshake / hosted
+    /// export/import boundaries — those carry no token-format validation today
+    /// either (only a non-empty check), but that is a separate property not
+    /// asserted by this test.
     #[test]
     fn user_token_is_opaque_hex_and_base58_both_accepted() {
         // A representative hex token (what older shell builds minted) and a
