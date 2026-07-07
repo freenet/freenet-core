@@ -53,6 +53,10 @@
 //!   bytes), so an authenticated token-holder cannot exhaust node memory by
 //!   minting repeatedly; minting also shares the per-user EXPORT rate limit.
 
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::{
     Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit},
@@ -60,14 +64,10 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::Instant;
-
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::client_events::user_op_rate_limit::UserOpRateLimiter;
@@ -94,17 +94,27 @@ const PULL_TOKEN_TTL: Duration = Duration::from_secs(600);
 /// (minting also shares the per-user export rate limit).
 const MAX_PULL_TOKENS_PER_USER: usize = 5;
 
-/// Global cap on live pull tokens across all users. With the per-user cap and
-/// the byte budget, bounds total store memory. Minting past it evicts the
+/// Global cap on live pull tokens across all users. With the per-user caps and
+/// the byte budgets, bounds total store memory. Minting past it evicts the
 /// globally-oldest token first.
 const MAX_PULL_TOKENS_TOTAL: usize = 512;
 
-/// Global byte budget for buffered ephemeral bundles. Sized to comfortably hold
-/// at least one maximal export (`MAX_IMPORT_BUNDLE_BYTES`) plus headroom; real
-/// bundles are kilobytes. Minting evicts oldest tokens until the new bundle
-/// fits; a single bundle larger than the whole budget is refused (can't happen
-/// for a valid export, which is capped below this).
-const MAX_PULL_STORE_BYTES: usize = MAX_IMPORT_BUNDLE_BYTES + 512 * 1024 * 1024;
+/// Per-user byte budget for buffered ephemeral bundles. Sized to hold one
+/// maximal export (`MAX_IMPORT_BUNDLE_BYTES`) plus headroom, so a legitimate
+/// large migration always fits — while capping how much RAM ONE account can
+/// pin. This is the load-bearing anti-griefing bound: without it, a single user
+/// minting two ~max bundles could evict every OTHER user's pending migration
+/// via the global byte budget (a griefing/OOM vector raised in review). Real
+/// bundles are kilobytes, so this ceiling is only ever hit adversarially.
+const MAX_PULL_BYTES_PER_USER: usize = MAX_IMPORT_BUNDLE_BYTES + 64 * 1024 * 1024;
+
+/// Global byte budget for buffered ephemeral bundles — the last-resort OOM
+/// ceiling, only reached when MANY users have filled the store (a broad-load
+/// condition, since the per-user byte budget already bounds each account).
+/// Minting evicts globally-oldest tokens until the new bundle fits; a single
+/// bundle larger than the budget is refused (can't happen for a valid export,
+/// which is capped below this).
+const MAX_PULL_STORE_BYTES: usize = 2 * MAX_PULL_BYTES_PER_USER;
 
 /// Upper bound on the JSON body of a `pull-import` request (`{source, pt}` is a
 /// few hundred bytes; this is generous). Over ⇒ 413.
@@ -136,6 +146,24 @@ struct PullEntry {
     expires_at: Instant,
 }
 
+/// The four bounds [`MigratePullStore::insert_with_limits`] enforces. Factored
+/// into a struct so tests can pass tiny values.
+#[derive(Clone, Copy)]
+struct StoreLimits {
+    max_per_user_count: usize,
+    max_per_user_bytes: usize,
+    max_total_count: usize,
+    max_total_bytes: usize,
+}
+
+/// Production bounds, from the module constants.
+const PROD_STORE_LIMITS: StoreLimits = StoreLimits {
+    max_per_user_count: MAX_PULL_TOKENS_PER_USER,
+    max_per_user_bytes: MAX_PULL_BYTES_PER_USER,
+    max_total_count: MAX_PULL_TOKENS_TOTAL,
+    max_total_bytes: MAX_PULL_STORE_BYTES,
+};
+
 /// Per-node handle to the migration pull-token store. Cheap to clone (an `Arc`),
 /// injected as a router `Extension` in
 /// [`HttpClientApi::as_router_with_origin_contracts`](super::HttpClientApi).
@@ -146,57 +174,62 @@ pub(crate) struct MigratePullStore(Arc<DashMap<String, PullEntry>>);
 impl MigratePullStore {
     /// Store a freshly-minted ephemeral bundle under a new random single-use
     /// token, returning the token. Prunes expired entries, enforces the per-user
-    /// cap (evicting that user's oldest), then the global count + byte budget
-    /// (evicting the globally-oldest until the new bundle fits). Returns `None`
-    /// only if the new bundle alone exceeds the whole byte budget (a valid
-    /// export never does), which the caller maps to a 503.
+    /// count + byte budget (evicting THAT user's oldest first — so one account
+    /// can never push other users' pending migrations out of the store), then
+    /// the global count + byte budget (evicting the globally-oldest). Returns
+    /// `None` only if the new bundle alone exceeds a budget (a valid export
+    /// never does), which the caller maps to a 503.
+    ///
+    /// NOTE: `insert` is a sequence of DashMap ops, not one atomic transaction,
+    /// so two concurrent mints for the SAME user can each observe room and both
+    /// land, transiently exceeding the per-user count cap by one or two. That is
+    /// harmless (still bounded) and is additionally gated by the shared per-user
+    /// EXPORT rate limit on the mint path, which serializes a user's mints far
+    /// below any contention window.
     fn insert(&self, user_id: UserId, bundle: Vec<u8>, key: String) -> Option<String> {
+        self.insert_with_limits(user_id, bundle, key, PROD_STORE_LIMITS)
+    }
+
+    /// [`Self::insert`] with the bounds made explicit, so tests can exercise the
+    /// eviction / oversize-refusal paths at small limits without allocating
+    /// gigabyte buffers (mirrors `secret_export::export_bundle_with_limits`).
+    fn insert_with_limits(
+        &self,
+        user_id: UserId,
+        bundle: Vec<u8>,
+        key: String,
+        limits: StoreLimits,
+    ) -> Option<String> {
         let now = Instant::now();
         let new_len = bundle.len();
-        if new_len > MAX_PULL_STORE_BYTES {
+        // A bundle that can't fit either budget can never be stored.
+        if new_len > limits.max_per_user_bytes || new_len > limits.max_total_bytes {
             return None;
         }
 
         // (1) Drop expired entries so caps count only live tokens.
         self.0.retain(|_, e| e.expires_at > now);
 
-        // (2) Per-user cap: keep at most MAX_PULL_TOKENS_PER_USER - 1 of this
-        // user's existing tokens, evicting oldest, so this insert lands at the
-        // cap.
-        let mut mine: Vec<(String, Instant)> = self
-            .0
-            .iter()
-            .filter(|r| r.value().user_id == user_id)
-            .map(|r| (r.key().clone(), r.value().expires_at))
-            .collect();
-        if mine.len() >= MAX_PULL_TOKENS_PER_USER {
-            mine.sort_by_key(|(_, exp)| *exp);
-            let excess = mine.len() - (MAX_PULL_TOKENS_PER_USER - 1);
-            for (id, _) in mine.into_iter().take(excess) {
-                self.0.remove(&id);
-            }
-        }
+        // (2) Per-user budget (count AND bytes): evict THIS user's own oldest
+        // until adding the new entry stays within both caps. Evicting the
+        // minter's own oldest first is what stops one account from evicting
+        // other users' pending migrations.
+        self.evict_oldest_until(
+            |v| v.user_id == user_id,
+            |count, bytes| {
+                count < limits.max_per_user_count && bytes + new_len <= limits.max_per_user_bytes
+            },
+        );
 
-        // (3) Global count + byte budget: evict globally-oldest until the new
-        // bundle fits.
-        loop {
-            let count = self.0.len();
-            let total: usize = self.0.iter().map(|r| r.value().bundle.len()).sum();
-            if count < MAX_PULL_TOKENS_TOTAL && total + new_len <= MAX_PULL_STORE_BYTES {
-                break;
-            }
-            let oldest = self
-                .0
-                .iter()
-                .min_by_key(|r| r.value().expires_at)
-                .map(|r| r.key().clone());
-            match oldest {
-                Some(id) => {
-                    self.0.remove(&id);
-                }
-                None => break, // store empty but new bundle still didn't fit — impossible given the guard above
-            }
-        }
+        // (3) Global budget (count AND bytes): the last-resort OOM ceiling,
+        // rarely reached because (2) already bounds each user. Evict
+        // globally-oldest across all users.
+        self.evict_oldest_until(
+            |_| true,
+            |count, bytes| {
+                count < limits.max_total_count && bytes + new_len <= limits.max_total_bytes
+            },
+        );
 
         let token = random_token();
         self.0.insert(
@@ -209,6 +242,39 @@ impl MigratePullStore {
             },
         );
         Some(token)
+    }
+
+    /// Evict the oldest entries matching `scope` (by expiry) until
+    /// `fits(count, bytes)` holds for the matching set, or none remain. `count`
+    /// / `bytes` are the current totals of the in-scope entries; the caller's
+    /// `fits` closure accounts for the entry about to be added.
+    fn evict_oldest_until(
+        &self,
+        scope: impl Fn(&PullEntry) -> bool,
+        fits: impl Fn(usize, usize) -> bool,
+    ) {
+        loop {
+            let mut in_scope: Vec<(String, Instant, usize)> = self
+                .0
+                .iter()
+                .filter(|r| scope(r.value()))
+                .map(|r| {
+                    (
+                        r.key().clone(),
+                        r.value().expires_at,
+                        r.value().bundle.len(),
+                    )
+                })
+                .collect();
+            let count = in_scope.len();
+            let bytes: usize = in_scope.iter().map(|(_, _, len)| *len).sum();
+            if in_scope.is_empty() || fits(count, bytes) {
+                break;
+            }
+            in_scope.sort_by_key(|(_, exp, _)| *exp);
+            let (oldest_id, _, _) = in_scope.remove(0);
+            self.0.remove(&oldest_id);
+        }
     }
 
     /// Consume the entry for `token` (single-use). Returns `None` — uniformly,
@@ -234,9 +300,13 @@ fn random_token() -> String {
     // `OsRng` exception. Never `GlobalRng` here.
     use chacha20poly1305::aead::OsRng;
     use chacha20poly1305::aead::rand_core::RngCore;
-    let mut buf = [0u8; 32];
-    OsRng.fill_bytes(&mut buf);
-    bs58::encode(buf)
+    // Zeroize the raw 32 bytes after encoding: for the pull TOKEN this is only
+    // hygiene (it is a capability, not a secret), but this same function mints
+    // the ephemeral BUNDLE KEY, whose raw pre-encoding bytes must not linger in
+    // the stack frame.
+    let mut buf = Zeroizing::new([0u8; 32]);
+    OsRng.fill_bytes(buf.as_mut_slice());
+    bs58::encode(buf.as_ref())
         .with_alphabet(bs58::Alphabet::BITCOIN)
         .into_string()
 }
@@ -371,6 +441,13 @@ async fn mint_handler(req: axum::extract::Request) -> Response {
 /// `GET /v{1,2}/hosted/migrate/pull?pt=<token>` — hand the ephemeral bundle to
 /// the pulling peer. PUBLIC: the single-use pull token is the entire auth. A
 /// missing / expired / already-used token gets a uniform 404.
+///
+/// The pull token rides in the URL query (unlike the export/import credentials,
+/// which use a header to stay out of access logs) because a clickable magic
+/// link cannot set a header. That divergence is acceptable here: the token is
+/// single-use and short-TTL, so a copy captured from a log is already spent by
+/// the time anyone reads it, and the design assumes the public reverse proxy
+/// terminates TLS and does not itself log query strings for this path.
 async fn pull_handler(req: axum::extract::Request) -> Response {
     let Some(store) = req.extensions().get::<MigratePullStore>().cloned() else {
         return pull_not_found();
@@ -452,12 +529,31 @@ fn is_valid_pull_token(pt: &str) -> bool {
 /// CLIENT-side (so no untrusted input is interpolated server-side) and requires
 /// an explicit click before POSTing to `pull-import` — a state-changing import
 /// is never triggered by mere navigation to the link.
+///
+/// Ships anti-framing headers (mirroring the permission-prompt page): the click
+/// on "Import my data" is a state-changing confirmation, so a remote page must
+/// not be able to FRAME this page and steal that click (clickjacking) to drive
+/// the victim's node into importing an attacker-minted bundle. `frame-ancestors
+/// 'none'` + `X-Frame-Options: DENY` forbid framing; `Cache-Control: no-store`
+/// keeps the `pt`-bearing URL out of the disk cache.
 pub(super) async fn import_page() -> impl IntoResponse {
-    Html(format!(
-        include_str!("assets/hosted_import_page.html"),
-        style = HOSTED_IMPORT_PAGE_CSS,
-        script = HOSTED_IMPORT_PAGE_JS,
-    ))
+    let headers = [
+        ("X-Frame-Options", "DENY"),
+        (
+            "Content-Security-Policy",
+            "frame-ancestors 'none'; default-src 'self' 'unsafe-inline'",
+        ),
+        ("Cache-Control", "no-store"),
+        ("Cross-Origin-Opener-Policy", "same-origin"),
+    ];
+    (
+        headers,
+        Html(format!(
+            include_str!("assets/hosted_import_page.html"),
+            style = HOSTED_IMPORT_PAGE_CSS,
+            script = HOSTED_IMPORT_PAGE_JS,
+        )),
+    )
 }
 
 const HOSTED_IMPORT_PAGE_CSS: &str = include_str!("assets/hosted_import_page.css");
@@ -606,6 +702,11 @@ async fn pull_bundle_from_source(
         // would defeat it. The pull endpoint answers 200/404 directly, never a
         // redirect, so this only closes the SSRF-via-redirect hole.
         .redirect(reqwest::redirect::Policy::none())
+        // Ignore ambient HTTP(S)_PROXY/ALL_PROXY env vars: the outbound pull
+        // must go straight to the allowlisted origin, not through an
+        // operator-or-attacker-influenced proxy, keeping the fetch fully
+        // self-contained for the SSRF guarantee.
+        .no_proxy()
         .build()
         .map_err(|_| {
             (
@@ -614,12 +715,25 @@ async fn pull_bundle_from_source(
             )
         })?;
 
-    let mut resp = client.get(&url).send().await.map_err(|_| {
+    let resp = client.get(&url).send().await.map_err(|_| {
         (
             StatusCode::BAD_GATEWAY,
             "could not reach the migration source",
         )
     })?;
+    read_pull_response(resp).await
+}
+
+/// Consume a pull response into `(bundle, key, key_kind)`, enforcing: 2xx
+/// status, a non-empty bundle key header, a hard body-size cap
+/// ([`MAX_IMPORT_BUNDLE_BYTES`], read incrementally so an oversized/hostile
+/// response can't be buffered), and a non-empty body. Split out from the
+/// client-building [`pull_bundle_from_source`] so the response-handling logic
+/// (the part with branches) is unit-testable against a synthesized response
+/// without needing a live HTTPS server.
+async fn read_pull_response(
+    mut resp: reqwest::Response,
+) -> Result<(Vec<u8>, String, BundleKeyKind), (StatusCode, &'static str)> {
     if !resp.status().is_success() {
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -764,6 +878,175 @@ mod tests {
         assert!(
             store.take(&other).is_some(),
             "another user's token must be unaffected by user-1's cap"
+        );
+    }
+
+    /// Small tunable limits so the byte-budget / count paths are exercised
+    /// without allocating gigabyte buffers.
+    fn tiny_limits() -> StoreLimits {
+        StoreLimits {
+            max_per_user_count: 10,
+            max_per_user_bytes: 100,
+            max_total_count: 10,
+            max_total_bytes: 1000,
+        }
+    }
+
+    /// The per-user BYTE budget evicts the minter's OWN oldest — never another
+    /// user's — which is the anti-griefing property. Two 60-byte user-1 bundles
+    /// exceed the 100-byte per-user budget, so the first is dropped; a small
+    /// user-2 bundle is untouched.
+    #[tokio::test(start_paused = true)]
+    async fn per_user_byte_budget_evicts_own_oldest_not_others() {
+        let store = MigratePullStore::default();
+        let limits = tiny_limits();
+
+        let t1 = store
+            .insert_with_limits(user(1), vec![0u8; 60], "k1".to_owned(), limits)
+            .expect("mint");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let other = store
+            .insert_with_limits(user(2), vec![0u8; 10], "ok".to_owned(), limits)
+            .expect("mint");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let t2 = store
+            .insert_with_limits(user(1), vec![0u8; 60], "k2".to_owned(), limits)
+            .expect("mint");
+
+        assert!(
+            store.take(&t1).is_none(),
+            "user-1's oldest must be evicted by the per-user byte budget"
+        );
+        assert!(
+            store.take(&t2).is_some(),
+            "the newest user-1 bundle remains"
+        );
+        assert!(
+            store.take(&other).is_some(),
+            "another user's bundle must NOT be evicted by user-1's byte pressure"
+        );
+    }
+
+    /// A bundle larger than a budget is refused outright (maps to 503), with
+    /// nothing stored.
+    #[tokio::test(start_paused = true)]
+    async fn oversize_bundle_is_refused() {
+        let store = MigratePullStore::default();
+        let limits = tiny_limits(); // per-user byte budget = 100
+        assert!(
+            store
+                .insert_with_limits(user(1), vec![0u8; 101], "k".to_owned(), limits)
+                .is_none(),
+            "a bundle over the per-user byte budget must be refused"
+        );
+        assert_eq!(store.0.len(), 0, "a refused oversize mint stores nothing");
+    }
+
+    /// The GLOBAL count cap evicts the globally-oldest across users once the
+    /// store is full.
+    #[tokio::test(start_paused = true)]
+    async fn global_count_cap_evicts_globally_oldest() {
+        let store = MigratePullStore::default();
+        // total count cap 3, generous bytes, per-user count high so the GLOBAL
+        // cap is the binding one.
+        let limits = StoreLimits {
+            max_per_user_count: 100,
+            max_per_user_bytes: 10_000,
+            max_total_count: 3,
+            max_total_bytes: 10_000,
+        };
+        let a = store
+            .insert_with_limits(user(1), vec![1], "a".to_owned(), limits)
+            .expect("mint");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let b = store
+            .insert_with_limits(user(2), vec![2], "b".to_owned(), limits)
+            .expect("mint");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let c = store
+            .insert_with_limits(user(3), vec![3], "c".to_owned(), limits)
+            .expect("mint");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // A 4th mint (from yet another user) evicts the globally-oldest (a).
+        let d = store
+            .insert_with_limits(user(4), vec![4], "d".to_owned(), limits)
+            .expect("mint");
+
+        assert!(store.take(&a).is_none(), "globally-oldest evicted at cap");
+        for (name, tok) in [("b", &b), ("c", &c), ("d", &d)] {
+            assert!(
+                store.take(tok).is_some(),
+                "{name} must remain under the cap"
+            );
+        }
+    }
+
+    /// Build a `reqwest::Response` from a synthesized HTTP response so
+    /// `read_pull_response` (the body-cap / key-extraction logic) is testable
+    /// without a live HTTPS server. `axum::http` is the same `http` crate
+    /// reqwest 0.12 consumes, so the `From` conversion type-checks.
+    fn synth_response(status: u16, headers: &[(&str, &str)], body: Vec<u8>) -> reqwest::Response {
+        let mut builder = axum::http::Response::builder().status(status);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        reqwest::Response::from(builder.body(body).expect("valid synthetic response"))
+    }
+
+    #[tokio::test]
+    async fn read_pull_response_success_extracts_bundle_and_key() {
+        let resp = synth_response(
+            200,
+            &[
+                ("x-freenet-bundle-key", "ephemeral-key-xyz"),
+                ("x-freenet-bundle-key-kind", "token"),
+            ],
+            b"the-bundle-bytes".to_vec(),
+        );
+        let (bundle, key, kind) = read_pull_response(resp).await.expect("must succeed");
+        assert_eq!(bundle, b"the-bundle-bytes");
+        assert_eq!(key, "ephemeral-key-xyz");
+        assert!(matches!(kind, BundleKeyKind::Token));
+    }
+
+    #[tokio::test]
+    async fn read_pull_response_kind_defaults_token_and_honors_passphrase() {
+        // Missing kind header defaults to Token.
+        let resp = synth_response(200, &[("x-freenet-bundle-key", "k")], b"b".to_vec());
+        let (_, _, kind) = read_pull_response(resp).await.unwrap();
+        assert!(matches!(kind, BundleKeyKind::Token));
+        // Explicit passphrase kind is honored.
+        let resp = synth_response(
+            200,
+            &[
+                ("x-freenet-bundle-key", "k"),
+                ("x-freenet-bundle-key-kind", "passphrase"),
+            ],
+            b"b".to_vec(),
+        );
+        let (_, _, kind) = read_pull_response(resp).await.unwrap();
+        assert!(matches!(kind, BundleKeyKind::Passphrase));
+    }
+
+    #[tokio::test]
+    async fn read_pull_response_rejects_non_success_missing_key_and_empty() {
+        // Non-2xx (the source 404'd the link).
+        let resp = synth_response(404, &[("x-freenet-bundle-key", "k")], b"b".to_vec());
+        assert_eq!(
+            read_pull_response(resp).await.unwrap_err().0,
+            StatusCode::BAD_GATEWAY
+        );
+        // 200 but no bundle key header.
+        let resp = synth_response(200, &[], b"b".to_vec());
+        assert_eq!(
+            read_pull_response(resp).await.unwrap_err().0,
+            StatusCode::BAD_GATEWAY
+        );
+        // 200 with a key but an empty body.
+        let resp = synth_response(200, &[("x-freenet-bundle-key", "k")], Vec::new());
+        assert_eq!(
+            read_pull_response(resp).await.unwrap_err().0,
+            StatusCode::BAD_GATEWAY
         );
     }
 
