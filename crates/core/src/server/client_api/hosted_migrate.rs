@@ -464,6 +464,13 @@ async fn pull_handler(req: axum::extract::Request) -> Response {
         CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
+    // Never let a shared/proxy cache persist the response: it carries the
+    // ephemeral bundle key header and the encrypted secrets, keyed by a
+    // single-use `pt` URL a cache must not replay.
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
     // The ephemeral key rides in a header (never the URL) — the same discipline
     // and header names the local pull-import forwards into the import path.
     match HeaderValue::from_str(entry.key.as_str()) {
