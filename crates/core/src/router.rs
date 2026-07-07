@@ -304,9 +304,13 @@ pub(crate) struct RouterSnapshotInfo {
     /// downstream gate and lease-aware `Renew`-vs-`Subscribe` split legitimately
     /// disagree with today's ANY-downstream renewal path), and `announce` (a
     /// subscribed, state-present, not-yet-advertised host). Read them as the
-    /// reconcile-vs-today delta. `retract_diffs` in particular reflects the
-    /// missing retraction driver (`is_hosted_locally` is monotonic in production
-    /// today), not a live-advertisement leak.
+    /// reconcile-vs-today delta. `retract_diffs` in particular reflects that no
+    /// on-`main` COLLAPSE/RENEWAL driver retracts at these shadow-compared sites
+    /// (the controller would). NOTE: `is_hosted_locally` is no longer strictly
+    /// monotonic in production — eviction now retracts via `on_contract_unhosted`
+    /// (#4722) — but that eviction path is distinct from these sites, so a nonzero
+    /// `retract_diffs` still reflects the missing site-local retraction, not a
+    /// live-advertisement leak.
     pub reconcile_shadow_collapse_comparisons: Option<u64>,
     pub reconcile_shadow_collapse_divergences: Option<u64>,
     pub reconcile_shadow_collapse_subscribe_diffs: Option<u64>,

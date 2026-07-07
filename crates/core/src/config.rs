@@ -3351,6 +3351,9 @@ std::thread_local! {
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_NEIGHBOR_HOSTING_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // Hosting advertisement retractions emitted on stop-hosting (eviction).
+    // Advertisement-layer reliability + retraction, #4642 spec step 1.
+    static GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_ANTI_STARVATION_TRIGGERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // Terminal advertisement consult (hosting redesign piece C, invariant 5).
     static GLOBAL_TERMINAL_CONSULT_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -3390,6 +3393,7 @@ impl GlobalTestMetrics {
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
+        GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS.with(|c| c.set(0));
         GLOBAL_ANTI_STARVATION_TRIGGERS.with(|c| c.set(0));
         GLOBAL_TERMINAL_CONSULT_ATTEMPTS.with(|c| c.set(0));
         GLOBAL_TERMINAL_CONSULT_HITS.with(|c| c.set(0));
@@ -3461,6 +3465,17 @@ impl GlobalTestMetrics {
 
     pub fn neighbor_hosting_updates() -> u64 {
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.get())
+    }
+
+    /// A hosting advertisement retraction was emitted because this node stopped
+    /// hosting a contract (eviction). Advertisement-layer reliability +
+    /// retraction, #4642 spec step 1 — see `NeighborHostingManager::on_contract_unhosted`.
+    pub fn record_neighbor_hosting_retraction() {
+        GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub fn neighbor_hosting_retractions() -> u64 {
+        GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS.with(|c| c.get())
     }
 
     pub fn record_anti_starvation_trigger() {

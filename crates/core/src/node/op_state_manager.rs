@@ -354,7 +354,13 @@ impl Drop for ClientOpGuard {
 }
 
 impl OpManager {
-    pub(super) fn new<ER: NetEventRegister + Clone>(
+    // `pub(crate)` (widened from `pub(super)`) so in-crate unit tests outside
+    // `crate::node` can stand up a real `OpManager` — specifically the
+    // `RuntimePool` eviction→retraction test in
+    // `contract::executor::runtime::pool`, which must drive
+    // `RuntimePool::remove_contract` against a genuine `OpManager`. Constructor
+    // only; no behavior change.
+    pub(crate) fn new<ER: NetEventRegister + Clone>(
         notification_channel: EventLoopNotificationsSender,
         ch_outbound: ContractHandlerChannel<SenderHalve>,
         config: &NodeConfig,

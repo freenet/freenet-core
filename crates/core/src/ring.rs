@@ -728,6 +728,14 @@ impl Ring {
             GlobalExecutor::spawn(Self::interest_heartbeat(ring.clone())),
         );
 
+        // NOTE: the advertisement-layer anti-entropy re-request (#4642 spec step 1,
+        // "Fix 1") is NOT a separate task — it is piggybacked on the
+        // `interest_heartbeat` loop above (see the `HostingStateRequest` send
+        // there). A separate task with its own `GlobalRng` initial-delay draw
+        // perturbed the shared per-thread seeded RNG stream that the deterministic
+        // simulation harness depends on; riding the existing heartbeat loop adds no
+        // RNG consumer and no second timer, so the sim stream is unchanged.
+
         // Spawn periodic governance reaper tick.
         // Computes per-contract state from accumulated cost/benefit
         // samples and logs `ReaperDecision`s. Mode defaults to `Off`
@@ -1384,11 +1392,17 @@ impl Ring {
                 continue;
             };
 
-            // Get our current interest hashes
+            // Get our current interest hashes. NOTE: unlike the pre-Fix-1 loop,
+            // an empty `hashes` does NOT skip the cycle. The InterestSync interest
+            // send is gated on `hashes` per-peer below, but the piggybacked
+            // advertisement-layer re-request (Fix 1) must run for ANY connected
+            // node: every node consults its `neighbor_contracts` view for terminal
+            // GET/SUBSCRIBE advertisement lookups (invariant 5) and Source-1 UPDATE
+            // fan-out, even a pure relay that hosts nothing and has no interests,
+            // so that view must be reconciled on the anti-entropy cadence — else a
+            // dropped retraction leaves a phantom advertised host unhealed
+            // indefinitely. The only gate is having connected peers (below).
             let hashes = op_manager.interest_manager.get_all_interest_hashes();
-            if hashes.is_empty() {
-                continue;
-            }
 
             // Get all connected peer addresses (deduplicated)
             let connections = ring.connection_manager.get_connections_by_location();
@@ -1419,26 +1433,76 @@ impl Ring {
             let sender = op_manager.to_event_listener.notifications_sender();
             let mut peers_sent = 0usize;
             for (i, peer_addr) in peer_addrs.into_iter().enumerate() {
-                let message = crate::message::InterestMessage::Interests {
-                    hashes: hashes.clone(),
-                };
-                if let Err(e) = sender
-                    .send(either::Either::Right(
-                        crate::message::NodeEvent::SendInterestMessage {
-                            target: peer_addr,
-                            message,
-                        },
-                    ))
-                    .await
-                {
-                    // Channel send failure means the receiver is dropped (node
-                    // shutting down). No point sending to remaining peers.
+                // InterestSync STATE heartbeat: only when we actually have
+                // interest hashes to advertise.
+                if !hashes.is_empty() {
+                    let message = crate::message::InterestMessage::Interests {
+                        hashes: hashes.clone(),
+                    };
+                    if let Err(e) = sender
+                        .send(either::Either::Right(
+                            crate::message::NodeEvent::SendInterestMessage {
+                                target: peer_addr,
+                                message,
+                            },
+                        ))
+                        .await
+                    {
+                        // Channel send failure means the receiver is dropped (node
+                        // shutting down). No point sending to remaining peers.
+                        tracing::debug!(
+                            peer = %peer_addr,
+                            error = %e,
+                            "Interest heartbeat: failed to queue message"
+                        );
+                        break;
+                    }
+                }
+
+                // Advertisement-layer anti-entropy (#4642 spec step 1, "Fix 1"),
+                // PIGGYBACKED on the InterestSync heartbeat's cycle / peer / cadence.
+                // Re-request this neighbor's full hosted-contract set; the
+                // `HostingStateResponse` handler REPLACES our view of it, so a
+                // dropped on-connect exchange or a dropped per-eviction retraction
+                // self-heals within one heartbeat interval (both directions, since
+                // every node runs this). ALWAYS sent when the cycle runs —
+                // decoupled from the interest send above, so an advertising-but-not-
+                // interested node (e.g. just-restarted with disk-loaded hosts) still
+                // reconciles. Carried in THIS loop rather than a separate background
+                // task on purpose: an independent task's random initial-delay draw
+                // from the shared `GlobalRng` shifts every seeded simulation's RNG
+                // stream (perturbing routing/topology) and a second per-node timer
+                // adds cross-run determinism surface — reusing this loop keeps the
+                // sim RNG stream byte-identical. It is WASM-free / state-free (only
+                // contract IDs move), so it cannot re-arm the #4440/#4473 summarize
+                // storm.
+                // Best-effort and NON-BLOCKING: `try_send`, never `send().await`.
+                // This is the anti-entropy backstop that heals next cycle, so a
+                // request dropped under backpressure is the DESIGNED behavior — and
+                // it rides the cap-2048 event-loop notification channel (the
+                // #4145/#4231/#4442 wedge channel), which a blocking send inside a
+                // background loop must never stall on (channel-safety rule). Mirrors
+                // the sibling retraction path (`announce_contract_unhosted` uses
+                // `try_notify_node_event`). No `break` on error: shutdown is caught
+                // by the `sleep_or_shutdown` on the spread delay below (and by the
+                // interest `send().await` above), so a dropped/closed send here just
+                // moves on.
+                if let Err(e) = sender.try_send(either::Either::Right(
+                    crate::message::NodeEvent::SendNetMessage {
+                        target: peer_addr,
+                        msg: Box::new(crate::message::NetMessage::V1(
+                            crate::message::NetMessageV1::NeighborHosting {
+                                message:
+                                    crate::message::NeighborHostingMessage::HostingStateRequest,
+                            },
+                        )),
+                    },
+                )) {
                     tracing::debug!(
                         peer = %peer_addr,
                         error = %e,
-                        "Interest heartbeat: failed to queue message"
+                        "Interest heartbeat: hosting re-request dropped (best-effort; heals next cycle)"
                     );
-                    break;
                 }
                 peers_sent += 1;
 
@@ -7295,6 +7359,81 @@ mod instant_now_pin_test {
              (#4277). If you intentionally added or removed a TEST-only call site, \
              update EXPECTED_BARE_INSTANT_NOW; if this fired on PRODUCTION code, \
              migrate it to `self.time_source.now()` instead of bumping the count."
+        );
+    }
+}
+
+/// Pin tests for the periodic hosting-advertisement re-request (#4642 spec step
+/// 1, "Fix 1"): the reliability backstop that heals a dropped on-connect
+/// advertisement exchange or a dropped per-eviction retraction. It is PIGGYBACKED
+/// on the `interest_heartbeat` loop (NOT a separate task) so it adds no
+/// `GlobalRng` draw / second timer that would perturb the deterministic sim
+/// harness. These source-scrape pins lock that: the re-request rides
+/// `interest_heartbeat`, and it carries only contract IDs (no state), so it can't
+/// re-arm the #4440/#4473 summarize storm.
+#[cfg(test)]
+mod hosting_heartbeat_pin_test {
+    fn extract_interest_heartbeat_body() -> &'static str {
+        let src = include_str!("ring.rs");
+        let head = ["async fn ", "interest_heartbeat("].concat();
+        let start = src
+            .find(&head)
+            .expect("`async fn interest_heartbeat(` must exist in ring.rs");
+        let body_open = src[start..].find('{').map(|off| start + off).unwrap();
+        let mut depth: i32 = 0;
+        let mut end = body_open;
+        for (i, ch) in src[body_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &src[start..end]
+    }
+
+    #[test]
+    fn hosting_re_request_is_piggybacked_on_interest_heartbeat() {
+        let body = extract_interest_heartbeat_body();
+        assert!(
+            body.contains("HostingStateRequest"),
+            "the advertisement-layer re-request (Fix 1) must be PIGGYBACKED on \
+             `interest_heartbeat` — it must send a `HostingStateRequest` in that \
+             loop. Do NOT move it to a separate task: a task with its own \
+             `GlobalRng` initial-delay draw perturbs the shared seeded RNG stream \
+             the deterministic sim harness depends on."
+        );
+    }
+
+    #[test]
+    fn hosting_re_request_carries_no_state() {
+        // Advertisement-layer ONLY: the re-request must NOT reach into the STATE
+        // anti-entropy (no WASM summarize / state fetch), or it would risk
+        // re-arming the #4440/#4473 summarize storm the ring.md gate guards against.
+        let body = extract_interest_heartbeat_body();
+        assert!(
+            !body.contains("get_contract_summary") && !body.contains("summarize_state"),
+            "the piggybacked hosting re-request must carry only contract IDs — \
+             never fetch / summarize STATE — so it cannot re-arm the summarize storm."
+        );
+    }
+
+    #[test]
+    fn no_separate_hosting_heartbeat_task() {
+        let src = include_str!("ring.rs");
+        // Runtime-compose so this test does not match itself.
+        let needle = ["async fn ", "hosting_heartbeat("].concat();
+        assert!(
+            !src.contains(&needle),
+            "there must be NO separate `hosting_heartbeat` task — its startup \
+             `GlobalRng` draw perturbed the deterministic sim harness. The \
+             re-request is piggybacked on `interest_heartbeat` instead."
         );
     }
 }

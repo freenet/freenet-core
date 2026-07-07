@@ -948,6 +948,24 @@ impl ContractExecutor for RuntimePool {
                     .pending_reclamation_add(*key, current_gen);
             }
         }
+
+        // Retract our hosting advertisement once ANY required on-disk half (state
+        // or WASM code) is gone — i.e. on `Full` (both gone) OR `Partial` (one gone,
+        // the other queued for retry): in either case we can no longer reliably
+        // serve `key`, so we must stop advertising it (Fix 1, #4642 spec step 1;
+        // invariant 1: advertise iff a fresh in-mesh host). `Err` (BOTH deletes
+        // failed → nothing removed → still fully present) keeps the advertisement
+        // and retries. Wired HERE on the confirmed-delete path, NOT at the eviction
+        // decision, so the three guards above that DELIBERATELY skip the delete
+        // (contract re-hosted / re-subscribed / written to a newer generation in
+        // the eviction→reclaim window) also skip the retraction — a contract kept
+        // alive by that race retains BOTH its state AND its advertisement.
+        // Best-effort (`try_notify_node_event`), healed by the periodic re-request
+        // on drop; idempotent, so a later Full retry after a Partial (or any repeat)
+        // re-retracts harmlessly.
+        if matches!(&result, Ok(ReclaimOutcome::Full | ReclaimOutcome::Partial)) {
+            crate::operations::announce_contract_unhosted(self.op_manager.as_ref(), key);
+        }
         // Drop the outcome detail at the trait boundary: callers expect
         // `Result<(), ExecutorError>` and cannot act on Full vs Partial.
         result.map(|_| ())
@@ -1312,5 +1330,188 @@ impl ContractExecutor for RuntimePool {
 
     fn take_delegate_notification_rx(&mut self) -> Option<super::DelegateNotificationReceiver> {
         self.delegate_notification_rx.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ConfigArgs, GlobalTestMetrics};
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, Parameters,
+        WrappedContract, WrappedState,
+    };
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    /// Synthetic contract container. The bytes are never executed
+    /// (`remove_contract` only deletes files / DB rows), so a fake blob is
+    /// sufficient — mirrors `runtime.rs`'s `make_contract` helper.
+    fn make_contract(code_seed: u8, param_seed: u8) -> (ContractContainer, ContractKey) {
+        let code = ContractCode::from(vec![code_seed; 64]);
+        let params = Parameters::from(vec![param_seed; 8]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let wrapped = WrappedContract::new(Arc::new(code), params);
+        let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
+        (container, key)
+    }
+
+    /// End-to-end proof that evicting an advertised contract through the real
+    /// `RuntimePool::remove_contract` path retracts the hosting advertisement
+    /// and records `GlobalTestMetrics::neighbor_hosting_retractions()` — giving
+    /// that (otherwise unread) counter a real reader.
+    ///
+    /// The path exercised: `RuntimePool::remove_contract` → reclaim on-disk
+    /// storage (`ReclaimOutcome::Full`) → `announce_contract_unhosted` →
+    /// `NeighborHostingManager::on_contract_unhosted` →
+    /// `record_neighbor_hosting_retraction()`.
+    ///
+    /// Must run on a `current_thread` runtime (the `#[tokio::test]` default):
+    /// the retraction counter is a `thread_local!`, and `remove_contract` (with
+    /// its synchronous `announce_contract_unhosted` call) is polled on the same
+    /// thread the assertion reads from. A `multi_thread` runtime could poll the
+    /// future on a worker thread whose thread-local the assertion would not see.
+    ///
+    /// This CANNOT be exercised via `SimNetwork`: the simulation contract
+    /// handlers use the direct inner `Executor` (no `op_manager`, no
+    /// retraction); only the real `RuntimePool` used by `NetworkContractHandler`
+    /// wires the retraction. So the test builds a real `OpManager` + `RuntimePool`
+    /// directly.
+    #[tokio::test]
+    async fn test_eviction_emits_hosting_retraction() {
+        // Reset thread-local counters at the start of the (current_thread) test.
+        GlobalTestMetrics::reset();
+
+        // --- Build a real OpManager backed by a temp-dir Config -----------
+        // Mirrors the wiring in `node::testing_impl::in_memory::Builder`, minus
+        // the node event loop. `id: Some(..)` isolates the on-disk state in a
+        // fresh temp dir (cleaned on each run — see `ConfigPathsArgs::default_dirs`).
+        let config_args = ConfigArgs {
+            id: Some("evict-retraction-step1".to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let config = node_config.config.clone();
+
+        // Keep the receivers / task monitor alive for the whole test (the
+        // `_`-prefixed bindings live to end of scope) so the OpManager's
+        // channels and background sweeps aren't torn down mid-run.
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                // Empty no-op event register — the eviction path emits no
+                // NetEventLog we need to capture here.
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        // --- Build a real RuntimePool over that OpManager -----------------
+        let mut pool = RuntimePool::new(
+            config.clone(),
+            op_manager.clone(),
+            NonZeroUsize::new(1).expect("nonzero pool size"),
+        )
+        .await
+        .expect("build RuntimePool");
+
+        // --- Store a contract (state + wasm) on disk through the pool -----
+        let (container, key) = make_contract(0x11, 0x22);
+        let params = container.params();
+        let state = WrappedState::new(b"hosted state payload".to_vec());
+
+        // WASM blob: stored via a pool executor's ContractStore. All executors
+        // share the pool's single ReDb handle and on-disk contracts dir, so the
+        // executor reclaimed by `remove_contract` sees it.
+        pool.runtimes[0]
+            .as_mut()
+            .expect("pool executor present")
+            .runtime
+            .contract_store
+            .store_contract(container)
+            .expect("store contract code");
+        // State: stored via the pool's shared StateStore — the very store the
+        // checked-out executor reclaims from (clones share the ReDb + caches).
+        pool.shared_state_store
+            .store(key, state.clone(), params)
+            .await
+            .expect("store contract state");
+
+        assert_eq!(
+            pool.shared_state_store
+                .get(&key)
+                .await
+                .expect("state present before eviction"),
+            state,
+            "stored state must round-trip before eviction",
+        );
+
+        // Register the contract as an advertised host — the retraction (and its
+        // counter) only fire when the contract is in `neighbor_hosting.my_contracts`.
+        op_manager.neighbor_hosting.on_contract_hosted(&key);
+        assert!(
+            op_manager.neighbor_hosting.is_hosted_locally(&key),
+            "contract advertised as hosted before eviction",
+        );
+
+        // The three `remove_contract` guards must NOT bail:
+        //   1. is_hosting_contract(key) — false; we never touched the ring hosting cache.
+        //   2. contract_in_use(key)     — false; no subscription/downstream interest.
+        //   3. state_generation(key)    — pass it as expected_generation so it matches.
+        assert!(
+            !op_manager.ring.is_hosting_contract(&key),
+            "guard precondition: contract must not be in the ring hosting cache",
+        );
+        assert!(
+            !op_manager.ring.contract_in_use(&key),
+            "guard precondition: contract must not be in use",
+        );
+        let expected_generation = op_manager.ring.state_generation(&key);
+
+        // --- Evict via the real RuntimePool::remove_contract path ---------
+        let before = GlobalTestMetrics::neighbor_hosting_retractions();
+        pool.remove_contract(&key, expected_generation)
+            .await
+            .expect("remove_contract reclaim must succeed");
+        let after = GlobalTestMetrics::neighbor_hosting_retractions();
+
+        // (i) On-disk state is gone.
+        match pool.shared_state_store.get(&key).await {
+            Err(StateStoreError::MissingContract(missing)) => assert_eq!(missing, key),
+            other => panic!("expected MissingContract after eviction, got {other:?}"),
+        }
+        // ...and the advertisement was retracted from the local hosted set.
+        assert!(
+            !op_manager.neighbor_hosting.is_hosted_locally(&key),
+            "eviction must retract the hosting advertisement",
+        );
+
+        // (ii) The retraction counter advanced by exactly one — the real reader
+        // this test exists to provide.
+        assert_eq!(
+            after,
+            before + 1,
+            "eviction of an advertised contract must emit exactly one hosting retraction",
+        );
+
+        // Explicitly hold the guards to end of scope.
+        drop(task_monitor);
     }
 }

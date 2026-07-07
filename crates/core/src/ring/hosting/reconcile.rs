@@ -45,9 +45,11 @@
 //! Several divergence classes are EXPECTED because the on-`main` sites do not yet
 //! implement the controller's model — they are the delta the keystone closes, not
 //! bugs:
-//! - **`retract` / `reroot_search`**: no on-`main` driver retracts a hosting
-//!   advertisement on teardown or re-roots on upstream loss, so the controller
-//!   emits these where production does nothing.
+//! - **`retract` / `reroot_search`**: no on-`main` driver retracts on *teardown*
+//!   (collapse/renewal) or re-roots on upstream loss, so the controller emits
+//!   these where the shadow-compared sites do nothing. (Eviction DOES now retract
+//!   via `on_contract_unhosted` / #4722, but that is a distinct eviction path, not
+//!   the collapse/renewal teardown these counters compare.)
 //! - **`renew` / `subscribe` / `unsubscribe`**: the controller's STRICT
 //!   downstream-demand gate (a downstream subscriber counts only when strictly
 //!   FARTHER from the key) and its lease-aware split (`Renew` iff we hold a
@@ -63,8 +65,9 @@
 //! - **`Collapse` is the LOCAL teardown** (drop our lease, `ring.unsubscribe`);
 //!   **`Unsubscribe` is the WIRE message** to the computed upstream; **`Retract`
 //!   withdraws the hosting advertisement** (on-`main` primitive
-//!   `neighbor_hosting.on_contract_unhosted`, `node/neighbor_hosting.rs:131`,
-//!   currently dead code a later flip must wire). The current code's
+//!   `neighbor_hosting.on_contract_unhosted`, now wired live on EVICTION inside
+//!   `RuntimePool::remove_contract` / #4722; the controller `Retract` flip that
+//!   would ALSO drive it from teardown is still a later step). The current code's
 //!   `send_unsubscribe_upstream` does the first two together ("send Unsubscribe +
 //!   `ring.unsubscribe`") in one call, so the shadow-compare must map it onto the
 //!   `{Collapse, Unsubscribe}` PAIR by SET membership, not exact-`Vec` equality.
@@ -147,7 +150,9 @@ pub(crate) enum Action {
     /// present, never before (reconcile-before-announce).
     Announce,
     /// Withdraw a hosting advertisement (on-`main` primitive:
-    /// `neighbor_hosting.on_contract_unhosted`, currently dead code). Emitted on
+    /// `neighbor_hosting.on_contract_unhosted`, now wired live on EVICTION inside
+    /// `RuntimePool::remove_contract` / #4722; the controller `Retract` flip that
+    /// would ALSO drive it from teardown is still a later step). Emitted on
     /// the teardown branch whenever we were advertising, INDEPENDENT of whether we
     /// held a lease — a verified root advertises without ever subscribing
     /// upstream, so a torn-down (not-in-use) advertised host must retract or its
