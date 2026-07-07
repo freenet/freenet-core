@@ -22,19 +22,28 @@ impl Executor<Runtime> {
     /// AEAD authentication — a torn read fails authentication and surfaces a
     /// clean export error, never silent corruption.
     /// The bundle is scoped to `user_context.scope()` — strictly the per-user
-    /// namespace, never `Local`. The `token` is the bundle-key material so the
-    /// user re-imports on their own peer with the token they already hold.
+    /// namespace, never `Local`. `bundle_key_material` is the secret the bundle
+    /// is encrypted under; it is DELIBERATELY decoupled from the scope. In the
+    /// self-reimport case (`GET /v1/hosted/export`) it is the user's own token,
+    /// so they decrypt with the token they already hold; in the magic-link
+    /// migration case (`hosted_migrate` mint) it is a FRESH EPHEMERAL key, so
+    /// the durable token never leaves the hosting node. Do NOT re-couple this to
+    /// `user_context`'s token — the two are independent by design.
     ///
-    /// The token and the derived key material live only in borrowed/`Zeroizing`
-    /// buffers here and inside `export_secret_bundle`; nothing is logged.
+    /// The key material and the plaintext it derives live only in
+    /// borrowed/`Zeroizing` buffers here and inside `export_secret_bundle`;
+    /// nothing is logged.
     pub fn export_user_secrets(
         &self,
         user_context: &UserSecretContext,
-        token: &[u8],
+        bundle_key_material: &[u8],
     ) -> Result<Vec<u8>, ExecutorError> {
         use crate::wasm_runtime::secret_export::{BundleKeyMaterial, ExportError};
         self.runtime
-            .export_secret_bundle(user_context.scope(), &BundleKeyMaterial::Token(token))
+            .export_secret_bundle(
+                user_context.scope(),
+                &BundleKeyMaterial::Token(bundle_key_material),
+            )
             .map_err(|e| {
                 // Preserve the over-limit case as a typed marker so the HTTP
                 // layer can map it to a 413 rather than a generic 500. The

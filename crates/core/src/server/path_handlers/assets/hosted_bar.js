@@ -114,4 +114,82 @@
         setOk('Export failed (' + e.message + ')');
       });
   });
+
+  // "Move to my peer" — the zero-friction magic-link migration (#4592). Mints a
+  // one-time pull token on this hosted node (authorized by the shell-only user
+  // token) and builds a link the user opens on their OWN peer, which then pulls
+  // the data over HTTPS and imports it. The durable access key never leaves this
+  // browser: the bundle is sealed under a fresh ephemeral key held server-side.
+  var migrateOut = document.getElementById('fnmigrateout');
+  var migrateLink = document.getElementById('fnmigratelink');
+  var migrateMsg = document.getElementById('fnmigratemsg');
+  // Default local-peer web/ws-api port (the freenet config default, see
+  // config.rs default_ws_api_port). Overriding a non-default local port is a
+  // future refinement.
+  var LOCAL_PEER_PORT = 7509;
+
+  function setMigrateMsg(m) {
+    if (migrateMsg) migrateMsg.textContent = m || '';
+  }
+
+  document.getElementById('fnmigrate').addEventListener('click', function () {
+    var t =
+      typeof __freenet_user_token !== 'undefined' ? __freenet_user_token : null;
+    if (!t) {
+      setOk('No key on this connection');
+      return;
+    }
+    setMigrateMsg('Preparing your one-time migration link...');
+    fetch('/v1/hosted/migrate/mint', {
+      method: 'POST',
+      headers: { 'X-Freenet-User-Token': t },
+    })
+      .then(function (r) {
+        if (!r.ok) {
+          throw new Error('HTTP ' + r.status);
+        }
+        return r.json();
+      })
+      .then(function (data) {
+        var pt = data && data.pull_token;
+        if (!pt) {
+          throw new Error('no token');
+        }
+        var link =
+          'http://127.0.0.1:' +
+          LOCAL_PEER_PORT +
+          '/hosted/import?source=' +
+          encodeURIComponent(window.location.origin) +
+          '&pt=' +
+          encodeURIComponent(pt);
+        if (migrateLink) migrateLink.value = link;
+        if (migrateOut) migrateOut.hidden = false;
+        setMigrateMsg('One-time link ready. It expires in a few minutes.');
+      })
+      .catch(function (e) {
+        setMigrateMsg('Could not prepare a link (' + e.message + ')');
+      });
+  });
+
+  document
+    .getElementById('fnmigratecopy')
+    .addEventListener('click', function () {
+      if (!migrateLink || !migrateLink.value) {
+        return;
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(migrateLink.value).then(
+          function () {
+            setMigrateMsg('Link copied to clipboard');
+          },
+          function () {
+            migrateLink.focus();
+            migrateLink.select();
+          },
+        );
+      } else {
+        migrateLink.focus();
+        migrateLink.select();
+      }
+    });
 })();

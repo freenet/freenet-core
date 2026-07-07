@@ -22,13 +22,28 @@
       <div class="sec">
         <h4>Your own peer</h4>
         <p>
-          Export your data to run it on your own Freenet node, fully
+          Move your data to a Freenet peer you run yourself, fully
           decentralized.
         </p>
         <div class="row">
-          <button class="act" id="fnexport">Export data</button>
+          <button class="act" id="fnmigrate">Move to my peer</button
+          ><button class="act" id="fnexport">Export file</button>
         </div>
-      </div>
-    </div></span
-  >
+        <div id="fnmigrateout" hidden>
+          <p class="mhint">
+            Open this one-time link (it expires soon) in a browser on the
+            computer running your Freenet peer:
+          </p>
+          <div class="row">
+            <input id="fnmigratelink" type="text" readonly /><button
+              class="act"
+              id="fnmigratecopy"
+            >
+              Copy link
+            </button>
+          </div>
+          <span id="fnmigratemsg"></span>
+        </div>
+      </div></div
+  ></span>
 </div>

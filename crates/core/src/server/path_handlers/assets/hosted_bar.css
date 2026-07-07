@@ -99,6 +99,33 @@ iframe {
   color: #2a8a55;
   font-size: 12px;
 }
+#fnmigrateout {
+  margin-top: 10px;
+}
+.mhint {
+  margin: 0 0 6px;
+  color: #666;
+  line-height: 1.45;
+}
+#fnmigratelink {
+  flex: 1 1 auto;
+  min-width: 0;
+  font:
+    12px/1.4 ui-monospace,
+    Menlo,
+    monospace;
+  color: #222;
+  background: #fff;
+  border: 1px solid #cfcfcf;
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+#fnmigratemsg {
+  display: block;
+  margin-top: 6px;
+  color: #2a8a55;
+  font-size: 12px;
+}
 
 /* Respect the OS dark-mode preference. Same restrained, near-monochrome
    character as the light theme: charcoal bar, light-grey text, hairline
@@ -136,6 +163,17 @@ iframe {
     color: #a0a0a4;
   }
   #fnok {
+    color: #5cbd83;
+  }
+  .mhint {
+    color: #a0a0a4;
+  }
+  #fnmigratelink {
+    color: #e6e6e8;
+    background: #2c2c2f;
+    border-color: #46464a;
+  }
+  #fnmigratemsg {
     color: #5cbd83;
   }
 }

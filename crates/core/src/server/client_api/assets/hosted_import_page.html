@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Import your Freenet data</title>
+    <style>{style}</style>
+  </head>
+  <body>
+    <main class="wrap">
+      <h1>Import your data</h1>
+      <p class="lead">
+        Bring the rooms, identities and other data from your hosted
+        &ldquo;try Freenet&rdquo; session onto this peer.
+      </p>
+      <p class="src" id="source-line" hidden>
+        Source: <span id="source" class="mono"></span>
+      </p>
+      <div class="status" id="status" role="status" aria-live="polite"></div>
+      <div class="actions">
+        <button type="button" id="import-btn" class="btn btn-primary">
+          Import my data
+        </button>
+        <a href="/" class="btn btn-secondary" id="cancel-link">Cancel</a>
+      </div>
+      <p class="note">
+        Your existing data on this peer is never overwritten. Anything that
+        already exists here is kept as it is.
+      </p>
+    </main>
+    <script>{script}</script>
+  </body>
+</html>
