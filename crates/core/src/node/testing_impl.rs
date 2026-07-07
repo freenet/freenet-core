@@ -388,16 +388,18 @@ impl ScheduledOperation {
 }
 
 /// Packet-delivery decision consulted by every `SimulationSocket` (via the
-/// global delivery callback set in `run_controlled_simulation`) so a scripted
-/// node crash actually drops packets instead of being a silent no-op.
+/// global delivery callback installed by `run_controlled_simulation` and
+/// `run_simulation_direct`) so an injected node crash or partition actually
+/// drops packets instead of being a silent no-op.
 ///
 /// Per-network: it looks up the fault injector for the socket's own network and,
-/// only if that network opted in (`enforce_crash_drops`), DROPS any packet whose
-/// source or destination is a crashed node — counting it in
-/// `stats.messages_dropped_crash`. Every other packet (and every network that
-/// did not opt in) is delivered unchanged, so installing this callback cannot
-/// alter fault behavior for the direct-runner churn driver or any other path.
-/// See #4642 piece F.
+/// only if that network opted in (`enforce_fault_drops`), DROPS any packet whose
+/// source or destination is a crashed node (counted in
+/// `stats.messages_dropped_crash`) or that is blocked by an active partition
+/// (counted in `stats.messages_dropped_partition`). Every other packet (and
+/// every network that did not opt in) is delivered unchanged, so installing this
+/// callback cannot alter fault behavior for any path that did not opt in.
+/// See #4642 piece F (scripted crashes) and #4694 (direct-runner churn).
 #[cfg(any(test, feature = "testing"))]
 fn fault_injection_delivery_decision(
     network_name: &str,
@@ -407,9 +409,21 @@ fn fault_injection_delivery_decision(
     use crate::transport::in_memory_socket::PacketDeliveryDecision;
     if let Some(injector) = crate::node::network_bridge::get_fault_injector(network_name) {
         let mut inj = injector.lock().unwrap();
-        if inj.enforce_crash_drops && (inj.config.is_crashed(&from) || inj.config.is_crashed(&to)) {
-            inj.stats.messages_dropped_crash += 1;
-            return PacketDeliveryDecision::Drop;
+        if inj.enforce_fault_drops {
+            if inj.config.is_crashed(&from) || inj.config.is_crashed(&to) {
+                inj.stats.messages_dropped_crash += 1;
+                return PacketDeliveryDecision::Drop;
+            }
+            // Partitions are time-scoped (start/heal), so use this network's
+            // VirtualTime as the current time; without VirtualTime a partition
+            // cannot be evaluated deterministically, so treat it as inactive.
+            use crate::simulation::TimeSource;
+            if let Some(now) = inj.virtual_time.as_ref().map(|vt| vt.now_nanos()) {
+                if inj.config.is_partitioned(&from, &to, now) {
+                    inj.stats.messages_dropped_partition += 1;
+                    return PacketDeliveryDecision::Drop;
+                }
+            }
         }
     }
     PacketDeliveryDecision::Deliver
@@ -4171,7 +4185,7 @@ impl SimNetwork {
         // Make `SimOperation::CrashNode` a REAL crash: install the global
         // packet-delivery callback that consults each network's fault injector
         // and DROPS every packet to/from a crashed node, then opt THIS network
-        // in via `enforce_crash_drops`. The callback is per-network aware (keyed
+        // in via `enforce_fault_drops`. The callback is per-network aware (keyed
         // on the network name it is handed) and inert for any network that did
         // not opt in, so the direct-runner churn driver's crash semantics stay
         // unchanged. `SimNetwork::Drop` clears the callback. Without this, a
@@ -4181,7 +4195,7 @@ impl SimNetwork {
             std::sync::Arc::new(fault_injection_delivery_decision),
         ));
         if let Some(injector) = crate::node::network_bridge::get_fault_injector(&network_name) {
-            injector.lock().unwrap().enforce_crash_drops = true;
+            injector.lock().unwrap().enforce_fault_drops = true;
         }
 
         // Build Turmoil simulation with seeded RNG for deterministic execution
@@ -4978,6 +4992,30 @@ impl SimNetwork {
         GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
 
         set_current_network_name(&self.name);
+
+        // Make direct-runner ChurnConfig crashes REAL packet drops (#4694).
+        //
+        // The chaos driver below marks nodes crashed in this network's fault
+        // injector, but a crash only drops packets if the global packet-delivery
+        // callback is installed AND this network opted in via
+        // `enforce_fault_drops`. Neither happened on the direct runner, so churn
+        // faults were inert: a "crashed" node kept exchanging packets and every
+        // near-K churn / partition validation on this runner was false-green
+        // (#4694; blocker for the demand-driven-hosting release-2 gate, #4642).
+        //
+        // Gated on `churn_config.is_some()` so non-churn direct-runner tests are
+        // byte-for-byte unchanged (the callback is inert unless a node is
+        // actually crashed/partitioned, but gating keeps the change surgical and
+        // makes the wiring impossible to miss when churn IS configured).
+        // `SimNetwork::Drop` clears the global callback.
+        if self.churn_config.is_some() {
+            crate::transport::in_memory_socket::set_packet_delivery_callback(Some(
+                std::sync::Arc::new(fault_injection_delivery_decision),
+            ));
+            if let Some(injector) = crate::node::network_bridge::get_fault_injector(&self.name) {
+                injector.lock().unwrap().enforce_fault_drops = true;
+            }
+        }
 
         // Single-threaded runtime with paused time for deterministic execution
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -5998,6 +6036,93 @@ use crate::contract::OperationMode;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unit test for the fault-injection delivery decision (#4694 / #4642 piece F).
+    ///
+    /// Directly exercises `fault_injection_delivery_decision` — the callback the
+    /// direct/controlled runners install so injected crashes and partitions
+    /// become real packet drops. Verifies:
+    ///   1. Without `enforce_fault_drops`, every packet is delivered (the inert
+    ///      state that made fault injection false-green before #4694).
+    ///   2. With `enforce_fault_drops`, packets to/from a crashed node are
+    ///      dropped (either direction) and counted in `messages_dropped_crash`.
+    ///   3. With `enforce_fault_drops`, partitioned pairs are dropped and counted
+    ///      in `messages_dropped_partition`.
+    ///   4. Unaffected pairs are still delivered.
+    #[test]
+    fn test_fault_injection_delivery_decision_drops_crash_and_partition() {
+        use crate::node::network_bridge::{FaultInjectorState, set_fault_injector};
+        use crate::simulation::{FaultConfig, Partition, VirtualTime};
+        use crate::transport::in_memory_socket::PacketDeliveryDecision;
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        const NETWORK: &str = "fault-decision-unit-test";
+
+        let crashed: SocketAddr = "127.0.0.1:20001".parse().unwrap();
+        let live_a: SocketAddr = "127.0.0.1:20002".parse().unwrap();
+        let part_x: SocketAddr = "127.0.0.1:20003".parse().unwrap();
+        let part_y: SocketAddr = "127.0.0.1:20004".parse().unwrap();
+
+        let mut config = FaultConfig::default();
+        config.crash_node(crashed);
+        config.add_partition(
+            Partition::new(HashSet::from([part_x]), HashSet::from([part_y])).permanent(0),
+        );
+
+        let state = FaultInjectorState::new(config, 42).with_virtual_time(VirtualTime::new());
+        let injector = Arc::new(Mutex::new(state));
+        set_fault_injector(NETWORK, Some(injector.clone()));
+
+        let is_drop = |d: PacketDeliveryDecision| matches!(d, PacketDeliveryDecision::Drop);
+
+        // (1) Not opted in: faults are inert, everything is delivered.
+        assert!(
+            !is_drop(fault_injection_delivery_decision(NETWORK, crashed, live_a)),
+            "crash must be inert without enforce_fault_drops (pre-#4694 behavior)"
+        );
+        assert!(
+            !is_drop(fault_injection_delivery_decision(NETWORK, part_x, part_y)),
+            "partition must be inert without enforce_fault_drops"
+        );
+
+        injector.lock().unwrap().enforce_fault_drops = true;
+
+        // (2) Crashed node: dropped in both directions.
+        assert!(
+            is_drop(fault_injection_delivery_decision(NETWORK, crashed, live_a)),
+            "packet FROM a crashed node must be dropped"
+        );
+        assert!(
+            is_drop(fault_injection_delivery_decision(NETWORK, live_a, crashed)),
+            "packet TO a crashed node must be dropped"
+        );
+
+        // (3) Partitioned pair: dropped in both directions.
+        assert!(
+            is_drop(fault_injection_delivery_decision(NETWORK, part_x, part_y)),
+            "packet across an active partition must be dropped (x->y)"
+        );
+        assert!(
+            is_drop(fault_injection_delivery_decision(NETWORK, part_y, part_x)),
+            "packet across an active partition must be dropped (y->x)"
+        );
+
+        // (4) Unaffected pair: delivered.
+        assert!(
+            !is_drop(fault_injection_delivery_decision(NETWORK, live_a, part_x)),
+            "healthy, non-partitioned pair must be delivered"
+        );
+
+        let stats = injector.lock().unwrap().stats.clone();
+        assert_eq!(stats.messages_dropped_crash, 2, "two crash drops expected");
+        assert_eq!(
+            stats.messages_dropped_partition, 2,
+            "two partition drops expected"
+        );
+
+        set_fault_injector(NETWORK, None);
+    }
 
     /// Test that peer locations are deterministic with the same seed.
     ///
