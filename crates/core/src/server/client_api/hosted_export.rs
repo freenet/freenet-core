@@ -216,7 +216,10 @@ pub(crate) fn export_user_context_or_reject(
 /// On an admitted export this RECORDS the export time (advances the per-user
 /// interval clock), so the call has a side effect and must run exactly once per
 /// request.
-fn export_rate_limited(
+///
+/// `pub(crate)` so the magic-link migration mint endpoint (`hosted_migrate`),
+/// which runs the SAME per-user export, shares the identical throttle.
+pub(crate) fn export_rate_limited(
     limiter: Option<&crate::client_events::user_op_rate_limit::UserOpRateLimiter>,
     user_context: &UserSecretContext,
 ) -> bool {
@@ -348,7 +351,12 @@ async fn export_handler(req: axum::extract::Request) -> Response {
 ///
 /// The `token` is moved into a redacted, zeroizing wrapper on the handler event
 /// so it is wiped after the bundle key is derived and never reaches a log.
-async fn run_export(
+///
+/// `pub(crate)` so the migration mint endpoint (`hosted_migrate`) reuses the
+/// exact same executor round-trip, passing a FRESH EPHEMERAL key as the
+/// `token` (bundle-key material) instead of the durable user token — see the
+/// `export_user_secrets` rustdoc on why scope and key are decoupled.
+pub(crate) async fn run_export(
     op_manager: &OpManager,
     user_context: UserSecretContext,
     token: Vec<u8>,

@@ -9,3 +9,4 @@ node_modules/
 **/assets/peer.html
 **/assets/peer_not_found.html
 **/assets/permission_prompt.html
+**/assets/hosted_import_page.html

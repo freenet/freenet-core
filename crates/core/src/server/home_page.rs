@@ -376,6 +376,57 @@ mod tests {
         );
     }
 
+    /// Pins the import-data UI wiring (#4592, file-upload path): the homepage
+    /// must render the import card's open button plus the modal form (file +
+    /// key inputs), and the modal must ship hidden. A source-scrape guard so a
+    /// refactor that drops the wiring fails CI rather than silently shipping a
+    /// dead "Import data file" button.
+    #[test]
+    fn homepage_renders_import_ui_wiring() {
+        let html = homepage_html();
+        assert!(
+            html.contains("import-open-btn"),
+            "homepage must render the import-data open button"
+        );
+        for id in [
+            "id=\"import-modal\"",
+            "id=\"import-file\"",
+            "id=\"import-key\"",
+            "id=\"import-submit\"",
+        ] {
+            assert!(
+                html.contains(id),
+                "homepage must render import modal element `{id}`"
+            );
+        }
+        // The modal ships hidden so it never flashes before the user opens it.
+        let modal = extract_element_line(&html, "id=\"import-modal\"");
+        assert!(
+            modal.contains("hidden"),
+            "import modal must be hidden by default, got: {modal}"
+        );
+    }
+
+    /// The served dashboard JS must POST the upload to `/v1/import` with the
+    /// bundle-key header the endpoint requires — the load-bearing half of the
+    /// export→import round-trip. Pinned so a JS refactor can't silently break
+    /// it while leaving the button in place.
+    #[test]
+    fn js_contains_import_upload_wiring() {
+        assert!(
+            JS.contains("/v1/import"),
+            "JS must POST the bundle to the /v1/import endpoint"
+        );
+        assert!(
+            JS.contains("X-Freenet-Bundle-Key"),
+            "JS must send the bundle decryption key in the X-Freenet-Bundle-Key header"
+        );
+        assert!(
+            JS.contains("runImport") && JS.contains("openImportModal"),
+            "JS must define the import submit + modal-open handlers"
+        );
+    }
+
     #[test]
     fn favicon_grey_when_no_snapshot() {
         let uri = build_favicon_data_uri(&None);

@@ -96,6 +96,7 @@ fn sandbox_origin_from_headers(headers: &axum::http::HeaderMap) -> String {
 
 pub(crate) mod hosted_export;
 pub(crate) mod hosted_import;
+pub(crate) mod hosted_migrate;
 mod permission_prompts;
 mod v1;
 mod v2;
@@ -202,11 +203,23 @@ impl HttpClientApi {
         // the node via `set_op_manager`).
         let export_op_manager = hosted_export::ExportOpManagerHandle::default();
 
+        // Per-node store of one-time migration pull tokens (#4592 magic-link
+        // path). Injected as an Extension below; the hosted mint fills it and
+        // the public pull drains it.
+        let migrate_store = hosted_migrate::MigratePullStore::default();
+
         let router = Router::new()
             .route("/", axum::routing::get(home_page::homepage))
             .route(
                 "/peer/{address}",
                 axum::routing::get(home_page::peer_detail),
+            )
+            // Local peer's migration confirmation page (#4592). First-party
+            // origin so its POST to `pull-import` passes the import gate; it
+            // never auto-pulls (an explicit click is required).
+            .route(
+                "/hosted/import",
+                axum::routing::get(hosted_migrate::import_page),
             )
             .merge(v1::routes(config.clone()))
             .merge(v2::routes(config))
@@ -222,10 +235,16 @@ impl HttpClientApi {
             // `ExportOpManagerHandle` Extension below to reach the executor.
             .merge(hosted_import::routes(ApiVersion::V1))
             .merge(hosted_import::routes(ApiVersion::V2))
+            // Zero-friction magic-link migration (#4592): hosted mint + public
+            // pull + local pull-import. Reuses the export/import gates and the
+            // per-node `ExportOpManagerHandle`; the pull-token store below.
+            .merge(hosted_migrate::routes(ApiVersion::V1))
+            .merge(hosted_migrate::routes(ApiVersion::V2))
             .merge(permission_prompts::routes())
             .layer(Extension(origin_contracts.clone()))
             .layer(Extension(pending_prompts))
             .layer(Extension(export_op_manager.clone()))
+            .layer(Extension(migrate_store))
             .layer(Extension(HttpClientApiRequest(proxy_request_sender)));
 
         (

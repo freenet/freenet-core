@@ -96,11 +96,15 @@ use super::{ApiVersion, OriginContractMap};
 /// HEADER (not a query param) so this high-value secret never lands in the
 /// request URI / access logs — same discipline as the export's
 /// `X-Freenet-User-Token`.
-const BUNDLE_KEY_HEADER: &str = "x-freenet-bundle-key";
+pub(crate) const BUNDLE_KEY_HEADER: &str = "x-freenet-bundle-key";
 
 /// Header selecting how to interpret [`BUNDLE_KEY_HEADER`]: `token` (default,
 /// the hosted-export form) or `passphrase` (the offline `--passphrase` form).
-const BUNDLE_KEY_KIND_HEADER: &str = "x-freenet-bundle-key-kind";
+///
+/// `pub(crate)` (with [`BUNDLE_KEY_HEADER`]) so the migration `pull` endpoint
+/// (`hosted_migrate`) returns the ephemeral bundle key under the SAME header
+/// names the local `pull-import` then forwards into the import path.
+pub(crate) const BUNDLE_KEY_KIND_HEADER: &str = "x-freenet-bundle-key-kind";
 
 /// Header controlling collision handling: `true` overwrites an existing secret,
 /// anything else (default) skips + reports it. Off unless explicitly opted in.
@@ -126,7 +130,8 @@ const AUTHORIZATION_NAME: &str = "authorization";
 /// covers the CBOR integer-array overhead and the 64 MiB margin generously
 /// covers the per-entry key/hash overhead (~200 B x up to 10k entries) plus
 /// framing. Over the cap → HTTP 413.
-const MAX_IMPORT_BUNDLE_BYTES: usize = 2 * MAX_EXPORT_TOTAL_PLAINTEXT_BYTES + 64 * 1024 * 1024;
+pub(crate) const MAX_IMPORT_BUNDLE_BYTES: usize =
+    2 * MAX_EXPORT_TOTAL_PLAINTEXT_BYTES + 64 * 1024 * 1024;
 
 /// Registers the live-import route for `version`. The handler reaches the node
 /// through the per-node [`ExportOpManagerHandle`] carried as a request
@@ -147,7 +152,12 @@ pub(super) fn routes(version: ApiVersion) -> Router {
 /// On rejection returns `(StatusCode::FORBIDDEN, reason)` with a fixed,
 /// non-secret reason string (never echoes the key or any token). See the module
 /// docs for the three layered checks. FAIL-CLOSED throughout.
-fn import_gate_or_reject(
+///
+/// `pub(crate)` so the magic-link migration's local `pull-import` endpoint
+/// (`hosted_migrate`) — which also WRITES secrets into the local store from a
+/// same-origin dashboard POST — reuses this EXACT gate rather than duplicating
+/// (and drifting from) the loopback + trusted-origin + no-contract-token checks.
+pub(crate) fn import_gate_or_reject(
     headers: &HeaderMap,
     source_ip: Option<IpAddr>,
     allowed_hosts: Option<&AllowedHosts>,
@@ -421,7 +431,11 @@ async fn import_handler(req: axum::extract::Request) -> Response {
 /// The bundle bytes and the key are moved into the (redacted/zeroizing) event
 /// wrappers so the high-value key is wiped after the bundle is decrypted and
 /// never reaches a log; the bundle's `Debug` prints only its length.
-async fn run_import(
+///
+/// `pub(crate)` so the magic-link migration's local `pull-import` endpoint
+/// (`hosted_migrate`) drives the import through the SAME executor round-trip
+/// (and the same 4xx/5xx classification) after fetching the bundle over HTTPS.
+pub(crate) async fn run_import(
     op_manager: &OpManager,
     bundle: Vec<u8>,
     key: String,
