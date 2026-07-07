@@ -42,9 +42,9 @@ if (b < 0 || e < 0 || e < b) {
   process.exit(1);
 }
 const region = src.slice(b, e);
-const fnStart = region.indexOf('function base58Encode');
+const fnStart = region.indexOf('function base58Encode(');
 if (fnStart < 0) {
-  console.error('FAIL: no `function base58Encode` between the markers.');
+  console.error('FAIL: no `function base58Encode(` between the markers.');
   process.exit(1);
 }
 const fnSource = region.slice(fnStart);
@@ -157,6 +157,10 @@ for (const [hex, expected] of vectors) {
 //        using only alphabet characters.
 const sample = new Uint8Array(32).fill(0x7f);
 const enc = base58Encode(sample);
+check(
+  enc === refBase58(sample),
+  `32-byte 0x7f sample must match the independent reference (got ${enc})`,
+);
 check(
   enc.length >= 43 && enc.length <= 44,
   `32-byte input should encode to 43-44 base58 chars, got ${enc.length}`,
