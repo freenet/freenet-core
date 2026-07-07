@@ -1667,6 +1667,17 @@ impl Ring {
             snapshot.hosting_local_hits_total = Some(ring.hosting_manager.local_get_serves());
             snapshot.hosting_local_misses_total = Some(ring.hosting_manager.local_get_forwards());
 
+            // Aggregate on-disk usage gauges (#4683): state (delta-tracked) +
+            // WASM blobs + wasmtime compile cache (both du-measured) + their sum.
+            // `None` until the tracker is configured and seeded (early startup),
+            // in which case the fields stay unset. Observational only in this PR.
+            if let Some(disk) = ring.hosting_manager.disk_usage_stats() {
+                snapshot.hosting_disk_state_bytes = Some(disk.state_bytes);
+                snapshot.hosting_disk_wasm_bytes = Some(disk.wasm_bytes);
+                snapshot.hosting_disk_compile_cache_bytes = Some(disk.compile_cache_bytes);
+                snapshot.hosting_disk_total_bytes = Some(disk.total_bytes);
+            }
+
             // Terminal advertisement-consult counters (hosting redesign piece C,
             // #4646). Exported here per #4658 so the production findability
             // baseline — the dead-end decomposition (off-path-advertised-host
@@ -2570,6 +2581,34 @@ impl Ring {
                     }
                 }
             }
+
+            // Disk-usage accounting maintenance (#4683). Runs OUTSIDE any
+            // hosting-cache write lock (the du-walks would stall cache readers).
+            // First tick lazily seeds the tracker from the true on-disk state
+            // total; every tick re-walks the `du`-measured WASM-blob and
+            // compile-cache totals so telemetry stays fresh. Observational only
+            // in this PR — no admission/eviction decision reads these yet.
+            //
+            // Both operations are synchronous, blocking disk I/O: a recursive
+            // `std::fs` walk of `contracts_dir` + the wasmtime cache dir on every
+            // tick, plus a one-time sync redb `load_all_hosting_metadata` on the
+            // seeding tick. `contracts_dir` is unbounded and non-self-pruning, so
+            // on a node hosting many contracts the walk can run for a while with
+            // no `.await` point. Push it onto a blocking thread so it can never
+            // stall other tasks on the async reactor — the same discipline
+            // `secrets_store/sweep.rs` uses for its "disk walk + ReDb reads".
+            let ring_for_disk = ring.clone();
+            if let Err(err) = tokio::task::spawn_blocking(move || {
+                #[cfg(feature = "redb")]
+                ring_for_disk.hosting_manager.seed_disk_tracker_if_absent();
+                ring_for_disk.hosting_manager.refresh_disk_usage();
+            })
+            .await
+            {
+                // The walk is observational only; a panic here must not wedge the
+                // sweep loop, but it must not be swallowed silently either.
+                tracing::warn!(%err, "disk-usage accounting maintenance task failed");
+            }
         }
     }
 
@@ -2697,6 +2736,19 @@ impl Ring {
     /// cleanup of persisted metadata when contracts are evicted.
     pub fn set_hosting_storage(&self, storage: crate::contract::storages::Storage) {
         self.hosting_manager.set_storage(storage);
+    }
+
+    /// Install the aggregate disk-usage tracker's paths (#4683). Called once at
+    /// startup with the node's mode-resolved contracts dir and the relocated
+    /// wasmtime compile-cache dir. The tracker is seeded lazily on the first
+    /// sweep tick.
+    pub fn set_hosting_disk_paths(
+        &self,
+        contracts_dir: std::path::PathBuf,
+        wasmtime_cache_dir: std::path::PathBuf,
+    ) {
+        self.hosting_manager
+            .configure_disk_tracker(contracts_dir, wasmtime_cache_dir);
     }
 
     /// Drop the ring's clones of the redb `Storage` handle (hosting metadata +
@@ -3213,11 +3265,25 @@ impl Ring {
         let new_gen = self.hosting_manager.bump_state_generation(contract);
         self.hosting_manager
             .refresh_cache_generation(contract, new_gen);
+        // Disk-usage accounting (#4683): maintain the aggregate on-disk state
+        // total by signed delta (`new − previous_for_key`). Observational only
+        // in this PR — no admission/eviction decision reads it yet. No-op until
+        // the tracker is seeded.
+        self.hosting_manager
+            .record_state_write(contract, state_size as u64);
         self.report_contract_resource_usage(
             *contract.id(),
             crate::topology::meter::ResourceType::StateBytesWritten,
             state_size as f64,
         );
+    }
+
+    /// Subtract a reclaimed contract's state bytes from the aggregate disk-usage
+    /// tracker (#4683). Called from the executor's reclaim path on successful
+    /// state deletion. Observational only in this PR; no-op until the tracker is
+    /// seeded.
+    pub(crate) fn record_state_removed(&self, contract: &ContractKey) {
+        self.hosting_manager.record_state_removed(contract);
     }
 
     /// Read the current state-write generation for `contract` (0 if never written).
