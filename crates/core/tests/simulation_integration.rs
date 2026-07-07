@@ -7469,6 +7469,105 @@ fn test_direct_runner_churn() {
     );
 }
 
+/// Regression test for #4694: direct-runner `ChurnConfig` crashes must actually
+/// DROP packets, not merely set fault config.
+///
+/// Before the fix, `run_simulation_direct` never installed the global
+/// packet-delivery callback and never set `enforce_fault_drops`, so the chaos
+/// driver's `crash_node()` calls were inert: a "crashed" node kept exchanging
+/// packets. Any near-K churn / partition validation on the direct runner was
+/// therefore false-green — it asserted recovery from a fault that never
+/// happened. This blocked trusting the demand-driven-hosting release-2 gate
+/// (#4642), whose churn validation runs on this exact runner.
+///
+/// The discriminating signal is the fault injector's `messages_dropped_crash`
+/// counter: it is `> 0` only if a crash was scheduled AND real traffic to/from
+/// the crashed node was subsequently blocked by the delivery callback. We use
+/// permanent crashes so a downed node stays down and keeps dropping traffic
+/// (its own event loop keeps trying to send, and neighbours keep routing to
+/// it), guaranteeing drops accumulate once faults are actually enforced.
+///
+/// - RED (pre-fix): callback never installed / never enforced → counter stays
+///   exactly `0` → assertion fails.
+/// - GREEN (post-fix): crashed-node packets are dropped → counter `> 0`.
+#[test]
+fn test_direct_runner_churn_actually_drops_packets() {
+    use freenet::dev_tool::ChurnConfig;
+
+    const SEED: u64 = 0xC1_0055_D009;
+    const NETWORK_NAME: &str = "test-churn-drops";
+
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+
+    let mut sim = rt.block_on(async {
+        SimNetwork::new(
+            NETWORK_NAME,
+            2,  // gateways
+            8,  // nodes
+            10, // ring_max_htl
+            5,  // rnd_if_htl_above
+            15, // max_connections
+            3,  // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    // Aggressive, permanent churn so at least one node is genuinely crashed
+    // shortly after warmup and stays down accumulating dropped packets.
+    sim.with_churn(ChurnConfig {
+        crash_probability: 0.5,
+        tick_interval: Duration::from_millis(200),
+        recovery_delay: Duration::from_millis(500),
+        max_simultaneous_crashes: Some(3),
+        permanent_crash_rate: 1.0, // every crash is permanent → stays down
+        // Must be >= connection wait (2s) + buffer to avoid crashing nodes during startup
+        warmup_delay: Duration::from_secs(5),
+    });
+
+    // Retain a clone of this network's fault injector Arc BEFORE the run.
+    // `run_simulation_direct` consumes `sim`; on drop, `SimNetwork::Drop` removes
+    // the injector from the global registry, but our retained Arc keeps the same
+    // underlying `FaultInjectorState` alive — and the chaos driver + delivery
+    // callback mutate that same state during the run, so we can read the final
+    // drop count afterwards.
+    let injector = freenet::dev_tool::get_fault_injector(NETWORK_NAME)
+        .expect("fault injector is registered at SimNetwork construction");
+
+    let logs_handle = sim.event_logs_handle();
+
+    drop(rt);
+
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(
+        SEED,
+        10, // max_contract_num
+        30, // iterations
+        Duration::from_millis(200),
+    )
+    .expect("Direct simulation with churn should complete without panic");
+
+    let crash_drops = injector.lock().unwrap().stats.messages_dropped_crash;
+
+    // Sanity: the run actually did something.
+    let rt = create_runtime();
+    let event_count = rt.block_on(async { logs_handle.lock().await.len() });
+    assert!(event_count > 0, "churn simulation produced no events");
+
+    assert!(
+        crash_drops > 0,
+        "expected crashed-node packets to be DROPPED (messages_dropped_crash > 0), \
+         but got {crash_drops}. Fault injection is inert on the direct runner — the \
+         packet-delivery callback was not installed / enforced (regression of #4694)."
+    );
+
+    tracing::info!(
+        "CHURN DROP TEST PASSED: {crash_drops} packets dropped for crashed nodes \
+         ({event_count} events produced)"
+    );
+}
+
 // =============================================================================
 // Unhealthy Peer Eviction Tests
 // =============================================================================
