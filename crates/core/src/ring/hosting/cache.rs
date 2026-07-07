@@ -543,6 +543,41 @@ pub struct HostingCache<T: TimeSource> {
     time_source: T,
 }
 
+/// The canonical eviction **victim ordering** (subscriber-primary, #4642).
+///
+/// Given the three ranking components of two hosted-contract candidates —
+/// `subscriber_count`, `last_get_seq`, and the `ContractKey` — returns the
+/// [`Ordering`](std::cmp::Ordering) that sorts them ascending by
+/// `(subscriber_count, last_get_seq, key_bytes)`:
+///
+/// 1. fewest **subscribers** first (subscribed contracts are the last to be
+///    shed — genuine demand pins them),
+/// 2. ties broken by least-recent real **GET** (`last_get_seq`, a recency
+///    tiebreak — NOT the primary key),
+/// 3. then contract-key bytes as a final deterministic tiebreak.
+///
+/// The candidate that sorts FIRST under this order is the one evicted first.
+///
+/// This is the single reusable entry point for eviction ranking:
+/// [`HostingCache::evict_over_budget`] sorts victims with it, and admission
+/// (#4717) plus any future disk-driven eviction (#4700's disk-eviction floor)
+/// MUST reuse it rather than forking a byte-only or distance-based order. Do
+/// NOT re-add distance to this key — its causal pull on demand already flows
+/// through `subscriber_count` via keyward routing gravity, and byte-only /
+/// distance-based eviction are the anti-patterns the hosting-invariants rule
+/// exists to keep out (see `.claude/rules/hosting-invariants.md`).
+pub(crate) fn victim_order(
+    a: (usize, u64, &ContractKey),
+    b: (usize, u64, &ContractKey),
+) -> std::cmp::Ordering {
+    let (a_subs, a_seq, a_key) = a;
+    let (b_subs, b_seq, b_key) = b;
+    a_subs
+        .cmp(&b_subs)
+        .then_with(|| a_seq.cmp(&b_seq))
+        .then_with(|| a_key.as_bytes().cmp(b_key.as_bytes()))
+}
+
 impl<T: TimeSource> HostingCache<T> {
     /// Create a new hosting cache with the given byte budget and TTL.
     pub fn new(budget_bytes: u64, min_ttl: Duration, time_source: T) -> Self {
@@ -654,11 +689,9 @@ impl<T: TimeSource> HostingCache<T> {
         // (least-recently real-GET first), then by contract-key bytes as a final
         // deterministic tiebreak. Under AtCapacity every candidate has
         // subscriber_count == 0, so the order reduces to real-GET recency.
-        candidates.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| a.2.cmp(&b.2))
-                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
-        });
+        // `victim_order` is the canonical ranking — admission and any future
+        // disk-driven eviction must reuse it rather than fork their own.
+        candidates.sort_by(|a, b| victim_order((a.1, a.2, &a.0), (b.1, b.2, &b.0)));
 
         let mut evicted = Vec::new();
         for (key, _subs, _) in candidates {
@@ -1386,6 +1419,45 @@ mod tests {
         let time_source = SharedMockTimeSource::new();
         let cache = HostingCache::new(budget, min_ttl, time_source.clone());
         (cache, time_source)
+    }
+
+    #[test]
+    fn victim_order_is_subscriber_then_get_recency_then_key() {
+        use std::cmp::Ordering;
+        let k1 = make_key(1);
+        let k2 = make_key(2);
+
+        // 1. Fewer subscribers ranks FIRST (evicted first), even against a
+        //    more-recent GET and a smaller key on the other side.
+        assert_eq!(
+            victim_order((0, 999, &k2), (1, 0, &k1)),
+            Ordering::Less,
+            "fewer subscribers must rank ahead of a more-recent GET / smaller key"
+        );
+
+        // 2. Equal subscribers: least-recent real GET (smaller last_get_seq)
+        //    ranks first.
+        assert_eq!(
+            victim_order((2, 5, &k1), (2, 6, &k2)),
+            Ordering::Less,
+            "with equal subscribers, least-recent GET ranks first"
+        );
+
+        // 3. Equal subscribers AND GET recency: smaller key bytes break the tie
+        //    deterministically.
+        let (small, large) = if k1.as_bytes() < k2.as_bytes() {
+            (&k1, &k2)
+        } else {
+            (&k2, &k1)
+        };
+        assert_eq!(
+            victim_order((3, 7, small), (3, 7, large)),
+            Ordering::Less,
+            "equal subscribers + GET recency fall back to key-byte order"
+        );
+
+        // Reflexive: identical ranking components compare Equal.
+        assert_eq!(victim_order((1, 1, &k1), (1, 1, &k1)), Ordering::Equal);
     }
 
     #[test]
