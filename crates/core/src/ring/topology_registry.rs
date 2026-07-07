@@ -337,6 +337,55 @@ pub fn clear_renewal_metrics(network_name: &str) {
     RENEWAL_METRICS_REGISTRY.retain(|key, _| key.0 != network_name);
 }
 
+/// Per-peer count of WASM `summarize_state` invocations — the summary-cache
+/// SLOW-path work that the state-hash-keyed cache exists to elide (#4440 /
+/// #4473, and the every-hop-placement summarize-storm falsifier, spec step 8).
+///
+/// Key: (network_name, peer_address). Value: monotonic count of times the peer
+/// actually ran the WASM `summarize_state` (a cache MISS), i.e. the expensive
+/// work whose per-heartbeat, per-neighbor multiplication was the #4440 storm.
+/// A cache HIT does NOT increment this, so under the working cache the count
+/// scales with the contract STATE-CHANGE rate, NOT with hosted-set size or
+/// neighbor overlap. That "flat vs hosted-set size" property is the every-hop
+/// placement falsifier: if this count grows with the number of shared hosted
+/// contracts (or the number of neighbors), the cache is not covering every-hop
+/// load and the storm has re-armed.
+static SUMMARIZE_METRICS_REGISTRY: LazyLock<DashMap<(String, SocketAddr), u64>> =
+    LazyLock::new(DashMap::new);
+
+/// Record one WASM `summarize_state` invocation (a summary-cache SLOW-path
+/// miss) for `peer_addr`. No-op outside a simulation context (no current
+/// network name), so this is free on production nodes — the counter exists only
+/// to let sim falsifiers assert the summary cache bounds every-hop summarize
+/// load. MUST be called from the contract-handling loop thread (where the
+/// simulation sets the network-name thread-local), NOT inside a `spawn_blocking`
+/// closure, or the thread-local will be unset and the record silently dropped.
+pub fn record_summarize_wasm_call(peer_addr: SocketAddr) {
+    if let Some(network_name) = get_current_network_name() {
+        *SUMMARIZE_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default() += 1;
+    }
+}
+
+/// Snapshot all per-peer WASM-summarize counts for a network into an owned map.
+///
+/// Used by `run_controlled_simulation` to capture the counts BEFORE
+/// `SimNetwork::Drop` clears the registry, mirroring how renewal metrics and
+/// topology snapshots are captured.
+pub fn get_all_summarize_wasm_calls(network_name: &str) -> HashMap<SocketAddr, u64> {
+    SUMMARIZE_METRICS_REGISTRY
+        .iter()
+        .filter(|entry| entry.key().0 == network_name)
+        .map(|entry| (entry.key().1, *entry.value()))
+        .collect()
+}
+
+/// Clear WASM-summarize counts for a network (for test cleanup).
+pub fn clear_summarize_metrics(network_name: &str) {
+    SUMMARIZE_METRICS_REGISTRY.retain(|key, _| key.0 != network_name);
+}
+
 /// Result of topology validation.
 #[derive(Debug, Default)]
 pub struct TopologyValidationResult {

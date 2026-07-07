@@ -15800,3 +15800,444 @@ fn test_nn_lattice_larger_ring_report() {
 // are reliable where a mid-run sim crash's timing is not. Re-discovery-on-loss is
 // exercised behaviorally by the cycle-completeness sim above (edges that fail to
 // form on the first probe are re-probed until the cycle completes).
+
+// =============================================================================
+// Every-hop LRU placement (spec step 8) — falsifiers (b) and (c)
+// =============================================================================
+
+/// Falsifier (b): per-peer UPDATE fan-out is bounded by a peer's connected
+/// co-host DEGREE, NOT by the total number of holders.
+///
+/// ## Claim under test
+///
+/// Every-hop LRU placement makes the *holder set* for a hot contract LARGE (many
+/// peers along every routed path host it). A naive worry is that this turns every
+/// UPDATE into a holder-count-wide fan-out storm. It does not: a peer only ever
+/// broadcasts an UPDATE to its OWN connected co-host subscribers, so the
+/// sends-per-committed-update at any single peer is bounded by that peer's
+/// connection DEGREE (`max_connections`), independent of how many holders exist
+/// network-wide. The broadcast reaches the far holders by RELAY through the
+/// co-host mesh (each hop re-broadcasts to its own bounded neighbor set), not by
+/// one peer fanning out to everyone.
+///
+/// ## How this test falsifies it
+///
+/// Build a deliberately SPARSE ring (`max_connections = 5`) with many
+/// subscribers (11 nodes + gateway) so the holder set is much larger than any
+/// single peer's degree. Drive a burst of UPDATEs from the gateway, then measure:
+///
+///   1. **holders-per-contract** — `is_node_hosting` over every captured node.
+///      Must be comfortably LARGER than `max_connections` (proves holders exceed
+///      any one peer's fan-out degree).
+///   2. **max sends-per-update** — the widest `broadcast_to` of any single
+///      `UpdateEvent::BroadcastEmitted` event, read from the structured event log
+///      via `StateVerifier` (`ContractStateHistory::emitted_broadcasts` →
+///      `TrackedBroadcast::targets`, filtered to `BroadcastSource::Update`). Must
+///      be bounded by DEGREE (`<= max_connections`) and strictly LESS than
+///      holders-per-contract.
+///
+/// If a future change made every holder a direct broadcast target (the storm),
+/// max sends-per-update would climb toward holders-per-contract and blow the
+/// `<= max_connections` bound.
+#[test_log::test]
+fn test_every_hop_fanout_bounded_by_degree_not_holder_count() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+    use freenet::tracing::state_verifier::BroadcastSource;
+
+    const SEED: u64 = 0x5748_08B0_0001;
+    const NETWORK_NAME: &str = "every-hop-fanout-degree";
+    // Subscribers: many, so the holder set dwarfs any single peer's degree.
+    const NODE_COUNT: usize = 11;
+    // Deliberately SPARSE: each peer holds at most this many direct connections,
+    // so no peer can broadcast to more than this many co-hosts regardless of how
+    // wide the holder set grows.
+    const MAX_CONNECTIONS: usize = 5;
+    // UPDATEs driven into the hot contract after all subscribers bootstrap.
+    const UPDATES: usize = 12;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,               // 1 gateway (the UPDATE source)
+            NODE_COUNT,      // subscriber nodes → large holder set
+            7,               // max_htl
+            3,               // rnd_if_htl_above
+            MAX_CONNECTIONS, // sparse degree bound
+            2,               // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // CRDT contract so post-bootstrap UPDATEs compute real version-aware deltas
+    // (matches test_sustained_update_fanout_no_full_state_storm).
+    let contract = SimOperation::create_test_contract(0x8B);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x10),
+            subscribe: true,
+        },
+    )];
+
+    // Every node GETs (fetching the contract along the routed path — every-hop
+    // placement + the return-path host) AND subscribes (joins the update mesh).
+    // GET+subscribe rather than a bare Subscribe because a bare subscribe from a
+    // node that does not yet hold the contract is rejected at t=0 (see the
+    // wide-star driver note); GET first acquires the contract so participation —
+    // and thus the holder set — is high and well beyond MAX_CONNECTIONS.
+    for node_idx in 1..=NODE_COUNT {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, node_idx),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
+        ));
+    }
+
+    // Sustained UPDATE burst from the gateway.
+    for v in 0..UPDATES {
+        let version = (v as u64) + 2; // versions 2.. (v1 was the PUT)
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(version, 0x20 + v as u8),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // (1) holders-per-contract: how many peers ended up hosting the contract.
+    let holders = result
+        .captured_node_labels()
+        .into_iter()
+        .filter(|label| result.is_node_hosting(label, &contract_key))
+        .count();
+
+    // (2) max sends-per-update: the widest single UPDATE BroadcastEmitted, read
+    // from the structured event log. `targets` is the per-broadcast subscriber
+    // set (`broadcast_to` filtered to peers with a socket addr) — i.e. the
+    // `broadcasted_to` fan-out width for that emission.
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        freenet::tracing::StateVerifier::from_events(logs.clone()).verify()
+    });
+    let mut update_broadcasts = 0usize;
+    let mut max_update_width = 0usize;
+    let mut max_any_width = 0usize;
+    for history in &report.contract_histories {
+        for b in &history.emitted_broadcasts {
+            max_any_width = max_any_width.max(b.targets.len());
+            if b.source_op == BroadcastSource::Update {
+                update_broadcasts += 1;
+                max_update_width = max_update_width.max(b.targets.len());
+            }
+        }
+    }
+
+    tracing::info!(
+        "every-hop fanout: holders_per_contract={holders} (max_connections={MAX_CONNECTIONS}); \
+         update_broadcasts={update_broadcasts}, max_sends_per_update={max_update_width}, \
+         max_sends_any_broadcast={max_any_width}"
+    );
+
+    // Sanity: the scenario must actually have hosted widely and broadcast, else
+    // the bound assertions below would pass vacuously.
+    assert!(
+        holders > MAX_CONNECTIONS,
+        "every-hop placement should host the contract on MORE peers than a single \
+         peer's degree ({MAX_CONNECTIONS}), but only {holders} peers hosted it — \
+         the holder set is not large enough to make the degree-vs-holders claim meaningful"
+    );
+    assert!(
+        update_broadcasts > 0,
+        "no UPDATE BroadcastEmitted events were recorded — the fan-out scenario did not run"
+    );
+
+    // THE FALSIFIER: max sends-per-update is bounded by DEGREE, not holder count.
+    // A peer can only broadcast to its own connected co-host subscribers, so the
+    // per-emission width cannot exceed `max_connections`. If a future change made
+    // every holder a direct target, this width would climb toward `holders` and
+    // blow the bound. (`max_connections` is a hard cap on direct connections in
+    // this harness, so no slack is needed; the observed max is well under it.)
+    assert!(
+        max_update_width <= MAX_CONNECTIONS,
+        "FANOUT STORM: max sends-per-update {max_update_width} exceeds the degree \
+         bound (max_connections={MAX_CONNECTIONS}). Every-hop placement must keep \
+         per-peer UPDATE fan-out bounded by connected co-host DEGREE, not by the \
+         holder count ({holders})."
+    );
+    // The load-bearing separation: fan-out width is strictly less than the holder
+    // set. This is the whole point — holders scale up, per-peer sends do not.
+    assert!(
+        max_update_width < holders,
+        "FANOUT STORM: max sends-per-update {max_update_width} is not strictly less \
+         than holders-per-contract {holders} — per-peer fan-out is scaling with the \
+         holder set instead of with degree."
+    );
+
+    tracing::info!(
+        "test_every_hop_fanout_bounded_by_degree_not_holder_count PASSED: \
+         max_sends_per_update={max_update_width} <= max_connections={MAX_CONNECTIONS} \
+         and < holders_per_contract={holders}"
+    );
+
+    // Avoid leaking the CRDT registration into other tests sharing this process.
+    freenet::dev_tool::clear_crdt_contracts();
+}
+
+/// Falsifier (c): WASM `summarize_state` calls scale with the contract
+/// STATE-CHANGE rate, NOT with hosted-set size or fan-out width.
+///
+/// This is the #4440 summarize-storm falsifier for every-hop placement. The
+/// `summarize_wasm_calls` counter increments ONLY on the summary-cache SLOW path
+/// (a real WASM `summarize_state` at `bridged_summarize_contract_state`), so a
+/// broken or removed cache re-arms the storm and blows the per-peer bound below.
+///
+/// ## Claim under test (#4440 summarize-storm, every-hop variant)
+///
+/// When a peer broadcasts an UPDATE to its co-host targets, the broadcast path
+/// (`broadcast_to_single_peer` → `get_contract_summary` →
+/// `bridged_summarize_contract_state`) needs that peer's OWN summary to compute a
+/// per-target delta. The summary is the SAME for every target in one state
+/// generation. WITHOUT a cache, the peer runs WASM `summarize_state` once PER
+/// TARGET PER UPDATE — so a peer fanning K updates to W co-host targets runs it
+/// `~K × W` times. WITH the state-hash-keyed summary cache, the W targets of one
+/// generation all hit the cache, so the peer runs `summarize_state` `~K` times
+/// (one slow-path miss per new state generation), INDEPENDENT of its fan-out
+/// width W. That per-peer decoupling of summarize-count from fan-out width is the
+/// invariant this test guards.
+///
+/// ## Why `use_mock_wasm = true` (NOT the CRDT emulation)
+///
+/// The counter is recorded ONLY inside the generic `bridged_summarize_contract_state`
+/// (the production `ContractExecutor` code path), reached under `MockWasmRuntime`.
+/// The default sim runtime, `MockRuntime` + `register_crdt_contract`, has its OWN
+/// `summarize_contract_state` that computes a versioned CRDT summary WITHOUT ever
+/// calling the bridged method — so under CRDT emulation this counter is
+/// STRUCTURALLY zero and the assertion would be vacuous. This test therefore runs
+/// the `MockWasmRuntime` path (`sim.use_mock_wasm = true`), whose `summarize_state`
+/// is a blake3 hash of the state and whose `update_state` is last-writer-wins, so
+/// each distinct UPDATE is a real new state generation that misses the cache once.
+///
+/// ## How this test falsifies it
+///
+/// A dense star (1 gateway host/source + N subscribers, `max_connections = 10 >= N`
+/// so the gateway connects to all N directly). The gateway PUTs+subscribes; the N
+/// nodes GET+subscribe, which under every-hop placement makes them REAL co-hosts
+/// that also relay updates (so the effective co-host mesh, and the total per-target
+/// UPDATE broadcast count, is much larger than a naive `K × N`). The gateway then
+/// drives K UPDATEs with distinct states → K state generations.
+///
+/// The signals asserted (all deterministic under the fixed seed):
+///   * **NON-VACUITY** — `total_summarize >= K/2` and the per-target UPDATE
+///     broadcast count `>= K × N`, proving the slow path and a wide fan-out really
+///     ran (else the low count would be trivially true).
+///   * **PER-PEER FLAT-vs-FANOUT (the core #4440 discriminator)** — the busiest
+///     peer's `max_summarize <= K + SLACK`: it summarizes ~once per state
+///     generation, NOT once per (generation × target). A re-armed storm would push
+///     the busiest peer to `K × W` (its fan-out width), far above this bound.
+///   * **AGGREGATE CACHE EFFECTIVENESS** — `total_summarize` is far below the
+///     total per-target UPDATE broadcast count (`< half`). Without the cache each
+///     per-target broadcast would miss (`total ≈ per-target-broadcasts`); the cache
+///     collapses all targets of a generation onto one summarize.
+///
+/// Note: the InterestSync 5-minute heartbeat barely fires in a ~330s virtual sim,
+/// so this test exercises the cache through the UPDATE broadcast summary path
+/// (`broadcast_to_single_peer`), which fires per-target and is exactly where
+/// every-hop overlap load concentrates — not through the heartbeat.
+#[test_log::test]
+fn test_every_hop_summarize_calls_flat_vs_fanout() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x5748_08C0_0001;
+    const NETWORK_NAME: &str = "every-hop-summarize-flat";
+    // N: direct co-host subscribers (the fan-out width per generation).
+    const N: usize = 6;
+    // K: state generations (UPDATEs) broadcast to all N subscribers.
+    const K: usize = 12;
+    // Multiplicative storm bound: without the summary cache, ~K summaries per
+    // target × N targets.
+    const STORM_BOUND: u64 = (K * N) as u64; // 72
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        // max_connections = 10 >= N so the gateway forms a TRUE direct star with
+        // all N subscribers (no multi-hop relay tree that would change the
+        // summary-path shape — see the wide-star note on run_fanout_liveness).
+        let mut sim = SimNetwork::new(NETWORK_NAME, 1, N, 7, 3, 10, 2, SEED).await;
+        // Production ContractExecutor path so summarize routes through
+        // `bridged_summarize_contract_state`, where the counter is recorded (the
+        // CRDT-emulation path bypasses it — see the doc comment above).
+        sim.use_mock_wasm = true;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    let contract = SimOperation::create_test_contract(0x8C);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+
+    // Gateway PUTs + subscribes → becomes host + UPDATE source.
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_test_state(0x01),
+            subscribe: true,
+        },
+    )];
+
+    // N subscribers join the update mesh (the fan-out targets). GET+subscribe
+    // (not a bare Subscribe) so each node first acquires the contract, then joins
+    // the mesh — robust participation so all N are real co-host targets.
+    for node_idx in 1..=N {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, node_idx),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
+        ));
+    }
+
+    // K state generations from the gateway, each broadcast to the N subscribers.
+    // Distinct states (byte-different per update) so every UPDATE is a genuine new
+    // state generation that misses the summary cache once at the source.
+    for v in 0..K {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_test_state(0x20 + v as u8),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Non-vacuity guard: count UPDATE broadcasts actually emitted, so a low
+    // summarize count reflects the cache working — not "no broadcasts happened."
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        freenet::tracing::StateVerifier::from_events(logs.clone()).verify()
+    });
+    let update_broadcast_targets: usize = report
+        .contract_histories
+        .iter()
+        .flat_map(|h| h.emitted_broadcasts.iter())
+        .filter(|b| b.source_op == freenet::tracing::state_verifier::BroadcastSource::Update)
+        .map(|b| b.targets.len())
+        .sum();
+
+    let total_summarize = result.total_summarize_wasm_calls();
+    let max_summarize = result.max_summarize_wasm_calls();
+
+    tracing::info!(
+        "every-hop summarize: total_summarize_wasm_calls={total_summarize}, \
+         max_per_peer={max_summarize}, K(updates)={K}, N(subscribers)={N}, \
+         update_broadcast_targets(sum)={update_broadcast_targets}, \
+         naive_storm(K*N)={STORM_BOUND}"
+    );
+
+    // NON-VACUITY (fan-out): the scenario must actually have fanned UPDATEs out to
+    // many co-host targets. Every-hop placement makes the subscribers real relays,
+    // so the total per-target UPDATE broadcast count is well above a naive K×N —
+    // it is the "without a cache, summarize would run this many times" baseline.
+    assert!(
+        update_broadcast_targets as u64 >= STORM_BOUND,
+        "scenario under-ran: only {update_broadcast_targets} per-target UPDATE \
+         broadcasts fired (< K*N={STORM_BOUND}). Without a wide fan-out the \
+         summarize-vs-fanout comparison is not meaningful."
+    );
+
+    // NON-VACUITY (slow path ran): the recorded slow path MUST have executed for
+    // real. If the counter reads ~0, summarize was never exercised (wrong runtime,
+    // no broadcasts) and the upper bounds below would pass vacuously.
+    let vacuity_floor = (K as u64) / 2; // 6
+    assert!(
+        total_summarize >= vacuity_floor,
+        "summarize path did not run: total WASM summarize calls {total_summarize} \
+         < non-vacuity floor {vacuity_floor} (K/2). With K={K} distinct state \
+         generations, hosting peers must miss the summary cache ~once each per \
+         generation — a near-zero count means the recorded slow path was never \
+         exercised, so the bounds below would be vacuous."
+    );
+
+    // PER-PEER FLAT-vs-FANOUT — the core #4440 discriminator. The busiest single
+    // peer summarizes ~once per new state generation (≈ K), NOT once per
+    // (generation × co-host target). It is bounded by the STATE-CHANGE rate K,
+    // independent of that peer's fan-out width. A re-armed storm (cache broken)
+    // would push the busiest peer to K × W (its co-host fan-out), far above this.
+    // Observed max ≈ K + 1 (the +1 is the bootstrap PUT/GET summary); the slack
+    // covers bootstrap plus a small apply/re-summarize margin.
+    const PER_PEER_SLACK: u64 = 8;
+    let per_peer_bound = K as u64 + PER_PEER_SLACK; // 20
+    assert!(
+        max_summarize <= per_peer_bound,
+        "#4440 SUMMARIZE STORM: the busiest peer ran WASM summarize {max_summarize} \
+         times, exceeding the per-peer bound {per_peer_bound} (K={K} + slack={PER_PEER_SLACK}). \
+         Per-peer summarize must scale with the state-change rate K, NOT with the \
+         peer's co-host fan-out width — a count near K × fan-out means the summary \
+         cache is not collapsing a generation's per-target summaries."
+    );
+
+    // AGGREGATE CACHE EFFECTIVENESS: total summarize is far below the total
+    // per-target UPDATE broadcast count. Without the cache, each per-target
+    // broadcast misses (total ≈ update_broadcast_targets); the cache collapses all
+    // targets of one generation onto a single summarize, so total falls well below
+    // half of the per-target broadcast count.
+    assert!(
+        total_summarize * 2 < update_broadcast_targets as u64,
+        "#4440 SUMMARIZE STORM: total WASM summarize calls {total_summarize} is not \
+         below half the per-target UPDATE broadcast count {update_broadcast_targets} \
+         — the summary cache is not collapsing per-target summaries within a state \
+         generation (without the cache these would be roughly equal)."
+    );
+
+    tracing::info!(
+        "test_every_hop_summarize_calls_flat_vs_fanout PASSED: \
+         max_per_peer={max_summarize} <= {per_peer_bound} (≈K={K}); \
+         total_summarize={total_summarize} << per_target_broadcasts={update_broadcast_targets} \
+         (>= vacuity_floor={vacuity_floor})"
+    );
+}

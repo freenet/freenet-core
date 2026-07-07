@@ -163,10 +163,11 @@ pub mod dev_tool {
     pub use ring::topology_registry::{
         ContractSubscription, ProximityViolation, RenewalMetrics, TopologySnapshot,
         TopologyValidationResult, aggregate_renewal_metrics, clear_all_topology_snapshots,
-        clear_current_network_name, clear_renewal_metrics, clear_topology_snapshots,
-        get_all_renewal_metrics, get_all_topology_snapshots, get_current_network_name,
-        get_renewal_metrics, get_topology_snapshot, register_topology_snapshot,
-        set_current_network_name, validate_topology, validate_topology_from_snapshots,
+        clear_current_network_name, clear_renewal_metrics, clear_summarize_metrics,
+        clear_topology_snapshots, get_all_renewal_metrics, get_all_summarize_wasm_calls,
+        get_all_topology_snapshots, get_current_network_name, get_renewal_metrics,
+        get_topology_snapshot, register_topology_snapshot, set_current_network_name,
+        validate_topology, validate_topology_from_snapshots,
     };
     pub use wasm_runtime::secret_export::{
         BundleKeyMaterial, ExportError, ImportReport, TargetScope, export_bundle, import_bundle,
