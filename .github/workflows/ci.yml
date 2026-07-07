@@ -167,6 +167,14 @@ jobs:
       - name: Self-test announce-to-river
         run: bash scripts/release-agent/announce-to-river_test.sh
 
+      # Regression gate for the v0.2.93 release failure (2026-07-07): the
+      # version-bump auto-merge step ran `gh pr merge --squash --auto`, but the
+      # merge queue rejects --squash, so the step exited non-zero (under bash -e)
+      # and skipped the entire publish cascade. Pins that release.yml's merge
+      # invocation stays --auto and never re-adds --squash.
+      - name: Self-test release.yml merge-queue auto-merge
+        run: bash scripts/release_mergequeue_test.sh
+
       # install.sh now sets up a supervised service by default (issue #4073) so
       # new nodes auto-update. The system-vs-user + lingering decision is the
       # load-bearing new logic; these smoke tests pin it without needing real
