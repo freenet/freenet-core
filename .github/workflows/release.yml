@@ -202,7 +202,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
-          gh pr merge ${{ steps.create_pr.outputs.pr_number }} --squash --auto
+          # The merge queue owns the merge strategy, so do NOT pass --squash
+          # here: it makes `gh pr merge` exit non-zero and, under `bash -e`,
+          # fails this step and skips the whole publish cascade (this is what
+          # broke the v0.2.93 release on 2026-07-07; the queue's strict-strategy
+          # enforcement was enabled between v0.2.92 and v0.2.93). Just enable
+          # auto-merge; the queue applies its configured strategy.
+          gh pr merge ${{ steps.create_pr.outputs.pr_number }} --auto
           echo "✅ Auto-merge enabled"
 
   wait_for_pr:
