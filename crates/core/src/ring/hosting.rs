@@ -29,6 +29,9 @@
 //! - Active subscriptions prevent eviction from the hosting cache
 //! - TTL protects recently accessed contracts from premature eviction
 
+// Admission decision core (#4642 piece B / spec "7-bis"): pure, inert, additive
+// — not yet wired to any production admission/eviction path (see the module docs).
+mod admission;
 mod cache;
 mod demand;
 mod disk_usage;
