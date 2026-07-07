@@ -1061,10 +1061,17 @@ async fn sandbox_content_body(
 /// Injected into the shell page (P2-frontend of #4381) ONLY when the node runs
 /// in hosted mode. The shell is same-origin with the node, so it can persist a
 /// token in `localStorage`; the sandboxed iframe cannot. The token is a 32-byte
-/// secret minted from `crypto.getRandomValues` (never from request input), hex
-/// encoded, and reused across every visit and every contract app on this node —
-/// one durable identity per visitor. The bridge presents it on the proxied
-/// WebSocket upgrade as `?userToken=<token>`.
+/// secret minted from `crypto.getRandomValues` (never from request input),
+/// base58 (Bitcoin/bs58 alphabet) encoded, and reused across every visit and
+/// every contract app on this node — one durable identity per visitor. The
+/// bridge presents it on the proxied WebSocket upgrade as `?userToken=<token>`.
+///
+/// The server treats the token as an OPAQUE namespace key (it hashes the raw
+/// string bytes — see [`crate::wasm_runtime::UserSecretContext::from_token`]),
+/// so the encoding is a purely client-side, display-facing choice: older builds
+/// stored a hex string and those tokens keep resolving to the same per-user
+/// namespace, while new identities are base58 (shorter and less error-prone for
+/// a user to copy or transcribe).
 ///
 /// On a non-`https:` page the IIFE returns undefined BEFORE touching
 /// `localStorage`, so the durable token is never loaded, minted, or transmitted
@@ -3202,6 +3209,20 @@ mod tests {
         assert!(
             html.contains("localStorage.setItem"),
             "hosted-mode token must be persisted to localStorage"
+        );
+        // New identities must mint a base58 access key: the shell must carry the
+        // inline base58 encoder and the Bitcoin/bs58 alphabet, and must NOT use
+        // the old hex encoding (`toString(16)`). The server hashes the raw token
+        // string, so a previously stored hex token still works — this only pins
+        // the format newly minted tokens take. See shell_user_token.js.
+        assert!(
+            html.contains("base58Encode")
+                && html.contains("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"),
+            "hosted-mode token must be minted as base58 via the inline encoder; got: {html}"
+        );
+        assert!(
+            !html.contains("toString(16)"),
+            "hosted-mode token must no longer be hex-encoded (toString(16)); got: {html}"
         );
         // The bridge must be called with the user-token argument AND the
         // hosted-mode flag (so it can fail closed over http).
