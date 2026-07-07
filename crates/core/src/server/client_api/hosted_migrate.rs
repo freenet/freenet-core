@@ -284,7 +284,7 @@ async fn mint_handler(req: axum::extract::Request) -> Response {
     // Same gate as the live export (hosted + loopback + XFP:https + valid
     // token). We take the user CONTEXT (the scope) and DISCARD the durable token
     // — the bundle is sealed under a fresh ephemeral key instead.
-    let (user_context, _durable_token) =
+    let (user_context, durable_token) =
         match export_user_context_or_reject(headers, source_ip, hosted_mode) {
             Ok(v) => v,
             Err((status, reason)) => {
@@ -292,6 +292,10 @@ async fn mint_handler(req: axum::extract::Request) -> Response {
                 return (status, reason).into_response();
             }
         };
+    // The durable token is only used to authenticate + scope; it is NEVER the
+    // bundle key here (the mint seals under a fresh ephemeral key). Wipe it now
+    // so it does not linger in freed memory — it must not leave this node.
+    drop(zeroize::Zeroizing::new(durable_token));
 
     // Minting runs a full export, so it shares the per-user EXPORT rate limit.
     let limiter = req.extensions().get::<UserOpRateLimiter>();
@@ -597,6 +601,11 @@ async fn pull_bundle_from_source(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(MIGRATION_PULL_TIMEOUT_SECS))
         .https_only(true)
+        // Do NOT follow redirects: the SSRF allowlist only vets the FIRST URL's
+        // host, so a redirect from the allowlisted origin to an internal address
+        // would defeat it. The pull endpoint answers 200/404 directly, never a
+        // redirect, so this only closes the SSRF-via-redirect hole.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| {
             (
