@@ -1,4 +1,19 @@
 # Demand-driven hosting: eviction & retention (piece A)
+
+> **⚠️ SUPERSEDED (2026-07 subscriber-primary rework, #4642).** The
+> Greedy-Dual `keep_score`/`eviction_floor` + proximity-prior
+> `predicted_demand` eviction policy described below is **no longer the live
+> policy.** Eviction is now **subscriber-primary**: victims are ordered by
+> ascending `(subscriber_count, real-GET recency)` — fewest subscribers first,
+> ties broken by least-recent real GET; distance/`predicted_demand` is removed
+> from the ranking (demoted to telemetry, `keep_score`/`eviction_floor`
+> retained but no longer drive eviction), and a last-resort OOM valve may shed
+> the fewest-subscriber contract under genuine RAM overflow. See
+> **`docs/design/demand-driven-hosting.md` §9 (Piece A)** for the current
+> model. The **Budget (capability-relative)** and **telemetry-shape** sections
+> below are still accurate; only the **Eviction** section is stale. This
+> document is retained for the history of the shipped-then-reworked A3 policy.
+
 Design resolved 2026-06-30. Tracker: freenet/freenet-core#4642. Invariants: `.claude/rules/hosting-invariants.md`.
 
 ## Goal

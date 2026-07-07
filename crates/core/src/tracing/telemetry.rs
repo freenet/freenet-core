@@ -2223,6 +2223,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_disk_total_bytes".to_string(),
                     serde_json::json!(snapshot.hosting_disk_total_bytes),
                 );
+                // OOM-valve falsifier (#4642 subscriber-primary rework): pinned by
+                // `router_snapshot_json_includes_oom_valve_gauge`. Same
+                // hand-mirrored footgun — invisible to the collector unless added
+                // here. Stays 0 until the Overflow trigger is wired.
+                obj.insert(
+                    "hosting_oom_valve_evictions_total".to_string(),
+                    serde_json::json!(snapshot.hosting_oom_valve_evictions_total),
+                );
                 // Terminal advertisement-consult counters (hosting redesign
                 // piece C, #4646; exported per #4658). Same hand-mirrored
                 // footgun as the gauges above: a new `RouterSnapshotInfo` field
@@ -2636,6 +2644,27 @@ mod tests {
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
+    }
+
+    /// Pin: the OOM-valve falsifier gauge (#4642 subscriber-primary rework) must
+    /// reach the hand-mirrored OTLP body — same footgun as the falsifier gauges
+    /// above. This counts evictions that shed a SUBSCRIBED contract under genuine
+    /// RAM overflow (the valve piercing the in-use pin). It stays 0 until the
+    /// Overflow trigger is wired, but the telemetry must be live now so a nonzero
+    /// rate is visible the moment the trigger lands; a silent drop would blind
+    /// central telemetry to the single riskiest new hosting behavior.
+    #[test]
+    fn router_snapshot_json_includes_oom_valve_gauge() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_oom_valve_evictions_total = Some(359);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(
+            json["hosting_oom_valve_evictions_total"], 359,
+            "hosting_oom_valve_evictions_total must reach the OTLP body"
+        );
     }
 
     /// Pin: the terminal advertisement-consult counters (hosting redesign piece

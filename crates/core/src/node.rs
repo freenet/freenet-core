@@ -3151,7 +3151,9 @@ async fn get_contract_summary(
 /// contract we can really summarize:
 /// - Phantom contracts (the storm) have no stored state, so they are skipped.
 /// - An evicted-but-in-use contract keeps its state ON DISK
-///   (`evict_over_budget` retains `contract_in_use` entries, and
+///   (`evict_over_budget` PINS `subscriber_count >= 1` entries under normal
+///   `AtCapacity` pressure — only the deliberately-unwired OOM valve under
+///   `MemoryPressure::Overflow` can pierce that pin — and
 ///   `reclaim_evicted_contract` only deletes state once NOT in use), so
 ///   `contract_state_present` is true and it KEEPS summarizing — which is why
 ///   the gate reads the state store, not the in-memory hosting cache.

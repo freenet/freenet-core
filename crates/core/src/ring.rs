@@ -1660,6 +1660,10 @@ impl Ring {
             snapshot.hosting_evicted_unread_total = Some(hosting.evicted_unread_total);
             snapshot.hosting_evicted_unread_age_secs_sum =
                 Some(hosting.evicted_unread_age_secs_sum);
+            // OOM-valve falsifier (#4642 subscriber-primary rework): evictions
+            // that shed a subscribed contract under genuine RAM overflow. Stays 0
+            // until the Overflow trigger is wired (mechanism-only this release).
+            snapshot.hosting_oom_valve_evictions_total = Some(hosting.oom_valve_evictions_total);
             // Local-client GET hit-rate (#4642 A3): served-locally vs routed to
             // the network. Driven by the real serve/forward decision in the
             // client GET handler, so it is read from the manager counters (not
@@ -2533,8 +2537,11 @@ impl Ring {
             }
 
             // Clean up local subscription state for each expired contract.
-            // Note: contracts with client subscriptions are protected from eviction
-            // by the should_retain predicate in sweep_expired_hosting().
+            // Note: contracts with subscribers (client subscriptions or
+            // downstream subscribers) are PINNED from eviction by the
+            // subscriber_count closure in sweep_expired_hosting() under normal
+            // AtCapacity pressure; only the deliberately-unwired OOM valve
+            // (MemoryPressure::Overflow) can pierce that pin.
             // The `expected_generation` snapshot is captured atomically with
             // the eviction decision in `HostingCache::record_access` /
             // `sweep_expired`; it is re-checked at deletion time by
