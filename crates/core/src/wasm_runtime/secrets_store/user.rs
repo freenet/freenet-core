@@ -194,3 +194,72 @@ pub fn user_dek_secret(token: &[u8]) -> Zeroizing<[u8; 32]> {
     hasher.update(token);
     Zeroizing::new(*hasher.finalize().as_bytes())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the DERIVATION-level opacity invariant: `from_token` / [`user_id`] /
+    /// [`user_dek_secret`] treat the token as raw opaque bytes
+    /// (`blake3(domain || raw_token_bytes)`) with NO hex decode and NO
+    /// length/charset validation. This derivation is the single load-bearing
+    /// construction site for a per-user namespace (see the `UserSecretContext`
+    /// security invariant), so it is the place that must stay format-agnostic.
+    ///
+    /// That is the property the shell's hex -> base58 access-key change relies
+    /// on — both encodings are just different UTF-8 strings, so:
+    ///
+    /// - a NEW base58 token is honored exactly like a hex one (no backend change
+    ///   was needed for the switch), and
+    /// - an EXISTING user's stored hex token keeps mapping to the same namespace
+    ///   (back-compat: their data stays reachable).
+    ///
+    /// This pins the derivation contract so a future "validate the token is
+    /// 32-byte hex" tightening added HERE would fail CI instead of silently
+    /// locking every pre-existing hex user out of their data. Note the scope: it
+    /// exercises the derivation directly, not the WS-handshake / hosted
+    /// export/import boundaries — those carry no token-format validation today
+    /// either (only a non-empty check), but that is a separate property not
+    /// asserted by this test.
+    #[test]
+    fn user_token_is_opaque_hex_and_base58_both_accepted() {
+        // A representative hex token (what older shell builds minted) and a
+        // representative base58 token (what new builds mint, Bitcoin alphabet).
+        // Both are just strings as far as the backend is concerned.
+        let hex_token = b"0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+        let base58_realistic = b"7Nsp3W1kZ2vQmYb8xR4tHgD6cF5aLj9UeKq";
+
+        // Every token yields a stable, non-panicking derivation.
+        for tok in [hex_token.as_slice(), base58_realistic.as_slice()] {
+            let a = UserSecretContext::from_token(tok);
+            let b = UserSecretContext::from_token(tok);
+            assert_eq!(
+                a.user_id(),
+                b.user_id(),
+                "same token string must derive the same namespace (existing hex \
+                 users must keep their namespace across restarts/versions)"
+            );
+        }
+
+        // Distinct token strings derive distinct namespaces — a hex token and a
+        // base58 token never collide (they are different byte strings).
+        let hex_id = user_id(hex_token);
+        let b58_id = user_id(base58_realistic);
+        assert_ne!(
+            hex_id.as_bytes(),
+            b58_id.as_bytes(),
+            "different token strings must derive different namespaces"
+        );
+
+        // The derivation depends ONLY on the raw bytes: a hex string and its
+        // uppercased form are DIFFERENT tokens (no normalization), which is the
+        // correct behavior for an opaque bearer secret.
+        let lower = b"abcdef0123456789";
+        let upper = b"ABCDEF0123456789";
+        assert_ne!(
+            user_id(lower).as_bytes(),
+            user_id(upper).as_bytes(),
+            "token derivation is over raw bytes with no case/format normalization"
+        );
+    }
+}

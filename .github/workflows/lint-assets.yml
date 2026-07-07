@@ -1,15 +1,17 @@
 name: Lint server web assets
 
-# Prettier + ESLint over the JS/CSS/HTML the gateway server serves to clients.
-# These assets used to be embedded as Rust raw-string consts; issue #4017
-# extracted them into real files (loaded via include_str!) so they can be
-# linted. This workflow guards their syntax/style going forward.
+# Prettier + ESLint over the JS/CSS/HTML the gateway server serves to clients,
+# plus a Node unit test for the inline base58 access-key encoder. These assets
+# used to be embedded as Rust raw-string consts; issue #4017 extracted them into
+# real files (loaded via include_str!) so they can be linted. This workflow
+# guards their syntax/style and the encoder's output going forward.
 
 on:
   push:
     branches: [main]
     paths:
       - 'crates/core/src/server/**/assets/**'
+      - 'crates/core/src/server/base58_encode.test.mjs'
       - 'crates/core/src/server/package.json'
       - 'crates/core/src/server/package-lock.json'
       - 'crates/core/src/server/.prettierrc.json'
@@ -19,6 +21,7 @@ on:
   pull_request:
     paths:
       - 'crates/core/src/server/**/assets/**'
+      - 'crates/core/src/server/base58_encode.test.mjs'
       - 'crates/core/src/server/package.json'
       - 'crates/core/src/server/package-lock.json'
       - 'crates/core/src/server/.prettierrc.json'
@@ -51,3 +54,7 @@ jobs:
       - name: Lint (Prettier --check + ESLint)
         working-directory: crates/core/src/server
         run: npm run lint
+
+      - name: Test (base58 access-key encoder)
+        working-directory: crates/core/src/server
+        run: npm test
