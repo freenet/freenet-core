@@ -42,6 +42,17 @@
         {ops_card}
 
         <div class="card">
+            <h2>Import your data</h2>
+            <p class="note">
+                Coming from a hosted "try Freenet" server? Import the
+                <code>freenet-data.fnsx</code> bundle you exported there to bring
+                your rooms, identities and other delegate data onto this peer.
+                The import runs live — no need to stop this node.
+            </p>
+            <button class="import-btn import-open-btn" type="button">Import data file&hellip;</button>
+        </div>
+
+        <div class="card">
             <h2>Freenet Links</h2>
             <ul class="app-list">
                 <li>
@@ -71,5 +82,45 @@
             </ul>
         </div>
     </main>
+
+    <!-- Import-data modal. Lives OUTSIDE <main> on purpose: the dashboard
+         auto-refresh (dashboard.js) swaps <main>'s innerHTML every 5s, which
+         would wipe a chosen file, a typed key, or an in-progress import if the
+         form were inside it. Kept here it survives every refresh. -->
+    <div class="modal-overlay" id="import-modal" hidden>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="import-modal-title">
+            <h2 id="import-modal-title">Import your data</h2>
+            <p class="note">
+                Choose the encrypted <code>.fnsx</code> bundle and enter the
+                access key that protects it. It is decrypted and imported
+                entirely on this peer &mdash; the key never leaves your browser
+                except to this local node.
+            </p>
+            <label class="modal-field">
+                <span>Data file (.fnsx)</span>
+                <input type="file" id="import-file" accept=".fnsx,application/octet-stream" />
+            </label>
+            <label class="modal-field">
+                <span>Key type</span>
+                <select id="import-key-kind">
+                    <option value="token" selected>Access key (from the hosted proxy)</option>
+                    <option value="passphrase">Passphrase (offline export)</option>
+                </select>
+            </label>
+            <label class="modal-field">
+                <span id="import-key-label">Access key</span>
+                <input type="password" id="import-key" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste your access key" />
+            </label>
+            <label class="modal-check">
+                <input type="checkbox" id="import-overwrite" />
+                <span>Overwrite secrets that already exist on this peer</span>
+            </label>
+            <div class="modal-status" id="import-status" role="status" aria-live="polite"></div>
+            <div class="modal-actions">
+                <button class="import-btn import-btn-secondary" type="button" id="import-cancel">Cancel</button>
+                <button class="import-btn import-btn-primary" type="button" id="import-submit">Import</button>
+            </div>
+        </div>
+    </div>
 </body>
 </html>

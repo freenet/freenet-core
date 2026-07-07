@@ -296,6 +296,129 @@ function switchTab(el) {
   } catch (e) {}
 }
 
+/* ── Import data (.fnsx) modal ──
+   The receiving end of #4592: a user who exported a `freenet-data.fnsx` bundle
+   from a hosted "try Freenet" server uploads it here to import their delegate
+   secrets into THIS local peer via `POST /v1/import`. The modal lives outside
+   <main> (see home.html) so the 5s auto-refresh never wipes it. */
+function setImportStatus(msg, isError) {
+  var el = document.getElementById('import-status');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.classList.toggle('import-status-error', !!isError);
+}
+
+function updateImportKeyLabel() {
+  var kind = document.getElementById('import-key-kind');
+  var label = document.getElementById('import-key-label');
+  var input = document.getElementById('import-key');
+  var isPass = kind && kind.value === 'passphrase';
+  if (label) label.textContent = isPass ? 'Passphrase' : 'Access key';
+  if (input)
+    input.placeholder = isPass
+      ? 'Enter your passphrase'
+      : 'Paste your access key';
+}
+
+function openImportModal() {
+  var modal = document.getElementById('import-modal');
+  if (!modal) return;
+  setImportStatus('', false);
+  updateImportKeyLabel();
+  modal.hidden = false;
+  var file = document.getElementById('import-file');
+  if (file) file.focus();
+}
+
+function closeImportModal() {
+  var modal = document.getElementById('import-modal');
+  if (!modal) return;
+  modal.hidden = true;
+  /* Clear the secret key (and the rest of the form) from the DOM on close. */
+  var key = document.getElementById('import-key');
+  if (key) key.value = '';
+  var file = document.getElementById('import-file');
+  if (file) file.value = '';
+  var overwrite = document.getElementById('import-overwrite');
+  if (overwrite) overwrite.checked = false;
+  setImportStatus('', false);
+}
+
+function runImport() {
+  var fileInput = document.getElementById('import-file');
+  var keyInput = document.getElementById('import-key');
+  var kindSel = document.getElementById('import-key-kind');
+  var overwrite = document.getElementById('import-overwrite');
+  var submit = document.getElementById('import-submit');
+
+  var file = fileInput && fileInput.files && fileInput.files[0];
+  if (!file) {
+    setImportStatus('Choose a .fnsx file to import.', true);
+    return;
+  }
+  var key = keyInput ? keyInput.value.trim() : '';
+  if (!key) {
+    setImportStatus('Enter the key that protects the bundle.', true);
+    return;
+  }
+
+  var headers = {
+    'X-Freenet-Bundle-Key': key,
+    'X-Freenet-Bundle-Key-Kind': kindSel ? kindSel.value : 'token',
+  };
+  if (overwrite && overwrite.checked) {
+    headers['X-Freenet-Import-Overwrite'] = 'true';
+  }
+
+  if (submit) submit.disabled = true;
+  setImportStatus('Importing…', false);
+
+  /* POST the raw file bytes as the body (application/octet-stream, NOT
+     multipart) — /v1/import reads the body verbatim. The browser attaches an
+     Origin header to this same-origin POST, which the import gate requires
+     (loopback + trusted dashboard origin, no per-contract token). */
+  fetch('/v1/import', { method: 'POST', headers: headers, body: file })
+    .then(function (r) {
+      return r.text().then(function (body) {
+        return { ok: r.ok, status: r.status, body: body };
+      });
+    })
+    .then(function (res) {
+      if (submit) submit.disabled = false;
+      if (res.ok) {
+        var imported = 0;
+        var skipped = 0;
+        try {
+          var data = JSON.parse(res.body);
+          imported = data.imported || 0;
+          skipped = (data.skipped && data.skipped.length) || 0;
+        } catch (e) {
+          /* A 200 with an unparseable body still means success. */
+        }
+        var msg =
+          'Imported ' + imported + (imported === 1 ? ' secret' : ' secrets');
+        if (skipped) msg += ', ' + skipped + ' skipped (already present)';
+        closeImportModal();
+        showToast(msg);
+      } else {
+        /* Non-2xx bodies are plain, non-secret reason strings from the
+           endpoint (wrong-key 422, forbidden 403, too-large 413, ...). */
+        var reason = (res.body || '').trim();
+        setImportStatus(
+          reason || 'Import failed (HTTP ' + res.status + ')',
+          true,
+        );
+      }
+    })
+    .catch(function (e) {
+      if (submit) submit.disabled = false;
+      setImportStatus(
+        'Import failed: ' + (e && e.message ? e.message : 'network error'),
+        true,
+      );
+    });
+}
+
 document.addEventListener('DOMContentLoaded', function () {
   var icon = document.getElementById('theme-icon');
   if (icon && document.documentElement.getAttribute('data-theme') === 'light') {
@@ -319,9 +442,47 @@ document.addEventListener('DOMContentLoaded', function () {
   checkForUpdate();
   checkVersionMismatch();
 
+  /* Import modal controls. These elements live OUTSIDE <main> (see home.html),
+     so they are stable across auto-refresh and can be bound directly, once. */
+  var importCancel = document.getElementById('import-cancel');
+  if (importCancel) importCancel.addEventListener('click', closeImportModal);
+  var importSubmit = document.getElementById('import-submit');
+  if (importSubmit) importSubmit.addEventListener('click', runImport);
+  var importKind = document.getElementById('import-key-kind');
+  if (importKind) importKind.addEventListener('change', updateImportKeyLabel);
+  var importOverlay = document.getElementById('import-modal');
+  if (importOverlay) {
+    importOverlay.addEventListener('click', function (ev) {
+      /* A click on the backdrop (not the card) dismisses the modal. */
+      if (ev.target === importOverlay) closeImportModal();
+    });
+  }
+  var importKey = document.getElementById('import-key');
+  if (importKey) {
+    importKey.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        runImport();
+      }
+    });
+  }
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Escape') return;
+    var modal = document.getElementById('import-modal');
+    if (modal && !modal.hidden) closeImportModal();
+  });
+
   /* Delegated click handler \u2014 survives <main> innerHTML swaps from auto-refresh,
        so we don't need to re-bind after each refresh. */
   document.addEventListener('click', function (ev) {
+    /* The open button is inside <main>, which auto-refresh re-renders, so it
+       must be handled via delegation to survive innerHTML swaps. */
+    var importOpen = ev.target.closest && ev.target.closest('.import-open-btn');
+    if (importOpen) {
+      ev.preventDefault();
+      openImportModal();
+      return;
+    }
     var copy = ev.target.closest && ev.target.closest('.copy-key');
     if (copy) {
       ev.preventDefault();

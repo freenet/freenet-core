@@ -1343,3 +1343,120 @@ table.sortable thead th.sort-desc::after {
   margin-left: 0.1em;
   vertical-align: middle;
 }
+
+/* ── Import-data card + modal (#4592) ──────────────────────────────── */
+.import-btn {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 0.4rem 0.85rem;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
+}
+.import-btn:hover {
+  border-color: var(--accent-primary);
+}
+.import-open-btn {
+  margin-top: 0.6rem;
+}
+.import-btn-primary {
+  background: rgba(10, 186, 181, 0.15);
+  border-color: rgba(10, 186, 181, 0.4);
+  color: var(--accent-light);
+}
+.import-btn-primary:hover {
+  border-color: var(--accent-primary);
+  background: rgba(10, 186, 181, 0.25);
+}
+[data-theme='light'] .import-btn-primary {
+  color: var(--accent-dark);
+}
+.import-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+}
+.modal-overlay[hidden] {
+  display: none;
+}
+.modal-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 1.25rem 1.4rem;
+  width: 100%;
+  max-width: 440px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+.modal-card h2 {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.75rem;
+  font-family: var(--font-mono);
+  font-weight: 500;
+}
+.modal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.9rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+.modal-field input[type='file'],
+.modal-field input[type='password'],
+.modal-field select {
+  font-family: var(--font-sans);
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+}
+.modal-field input:focus,
+.modal-field select:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+.modal-check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.9rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.modal-status {
+  min-height: 1.2rem;
+  margin-top: 0.75rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+.modal-status.import-status-error {
+  color: #f87171;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin-top: 1.1rem;
+}
