@@ -180,28 +180,27 @@ impl ProximityPrior {
     /// strictly positive: `g0 > 0` and `fit >= 0`, and `w(n) > 0`, so the blend
     /// `w*g0 + (1-w)*fit >= w*g0 > 0`.
     ///
-    /// # Accepted tradeoff (A3 intermediate)
+    /// # Demoted to telemetry (subscriber-primary rework, #4642)
     ///
-    /// At cold start (and for a low-traffic peer whose observed rates stay
-    /// `<< NEUTRAL_DEMAND`; see the module docs) eviction ordering is effectively
-    /// **distance-only** — demand-blind, because the per-contract observed-read-
-    /// rate signal (A4) is deferred. Concretely: a FAR contract that is actually
-    /// GET-hot can be out-scored, and once past `min_ttl` evicted, in favor of an
-    /// unread NEAR contract that merely sits closer to this peer's key. This is
-    /// the spec-accepted intermediate state, not a bug:
+    /// This predicted demand NO LONGER feeds eviction. Under the subscriber-primary
+    /// model (`.claude/rules/hosting-invariants.md`, invariant 3) eviction orders
+    /// victims ascending by `(subscriber_count, real-GET/PUT recency, key_bytes)` —
+    /// fewest subscribers first, then least-recent genuine client access (a real
+    /// GET or PUT, not SUBSCRIBE or subscription renewal), then a deterministic
+    /// key-byte tiebreak. Ring **distance is not an eviction input**: its causal
+    /// pull on demand already flows through subscriber count via keyward routing
+    /// gravity (counting both would double-count), and locality is delivered by
+    /// routing, not by the eviction decision.
     ///
-    /// - It is **bounded by `min_ttl`** — the anti-thrash retention floor kept
-    ///   deliberately per the hosting design (`hosting-invariants.md`, invariant
-    ///   3 / #4441): nothing evicts a contract within `min_ttl` of its last read,
-    ///   so a genuinely hot far contract keeps being refreshed and survives.
-    /// - It is **fully resolved when A4 lands** (per-contract own-observed-rate
-    ///   blend) together with in-flight op-pinning, at which point real read
-    ///   demand overrides the distance prior for any contract with evidence.
-    ///
-    /// The design contract for this piece is exactly "distance prior + `min_ttl`
-    /// until A4" (`.claude/rules/hosting-invariants.md`, piece A / #4642). Do NOT
-    /// try to close the gap here by reaching for a per-contract counter — that is
-    /// A4's job and belongs with its telemetry and op-pinning.
+    /// `predict()` (and the whole distance-prior estimator) is therefore retained
+    /// for **telemetry only** — it backs the demoted `predicted_demand` /
+    /// `keep_score` dashboard signal (see [`super::cache`]) and drives no retention
+    /// decision. The `min_ttl` cold-start floor that once bounded a distance-only
+    /// ordering was **dropped entirely** (2026-07-08): a fresh zero-subscriber
+    /// PUT/GET is now protected by being the most-recently-accessed, not by an age
+    /// floor. Do NOT re-wire this estimate back into the eviction sort — the whole
+    /// demand machinery is scheduled for deletion once subscriber-primary is
+    /// field-validated.
     pub(crate) fn predict(&self, distance: f64) -> f64 {
         if !distance.is_finite() {
             return NEUTRAL_DEMAND;

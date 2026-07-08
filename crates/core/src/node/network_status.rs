@@ -1213,10 +1213,10 @@ pub struct HostedContractEntry {
     /// Read accesses (GET/SUBSCRIBE) observed over this entry's residency.
     pub read_count: u32,
     /// Whether the over-budget sweep would actually consider this contract for
-    /// eviction: past its `min_ttl` age gate AND not pinned by demand
-    /// (`contract_in_use`). The renderer badges "next to evict" on the first
-    /// eligible row, NOT the raw lowest-keep-score row — a within-TTL or
-    /// in-use low-score contract is skipped by the real sweep, so badging it
+    /// eviction: NOT pinned by demand (`contract_in_use`). There is no longer a
+    /// `min_ttl` age gate (dropped 2026-07-08). The renderer badges "next to
+    /// evict" on the first eligible row, NOT the raw lowest-keep-score row — an
+    /// in-use low-score contract is ordered last by the real sweep, so badging it
     /// would mislead the operator.
     pub eviction_eligible: bool,
 }

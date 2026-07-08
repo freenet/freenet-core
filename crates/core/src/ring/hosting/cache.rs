@@ -11,23 +11,36 @@
 //! 1. **Single source of truth**: All hosted contracts are tracked in one cache
 //! 2. **Subscriber-primary eviction** (freenet/freenet-core#4642, subscriber-
 //!    primary rework): when over budget the eviction victim is chosen by
-//!    ascending `(subscriber_count, last_get_seq, key_bytes)` — the
-//!    FEWEST-subscriber contract first, ties broken by least-recent **real GET
-//!    read**, then a deterministic key-byte tiebreak. `subscriber_count` is
-//!    supplied by the caller (`HostingManager`) via the same closure that used
-//!    to be `should_retain`; it is the count of genuine demand (local client
-//!    subscriptions + downstream subscribers) and is `0` exactly when the
-//!    contract is NOT `contract_in_use`. In NORMAL over-budget operation
-//!    ([`MemoryPressure::AtCapacity`]) any subscribed contract (count >= 1) is
-//!    PINNED — only zero-subscriber contracts are evicted, so among the
-//!    candidate set `subscriber_count` is always 0 and the order reduces to
-//!    least-recent-GET. The subscriber-count gradation only bites at ADMISSION
-//!    (a later PR) and under the OOM valve ([`MemoryPressure::Overflow`]), where
-//!    the pin is pierced and the fewest-subscriber contract is shed to survive
-//!    genuine RAM overflow. `min_ttl` is preserved as the cold-start grace floor
-//!    for fresh zero-subscriber contracts.
+//!    ascending `(local_subscription_count, downstream_subscriber_count,
+//!    recency_seq, key_bytes)` — the FEWEST-subscriber contract first (local
+//!    subscriptions weighed ahead of downstream), ties broken by least-recent
+//!    **real GET or PUT access** (`recency_seq`), then a deterministic key-byte
+//!    tiebreak. The split
+//!    `(local, downstream)` counts are supplied by the caller (`HostingManager`)
+//!    via the same closure that used to be `should_retain`; they count genuine
+//!    demand (local client subscriptions + downstream subscribers) and sum to
+//!    `0` exactly when the contract is NOT `contract_in_use`. Subscriber count
+//!    is the ORDERING, NOT a hard pin: under NORMAL over-budget operation
+//!    ([`MemoryPressure::AtCapacity`]) a subscribed contract is ordered LAST and
+//!    survives while any contract with fewer subscribers is eligible, but when
+//!    the peer is still over budget and nothing fewer-subscriber is eligible the
+//!    fewest-subscriber contract IS shed as a last resort — including a
+//!    subscribed one (its subscription state is then torn down; see
+//!    [`RecordAccessResult::evicted_in_use_teardown`]). This is the change from
+//!    the shipped #4720 code, which hard-pinned every subscribed contract. There
+//!    is **no `min_ttl` cold-start floor** (dropped 2026-07-08): a real GET or
+//!    PUT resets an entry's `recency_seq`, so a freshly-accessed contract is
+//!    protected simply by being the most-recently-accessed under the recency
+//!    ordering, and a fresh PUT protects itself at PUT time without waiting for a
+//!    first read. The OOM valve ([`MemoryPressure::Overflow`], trigger unwired)
+//!    now differs from `AtCapacity` only in that it pierces the op-scoped backstop
+//!    (evicting even a contract with an in-flight op) to survive genuine RAM
+//!    overflow.
 //! 3. **Subscription renewal**: All hosted contracts get subscription renewal
-//! 4. **Access type tracking**: Records how contract was accessed (GET/PUT/SUBSCRIBE)
+//! 4. **Access type tracking**: Records how contract was accessed (GET/PUT/SUBSCRIBE).
+//!    A real GET or PUT (genuine client access) resets `recency_seq`; SUBSCRIBE
+//!    and automatic subscription-renewal traffic do NOT, so renewal cannot keep a
+//!    contract artificially fresh (invariant 3, decision 2026-07-08).
 //!
 //! ## Demoted (telemetry-only) demand machinery
 //!
@@ -38,10 +51,19 @@
 //! displayed) for telemetry continuity this release, and are scheduled for
 //! deletion in a follow-up once the subscriber-primary policy is field-
 //! validated. Eviction reads NONE of them; it orders by subscriber count and
-//! real-GET recency (see principle 2). `predicted_demand` is still supplied by
+//! real GET/PUT recency (see principle 2). `predicted_demand` is still supplied by
 //! the caller (`HostingManager`, which owns the proximity-prior estimator and
 //! the peer's own ring location — see [`super::demand`]) purely so the
 //! estimator keeps training and the dashboard column stays populated.
+
+// NAMING LANDMINE: "cache" throughout this module means HOSTING, not a lesser
+// cache tier. A peer stores a contract because a GET or PUT routed through it, and
+// a routed GET/PUT is a demand signal, so the peer HOSTS the contract (holds
+// WASM+state, kept fresh in the update mesh) until LRU eviction. There is no cache
+// tier. This naming confuses humans and LLMs; slated to be renamed to hosting-* in
+// a follow-up refactor AFTER 0.2.94 (deferred to avoid conflicting with the
+// in-flight eviction rewrite of this file). See .claude/rules/hosting-invariants.md
+// terminology + epic #4642.
 
 use freenet_stdlib::prelude::ContractKey;
 use std::collections::HashMap;
@@ -49,6 +71,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::demand::NEUTRAL_DEMAND;
+use crate::ring::interest::PeerKey;
 use crate::util::time_source::TimeSource;
 use crate::wasm_runtime::read_total_ram_bytes;
 
@@ -280,6 +303,19 @@ pub(crate) struct HostingCacheStats {
     /// stays 0 in the field today; once the RSS trigger is plumbed, a nonzero
     /// differenced rate is the alarm that the node is shedding to avoid OOM.
     pub oom_valve_evictions_total: u64,
+    /// Monotonic count of over-budget evictions whose victim still had ≥1
+    /// subscriber (local client OR downstream peer) at eviction-decision time —
+    /// i.e. a SUBSCRIBED contract shed by the subscriber-primary ordering
+    /// (#4642, invariant 3). Counted by the captured `(local + downstream)`
+    /// count, regardless of pressure, so it covers BOTH the normal AtCapacity
+    /// last-resort shed (nothing zero-subscriber eligible) AND the Overflow
+    /// valve. This is the FIELD FALSIFIER for the single riskiest new behavior
+    /// in the subscriber-primary rework: shedding a subscribed contract. Unlike
+    /// [`Self::oom_valve_evictions_total`] (which stays 0 until the Overflow
+    /// trigger is wired), this can go nonzero the moment the eviction rework
+    /// ships, so a rising differenced rate here is the signal to check whether
+    /// budgets are too tight / demand is churning subscribed contracts.
+    pub subscribed_evictions_total: u64,
 }
 
 /// Per-contract Greedy-Dual priority row for the local-peer dashboard.
@@ -302,29 +338,12 @@ pub(crate) struct HostingContractScore {
     pub size_bytes: u64,
     /// Read accesses (GET/SUBSCRIBE) observed over this entry's residency.
     pub read_count: u32,
-    /// Monotonic access sequence at the entry's most recent real GET — the
-    /// eviction recency tiebreak (subscriber-primary rework, #4642). The cache
-    /// orders zero-subscriber eviction candidates ascending by this.
-    pub last_get_seq: u64,
-    /// Whether this entry is past its `min_ttl` age gate — the TTL half of the
-    /// `evict_over_budget` eviction filter (`age >= min_ttl && !should_retain`).
-    /// This is the only half the cache can decide on its own; the
-    /// `!should_retain` (in-use) half is folded in by the `HostingManager`
-    /// layer via [`super::HostingManager::is_eviction_eligible`]. Used by the
-    /// dashboard so the "next to evict" badge only marks a contract the
-    /// over-budget sweep would actually consider — never one it would skip.
-    pub past_min_ttl: bool,
+    /// Monotonic access sequence at the entry's most recent real GET or PUT
+    /// (genuine client access) — the eviction recency tiebreak (subscriber-
+    /// primary rework, #4642). The cache orders zero-subscriber eviction
+    /// candidates ascending by this. SUBSCRIBE / renewal traffic does NOT bump it.
+    pub recency_seq: u64,
 }
-
-/// Multiplier for TTL relative to subscription renewal interval.
-/// Gives this many renewal attempts before eviction if renewals keep failing.
-pub const TTL_RENEWAL_MULTIPLIER: u32 = 4;
-
-/// Default minimum TTL before a hosted contract can be evicted.
-/// Computed as TTL_RENEWAL_MULTIPLIER × SUBSCRIPTION_RENEWAL_INTERVAL.
-pub const DEFAULT_MIN_TTL: Duration = Duration::from_secs(
-    super::SUBSCRIPTION_RENEWAL_INTERVAL.as_secs() * TTL_RENEWAL_MULTIPLIER as u64,
-);
 
 /// Type of access that adds/refreshes a contract in the hosting cache.
 ///
@@ -346,53 +365,59 @@ pub enum AccessType {
 
 /// Coarse memory-pressure state handed to the over-budget eviction sweep — the
 /// eviction half of invariant 3 ("admission and eviction are ONE demand-vs-
-/// capacity decision"). Mirrors the shape of the admission core's
-/// `MemoryPressure` (a later PR); kept minimal here because the eviction sweep
-/// only runs once the byte budget is already exceeded, so it only needs to
-/// distinguish "at capacity" from "genuine RAM overflow".
+/// capacity decision"). Kept minimal because the eviction sweep only runs once
+/// the byte budget is already exceeded, so it only needs to distinguish "at
+/// capacity" from "genuine RAM overflow".
 ///
-/// # The OOM-valve trigger is intentionally UNWIRED in production
+/// # There is ONE eviction ordering; the two variants only differ on the op-scoped backstop
 ///
-/// [`Self::Overflow`] is the ONLY value that lets eviction pierce the in-use
-/// pin (shed a subscribed contract). It is a genuine-RAM-overflow signal
-/// (RSS near the ceiling), which is NOT plumbed yet: production callers
-/// (`HostingManager::sweep_expired_hosting`, `record_contract_access`) pass
-/// [`Self::AtCapacity`] unconditionally, so **nothing can shed a subscribed
-/// contract in the field yet**. The valve MECHANISM lands + is unit-tested
-/// here; wiring the real RSS/A1-resource trigger is a deliberately separate,
-/// separately-validated step, because shedding a subscribed contract is the
-/// single riskiest new behavior in the subscriber-primary rework (#4642).
+/// Since the subscriber-primary eviction rework (#4642, Ian's confirmed model)
+/// BOTH variants shed the fewest-`(local, downstream)`-subscriber contract using
+/// the same [`victim_order`] — a subscribed contract is NOT hard-pinned under
+/// either, and there is no `min_ttl` cold-start floor (dropped 2026-07-08). The
+/// only difference is the op-scoped backstop:
+///
+/// - [`Self::AtCapacity`] never evicts the `protected` key (the contract whose
+///   in-flight access triggered this sweep — the op-scoped backstop guard;
+///   invariant 3, decision 2026-07-08). This is what production passes.
+/// - [`Self::Overflow`] pierces that backstop, so a node at genuine RAM-overflow
+///   can shed even a contract with an in-flight op to survive. This is "a corner
+///   of the same eviction, not a separate valve" (hosting-invariants Resolved
+///   decisions); it is NOT a second ranking.
+///
+/// The `Overflow` (backstop-pierce) TRIGGER is intentionally UNWIRED in
+/// production: it needs a genuine RSS/A1 resource signal, which is NOT plumbed.
+/// Production callers (`HostingManager::sweep_expired_hosting`,
+/// `record_contract_access`) pass [`Self::AtCapacity`] unconditionally. Note
+/// that — unlike the shipped #4720 code — AtCapacity CAN now shed a subscribed
+/// contract (as a last resort), so shedding subscribed contracts is live in the
+/// field; only the op-backstop PIERCE remains gated behind the unwired trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryPressure {
-    /// Over the byte budget but not at genuine RAM-overflow risk. Subscribed
-    /// contracts (subscriber_count >= 1) stay PINNED; only zero-subscriber
-    /// contracts past `min_ttl` are evicted, by least-recent real GET. This is
-    /// the value production always passes today (the Overflow trigger is
-    /// unwired — see the type docs).
+    /// Over the byte budget but not at genuine RAM-overflow risk. Every entry is
+    /// eligible EXCEPT the op-scoped `protected` key; victims are chosen fewest-
+    /// `(local, downstream)`-subscriber first, so a subscribed contract is ordered
+    /// LAST and shed only as a last resort (when nothing with fewer subscribers is
+    /// eligible and the peer is still over budget). This is the value production
+    /// always passes.
     AtCapacity,
-    /// Genuine RAM overflow: the OOM valve may shed the FEWEST-subscriber
-    /// contract, piercing the in-use pin AND bypassing `min_ttl`, to survive.
-    /// NOTHING produces this value in production yet.
+    /// Genuine RAM overflow: the same fewest-subscriber ordering, but ALSO
+    /// pierces the op-scoped backstop so a contract with an in-flight op can be
+    /// shed to survive OOM. NOTHING produces this value in production yet.
     ///
-    /// `dead_code`-allowed in non-test builds ON PURPOSE: the OOM-valve trigger
-    /// (a genuine RSS/A1 resource signal) is intentionally unwired for this PR,
-    /// so only the valve-mechanism unit tests construct `Overflow`. Remove the
-    /// allow when the trigger is plumbed in a later, separately-validated step.
+    /// `dead_code`-allowed in non-test builds ON PURPOSE: the backstop-pierce
+    /// trigger (a genuine RSS/A1 resource signal) is intentionally unwired, so
+    /// only the mechanism unit tests construct `Overflow`. Remove the allow when
+    /// the trigger is plumbed in a later, separately-validated step.
     ///
-    /// OWED when the trigger is wired (NOT done here — the mechanism is
-    /// deliberately unwired this release):
-    /// 1. **Rank the valve by the LEASE-FILTERED downstream count**
-    ///    (`HostingManager::downstream_subscriber_peers`, which drops leases
-    ///    older than `SUBSCRIPTION_LEASE_DURATION`), NOT the unfiltered
-    ///    `subscriber_count` used for the normal-op pin. The unfiltered count
-    ///    includes stale-unswept leases, which is fine for the pin (it must equal
-    ///    `contract_in_use`) but would let the valve mis-rank "real demand" when
-    ///    it is actually shedding under overflow.
-    /// 2. **Clean up the shed contract's subscription state.** Valve-evicting a
-    ///    subscribed contract MUST also remove its `client_subscriptions` /
-    ///    `downstream_subscribers` entries, or `subscriber_count` immediately
-    ///    reports it in-use again and the eviction is undone in practice
-    ///    (the entry is gone from the cache but still pinned by phantom demand).
+    /// Subscription-state teardown for a shed subscribed contract is handled the
+    /// SAME way as the AtCapacity last-resort shed: the `was_in_use` flag on the
+    /// returned [`EvictedContract`] drives
+    /// `HostingManager::teardown_evicted_in_use_contract`, so a valve eviction is
+    /// not "undone in practice" by phantom demand. When the trigger is wired,
+    /// prefer ranking by the LEASE-FILTERED downstream count
+    /// (`HostingManager::downstream_subscriber_peers`) rather than the unfiltered
+    /// map length, so stale-unswept leases don't mis-rank real demand.
     #[cfg_attr(not(test), allow(dead_code))]
     Overflow,
 }
@@ -408,6 +433,34 @@ pub struct RecordAccessResult {
     /// deletion-time guard in `RuntimePool::remove_contract` can detect
     /// a re-host that occurred between eviction and disk reclamation.
     pub evicted: Vec<(ContractKey, u64)>,
+    /// Subset of [`Self::evicted`] whose victim still had ≥1 subscriber (a
+    /// local client subscription OR a downstream peer subscriber) at the
+    /// eviction-decision instant — i.e. `contract_in_use` was true for it.
+    ///
+    /// Under the subscriber-primary ordering (#4642, invariant 3) an
+    /// over-budget peer sheds the fewest-`(local, downstream)`-subscriber
+    /// contract, which — when nothing zero-subscriber is eligible — is a
+    /// SUBSCRIBED contract. The `HostingManager` MUST tear down that
+    /// contract's subscription state (see
+    /// `HostingManager::teardown_evicted_in_use_contract`) so
+    /// `contract_in_use` flips to false BEFORE `reclaim_evicted_contract`
+    /// runs; otherwise the reclaim gate skips the deletion forever and the
+    /// eviction frees the cache entry but not the on-disk state (the drift
+    /// the shipped #4720 code carried). Captured atomically with the
+    /// eviction decision to avoid a racy post-hoc `contract_in_use` re-read.
+    pub evicted_in_use: Vec<ContractKey>,
+    /// The subscription state that `HostingManager::teardown_evicted_in_use_contract`
+    /// actually removed for each [`Self::evicted_in_use`] victim (one entry per
+    /// key). Populated by the `HostingManager` AFTER `evicted_in_use` drives the
+    /// teardown (empty at the cache layer, which decides the eviction but does
+    /// not own the subscription maps or the peer identities). The eviction
+    /// CONSUMER replays these removals against the `InterestManager` (which
+    /// lives on `OpManager`, not `HostingManager`) via
+    /// [`InterestManager::remove_evicted_in_use`](crate::ring::interest::InterestManager::remove_evicted_in_use)
+    /// so no ghost `interested_peers` / `peer_contracts` / `local_client_count`
+    /// entry survives to mis-target UPDATE broadcasts or inflate upstream
+    /// interest counts (PR #4734 Fix 1).
+    pub evicted_in_use_teardown: Vec<EvictedInUseTeardown>,
     /// Observed read-rate training sample (reads/second) for the accessed
     /// contract, or `None` when no meaningful rate is available (a seed/PUT, a
     /// brand-new entry, or a read with zero residency). `HostingManager` pairs
@@ -417,41 +470,90 @@ pub struct RecordAccessResult {
     pub observed_read_rate: Option<f64>,
 }
 
+/// The subscription state `HostingManager::teardown_evicted_in_use_contract`
+/// removed from the hosting maps for a single subscriber-primary eviction that
+/// shed a still-in-use contract. Carries exactly what the eviction consumer
+/// needs to replay against the `InterestManager` (per-peer downstream removals +
+/// a per-contract local-client count) so the two managers stay in sync. See
+/// [`RecordAccessResult::evicted_in_use_teardown`] and
+/// [`InterestManager::remove_evicted_in_use`](crate::ring::interest::InterestManager::remove_evicted_in_use).
+#[derive(Debug, Clone)]
+pub struct EvictedInUseTeardown {
+    /// The evicted contract.
+    pub key: ContractKey,
+    /// Downstream peer leases removed from `downstream_subscribers[key]`. The
+    /// consumer replays `remove_peer_interest(&key, peer)` +
+    /// `remove_downstream_subscriber(&key)` per peer (the
+    /// `handle_unsubscribe_inbound` pair).
+    pub downstream_peers: Vec<PeerKey>,
+    /// Number of local WebSocket client subscriptions removed from
+    /// `client_subscriptions[key.id()]`. The consumer replays
+    /// `remove_local_client(&key)` once per client (the client-disconnect path).
+    pub local_client_count: usize,
+}
+
+/// A single contract evicted by the over-budget sweep, with the metadata the
+/// `HostingManager` needs to (a) drive disk reclamation and (b) — for a
+/// subscriber-primary eviction that shed a still-in-use contract — tear down
+/// the subscription state pinning it. See [`RecordAccessResult::evicted_in_use`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EvictedContract {
+    /// The evicted contract's key.
+    pub key: ContractKey,
+    /// State-write generation snapshot captured atomically with the eviction
+    /// decision; carried through `EvictContract` for the deletion-time re-host
+    /// guard in `RuntimePool::remove_contract`.
+    pub write_generation: u64,
+    /// `true` iff the victim had ≥1 subscriber (local client OR downstream peer)
+    /// at eviction-decision time — the flag the manager keys its subscription
+    /// teardown on. Zero-subscriber evictions leave this `false` (nothing to
+    /// tear down; `contract_in_use` is already false for them).
+    pub was_in_use: bool,
+}
+
 /// Metadata about a hosted contract.
 #[derive(Debug, Clone)]
 pub struct HostedContract {
     /// Size of the contract state in bytes
     pub size_bytes: u64,
-    /// Last time this contract was accessed (via GET/PUT/SUBSCRIBE). Drives the
-    /// TTL gate (an entry is not eviction-eligible until `min_ttl` since this).
+    /// Last time this contract was accessed (via GET/PUT/SUBSCRIBE). Used as the
+    /// restart-reload recency tiebreak (`finalize_loading`) and to age-gate local-
+    /// client renewal; it no longer gates eviction eligibility (the `min_ttl` floor
+    /// was dropped 2026-07-08 — see [`Self::recency_seq`]).
     pub last_accessed: Instant,
     /// Monotonic access sequence number stamped on every access (insert / read /
     /// seed / touch).
     ///
     /// UNUSED, pending deletion: it was the old eviction tiebreak, which the
-    /// subscriber-primary rework (#4642) replaced with [`Self::last_get_seq`]
+    /// subscriber-primary rework (#4642) replaced with [`Self::recency_seq`]
     /// (real-GET recency). No production reader remains (only a `#[cfg(test)]`
     /// assertion via the `get()` accessor keeps it from tripping dead-code). It
     /// is still maintained here to avoid churning the write sites in this PR;
     /// slated for removal with the rest of the demoted machinery once
     /// subscriber-primary is field-validated. Do NOT add new readers.
     pub last_access_seq: u64,
-    /// Monotonic access sequence at this entry's most recent **real GET read**
-    /// — the eviction recency tiebreak (subscriber-primary rework, #4642).
+    /// Monotonic access sequence at this entry's most recent **real GET or PUT
+    /// access** (genuine client access) — the eviction recency tiebreak among
+    /// equal-`(local, downstream)`-subscriber candidates (subscriber-primary
+    /// rework, #4642; GET-or-PUT extension 2026-07-08).
     ///
-    /// Stamped (to the shared `access_seq` value) ONLY by an `AccessType::Get`
-    /// access and by `touch_with_demand` (a local-cache GET serve). It is
-    /// deliberately NOT bumped by PUT (a seed/write, not a read), by SUBSCRIBE
-    /// (a subscription, not a read), by subscription RENEWAL traffic, or by a
-    /// restart reload — so that "recently GET-read" means exactly that. Without
-    /// this Get-only key, renewal traffic on every subscribed contract would
-    /// keep them all equally "fresh" and the tiebreak would be useless.
+    /// Stamped (to the shared `access_seq` value) by an `AccessType::Get` or
+    /// `AccessType::Put` access, by `touch_with_demand` (a local-cache GET serve),
+    /// and — reset to the current frontier — at subscription TERMINATION
+    /// (`record_abandonment`, so a formerly-subscribed contract is not instantly
+    /// evicted for an old last-read accrued while it sat in the subscription tier).
+    /// It is deliberately NOT bumped by SUBSCRIBE (a subscription, not a read/
+    /// write), by subscription RENEWAL traffic, or by a restart reload — so that
+    /// "recently accessed by a client" means exactly that. Without excluding
+    /// renewal traffic, every subscribed contract would stay equally "fresh" and
+    /// the tiebreak would be useless.
     ///
-    /// A never-GET-read entry (e.g. a fresh PUT seed) has `last_get_seq == 0`,
-    /// so among zero-subscriber candidates it sorts to evict first once past
-    /// `min_ttl` — the intended "unread seeds evaporate" behavior, with the
-    /// `min_ttl` floor giving it cold-start grace to be found first.
-    pub last_get_seq: u64,
+    /// A never-accessed entry (a fresh SUBSCRIBE-only seed, or a restart-reloaded
+    /// entry) has `recency_seq == 0`, so among zero-subscriber candidates it sorts
+    /// to evict first. A fresh PUT resets `recency_seq` at PUT time, so it is
+    /// protected by being the most-recently-accessed without any `min_ttl` floor
+    /// (dropped 2026-07-08).
+    pub recency_seq: u64,
     /// Demand-ordered (Greedy-Dual) priority: `eviction_floor + predicted_demand` captured at the
     /// last read-demand refresh (or at insert). The over-budget walk evicts the
     /// entry with the lowest `keep_score` (ties broken by `last_accessed`). A
@@ -554,32 +656,35 @@ pub struct HostedContract {
     pub abandoned_at: Option<Instant>,
 }
 
-/// Unified hosting cache that combines byte-budget LRU with TTL protection.
+/// Unified hosting cache with a byte-budget and subscriber-primary eviction.
 ///
 /// This cache maintains contracts that this peer is "hosting" - keeping available
 /// for the network. The cache has:
 /// - Byte budget: Large contracts consume more budget. The budget is measured
 ///   in tracked contract **state** bytes only; WASM code blobs and database
 ///   overhead are not counted against it.
-/// - TTL protection: Contracts can't be evicted until min_ttl has passed
-/// - Demand-ordered eviction (Greedy-Dual): when over budget the
-///   contract with the lowest `keep_score` is evicted first (ties broken by
-///   least-recently-read), NOT purely the oldest. See the module docs.
+/// - Subscriber-primary eviction: when over budget the victim is chosen by
+///   ascending `(local_subscription_count, downstream_subscriber_count,
+///   recency_seq, key_bytes)` (see [`victim_order`] and the module docs). There
+///   is no `min_ttl` cold-start floor (dropped 2026-07-08); a fresh contract is
+///   protected by being the most-recently-accessed under the recency ordering.
 ///
 /// # Subscription Renewal
 ///
 /// ALL contracts in this cache should have their subscriptions renewed automatically.
 /// This is the key fix for the bug where GET-triggered subscriptions weren't being renewed.
+// NAMING LANDMINE: "cache" here = HOSTING, not a lesser tier. Entries are contracts
+// this peer HOSTS (WASM+state, kept fresh in the update mesh) because a GET/PUT
+// routed through it, and a routed GET/PUT is demand. No cache tier exists; to be
+// renamed hosting-* after 0.2.94. See .claude/rules/hosting-invariants.md + #4642.
 pub struct HostingCache<T: TimeSource> {
     /// Maximum bytes to use for cached contracts
     budget_bytes: u64,
     /// Current total bytes used
     current_bytes: u64,
-    /// Minimum time since last access before eviction is allowed
-    min_ttl: Duration,
     /// Contract metadata indexed by key. Eviction order is derived from each
-    /// entry's `keep_score` (then `last_accessed`), not from a separate LRU
-    /// list, so there is no second structure to keep in sync.
+    /// entry's subscriber counts + `recency_seq` (via [`victim_order`]), not from
+    /// a separate LRU list, so there is no second structure to keep in sync.
     contracts: HashMap<ContractKey, HostedContract>,
     /// Monotonic access counter. Incremented on every access (insert / read /
     /// seed / touch) and stamped onto the entry's `last_access_seq`, giving an
@@ -620,52 +725,71 @@ pub struct HostingCache<T: TimeSource> {
     /// and, once the RSS trigger is plumbed, becomes the alarm for how often the
     /// node is shedding to avoid OOM.
     oom_valve_evictions_total: u64,
+    /// Monotonic count of over-budget evictions whose victim was SUBSCRIBED
+    /// (`local + downstream >= 1`) at eviction-decision time — the field
+    /// falsifier for shedding a subscribed contract. Counted by the captured
+    /// subscriber count regardless of pressure (covers the normal AtCapacity
+    /// last-resort shed AND the Overflow valve). See
+    /// [`HostingCacheStats::subscribed_evictions_total`].
+    subscribed_evictions_total: u64,
     /// Time source for testability
     time_source: T,
 }
 
 /// The canonical eviction **victim ordering** (subscriber-primary, #4642).
 ///
-/// Given the three ranking components of two hosted-contract candidates —
-/// `subscriber_count`, `last_get_seq`, and the `ContractKey` — returns the
-/// [`Ordering`](std::cmp::Ordering) that sorts them ascending by
-/// `(subscriber_count, last_get_seq, key_bytes)`:
+/// Given the four ranking components of two hosted-contract candidates —
+/// `local_subscription_count`, `downstream_subscriber_count`, `recency_seq`,
+/// and the `ContractKey` — returns the [`Ordering`](std::cmp::Ordering) that
+/// sorts them ascending by
+/// `(local_subscription_count, downstream_subscriber_count, recency_seq, key_bytes)`:
 ///
-/// 1. fewest **subscribers** first (subscribed contracts are the last to be
-///    shed — genuine demand pins them),
-/// 2. ties broken by least-recent real **GET** (`last_get_seq`, a recency
-///    tiebreak — NOT the primary key),
-/// 3. then contract-key bytes as a final deterministic tiebreak.
+/// 1. fewest **local client subscriptions** first — a contract THIS node's own
+///    client is subscribed to is evicted LAST (Ian's confirmed ordering, #4642);
+/// 2. then fewest **downstream subscribers** (forwarded demand);
+/// 3. then least-recent real **GET** (`recency_seq`, a recency tiebreak — NOT a
+///    primary key; subscription-renewal traffic must not refresh it);
+/// 4. then contract-key bytes as a final deterministic tiebreak.
 ///
-/// The candidate that sorts FIRST under this order is the one evicted first.
+/// The candidate that sorts FIRST under this order is the one evicted first. A
+/// locally-subscribed contract is ordered LAST but NOT absolutely pinned: in the
+/// extreme where every eligible contract carries a local subscription and the
+/// peer is still over budget, the least-recently-read local one IS the victim
+/// (accepted last resort — see [`HostingCache::evict_over_budget`] and
+/// hosting-invariants invariant 3).
 ///
 /// This is the single reusable entry point for eviction ranking:
-/// [`HostingCache::evict_over_budget`] sorts victims with it, and admission
-/// (#4717) plus any future disk-driven eviction (#4700's disk-eviction floor)
-/// MUST reuse it rather than forking a byte-only or distance-based order. Do
-/// NOT re-add distance to this key — its causal pull on demand already flows
-/// through `subscriber_count` via keyward routing gravity, and byte-only /
-/// distance-based eviction are the anti-patterns the hosting-invariants rule
-/// exists to keep out (see `.claude/rules/hosting-invariants.md`).
+/// [`HostingCache::evict_over_budget`] sorts victims with it. Do NOT re-add
+/// distance to this key — its causal pull on demand already flows through the
+/// subscriber counts via keyward routing gravity, and byte-only / distance-based
+/// eviction are the anti-patterns the hosting-invariants rule exists to keep out
+/// (see `.claude/rules/hosting-invariants.md`).
+///
+/// The inert admission core (#4717, not wired to production) reuses this ordering
+/// with `local_subscription_count` held at 0 — its model tracks only a single
+/// combined `subscriber_count`, and `(0, n, seq, key)` ordering reduces exactly
+/// to ordering by that combined count. That shim keeps ONE canonical ordering
+/// until admission is reconciled with the split model (or removed per the
+/// demand-driven-hosting model, which has no separate admission decision).
 pub(crate) fn victim_order(
-    a: (usize, u64, &ContractKey),
-    b: (usize, u64, &ContractKey),
+    a: (usize, usize, u64, &ContractKey),
+    b: (usize, usize, u64, &ContractKey),
 ) -> std::cmp::Ordering {
-    let (a_subs, a_seq, a_key) = a;
-    let (b_subs, b_seq, b_key) = b;
-    a_subs
-        .cmp(&b_subs)
+    let (a_local, a_down, a_seq, a_key) = a;
+    let (b_local, b_down, b_seq, b_key) = b;
+    a_local
+        .cmp(&b_local)
+        .then_with(|| a_down.cmp(&b_down))
         .then_with(|| a_seq.cmp(&b_seq))
         .then_with(|| a_key.as_bytes().cmp(b_key.as_bytes()))
 }
 
 impl<T: TimeSource> HostingCache<T> {
-    /// Create a new hosting cache with the given byte budget and TTL.
-    pub fn new(budget_bytes: u64, min_ttl: Duration, time_source: T) -> Self {
+    /// Create a new hosting cache with the given byte budget.
+    pub fn new(budget_bytes: u64, time_source: T) -> Self {
         Self {
             budget_bytes,
             current_bytes: 0,
-            min_ttl,
             contracts: HashMap::new(),
             access_seq: 0,
             eviction_floor: 0.0,
@@ -674,6 +798,7 @@ impl<T: TimeSource> HostingCache<T> {
             evicted_unread_total: 0,
             evicted_unread_age_secs_sum: 0,
             oom_valve_evictions_total: 0,
+            subscribed_evictions_total: 0,
             time_source,
         }
     }
@@ -686,110 +811,155 @@ impl<T: TimeSource> HostingCache<T> {
     }
 
     /// Evict contracts while the cache is over budget, choosing victims
-    /// **subscriber-primary**: ascending `(subscriber_count, last_get_seq,
-    /// key_bytes)` — fewest subscribers first, then least-recent real GET, then
-    /// a deterministic key-byte tiebreak (#4642 subscriber-primary rework).
+    /// **subscriber-primary**: ascending `(local_subscription_count,
+    /// downstream_subscriber_count, recency_seq, key_bytes)` — fewest LOCAL
+    /// client subscriptions first, then fewest downstream subscribers, then
+    /// least-recent real GET, then a deterministic key-byte tiebreak (#4642
+    /// subscriber-primary rework; Ian's confirmed ordering).
     ///
-    /// `subscriber_count(key)` is the caller's genuine-demand count (local
-    /// client subscriptions + downstream subscribers); it is `0` exactly when
-    /// the contract is NOT `contract_in_use`. Candidate eligibility depends on
-    /// `pressure`:
+    /// `subscriber_counts(key)` is the caller's genuine-demand split
+    /// `(local_client_subscriptions, downstream_subscribers)`; their sum is `0`
+    /// exactly when the contract is NOT `contract_in_use`. There is NO `min_ttl`
+    /// cold-start floor (dropped 2026-07-08); every entry is eligible, with a
+    /// single op-scoped exception governed by `pressure`:
     ///
-    /// - [`MemoryPressure::AtCapacity`] (the production value today): an entry
-    ///   is eligible iff `age >= min_ttl` AND `subscriber_count(key) == 0`.
-    ///   Subscribed contracts are PINNED and never evicted; the `min_ttl` floor
-    ///   gives fresh zero-subscriber contracts cold-start grace. Among the
-    ///   eligible (all zero-subscriber) entries the order reduces to least-
-    ///   recent real GET.
-    /// - [`MemoryPressure::Overflow`] (the OOM valve — trigger UNWIRED in
-    ///   production, see [`MemoryPressure`]): ALL entries are eligible; the pin
-    ///   and `min_ttl` are BOTH pierced, and the fewest-subscriber (then least-
-    ///   recent-GET) contract is shed to survive genuine RAM overflow. Shedding
-    ///   a subscribed contract increments [`Self::oom_valve_evictions_total`].
+    /// - [`MemoryPressure::AtCapacity`] (the production value): every entry is
+    ///   eligible EXCEPT `protected` — the op-scoped backstop guard. `protected`
+    ///   is the contract whose in-flight access triggered this sweep (the just-
+    ///   inserted key on the `record_access` path). Skipping it replaces the old
+    ///   `min_ttl` age-0 guarantee that "the entry a call just inserted cannot be
+    ///   evicted by that same call", so `host_contract` still guarantees the
+    ///   contract is hosted on return. It is a backstop, not a pin: the just-
+    ///   accessed key also has the highest `recency_seq`, so `victim_order` already
+    ///   sorts it LAST — the skip only bites on an already-broken peer (invariant
+    ///   3, decision 2026-07-08). Subscriber count is NOT a filter — it is the
+    ///   ORDERING. A subscribed contract is ordered LAST but is NOT hard-pinned:
+    ///   when nothing with fewer subscribers is eligible and the peer is still over
+    ///   budget, the fewest-`(local, downstream)` subscribed contract IS evicted
+    ///   (the accepted last resort). This is the change from the shipped #4720
+    ///   code, which hard-filtered `subs == 0` (a hard pin).
+    /// - [`MemoryPressure::Overflow`] (genuine-RAM-overflow corner — trigger
+    ///   UNWIRED in production, see [`MemoryPressure`]): ALL entries are eligible,
+    ///   INCLUDING `protected` (the op-scoped backstop is pierced), so the
+    ///   fewest-subscriber contract is shed even out from under an in-flight op to
+    ///   survive OOM. Not a separate ranking — the SAME `victim_order` — just a
+    ///   wider eligibility set (hosting-invariants: "a corner of the same
+    ///   eviction, not a separate valve").
+    ///
+    /// Any eviction whose victim was subscribed (`local + downstream >= 1` at
+    /// decision time) increments [`Self::subscribed_evictions_total`] (the field
+    /// falsifier) and is flagged `was_in_use` in the returned [`EvictedContract`]
+    /// so the manager tears down its subscription state. Overflow-pressure
+    /// evictions additionally increment [`Self::oom_valve_evictions_total`].
     ///
     /// Eviction stops as soon as `current_bytes <= budget_bytes`. Returns the
-    /// evicted `(key, write_generation)` pairs; the generation is captured
-    /// atomically under the cache's write lock so the `EvictContract`
-    /// deletion-time guard can detect a re-host that races with this eviction
-    /// (see `RuntimePool::remove_contract`).
+    /// evicted contracts; the generation is captured atomically under the cache's
+    /// write lock so the `EvictContract` deletion-time guard can detect a re-host
+    /// that races with this eviction (see `RuntimePool::remove_contract`).
     ///
     /// do NOT revert to byte-only / recency-only LRU as the PRIMARY key — see
     /// hosting-invariants (byte-only eviction anti-pattern). Subscriber count is
     /// the demand-authorization signal: a subscribed contract is real demand and
-    /// must be pinned in normal operation (only the OOM valve may pierce it).
-    /// Real-GET recency is a SECONDARY tiebreak among equal-subscriber
-    /// contracts, not the primary key.
+    /// is shed only as a last resort. Real GET/PUT recency is a tiebreak among
+    /// equal-subscriber contracts, not the primary key.
     fn evict_over_budget<G>(
         &mut self,
-        subscriber_count: &G,
+        subscriber_counts: &G,
         pressure: MemoryPressure,
-    ) -> Vec<(ContractKey, u64)>
+        protected: Option<&ContractKey>,
+    ) -> Vec<EvictedContract>
     where
-        G: Fn(&ContractKey) -> usize,
+        G: Fn(&ContractKey) -> (usize, usize),
     {
         if self.current_bytes <= self.budget_bytes {
             return Vec::new();
         }
-
-        let now = self.time_source.now();
 
         // Collect eviction-eligible entries with their ordering keys, then evict
         // lowest-priority first until back under budget. O(n log n) per
         // over-budget event; n is the hosted-contract count (hundreds to ~1k),
         // and this only runs when actually over budget.
         //
-        // Eligibility by pressure:
-        // - AtCapacity: past-TTL AND zero-subscriber (subscribed = pinned).
-        // - Overflow (OOM valve): every entry — pierce the in-use pin AND
-        //   bypass min_ttl to survive genuine RAM overflow.
+        // Eligibility (no `min_ttl` floor since 2026-07-08 — every entry is
+        // eligible) with one op-scoped exception:
+        // - AtCapacity: skip the `protected` key (the op-scoped backstop guard).
+        //   Subscriber count is the ORDERING, not a filter — a subscribed contract
+        //   is ordered last but still eligible, so it is shed as a last resort when
+        //   nothing zero-subscriber is eligible.
+        // - Overflow (genuine-overflow corner): every entry, INCLUDING protected —
+        //   pierce the op backstop to survive genuine RAM overflow.
         //
-        // `subscriber_count(key)` reads the unlocked subscription DashMaps, so it
-        // is evaluated EXACTLY ONCE per entry here and reused for both the filter
-        // decision and the sort key. Reading it twice (once to filter, once to
-        // build the sort key) would open a TOCTOU window: a subscription
-        // registered between the two reads could make an entry that passed the
-        // `== 0` AtCapacity filter carry `subs >= 1` in the sort key. (The valve
-        // counter is separately made airtight below by gating on `pressure`.)
-        let mut candidates: Vec<(ContractKey, usize, u64)> = self
+        // `subscriber_counts(key)` reads the unlocked subscription DashMaps, so
+        // it is evaluated EXACTLY ONCE per entry here and reused for the (local,
+        // downstream) sort key. Evaluating it once also fixes the captured
+        // `was_in_use` flag atomically with the decision, so the manager's teardown
+        // targets exactly the contracts this sweep decided to shed while in use (no
+        // racy post-hoc `contract_in_use` re-read).
+        let mut candidates: Vec<(ContractKey, usize, usize, u64)> = self
             .contracts
             .iter()
             .filter_map(|(key, entry)| {
-                let subs = subscriber_count(key);
                 let eligible = match pressure {
-                    MemoryPressure::AtCapacity => {
-                        let age = now.saturating_duration_since(entry.last_accessed);
-                        age >= self.min_ttl && subs == 0
-                    }
+                    // Op-scoped backstop: never evict the contract whose in-flight
+                    // access triggered this sweep. Only trips on an already-broken
+                    // peer because `protected` also has the highest recency_seq.
+                    //
+                    // KNOWN invariant-3 divergence (tracked in #4735, deferred): in
+                    // the corner where the cache is at budget and EVERY incumbent is
+                    // subscribed, excluding a zero-subscriber `protected` newcomer
+                    // from the candidate set forces the victim to be a subscribed
+                    // incumbent — the INVERSE of invariant 3's emergent refusal,
+                    // which says the fewest-subscriber contract (the newcomer) is the
+                    // one that should be refused, never displacing a 2+-subscriber
+                    // incumbent. The correct fix needs `host_contract` to signal
+                    // "served but not retained" so a zero-subscriber op doesn't have
+                    // to be protected here; until then this is left as-is (comment
+                    // only, no behavior change) — see #4735.
+                    MemoryPressure::AtCapacity => protected != Some(key),
                     MemoryPressure::Overflow => true,
                 };
-                eligible.then_some((*key, subs, entry.last_get_seq))
+                if !eligible {
+                    return None;
+                }
+                let (local, downstream) = subscriber_counts(key);
+                Some((*key, local, downstream, entry.recency_seq))
             })
             .collect();
 
-        // Ascending by subscriber_count (fewest first), then by last_get_seq
-        // (least-recently real-GET first), then by contract-key bytes as a final
-        // deterministic tiebreak. Under AtCapacity every candidate has
-        // subscriber_count == 0, so the order reduces to real-GET recency.
-        // `victim_order` is the canonical ranking — admission and any future
-        // disk-driven eviction must reuse it rather than fork their own.
-        candidates.sort_by(|a, b| victim_order((a.1, a.2, &a.0), (b.1, b.2, &b.0)));
+        // Ascending by local subscriptions (fewest first), then downstream
+        // subscribers, then recency_seq (least-recently real-GET first), then
+        // contract-key bytes as a final deterministic tiebreak. `victim_order`
+        // is the canonical ranking (Ian's confirmed ordering, #4642).
+        candidates.sort_by(|a, b| victim_order((a.1, a.2, a.3, &a.0), (b.1, b.2, b.3, &b.0)));
 
+        // Only used by the unread-seed age falsifier below.
+        let now = self.time_source.now();
         let mut evicted = Vec::new();
-        for (key, _subs, _) in candidates {
+        for (key, local, downstream, _seq) in candidates {
             if self.current_bytes <= self.budget_bytes {
                 break; // back under budget, stop evicting
             }
             if let Some(entry) = self.contracts.remove(&key) {
+                let was_in_use = local + downstream > 0;
                 self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
                 self.budget_evictions_total = self.budget_evictions_total.saturating_add(1);
-                // Count OOM-valve evictions by PRESSURE, not by the entry's
-                // subscriber count. Gating on `pressure == Overflow` is airtight:
-                // it cannot be perturbed by a concurrent subscription change, so
-                // the "stays 0 in the field while the Overflow trigger is unwired"
-                // guarantee holds by construction. (Under Overflow the sweep sheds
-                // fewest-subscriber-first, so these evictions MAY be subscribed
-                // contracts — the valve piercing the in-use pin — which is exactly
-                // the riskiest behavior this counter exists to surface.)
+                // Field falsifier for the single riskiest new behavior: shedding a
+                // subscribed contract. Counted by the captured subscriber split
+                // (not by pressure), so it covers the normal AtCapacity last-resort
+                // shed AND the Overflow valve. The `was_in_use` flag on the
+                // returned tuple drives the manager's subscription teardown.
+                if was_in_use {
+                    self.subscribed_evictions_total =
+                        self.subscribed_evictions_total.saturating_add(1);
+                }
+                // Count OOM-valve evictions by PRESSURE (any eviction under
+                // Overflow), not by the victim's subscriber count. Gating on
+                // `pressure == Overflow` is airtight: it cannot be perturbed by a
+                // concurrent subscription change, so the "stays 0 in the field
+                // while the Overflow trigger is unwired" guarantee holds by
+                // construction. (Overflow's only remaining special power is
+                // piercing the op-scoped backstop; AtCapacity already sheds
+                // subscribed contracts, tracked by `subscribed_evictions_total`.)
                 if matches!(pressure, MemoryPressure::Overflow) {
                     self.oom_valve_evictions_total =
                         self.oom_valve_evictions_total.saturating_add(1);
@@ -820,7 +990,41 @@ impl<T: TimeSource> HostingCache<T> {
                 if entry.keep_score > self.eviction_floor {
                     self.eviction_floor = entry.keep_score;
                 }
-                evicted.push((key, entry.write_generation));
+                evicted.push(EvictedContract {
+                    key,
+                    write_generation: entry.write_generation,
+                    was_in_use,
+                });
+            }
+        }
+
+        // Op-scoped backstop tripwire (invariant 3, decision 2026-07-08): under
+        // AtCapacity we refused to evict `protected` (the op-scoped guard). If that
+        // refusal leaves us still over budget with `protected` still resident, the
+        // peer is in the corner the invariant calls out — a recency-reset contract
+        // we would otherwise have to evict mid-op. On a healthy peer this never
+        // fires: `protected` sorts LAST by recency, so everything else evicts first
+        // and clears the budget before we would reach it. It CAN fire on an already-
+        // over-capacity peer (e.g. a just-inserted contract larger than the whole
+        // budget); genuine RAM overflow arrives as `Overflow`, which pierces the
+        // backstop. Not a `debug_assert!`: the "contract larger than budget" corner
+        // is legitimate (the old `min_ttl` age-0 gate left the same state silently),
+        // so we surface it as a warning rather than panicking debug builds.
+        if self.current_bytes > self.budget_bytes {
+            if let Some(protected_key) = protected {
+                if matches!(pressure, MemoryPressure::AtCapacity)
+                    && self.contracts.contains_key(protected_key)
+                {
+                    tracing::warn!(
+                        contract = %protected_key,
+                        current_bytes = self.current_bytes,
+                        budget_bytes = self.budget_bytes,
+                        over_by = self.current_bytes - self.budget_bytes,
+                        "op-scoped backstop kept an in-flight contract while still over \
+                         budget (pathological — a genuine RAM-overflow signal would pierce \
+                         this via Overflow)",
+                    );
+                }
             }
         }
 
@@ -839,17 +1043,23 @@ impl<T: TimeSource> HostingCache<T> {
     ///   the cache's write lock so the `EvictContract` deletion-time guard
     ///   can detect a re-host that occurred after this call returned.
     ///
-    /// Eviction respects TTL: age-0 entries are not eligible for eviction
-    /// while `min_ttl > 0` (the production default — i.e. the new entry
-    /// just inserted by this call cannot be evicted by the same call).
-    /// It also honors `subscriber_count`: a contract with `subscriber_count(key)
-    /// >= 1` (an active client subscription or downstream subscriber) is PINNED
-    /// and never evicted under normal ([`MemoryPressure::AtCapacity`]) pressure,
-    /// even past TTL. Evicting an in-use contract would orphan its on-disk state
-    /// — the caller skips disk reclamation for it, but the contract is then gone
-    /// from the cache and never revisited. (Only the OOM valve, wired via
-    /// `sweep_expired` under [`MemoryPressure::Overflow`], may pierce this pin;
-    /// a fresh insert always uses `AtCapacity`.)
+    /// The entry this call just inserted is passed to `evict_over_budget` as the
+    /// op-scoped `protected` key, so it can never be evicted by the same call
+    /// (replacing the old `min_ttl` age-0 guarantee, now that `min_ttl` is gone).
+    /// It also carries the highest `recency_seq`, so it sorts LAST regardless.
+    /// Subscriber count ORDERS victims, it does not pin them: a contract with
+    /// `subscriber_count(key) >= 1` (an active client subscription or downstream
+    /// subscriber) is evicted LAST and survives while any contract with fewer
+    /// subscribers is eligible, but when the cache is still over budget and nothing
+    /// fewer-subscriber is eligible, the fewest-subscriber contract IS shed as a
+    /// last resort — even a subscribed one. When that happens the returned
+    /// `EvictedContract::was_in_use` flag is set so the caller tears down the
+    /// subscription state and reclaims the on-disk state (see
+    /// `HostingManager::teardown_evicted_in_use_contract`). This is the change
+    /// from the shipped #4720 code, which hard-pinned subscribed contracts. The
+    /// OOM valve ([`MemoryPressure::Overflow`], trigger unwired) adds only one
+    /// extra power: it ALSO pierces the op-scoped backstop; a fresh insert always
+    /// uses `AtCapacity`.
     ///
     /// `write_generation` is the current state-write generation for this
     /// contract (from `HostingManager::state_generation`). It is stored on
@@ -868,10 +1078,10 @@ impl<T: TimeSource> HostingCache<T> {
         size_bytes: u64,
         access_type: AccessType,
         write_generation: u64,
-        subscriber_count: G,
+        subscriber_counts: G,
     ) -> RecordAccessResult
     where
-        G: Fn(&ContractKey) -> usize,
+        G: Fn(&ContractKey) -> (usize, usize),
     {
         // Neutral demand: the demoted proximity-prior term (telemetry only). The
         // eviction order is subscriber-primary + real-GET recency regardless.
@@ -884,7 +1094,7 @@ impl<T: TimeSource> HostingCache<T> {
             access_type,
             write_generation,
             NEUTRAL_DEMAND,
-            subscriber_count,
+            subscriber_counts,
         )
     }
 
@@ -894,19 +1104,20 @@ impl<T: TimeSource> HostingCache<T> {
     /// Semantics by access kind:
     /// - **New entry (any kind):** inserted with the caller's `predicted_demand`
     ///   (telemetry). A GET/SUBSCRIBE counts as one read (`read_count = 1`); a
-    ///   PUT is a SEED (`read_count = 0`). Only a GET stamps `last_get_seq` (the
-    ///   eviction recency key); a PUT/SUBSCRIBE leaves it at 0.
-    /// - **Existing entry, GET (real read):** stamp `last_get_seq` to the
+    ///   PUT is a SEED (`read_count = 0`). A GET or PUT (genuine client access)
+    ///   stamps `recency_seq`; a SUBSCRIBE-only seed leaves it at 0.
+    /// - **Existing entry, GET (real read):** stamp `recency_seq` to the
     ///   current frontier (this is the eviction recency refresh), bump
     ///   `read_count`, clear any abandonment, refresh the telemetry
     ///   `keep_score`. Returns an `observed_read_rate` training sample.
     /// - **Existing entry, SUBSCRIBE:** counts as a read for `read_count` /
-    ///   telemetry, but does NOT stamp `last_get_seq` — a subscription is not a
-    ///   GET, so it must not refresh eviction recency (renewal traffic would
+    ///   telemetry, but does NOT stamp `recency_seq` — a subscription is not a
+    ///   GET/PUT, so it must not refresh eviction recency (renewal traffic would
     ///   otherwise keep every subscribed contract equally fresh).
     /// - **Existing entry, PUT (seed only):** refresh recency-of-access/size/
-    ///   generation and the stored `predicted_demand`, but no read count, no
-    ///   `last_get_seq` stamp, no `keep_score` refresh.
+    ///   generation, the stored `predicted_demand`, AND `recency_seq` (a PUT is
+    ///   genuine client access — invariant 3, decision 2026-07-08), but no read
+    ///   count and no `keep_score` refresh (a PUT is a write, not a read).
     pub fn record_access_with_demand<G>(
         &mut self,
         key: ContractKey,
@@ -914,17 +1125,18 @@ impl<T: TimeSource> HostingCache<T> {
         access_type: AccessType,
         write_generation: u64,
         predicted_demand: f64,
-        subscriber_count: G,
+        subscriber_counts: G,
     ) -> RecordAccessResult
     where
-        G: Fn(&ContractKey) -> usize,
+        G: Fn(&ContractKey) -> (usize, usize),
     {
         let now = self.time_source.now();
         let seq = self.next_seq();
         let is_read = matches!(access_type, AccessType::Get | AccessType::Subscribe);
-        // Only a real GET refreshes the eviction recency key. SUBSCRIBE and PUT
-        // do not, so renewal/subscription traffic can't keep a contract fresh.
-        let is_get = matches!(access_type, AccessType::Get);
+        // A real GET or PUT (genuine client access) refreshes the eviction recency
+        // key (invariant 3, decision 2026-07-08). SUBSCRIBE / renewal traffic does
+        // NOT, so it can't keep a contract artificially fresh.
+        let resets_recency = matches!(access_type, AccessType::Get | AccessType::Put);
 
         if let Some(existing) = self.contracts.get_mut(&key) {
             // Already cached - update size if changed
@@ -947,9 +1159,10 @@ impl<T: TimeSource> HostingCache<T> {
             // (which has no estimator access) refreshes against the latest prior.
             existing.predicted_demand = predicted_demand;
 
-            // A real GET refreshes the eviction recency key.
-            if is_get {
-                existing.last_get_seq = seq;
+            // A real GET or PUT refreshes the eviction recency key (a PUT is
+            // genuine client access; SUBSCRIBE/renewal does not).
+            if resets_recency {
+                existing.recency_seq = seq;
             }
 
             let observed_read_rate = if is_read {
@@ -960,29 +1173,36 @@ impl<T: TimeSource> HostingCache<T> {
                 existing.keep_score = self.eviction_floor + predicted_demand;
                 Self::rate_sample(existing.read_count, now, existing.inserted_at)
             } else {
-                // Seed (PUT) on an existing entry: no read count, no recency
-                // refresh, no telemetry keep_score refresh.
+                // Seed (PUT) on an existing entry: recency already refreshed above
+                // (genuine client access), but no read count and no telemetry
+                // keep_score refresh (a PUT is a write, not a read).
                 None
             };
 
             RecordAccessResult {
                 is_new: false,
                 evicted: Vec::new(),
+                evicted_in_use: Vec::new(),
+                // Filled by `HostingManager::record_contract_access` after the
+                // teardown loop; empty here (refresh path evicts nothing).
+                evicted_in_use_teardown: Vec::new(),
                 observed_read_rate,
             }
         } else {
             // Not cached - insert the new entry first, then evict over-budget
-            // entries. The new entry is age-0 so the eviction walk's
-            // past-TTL check guarantees it is never evicted by this call
-            // (under AtCapacity, which a fresh insert always uses).
+            // entries. The new entry is passed to `evict_over_budget` as the
+            // op-scoped `protected` key, so it is never evicted by this call
+            // (under AtCapacity, which a fresh insert always uses) — the backstop
+            // that replaces the old `min_ttl` age-0 guarantee.
             let contract = HostedContract {
                 size_bytes,
                 last_accessed: now,
                 last_access_seq: seq,
-                // Only a real GET seeds the eviction recency key; a fresh PUT
-                // seed / SUBSCRIBE starts at 0 (never GET-read), so once past
-                // min_ttl it sorts to evict first among zero-subscriber entries.
-                last_get_seq: if is_get { seq } else { 0 },
+                // A real GET or PUT (genuine client access) seeds the eviction
+                // recency key at the current frontier; a SUBSCRIBE-only seed starts
+                // at 0 (never client-accessed), so it sorts to evict first among
+                // zero-subscriber entries.
+                recency_seq: if resets_recency { seq } else { 0 },
                 keep_score: self.eviction_floor + predicted_demand,
                 predicted_demand,
                 read_count: if is_read { 1 } else { 0 },
@@ -1000,13 +1220,44 @@ impl<T: TimeSource> HostingCache<T> {
             self.current_bytes = self.current_bytes.saturating_add(size_bytes);
 
             // A fresh insert always evicts under AtCapacity: an insert never
-            // constitutes genuine RAM overflow, so it must not pierce the pin.
-            let evicted = self.evict_over_budget(&subscriber_count, MemoryPressure::AtCapacity);
+            // constitutes genuine RAM overflow, so it must not pierce the op-scoped
+            // backstop. The just-inserted `key` is the `protected` key, so this
+            // call can never evict the contract it just added.
+            //
+            // KNOWN invariant-3 divergence (tracked in #4735, deferred): passing the
+            // zero-subscriber newcomer as `protected` means that, when the cache is
+            // at budget and every incumbent is subscribed, admitting this newcomer
+            // sheds a subscribed incumbent — the inverse of invariant 3's emergent
+            // refusal (the fewest-subscriber contract, i.e. the newcomer, should be
+            // the one refused). The proper fix needs `host_contract` to distinguish
+            // "served but not retained"; comment-only for now — see the matching note
+            // on the `protected` skip in `evict_over_budget`.
+            let evicted =
+                self.evict_over_budget(&subscriber_counts, MemoryPressure::AtCapacity, Some(&key));
+
+            // Split into the (key, generation) reclaim list (unchanged external
+            // contract) and the in-use subset the manager must tear down. Under
+            // the subscriber-primary ordering a fresh insert CAN now shed a
+            // subscribed contract as a last resort, so `evicted_in_use` is no
+            // longer always empty here.
+            let evicted_in_use: Vec<ContractKey> = evicted
+                .iter()
+                .filter(|e| e.was_in_use)
+                .map(|e| e.key)
+                .collect();
+            let evicted = evicted
+                .into_iter()
+                .map(|e| (e.key, e.write_generation))
+                .collect();
 
             RecordAccessResult {
                 is_new: true,
                 evicted,
-                // Brand-new entry has zero residency -> no rate sample yet.
+                evicted_in_use,
+                // Filled by `HostingManager::record_contract_access` from the
+                // teardown loop (this layer knows WHICH keys are in-use but not
+                // the peer identities / client counts the manager tears down).
+                evicted_in_use_teardown: Vec::new(),
                 observed_read_rate: None,
             }
         }
@@ -1093,7 +1344,7 @@ impl<T: TimeSource> HostingCache<T> {
             existing.last_access_seq = seq;
             // A touch is a local-cache GET serve — a real GET read, so it
             // refreshes the eviction recency key (unlike SUBSCRIBE/PUT/renewal).
-            existing.last_get_seq = seq;
+            existing.recency_seq = seq;
             existing.read_count = existing.read_count.saturating_add(1);
             // A fresh touch is evidence of demand — clear any abandoned marker,
             // refresh the stored demand estimate to the caller's freshly-derived
@@ -1119,39 +1370,64 @@ impl<T: TimeSource> HostingCache<T> {
         self.touch_with_demand(key, stored)
     }
 
-    /// Mark `key` as recently abandoned and strip its demand credit so it is the
-    /// first candidate for eviction under budget pressure.
+    /// Mark `key` as recently abandoned and **reset its recency clock** as the
+    /// contract enters the zero-subscriber tier.
     ///
     /// Called by `HostingManager` when a contract transitions from "in
     /// use" (has subscribers / clients / downstream peers) to "no longer
     /// in use" — the moment its `contract_in_use` predicate flips from
-    /// `true` to `false`. The entry's `keep_score` is dropped to the current
-    /// `eviction_floor` (zero demand credit), so among the credited band it
-    /// sorts first: a still-active entry keeps `floor + demand`, and since the
-    /// proximity prior (`predict`) is strictly positive it sorts strictly above
-    /// the abandoned entry at the floor. The TTL gate in `evict_over_budget`
-    /// still applies: an abandoned entry within
-    /// `min_ttl` of its last access is not yet eligible.
+    /// `true` to `false`, i.e. subscription TERMINATION.
     ///
-    /// No-op when `key` is absent (already evicted). Idempotent: calling
-    /// it on an already-abandoned entry leaves the existing marker (and
-    /// its earlier timestamp) intact, which is the right behavior — the
-    /// first abandonment is what we want to time from.
+    /// # Recency reset at termination (invariant 3, decision 2026-07-08)
     ///
-    /// Network forgetfulness is explicitly preserved: this method does
-    /// **not** evict the contract or shorten its TTL. It only changes the
-    /// eviction *priority* used when the cache is genuinely over budget. A
-    /// contract that's abandoned but under budget pressure stays cached.
+    /// While a contract is subscribed its eviction rank is dominated by its
+    /// `(local, downstream)` subscriber counts, and its `recency_seq` (a GET/PUT
+    /// tiebreak) is NOT refreshed by subscription-renewal traffic. So the moment
+    /// the last subscription terminates and the contract drops into the zero-
+    /// subscriber tier, its `recency_seq` could be arbitrarily stale (an old read
+    /// from before it was subscribed), which would make it the instant eviction
+    /// victim. To avoid that, termination resets `recency_seq` to the current
+    /// frontier — the recency clock "starts" at termination, so a formerly-
+    /// subscribed contract competes on equal footing with freshly-accessed
+    /// zero-subscriber copies rather than being punished for an old last-read it
+    /// accrued while parked in the subscription tier.
+    ///
+    /// The demoted telemetry `keep_score` is also dropped to the current
+    /// `eviction_floor`; that field no longer drives eviction (see the module
+    /// docs) and is retained only for the dashboard.
+    ///
+    /// No-op when `key` is absent (already evicted). Idempotent: only the FIRST
+    /// abandonment (the actual termination) resets recency / marks the timestamp;
+    /// a repeat call on an already-abandoned entry leaves it intact. A later
+    /// re-subscription clears `abandoned_at` (via `record_access` / `touch`), so a
+    /// second termination resets recency again — the correct behavior.
+    ///
+    /// Network forgetfulness is explicitly preserved: this method does **not**
+    /// evict the contract. It only re-times the eviction *priority* used when the
+    /// cache is genuinely over budget. A contract that's abandoned but under
+    /// budget pressure stays cached.
     pub fn record_abandonment(&mut self, key: &ContractKey) {
         let floor = self.eviction_floor;
+        // Only the first abandonment (the termination transition) acts. Decide
+        // before taking the &mut borrow so we can allocate a fresh recency seq.
+        let is_termination = self
+            .contracts
+            .get(key)
+            .is_some_and(|e| e.abandoned_at.is_none());
+        if !is_termination {
+            return;
+        }
+        let seq = self.next_seq();
+        let now = self.time_source.now();
         if let Some(existing) = self.contracts.get_mut(key) {
-            if existing.abandoned_at.is_none() {
-                existing.abandoned_at = Some(self.time_source.now());
-                // Strip demand credit: drop keep_score to the frontier so the
-                // next over-budget walk evaluates this entry before any
-                // still-credited (floor + demand) entry.
-                existing.keep_score = floor;
-            }
+            existing.abandoned_at = Some(now);
+            // Reset the recency clock at termination (see the doc above) so the
+            // formerly-subscribed contract is not instantly evicted for an old
+            // last-read accrued while it sat in the subscription tier.
+            existing.recency_seq = seq;
+            // Strip demand credit (demoted telemetry only): drop keep_score to
+            // the frontier.
+            existing.keep_score = floor;
         }
     }
 
@@ -1214,6 +1490,18 @@ impl<T: TimeSource> HostingCache<T> {
         self.budget_bytes
     }
 
+    /// Test-only: shrink/grow the byte budget after construction WITHOUT running
+    /// eviction. Lets a test seed several entries at a generous budget (so they
+    /// get distinct `recency_seq` without the insert path auto-evicting), then
+    /// tighten the budget and observe a subsequent sweep. Needed since dropping
+    /// `min_ttl` (2026-07-08) means the insert path now sheds down to budget
+    /// immediately, so "sit over budget with everything present" is only
+    /// reachable by growing the resident set under a large budget then shrinking.
+    #[cfg(test)]
+    pub fn set_budget_for_test(&mut self, budget_bytes: u64) {
+        self.budget_bytes = budget_bytes;
+    }
+
     /// Overwrite the byte budget (#4683 eviction floor). The ONLY writer after
     /// the constructor: the 60s recompute sets this to
     /// `min(ram_budget, disk_budget)` so the existing Greedy-Dual over-budget
@@ -1232,6 +1520,7 @@ impl<T: TimeSource> HostingCache<T> {
             current_bytes: self.current_bytes,
             contract_count: self.contracts.len() as u64,
             budget_evictions_total: self.budget_evictions_total,
+            subscribed_evictions_total: self.subscribed_evictions_total,
             evictions_of_recently_read_total: self.evictions_of_recently_read_total,
             evicted_unread_total: self.evicted_unread_total,
             evicted_unread_age_secs_sum: self.evicted_unread_age_secs_sum,
@@ -1240,7 +1529,7 @@ impl<T: TimeSource> HostingCache<T> {
     }
 
     /// Per-contract rows for the local dashboard, in the cache-side EVICTION
-    /// order: ascending `(last_get_seq, key)` — least-recent real GET first, the
+    /// order: ascending `(recency_seq, key)` — least-recent real GET/PUT first, the
     /// same order [`Self::keys_eviction_order`] uses. This reflects the order
     /// among the ZERO-subscriber candidate set the over-budget sweep would evict
     /// under `AtCapacity` (the production pressure); the subscriber-count pin is
@@ -1249,10 +1538,6 @@ impl<T: TimeSource> HostingCache<T> {
     /// still carry the demoted telemetry score fields (`keep_score`,
     /// `predicted_demand`) the dashboard renders.
     pub(crate) fn eviction_ordered_scores(&self) -> Vec<HostingContractScore> {
-        // `past_min_ttl` mirrors the `age >= self.min_ttl` term of the
-        // `evict_over_budget` AtCapacity filter so the dashboard reflects real
-        // sweep behavior (see `past_min_ttl` doc).
-        let now = self.time_source.now();
         let mut rows: Vec<HostingContractScore> = self
             .contracts
             .iter()
@@ -1262,20 +1547,19 @@ impl<T: TimeSource> HostingCache<T> {
                 predicted_demand: v.predicted_demand,
                 size_bytes: v.size_bytes,
                 read_count: v.read_count,
-                last_get_seq: v.last_get_seq,
-                past_min_ttl: now.saturating_duration_since(v.last_accessed) >= self.min_ttl,
+                recency_seq: v.recency_seq,
             })
             .collect();
         rows.sort_by(|a, b| {
-            a.last_get_seq
-                .cmp(&b.last_get_seq)
+            a.recency_seq
+                .cmp(&b.recency_seq)
                 .then_with(|| a.key.as_bytes().cmp(b.key.as_bytes()))
         });
         rows
     }
 
     /// Get all hosted contract keys in the cache-side EVICTION order — ascending
-    /// `(last_get_seq, key)`, i.e. the least-recently real-GET-read contract
+    /// `(recency_seq, key)`, i.e. the least-recently real-GET-read contract
     /// first. This is the order among the zero-subscriber candidate set under
     /// `AtCapacity`; the subscriber-count primary key and pin are applied by the
     /// caller (`HostingManager`), which the cache cannot see here.
@@ -1284,7 +1568,7 @@ impl<T: TimeSource> HostingCache<T> {
         let mut entries: Vec<_> = self
             .contracts
             .iter()
-            .map(|(k, v)| (*k, v.last_get_seq))
+            .map(|(k, v)| (*k, v.recency_seq))
             .collect();
         entries.sort_by(|a, b| {
             a.1.cmp(&b.1)
@@ -1309,32 +1593,41 @@ impl<T: TimeSource> HostingCache<T> {
     /// [`MemoryPressure`].
     ///
     /// Only evicts when `current_bytes > budget_bytes`. Victims are chosen
-    /// subscriber-primary — ascending `(subscriber_count, last_get_seq, key)` —
+    /// subscriber-primary — ascending
+    /// `(local_subscription_count, downstream_subscriber_count, recency_seq, key)` —
     /// with eligibility governed by `pressure`:
-    /// - [`MemoryPressure::AtCapacity`]: past-TTL, zero-subscriber entries only
-    ///   (subscribed contracts pinned). This is the production value today.
-    /// - [`MemoryPressure::Overflow`]: the OOM valve — pierces the pin and
-    ///   `min_ttl` to shed the fewest-subscriber contract. The trigger is
-    ///   UNWIRED in production (see [`MemoryPressure`]).
+    /// - [`MemoryPressure::AtCapacity`] (production): every entry is eligible (no
+    ///   `min_ttl` floor). Subscriber count is the ORDERING, not a filter — a
+    ///   subscribed contract is ordered last but shed as a last resort when nothing
+    ///   zero-subscriber is eligible.
+    /// - [`MemoryPressure::Overflow`]: the genuine-overflow corner — ALSO pierces
+    ///   the op-scoped backstop. The trigger is UNWIRED in production (see
+    ///   [`MemoryPressure`]).
     ///
-    /// `subscriber_count(key)` is the caller's genuine-demand count (client
-    /// subscriptions + downstream subscribers), `0` iff not `contract_in_use`.
+    /// The periodic sweep has no single triggering access, so it passes NO
+    /// op-scoped `protected` key: in-flight-op contracts are protected only by
+    /// their fresh `recency_seq` (they sort last), not by a per-sweep skip.
     ///
-    /// Returns `(ContractKey, write_generation)` pairs for evicted contracts;
-    /// the generation snapshot is carried through `EvictContract` so the
-    /// deletion-time guard can detect a re-host race.
+    /// `subscriber_counts(key)` is the caller's genuine-demand split
+    /// `(local_client_subscriptions, downstream_subscribers)`; their sum is `0`
+    /// iff not `contract_in_use`.
+    ///
+    /// Returns [`EvictedContract`]s: each carries the write-generation snapshot
+    /// (carried through `EvictContract` for the deletion-time re-host guard) and
+    /// the `was_in_use` flag the manager keys its subscription teardown on.
     pub fn sweep_expired<G>(
         &mut self,
-        subscriber_count: G,
+        subscriber_counts: G,
         pressure: MemoryPressure,
-    ) -> Vec<(ContractKey, u64)>
+    ) -> Vec<EvictedContract>
     where
-        G: Fn(&ContractKey) -> usize,
+        G: Fn(&ContractKey) -> (usize, usize),
     {
         // Over-budget eviction logic is shared with `record_access` via
         // `evict_over_budget`: it returns early when under budget, then evicts
-        // subscriber-primary (fewest-subscriber, then least-recent real GET).
-        self.evict_over_budget(&subscriber_count, pressure)
+        // subscriber-primary (fewest local, then fewest downstream, then
+        // least-recent real GET/PUT). No `protected` key on the periodic sweep.
+        self.evict_over_budget(&subscriber_counts, pressure, None)
     }
 
     /// Load a contract entry from persisted data during startup, using an
@@ -1397,7 +1690,7 @@ impl<T: TimeSource> HostingCache<T> {
             // demand (a never-read PUT seed out-surviving a genuinely GET-read
             // entry). A live GET after restart re-stamps it to a true value. See
             // `finalize_loading`.
-            last_get_seq: 0,
+            recency_seq: 0,
             // Loaded entries start at the caller-supplied cold demand (the
             // distance prior when this peer's location is known at load, else
             // neutral). The first live read re-scores against the current prior.
@@ -1461,12 +1754,12 @@ impl<T: TimeSource> HostingCache<T> {
     /// access counter past the assigned range so subsequent live accesses keep
     /// sorting after loaded entries.
     ///
-    /// It deliberately does NOT stamp `last_get_seq` (the eviction recency key):
+    /// It deliberately does NOT stamp `recency_seq` (the eviction recency key):
     /// persistence records only a generic LAST-ACCESS time, which does not
-    /// distinguish a real GET from a PUT/SUBSCRIBE, so stamping `last_get_seq`
+    /// distinguish a real GET from a PUT/SUBSCRIBE, so stamping `recency_seq`
     /// from it would FABRICATE real-GET recency — a never-GET-read PUT seed
     /// persisted just before restart would then out-survive an entry that had
-    /// genuine GET demand. Instead every reloaded entry keeps `last_get_seq == 0`
+    /// genuine GET demand. Instead every reloaded entry keeps `recency_seq == 0`
     /// (treated as "never GET-read since restart"); a live GET after restart
     /// re-stamps it to a real value. Reloaded entries therefore tie at the front
     /// of the eviction order (0), broken by key bytes, until a real GET lifts
@@ -1503,38 +1796,55 @@ mod tests {
         )
     }
 
-    fn make_cache(
-        budget: u64,
-        min_ttl: Duration,
-    ) -> (HostingCache<SharedMockTimeSource>, SharedMockTimeSource) {
+    fn make_cache(budget: u64) -> (HostingCache<SharedMockTimeSource>, SharedMockTimeSource) {
         let time_source = SharedMockTimeSource::new();
-        let cache = HostingCache::new(budget, min_ttl, time_source.clone());
+        let cache = HostingCache::new(budget, time_source.clone());
         (cache, time_source)
     }
 
+    /// Project the `(key, write_generation)` reclaim pairs out of a
+    /// `sweep_expired` result so the ordering/eviction assertions can compare
+    /// against a plain `Vec<(ContractKey, u64)>` (the `was_in_use` flag is
+    /// asserted separately where it matters).
+    fn evicted_pairs(evicted: &[EvictedContract]) -> Vec<(ContractKey, u64)> {
+        evicted
+            .iter()
+            .map(|e| (e.key, e.write_generation))
+            .collect()
+    }
+
     #[test]
-    fn victim_order_is_subscriber_then_get_recency_then_key() {
+    fn victim_order_is_local_then_downstream_then_get_recency_then_key() {
         use std::cmp::Ordering;
         let k1 = make_key(1);
         let k2 = make_key(2);
 
-        // 1. Fewer subscribers ranks FIRST (evicted first), even against a
-        //    more-recent GET and a smaller key on the other side.
+        // 1. Fewer LOCAL client subscriptions ranks FIRST (evicted first), even
+        //    against MORE downstream subscribers, a more-recent GET, and a smaller
+        //    key on the other side. A locally-subscribed contract is evicted LAST.
         assert_eq!(
-            victim_order((0, 999, &k2), (1, 0, &k1)),
+            victim_order((0, 99, 999, &k2), (1, 0, 0, &k1)),
             Ordering::Less,
-            "fewer subscribers must rank ahead of a more-recent GET / smaller key"
+            "fewer local subscriptions must rank ahead of everything else"
         );
 
-        // 2. Equal subscribers: least-recent real GET (smaller last_get_seq)
-        //    ranks first.
+        // 2. Equal local count: fewer DOWNSTREAM subscribers ranks first, even
+        //    against a more-recent GET / smaller key on the other side.
         assert_eq!(
-            victim_order((2, 5, &k1), (2, 6, &k2)),
+            victim_order((1, 0, 999, &k2), (1, 3, 0, &k1)),
             Ordering::Less,
-            "with equal subscribers, least-recent GET ranks first"
+            "with equal local count, fewer downstream subscribers ranks first"
         );
 
-        // 3. Equal subscribers AND GET recency: smaller key bytes break the tie
+        // 3. Equal local AND downstream: least-recent real GET (smaller
+        //    recency_seq) ranks first.
+        assert_eq!(
+            victim_order((2, 2, 5, &k1), (2, 2, 6, &k2)),
+            Ordering::Less,
+            "with equal subscriber counts, least-recent GET ranks first"
+        );
+
+        // 4. Equal subscribers AND GET recency: smaller key bytes break the tie
         //    deterministically.
         let (small, large) = if k1.as_bytes() < k2.as_bytes() {
             (&k1, &k2)
@@ -1542,18 +1852,21 @@ mod tests {
             (&k2, &k1)
         };
         assert_eq!(
-            victim_order((3, 7, small), (3, 7, large)),
+            victim_order((3, 1, 7, small), (3, 1, 7, large)),
             Ordering::Less,
-            "equal subscribers + GET recency fall back to key-byte order"
+            "equal subscriber counts + GET recency fall back to key-byte order"
         );
 
         // Reflexive: identical ranking components compare Equal.
-        assert_eq!(victim_order((1, 1, &k1), (1, 1, &k1)), Ordering::Equal);
+        assert_eq!(
+            victim_order((1, 1, 1, &k1), (1, 1, 1, &k1)),
+            Ordering::Equal
+        );
     }
 
     #[test]
     fn test_empty_cache() {
-        let (cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (cache, _) = make_cache(1000);
         assert!(cache.is_empty());
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.current_bytes(), 0);
@@ -1562,10 +1875,10 @@ mod tests {
 
     #[test]
     fn test_add_single_contract() {
-        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(1000);
         let key = make_key(1);
 
-        let result = cache.record_access(key, 100, AccessType::Get, 0, |_| 0);
+        let result = cache.record_access(key, 100, AccessType::Get, 0, |_| (0, 0));
 
         assert!(result.is_new);
         assert!(result.evicted.is_empty());
@@ -1580,16 +1893,16 @@ mod tests {
 
     #[test]
     fn test_refresh_existing_contract() {
-        let (mut cache, time) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(1000);
         let key = make_key(1);
 
         // First access
-        cache.record_access(key, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| (0, 0));
         let first_access = cache.get(&key).unwrap().last_accessed;
 
         // Advance time and access again
         time.advance_time(Duration::from_secs(10));
-        cache.record_access(key, 100, AccessType::Put, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Put, 0, |_| (0, 0));
 
         // Should still be one contract, but updated
         assert_eq!(cache.len(), 1);
@@ -1600,55 +1913,27 @@ mod tests {
         assert!(info.last_accessed > first_access);
     }
 
+    /// Over budget, eviction happens IMMEDIATELY — there is no `min_ttl` floor
+    /// (dropped 2026-07-08). Adding a third entry that pushes over budget sheds the
+    /// least-recently-accessed entry at once; the just-inserted entry is protected.
+    /// (The former `test_lru_eviction_respects_ttl` / `test_lru_eviction_after_ttl`
+    /// pair, which asserted min_ttl grace then post-TTL eviction, was collapsed into
+    /// this single no-floor pin.)
     #[test]
-    fn test_lru_eviction_respects_ttl() {
-        // Cache with max 200 bytes, 60 second TTL
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+    fn test_over_budget_evicts_least_recent_no_min_ttl_floor() {
+        // Cache with max 200 bytes.
+        let (mut cache, _time) = make_cache(200);
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
 
-        // Add two entries
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
+        // Add two entries (fits exactly, no eviction).
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(cache.current_bytes(), 200);
 
-        // Advance time by 30 seconds (under TTL)
-        time.advance_time(Duration::from_secs(30));
-
-        // Add third entry - should NOT evict because all entries under TTL
-        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| 0);
-        assert!(
-            result.evicted.is_empty(),
-            "Should not evict entries under TTL"
-        );
-        assert_eq!(
-            cache.len(),
-            3,
-            "Cache should exceed budget when all under TTL"
-        );
-        assert!(cache.contains(&key1));
-        assert!(cache.contains(&key2));
-        assert!(cache.contains(&key3));
-    }
-
-    #[test]
-    fn test_lru_eviction_after_ttl() {
-        // Cache with max 200 bytes, 60 second TTL
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
-        let key1 = make_key(1);
-        let key2 = make_key(2);
-        let key3 = make_key(3);
-
-        // Add two entries
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
-
-        // Advance time past TTL
-        time.advance_time(Duration::from_secs(61));
-
-        // Add third entry - should evict key1 (oldest)
-        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| 0);
+        // Add third entry - immediately evicts key1 (oldest); no TTL wait.
+        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| (0, 0));
         assert!(result.is_new);
         assert_eq!(result.evicted, vec![(key1, 0)]);
         assert_eq!(cache.len(), 2);
@@ -1659,18 +1944,18 @@ mod tests {
 
     #[test]
     fn test_access_refreshes_lru_position() {
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(200);
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
 
         // Add two contracts
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
 
         // GET key1 again - a real GET refreshes the eviction recency position,
         // so it becomes the LAST eviction candidate; key2 is now first.
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0));
 
         // Eviction order (least-worthy first) should now be [key2, key1]
         let order = cache.keys_eviction_order();
@@ -1678,7 +1963,7 @@ mod tests {
 
         // Advance past TTL and add key3 - should evict key2 (now oldest)
         time.advance_time(Duration::from_secs(61));
-        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| 0);
+        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| (0, 0));
 
         assert_eq!(result.evicted, vec![(key2, 0)]);
         assert!(cache.contains(&key1));
@@ -1688,14 +1973,14 @@ mod tests {
 
     #[test]
     fn test_touch_refreshes_ttl() {
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(200);
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
 
         // Add two entries
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
 
         // Advance time by 50 seconds
         time.advance_time(Duration::from_secs(50));
@@ -1707,7 +1992,7 @@ mod tests {
         time.advance_time(Duration::from_secs(15));
 
         // Add key3 - should evict key2 (past TTL), NOT key1 (recently touched)
-        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| 0);
+        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| (0, 0));
 
         assert_eq!(
             result.evicted,
@@ -1723,7 +2008,7 @@ mod tests {
 
     #[test]
     fn test_large_contract_evicts_multiple() {
-        let (mut cache, time) = make_cache(300, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(300);
 
         let small1 = make_key(1);
         let small2 = make_key(2);
@@ -1731,16 +2016,16 @@ mod tests {
         let large = make_key(4);
 
         // Add three small contracts
-        cache.record_access(small1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(small2, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(small3, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(small1, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(small2, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(small3, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(cache.current_bytes(), 300);
 
         // Advance past TTL
         time.advance_time(Duration::from_secs(61));
 
         // Add one large contract - should evict two small ones
-        let result = cache.record_access(large, 200, AccessType::Put, 0, |_| 0);
+        let result = cache.record_access(large, 200, AccessType::Put, 0, |_| (0, 0));
 
         assert_eq!(result.evicted.len(), 2);
         assert_eq!(result.evicted[0], (small1, 0)); // Oldest first
@@ -1753,113 +2038,118 @@ mod tests {
 
     #[test]
     fn test_sweep_expired() {
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        // Seed three entries under a generous budget (no auto-evict), then tighten
+        // so the cache sits over budget for the sweep. (There is no `min_ttl` floor
+        // since 2026-07-08, so record_access sheds to budget immediately — the
+        // "3 resident over budget" state is only reachable via a budget shrink.)
+        let (mut cache, _time) = make_cache(100_000);
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
 
-        // Add three entries (exceeds budget)
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key3, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0)); // recency: oldest
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key3, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.set_budget_for_test(200);
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.current_bytes(), 300);
 
-        // Sweep immediately - nothing should be evicted (all under TTL)
-        let evicted = cache.sweep_expired(|_| 0, MemoryPressure::AtCapacity);
-        assert!(evicted.is_empty());
-        assert_eq!(cache.len(), 3);
-
-        // Advance past TTL
-        time.advance_time(Duration::from_secs(61));
-
-        // Sweep should evict oldest entry to get back under budget
-        let evicted = cache.sweep_expired(|_| 0, MemoryPressure::AtCapacity);
-        assert_eq!(evicted, vec![(key1, 0)]);
+        // Sweep evicts the least-recently-accessed entry (key1) to get back under
+        // budget.
+        let evicted = cache.sweep_expired(|_| (0, 0), MemoryPressure::AtCapacity);
+        assert_eq!(evicted_pairs(&evicted), vec![(key1, 0)]);
         assert_eq!(cache.current_bytes(), 200);
     }
 
     #[test]
-    fn test_sweep_respects_should_retain() {
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+    fn test_sweep_orders_subscribed_last() {
+        // Seed three entries under a generous budget (distinct recency), then
+        // tighten so the sweep runs over budget.
+        let (mut cache, _time) = make_cache(100_000);
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
 
-        // Add three entries (exceeds budget)
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key3, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key3, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.set_budget_for_test(200);
 
-        // Advance past TTL
-        time.advance_time(Duration::from_secs(61));
+        // Sweep with a subscriber count that makes key1 subscribed (downstream).
+        // Under subscriber-primary ordering it sorts LAST, so the zero-subscriber
+        // key2 is shed first — one eviction is enough to get back under budget, so
+        // key1 survives (ordered last, not hard-pinned).
+        let evicted =
+            cache.sweep_expired(|k| (0, (*k == key1) as usize), MemoryPressure::AtCapacity);
 
-        // Sweep with predicate that retains key1
-        let evicted = cache.sweep_expired(|k| (*k == key1) as usize, MemoryPressure::AtCapacity);
-
-        // key1 should be retained, key2 evicted to get under budget
-        assert_eq!(evicted, vec![(key2, 0)]);
+        // key1 (subscribed) survives, key2 (zero-subscriber) evicted to get under budget
+        assert_eq!(evicted_pairs(&evicted), vec![(key2, 0)]);
         assert!(cache.contains(&key1));
         assert!(!cache.contains(&key2));
         assert!(cache.contains(&key3));
         assert_eq!(cache.current_bytes(), 200);
     }
 
-    /// `record_access` must honor `should_retain`: an over-budget, past-TTL
-    /// entry whose `should_retain` returns true is NOT evicted; an
-    /// unretained past-TTL entry IS evicted.
+    /// `record_access` orders subscribed contracts LAST: over budget past TTL,
+    /// the subscribed entry survives while a zero-subscriber past-TTL entry is
+    /// shed instead (one eviction is enough to get back under budget). It is NOT
+    /// a hard pin — see `evict_all_subscribed_sheds_fewest_as_last_resort` for
+    /// the last-resort shed when EVERY contract is subscribed.
     #[test]
-    fn test_record_access_respects_should_retain() {
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+    fn test_record_access_orders_subscribed_last() {
+        let (mut cache, time) = make_cache(200);
         let retained = make_key(1);
         let evictable = make_key(2);
         let trigger = make_key(3);
 
         // Fill the cache: `retained` (oldest) then `evictable`.
-        cache.record_access(retained, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(evictable, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(retained, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(evictable, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(cache.current_bytes(), 200);
 
         // Advance past TTL so both existing entries are eviction-eligible.
         time.advance_time(Duration::from_secs(61));
 
         // Insert a third entry, over budget. `retained` is the oldest, so a
-        // naive LRU eviction would drop it first — but `should_retain`
-        // protects it, so `evictable` (next oldest) must be evicted instead.
+        // naive LRU eviction would drop it first — but it is subscribed
+        // (downstream), so under subscriber-primary ordering it sorts LAST and the
+        // zero-subscriber `evictable` is shed first. One eviction is enough, so
+        // `retained` survives (ordered last, not hard-pinned).
         let result = cache.record_access(trigger, 100, AccessType::Get, 0, |k| {
-            (*k == retained) as usize
+            (0, (*k == retained) as usize)
         });
 
         assert_eq!(
             result.evicted,
             vec![(evictable, 0)],
-            "in-use (retained) contract must be skipped; the unretained \
+            "the subscribed contract is ordered last; the zero-subscriber \
              past-TTL contract must be evicted instead"
         );
         assert!(
             cache.contains(&retained),
-            "retained contract must survive even past TTL and over budget"
+            "subscribed contract survives while a zero-subscriber one can be shed"
         );
         assert!(!cache.contains(&evictable));
         assert!(cache.contains(&trigger));
     }
 
-    /// The contract inserted by `record_access` is age-0, so while
-    /// `min_ttl > 0` (the production default) it is never evicted by the
-    /// same call even when the insert pushes over budget.
+    /// The contract inserted by `record_access` is the op-scoped `protected` key,
+    /// so it is never evicted by the same call even when the insert pushes over
+    /// budget — the backstop that replaces the old `min_ttl` age-0 guarantee (now
+    /// that `min_ttl` is dropped, 2026-07-08). It is also the most-recently-
+    /// accessed, so it sorts last regardless.
     #[test]
     fn test_record_access_never_evicts_the_new_entry() {
-        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let (mut cache, _time) = make_cache(100);
         let first = make_key(1);
         let second = make_key(2);
 
-        cache.record_access(first, 100, AccessType::Get, 0, |_| 0);
-        time.advance_time(Duration::from_secs(61));
+        cache.record_access(first, 100, AccessType::Get, 0, |_| (0, 0));
 
-        // Inserting `second` puts the cache over budget; `first` is past TTL
-        // and unretained so it is evicted, but the just-inserted `second`
-        // (age 0) must survive.
-        let result = cache.record_access(second, 100, AccessType::Get, 0, |_| 0);
+        // Inserting `second` puts the cache over budget; `first` (older, zero-
+        // subscriber) is evicted, but the just-inserted `second` (the op-protected
+        // key) must survive.
+        let result = cache.record_access(second, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(result.evicted, vec![(first, 0)]);
         assert!(cache.contains(&second));
         assert!(!cache.contains(&first));
@@ -1867,7 +2157,7 @@ mod tests {
 
     #[test]
     fn test_touch_non_existent_is_no_op() {
-        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(1000);
         let key = make_key(1);
 
         // Touch a key that doesn't exist
@@ -1880,44 +2170,44 @@ mod tests {
 
     #[test]
     fn test_access_types() {
-        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(1000);
         let key = make_key(1);
 
         // Test each access type is recorded correctly
-        cache.record_access(key, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(cache.get(&key).unwrap().access_type, AccessType::Get);
 
-        cache.record_access(key, 100, AccessType::Put, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Put, 0, |_| (0, 0));
         assert_eq!(cache.get(&key).unwrap().access_type, AccessType::Put);
 
-        cache.record_access(key, 100, AccessType::Subscribe, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Subscribe, 0, |_| (0, 0));
         assert_eq!(cache.get(&key).unwrap().access_type, AccessType::Subscribe);
     }
 
     #[test]
     fn test_contract_size_change() {
-        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(1000);
         let key = make_key(1);
 
         // Add contract with initial size
-        cache.record_access(key, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(cache.current_bytes(), 100);
         assert_eq!(cache.get(&key).unwrap().size_bytes, 100);
 
         // Contract state grows
-        cache.record_access(key, 200, AccessType::Put, 0, |_| 0);
+        cache.record_access(key, 200, AccessType::Put, 0, |_| (0, 0));
         assert_eq!(cache.current_bytes(), 200);
         assert_eq!(cache.get(&key).unwrap().size_bytes, 200);
 
         // Contract state shrinks
-        cache.record_access(key, 150, AccessType::Put, 0, |_| 0);
+        cache.record_access(key, 150, AccessType::Put, 0, |_| (0, 0));
         assert_eq!(cache.current_bytes(), 150);
         assert_eq!(cache.get(&key).unwrap().size_bytes, 150);
     }
 
     #[test]
     fn test_iter_returns_all_hosted_keys() {
-        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(1000);
 
         // Empty cache yields no keys
         assert_eq!(cache.iter().count(), 0);
@@ -1926,9 +2216,9 @@ mod tests {
         let key2 = make_key(2);
         let key3 = make_key(3);
 
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Put, 0, |_| 0);
-        cache.record_access(key3, 100, AccessType::Subscribe, 0, |_| 0);
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key2, 100, AccessType::Put, 0, |_| (0, 0));
+        cache.record_access(key3, 100, AccessType::Subscribe, 0, |_| (0, 0));
 
         let keys: Vec<ContractKey> = cache.iter().collect();
         assert_eq!(keys.len(), 3);
@@ -1947,7 +2237,7 @@ mod tests {
     /// Regression test for PR #4212 review round C.
     #[test]
     fn test_record_access_carries_write_generation_through_eviction() {
-        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(100);
         let evicted_key = make_key(1);
         let trigger_key = make_key(2);
 
@@ -1958,7 +2248,7 @@ mod tests {
             100,
             AccessType::Get,
             captured_generation,
-            |_| 0,
+            |_| (0, 0),
         );
         assert!(first.evicted.is_empty(), "first insert evicts nothing");
         assert_eq!(
@@ -1979,7 +2269,7 @@ mod tests {
             100,
             AccessType::Get,
             999, // trigger's own generation is irrelevant to the eviction
-            |_| 0,
+            |_| (0, 0),
         );
         assert_eq!(
             result.evicted,
@@ -1998,16 +2288,16 @@ mod tests {
     /// captures the correct generation snapshot.
     #[test]
     fn test_record_access_refresh_updates_write_generation() {
-        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(1000);
         let key = make_key(7);
 
-        cache.record_access(key, 100, AccessType::Get, 1, |_| 0);
+        cache.record_access(key, 100, AccessType::Get, 1, |_| (0, 0));
         assert_eq!(cache.get(&key).unwrap().write_generation, 1);
 
         // Refresh with a higher generation (simulates a state write that
         // bumped the generation between the original insert and a later
         // GET/PUT/SUBSCRIBE re-access).
-        cache.record_access(key, 100, AccessType::Put, 5, |_| 0);
+        cache.record_access(key, 100, AccessType::Put, 5, |_| (0, 0));
         assert_eq!(
             cache.get(&key).unwrap().write_generation,
             5,
@@ -2021,10 +2311,10 @@ mod tests {
     #[test]
     fn test_local_client_access_age_gate_expiry() {
         let lease = Duration::from_secs(480); // SUBSCRIPTION_LEASE_DURATION
-        let (mut cache, time) = make_cache(10000, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(10000);
         let key = make_key(1);
 
-        cache.record_access(key, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| (0, 0));
         cache.mark_local_client_access(&key);
 
         // Immediately after marking: recent access is true
@@ -2061,13 +2351,13 @@ mod tests {
         // The dashboard reads `eviction_ordered_scores` (production) to render
         // piece A's demand-driven eviction. It must yield the same order as the
         // test-only `keys_eviction_order` and carry each entry's score fields.
-        let (mut cache, _) = make_cache(10_000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(10_000);
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
-        cache.record_access(key1, 111, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 222, AccessType::Get, 0, |_| 0);
-        cache.record_access(key3, 333, AccessType::Get, 0, |_| 0);
+        cache.record_access(key1, 111, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key2, 222, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key3, 333, AccessType::Get, 0, |_| (0, 0));
 
         let scores = cache.eviction_ordered_scores();
         let score_keys: Vec<_> = scores.iter().map(|s| s.key).collect();
@@ -2082,42 +2372,15 @@ mod tests {
             assert_eq!(s.size_bytes, entry.size_bytes);
             assert_eq!(s.read_count, entry.read_count);
             assert_eq!(s.predicted_demand, entry.predicted_demand);
-            assert_eq!(s.last_get_seq, entry.last_get_seq);
-            // Just accessed with a 60s min_ttl → not yet past the TTL gate.
-            assert!(
-                !s.past_min_ttl,
-                "a freshly-accessed entry is within min_ttl, so it is not \
-                 eviction-eligible yet"
-            );
+            assert_eq!(s.recency_seq, entry.recency_seq);
         }
     }
 
-    #[test]
-    fn eviction_ordered_scores_flags_past_min_ttl_after_ttl_elapses() {
-        // `past_min_ttl` must mirror the `age >= min_ttl` term of the
-        // `evict_over_budget` filter: false while within the TTL window, true
-        // once the entry has aged past it. This is the cache half of the
-        // dashboard "next to evict" eligibility (the in-use half is folded in
-        // by `HostingManager::is_eviction_eligible`).
-        let min_ttl = Duration::from_secs(60);
-        let (mut cache, time_source) = make_cache(10_000, min_ttl);
-        let key = make_key(1);
-        cache.record_access(key, 111, AccessType::Get, 0, |_| 0);
-
-        let before = cache.eviction_ordered_scores();
-        assert!(
-            !before[0].past_min_ttl,
-            "within min_ttl → not past the TTL gate"
-        );
-
-        // Age the entry past min_ttl.
-        time_source.advance_time(min_ttl + Duration::from_secs(1));
-        let after = cache.eviction_ordered_scores();
-        assert!(
-            after[0].past_min_ttl,
-            "past min_ttl → now eligible for the TTL gate"
-        );
-    }
+    // The former `eviction_ordered_scores_flags_past_min_ttl_after_ttl_elapses`
+    // test was DELETED: it exercised the `past_min_ttl` age gate, which no longer
+    // exists (the `min_ttl` cold-start floor was dropped 2026-07-08 — invariant 3).
+    // Dashboard eviction-eligibility is now "not in use" only; that half is
+    // covered by `HostingManager::is_eviction_eligible` tests in hosting.rs.
 
     // --- Recently-abandoned priority (demand-credit strip) ---
 
@@ -2128,16 +2391,16 @@ mod tests {
     #[ignore]
     #[test]
     fn test_record_abandonment_moves_entry_to_eviction_front() {
-        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(1000);
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
 
         // Equal (neutral) demand -> equal keep_score; eviction order is by
         // access sequence: key1, key2, key3.
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key3, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key3, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(cache.keys_eviction_order(), vec![key1, key2, key3]);
 
         // Abandon key3 — the most recently used — and its keep_score drops to
@@ -2158,11 +2421,53 @@ mod tests {
         );
     }
 
+    /// Decision 3 (invariant 3, 2026-07-08): the recency clock starts at
+    /// subscription TERMINATION. `record_abandonment` (the termination hook) resets
+    /// the contract's `recency_seq` to the current frontier, so a formerly-
+    /// subscribed contract is NOT instantly evicted for an old last-read it accrued
+    /// while parked in the subscription tier. Here `subscribed` has the OLDEST GET
+    /// recency, but after termination it becomes the newest and survives; the
+    /// genuinely-oldest zero-subscriber contract is the victim instead.
+    #[test]
+    fn record_abandonment_resets_recency_at_subscription_termination() {
+        let (mut cache, _time) = make_cache(300); // 3x100-byte entries fit
+        let subscribed = make_key(1);
+        let older = make_key(2);
+        let newer = make_key(3);
+        let trigger = make_key(4);
+
+        // Recency order after the GETs: subscribed < older < newer.
+        cache.record_access(subscribed, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(older, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(newer, 100, AccessType::Get, 0, |_| (0, 0));
+
+        // The subscription on `subscribed` terminates → recency reset to newest.
+        cache.record_abandonment(&subscribed);
+        assert!(
+            cache.get(&subscribed).unwrap().recency_seq > cache.get(&newer).unwrap().recency_seq,
+            "termination must reset recency to the frontier (newer than everything else)"
+        );
+
+        // Insert `trigger` over budget: the victim is the genuinely least-recent
+        // zero-subscriber contract (`older`), NOT the formerly-subscribed one.
+        let result = cache.record_access(trigger, 100, AccessType::Get, 0, |_| (0, 0));
+        assert_eq!(
+            result.evicted,
+            vec![(older, 0)],
+            "the least-recent zero-subscriber contract is shed; termination protected `subscribed`"
+        );
+        assert!(
+            cache.contains(&subscribed),
+            "the formerly-subscribed contract survived: termination reset its recency"
+        );
+        assert!(!cache.contains(&older));
+    }
+
     #[test]
     fn test_record_abandonment_is_idempotent() {
-        let (mut cache, time) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(1000);
         let key = make_key(1);
-        cache.record_access(key, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| (0, 0));
 
         cache.record_abandonment(&key);
         let first = cache.get(&key).unwrap().abandoned_at;
@@ -2179,7 +2484,7 @@ mod tests {
 
     #[test]
     fn test_record_abandonment_missing_key_is_noop() {
-        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(1000);
         let key = make_key(42);
         // Should not panic, should not insert anything.
         cache.record_abandonment(&key);
@@ -2189,15 +2494,15 @@ mod tests {
 
     #[test]
     fn test_record_access_clears_abandoned_marker() {
-        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(1000);
         let key = make_key(1);
-        cache.record_access(key, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| (0, 0));
         cache.record_abandonment(&key);
         assert!(cache.get(&key).unwrap().abandoned_at.is_some());
 
         // Fresh access — a re-subscribe or re-GET — clears the marker
         // and returns the entry to the LRU tail.
-        cache.record_access(key, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| (0, 0));
         assert!(
             cache.get(&key).unwrap().abandoned_at.is_none(),
             "record_access must clear abandoned_at"
@@ -2206,9 +2511,9 @@ mod tests {
 
     #[test]
     fn test_touch_clears_abandoned_marker() {
-        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(1000);
         let key = make_key(1);
-        cache.record_access(key, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| (0, 0));
         cache.record_abandonment(&key);
 
         cache.touch(&key);
@@ -2230,13 +2535,13 @@ mod tests {
         // are past TTL. Without the abandonment bump key1 (oldest)
         // evicts; with the bump key2 (abandoned-and-bumped) evicts
         // even though key1 is older.
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(200);
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
 
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
 
         // key2 is abandoned (latest in use, just lost its subscribers).
         cache.record_abandonment(&key2);
@@ -2247,7 +2552,7 @@ mod tests {
         // Insert key3: now over budget, must evict one. The abandoned
         // bucket means key2 goes first, even though key1 is the older
         // entry by `last_accessed`.
-        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| 0);
+        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| (0, 0));
         assert!(result.is_new);
         assert_eq!(
             result.evicted,
@@ -2265,19 +2570,19 @@ mod tests {
         // Abandoning an entry MUST NOT evict it — the network's
         // persistence-beyond-active-demand property only yields to
         // disk pressure, never to abandonment alone.
-        let (mut cache, time) = make_cache(1000, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(1000);
         let key1 = make_key(1);
         let key2 = make_key(2);
 
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
 
         cache.record_abandonment(&key2);
         time.advance_time(Duration::from_secs(3600));
 
         // No budget pressure → sweep_expired evicts nothing, abandoned
         // or otherwise.
-        let evicted = cache.sweep_expired(|_| 0, MemoryPressure::AtCapacity);
+        let evicted = cache.sweep_expired(|_| (0, 0), MemoryPressure::AtCapacity);
         assert!(evicted.is_empty(), "no pressure → no eviction");
         assert!(cache.contains(&key1));
         assert!(cache.contains(&key2));
@@ -2451,48 +2756,47 @@ mod tests {
     }
 
     /// The budget-triggered eviction counter increments once per over-budget
-    /// eviction and is surfaced via `stats()`; a TTL-protected or no-pressure
-    /// cache leaves it untouched. This is the telemetry A2 ships to observe its
-    /// own eviction rate.
+    /// eviction and is surfaced via `stats()`; a no-pressure (under-budget) cache
+    /// leaves it untouched. This is the telemetry A2 ships to observe its own
+    /// eviction rate. (There is no `min_ttl` floor since 2026-07-08, so an over-
+    /// budget insert evicts — and counts — immediately.)
     #[test]
     fn test_budget_eviction_counter_tracks_over_budget_evictions() {
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let (mut cache, _time) = make_cache(200);
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
+        let key4 = make_key(4);
 
-        cache.record_access(key1, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
+        // Under budget: no eviction, counter untouched.
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(cache.stats().budget_evictions_total, 0);
 
-        // Over budget but every entry is under TTL: no budget eviction yet.
-        cache.record_access(key3, 100, AccessType::Get, 0, |_| 0);
+        // Over budget: the insert immediately sheds the oldest (key1) → counter 1.
+        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| (0, 0));
+        assert_eq!(result.evicted, vec![(key1, 0)]);
         assert_eq!(
             cache.stats().budget_evictions_total,
-            0,
-            "TTL-protected entries must not count as budget evictions"
+            1,
+            "an over-budget insert counts one budget eviction (no min_ttl grace)"
         );
 
-        // Past TTL: a sweep now evicts the single over-budget entry.
-        time.advance_time(Duration::from_secs(61));
-        let evicted = cache.sweep_expired(|_| 0, MemoryPressure::AtCapacity);
-        assert_eq!(
-            evicted.len(),
-            1,
-            "one 100-byte entry brings 300 back to 200"
-        );
+        // A further over-budget insert sheds key2 → counter 2.
+        let result = cache.record_access(key4, 100, AccessType::Get, 0, |_| (0, 0));
+        assert_eq!(result.evicted, vec![(key2, 0)]);
         let stats = cache.stats();
-        assert_eq!(stats.budget_evictions_total, 1);
+        assert_eq!(stats.budget_evictions_total, 2);
         assert_eq!(stats.current_bytes, 200);
         assert_eq!(stats.contract_count, 2);
         assert_eq!(stats.budget_bytes, 200);
 
         // No pressure now (at budget): the counter is unchanged.
-        let evicted = cache.sweep_expired(|_| 0, MemoryPressure::AtCapacity);
+        let evicted = cache.sweep_expired(|_| (0, 0), MemoryPressure::AtCapacity);
         assert!(evicted.is_empty(), "at budget -> no further eviction");
         assert_eq!(
             cache.stats().budget_evictions_total,
-            1,
+            2,
             "counter must not advance with no budget pressure"
         );
     }
@@ -2505,19 +2809,19 @@ mod tests {
     fn test_evicted_unread_counts_only_never_read_seeds() {
         // Budget 100 bytes: only one 100-byte entry fits, so each insert past
         // TTL evicts the resident one.
-        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(100);
         let key1 = make_key(1);
         let key2 = make_key(2);
         let key3 = make_key(3);
 
         // Seed key1 via PUT (read_count == 0 — an unread seed).
-        cache.record_access(key1, 100, AccessType::Put, 0, |_| 0);
+        cache.record_access(key1, 100, AccessType::Put, 0, |_| (0, 0));
         assert_eq!(cache.stats().evicted_unread_total, 0);
 
         // Past TTL, insert key2 (also a seed). key1 is evicted: never read, so
         // it counts as an unread-seed eviction and its age (~61s) is recorded.
         time.advance_time(Duration::from_secs(61));
-        let result = cache.record_access(key2, 100, AccessType::Put, 0, |_| 0);
+        let result = cache.record_access(key2, 100, AccessType::Put, 0, |_| (0, 0));
         assert_eq!(result.evicted, vec![(key1, 0)]);
         let stats = cache.stats();
         assert_eq!(stats.budget_evictions_total, 1);
@@ -2528,13 +2832,13 @@ mod tests {
         );
 
         // Read key2 once (GET) so read_count == 1 — no longer an unread seed.
-        cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
 
         // Past TTL, insert key3 to evict key2. key2 was read once, so it is
         // neither an unread seed nor a recently-read (>=2) victim: the unread
         // counter and age sum both hold.
         time.advance_time(Duration::from_secs(61));
-        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| 0);
+        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(result.evicted, vec![(key2, 0)]);
         let stats = cache.stats();
         assert_eq!(stats.budget_evictions_total, 2);
@@ -2558,23 +2862,23 @@ mod tests {
     #[test]
     fn test_reloaded_entry_eviction_does_not_count_as_unread_seed() {
         // Budget 100 bytes: one 100-byte entry fits.
-        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let (mut cache, _time) = make_cache(100);
         let key1 = make_key(1);
         let key2 = make_key(2);
 
         // Reload key1 from persistence with read_count 0 — the exact shape of a
         // long-hosted entry after a restart resets its counters. (A PUT was its
         // last pre-restart access, so access_type == Put, proving the counter
-        // cannot key on access_type instead of the explicit marker.)
+        // cannot key on access_type instead of the explicit marker.) A reloaded
+        // entry has recency_seq 0, so it is the first eviction candidate.
         cache.load_persisted_entry(key1, 100, AccessType::Put, Duration::from_secs(1), false);
         cache.finalize_loading();
         assert!(cache.contains(&key1));
         assert_eq!(cache.stats().evicted_unread_total, 0);
 
-        // Advance past min_ttl so the reloaded entry is eviction-eligible, then a
-        // fresh insert pushes over budget and sheds it (the post-load burst).
-        time.advance_time(Duration::from_secs(61));
-        let result = cache.record_access(key2, 100, AccessType::Get, 0, |_| 0);
+        // A fresh insert (key2, the op-protected key) pushes over budget and sheds
+        // the reloaded key1 (the post-load burst) — no `min_ttl` wait needed.
+        let result = cache.record_access(key2, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(
             result.evicted,
             vec![(key1, 0)],
@@ -2593,20 +2897,20 @@ mod tests {
     }
 
     /// Restart must NOT fabricate real-GET recency (#4642 review fix): a reloaded
-    /// entry keeps `last_get_seq == 0` regardless of its persisted access type,
+    /// entry keeps `recency_seq == 0` regardless of its persisted access type,
     /// because persistence records only a generic last-ACCESS time and cannot
-    /// distinguish a real GET from a PUT/SUBSCRIBE. Stamping `last_get_seq` from
+    /// distinguish a real GET from a PUT/SUBSCRIBE. Stamping `recency_seq` from
     /// last-access order would let a never-GET-read PUT seed out-survive an entry
     /// with genuine GET demand after a restart.
     #[test]
     fn reloaded_entry_has_zero_get_recency_regardless_of_access_type() {
-        let (mut cache, _) = make_cache(10_000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(10_000);
         let put_seed = make_key(1);
         let subscribed = make_key(2);
 
         // Both reloaded from persistence with different pre-restart access types
         // and different persisted recency (so finalize_loading's last_access_seq
-        // ordering differs) — neither may fabricate a nonzero last_get_seq.
+        // ordering differs) — neither may fabricate a nonzero recency_seq.
         cache.load_persisted_entry(
             put_seed,
             100,
@@ -2624,22 +2928,22 @@ mod tests {
         cache.finalize_loading();
 
         assert_eq!(
-            cache.get(&put_seed).unwrap().last_get_seq,
+            cache.get(&put_seed).unwrap().recency_seq,
             0,
-            "a reloaded PUT entry must have last_get_seq == 0 (never GET-read since restart)"
+            "a reloaded PUT entry must have recency_seq == 0 (never GET-read since restart)"
         );
         assert_eq!(
-            cache.get(&subscribed).unwrap().last_get_seq,
+            cache.get(&subscribed).unwrap().recency_seq,
             0,
-            "a reloaded SUBSCRIBE entry must also have last_get_seq == 0"
+            "a reloaded SUBSCRIBE entry must also have recency_seq == 0"
         );
 
         // A real GET after restart re-stamps it to a genuine (nonzero) value,
         // lifting it out of the never-GET-read front of the eviction order.
-        cache.record_access(put_seed, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(put_seed, 100, AccessType::Get, 0, |_| (0, 0));
         assert!(
-            cache.get(&put_seed).unwrap().last_get_seq > 0,
-            "a real GET after restart must re-stamp last_get_seq to a real value"
+            cache.get(&put_seed).unwrap().recency_seq > 0,
+            "a real GET after restart must re-stamp recency_seq to a real value"
         );
     }
 
@@ -2651,17 +2955,17 @@ mod tests {
     /// stays put.
     #[test]
     fn fuel_gauge_keep_score_set_on_insert_and_refreshed_on_read() {
-        let (mut cache, _) = make_cache(10_000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(10_000);
         let key = make_key(1);
 
         // Insert at floor 0 with demand 3.0 -> keep_score 3.0.
-        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 3.0, |_| 0);
+        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 3.0, |_| (0, 0));
         assert_eq!(cache.get(&key).unwrap().keep_score, 3.0);
         assert_eq!(cache.get(&key).unwrap().predicted_demand, 3.0);
         assert_eq!(cache.get(&key).unwrap().read_count, 1);
 
         // A read with a new demand estimate refreshes keep_score = floor + demand.
-        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 5.0, |_| 0);
+        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 5.0, |_| (0, 0));
         assert_eq!(cache.get(&key).unwrap().keep_score, 5.0);
         assert_eq!(cache.get(&key).unwrap().read_count, 2);
     }
@@ -2675,22 +2979,23 @@ mod tests {
     #[ignore]
     #[test]
     fn fuel_gauge_evicts_lowest_demand_not_lru() {
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(200);
         let high = make_key(1);
         let low = make_key(2);
         let trigger = make_key(3);
 
         // `high` inserted first (older) with strong demand; `low` inserted after
         // with weak demand. A recency-only (LRU) policy would evict `high`.
-        cache.record_access_with_demand(high, 100, AccessType::Get, 0, 10.0, |_| 0);
-        cache.record_access_with_demand(low, 100, AccessType::Get, 0, 1.0, |_| 0);
+        cache.record_access_with_demand(high, 100, AccessType::Get, 0, 10.0, |_| (0, 0));
+        cache.record_access_with_demand(low, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
         assert_eq!(cache.current_bytes(), 200);
 
         time.advance_time(Duration::from_secs(61));
 
         // Over-budget insert must evict the LOWEST keep_score (`low`), not the
         // oldest (`high`).
-        let result = cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 1.0, |_| 0);
+        let result =
+            cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
         assert_eq!(
             result.evicted,
             vec![(low, 0)],
@@ -2729,14 +3034,14 @@ mod tests {
         );
 
         // Budget for exactly two 100-byte contracts.
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(200);
         let near = make_key(1);
         let far = make_key(2);
         let trigger = make_key(3);
 
         // Insert both cold (zero samples), scored only by the distance prior.
-        cache.record_access_with_demand(near, 100, AccessType::Get, 0, near_demand, |_| 0);
-        cache.record_access_with_demand(far, 100, AccessType::Get, 0, far_demand, |_| 0);
+        cache.record_access_with_demand(near, 100, AccessType::Get, 0, near_demand, |_| (0, 0));
+        cache.record_access_with_demand(far, 100, AccessType::Get, 0, far_demand, |_| (0, 0));
         assert_eq!(cache.current_bytes(), 200);
         assert!(
             cache.get(&near).unwrap().keep_score > cache.get(&far).unwrap().keep_score,
@@ -2753,7 +3058,7 @@ mod tests {
             AccessType::Get,
             0,
             NEUTRAL_DEMAND,
-            |_| 0,
+            |_| (0, 0),
         );
         assert_eq!(
             result.evicted,
@@ -2798,14 +3103,14 @@ mod tests {
     #[test]
     fn fuel_gauge_keeps_repeatedly_read_contract_over_junk() {
         // Budget for two 100-byte contracts.
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(200);
         let room = make_key(1); // the "River room": repeatedly read, high demand
         let junk = make_key(2); // never re-read, low demand, inserted LATER
         let trigger = make_key(3);
 
         // Seed the room with strong demand, then read it repeatedly (simulating
         // recurring GETs). These reads are the room's LAST accesses.
-        cache.record_access_with_demand(room, 100, AccessType::Get, 0, 10.0, |_| 0);
+        cache.record_access_with_demand(room, 100, AccessType::Get, 0, 10.0, |_| (0, 0));
         for _ in 0..3 {
             time.advance_time(Duration::from_secs(5));
             cache.touch(&room);
@@ -2814,7 +3119,7 @@ mod tests {
         // Junk arrives AFTER the room's last read, so junk is the more-recently-
         // accessed entry — and carries weak demand.
         time.advance_time(Duration::from_secs(5));
-        cache.record_access_with_demand(junk, 100, AccessType::Get, 0, 1.0, |_| 0);
+        cache.record_access_with_demand(junk, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
 
         // Advance so BOTH are past TTL and eviction-eligible; the room, last read
         // 5s before junk, is the least-recently-accessed of the two.
@@ -2839,7 +3144,8 @@ mod tests {
         // Over-budget insert: the fuel gauge evicts the lowest keep_score (junk).
         // Byte-LRU-with-TTL would instead evict the room (the oldest past-TTL
         // entry) — so this assertion is what fails under a recency-only policy.
-        let result = cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 1.0, |_| 0);
+        let result =
+            cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
         assert_eq!(
             result.evicted,
             vec![(junk, 0)],
@@ -2864,16 +3170,16 @@ mod tests {
     /// and never decreases (Greedy-Dual aging).
     #[test]
     fn eviction_floor_ratchets_up_on_eviction() {
-        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(100);
         assert_eq!(cache.eviction_floor(), 0.0);
 
         // Insert a demand-7 contract, let it age, then evict it via an
         // over-budget insert; the floor must climb to 7.
         let a = make_key(1);
-        cache.record_access_with_demand(a, 100, AccessType::Get, 0, 7.0, |_| 0);
+        cache.record_access_with_demand(a, 100, AccessType::Get, 0, 7.0, |_| (0, 0));
         time.advance_time(Duration::from_secs(61));
         let b = make_key(2);
-        let r = cache.record_access_with_demand(b, 100, AccessType::Get, 0, 2.0, |_| 0);
+        let r = cache.record_access_with_demand(b, 100, AccessType::Get, 0, 2.0, |_| (0, 0));
         assert_eq!(r.evicted, vec![(a, 0)]);
         assert_eq!(
             cache.eviction_floor(),
@@ -2885,7 +3191,7 @@ mod tests {
         // lower-scored victim must not drop the floor below 7.
         time.advance_time(Duration::from_secs(61));
         let c = make_key(3);
-        let r = cache.record_access_with_demand(c, 100, AccessType::Get, 0, 1.0, |_| 0);
+        let r = cache.record_access_with_demand(c, 100, AccessType::Get, 0, 1.0, |_| (0, 0));
         assert_eq!(r.evicted, vec![(b, 0)], "b (keep_score 2) evicts");
         assert_eq!(
             cache.eviction_floor(),
@@ -2899,18 +3205,18 @@ mod tests {
     /// contract cannot outrank a repeatedly-GET one.
     #[test]
     fn put_seeds_but_earns_no_read_demand_credit() {
-        let (mut cache, _) = make_cache(10_000, Duration::from_secs(60));
+        let (mut cache, _) = make_cache(10_000);
         let key = make_key(1);
 
         // Seed via PUT: keep_score = floor(0) + demand, read_count 0.
-        cache.record_access_with_demand(key, 100, AccessType::Put, 0, 2.0, |_| 0);
+        cache.record_access_with_demand(key, 100, AccessType::Put, 0, 2.0, |_| (0, 0));
         assert_eq!(cache.get(&key).unwrap().read_count, 0, "PUT is not a read");
         let seed_score = cache.get(&key).unwrap().keep_score;
         assert_eq!(seed_score, 2.0);
 
         // Manually raise the floor by evicting something else would be indirect;
         // instead assert that a re-PUT does NOT refresh keep_score or read_count.
-        cache.record_access_with_demand(key, 100, AccessType::Put, 0, 9.0, |_| 0);
+        cache.record_access_with_demand(key, 100, AccessType::Put, 0, 9.0, |_| (0, 0));
         assert_eq!(
             cache.get(&key).unwrap().read_count,
             0,
@@ -2923,7 +3229,7 @@ mod tests {
         );
 
         // A GET, by contrast, IS read-demand and refreshes both.
-        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 9.0, |_| 0);
+        cache.record_access_with_demand(key, 100, AccessType::Get, 0, 9.0, |_| (0, 0));
         assert_eq!(cache.get(&key).unwrap().read_count, 1);
         assert_eq!(cache.get(&key).unwrap().keep_score, 9.0);
     }
@@ -2932,16 +3238,16 @@ mod tests {
     /// repeat demand (`read_count >= 2`), not one-off seeds.
     #[test]
     fn evictions_of_recently_read_counts_only_repeat_demand() {
-        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(100);
 
         // A contract read twice (repeat demand), then forced out by junk.
         let read_twice = make_key(1);
-        cache.record_access(read_twice, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(read_twice, 100, AccessType::Get, 0, |_| (0, 0));
         cache.touch(&read_twice); // second read -> read_count 2
         time.advance_time(Duration::from_secs(61));
         // Evict it by inserting a higher-demand junk (so read_twice is the victim).
         let junk = make_key(2);
-        let r = cache.record_access_with_demand(junk, 100, AccessType::Get, 0, 5.0, |_| 0);
+        let r = cache.record_access_with_demand(junk, 100, AccessType::Get, 0, 5.0, |_| (0, 0));
         assert_eq!(r.evicted, vec![(read_twice, 0)]);
         assert_eq!(
             cache.stats().evictions_of_recently_read_total,
@@ -2953,7 +3259,7 @@ mod tests {
         time.advance_time(Duration::from_secs(61));
         let seed = make_key(3);
         // junk currently has demand 5 (>seed's), so make the new one higher.
-        let r = cache.record_access_with_demand(seed, 100, AccessType::Get, 0, 9.0, |_| 0);
+        let r = cache.record_access_with_demand(seed, 100, AccessType::Get, 0, 9.0, |_| (0, 0));
         assert_eq!(r.evicted, vec![(junk, 0)], "junk (read once) evicts");
         assert_eq!(
             cache.stats().evictions_of_recently_read_total,
@@ -2962,95 +3268,109 @@ mod tests {
         );
     }
 
-    /// A subscribed (retained) contract is exempt from eviction even when its
-    /// `keep_score` is the lowest and it is past TTL — the pin dominates demand
-    /// ordering.
+    /// A subscribed contract is ordered LAST, so when only ONE eviction is needed
+    /// to get back under budget a zero-subscriber contract is shed and the
+    /// subscribed one survives — even though its `keep_score` is the lowest and it
+    /// is past TTL. (Subscriber-primary ordering dominates demand ordering; the
+    /// subscribed contract is NOT hard-pinned — see
+    /// `evict_all_subscribed_sheds_fewest_as_last_resort` for the last-resort shed.)
     #[test]
-    fn subscribe_pin_exempts_lowest_score_from_eviction() {
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
-        let pinned = make_key(1); // lowest demand, but subscribed
+    fn subscribed_contract_ordered_last_survives_while_zero_sub_evicted() {
+        let (mut cache, time) = make_cache(200);
+        let subscribed = make_key(1); // lowest demand, but subscribed
         let other = make_key(2);
         let trigger = make_key(3);
 
-        cache.record_access_with_demand(pinned, 100, AccessType::Get, 0, 0.1, |_| 0);
-        cache.record_access_with_demand(other, 100, AccessType::Get, 0, 5.0, |_| 0);
+        cache.record_access_with_demand(subscribed, 100, AccessType::Get, 0, 0.1, |_| (0, 0));
+        cache.record_access_with_demand(other, 100, AccessType::Get, 0, 5.0, |_| (0, 0));
         time.advance_time(Duration::from_secs(61));
 
-        // Over budget: `pinned` has the lowest keep_score and would evict first,
-        // but should_retain protects it, so `other` is evicted instead.
+        // Over budget by one entry: `subscribed` has the lowest keep_score and a
+        // naive demand order would evict it first, but it is downstream-subscribed
+        // so it sorts LAST — the zero-subscriber `other` is shed instead.
         let result = cache.record_access_with_demand(trigger, 100, AccessType::Get, 0, 5.0, |k| {
-            (*k == pinned) as usize
+            (0, (*k == subscribed) as usize)
         });
         assert_eq!(
             result.evicted,
             vec![(other, 0)],
-            "an active subscription pins the contract even at the lowest keep_score"
+            "the subscribed contract is ordered last; the zero-subscriber one sheds"
         );
-        assert!(cache.contains(&pinned));
+        assert_eq!(
+            result.evicted_in_use,
+            Vec::<ContractKey>::new(),
+            "no in-use contract was shed here, so nothing needs subscription teardown"
+        );
+        assert!(cache.contains(&subscribed));
         assert!(!cache.contains(&other));
     }
 
     // --- Subscriber-primary eviction (#4642, PR-1) ---
 
-    /// Under normal (AtCapacity) over-budget pressure a subscribed contract is
-    /// PINNED and only the zero-subscriber contract is evicted.
+    /// Under normal (AtCapacity) over-budget pressure the zero-subscriber contract
+    /// is shed before the subscribed one (subscriber-primary ordering). The
+    /// subscribed contract is ordered LAST, not hard-pinned.
     #[test]
-    fn evict_normal_pins_subscribed_drops_zero_sub() {
-        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+    fn evict_normal_drops_zero_sub_before_subscribed() {
+        let (mut cache, time) = make_cache(200);
         let a = make_key(1);
         let b = make_key(2);
         let c = make_key(3);
 
-        // A is subscribed (pinned); B is zero-subscriber.
-        let subs = |k: &ContractKey| usize::from(*k == a);
+        // A is subscribed (downstream); B is zero-subscriber.
+        let subs = |k: &ContractKey| (0, usize::from(*k == a));
         cache.record_access(a, 100, AccessType::Get, 0, subs);
         cache.record_access(b, 100, AccessType::Get, 0, subs);
         assert_eq!(cache.current_bytes(), 200);
 
-        // Past TTL, insert C over budget. Under AtCapacity, A (subscribed) is
-        // pinned and B (zero-subscriber, past TTL) is the only eligible victim.
+        // Past TTL, insert C over budget. Both A and B are eligible (past TTL),
+        // but B (zero-subscriber) sorts ahead of A (subscribed), so B is the
+        // victim and one eviction is enough — A survives, ordered last.
         time.advance_time(Duration::from_secs(61));
         let result = cache.record_access(c, 100, AccessType::Get, 0, subs);
         assert_eq!(
             result.evicted,
             vec![(b, 0)],
-            "a subscribed contract is pinned; only the zero-subscriber one is evicted"
+            "the zero-subscriber contract sheds before the subscribed one"
         );
-        assert!(cache.contains(&a), "subscribed A stays pinned");
+        assert!(cache.contains(&a), "subscribed A survives (ordered last)");
         assert!(cache.contains(&c));
         assert!(!cache.contains(&b));
     }
 
-    /// Neither SUBSCRIBE nor PUT refreshes the eviction recency key, so a
-    /// contract subscribed/re-PUT after its last GET stays the least-recent
-    /// real-GET entry and is evicted first.
+    /// A real GET OR PUT (genuine client access) refreshes the eviction recency
+    /// key (invariant 3, decision 2026-07-08); SUBSCRIBE / renewal does NOT. This
+    /// discriminates both facts at once: `a` is re-PUT (must float to newest, so
+    /// it survives) while `b` is only re-SUBSCRIBEd (must stay stale, so it is the
+    /// victim). Without the PUT-refresh, `a` (the oldest GET) would be the victim
+    /// instead — so this fails under a GET-only recency rule.
     #[test]
-    fn real_get_refreshes_recency_subscribe_and_put_do_not() {
-        let (mut cache, time) = make_cache(300, Duration::from_secs(60));
+    fn real_get_and_put_refresh_recency_subscribe_does_not() {
+        let (mut cache, _time) = make_cache(300);
         let a = make_key(1);
         let b = make_key(2);
         let c = make_key(3);
         let d = make_key(4);
 
-        // last_get order A < B < C.
-        cache.record_access(a, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(b, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(c, 100, AccessType::Get, 0, |_| 0);
+        // Recency order after the initial GETs: A < B < C (A oldest).
+        cache.record_access(a, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(b, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(c, 100, AccessType::Get, 0, |_| (0, 0));
 
-        // A SUBSCRIBE on A and a PUT on B must NOT refresh their real-GET
-        // recency, so A stays the least-recently-GET entry.
-        cache.record_access(a, 100, AccessType::Subscribe, 0, |_| 0);
-        cache.record_access(b, 100, AccessType::Put, 0, |_| 0);
+        // A PUT on A refreshes A's recency (genuine client access) → A becomes
+        // NEWEST. A SUBSCRIBE on B must NOT refresh B → B stays at its GET recency,
+        // so B is now the least-recently-accessed entry.
+        cache.record_access(a, 100, AccessType::Put, 0, |_| (0, 0));
+        cache.record_access(b, 100, AccessType::Subscribe, 0, |_| (0, 0));
 
-        time.advance_time(Duration::from_secs(61));
-        let result = cache.record_access(d, 100, AccessType::Get, 0, |_| 0);
+        let result = cache.record_access(d, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(
             result.evicted,
-            vec![(a, 0)],
-            "A is evicted: SUBSCRIBE/PUT did not refresh its real-GET recency"
+            vec![(b, 0)],
+            "B is evicted: SUBSCRIBE did not refresh recency, but A's PUT did (A survives)"
         );
-        assert!(!cache.contains(&a));
-        assert!(cache.contains(&b));
+        assert!(cache.contains(&a), "A survives: its PUT refreshed recency");
+        assert!(!cache.contains(&b));
         assert!(cache.contains(&c));
         assert!(cache.contains(&d));
     }
@@ -3059,21 +3379,21 @@ mod tests {
     /// the newest position so a different (now least-recent) entry evicts.
     #[test]
     fn real_get_refreshes_recency() {
-        let (mut cache, time) = make_cache(300, Duration::from_secs(60));
+        let (mut cache, time) = make_cache(300);
         let a = make_key(1);
         let b = make_key(2);
         let c = make_key(3);
         let d = make_key(4);
 
-        cache.record_access(a, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(b, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(c, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(a, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(b, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(c, 100, AccessType::Get, 0, |_| (0, 0));
 
         // A real GET on A makes A the newest, leaving B least-recently-GET.
-        cache.record_access(a, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(a, 100, AccessType::Get, 0, |_| (0, 0));
 
         time.advance_time(Duration::from_secs(61));
-        let result = cache.record_access(d, 100, AccessType::Get, 0, |_| 0);
+        let result = cache.record_access(d, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(
             result.evicted,
             vec![(b, 0)],
@@ -3085,113 +3405,195 @@ mod tests {
         assert!(cache.contains(&d));
     }
 
-    /// The OOM valve (Overflow) pierces the in-use pin and sheds the
-    /// FEWEST-subscriber contract first, bumping the valve counter.
+    /// The Overflow-pressure sweep sheds the FEWEST-subscriber contract first and
+    /// bumps both the OOM-valve counter and the subscribed-eviction counter. (With
+    /// `min_ttl` dropped 2026-07-08 there is no cold-start floor to pierce;
+    /// Overflow's only remaining distinct power is piercing the op-scoped backstop,
+    /// which a periodic sweep never sets — so here it behaves like AtCapacity
+    /// except for the OOM-valve counter.)
     #[test]
-    fn oom_valve_sheds_fewest_subscriber_piercing_pin() {
-        let (mut cache, _time) = make_cache(100, Duration::from_secs(60));
+    fn oom_valve_sheds_fewest_subscriber() {
+        // Seed under a generous budget so the inserts don't auto-evict, then
+        // tighten so both are resident and over budget for the sweep.
+        let (mut cache, _time) = make_cache(100_000);
         let a = make_key(1);
         let b = make_key(2);
 
-        // A has more subscribers than B; both are subscribed (pinned under
-        // AtCapacity).
-        let subs = |k: &ContractKey| if *k == a { 2 } else { 1 };
+        // A has more downstream subscribers than B; both are subscribed.
+        let subs = |k: &ContractKey| if *k == a { (0, 2) } else { (0, 1) };
         cache.record_access(a, 100, AccessType::Get, 0, subs);
-        // Inserting B pushes over budget, but under AtCapacity both are pinned
-        // (subscriber_count >= 1) and B is age-0, so nothing is evicted.
-        let insert = cache.record_access(b, 100, AccessType::Get, 0, subs);
-        assert!(
-            insert.evicted.is_empty(),
-            "AtCapacity pins both subscribed contracts"
-        );
+        cache.record_access(b, 100, AccessType::Get, 0, subs);
+        cache.set_budget_for_test(100);
         assert!(cache.contains(&a));
         assert!(cache.contains(&b));
         assert_eq!(cache.current_bytes(), 200, "200 bytes over the 100 budget");
 
-        // The OOM valve pierces the pin and sheds the FEWEST-subscriber contract
-        // (B, 1 sub) before A (2 subs), bumping the valve counter.
+        // The Overflow sweep sheds the FEWEST-subscriber contract (B, 1 sub) before
+        // A (2 subs), bumping both counters.
         let evicted = cache.sweep_expired(subs, MemoryPressure::Overflow);
         assert_eq!(
-            evicted,
+            evicted_pairs(&evicted),
             vec![(b, 0)],
             "fewest-subscriber contract sheds first"
+        );
+        assert!(
+            evicted.iter().all(|e| e.was_in_use),
+            "the shed contract was subscribed, so it is flagged in-use for teardown"
         );
         assert!(cache.contains(&a), "the more-subscribed contract survives");
         assert!(!cache.contains(&b));
         assert_eq!(cache.stats().oom_valve_evictions_total, 1);
+        assert_eq!(
+            cache.stats().subscribed_evictions_total,
+            1,
+            "shedding a subscribed contract bumps the subscribed-eviction falsifier"
+        );
     }
 
-    /// With equal subscriber counts, the OOM valve tiebreaks by least-recent
-    /// real GET.
+    /// With equal subscriber counts, the Overflow sweep tiebreaks by least-recent
+    /// real GET/PUT.
     #[test]
     fn oom_valve_equal_subscribers_sheds_least_recent_get() {
-        let (mut cache, _time) = make_cache(100, Duration::from_secs(60));
+        // Seed under a generous budget (distinct recency: A older than B), then
+        // tighten so both are resident and over budget for the sweep.
+        let (mut cache, _time) = make_cache(100_000);
         let a = make_key(1);
         let b = make_key(2);
 
-        // Equal subscriber counts: the tiebreak is least-recent real GET.
-        cache.record_access(a, 100, AccessType::Get, 0, |_| 1);
-        cache.record_access(b, 100, AccessType::Get, 0, |_| 1);
+        cache.record_access(a, 100, AccessType::Get, 0, |_| (0, 1)); // recency: A older
+        cache.record_access(b, 100, AccessType::Get, 0, |_| (0, 1)); // recency: B newer
+        cache.set_budget_for_test(100);
         assert_eq!(cache.current_bytes(), 200);
 
-        let evicted = cache.sweep_expired(|_| 1, MemoryPressure::Overflow);
+        let evicted = cache.sweep_expired(|_| (0, 1), MemoryPressure::Overflow);
         assert_eq!(
-            evicted,
+            evicted_pairs(&evicted),
             vec![(a, 0)],
-            "with equal subscribers, the least-recently-GET contract (A) sheds"
+            "with equal subscribers, the least-recently-accessed contract (A) sheds"
         );
         assert!(!cache.contains(&a));
         assert!(cache.contains(&b));
         assert_eq!(cache.stats().oom_valve_evictions_total, 1);
     }
 
-    /// A normal AtCapacity eviction of a zero-subscriber contract must NOT
-    /// touch the OOM-valve counter (that counter is only for pierced pins).
+    /// A normal AtCapacity eviction of a zero-subscriber contract must NOT touch
+    /// EITHER the OOM-valve counter (Overflow-pressure only) or the
+    /// subscribed-eviction counter (in-use victims only).
     #[test]
     fn oom_valve_counter_zero_under_normal_atcapacity() {
-        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let (mut cache, _time) = make_cache(100);
         let a = make_key(1);
         let b = make_key(2);
 
-        cache.record_access(a, 100, AccessType::Get, 0, |_| 0);
-        time.advance_time(Duration::from_secs(61));
-        // Normal AtCapacity eviction of a zero-subscriber, past-TTL contract.
-        let result = cache.record_access(b, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(a, 100, AccessType::Get, 0, |_| (0, 0));
+        // Inserting B (the op-protected key) over budget evicts the older, zero-
+        // subscriber A under AtCapacity — no `min_ttl` wait needed.
+        let result = cache.record_access(b, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(result.evicted, vec![(a, 0)]);
+        assert!(
+            result.evicted_in_use.is_empty(),
+            "a zero-subscriber eviction needs no subscription teardown"
+        );
         assert_eq!(
             cache.stats().oom_valve_evictions_total,
             0,
             "a normal zero-subscriber eviction must not touch the OOM-valve counter"
         );
+        assert_eq!(
+            cache.stats().subscribed_evictions_total,
+            0,
+            "a zero-subscriber eviction must not touch the subscribed-eviction counter"
+        );
     }
 
-    /// Cold-start grace: a fresh, never-read zero-subscriber PUT seed survives
-    /// over-budget pressure within min_ttl, then becomes evictable past it.
+    /// A fresh PUT resets `recency_seq` (invariant 3, decision 2026-07-08), so it
+    /// is protected by being the most-recently-accessed — NO `min_ttl` floor
+    /// needed. It out-survives an OLDER contract and is never evicted by its own
+    /// insert (the op-scoped backstop). This is what `min_ttl`'s cold-start grace
+    /// used to provide, now delivered by recency instead.
     #[test]
-    fn cold_start_grace_fresh_unread_seed_survives_min_ttl() {
-        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
-        let seed = make_key(1);
-        let other = make_key(2);
+    fn fresh_put_protected_by_recency_not_min_ttl() {
+        let (mut cache, _time) = make_cache(100);
+        let old = make_key(1);
+        let seed = make_key(2);
 
-        // A fresh PUT seed (never GET-read, zero-subscriber, read_count 0).
-        cache.record_access(seed, 100, AccessType::Put, 0, |_| 0);
-        // Inserting `other` pushes over budget, but the seed is age-0 / within
-        // min_ttl, so cold-start grace keeps it: nothing is evicted.
-        let result = cache.record_access(other, 100, AccessType::Get, 0, |_| 0);
-        assert!(
-            result.evicted.is_empty(),
-            "a fresh unread zero-subscriber seed is not evicted within min_ttl even over budget"
+        // An older GET, then a fresh zero-subscriber PUT seed. Budget fits one.
+        cache.record_access(old, 100, AccessType::Get, 0, |_| (0, 0)); // recency: older
+        let result = cache.record_access(seed, 100, AccessType::Put, 0, |_| (0, 0));
+
+        // The fresh PUT seed (newest recency + op-protected) survives; the OLDER
+        // contract is shed. Under a GET-only recency rule the seed would have
+        // recency 0 and be the victim instead — so this pins the PUT-refresh.
+        assert_eq!(
+            result.evicted,
+            vec![(old, 0)],
+            "the fresh PUT out-survives the older contract by recency"
         );
-        assert!(cache.contains(&seed));
-        assert!(cache.contains(&other));
+        assert!(
+            cache.contains(&seed),
+            "a fresh PUT is protected by its recency + the op-scoped backstop"
+        );
+        assert!(!cache.contains(&old));
+    }
 
-        // Past min_ttl the unread seed becomes eligible and sheds under budget.
+    /// LAST RESORT (Ian's confirmed ordering, #4642): when EVERY eligible contract
+    /// is subscribed and the peer is still over budget, the fewest-`(local,
+    /// downstream)`-subscriber one IS shed under normal AtCapacity pressure (no
+    /// hard pin), and is flagged `was_in_use` so the manager tears down its
+    /// subscription state. Also checks fewest-LOCAL-first: a downstream-only
+    /// contract is shed before a local-client one.
+    #[test]
+    fn evict_all_subscribed_sheds_fewest_as_last_resort() {
+        let (mut cache, time) = make_cache(200);
+        let local_sub = make_key(1); // (local=1, downstream=0) — evicted LAST
+        let downstream_sub = make_key(2); // (local=0, downstream=5) — evicted first
+        let trigger = make_key(3);
+
+        // Every contract is subscribed; NONE is zero-subscriber.
+        let subs = |k: &ContractKey| {
+            if *k == local_sub {
+                (1, 0)
+            } else if *k == downstream_sub {
+                (0, 5)
+            } else {
+                (0, 1) // trigger: one downstream subscriber
+            }
+        };
+        cache.record_access(local_sub, 100, AccessType::Get, 0, subs);
+        cache.record_access(downstream_sub, 100, AccessType::Get, 0, subs);
+        assert_eq!(cache.current_bytes(), 200);
+
+        // Age both past min_ttl so they are eligible, then insert `trigger` over
+        // budget. Nothing is zero-subscriber, so the fewest-`(local, downstream)`
+        // contract — `downstream_sub` (0, 5) sorts ahead of `local_sub` (1, 0) —
+        // is shed as the last resort, NOT hard-pinned.
         time.advance_time(Duration::from_secs(61));
-        let evicted = cache.sweep_expired(|_| 0, MemoryPressure::AtCapacity);
-        assert!(
-            evicted.iter().any(|(k, _)| *k == seed),
-            "past min_ttl the unread seed is evicted"
+        let result = cache.record_access(trigger, 100, AccessType::Get, 0, subs);
+        assert_eq!(
+            result.evicted,
+            vec![(downstream_sub, 0)],
+            "with only subscribed contracts, the fewest-LOCAL (then fewest-\
+             downstream) one is shed — the local-client contract is evicted last"
         );
-        assert!(!cache.contains(&seed));
+        assert_eq!(
+            result.evicted_in_use,
+            vec![downstream_sub],
+            "the shed subscribed contract is flagged in-use for teardown"
+        );
+        assert!(
+            cache.contains(&local_sub),
+            "the local-client contract survives (ordered last)"
+        );
+        assert!(!cache.contains(&downstream_sub));
+        assert_eq!(
+            cache.stats().subscribed_evictions_total,
+            1,
+            "shedding a subscribed contract bumps the falsifier under AtCapacity"
+        );
+        assert_eq!(
+            cache.stats().oom_valve_evictions_total,
+            0,
+            "AtCapacity last-resort shed is NOT an OOM-valve eviction"
+        );
     }
 }

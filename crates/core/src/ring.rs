@@ -1683,6 +1683,12 @@ impl Ring {
             // that shed a subscribed contract under genuine RAM overflow. Stays 0
             // until the Overflow trigger is wired (mechanism-only this release).
             snapshot.hosting_oom_valve_evictions_total = Some(hosting.oom_valve_evictions_total);
+            // Subscribed-eviction falsifier (#4642 subscriber-primary rework): the
+            // count of evictions that shed a SUBSCRIBED contract (the riskiest new
+            // behavior). Unlike the OOM-valve counter this can go nonzero as soon
+            // as the rework ships (AtCapacity now sheds subscribed as a last
+            // resort). Same periodic cadence.
+            snapshot.hosting_subscribed_evictions_total = Some(hosting.subscribed_evictions_total);
             // Local-client GET hit-rate (#4642 A3): served-locally vs routed to
             // the network. Driven by the real serve/forward decision in the
             // client GET handler, so it is read from the manager counters (not
@@ -2592,7 +2598,10 @@ impl Ring {
             }
 
             // Sweep expired entries from GET subscription cache
-            let expired = ring.sweep_expired_get_subscriptions();
+            let crate::ring::hosting::HostingSweepResult {
+                expired,
+                evicted_in_use_teardown,
+            } = ring.sweep_expired_get_subscriptions();
 
             // Do NOT early-continue when `expired` is empty: pending
             // reclamation retries below must run every cycle, otherwise
@@ -2624,16 +2633,50 @@ impl Ring {
                 );
             }
 
+            // Sync the `InterestManager` for any still-in-use victim the sweep
+            // shed as a last resort: `teardown_evicted_in_use_contract` cleared
+            // the hosting maps but the `InterestManager` lives on `OpManager`, so
+            // ghost `interested_peers` / `peer_contracts` / `local_client_count`
+            // entries survive unless we replay the same removals here (PR #4734
+            // Fix 1). No-op in the common zero-subscriber sweep. Run BEFORE the
+            // `unregister_local_hosting` loop below so that call observes the
+            // now-zeroed subscriber counts and reports full interest loss (→
+            // retraction), mirroring the GET/PUT host-formation paths.
+            if let Some(op_manager) = &op_manager {
+                for teardown in &evicted_in_use_teardown {
+                    op_manager.interest_manager.remove_evicted_in_use(
+                        &teardown.key,
+                        &teardown.downstream_peers,
+                        teardown.local_client_count,
+                    );
+                }
+            }
+
             // Clean up local subscription state for each expired contract.
-            // Note: contracts with subscribers (client subscriptions or
-            // downstream subscribers) are PINNED from eviction by the
-            // subscriber_count closure in sweep_expired_hosting() under normal
-            // AtCapacity pressure; only the deliberately-unwired OOM valve
-            // (MemoryPressure::Overflow) can pierce that pin.
+            // Note: under the subscriber-primary ordering (#4642, invariant 3) a
+            // contract with subscribers is ordered LAST but NOT hard-pinned, so
+            // `sweep_expired_hosting()` CAN shed a still-in-use contract as a last
+            // resort — and when it does, it has already torn down that contract's
+            // subscription state (downstream + client subscriptions + upstream
+            // lease) so `contract_in_use` is false before we reclaim it. The
+            // `ring.unsubscribe(&key)` below is therefore a belt-and-suspenders
+            // no-op for those (its lease is already gone) and, for a
+            // zero-subscriber eviction, drops any lingering upstream lease.
             // The `expected_generation` snapshot is captured atomically with
             // the eviction decision in `HostingCache::record_access` /
             // `sweep_expired`; it is re-checked at deletion time by
             // `RuntimePool::remove_contract` to close the re-host race.
+            //
+            // Also retract the local hosting advertisement for each evicted
+            // contract, mirroring the GET (`get/op_ctx_task.rs`) and PUT
+            // (`put/op_ctx_task.rs`) host-formation paths (PR #4734 Fix 1):
+            // clear `LocalInterest.hosting` via `unregister_local_hosting` and
+            // collect the contracts that thereby lose ALL interest so the
+            // neighbor advertisement can be retracted below. Without this an
+            // evicted contract keeps `hosting = true` and its advertisement
+            // lingers on neighbors — a stale-interest leak, now widened because
+            // subscribed contracts are sweep-evictable under invariant 3.
+            let mut removed_contracts = Vec::new();
             for (key, expected_generation) in expired {
                 ring.unsubscribe(&key);
                 tracing::info!(
@@ -2641,12 +2684,28 @@ impl Ring {
                     "Cleaned up expired hosting subscription from local state"
                 );
                 if let Some(op_manager) = &op_manager {
+                    if op_manager.interest_manager.unregister_local_hosting(&key) {
+                        removed_contracts.push(key);
+                    }
                     crate::operations::reclaim_evicted_contract(
                         op_manager,
                         key,
                         expected_generation,
                     );
                 }
+            }
+
+            // Retract neighbor advertisements for contracts that lost all local
+            // interest above. The sweep never ADDS interest, so `added` is always
+            // empty here (unlike the GET/PUT paths). `broadcast_change_interests`
+            // is a no-op when `removed_contracts` is empty (the common case).
+            if let Some(op_manager) = &op_manager {
+                crate::operations::broadcast_change_interests(
+                    op_manager,
+                    Vec::new(),
+                    removed_contracts,
+                )
+                .await;
             }
 
             // Retry pending reclamations queued by the two skip points
@@ -4256,22 +4315,22 @@ impl Ring {
 
     /// Sweep for expired entries in the hosting cache.
     ///
-    /// Returns `(ContractKey, write_generation)` pairs for contracts
-    /// evicted from this cache. Contracts with client subscriptions
-    /// (or downstream/network subscribers) are protected from eviction.
-    /// The generation snapshot is carried through `EvictContract` so the
-    /// deletion-time guard can detect a re-host race.
-    pub fn sweep_expired_hosting(&self) -> Vec<(ContractKey, u64)> {
+    /// Returns a [`HostingSweepResult`]: the `(ContractKey, write_generation)`
+    /// reclaim pairs plus, for any still-in-use victim shed as a last resort,
+    /// the subscription state torn down (so the caller can sync the
+    /// `InterestManager`). Under subscriber-primary ordering a contract with
+    /// subscribers is evicted LAST (shed only when nothing with fewer
+    /// subscribers is eligible). The generation snapshot is carried through
+    /// `EvictContract` so the deletion-time guard can detect a re-host race.
+    pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
         self.hosting_manager.sweep_expired_hosting()
     }
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================
     /// Sweep for expired entries (delegated to hosting cache).
     ///
-    /// Returns `(ContractKey, write_generation)` pairs for contracts
-    /// evicted from the cache. Contracts with client subscriptions are
-    /// protected from eviction.
-    pub fn sweep_expired_get_subscriptions(&self) -> Vec<(ContractKey, u64)> {
+    /// Returns a [`HostingSweepResult`] (see [`Self::sweep_expired_hosting`]).
+    pub fn sweep_expired_get_subscriptions(&self) -> crate::ring::hosting::HostingSweepResult {
         // Delegate to hosting cache
         self.sweep_expired_hosting()
     }
@@ -6433,6 +6492,63 @@ mod k_closest_source_tests {
              is_peer_ready in the routability mapping): k_closest falls back to \
              not-ready peers, so a not-ready closer neighbor is still a valid route \
              target and must keep this node from short-circuiting its renewal (#4440)."
+        );
+    }
+
+    /// PR #4734 Fix 1: the periodic hosting sweep must retract the local hosting
+    /// advertisement for every contract it evicts, exactly like the GET/PUT
+    /// host-formation paths (`cache_contract_locally` / the PUT relay store). An
+    /// evicted contract that keeps `LocalInterest.hosting = true` and does not
+    /// retract its neighbor advertisement is a stale-interest leak — now widened
+    /// because subscribed contracts are sweep-evictable under invariant 3.
+    ///
+    /// The GET/PUT pins (`cache_contract_locally_syncs_interest_on_subscribed_eviction`)
+    /// only cover `remove_evicted_in_use`; this pins the sweep's matching
+    /// `unregister_local_hosting` + `broadcast_change_interests` so a future refactor
+    /// can't silently drop the retraction from the maintenance path.
+    #[test]
+    fn sweep_retracts_hosting_interest_on_eviction() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        // Teardown of a still-in-use victim (subscribed contract shed as a last
+        // resort) must sync the InterestManager, matching GET/PUT.
+        assert!(
+            body.contains("remove_evicted_in_use"),
+            "sweep must call remove_evicted_in_use to sync the InterestManager for \
+             a subscribed contract it sheds (mirrors GET/PUT)."
+        );
+        // Every evicted contract must clear its local hosting flag …
+        assert!(
+            body.contains("unregister_local_hosting"),
+            "sweep must call unregister_local_hosting for each evicted contract so \
+             the evicted contract does not keep LocalInterest.hosting = true \
+             (PR #4734 Fix 1 — mirrors GET/PUT host-formation paths)."
+        );
+        // … and retract the neighbor advertisement for those that lost all interest.
+        assert!(
+            body.contains("broadcast_change_interests"),
+            "sweep must call broadcast_change_interests to retract neighbor \
+             advertisements for evicted contracts (PR #4734 Fix 1)."
+        );
+        // Ordering: the remove_evicted_in_use CALL must run BEFORE the
+        // unregister_local_hosting CALL so the latter observes zeroed subscriber
+        // counts and reports full interest loss (→ retraction), matching the
+        // GET/PUT comment discipline. Anchor on the call expressions (`.method(`),
+        // not the bare identifiers, so a prose mention in a leading comment (e.g.
+        // "Run BEFORE the `unregister_local_hosting` loop") can't fool the check.
+        let teardown_pos = body
+            .find("interest_manager.remove_evicted_in_use(")
+            .expect("remove_evicted_in_use call present");
+        let unregister_pos = body
+            .find("interest_manager.unregister_local_hosting(")
+            .expect("unregister_local_hosting call present");
+        assert!(
+            teardown_pos < unregister_pos,
+            "remove_evicted_in_use must precede unregister_local_hosting in the sweep \
+             so interest loss is reported against the already-zeroed subscriber counts."
         );
     }
 

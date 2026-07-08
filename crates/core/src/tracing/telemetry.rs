@@ -2231,6 +2231,17 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_oom_valve_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_oom_valve_evictions_total),
                 );
+                // Subscribed-eviction falsifier (#4642 subscriber-primary rework):
+                // count of evictions that shed a SUBSCRIBED contract. Same
+                // hand-mirrored footgun — invisible to the collector unless added
+                // here. Unlike the OOM-valve gauge this can go nonzero as soon as
+                // the rework ships (AtCapacity now sheds subscribed as a last
+                // resort). Pinned by
+                // `router_snapshot_json_includes_subscribed_evictions_gauge`.
+                obj.insert(
+                    "hosting_subscribed_evictions_total".to_string(),
+                    serde_json::json!(snapshot.hosting_subscribed_evictions_total),
+                );
                 // Terminal advertisement-consult counters (hosting redesign
                 // piece C, #4646; exported per #4658). Same hand-mirrored
                 // footgun as the gauges above: a new `RouterSnapshotInfo` field
@@ -2664,6 +2675,26 @@ mod tests {
         assert_eq!(
             json["hosting_oom_valve_evictions_total"], 359,
             "hosting_oom_valve_evictions_total must reach the OTLP body"
+        );
+    }
+
+    /// Pin: the subscribed-eviction falsifier gauge (#4642 subscriber-primary
+    /// rework) must reach the hand-mirrored OTLP body. This counts evictions that
+    /// shed a SUBSCRIBED contract as a last resort — unlike the OOM-valve gauge it
+    /// can go nonzero the moment the rework ships (AtCapacity now sheds subscribed
+    /// contracts), so a silent drop would blind central telemetry to the single
+    /// riskiest new hosting behavior exactly when it first fires.
+    #[test]
+    fn router_snapshot_json_includes_subscribed_evictions_gauge() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_subscribed_evictions_total = Some(287);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(
+            json["hosting_subscribed_evictions_total"], 287,
+            "hosting_subscribed_evictions_total must reach the OTLP body"
         );
     }
 

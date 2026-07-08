@@ -1172,6 +1172,11 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 ///    (i.e., `access_result.is_new && put_persisted`). NOT gated on
 ///    `is_client_requester`; legacy announces on any first-time relay
 ///    cache too (`get.rs:2278, 2370`).
+// NAMING LANDMINE: "cache"/"store" here means HOSTING, not a lesser cache tier. A
+// peer stores a contract because a GET routed through it, and a routed GET is a
+// demand signal, so the peer HOSTS the contract (WASM+state, kept fresh in the
+// update mesh) until LRU eviction. There is no cache tier. Slated to be renamed
+// hosting-* AFTER 0.2.94. See .claude/rules/hosting-invariants.md + epic #4642.
 async fn cache_contract_locally(
     op_manager: &OpManager,
     key: ContractKey,
@@ -1276,6 +1281,21 @@ async fn cache_contract_locally(
     // `is_original_requester = upstream_addr.is_none()`.
     if is_client_requester {
         op_manager.ring.mark_local_client_access(&key);
+    }
+
+    // Sync the InterestManager for any subscribed contract the subscriber-primary
+    // eviction shed + tore down (#4642 invariant 3). Run BEFORE the
+    // `unregister_local_hosting` loop below so that call observes the now-zeroed
+    // subscriber counts and reports full interest loss (→ retraction via
+    // `removed_contracts`). Without this, ghost `interested_peers` /
+    // `peer_contracts` / `local_client_count` entries survive and mis-target
+    // UPDATE broadcasts / inflate upstream interest counts (PR #4734 Fix 1).
+    for teardown in &access_result.evicted_in_use_teardown {
+        op_manager.interest_manager.remove_evicted_in_use(
+            &teardown.key,
+            &teardown.downstream_peers,
+            teardown.local_client_count,
+        );
     }
 
     let mut removed_contracts = Vec::new();
@@ -2149,6 +2169,13 @@ async fn run_relay_get<CB>(
     }
 }
 
+// NAMING LANDMINE: "relay" is a fossil of the hollow-relay firefight (#3763).
+// Forwarding a GET does NOT make a peer a hollow relay; a routed GET is demand, so
+// the peer HOSTS the contract (routing and hosting co-occur; there is no
+// forward-without-hosting for GET/PUT). The only true hollow relay was the
+// standalone SUBSCRIBE hop, being retired (subscribe folds into GET/PUT). Slated for
+// removal/rename by piece D (chain peers become real hosts). Do not name new code
+// "relay". See .claude/rules/hosting-invariants.md terminology + epic #4642.
 #[allow(clippy::too_many_arguments)]
 async fn drive_relay_get<CB>(
     op_manager: &Arc<OpManager>,
@@ -4104,6 +4131,30 @@ mod tests {
              executor rejects the PutQuery. The legacy branch at \
              get.rs:2420-2435 continues these side effects on error; \
              the driver must match."
+        );
+    }
+
+    /// Pin (PR #4734 Fix 1): the GET eviction handler must sync the
+    /// InterestManager for any subscribed contract the subscriber-primary
+    /// eviction shed + tore down. `teardown_evicted_in_use_contract` clears the
+    /// hosting maps, but the InterestManager lives on `OpManager`, so a dropped
+    /// `remove_evicted_in_use` call leaves ghost `interested_peers` /
+    /// `peer_contracts` / `local_client_count` entries that mis-target UPDATE
+    /// broadcasts and do NOT self-heal. A refactor that drops the call must trip
+    /// this pin (the "manually-inlined side effect after a task-per-tx
+    /// migration" class — see .claude/rules/bug-prevention-patterns.md).
+    #[test]
+    fn cache_contract_locally_syncs_interest_on_subscribed_eviction() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn cache_contract_locally(");
+        assert!(
+            body.contains("evicted_in_use_teardown"),
+            "GET eviction handler must consume access_result.evicted_in_use_teardown"
+        );
+        assert!(
+            body.contains("remove_evicted_in_use"),
+            "GET eviction handler must call interest_manager.remove_evicted_in_use \
+             to sync the InterestManager after a subscribed eviction"
         );
     }
 
