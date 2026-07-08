@@ -125,6 +125,13 @@
 //! selection. See the pin test `distance_partialeq_is_fuzzy_but_cmp_is_exact` and
 //! `ring/location.rs:223-243`.
 
+// NAMING LANDMINE: the `is_upstream` stored flag and the upstream/relay framing in
+// this module are fossils of the hollow-relay era (#3763). Piece D (compute-upstream,
+// #4671) retires the stored flag and makes chain peers real subscribed HOSTS, not
+// relays: routing and hosting co-occur, there is no forward-without-hosting. Do not
+// name new code "relay" or add new stored-upstream flags.
+// See .claude/rules/hosting-invariants.md terminology + epic #4642.
+
 // Wired to production in SHADOW mode by keystone sub-task 2 (compare-only, drives
 // nothing). The driver that would apply a `Vec<Action>`, and the forward-looking
 // hooks (Retract's `on_contract_unhosted`, `actively_acquiring`, the not-yet-wired
