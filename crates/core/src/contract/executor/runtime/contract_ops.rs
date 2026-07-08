@@ -71,6 +71,25 @@ impl Executor<Runtime> {
 
             // Commit locally
             let written_bytes = new_state.as_ref().len();
+            // Disk-budget admission gate (#4683): a re-PUT into an ALREADY-hosted
+            // contract is a CRDT merge — a mutation of an already-counted
+            // footprint, not a new admission. Use the GROWTH-ONLY check so a
+            // shrinking/holding merge (`delta <= 0`) always admits even over
+            // budget (rejecting would stall convergence without freeing bytes);
+            // only genuine growth is bounded. Nothing has landed → no rollback.
+            if let Some(op_manager) = &self.op_manager {
+                if let Err(over) = op_manager.ring.admit_state_update(&key, written_bytes) {
+                    tracing::warn!(
+                        contract = %key,
+                        %over,
+                        "Rejecting re-PUT: disk budget exceeded (growth over budget)"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: over.to_string().into(),
+                    }));
+                }
+            }
             self.state_store
                 .update(&key, new_state.clone())
                 .await
@@ -323,6 +342,31 @@ impl Executor<Runtime> {
             "starting contract verification and storage"
         );
 
+        // Disk-budget admission gate for the code blob (#4683, PR 3): charge the
+        // blob only if it is not already on disk (dedup — a re-PUT of existing
+        // code adds nothing). Reject before storing; nothing has landed.
+        let code_already_stored = self
+            .runtime
+            .contract_store
+            .fetch_contract(&key, &params)
+            .is_some();
+        let blob_len = contract.data().len();
+        if !code_already_stored {
+            if let Some(op_manager) = &self.op_manager {
+                if let Err(over) = op_manager.ring.admit_wasm_write(blob_len) {
+                    tracing::warn!(
+                        contract = %key,
+                        %over,
+                        "Rejecting PUT: disk budget exceeded (contract code)"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: over.to_string().into(),
+                    }));
+                }
+            }
+        }
+
         // Store contract code in runtime store
         self.runtime
             .contract_store
@@ -335,6 +379,22 @@ impl Executor<Runtime> {
                 );
                 ExecutorError::other(e)
             })?;
+
+        // Charge the newly-written blob to the disk tracker NOW (#4683), before
+        // the state gate below, so the state gate sees the wasm just stored (no
+        // per-PUT double-count overshoot) and a burst of distinct-code PUTs stays
+        // bounded within a du-walk window. Reversed at each removal site below if
+        // the PUT fails. Only when the code was newly stored (deduped away above).
+        let charged_wasm: Option<usize> = if !code_already_stored {
+            if let Some(op_manager) = &self.op_manager {
+                op_manager.ring.record_wasm_write(blob_len);
+                Some(blob_len)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Validate with depth=1 related contract resolution.
         //
@@ -354,6 +414,10 @@ impl Executor<Runtime> {
                 if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
                     tracing::warn!(contract = %key, error = %e, "failed to remove contract after validation failure");
                 }
+                // Reverse the wasm charge (#4683): the blob is removed.
+                if let (Some(len), Some(op_manager)) = (charged_wasm, &self.op_manager) {
+                    op_manager.ring.record_wasm_removed(len);
+                }
             })?;
 
         // fetch_related_for_validation resolves RequestRelated internally,
@@ -361,6 +425,10 @@ impl Executor<Runtime> {
         if result != ValidateResult::Valid {
             if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
                 tracing::warn!(contract = %key, error = %e, "failed to remove contract after invalid validation");
+            }
+            // Reverse the wasm charge (#4683): the blob is removed.
+            if let (Some(len), Some(op_manager)) = (charged_wasm, &self.op_manager) {
+                op_manager.ring.record_wasm_removed(len);
             }
             return Err(ExecutorError::request(StdContractError::Put {
                 key,
@@ -374,6 +442,30 @@ impl Executor<Runtime> {
             "storing contract state"
         );
         let written_bytes = state.as_ref().len();
+        // Disk-budget admission gate for the state (#4683, PR 3): reject before
+        // the store. Roll back the contract code we stored above (reuse the same
+        // `remove_contract` rollback the validation-failure paths use) so a
+        // rejected PUT leaves no partial state on disk.
+        if let Some(op_manager) = &self.op_manager {
+            if let Err(over) = op_manager.ring.admit_state_write(&key, written_bytes) {
+                tracing::warn!(
+                    contract = %key,
+                    %over,
+                    "Rejecting PUT: disk budget exceeded"
+                );
+                if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
+                    tracing::warn!(contract = %key, error = %e, "failed to remove contract after disk-budget rejection");
+                }
+                // Reverse the wasm charge (#4683): the blob is removed.
+                if let Some(len) = charged_wasm {
+                    op_manager.ring.record_wasm_removed(len);
+                }
+                return Err(ExecutorError::request(StdContractError::Put {
+                    key,
+                    cause: over.to_string().into(),
+                }));
+            }
+        }
         self.state_store
             .store(key, state, params)
             .await

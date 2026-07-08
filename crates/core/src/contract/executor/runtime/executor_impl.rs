@@ -198,8 +198,10 @@ where
                 })?
         };
 
-        // Track if we stored a new contract
-        let (remove_if_fail, contract_was_provided) =
+        // Track if we stored a new contract. `charged_wasm` carries the blob
+        // length charged to the disk tracker (#4683) so every rollback site that
+        // removes the just-stored contract also reverses the wasm charge.
+        let (remove_if_fail, contract_was_provided, charged_wasm): (bool, bool, Option<usize>) =
             if self.runtime.fetch_contract_code(&key, &params).is_none() {
                 if let Some(ref contract_code) = code {
                     tracing::debug!(
@@ -208,10 +210,45 @@ where
                         "Storing new contract"
                     );
 
+                    // Disk-budget admission gate for the NEW (deduped) code blob
+                    // (#4683): the code was not already on disk
+                    // (`fetch_contract_code` returned None), so charge its bytes.
+                    // Reject before the store so nothing lands; no rollback of the
+                    // blob is needed since it was never written.
+                    let blob_len = contract_code.data().len();
+                    if let Some(op_manager) = &self.op_manager {
+                        if let Err(over) = op_manager.ring.admit_wasm_write(blob_len) {
+                            tracing::warn!(
+                                contract = %key,
+                                %over,
+                                "Rejecting PUT: disk budget exceeded (contract code)"
+                            );
+                            return Err(ExecutorError::request(StdContractError::Put {
+                                key,
+                                cause: over.to_string().into(),
+                            }));
+                        }
+                    }
+
                     self.runtime
                         .store_contract(contract_code.clone())
                         .map_err(ExecutorError::other)?;
-                    (true, true)
+                    // Charge the newly-written blob to the disk tracker NOW
+                    // (#4683), before the state gate runs later in this same
+                    // PUT. This (a) makes the state gate's aggregate include the
+                    // wasm just stored, so a single PUT can't pass both the wasm
+                    // and state gates independently and overshoot the budget, and
+                    // (b) makes a burst of distinct-code PUTs visible to each
+                    // other's admission check within one 60s du-walk window. The
+                    // next `refresh_wasm` reconciles the counter against ground
+                    // truth. Rolled back below if the PUT later fails to persist.
+                    let charged = if let Some(op_manager) = &self.op_manager {
+                        op_manager.ring.record_wasm_write(blob_len);
+                        Some(blob_len)
+                    } else {
+                        None
+                    };
+                    (true, true, charged)
                 } else {
                     // Bug #2306: This should never happen for PUT operations because they
                     // always provide the contract code. If we hit this path during a PUT,
@@ -242,7 +279,7 @@ where
                         .ensure_key_indexed(&key)
                         .map_err(ExecutorError::other)?;
                 }
-                (false, code.is_some())
+                (false, code.is_some(), None)
             };
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
@@ -275,6 +312,10 @@ where
                         "Failed to remove contract after init tracker rejection"
                     );
                 }
+                // Reverse the wasm charge (#4683): the blob is being removed.
+                if let (Some(blob_len), Some(op_manager)) = (charged_wasm, &self.op_manager) {
+                    op_manager.ring.record_wasm_removed(blob_len);
+                }
                 return Err(ExecutorError::request(StdContractError::Put {
                     key,
                     cause: "node is too busy: too many contracts initializing simultaneously, try again later".into(),
@@ -303,6 +344,11 @@ where
                                 "failed to remove contract after size rejection"
                             );
                         }
+                        // Reverse the wasm charge (#4683): the blob is removed.
+                        if let (Some(blob_len), Some(op_manager)) = (charged_wasm, &self.op_manager)
+                        {
+                            op_manager.ring.record_wasm_removed(blob_len);
+                        }
                     }
                     return Err(ExecutorError::request(StdContractError::Put {
                         key,
@@ -326,6 +372,12 @@ where
                         if remove_if_fail {
                             if let Err(e) = self.runtime.remove_contract(&key) {
                                 tracing::warn!(contract = %key, error = %e, "failed to remove contract after validation failure");
+                            }
+                            // Reverse the wasm charge (#4683): the blob is removed.
+                            if let (Some(blob_len), Some(op_manager)) =
+                                (charged_wasm, &self.op_manager)
+                            {
+                                op_manager.ring.record_wasm_removed(blob_len);
                             }
                         }
                         // Clean up init_tracker so queued operations aren't left dangling
@@ -353,6 +405,50 @@ where
                             );
                             let state_to_store = incoming_state.clone();
                             let written_bytes = state_to_store.as_ref().len();
+                            // Disk-budget admission gate (#4683): reject BEFORE
+                            // the store if this write would push aggregate disk
+                            // past the budget. No bytes have landed yet, so we
+                            // only roll back the contract code we just stored and
+                            // the init tracker; the rejection rides `PutMsg::Error`
+                            // to the client and network via the non-fatal
+                            // `StdContractError::Put`.
+                            if let Some(op_manager) = &self.op_manager {
+                                if let Err(over) =
+                                    op_manager.ring.admit_state_write(&key, written_bytes)
+                                {
+                                    tracing::warn!(
+                                        contract = %key,
+                                        %over,
+                                        "Rejecting PUT: disk budget exceeded"
+                                    );
+                                    if remove_if_fail {
+                                        if let Err(e) = self.runtime.remove_contract(&key) {
+                                            tracing::warn!(
+                                                contract = %key,
+                                                error = %e,
+                                                "failed to remove contract after disk-budget rejection"
+                                            );
+                                        }
+                                        // Reverse the wasm charge (#4683).
+                                        if let Some(blob_len) = charged_wasm {
+                                            op_manager.ring.record_wasm_removed(blob_len);
+                                        }
+                                    }
+                                    if let Some(dropped) =
+                                        self.init_tracker.fail_initialization(&key)
+                                    {
+                                        tracing::warn!(
+                                            contract = %key,
+                                            dropped_operations = dropped,
+                                            "Disk-budget rejection dropped queued operations"
+                                        );
+                                    }
+                                    return Err(ExecutorError::request(StdContractError::Put {
+                                        key,
+                                        cause: over.to_string().into(),
+                                    }));
+                                }
+                            }
                             self.state_store
                                 .store(key, state_to_store, params.clone())
                                 .await
@@ -1530,6 +1626,30 @@ where
                 )
                 .into(),
             }));
+        }
+
+        // Disk-budget admission gate (#4683): UPDATE is a mutation of an
+        // already-hosted, already-counted footprint, NOT a new admission. Use the
+        // GROWTH-ONLY check: a shrinking or size-holding CRDT merge (`delta <= 0`)
+        // is admitted unconditionally, even when the aggregate is over budget —
+        // rejecting it would stall convergence without freeing any bytes, and a
+        // relayed UPDATE rejection is silently dropped (fire-and-forget, no
+        // `UpdateMsg::Error`), so no one would learn of the stall. Only genuine
+        // growth is subjected to the aggregate bound. Fresh PUTs keep the hard
+        // `admit_state_write` gate (they are where new footprints enter and carry
+        // `PutMsg::Error` propagation). Nothing has landed, so no rollback needed.
+        if let Some(op_manager) = &self.op_manager {
+            if let Err(over) = op_manager.ring.admit_state_update(key, state_size) {
+                tracing::warn!(
+                    contract = %key,
+                    %over,
+                    "Rejecting UPDATE: disk budget exceeded (growth over budget)"
+                );
+                return Err(ExecutorError::request(StdContractError::Update {
+                    key: *key,
+                    cause: over.to_string().into(),
+                }));
+            }
         }
 
         self.state_store
