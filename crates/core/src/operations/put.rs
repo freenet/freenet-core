@@ -271,6 +271,36 @@ mod messages {
         pub value: WrappedState,
     }
 
+    /// Deserializes a [`StateDelta`] into its owned (`'static`) form.
+    ///
+    /// Mirrors [`StateSummary::deser_state_summary`]: a borrowed
+    /// `StateDelta<'de>` is not `DeserializeOwned` and cannot cross the
+    /// bincode boundary as a plain field, so any wire-carried `StateDelta`
+    /// needs a `#[serde(deserialize_with = ...)]` helper that forces an
+    /// owned copy. `freenet-stdlib` 0.8.2 provides
+    /// `StateSummary::deser_state_summary` but no equivalent for
+    /// `StateDelta`, so this helper is defined locally. Used by
+    /// [`PutMsg::ProbeReconcile`].
+    fn deser_state_delta<'de, D>(deser: D) -> Result<StateDelta<'static>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <StateDelta as Deserialize>::deserialize(deser)?;
+        Ok(value.into_owned())
+    }
+
+    /// Deserializes an `Option<StateSummary>` into its owned (`'static`)
+    /// form, mapping the `Some` arm through `StateSummary::into_owned`.
+    /// Used by `PutMsg::ProbeResponse::holder_summary`, which is `Some`
+    /// only when the probe found a holder and `None` otherwise.
+    fn deser_opt_state_summary<'de, D>(deser: D) -> Result<Option<StateSummary<'static>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <Option<StateSummary> as Deserialize>::deserialize(deser)?;
+        Ok(value.map(StateSummary::into_owned))
+    }
+
     /// PUT operation messages.
     ///
     /// The PUT operation stores a contract and its initial state in the network.
@@ -401,8 +431,7 @@ mod messages {
             cause: String,
         },
 
-        /// **Summary-first PUT — Phase-1 probe. INERT wire scaffolding
-        /// (#4642, step 3-bis; NOT yet emitted — see below).**
+        /// **Summary-first PUT — probe (#4642, step 3-bis).**
         ///
         /// Instead of shipping the full [`WrappedState`] up front (as
         /// [`Request`](Self::Request) does), a summary-first PUT routes a
@@ -414,19 +443,13 @@ mod messages {
         /// need not know in advance whether the contract is genuinely new
         /// (ship full state) or already held (reconcile a delta).
         ///
-        /// # NOT YET EMITTED (inert scaffolding)
-        ///
-        /// No producer constructs this variant and no send path emits it.
-        /// It is merged inert: the probe→dispatch driver, the body-fetch
-        /// flow, and the emission gate are a LATER piece paired with
-        /// every-hop placement (#4642). When emission is added it MUST be
-        /// version-gated via `version_supports_summary_first_put` (in
-        /// `node::network_bridge::p2p_protoc`) — a pre-floor peer cannot
-        /// bincode-deserialize this appended tag and would drop the
-        /// connection, so it must never receive the probe. Because nothing
-        /// emits it yet, nothing is committed on the wire and the field
-        /// layout stays refinable until first emission ships in a release.
-        #[allow(dead_code)]
+        /// Emitted only by `operations::put::op_ctx_task::try_summary_first_put`
+        /// (originator) and forwarded hop-by-hop by
+        /// `start_relay_probe`/`drive_relay_probe`, and only after the
+        /// sender confirms the target passes
+        /// `ConnectionManager::supports_summary_first_put` — a pre-floor
+        /// peer cannot bincode-deserialize this appended tag and would drop
+        /// the connection, so it must never receive the probe.
         ProbeRequest {
             id: Transaction,
             /// Key of the contract being probed.
@@ -444,40 +467,96 @@ mod messages {
             skip_list: HashSet<std::net::SocketAddr>,
         },
 
-        /// **Summary-first PUT — Phase-2 dispatch reply. INERT wire
-        /// scaffolding (#4642, step 3-bis; NOT yet emitted — see
+        /// **Summary-first PUT — probe reply (#4642, step 3-bis, see
         /// [`ProbeRequest`](Self::ProbeRequest)).**
         ///
         /// Routed hop-by-hop back to the initiator, signalling whether the
         /// probe found an existing holder:
         ///
-        /// - `holder_found == false` → no holder → the contract is treated
-        ///   as genuinely new and full state ships hop-by-hop along the
-        ///   route (the [`Request`](Self::Request) path) — exactly where
-        ///   every-hop placement acquires its bytes.
-        /// - `holder_found == true` → a holder exists → the two copies
-        ///   reconcile bidirectionally via the contract's summary/delta
-        ///   primitives (a later piece); full state does NOT re-travel a
-        ///   mesh that already holds it. Not "ahead/behind": divergent
-        ///   copies merge via the commutative monoid.
+        /// - `holder_found == false`: no holder found, so the contract is
+        ///   treated as genuinely new and full state ships hop-by-hop
+        ///   along the route (the [`Request`](Self::Request) path), which
+        ///   is where every-hop placement acquires its bytes.
+        ///   `holder_summary` is `None`.
+        /// - `holder_found == true`: a holder exists, and `holder_summary`
+        ///   carries that holder's contract-defined `summarize_state`
+        ///   output. The initiator uses it to compute the delta the
+        ///   holder is missing, then sends that delta as
+        ///   [`ProbeReconcile`](Self::ProbeReconcile) instead of shipping
+        ///   full state into a mesh that already holds the contract. Not
+        ///   "ahead/behind": divergent copies merge via the contract's
+        ///   commutative monoid.
         ///
-        /// The reconcile message exchange is deliberately NOT modelled
-        /// here — this variant is only the new-vs-existing dispatch signal.
-        /// INERT: see [`ProbeRequest`](Self::ProbeRequest).
-        #[allow(dead_code)]
+        /// Produced by `start_relay_probe`/`drive_relay_probe` (a fresh
+        /// holder, or a routing terminus with no holder) and consumed by
+        /// `try_summary_first_put` at the originator; see
+        /// [`ProbeRequest`](Self::ProbeRequest).
         ProbeResponse {
             id: Transaction,
             /// Key of the probed contract.
             key: ContractKey,
             /// Whether the probe found an existing holder along the route.
             holder_found: bool,
-            /// Forward-path hop count — same semantics as
+            /// Forward-path hop count, same semantics as
             /// [`Response`](Self::Response)'s `hop_count`.
             /// `#[serde(default)]` is for source-level clarity; bincode is
             /// positional, so cross-version compat rides the handshake
             /// `MIN_COMPATIBLE_VERSION` gate, not the serde default.
             #[serde(default)]
             hop_count: usize,
+            /// The found holder's contract-defined `summarize_state`
+            /// output (opaque bytes), so the PUT initiator can compute
+            /// the delta the holder is missing without re-shipping full
+            /// state (summary-first PUT reconcile, #4642 step 3-bis).
+            ///
+            /// `Some(S_H)` only when `holder_found == true`; `None` when
+            /// no holder was found. Deserialized owned (`'static`) via the
+            /// local `deser_opt_state_summary` helper, matching the
+            /// `ProbeRequest::summary` wire pattern. Appended AFTER
+            /// `hop_count` so tag 7's existing prefix stays byte-for-byte
+            /// identical; nothing emits this variant yet, so the field
+            /// layout stays refinable until first emission ships.
+            #[serde(default, deserialize_with = "deser_opt_state_summary")]
+            holder_summary: Option<StateSummary<'static>>,
+        },
+
+        /// **Summary-first PUT — reconcile write (#4642, step 3-bis, see
+        /// [`ProbeRequest`](Self::ProbeRequest)).**
+        ///
+        /// Sent by the PUT initiator after learning a holder exists
+        /// ([`ProbeResponse`](Self::ProbeResponse) with `holder_found ==
+        /// true`). Routed hop-by-hop toward the contract key, the same
+        /// way [`Request`](Self::Request) and
+        /// [`ProbeRequest`](Self::ProbeRequest) are. It carries ONLY the
+        /// contract-defined [`StateDelta`], the initiator's contribution
+        /// relative to the holder's summary
+        /// (`ProbeResponse::holder_summary`), never full state: the whole
+        /// point of summary-first PUT is that a PUT into a mesh that
+        /// already holds the contract ships a delta, not the full body.
+        ///
+        /// The first fresh holder this reaches merges the delta via the
+        /// contract's `update_state` (`start_relay_probe_reconcile` /
+        /// `drive_relay_probe_reconcile`); normal update fan-out then
+        /// propagates it to the rest of the subscriber mesh, the same
+        /// mechanism `Update` operations use. Fire-and-forget: there is no
+        /// reply variant, matching the originator's `try_summary_first_put`,
+        /// which completes the PUT once the reconcile is dispatched rather
+        /// than waiting for a merge confirmation.
+        ProbeReconcile {
+            id: Transaction,
+            /// Key of the contract being reconciled.
+            key: ContractKey,
+            /// Contract-defined opaque write delta, relative to the
+            /// holder's summary, never full state. Deserialized owned
+            /// (`'static`) via the local `deser_state_delta` helper,
+            /// mirroring `ProbeRequest::summary`.
+            #[serde(deserialize_with = "deser_state_delta")]
+            delta: StateDelta<'static>,
+            /// Hops to live, decremented at each hop (mirrors
+            /// `Request.htl` / `ProbeRequest.htl`).
+            htl: usize,
+            /// Addresses to skip when selecting next hop (loop prevention).
+            skip_list: HashSet<std::net::SocketAddr>,
         },
     }
 
@@ -491,7 +570,8 @@ mod messages {
                 | Self::ForwardingAck { id, .. }
                 | Self::Error { id, .. }
                 | Self::ProbeRequest { id, .. }
-                | Self::ProbeResponse { id, .. } => id,
+                | Self::ProbeResponse { id, .. }
+                | Self::ProbeReconcile { id, .. } => id,
             }
         }
 
@@ -510,6 +590,7 @@ mod messages {
                 Self::Error { .. } => None,
                 Self::ProbeRequest { contract_key, .. } => Some(Location::from(contract_key.id())),
                 Self::ProbeResponse { key, .. } => Some(Location::from(key.id())),
+                Self::ProbeReconcile { key, .. } => Some(Location::from(key.id())),
             }
         }
     }
@@ -583,12 +664,32 @@ mod messages {
                     id,
                     key,
                     holder_found,
+                    holder_summary,
                     ..
                 } => {
                     write!(
                         f,
-                        "PutProbeResponse(id: {}, key: {}, holder_found: {})",
-                        id, key, holder_found
+                        "PutProbeResponse(id: {}, key: {}, holder_found: {}, holder_summary: {})",
+                        id,
+                        key,
+                        holder_found,
+                        holder_summary.is_some()
+                    )
+                }
+                Self::ProbeReconcile {
+                    id,
+                    key,
+                    delta,
+                    htl,
+                    ..
+                } => {
+                    write!(
+                        f,
+                        "PutProbeReconcile(id: {}, key: {}, delta_len: {}, htl: {})",
+                        id,
+                        key,
+                        delta.size(),
+                        htl
                     )
                 }
             }
@@ -705,7 +806,7 @@ mod tests {
         let tx = Transaction::new::<PutMsg>();
         let key = make_contract_key(0);
         // One minimal instance per variant, in declaration order.
-        let samples: [(u32, PutMsg); 8] = [
+        let samples: [(u32, PutMsg); 9] = [
             (
                 0,
                 PutMsg::Request {
@@ -760,9 +861,9 @@ mod tests {
                     cause: String::new(),
                 },
             ),
-            // Tags 6/7: summary-first PUT scaffolding (INERT, #4642).
+            // Tags 6/7/8: summary-first PUT scaffolding (INERT, #4642).
             // Appended AFTER every existing variant so tags 0-5 stay
-            // byte-identical — old peers keep deserializing them
+            // byte-identical, old peers keep deserializing them
             // unchanged. Emission is version-gated (never sent to a
             // pre-floor peer), so these tags never reach a node that
             // can't decode them.
@@ -783,6 +884,17 @@ mod tests {
                     key,
                     holder_found: false,
                     hop_count: 0,
+                    holder_summary: None,
+                },
+            ),
+            (
+                8,
+                PutMsg::ProbeReconcile {
+                    id: tx,
+                    key,
+                    delta: StateDelta::from(Vec::new()),
+                    htl: 0,
+                    skip_list: Default::default(),
                 },
             ),
         ];
@@ -849,18 +961,26 @@ mod tests {
     }
 
     /// Summary-first PUT dispatch reply (INERT scaffolding, #4642): the
-    /// new-vs-existing signal (`holder_found`) and `hop_count` round-trip
-    /// through bincode for both boolean cases.
+    /// new-vs-existing signal (`holder_found`), `hop_count`, and the
+    /// trailing `holder_summary` round-trip through bincode for both
+    /// boolean cases, including a `Some` summary whose opaque bytes must
+    /// survive intact via the `deser_opt_state_summary` owned-deserialize
+    /// path.
     #[test]
     fn put_msg_probe_response_serde_roundtrip() {
         let key = make_contract_key(4);
-        for (holder_found, hop_count) in [(false, 0usize), (true, 5usize)] {
+        let cases: [(bool, usize, Option<Vec<u8>>); 2] = [
+            (false, 0usize, None),
+            (true, 5usize, Some(vec![0x11, 0x22, 0x33, 0x44])),
+        ];
+        for (holder_found, hop_count, summary_bytes) in cases {
             let tx = Transaction::new::<PutMsg>();
             let msg = PutMsg::ProbeResponse {
                 id: tx,
                 key,
                 holder_found,
                 hop_count,
+                holder_summary: summary_bytes.clone().map(StateSummary::from),
             };
             let bytes = bincode::serialize(&msg).expect("serialize");
             let decoded: PutMsg = bincode::deserialize(&bytes).expect("deserialize");
@@ -870,20 +990,79 @@ mod tests {
                     key: decoded_key,
                     holder_found: decoded_holder,
                     hop_count: decoded_hops,
+                    holder_summary: decoded_summary,
                 } => {
                     assert_eq!(id, tx);
                     assert_eq!(decoded_key, key);
                     assert_eq!(decoded_holder, holder_found);
                     assert_eq!(decoded_hops, hop_count);
+                    match (&decoded_summary, &summary_bytes) {
+                        (Some(decoded), Some(expected)) => {
+                            assert_eq!(
+                                decoded.as_ref(),
+                                expected.as_slice(),
+                                "opaque holder_summary bytes must survive the bincode round-trip"
+                            );
+                        }
+                        (None, None) => {}
+                        _ => panic!(
+                            "holder_summary presence mismatch: decoded {decoded_summary:?} vs \
+                             expected {summary_bytes:?}"
+                        ),
+                    }
                 }
                 other => panic!("expected ProbeResponse, got {other}"),
             }
         }
     }
 
+    /// Summary-first PUT reconcile write (INERT scaffolding, #4642): the
+    /// opaque `StateDelta`, `htl`, and `skip_list` round-trip through
+    /// bincode via the `deser_state_delta` owned-deserialize path.
+    #[test]
+    fn put_msg_probe_reconcile_serde_roundtrip() {
+        let tx = Transaction::new::<PutMsg>();
+        let key = make_contract_key(5);
+        let delta_bytes = vec![0x9A, 0xBC, 0xDE, 0xF0, 0x12, 0x34];
+        let mut skip_list = std::collections::HashSet::new();
+        skip_list.insert(std::net::SocketAddr::from(([127, 0, 0, 1], 9090)));
+        skip_list.insert(std::net::SocketAddr::from(([10, 0, 0, 1], 4242)));
+        let msg = PutMsg::ProbeReconcile {
+            id: tx,
+            key,
+            delta: StateDelta::from(delta_bytes.clone()),
+            htl: 3,
+            skip_list: skip_list.clone(),
+        };
+
+        let bytes = bincode::serialize(&msg).expect("serialize");
+        let decoded: PutMsg = bincode::deserialize(&bytes).expect("deserialize");
+        match decoded {
+            PutMsg::ProbeReconcile {
+                id,
+                key: decoded_key,
+                delta,
+                htl,
+                skip_list: decoded_skip,
+            } => {
+                assert_eq!(id, tx);
+                assert_eq!(decoded_key, key);
+                assert_eq!(
+                    delta.as_ref(),
+                    delta_bytes.as_slice(),
+                    "opaque delta bytes must survive the bincode round-trip"
+                );
+                assert_eq!(htl, 3);
+                assert_eq!(decoded_skip, skip_list);
+            }
+            other => panic!("expected ProbeReconcile, got {other}"),
+        }
+    }
+
     /// `id()` and `requested_location()` cover the summary-first
-    /// scaffolding variants: the probe/dispatch reply carry the tx and a
-    /// key-derived location like every other addressed PUT variant.
+    /// scaffolding variants: the probe/dispatch reply/reconcile carry the
+    /// tx and a key-derived location like every other addressed PUT
+    /// variant.
     #[test]
     fn put_msg_probe_variants_id_and_location() {
         let tx = Transaction::new::<PutMsg>();
@@ -900,11 +1079,21 @@ mod tests {
             key,
             holder_found: true,
             hop_count: 0,
+            holder_summary: None,
+        };
+        let reconcile = PutMsg::ProbeReconcile {
+            id: tx,
+            key,
+            delta: StateDelta::from(Vec::new()),
+            htl: 1,
+            skip_list: Default::default(),
         };
         assert_eq!(*req.id(), tx);
         assert_eq!(*resp.id(), tx);
+        assert_eq!(*reconcile.id(), tx);
         assert!(req.requested_location().is_some());
         assert!(resp.requested_location().is_some());
+        assert!(reconcile.requested_location().is_some());
     }
 
     /// `bound_cause` keeps short strings byte-identical and truncates

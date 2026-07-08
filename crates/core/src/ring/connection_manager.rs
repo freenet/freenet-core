@@ -289,6 +289,32 @@ pub(crate) struct ConnectionManager {
     /// only in a sim test that opted into the migration cascade via
     /// `SimNetwork::enable_placement_migration`. See `NodeConfig`.
     subscribe_hint_floor_override: Option<(u8, u8, u16)>,
+    /// Mirror of `P2pConnManager.connections[addr].remote_version`, kept on
+    /// `ConnectionManager` so op drivers (`operations::put::op_ctx_task`,
+    /// reached via `op_manager.ring.connection_manager`) can gate emission of
+    /// version-sensitive wire variants. The network-bridge layer
+    /// (`P2pConnManager`) is not reachable from op drivers, so the
+    /// `peer_supports_subscribe_hint`-style version check cannot read
+    /// `P2pConnManager.connections` directly; this mirror closes that gap for
+    /// the summary-first PUT probe (#4642 step 3-bis).
+    ///
+    /// Populated at connection establishment
+    /// (`p2p_protoc::connection_lifecycle`, the same call site that populates
+    /// `P2pConnManager.connections[addr].remote_version`) via
+    /// `record_remote_version`. Never proactively removed: a stale entry can
+    /// only matter if a different peer later reconnects at the exact same
+    /// socket address with an older version, and any real reconnection at
+    /// that address overwrites the entry before it is ever consulted (lookups
+    /// only target addresses with a live connection). Unknown addresses
+    /// (`None`) fail closed in `version_supports_summary_first_put`.
+    #[allow(clippy::type_complexity)]
+    remote_version: Arc<RwLock<BTreeMap<SocketAddr, (u8, u8, u16)>>>,
+    /// Test-only override for the summary-first PUT probe version floor,
+    /// threaded exactly like `subscribe_hint_floor_override`. `None` in
+    /// production (the real `SUMMARY_FIRST_PUT_MIN_VERSION` applies);
+    /// `Some(floor)` only in a sim test that opted in via
+    /// `SimNetwork::enable_summary_first_put`. See `NodeConfig`.
+    summary_first_put_floor_override: Option<(u8, u8, u16)>,
     /// Rotating start offset for the per-new-peer migration scan. The scan
     /// examines at most `MIGRATION_SCAN_CAP_PER_NEW_PEER` hosted contracts per
     /// event; advancing this cursor each event makes successive events cover
@@ -411,6 +437,7 @@ impl ConnectionManager {
         // None for all the test-helper constructions, Some(floor) only when a
         // sim opted into the migration cascade.
         cm.subscribe_hint_floor_override = config.subscribe_hint_floor_override;
+        cm.summary_first_put_floor_override = config.summary_first_put_floor_override;
         cm
     }
 
@@ -444,6 +471,9 @@ impl ConnectionManager {
             is_gateway,
             // Default off; `new(config)` overrides from config after init.
             subscribe_hint_floor_override: None,
+            remote_version: Arc::new(RwLock::new(BTreeMap::new())),
+            // Default off; `new(config)` overrides from config after init.
+            summary_first_put_floor_override: None,
             migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
@@ -797,6 +827,51 @@ impl ConnectionManager {
     /// production). See `NodeConfig::subscribe_hint_floor_override`.
     pub(crate) fn subscribe_hint_floor_override(&self) -> Option<(u8, u8, u16)> {
         self.subscribe_hint_floor_override
+    }
+
+    /// Record the negotiated protocol version for a peer at `addr`, mirroring
+    /// `P2pConnManager.connections[addr].remote_version` so op drivers can
+    /// read it via `op_manager.ring.connection_manager`. Overwrites any prior
+    /// entry for `addr` (a fresh connection at a reused address always wins).
+    ///
+    /// Called from `p2p_protoc::connection_lifecycle` at the same point
+    /// `P2pConnManager` records `remote_version` on its own `connections`
+    /// entry — keep the two writes together if that call site changes.
+    pub(crate) fn record_remote_version(&self, addr: SocketAddr, version: (u8, u8, u16)) {
+        self.remote_version.write().insert(addr, version);
+    }
+
+    /// Look up the negotiated protocol version recorded for `addr` via
+    /// [`Self::record_remote_version`]. `None` if no connection has been
+    /// established at `addr` (or none since this node started).
+    pub(crate) fn remote_version(&self, addr: SocketAddr) -> Option<(u8, u8, u16)> {
+        self.remote_version.read().get(&addr).copied()
+    }
+
+    /// Test-only override for the summary-first PUT probe version floor
+    /// (`None` in production). See `NodeConfig::summary_first_put_floor_override`.
+    pub(crate) fn summary_first_put_floor_override(&self) -> Option<(u8, u8, u16)> {
+        self.summary_first_put_floor_override
+    }
+
+    /// Whether the peer at `addr` reports a negotiated protocol version new
+    /// enough to understand the summary-first PUT probe/dispatch variants
+    /// (`PutMsg::ProbeRequest` / `ProbeResponse` / `ProbeReconcile`).
+    ///
+    /// Driver-reachable mirror of
+    /// `P2pConnManager::peer_supports_subscribe_hint`: op drivers
+    /// (`operations::put::op_ctx_task`) only reach `op_manager.ring`, not the
+    /// network-bridge layer, so this reads the `remote_version` mirror above
+    /// instead of `P2pConnManager.connections`. `None` (unknown version) is
+    /// treated as unsupported (fail-closed): an older peer that cannot
+    /// deserialize the appended `ProbeRequest` wire tag would drop the
+    /// connection, so when in doubt the caller must not emit it.
+    pub(crate) fn supports_summary_first_put(&self, addr: SocketAddr) -> bool {
+        let remote = self.remote_version(addr);
+        let floor = self
+            .summary_first_put_floor_override()
+            .unwrap_or(crate::node::SUMMARY_FIRST_PUT_MIN_VERSION);
+        crate::node::version_supports_summary_first_put(remote, floor)
     }
 
     /// Reserve the next `window`-sized slice of the hosting set for a migration
@@ -1934,6 +2009,66 @@ mod tests {
         if let Some(mut entry) = cm.transient_connections.get_mut(&addr) {
             entry.created_at = Instant::now() - age;
         }
+    }
+
+    // ============ summary-first PUT version-gate tests (#4642 step 3-bis) ============
+
+    /// `record_remote_version` / `remote_version` round-trip: an address
+    /// with no recorded connection returns `None`, and a recorded version
+    /// is returned verbatim.
+    #[test]
+    fn record_remote_version_then_lookup_roundtrips() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+        let addr = make_addr(9001);
+        assert_eq!(cm.remote_version(addr), None);
+        cm.record_remote_version(addr, (0, 2, 94));
+        assert_eq!(cm.remote_version(addr), Some((0, 2, 94)));
+    }
+
+    /// Emission gate, fail-closed case: a peer with no recorded version
+    /// (e.g. never connected, or connected pre-handshake) must not be
+    /// treated as summary-first-capable — mirrors the mixed-version
+    /// interop guarantee the gate's own unit tests assert in isolation
+    /// (`p2p_protoc::tests::summary_first_unknown_remote_version_fails_closed`),
+    /// exercised here through the driver-reachable `ConnectionManager`
+    /// wrapper instead of the pure predicate directly.
+    #[test]
+    fn supports_summary_first_put_fails_closed_for_unknown_peer() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+        let addr = make_addr(9002);
+        assert!(!cm.supports_summary_first_put(addr));
+    }
+
+    /// Emission gate, known-version case against the real production floor
+    /// (no test override set): a pre-floor peer is rejected, an
+    /// at-or-above-floor peer is accepted. This is the decision
+    /// `try_summary_first_put` consults before ever emitting a
+    /// `PutMsg::ProbeRequest` — a pre-floor peer must never receive one
+    /// (it cannot bincode-deserialize the appended tag).
+    #[test]
+    fn supports_summary_first_put_respects_recorded_version_against_production_floor() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+
+        let pre_floor_addr = make_addr(9003);
+        cm.record_remote_version(pre_floor_addr, (0, 2, 80));
+        assert!(!cm.supports_summary_first_put(pre_floor_addr));
+
+        // The exact staggered-rollout boundary (#4642 step 3-bis): a 0.2.93
+        // peer carries the probe wire variants INERT (it can decode a probe
+        // but has no handler to process it), so a 0.2.94 emitter must fall
+        // back to a full-state PUT and NEVER send it a summary probe. The
+        // floor being strictly greater than 0.2.93 is what enforces this.
+        let inert_variant_peer = make_addr(9005);
+        cm.record_remote_version(inert_variant_peer, (0, 2, 93));
+        assert!(
+            !cm.supports_summary_first_put(inert_variant_peer),
+            "a 0.2.93 peer decodes but cannot process a probe; emitter must \
+             fall back to full-state PUT"
+        );
+
+        let at_floor_addr = make_addr(9004);
+        cm.record_remote_version(at_floor_addr, crate::node::SUMMARY_FIRST_PUT_MIN_VERSION);
+        assert!(cm.supports_summary_first_put(at_floor_addr));
     }
 
     // ============ cleanup_expired_transients tests ============

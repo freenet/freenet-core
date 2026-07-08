@@ -381,6 +381,26 @@ pub struct OperationStats {
     /// Count of broadcast updates received via subscription streaming.
     /// These are push-based and don't have success/failure semantics.
     pub updates_received: u32,
+    /// Summary-first PUT (#4642 step 3-bis): count + bytes shipped for the
+    /// new-contract case (no holder found; full state ships hop-by-hop via
+    /// the existing `PutMsg::Request` path). See [`record_put_bytes`].
+    pub put_probe_new_contract: (u32, u64),
+    /// Summary-first PUT: count + bytes shipped for the existing-mesh case
+    /// (holder found; only a `StateDelta` ships via `ProbeReconcile`). See
+    /// [`record_put_bytes`].
+    pub put_probe_existing_mesh_delta: (u32, u64),
+}
+
+/// Which path a summary-first PUT took (#4642 step 3-bis telemetry). See
+/// [`record_put_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutProbeCase {
+    /// No holder found along the probe route — treated as a genuinely new
+    /// contract; full state ships hop-by-hop via the existing
+    /// `PutMsg::Request` path.
+    NewContract,
+    /// A holder was found — only a `StateDelta` ships via `ProbeReconcile`.
+    ExistingMeshDelta,
 }
 
 /// Maximum number of recent NAT attempts to track for rolling trend.
@@ -658,6 +678,27 @@ pub fn record_update_received() {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             s.op_stats.updates_received = s.op_stats.updates_received.saturating_add(1);
+        }
+    }
+}
+
+/// Record a summary-first PUT probe outcome for the dashboard "Operations"
+/// panel (#4642 step 3-bis falsifier): which path the originator took
+/// (`case`) and how many bytes that path actually shipped.
+///
+/// Single call site: `operations::put::op_ctx_task::record_put_probe_outcome`,
+/// which also feeds the matching `GlobalTestMetrics` counter from the same
+/// call so the two can never drift relative to each other (see
+/// `.claude/rules/bug-prevention-patterns.md`: manually-mirrored counters).
+pub fn record_put_bytes(case: PutProbeCase, bytes: u64) {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            let counter = match case {
+                PutProbeCase::NewContract => &mut s.op_stats.put_probe_new_contract,
+                PutProbeCase::ExistingMeshDelta => &mut s.op_stats.put_probe_existing_mesh_delta,
+            };
+            counter.0 = counter.0.saturating_add(1);
+            counter.1 = counter.1.saturating_add(bytes);
         }
     }
 }
