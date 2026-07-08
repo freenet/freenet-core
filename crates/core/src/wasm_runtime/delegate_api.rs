@@ -391,6 +391,7 @@ mod tests {
                     &self.contract_store,
                     Some(self.db.clone()),
                     None,
+                    None,
                     delegate_key,
                     &mut self.delegate_store,
                     depth,
@@ -418,6 +419,38 @@ mod tests {
                     &self.contract_store,
                     Some(self.db.clone()),
                     Some(cb),
+                    None,
+                    delegate_key,
+                    &mut self.delegate_store,
+                    0,
+                    vec![],
+                    None,
+                )
+            }
+        }
+
+        /// Create a DelegateCallEnv wired to an arbitrary admit callback
+        /// (#4683). The callback receives `(key, state_size, is_update)` and its
+        /// `Err(cause)` aborts the V2 write with
+        /// `DelegateEnvError::DiskBudgetExceeded(cause)`.
+        ///
+        /// # Safety
+        /// Caller must ensure the returned env does not outlive `self`.
+        unsafe fn make_env_with_admit(
+            &mut self,
+            admit: super::super::runtime::StateAdmitCallback,
+        ) -> DelegateCallEnv {
+            let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+            // SAFETY: The caller guarantees the returned env does not outlive `self`,
+            // which keeps the borrowed `secret_store` and `contract_store` alive.
+            unsafe {
+                DelegateCallEnv::new(
+                    vec![],
+                    &mut self.secret_store,
+                    &self.contract_store,
+                    Some(self.db.clone()),
+                    None,
+                    Some(admit),
                     delegate_key,
                     &mut self.delegate_store,
                     0,
@@ -444,6 +477,7 @@ mod tests {
                     &mut self.secret_store,
                     &self.contract_store,
                     Some(self.db.clone()),
+                    None,
                     None,
                     delegate_key,
                     &mut self.delegate_store,
@@ -539,6 +573,7 @@ mod tests {
                 &env_holder.contract_store,
                 None, // No state store
                 None,
+                None,
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
@@ -621,6 +656,7 @@ mod tests {
                 &env_holder.contract_store,
                 None,
                 None,
+                None,
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
@@ -647,6 +683,7 @@ mod tests {
                 vec![],
                 &mut env_holder.secret_store,
                 &env_holder.contract_store,
+                None,
                 None,
                 None,
                 delegate_key,
@@ -794,6 +831,86 @@ mod tests {
             calls[0].1, 3,
             "callback must receive the on-disk state byte count (vec![40, 50, 60] = 3 bytes)"
         );
+    }
+
+    /// #4683 finding #2 regression: a V2 delegate PUT that the admit callback
+    /// REJECTS (disk over budget) must return `DiskBudgetExceeded`, map to
+    /// `ERR_STORE_ERROR`, and leave the write un-landed (state unchanged). This
+    /// exercises the V2 accept-with-callback plumbing and the error mapping that
+    /// every other delegate_api test skips by passing `None`.
+    #[tokio::test]
+    async fn test_env_v2_put_rejected_when_over_budget() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(200, &[1, 2, 3]).await;
+
+        // Admit callback that rejects every PUT (is_update == false). It also
+        // asserts the flag it receives so a future refactor that swaps the PUT
+        // and UPDATE flags is caught.
+        let admit: super::super::runtime::StateAdmitCallback =
+            std::sync::Arc::new(|_k: &ContractKey, _size: usize, is_update: bool| {
+                assert!(
+                    !is_update,
+                    "put_contract_state_sync must pass is_update=false"
+                );
+                Err("disk budget exceeded (test)".to_string())
+            });
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_admit(admit) };
+        let result = env.put_contract_state_sync(&contract_id, vec![4, 5, 6, 7]);
+        assert!(
+            matches!(result, Err(DelegateEnvError::DiskBudgetExceeded(_))),
+            "over-budget V2 PUT must return DiskBudgetExceeded, got {result:?}"
+        );
+        // The rejected write must NOT have landed: state is still the original.
+        let state = env.get_contract_state_sync(&contract_id).unwrap();
+        assert_eq!(
+            state,
+            Some(vec![1, 2, 3]),
+            "rejected V2 PUT must leave state unchanged"
+        );
+        // DiskBudgetExceeded maps to the store-error contract code.
+        assert_eq!(
+            super::super::native_api::delegate_contracts::delegate_env_error_to_code(
+                &DelegateEnvError::DiskBudgetExceeded("x".into())
+            ),
+            contract_error_codes::ERR_STORE_ERROR as i64,
+        );
+    }
+
+    /// #4683 finding #2 regression: the V2 UPDATE path uses the GROWTH-ONLY gate,
+    /// so a shrinking / size-holding V2 UPDATE must be admitted even when the
+    /// aggregate is over budget. We prove the plumbing carries `is_update=true`
+    /// (so the executor installs the growth-only branch) and that an admitting
+    /// callback lets the UPDATE land. Correctness of the growth-only decision
+    /// itself is covered by the tracker/manager tests; here we pin that the V2
+    /// UPDATE site routes to the update branch, not the hard PUT branch.
+    #[tokio::test]
+    async fn test_env_v2_update_uses_growth_only_gate() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(201, &[10, 20, 30, 40, 50]).await;
+
+        // The admit callback records the flag it was called with and admits.
+        let seen_update = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_for_cb = seen_update.clone();
+        let admit: super::super::runtime::StateAdmitCallback =
+            std::sync::Arc::new(move |_k: &ContractKey, _size: usize, is_update: bool| {
+                seen_for_cb.store(is_update, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            });
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_admit(admit) };
+        // Shrinking UPDATE (5 bytes -> 2 bytes).
+        env.update_contract_state_sync(&contract_id, vec![1, 2])
+            .expect("shrinking V2 UPDATE must be admitted");
+        assert!(
+            seen_update.load(std::sync::atomic::Ordering::SeqCst),
+            "update_contract_state_sync must pass is_update=true so the executor \
+             routes to the growth-only admit_state_update branch"
+        );
+        let state = env.get_contract_state_sync(&contract_id).unwrap();
+        assert_eq!(state, Some(vec![1, 2]), "admitted V2 UPDATE must land");
     }
 
     /// END-TO-END: a REAL V2 delegate PUT, driven through the PRODUCTION
