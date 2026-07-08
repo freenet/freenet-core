@@ -51,7 +51,7 @@ pub(crate) use cache::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use cache::default_hosting_budget_bytes;
 pub use cache::{AccessType, EvictedInUseTeardown, RecordAccessResult};
-use cache::{DEFAULT_MIN_TTL, HostingCache, HostingCacheStats};
+use cache::{HostingCache, HostingCacheStats};
 /// Clamp bounds re-exported only for the config-default round-trip test, which
 /// asserts the resolved default lands within [MIN, MAX] without hardcoding the
 /// byte values. Gated to test builds so the re-export isn't an unused import
@@ -390,11 +390,7 @@ impl HostingManager {
         Self {
             active_subscriptions: DashMap::new(),
             client_subscriptions: DashMap::new(),
-            hosting_cache: RwLock::new(HostingCache::new(
-                budget_bytes,
-                DEFAULT_MIN_TTL,
-                time_source.clone(),
-            )),
+            hosting_cache: RwLock::new(HostingCache::new(budget_bytes, time_source.clone())),
             demand_estimator: RwLock::new(ProximityPrior::new()),
             own_location: RwLock::new(None),
             local_get_serves: AtomicU64::new(0),
@@ -1261,7 +1257,7 @@ impl HostingManager {
     /// The SPLIT genuine-demand counts pinning `contract`:
     /// `(local_client_subscriptions, downstream_subscribers)`. This is the
     /// subscriber-primary eviction key (#4642, Ian's confirmed ordering): the
-    /// cache orders victims ascending by `(local, downstream, last_get_seq, key)`,
+    /// cache orders victims ascending by `(local, downstream, recency_seq, key)`,
     /// so a contract THIS node's own client is subscribed to (local >= 1) is
     /// evicted LAST. Aligned with [`contract_in_use`](Self::contract_in_use) BY
     /// CONSTRUCTION — it counts the exact same two sources, so `local + downstream
@@ -1764,14 +1760,14 @@ impl HostingManager {
     }
 
     /// Whether the over-budget sweep would evict `score`'s contract in the
-    /// COMMON case — `past_min_ttl` (the TTL floor, precomputed by the cache) AND
-    /// NOT [`contract_in_use`](Self::contract_in_use).
+    /// COMMON case — NOT [`contract_in_use`](Self::contract_in_use).
     ///
     /// The dashboard uses this to badge the "next to evict" contract: the raw
-    /// lowest-keep-score row can be an entry the sweep would not pick first (still
-    /// within `min_ttl`, or ordered last because a local client / downstream
-    /// subscriber makes it in-use), so badging it unconditionally would mislabel a
-    /// still-wanted contract.
+    /// lowest-keep-score row can be an entry the sweep would not pick first
+    /// (ordered last because a local client / downstream subscriber makes it
+    /// in-use), so badging it unconditionally would mislabel a still-wanted
+    /// contract. There is no longer a `min_ttl` age gate (dropped 2026-07-08), so
+    /// eligibility reduces to "not in use".
     ///
     /// NOTE (subscriber-primary rework, #4642): under the split-ordering model an
     /// in-use contract is no longer hard-pinned — it is ordered LAST and IS shed
@@ -1787,7 +1783,7 @@ impl HostingManager {
     /// and `contract_in_use` reads only the subscription maps — never the
     /// hosting cache — so there is no lock held across this call.
     pub(crate) fn is_eviction_eligible(&self, score: &HostingContractScore) -> bool {
-        score.past_min_ttl && !self.contract_in_use(&score.key)
+        !self.contract_in_use(&score.key)
     }
 
     /// Check if we should continue hosting a contract.
@@ -1893,7 +1889,7 @@ impl HostingManager {
     ///
     /// Under normal (`AtCapacity`) pressure victims are chosen subscriber-primary
     /// (#4642, invariant 3): ascending `(local_subscription_count,
-    /// downstream_subscriber_count, last_get_seq, key)`, using the same split
+    /// downstream_subscriber_count, recency_seq, key)`, using the same split
     /// `local_and_downstream_counts` closure `record_contract_access` passes, so
     /// all eviction paths agree. A subscribed contract is ordered LAST and shed
     /// only as a last resort (when nothing with fewer subscribers is eligible and
@@ -1901,8 +1897,9 @@ impl HostingManager {
     /// shipped #4720 code. When such a still-in-use victim IS shed, its
     /// subscription state is torn down here (via `teardown_evicted_in_use_contract`)
     /// so `contract_in_use` is false before the caller reclaims it and the on-disk
-    /// state is actually freed. The `Overflow` pressure (which ALSO pierces
-    /// `min_ttl`) is intentionally unwired in production (see `cache::MemoryPressure`).
+    /// state is actually freed. The `Overflow` pressure (which ALSO pierces the
+    /// op-scoped backstop) is intentionally unwired in production (see
+    /// `cache::MemoryPressure`).
     /// Downstream subscriber leases are otherwise time-bounded: stale entries are
     /// removed by `expire_stale_downstream_subscribers()` (called periodically)
     /// after `SUBSCRIPTION_LEASE_DURATION` without renewal.
@@ -1915,7 +1912,7 @@ impl HostingManager {
     /// as a last resort, the subscription state torn down so the caller can sync
     /// the `InterestManager` (PR #4734 Fix 1).
     pub fn sweep_expired_hosting(&self) -> HostingSweepResult {
-        // AtCapacity: the Overflow `min_ttl`-pierce trigger is intentionally
+        // AtCapacity: the Overflow op-backstop-pierce trigger is intentionally
         // unwired in production (see cache::MemoryPressure). AtCapacity itself
         // CAN now shed a subscribed contract as a last resort — see below.
         let evicted = self.hosting_cache.write().sweep_expired(
@@ -3203,46 +3200,18 @@ mod tests {
         assert!(used.in_use, "a client subscription is real demand → in_use");
     }
 
-    /// `is_eviction_eligible` must combine BOTH halves of the
-    /// `evict_over_budget` skip filter — the cache's `past_min_ttl` age gate
-    /// AND `!contract_in_use` — so the dashboard's "next to evict" badge only
-    /// marks a contract the sweep would actually consider. A within-TTL OR an
-    /// in-use low-score contract must read as NOT eligible (the sweep skips it);
-    /// badging it would mislabel an eviction-exempt contract.
+    /// `is_eviction_eligible` gates the dashboard's "next to evict" badge on the
+    /// sweep skip filter, which since 2026-07-08 is `!contract_in_use` ONLY (the
+    /// `min_ttl` age gate was dropped — invariant 3). A freshly-accessed, not-in-
+    /// use contract is now eligible (the change: it is no longer protected by a
+    /// cold-start floor), while an in-use contract reads as NOT eligible so the
+    /// badge does not mislabel it.
     #[test]
     fn dashboard_is_eviction_eligible_matches_sweep_skip_filter() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
 
-        // Case 1 — default cache (DEFAULT_MIN_TTL): a freshly-accessed contract
-        // is within its TTL window → past_min_ttl false → NOT eligible even
-        // though nothing pins it.
-        let fresh = make_contract_key(1);
-        manager.record_contract_access(fresh, 100, AccessType::Get);
-        let scores = manager.dashboard_hosting_scores();
-        let fresh_score = scores
-            .iter()
-            .find(|s| s.key == fresh)
-            .expect("fresh contract present");
-        assert!(
-            !fresh_score.past_min_ttl,
-            "a freshly-accessed contract is within min_ttl"
-        );
-        assert!(
-            !manager.is_eviction_eligible(fresh_score),
-            "within-TTL contract is skipped by the sweep → not eligible"
-        );
-
-        // Case 2 — override with a ZERO-TTL cache so every entry is instantly
-        // past the TTL gate; eligibility is then decided solely by
-        // `contract_in_use`.
-        {
-            let mut cache = manager.hosting_cache.write();
-            *cache = cache::HostingCache::new(
-                10_000,
-                std::time::Duration::ZERO,
-                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
-            );
-        }
+        // A freshly-accessed contract with nothing pinning it is ELIGIBLE — there
+        // is no longer a `min_ttl` cold-start floor to protect it.
         let evictable = make_contract_key(2);
         let pinned = make_contract_key(3);
         manager.record_contract_access(evictable, 100, AccessType::Get);
@@ -3263,16 +3232,12 @@ mod tests {
             .find(|s| s.key == pinned)
             .expect("pinned contract present");
         assert!(
-            ev.past_min_ttl && pin.past_min_ttl,
-            "zero TTL → both entries are past the TTL gate"
-        );
-        assert!(
             manager.is_eviction_eligible(ev),
-            "past-TTL and not in use → eligible (the real next victim)"
+            "fresh and not in use → eligible (the real next victim; no TTL floor)"
         );
         assert!(
             !manager.is_eviction_eligible(pin),
-            "past-TTL but in use → NOT eligible (sweep skips it)"
+            "in use → NOT eligible (sweep skips it)"
         );
     }
 
@@ -4399,7 +4364,6 @@ mod tests {
             let mut cache = manager.hosting_cache.write();
             *cache = cache::HostingCache::new(
                 100,
-                std::time::Duration::ZERO,
                 std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }
@@ -4471,7 +4435,6 @@ mod tests {
             let mut cache = manager.hosting_cache.write();
             *cache = cache::HostingCache::new(
                 100,
-                std::time::Duration::ZERO,
                 std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }
@@ -4588,7 +4551,6 @@ mod tests {
             let mut cache = manager.hosting_cache.write();
             *cache = cache::HostingCache::new(
                 200, // room for ~2 contracts at 100 bytes
-                std::time::Duration::ZERO,
                 std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }
@@ -4655,7 +4617,6 @@ mod tests {
             let mut cache = manager.hosting_cache.write();
             *cache = cache::HostingCache::new(
                 200, // room for ~2 contracts at 100 bytes
-                std::time::Duration::ZERO,
                 std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }
@@ -4733,7 +4694,6 @@ mod tests {
             let mut cache = manager.hosting_cache.write();
             *cache = cache::HostingCache::new(
                 200,
-                std::time::Duration::ZERO,
                 std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }
@@ -4826,27 +4786,27 @@ mod tests {
     /// subscribed contracts last, interior peers would drop hosting → stop
     /// renewal → lose upstream subscription → downstream subscribers lose their feed.
     ///
-    /// This test operates at the HostingCache level with MockTimeSrc so we
-    /// can actually advance time past TTL and verify the ordering.
+    /// This test operates at the HostingCache level so it can seed both entries
+    /// and verify the subscriber-primary ordering directly.
     #[test]
     fn test_zero_sub_evicted_before_downstream_subscribed() {
         use crate::ring::hosting::cache::HostingCache;
         use crate::util::time_source::SharedMockTimeSource;
 
         let time = SharedMockTimeSource::new();
-        let min_ttl = Duration::from_secs(60);
-        // Budget of 150 bytes with 2x100-byte entries = over budget
-        let mut cache = HostingCache::new(150, min_ttl, time.clone());
+        // Seed both under a generous budget (no auto-evict; distinct recency), then
+        // tighten to 150 so 2x100-byte entries are over budget for the sweep. (No
+        // `min_ttl` floor since 2026-07-08, so record_access sheds to budget
+        // immediately — the "both resident over budget" state needs a budget shrink.)
+        let mut cache = HostingCache::new(100_000, time.clone());
 
         let subscribed = make_contract_key(1);
         let zero_sub = make_contract_key(2);
 
         cache.record_access(subscribed, 100, AccessType::Get, 0, |_| (0, 0));
         cache.record_access(zero_sub, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.set_budget_for_test(150);
         assert_eq!(cache.current_bytes(), 200); // over budget
-
-        // Advance past TTL
-        time.advance_time(Duration::from_secs(61));
 
         // `subscribed` has a downstream subscriber; `zero_sub` has none. Under
         // subscriber-primary ordering the zero-subscriber one sheds first, and one
@@ -4863,44 +4823,37 @@ mod tests {
         );
         assert!(
             evicted.iter().any(|e| e.key == zero_sub),
-            "the zero-subscriber contract is evicted first when over budget + past TTL"
+            "the zero-subscriber contract is evicted first when over budget"
         );
         assert!(cache.contains(&subscribed));
     }
 
-    /// A hosted contract with NO subscribers and NO clients SHOULD be
-    /// evictable after TTL expires when the cache is over budget.
+    /// A hosted contract with NO subscribers and NO clients IS evictable when the
+    /// cache is over budget — there is no `min_ttl` floor (dropped 2026-07-08), so
+    /// the sweep sheds it immediately.
     ///
-    /// Uses HostingCache with MockTimeSrc for time advancement.
+    /// Uses HostingCache with MockTimeSrc.
     #[test]
     fn test_no_subscribers_allows_eviction() {
         use crate::ring::hosting::cache::HostingCache;
         use crate::util::time_source::SharedMockTimeSource;
 
         let time = SharedMockTimeSource::new();
-        let min_ttl = Duration::from_secs(60);
-        // Budget of 80 bytes, entry is 100 → over budget immediately
-        let mut cache = HostingCache::new(80, min_ttl, time.clone());
+        // Budget of 80 bytes, entry is 100 → over budget immediately.
+        let mut cache = HostingCache::new(80, time.clone());
 
         let contract = make_contract_key(100);
+        // The insert can't self-evict the just-inserted contract (op-scoped
+        // backstop), so it is resident but over budget.
         cache.record_access(contract, 100, AccessType::Get, 0, |_| (0, 0));
         assert!(cache.contains(&contract));
 
-        // Under TTL: should not be evicted even though over budget
-        let evicted = cache.sweep_expired(|_| (0, 0), cache::MemoryPressure::AtCapacity);
-        assert!(
-            evicted.is_empty(),
-            "Contract within TTL should not be evicted"
-        );
-
-        // Advance past TTL
-        time.advance_time(Duration::from_secs(61));
-
-        // Now should be evicted (over budget + past TTL + no subscribers)
+        // A sweep (no op-protected key) sheds the zero-subscriber contract at once
+        // — no TTL wait.
         let evicted = cache.sweep_expired(|_| (0, 0), cache::MemoryPressure::AtCapacity);
         assert!(
             evicted.iter().any(|e| e.key == contract),
-            "Contract past TTL with no subscribers should be evicted"
+            "an over-budget contract with no subscribers is evicted (no min_ttl floor)"
         );
         assert!(!cache.contains(&contract));
     }
@@ -5242,8 +5195,7 @@ mod tests {
         {
             let mut cache = manager.hosting_cache.write();
             *cache = cache::HostingCache::new(
-                200,                       // tiny budget: room for ~2 contracts at 100 bytes
-                std::time::Duration::ZERO, // no TTL protection
+                200, // tiny budget: room for ~2 contracts at 100 bytes
                 std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
             );
         }

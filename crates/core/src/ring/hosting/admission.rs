@@ -469,7 +469,6 @@ mod tests {
     use crate::util::time_source::SharedMockTimeSource;
     use freenet_stdlib::prelude::{CodeHash, ContractInstanceId};
     use std::collections::HashMap;
-    use std::time::Duration;
 
     /// Deterministic distinct `ContractKey` from a seed byte (same construction
     /// as the `cache` module's tests).
@@ -1009,13 +1008,18 @@ mod tests {
     /// Build the shared 4-contract fixture: seeds 3 & 2 are zero-subscriber,
     /// seed 5 has 1 subscriber, seed 4 has 2. Inserts via GET in `[3, 2, 5, 4]`
     /// order so seed 3 is a strictly-less-recent GET than seed 2 (each GET stamps
-    /// an increasing `last_get_seq`), making the zero-subscriber tiebreak
+    /// an increasing `recency_seq`), making the zero-subscriber tiebreak
     /// deterministic and key-independent. Returns the populated cache, the
     /// subscriber-count map, and the admission-side view of the same set with
     /// each `last_get_seq` read back from the cache's actually-stamped value.
+    ///
+    /// All four are inserted under a GENEROUS budget so no insert auto-evicts (now
+    /// that `min_ttl` is gone, the insert path sheds down to budget immediately);
+    /// the caller-requested `budget` is then applied via `set_budget_for_test`, so
+    /// a subsequent sweep sees all four resident with their distinct recency and
+    /// sheds according to the tightened budget.
     fn cross_module_fixture(
         budget: u64,
-        ttl: Duration,
     ) -> (
         HostingCache<SharedMockTimeSource>,
         SharedMockTimeSource,
@@ -1035,19 +1039,21 @@ mod tests {
         let counts_of = |k: &ContractKey| (0usize, subs.get(k).copied().unwrap_or(0));
 
         let time = SharedMockTimeSource::new();
-        let mut cache = HostingCache::new(budget, ttl, time.clone());
+        // Seed under a generous budget so no insert auto-evicts, then tighten.
+        let mut cache = HostingCache::new(100_000, time.clone());
         for seed in [3u8, 2, 5, 4] {
             let key = make_key(seed);
             let r = cache.record_access(key, 100, AccessType::Get, 0, counts_of);
             assert!(r.is_new, "fixture keys must be distinct fresh inserts");
         }
+        cache.set_budget_for_test(budget);
 
         let hosted: Vec<AdmissionIncumbent> = subs
             .keys()
             .map(|k| AdmissionIncumbent {
                 key: *k,
                 subscriber_count: subs.get(k).copied().unwrap_or(0),
-                last_get_seq: cache.get(k).expect("inserted above").last_get_seq,
+                last_get_seq: cache.get(k).expect("inserted above").recency_seq,
             })
             .collect();
 
@@ -1057,10 +1063,10 @@ mod tests {
     #[test]
     fn admission_and_cache_agree_on_full_eviction_order() {
         // Budget 0 so an Overflow sweep sheds EVERY entry, exposing the full
-        // eviction order across all three ranking tiers. mock time never advances
-        // (age stays 0), so the AtCapacity eviction each insert triggers finds
-        // nothing past `min_ttl` and all four survive for the Overflow sweep.
-        let (mut cache, _time, subs, hosted) = cross_module_fixture(0, Duration::from_secs(3600));
+        // eviction order across all three ranking tiers. The fixture seeds all four
+        // under a generous budget then tightens to 0 (see `cross_module_fixture`),
+        // so all four are resident with distinct recency for the Overflow sweep.
+        let (mut cache, _time, subs, hosted) = cross_module_fixture(0);
         // Combined counts mapped to the downstream slot (local = 0), matching the
         // admission `victim_order` shim, so the two orderings stay comparable.
         let counts_of = |k: &ContractKey| (0usize, subs.get(k).copied().unwrap_or(0));
@@ -1102,19 +1108,17 @@ mod tests {
         // The displacement / AtCapacity path: a 1-subscriber newcomer, so
         // admission's displacement picker is eligible to evict the strictly-fewer
         // (zero-subscriber) incumbents, while the cache's AtCapacity sweep evicts
-        // only zero-subscriber, past-`min_ttl` entries. Both must pick seed 3.
-        let ttl = Duration::from_secs(60);
+        // the fewest-subscriber entries (no `min_ttl` gate). Both must pick seed 3.
         // Budget 350: three entries (300B) fit, four (400B) do not, so exactly
         // one entry is shed and the sweep's FRONT victim is observable.
-        let (mut cache, time, subs, hosted) = cross_module_fixture(350, ttl);
+        let (mut cache, _time, subs, hosted) = cross_module_fixture(350);
         // Combined counts mapped to the downstream slot (local = 0), matching the
         // admission `victim_order` shim.
         let counts_of = |k: &ContractKey| (0usize, subs.get(k).copied().unwrap_or(0));
 
-        // Age every entry past `min_ttl` so all become eligible; the zero-
-        // subscriber seeds 2 & 3 still sort ahead of the subscribed 4 & 5, so one
+        // No `min_ttl` gate (dropped 2026-07-08): every entry is eligible, so the
+        // zero-subscriber seeds 2 & 3 sort ahead of the subscribed 4 & 5 and one
         // zero-subscriber entry is the front victim (subscribed ordered last).
-        time.advance_time(ttl + Duration::from_secs(1));
 
         let admission_victim =
             pick_displacement_victim(&hosted, 1).expect("a zero-sub incumbent is displaceable");
