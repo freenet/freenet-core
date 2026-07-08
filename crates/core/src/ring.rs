@@ -1728,6 +1728,12 @@ impl Ring {
             // that shed a subscribed contract under genuine RAM overflow. Stays 0
             // until the Overflow trigger is wired (mechanism-only this release).
             snapshot.hosting_oom_valve_evictions_total = Some(hosting.oom_valve_evictions_total);
+            // Subscribed-eviction falsifier (#4642 subscriber-primary rework): the
+            // count of evictions that shed a SUBSCRIBED contract (the riskiest new
+            // behavior). Unlike the OOM-valve counter this can go nonzero as soon
+            // as the rework ships (AtCapacity now sheds subscribed as a last
+            // resort). Same periodic cadence.
+            snapshot.hosting_subscribed_evictions_total = Some(hosting.subscribed_evictions_total);
             // Local-client GET hit-rate (#4642 A3): served-locally vs routed to
             // the network. Driven by the real serve/forward decision in the
             // client GET handler, so it is read from the manager counters (not
@@ -2601,11 +2607,15 @@ impl Ring {
             }
 
             // Clean up local subscription state for each expired contract.
-            // Note: contracts with subscribers (client subscriptions or
-            // downstream subscribers) are PINNED from eviction by the
-            // subscriber_count closure in sweep_expired_hosting() under normal
-            // AtCapacity pressure; only the deliberately-unwired OOM valve
-            // (MemoryPressure::Overflow) can pierce that pin.
+            // Note: under the subscriber-primary ordering (#4642, invariant 3) a
+            // contract with subscribers is ordered LAST but NOT hard-pinned, so
+            // `sweep_expired_hosting()` CAN shed a still-in-use contract as a last
+            // resort — and when it does, it has already torn down that contract's
+            // subscription state (downstream + client subscriptions + upstream
+            // lease) so `contract_in_use` is false before we reclaim it. The
+            // `ring.unsubscribe(&key)` below is therefore a belt-and-suspenders
+            // no-op for those (its lease is already gone) and, for a
+            // zero-subscriber eviction, drops any lingering upstream lease.
             // The `expected_generation` snapshot is captured atomically with
             // the eviction decision in `HostingCache::record_access` /
             // `sweep_expired`; it is re-checked at deletion time by

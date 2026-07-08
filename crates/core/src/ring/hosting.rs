@@ -1245,17 +1245,20 @@ impl HostingManager {
         self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
     }
 
-    /// Count of genuine demand pinning `contract`: local client subscriptions
-    /// PLUS downstream subscribers. This is the subscriber-primary eviction key
-    /// (#4642). Aligned with [`contract_in_use`](Self::contract_in_use) BY
-    /// CONSTRUCTION — it counts the exact same two sources, so
-    /// `subscriber_count(k) == 0` iff `!contract_in_use(k)`, keeping retention
-    /// and the collapse/renewal decision in agreement (per the piece-D source).
-    /// Counts ALL downstream entries (matching `has_downstream_subscribers`, no
-    /// lease filter) so the pin equals `contract_in_use` exactly; the periodic
+    /// The SPLIT genuine-demand counts pinning `contract`:
+    /// `(local_client_subscriptions, downstream_subscribers)`. This is the
+    /// subscriber-primary eviction key (#4642, Ian's confirmed ordering): the
+    /// cache orders victims ascending by `(local, downstream, last_get_seq, key)`,
+    /// so a contract THIS node's own client is subscribed to (local >= 1) is
+    /// evicted LAST. Aligned with [`contract_in_use`](Self::contract_in_use) BY
+    /// CONSTRUCTION — it counts the exact same two sources, so `local + downstream
+    /// == 0` iff `!contract_in_use(k)`, keeping retention and the collapse/renewal
+    /// decision in agreement (per the piece-D source). Counts ALL downstream
+    /// entries (no lease filter, matching `has_downstream_subscribers`) so the
+    /// count equals `contract_in_use` exactly; the periodic
     /// `expire_stale_downstream_subscribers` sweep keeps the map fresh.
-    pub(crate) fn subscriber_count(&self, contract: &ContractKey) -> usize {
-        let clients = self
+    pub(crate) fn local_and_downstream_counts(&self, contract: &ContractKey) -> (usize, usize) {
+        let local = self
             .client_subscriptions
             .get(contract.id())
             .map(|c| c.len())
@@ -1265,7 +1268,56 @@ impl HostingManager {
             .get(contract)
             .map(|peers| peers.len())
             .unwrap_or(0);
-        clients + downstream
+        (local, downstream)
+    }
+
+    /// Complete a subscriber-primary eviction that shed a still-in-use contract
+    /// (#4642, invariant 3): drop every subscription record that keeps
+    /// `contract_in_use(key)` true, so the disk-reclamation funnel
+    /// (`reclaim_evicted_contract` → `RuntimePool::remove_contract`) actually
+    /// frees the on-disk state instead of skipping it forever. Called ONLY for
+    /// the `evicted_in_use` subset (victims that were subscribed at eviction-
+    /// decision time), so a zero-subscriber eviction is untouched and — crucially
+    /// — a contract that gained a fresh subscriber AFTER it was evicted as
+    /// zero-subscriber is NOT torn down here (the re-host / re-subscribe guards in
+    /// `RuntimePool::remove_contract` handle that race).
+    ///
+    /// Clears, in order:
+    /// - `downstream_subscribers[key]` — the peer subscription leases. Downstream
+    ///   re-home, when demand persists, happens through the interest-gated
+    ///   renewal loop (ring-routed via `k_closest_potentially_hosting`), NOT from
+    ///   here — this PR builds no proactive re-home signal.
+    /// - `client_subscriptions[key.id()]` — local WebSocket client subscriptions.
+    ///   Under the fewest-`(local, downstream)` ordering a contract with LOCAL
+    ///   subscriptions is only ever a victim in the all-local-subscribed extreme
+    ///   (every eligible contract carries a local subscriber and the peer is still
+    ///   over budget), so this is a no-op in the common case and, in that extreme,
+    ///   silently STRANDS the local client. That is the accepted last-resort
+    ///   behavior — there is deliberately no client-notification surface (out of
+    ///   scope; see hosting-invariants invariant 3).
+    /// - the active upstream subscription lease (`unsubscribe`), so
+    ///   `contracts_needing_renewal` section 1 (active-subscription renewal, gated
+    ///   on `contract_in_use`) does not immediately re-drive the torn-down
+    ///   contract; clearing `client_subscriptions` likewise stops section 2
+    ///   (client-subscription re-subscribe) from re-driving it.
+    ///
+    /// Idempotent and safe to call on an already-clean key (each removal is a
+    /// no-op when absent).
+    fn teardown_evicted_in_use_contract(&self, key: &ContractKey) {
+        let had_downstream = self.downstream_subscribers.remove(key).is_some();
+        let had_client = self.client_subscriptions.remove(key.id()).is_some();
+        // Drop our own upstream lease too (same as the sweep loop's belt-and-
+        // suspenders `ring.unsubscribe`), so renewal section 1 won't re-drive it.
+        self.unsubscribe(key);
+        if had_downstream || had_client {
+            debug!(
+                contract = %key,
+                had_downstream,
+                had_client,
+                "Tore down subscription state for a subscriber-primary eviction \
+                 (#4642 invariant 3); disk reclamation can now proceed"
+            );
+        }
     }
 
     /// Hook called from every code path that removes an "in-use" signal
@@ -1439,8 +1491,20 @@ impl HostingManager {
             access_type,
             current_generation,
             predicted_demand,
-            |k: &ContractKey| self.subscriber_count(k),
+            |k: &ContractKey| self.local_and_downstream_counts(k),
         );
+
+        // Subscriber-primary eviction (#4642, invariant 3) can now shed a
+        // still-in-use contract as a last resort. For each such victim tear down
+        // its subscription state HERE — before the caller iterates `result.evicted`
+        // and calls `reclaim_evicted_contract` — so `contract_in_use` is already
+        // false when the reclaim gate checks it and the on-disk state is actually
+        // freed (the memory-teardown the shipped #4720 code was missing). The
+        // cache write lock is already dropped; the teardown touches only the
+        // subscription DashMaps + active_subscriptions, never the hosting cache.
+        for evicted_key in &result.evicted_in_use {
+            self.teardown_evicted_in_use_contract(evicted_key);
+        }
 
         // Train the proximity prior from this peer's own observed read rate for
         // the accessed contract (only reads yield a sample; PUT is a seed). The
@@ -1655,16 +1719,23 @@ impl HostingManager {
         self.hosting_cache.read().eviction_ordered_scores()
     }
 
-    /// Whether the over-budget sweep would currently CONSIDER `score`'s
-    /// contract for eviction — i.e. whether it passes the same per-contract
-    /// filter [`cache::HostingCache::evict_over_budget`] applies:
-    /// `past_min_ttl` (the TTL half, precomputed by the cache) AND NOT
-    /// [`contract_in_use`](Self::contract_in_use) (the `should_retain` half).
+    /// Whether the over-budget sweep would evict `score`'s contract in the
+    /// COMMON case — `past_min_ttl` (the TTL floor, precomputed by the cache) AND
+    /// NOT [`contract_in_use`](Self::contract_in_use).
     ///
-    /// The dashboard uses this to badge the true "next to evict" contract: the
-    /// raw lowest-keep-score row can be an entry the sweep would SKIP (still
-    /// within `min_ttl`, or pinned by a local client / downstream subscriber),
-    /// so badging it unconditionally mislabels an eviction-exempt contract.
+    /// The dashboard uses this to badge the "next to evict" contract: the raw
+    /// lowest-keep-score row can be an entry the sweep would not pick first (still
+    /// within `min_ttl`, or ordered last because a local client / downstream
+    /// subscriber makes it in-use), so badging it unconditionally would mislabel a
+    /// still-wanted contract.
+    ///
+    /// NOTE (subscriber-primary rework, #4642): under the split-ordering model an
+    /// in-use contract is no longer hard-pinned — it is ordered LAST and IS shed
+    /// as a last resort when nothing with fewer subscribers is eligible and the
+    /// peer is still over budget. This badge deliberately reflects the common,
+    /// non-last-resort case (in-use = not the next victim); it does not surface the
+    /// all-subscribed-extreme last-resort shed. A dashboard that wants to show the
+    /// true last-resort victim would drop the `!contract_in_use` term.
     ///
     /// Deadlock-safe by construction: `score` is already-collected owned data
     /// (the `hosting_cache` read guard was released when
@@ -1774,18 +1845,21 @@ impl HostingManager {
         }
     }
 
-    /// Sweep for expired entries in the hosting cache.
+    /// Sweep for over-budget entries in the hosting cache.
     ///
-    /// Under normal (`AtCapacity`) pressure a contract is PINNED — never evicted
-    /// — while `subscriber_count(key) >= 1`, i.e. it has client subscriptions OR
-    /// downstream subscribers (the two sources `contract_in_use` checks; note an
-    /// active *upstream* network subscription is deliberately NOT one of them —
-    /// see `contract_in_use`). This is the same `subscriber_count` closure
-    /// `record_contract_access` passes, so all eviction paths agree. Only the OOM
-    /// valve (`MemoryPressure::Overflow`) pierces this pin, and its trigger is
-    /// intentionally unwired in production (see `cache::MemoryPressure`), so
-    /// nothing sheds a subscribed contract in the field yet.
-    /// The downstream subscriber exemption is time-bounded: stale entries are
+    /// Under normal (`AtCapacity`) pressure victims are chosen subscriber-primary
+    /// (#4642, invariant 3): ascending `(local_subscription_count,
+    /// downstream_subscriber_count, last_get_seq, key)`, using the same split
+    /// `local_and_downstream_counts` closure `record_contract_access` passes, so
+    /// all eviction paths agree. A subscribed contract is ordered LAST and shed
+    /// only as a last resort (when nothing with fewer subscribers is eligible and
+    /// the peer is still over budget) — it is NOT hard-pinned, the change from the
+    /// shipped #4720 code. When such a still-in-use victim IS shed, its
+    /// subscription state is torn down here (via `teardown_evicted_in_use_contract`)
+    /// so `contract_in_use` is false before the caller reclaims it and the on-disk
+    /// state is actually freed. The `Overflow` pressure (which ALSO pierces
+    /// `min_ttl`) is intentionally unwired in production (see `cache::MemoryPressure`).
+    /// Downstream subscriber leases are otherwise time-bounded: stale entries are
     /// removed by `expire_stale_downstream_subscribers()` (called periodically)
     /// after `SUBSCRIPTION_LEASE_DURATION` without renewal.
     /// Automatically removes persisted metadata for expired contracts.
@@ -1795,13 +1869,28 @@ impl HostingManager {
     /// the `EvictContract` event so the deletion-time guard can detect a
     /// re-host race.
     pub fn sweep_expired_hosting(&self) -> Vec<(ContractKey, u64)> {
-        // AtCapacity: the OOM-valve Overflow trigger is intentionally unwired in
-        // production (see cache::MemoryPressure); nothing sheds a subscribed
-        // contract in the field yet.
-        let expired = self.hosting_cache.write().sweep_expired(
-            |key| self.subscriber_count(key),
+        // AtCapacity: the Overflow `min_ttl`-pierce trigger is intentionally
+        // unwired in production (see cache::MemoryPressure). AtCapacity itself
+        // CAN now shed a subscribed contract as a last resort — see below.
+        let evicted = self.hosting_cache.write().sweep_expired(
+            |key| self.local_and_downstream_counts(key),
             cache::MemoryPressure::AtCapacity,
         );
+
+        // Tear down subscription state for any still-in-use victim BEFORE the
+        // caller reclaims it, so `contract_in_use` is false when the reclaim gate
+        // checks it and the disk state is actually freed (the memory-teardown the
+        // shipped #4720 code was missing). Then strip to the `(key, generation)`
+        // reclaim list the caller (`ring.rs` maintenance loop) already consumes.
+        let expired: Vec<(ContractKey, u64)> = evicted
+            .iter()
+            .map(|e| {
+                if e.was_in_use {
+                    self.teardown_evicted_in_use_contract(&e.key);
+                }
+                (e.key, e.write_generation)
+            })
+            .collect();
 
         // Clean up persisted metadata for expired contracts
         if !expired.is_empty() {
@@ -4428,17 +4517,21 @@ mod tests {
         );
     }
 
-    /// `record_contract_access` must not evict an in-use contract when the
-    /// cache is over budget; once the in-use signal is removed the contract
-    /// becomes evictable. The in-use signal here is a local client
-    /// subscription — the time-bounded form `contract_in_use` actually
-    /// checks (see its rustdoc for why an upstream network subscription
-    /// alone is excluded).
+    /// `record_contract_access`: an in-use (locally-subscribed) contract is
+    /// ordered LAST, so while a zero-subscriber contract is available to shed it
+    /// is NOT the victim — the subscribed contract survives WITHOUT being torn
+    /// down. Once its subscription is removed it becomes an ordinary zero-
+    /// subscriber contract and is evicted normally. (The in-use signal here is a
+    /// local client subscription, the LAST-evicted dimension of the
+    /// subscriber-primary ordering; see `contract_in_use`'s rustdoc for why an
+    /// upstream network subscription alone is excluded.) The complementary
+    /// last-resort case — an in-use contract that IS shed and torn down — is
+    /// covered by `record_contract_access_sheds_and_tears_down_only_subscribed`.
     #[test]
-    fn test_record_contract_access_skips_in_use_contract() {
+    fn test_record_contract_access_orders_in_use_last() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         // Override with a tiny cache and ZERO TTL so every entry is instantly
-        // eviction-eligible — `contract_in_use` is then the only protection.
+        // eviction-eligible — ordering is then the only thing in play.
         {
             let mut cache = manager.hosting_cache.write();
             *cache = cache::HostingCache::new(
@@ -4460,30 +4553,182 @@ mod tests {
         manager.record_contract_access(in_use, 100, AccessType::Get);
         manager.record_contract_access(filler, 100, AccessType::Get);
 
-        // Inserting `trigger` puts the cache over budget. A naive LRU would
-        // evict `in_use` (oldest) — `contract_in_use` must protect it, so
-        // `filler` is evicted instead.
+        // Inserting `trigger` puts the cache over budget. A naive LRU would evict
+        // `in_use` (oldest) — but it is locally subscribed so it is ordered LAST,
+        // and one eviction of the zero-subscriber `filler` is enough.
         let result = manager.record_contract_access(trigger, 100, AccessType::Get);
         assert_eq!(
             result.evicted,
             vec![(filler, 0)],
-            "in-use (client-subscribed) contract must be skipped; the \
-             unprotected contract must be evicted instead"
+            "the zero-subscriber contract is shed; the locally-subscribed one is \
+             ordered last and survives"
+        );
+        assert!(
+            result.evicted_in_use.is_empty(),
+            "no in-use contract was shed, so nothing was torn down"
         );
         assert!(manager.is_hosting_contract(&in_use));
         assert!(!manager.is_hosting_contract(&filler));
+        // `in_use`'s subscription is intact — it was NOT torn down.
+        assert!(manager.contract_in_use(&in_use));
 
-        // Drop the client subscription: `in_use` is now evictable.
+        // Drop the client subscription: `in_use` is now an ordinary zero-
+        // subscriber contract.
         manager.remove_client_subscription(in_use.id(), client);
         assert!(!manager.contract_in_use(&in_use));
 
         let result = manager.record_contract_access(filler, 100, AccessType::Get);
         assert!(
             result.evicted.iter().any(|(k, _)| *k == in_use),
-            "once the subscription is removed the contract must become \
-             evictable when the cache is over budget"
+            "once the subscription is removed the contract is evicted normally \
+             when the cache is over budget"
         );
         assert!(!manager.is_hosting_contract(&in_use));
+    }
+
+    /// LOAD-BEARING (#4642, invariant 3): when the cache is over budget and EVERY
+    /// hosted contract is subscribed, `record_contract_access` sheds the fewest-
+    /// `(local, downstream)`-subscriber one AND tears down its subscription state
+    /// so `contract_in_use` flips to false — the memory-teardown the shipped
+    /// #4720 code was missing (there, the entry vanished from the cache but the
+    /// subscription lingered, so `reclaim_evicted_contract` skipped the disk
+    /// delete forever). Verifies fewest-downstream-first among equal-local
+    /// contracts, and that ONLY the shed contract is torn down.
+    #[test]
+    fn record_contract_access_sheds_and_tears_down_only_subscribed() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Tiny cache, ZERO TTL so every entry is instantly eligible (no min_ttl
+        // grace masking the shed).
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                200, // room for ~2 contracts at 100 bytes
+                std::time::Duration::ZERO,
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            );
+        }
+
+        let few = make_contract_key(1); // 1 downstream subscriber — shed first
+        let many = make_contract_key(2); // 3 downstream subscribers — survives
+        let trigger = make_contract_key(3); // 2 downstream subscribers
+
+        // Every contract is subscribed (downstream peers); none is zero-subscriber.
+        let p_few = make_peer_key(10);
+        let p_many: Vec<_> = (0..3).map(|i| make_peer_key(20 + i)).collect();
+        let p_trigger: Vec<_> = (0..2).map(|i| make_peer_key(30 + i)).collect();
+        manager.add_downstream_subscriber(&few, p_few.clone());
+        for p in &p_many {
+            manager.add_downstream_subscriber(&many, p.clone());
+        }
+        for p in &p_trigger {
+            manager.add_downstream_subscriber(&trigger, p.clone());
+        }
+
+        manager.record_contract_access(few, 100, AccessType::Get);
+        manager.record_contract_access(many, 100, AccessType::Get);
+        assert!(manager.contract_in_use(&few));
+        assert!(manager.contract_in_use(&many));
+
+        // Insert `trigger` over budget. Nothing is zero-subscriber, so the fewest-
+        // downstream contract `few` (1 sub) is shed as the last resort ahead of
+        // `many` (3 subs).
+        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        assert_eq!(
+            result.evicted,
+            vec![(few, 0)],
+            "with only subscribed contracts, the fewest-downstream one is shed"
+        );
+        assert_eq!(
+            result.evicted_in_use,
+            vec![few],
+            "the shed subscribed contract is reported for teardown"
+        );
+
+        // THE LOAD-BEARING ASSERTION: the shed contract's subscription state was
+        // torn down, so `contract_in_use` is now false and the reclaim gate
+        // (`reclaim_evicted_contract` / `RuntimePool::remove_contract`) will
+        // proceed to free the disk state instead of skipping it forever.
+        assert!(
+            !manager.contract_in_use(&few),
+            "the shed contract must be torn down so contract_in_use is false and \
+             disk reclamation proceeds (the memory-teardown #4720 lacked)"
+        );
+        assert!(!manager.has_downstream_subscribers(&few));
+        assert!(!manager.is_hosting_contract(&few));
+
+        // The surviving contract keeps its subscription intact — only the victim
+        // was torn down.
+        assert!(
+            manager.contract_in_use(&many),
+            "the surviving subscribed contract must NOT be torn down"
+        );
+        assert!(manager.has_downstream_subscribers(&many));
+        assert!(manager.is_hosting_contract(&many));
+    }
+
+    /// A torn-down subscriber-primary eviction must NOT be immediately re-driven
+    /// by `contracts_needing_renewal` (#4642 teardown correctness). In the all-
+    /// local-subscribed extreme the victim's client subscription AND its upstream
+    /// lease are cleared, so neither renewal section 1 (active-subscription, gated
+    /// on `contract_in_use`) nor section 2 (client-subscription re-subscribe)
+    /// re-selects it — otherwise the teardown would be undone one tick later and
+    /// the contract would re-fetch/re-host, defeating the eviction.
+    #[test]
+    fn torn_down_eviction_not_redriven_by_contracts_needing_renewal() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Tiny cache, ZERO TTL so every entry is instantly eligible.
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                200,
+                std::time::Duration::ZERO,
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            );
+        }
+
+        let victim = make_contract_key(1);
+        let keep = make_contract_key(2);
+        let trigger = make_contract_key(3);
+
+        // The all-LOCAL extreme: every contract has a local client subscription
+        // AND an upstream subscription lease (so both renewal sections are live).
+        let client = crate::client_events::ClientId::next();
+        for k in [&victim, &keep, &trigger] {
+            manager.add_client_subscription(k.id(), client);
+            manager.subscribe(*k);
+        }
+
+        manager.record_contract_access(victim, 100, AccessType::Get);
+        manager.record_contract_access(keep, 100, AccessType::Get);
+        assert!(manager.contract_in_use(&victim));
+
+        // Insert `trigger` over budget. Every contract is locally subscribed
+        // (local = 1), so ties break by least-recent GET → `victim` (accessed
+        // first) is shed as the last resort and torn down.
+        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        assert_eq!(
+            result.evicted_in_use,
+            vec![victim],
+            "the local victim is torn down"
+        );
+        assert!(
+            !manager.contract_in_use(&victim),
+            "victim's local subscription + lease were cleared"
+        );
+        assert!(
+            !manager.is_subscribed(&victim),
+            "victim's upstream lease was dropped"
+        );
+
+        // THE REGRESSION ASSERTION: renewal must not re-select the torn-down
+        // victim. The still-subscribed `keep` (and `trigger`) may appear, but
+        // `victim` must not — otherwise the next renewal tick would re-fetch it.
+        let renewal = manager.contracts_needing_renewal();
+        assert!(
+            !renewal.contains(&victim),
+            "a torn-down eviction must not be re-driven by contracts_needing_renewal, \
+             got {renewal:?}"
+        );
     }
 
     /// Removing from an untracked contract is a noop; other contracts unaffected.
@@ -4520,15 +4765,19 @@ mod tests {
         assert!(interest.remove_peer_interest(&contract, &peer));
     }
 
-    /// A hosted contract with downstream subscribers must NOT be evicted
-    /// from the hosting cache even after TTL expires and cache is over budget.
-    /// Without this, interior peers would drop hosting → stop renewal → lose
-    /// upstream subscription → downstream subscribers lose their feed.
+    /// A hosted contract with downstream subscribers is ordered LAST, so when a
+    /// zero-subscriber contract is available to shed it is NOT evicted (one
+    /// eviction of the zero-subscriber contract is enough to get back under
+    /// budget). This is the common case; it is NOT a hard pin — see
+    /// `evict_all_subscribed_sheds_fewest_as_last_resort` (cache tests) for the
+    /// last-resort shed when EVERY contract is subscribed. Without ordering
+    /// subscribed contracts last, interior peers would drop hosting → stop
+    /// renewal → lose upstream subscription → downstream subscribers lose their feed.
     ///
     /// This test operates at the HostingCache level with MockTimeSrc so we
-    /// can actually advance time past TTL and verify the retain predicate.
+    /// can actually advance time past TTL and verify the ordering.
     #[test]
-    fn test_downstream_subscribers_protect_from_eviction() {
+    fn test_downstream_subscribers_evicted_after_zero_sub() {
         use crate::ring::hosting::cache::HostingCache;
         use crate::util::time_source::SharedMockTimeSource;
 
@@ -4537,32 +4786,34 @@ mod tests {
         // Budget of 150 bytes with 2x100-byte entries = over budget
         let mut cache = HostingCache::new(150, min_ttl, time.clone());
 
-        let protected = make_contract_key(1);
-        let unprotected = make_contract_key(2);
+        let subscribed = make_contract_key(1);
+        let zero_sub = make_contract_key(2);
 
-        cache.record_access(protected, 100, AccessType::Get, 0, |_| 0);
-        cache.record_access(unprotected, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(subscribed, 100, AccessType::Get, 0, |_| (0, 0));
+        cache.record_access(zero_sub, 100, AccessType::Get, 0, |_| (0, 0));
         assert_eq!(cache.current_bytes(), 200); // over budget
 
         // Advance past TTL
         time.advance_time(Duration::from_secs(61));
 
-        // Sweep with predicate that protects the first contract
-        // (simulates has_downstream_subscribers returning true)
+        // `subscribed` has a downstream subscriber; `zero_sub` has none. Under
+        // subscriber-primary ordering the zero-subscriber one sheds first, and one
+        // eviction is enough — so the subscribed one survives (ordered last).
         let evicted = cache.sweep_expired(
-            |k| (*k == protected) as usize,
+            |k| (0, (*k == subscribed) as usize),
             cache::MemoryPressure::AtCapacity,
         );
 
         assert!(
-            !evicted.iter().any(|(k, _)| *k == protected),
-            "Contract with downstream subscribers must not be evicted"
+            !evicted.iter().any(|e| e.key == subscribed),
+            "the subscribed contract is ordered last; it survives while a \
+             zero-subscriber one can be shed"
         );
         assert!(
-            evicted.iter().any(|(k, _)| *k == unprotected),
-            "Unprotected contract should be evicted when over budget + past TTL"
+            evicted.iter().any(|e| e.key == zero_sub),
+            "the zero-subscriber contract is evicted first when over budget + past TTL"
         );
-        assert!(cache.contains(&protected));
+        assert!(cache.contains(&subscribed));
     }
 
     /// A hosted contract with NO subscribers and NO clients SHOULD be
@@ -4580,11 +4831,11 @@ mod tests {
         let mut cache = HostingCache::new(80, min_ttl, time.clone());
 
         let contract = make_contract_key(100);
-        cache.record_access(contract, 100, AccessType::Get, 0, |_| 0);
+        cache.record_access(contract, 100, AccessType::Get, 0, |_| (0, 0));
         assert!(cache.contains(&contract));
 
         // Under TTL: should not be evicted even though over budget
-        let evicted = cache.sweep_expired(|_| 0, cache::MemoryPressure::AtCapacity);
+        let evicted = cache.sweep_expired(|_| (0, 0), cache::MemoryPressure::AtCapacity);
         assert!(
             evicted.is_empty(),
             "Contract within TTL should not be evicted"
@@ -4593,10 +4844,10 @@ mod tests {
         // Advance past TTL
         time.advance_time(Duration::from_secs(61));
 
-        // Now should be evicted (over budget + past TTL + no retain predicate)
-        let evicted = cache.sweep_expired(|_| 0, cache::MemoryPressure::AtCapacity);
+        // Now should be evicted (over budget + past TTL + no subscribers)
+        let evicted = cache.sweep_expired(|_| (0, 0), cache::MemoryPressure::AtCapacity);
         assert!(
-            evicted.iter().any(|(k, _)| *k == contract),
+            evicted.iter().any(|e| e.key == contract),
             "Contract past TTL with no subscribers should be evicted"
         );
         assert!(!cache.contains(&contract));

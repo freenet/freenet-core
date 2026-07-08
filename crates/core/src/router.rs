@@ -254,6 +254,17 @@ pub(crate) struct RouterSnapshotInfo {
     /// avoid OOM. Populated by `Ring` on the snapshot cadence. `None` until the
     /// ring is built. Per-node aggregate scalar.
     pub hosting_oom_valve_evictions_total: Option<u64>,
+    /// Subscribed-eviction falsifier (subscriber-primary hosting rework, #4642):
+    /// monotonic count of over-budget evictions whose victim was SUBSCRIBED
+    /// (`local + downstream >= 1`) at eviction-decision time. Unlike
+    /// `hosting_oom_valve_evictions_total` (which stays 0 until the unwired
+    /// Overflow trigger lands), this can go nonzero the moment the eviction rework
+    /// ships — it is the field signal for the single riskiest new behavior,
+    /// shedding a subscribed contract as a last resort. A rising differenced rate
+    /// means budgets are too tight or demand is churning subscribed contracts.
+    /// Populated by `Ring` on the snapshot cadence. `None` until the ring is
+    /// built. Per-node aggregate scalar.
+    pub hosting_subscribed_evictions_total: Option<u64>,
     /// Terminal advertisement-consult counters (hosting redesign piece C,
     /// #4646; exported to central telemetry per #4658), populated by `Ring`
     /// from the per-node `network_status` singleton on the snapshot cadence.
@@ -1259,6 +1270,7 @@ impl Router {
             hosting_disk_compile_cache_bytes: None,
             hosting_disk_total_bytes: None,
             hosting_oom_valve_evictions_total: None,
+            hosting_subscribed_evictions_total: None,
             // Terminal advertisement-consult counters (piece C, #4646),
             // populated by Ring from the network_status singleton on the
             // snapshot cadence (#4658).

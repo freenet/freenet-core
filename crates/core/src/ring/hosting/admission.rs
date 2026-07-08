@@ -26,13 +26,20 @@
 //! Admission and the background over-budget eviction sweep are ONE demand-vs-
 //! capacity decision (invariant 3), so they MUST rank victims the same way. They
 //! do, by construction: both go through the single canonical
-//! [`cache::victim_order`], which orders victims ascending
-//! `(subscriber_count, last_get_seq, key_bytes)`. [`pick_displacement_victim`]
-//! and [`pick_oom_valve_victim`] call it directly — there is no second copy of
-//! the ordering to drift out of sync. The `admission_and_cache_agree_*` pin tests
-//! in this module assert admission's victim selection and `cache`'s over-budget
-//! eviction pick the SAME victim (and the same full eviction order) from a shared
-//! fixture, so a change to either side that broke the agreement fails CI.
+//! [`cache::victim_order`], which since the subscriber-primary rework (#4642)
+//! orders victims ascending
+//! `(local_subscription_count, downstream_subscriber_count, last_get_seq, key_bytes)`.
+//! This inert admission model tracks only a single COMBINED `subscriber_count`, so
+//! [`pick_displacement_victim`] and [`pick_oom_valve_victim`] call `victim_order`
+//! with that combined count in the DOWNSTREAM slot and the local slot held at 0 —
+//! `(0, n, seq, key)` compares exactly as the pre-split `(n, seq, key)` did, so no
+//! second copy of the ordering drifts out of sync. The `admission_and_cache_agree_*`
+//! pin tests in this module map their combined counts the same way and assert
+//! admission's victim selection and `cache`'s over-budget eviction pick the SAME
+//! victim (and the same full eviction order) from a shared fixture, so a change to
+//! either side that broke the agreement fails CI. (When admission is reconciled
+//! with the split model — or removed, per the demand-driven-hosting model that has
+//! no separate admission decision — this shim goes away.)
 //!
 //! The subscriber signal is a raw `usize` count (local client subs + downstream
 //! subs), NOT a distance-derived read-demand estimate and NOT ring distance. Both
@@ -415,9 +422,16 @@ fn pick_displacement_victim(
         .iter()
         .filter(|c| c.subscriber_count < candidate_subscriber_count)
         .min_by(|a, b| {
+            // The inert admission model (#4717) tracks only a single combined
+            // `subscriber_count`; the split `(local, downstream)` `victim_order`
+            // key degrades to ordering by that combined count when the first
+            // (local) slot is held at 0 — `(0, n, seq, key)` compares exactly as
+            // the old `(n, seq, key)` did. Shim kept until admission is reconciled
+            // with the split model (or removed per the demand-driven-hosting model,
+            // which has no separate admission decision).
             cache::victim_order(
-                (a.subscriber_count, a.last_get_seq, &a.key),
-                (b.subscriber_count, b.last_get_seq, &b.key),
+                (0, a.subscriber_count, a.last_get_seq, &a.key),
+                (0, b.subscriber_count, b.last_get_seq, &b.key),
             )
         })
         .map(|c| c.key)
@@ -438,9 +452,11 @@ fn pick_oom_valve_victim(hosted: &[AdmissionIncumbent]) -> Option<ContractKey> {
     hosted
         .iter()
         .min_by(|a, b| {
+            // See `pick_displacement_victim`: admission's inert combined-count
+            // model maps onto the split `victim_order` key with the local slot 0.
             cache::victim_order(
-                (a.subscriber_count, a.last_get_seq, &a.key),
-                (b.subscriber_count, b.last_get_seq, &b.key),
+                (0, a.subscriber_count, a.last_get_seq, &a.key),
+                (0, b.subscriber_count, b.last_get_seq, &b.key),
             )
         })
         .map(|c| c.key)
@@ -1012,13 +1028,17 @@ mod tests {
             (make_key(4), 2),
             (make_key(5), 1),
         ]);
-        let subs_of = |k: &ContractKey| subs.get(k).copied().unwrap_or(0);
+        // The cache orders by (local, downstream); admission's inert model tracks
+        // only a combined count. Map every combined count to the DOWNSTREAM slot
+        // (local = 0), exactly as admission's `victim_order` shim does, so the two
+        // orderings remain comparable.
+        let counts_of = |k: &ContractKey| (0usize, subs.get(k).copied().unwrap_or(0));
 
         let time = SharedMockTimeSource::new();
         let mut cache = HostingCache::new(budget, ttl, time.clone());
         for seed in [3u8, 2, 5, 4] {
             let key = make_key(seed);
-            let r = cache.record_access(key, 100, AccessType::Get, 0, &subs_of);
+            let r = cache.record_access(key, 100, AccessType::Get, 0, counts_of);
             assert!(r.is_new, "fixture keys must be distinct fresh inserts");
         }
 
@@ -1026,7 +1046,7 @@ mod tests {
             .keys()
             .map(|k| AdmissionIncumbent {
                 key: *k,
-                subscriber_count: subs_of(k),
+                subscriber_count: subs.get(k).copied().unwrap_or(0),
                 last_get_seq: cache.get(k).expect("inserted above").last_get_seq,
             })
             .collect();
@@ -1041,7 +1061,9 @@ mod tests {
         // (age stays 0), so the AtCapacity eviction each insert triggers finds
         // nothing past `min_ttl` and all four survive for the Overflow sweep.
         let (mut cache, _time, subs, hosted) = cross_module_fixture(0, Duration::from_secs(3600));
-        let subs_of = |k: &ContractKey| subs.get(k).copied().unwrap_or(0);
+        // Combined counts mapped to the downstream slot (local = 0), matching the
+        // admission `victim_order` shim, so the two orderings stay comparable.
+        let counts_of = |k: &ContractKey| (0usize, subs.get(k).copied().unwrap_or(0));
 
         // Admission's full order: repeatedly pick the OOM-valve victim (ranks
         // over ALL incumbents by `victim_order`) and remove it.
@@ -1055,9 +1077,9 @@ mod tests {
         // Cache's full order: Overflow sweep at budget 0 sheds all, fewest-
         // subscriber-then-least-recent-GET-first.
         let cache_order: Vec<ContractKey> = cache
-            .sweep_expired(&subs_of, CachePressure::Overflow)
+            .sweep_expired(counts_of, CachePressure::Overflow)
             .into_iter()
-            .map(|(k, _)| k)
+            .map(|e| e.key)
             .collect();
 
         assert_eq!(
@@ -1085,22 +1107,25 @@ mod tests {
         // Budget 350: three entries (300B) fit, four (400B) do not, so exactly
         // one entry is shed and the sweep's FRONT victim is observable.
         let (mut cache, time, subs, hosted) = cross_module_fixture(350, ttl);
-        let subs_of = |k: &ContractKey| subs.get(k).copied().unwrap_or(0);
+        // Combined counts mapped to the downstream slot (local = 0), matching the
+        // admission `victim_order` shim.
+        let counts_of = |k: &ContractKey| (0usize, subs.get(k).copied().unwrap_or(0));
 
-        // Age every entry past `min_ttl` so the AtCapacity zero-subscriber
-        // candidates become eligible (the subscribed seeds 4 & 5 stay pinned).
+        // Age every entry past `min_ttl` so all become eligible; the zero-
+        // subscriber seeds 2 & 3 still sort ahead of the subscribed 4 & 5, so one
+        // zero-subscriber entry is the front victim (subscribed ordered last).
         time.advance_time(ttl + Duration::from_secs(1));
 
         let admission_victim =
             pick_displacement_victim(&hosted, 1).expect("a zero-sub incumbent is displaceable");
 
-        let evicted = cache.sweep_expired(&subs_of, CachePressure::AtCapacity);
+        let evicted = cache.sweep_expired(counts_of, CachePressure::AtCapacity);
         assert_eq!(
             evicted.len(),
             1,
             "budget 350 sheds exactly one of four 100B entries"
         );
-        let cache_victim = evicted[0].0;
+        let cache_victim = evicted[0].key;
 
         assert_eq!(
             admission_victim, cache_victim,
