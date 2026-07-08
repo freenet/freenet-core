@@ -2266,18 +2266,34 @@ impl Ring {
 
             let mut attempted = 0;
             let mut skipped = 0;
+            // Per-tick budget on the number of interest-gate EVALUATIONS
+            // (`OpManager::reconcile_wants_renewal`) we run. Each evaluation builds
+            // a FRESH `ReconcileInputs` snapshot: a synchronous redb
+            // `get_state_size` read plus an `is_subscription_root` neighbor-map
+            // scan. The `attempted >= batch_limit` break below counts only SPAWNED
+            // renewals; a gate-SUPPRESSED candidate does `continue` WITHOUT
+            // advancing `attempted`, so on a high-hosting peer (every peer, now
+            // that every-hop placement is live) a single ~30s tick could otherwise
+            // build hundreds-to-thousands of these snapshots when the gate
+            // suppresses most candidates. Counting every gate evaluation against
+            // this budget restores the pre-flip `shadow_budget` bound: at most
+            // `batch_limit` snapshots per tick regardless of how many are
+            // suppressed. (Codex P2, #4725.)
+            let mut evaluated = 0;
 
             // Reconcile-controller FLIP (keystone sub-task 3, #4642), RENEWAL
-            // site. The controller no longer records a shadow divergence here — it
+            // site. The controller no longer records a shadow divergence here; it
             // DRIVES: for each candidate the loop calls
             // `OpManager::reconcile_wants_renewal`, which builds a FRESH
             // `ReconcileInputs` snapshot AT EMISSION time and renews only while the
-            // controller wants the contract's place in the mesh maintained. The
-            // drive runs only for contracts that reach the pending-mark gate below
-            // (past the ban + backoff `continue`s and the `attempted >=
-            // batch_limit` break), so its per-tick cost — a redb state-store read +
-            // an `is_subscription_root` neighbor scan per snapshot — stays bounded
-            // by `batch_limit`, as the old shadow sample budget did.
+            // controller wants the contract's place in the mesh maintained. Each
+            // snapshot is a redb state-store read plus an `is_subscription_root`
+            // neighbor scan, so the per-tick cost is bounded by the `evaluated`
+            // budget below (at most `batch_limit` gate evaluations per tick),
+            // mirroring the old shadow sample budget. The `attempted >=
+            // batch_limit` break bounds only the SPAWNED renewals and must NOT be
+            // relied on to bound the evaluations, because a gate-suppressed
+            // candidate does not advance `attempted`.
             for contract in contracts_needing_renewal {
                 // Limit concurrent renewal attempts to avoid overwhelming the network
                 if attempted >= batch_limit {
@@ -2325,6 +2341,27 @@ impl Ring {
                     skipped += 1;
                     continue;
                 }
+
+                // Per-tick evaluation budget (Codex P2, #4725): stop building
+                // expensive `ReconcileInputs` snapshots once we've run
+                // `batch_limit` interest-gate evaluations this tick, whether they
+                // led to a spawn or a suppression. This is the bound that keeps a
+                // high-hosting peer from building hundreds-to-thousands of
+                // snapshots per tick when the gate suppresses most candidates (the
+                // `attempted >= batch_limit` break above does NOT cover this,
+                // because a suppressed candidate never advances `attempted`).
+                // Remaining candidates are retried next cycle.
+                if evaluated >= batch_limit {
+                    tracing::debug!(
+                        limit = batch_limit,
+                        attempted,
+                        skipped,
+                        "Reached max renewal-gate evaluations for this interval, \
+                         remaining will be tried next cycle"
+                    );
+                    break;
+                }
+                evaluated += 1;
 
                 // FLIP (#4642 keystone): interest-gated renewal DRIVEN by the
                 // reconcile controller's interest gate (design §5a
@@ -6313,6 +6350,149 @@ mod k_closest_source_tests {
             gate < spawn,
             "the reconcile interest gate must run BEFORE mark_subscription_pending \
              so a torn-down contract is never renewed"
+        );
+    }
+
+    /// Regression pin for the per-tick renewal-gate EVALUATION budget (Codex P2,
+    /// #4725). The interest gate `OpManager::reconcile_wants_renewal` builds a
+    /// fresh `ReconcileInputs` snapshot (a redb `get_state_size` read + an
+    /// `is_subscription_root` neighbor scan) on EVERY call. The pre-fix loop
+    /// bounded only SPAWNED renewals via `attempted >= batch_limit`, but a
+    /// gate-suppressed candidate `continue`s WITHOUT advancing `attempted`, so on
+    /// a high-hosting peer (every peer, now that every-hop placement is live) one
+    /// ~30s maintenance tick could evaluate the gate for the whole renewal set —
+    /// hundreds-to-thousands of snapshots instead of the intended ~`batch_limit`.
+    /// This pins that a DISTINCT evaluation budget (`evaluated`) breaks the loop
+    /// BEFORE the expensive gate runs, and is advanced on every gate evaluation
+    /// (not only on spawn, which is what `attempted` counts). A refactor that
+    /// drops the budget or reverts to an `attempted`-only bound fails CI here.
+    #[test]
+    fn renewal_gate_evaluations_bounded_before_gate() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn recover_orphaned_subscriptions(");
+
+        let budget_break = body.find("if evaluated >= batch_limit").expect(
+            "the renewal loop must bound the number of interest-gate evaluations \
+             per tick with `if evaluated >= batch_limit { break }` (Codex P2, \
+             #4725) — otherwise a gate-suppressed candidate never advances \
+             `attempted` and the loop builds an unbounded number of \
+             ReconcileInputs snapshots per tick",
+        );
+        let gate = body
+            .find("reconcile_wants_renewal(&contract)")
+            .expect("renewal loop must consult the reconcile interest gate");
+        assert!(
+            budget_break < gate,
+            "the evaluation-budget break (offset {budget_break}) must run BEFORE \
+             the expensive reconcile_wants_renewal gate (offset {gate}) so the \
+             per-snapshot cost is bounded by batch_limit"
+        );
+
+        // The budget must advance on every gate evaluation (between the break and
+        // the gate), which is what distinguishes it from the `attempted` spawn cap.
+        let increment = body.find("evaluated += 1").expect(
+            "the evaluation budget `evaluated` must be incremented per gate \
+             evaluation, not only when a renewal is spawned",
+        );
+        assert!(
+            budget_break < increment && increment < gate,
+            "`evaluated += 1` (offset {increment}) must sit between the budget \
+             break (offset {budget_break}) and the gate (offset {gate}) so every \
+             gate evaluation is counted toward the per-tick bound"
+        );
+    }
+
+    /// Behavioral regression for the per-tick evaluation budget (Codex P2,
+    /// #4725). Models the renewal loop's exact two-counter structure and asserts
+    /// the number of expensive interest-gate evaluations stays bounded by
+    /// `batch_limit` regardless of how many candidates the gate suppresses. The
+    /// pre-fix `attempted`-only bound (encoded in `simulate_attempted_only`)
+    /// evaluated the WHOLE candidate set when the gate suppressed everything —
+    /// this is the unbounded-per-heartbeat-read cost the fix removes.
+    #[test]
+    fn renewal_gate_evaluation_count_is_bounded_when_suppressed() {
+        // Faithful model of the loop's per-tick counting: `attempted` is the
+        // spawn cap (advanced only on a spawn) and `evaluated` is the evaluation
+        // budget (advanced on every gate call). Returns (evaluations, spawns).
+        fn simulate(
+            candidates: usize,
+            batch_limit: usize,
+            gate: impl Fn(usize) -> bool,
+        ) -> (usize, usize) {
+            let mut attempted = 0usize;
+            let mut evaluated = 0usize;
+            for i in 0..candidates {
+                if attempted >= batch_limit {
+                    break; // spawn cap
+                }
+                if evaluated >= batch_limit {
+                    break; // evaluation budget (the fix)
+                }
+                evaluated += 1;
+                if !gate(i) {
+                    continue; // suppressed: does NOT advance `attempted`
+                }
+                attempted += 1;
+            }
+            (evaluated, attempted)
+        }
+
+        // The pre-fix model: only the `attempted` spawn cap bounds the loop.
+        fn simulate_attempted_only(
+            candidates: usize,
+            batch_limit: usize,
+            gate: impl Fn(usize) -> bool,
+        ) -> usize {
+            let mut attempted = 0usize;
+            let mut evaluated = 0usize;
+            for i in 0..candidates {
+                if attempted >= batch_limit {
+                    break;
+                }
+                evaluated += 1;
+                if !gate(i) {
+                    continue;
+                }
+                attempted += 1;
+            }
+            evaluated
+        }
+
+        let batch_limit = 10usize;
+        let many = 5_000usize;
+
+        // Pathological case: the gate suppresses every candidate. Evaluations
+        // must still be capped at `batch_limit`, and nothing spawns.
+        let (evaluated, attempted) = simulate(many, batch_limit, |_| false);
+        assert!(
+            evaluated <= batch_limit,
+            "gate evaluations ({evaluated}) must be bounded by batch_limit \
+             ({batch_limit}) even when every candidate is suppressed"
+        );
+        assert_eq!(
+            attempted, 0,
+            "no renewals spawn when every candidate is suppressed"
+        );
+
+        // Demonstrates the bug the budget fixes: the old attempted-only bound
+        // evaluated the WHOLE set when the gate suppressed everything.
+        let unbounded = simulate_attempted_only(many, batch_limit, |_| false);
+        assert_eq!(
+            unbounded, many,
+            "sanity: without the evaluation budget an all-suppressing gate builds \
+             a snapshot for every candidate — the unbounded cost the fix removes"
+        );
+
+        // Happy path: the gate wants every candidate. The evaluation budget must
+        // NOT reduce throughput below the spawn cap.
+        let (evaluated, attempted) = simulate(many, batch_limit, |_| true);
+        assert_eq!(
+            attempted, batch_limit,
+            "the spawn cap is still reached in the happy path"
+        );
+        assert!(
+            evaluated <= batch_limit,
+            "evaluations never exceed batch_limit"
         );
     }
 
