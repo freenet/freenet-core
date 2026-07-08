@@ -2574,7 +2574,10 @@ impl Ring {
             }
 
             // Sweep expired entries from GET subscription cache
-            let expired = ring.sweep_expired_get_subscriptions();
+            let crate::ring::hosting::HostingSweepResult {
+                expired,
+                evicted_in_use_teardown,
+            } = ring.sweep_expired_get_subscriptions();
 
             // Do NOT early-continue when `expired` is empty: pending
             // reclamation retries below must run every cycle, otherwise
@@ -2631,6 +2634,22 @@ impl Ring {
                         op_manager,
                         key,
                         expected_generation,
+                    );
+                }
+            }
+
+            // Sync the `InterestManager` for any still-in-use victim the sweep
+            // shed as a last resort: `teardown_evicted_in_use_contract` cleared
+            // the hosting maps but the `InterestManager` lives on `OpManager`, so
+            // ghost `interested_peers` / `peer_contracts` / `local_client_count`
+            // entries survive unless we replay the same removals here (PR #4734
+            // Fix 1). No-op in the common zero-subscriber sweep.
+            if let Some(op_manager) = &op_manager {
+                for teardown in &evicted_in_use_teardown {
+                    op_manager.interest_manager.remove_evicted_in_use(
+                        &teardown.key,
+                        &teardown.downstream_peers,
+                        teardown.local_client_count,
                     );
                 }
             }
@@ -4115,22 +4134,22 @@ impl Ring {
 
     /// Sweep for expired entries in the hosting cache.
     ///
-    /// Returns `(ContractKey, write_generation)` pairs for contracts
-    /// evicted from this cache. Contracts with client subscriptions
-    /// (or downstream/network subscribers) are protected from eviction.
-    /// The generation snapshot is carried through `EvictContract` so the
-    /// deletion-time guard can detect a re-host race.
-    pub fn sweep_expired_hosting(&self) -> Vec<(ContractKey, u64)> {
+    /// Returns a [`HostingSweepResult`]: the `(ContractKey, write_generation)`
+    /// reclaim pairs plus, for any still-in-use victim shed as a last resort,
+    /// the subscription state torn down (so the caller can sync the
+    /// `InterestManager`). Under subscriber-primary ordering a contract with
+    /// subscribers is evicted LAST (shed only when nothing with fewer
+    /// subscribers is eligible). The generation snapshot is carried through
+    /// `EvictContract` so the deletion-time guard can detect a re-host race.
+    pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
         self.hosting_manager.sweep_expired_hosting()
     }
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================
     /// Sweep for expired entries (delegated to hosting cache).
     ///
-    /// Returns `(ContractKey, write_generation)` pairs for contracts
-    /// evicted from the cache. Contracts with client subscriptions are
-    /// protected from eviction.
-    pub fn sweep_expired_get_subscriptions(&self) -> Vec<(ContractKey, u64)> {
+    /// Returns a [`HostingSweepResult`] (see [`Self::sweep_expired_hosting`]).
+    pub fn sweep_expired_get_subscriptions(&self) -> crate::ring::hosting::HostingSweepResult {
         // Delegate to hosting cache
         self.sweep_expired_hosting()
     }

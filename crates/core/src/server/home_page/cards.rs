@@ -1151,13 +1151,14 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // keep-score first); show at most MAX_ROWS. The tile carries the full count.
     //
     // The "next to evict" badge marks the first EVICTION-ELIGIBLE row, not
-    // simply the lowest keep-score row: the over-budget sweep SKIPS contracts
-    // that are within `min_ttl` or still in use (`should_retain`), so the
-    // lowest-score row may be one the cache would never actually evict. Badging
-    // it would mislabel an eviction-exempt contract — exactly the "dashboard
-    // misleads the operator" problem this card exists to fix. When nothing is
-    // currently eligible (every hosted contract is within-TTL / in use), no row
-    // is badged.
+    // simply the lowest keep-score row. A contract within `min_ttl` is not yet
+    // eligible, and one still in use (a local client / downstream subscriber) is
+    // ordered LAST by the subscriber-primary sweep — shed only as a last resort
+    // when nothing with fewer subscribers is eligible — so it is not the common-
+    // case next victim. `is_eviction_eligible` reflects that (past `min_ttl` AND
+    // not in use), so the badge never mislabels a contract the sweep would
+    // ordinarily keep. When nothing is currently eligible (every hosted contract
+    // is within-TTL / in use), no row is badged.
     const MAX_ROWS: usize = 20;
     let next_victim_idx = h.contracts.iter().position(|c| c.eviction_eligible);
     let mut rows = String::new();

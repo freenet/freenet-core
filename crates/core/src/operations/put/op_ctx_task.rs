@@ -1913,10 +1913,27 @@ async fn relay_put_store_locally(
     };
 
     if !was_hosting {
-        let evicted = op_manager
-            .ring
-            .host_contract(key, value.size() as u64, crate::ring::AccessType::Put)
-            .evicted;
+        let access_result =
+            op_manager
+                .ring
+                .host_contract(key, value.size() as u64, crate::ring::AccessType::Put);
+        let evicted = access_result.evicted;
+
+        // Sync the InterestManager for any subscribed contract the
+        // subscriber-primary eviction shed + tore down (#4642 invariant 3). Run
+        // BEFORE the `unregister_local_hosting` loop below so that call observes
+        // the now-zeroed subscriber counts and reports full interest loss (→
+        // retraction via `removed_contracts`). Without this, ghost
+        // `interested_peers` / `peer_contracts` / `local_client_count` entries
+        // survive and mis-target UPDATE broadcasts / inflate upstream interest
+        // counts (PR #4734 Fix 1).
+        for teardown in &access_result.evicted_in_use_teardown {
+            op_manager.interest_manager.remove_evicted_in_use(
+                &teardown.key,
+                &teardown.downstream_peers,
+                teardown.local_client_count,
+            );
+        }
 
         crate::operations::announce_contract_hosted(op_manager, &key).await;
 
@@ -4556,6 +4573,20 @@ mod tests {
         assert!(
             helper_src.contains("announce_contract_hosted"),
             "helper MUST call announce_contract_hosted for first-time hosting"
+        );
+        // PR #4734 Fix 1: the eviction handler must sync the InterestManager for
+        // any subscribed contract the subscriber-primary eviction shed + tore
+        // down, or ghost interested_peers / peer_contracts / local_client_count
+        // entries survive (they mis-target UPDATE broadcasts and do NOT
+        // self-heal). A dropped call must trip this pin.
+        assert!(
+            helper_src.contains("evicted_in_use_teardown"),
+            "helper MUST consume access_result.evicted_in_use_teardown"
+        );
+        assert!(
+            helper_src.contains("remove_evicted_in_use"),
+            "helper MUST call interest_manager.remove_evicted_in_use to sync the \
+             InterestManager after a subscribed eviction"
         );
     }
 

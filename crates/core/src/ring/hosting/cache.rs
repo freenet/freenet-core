@@ -11,21 +11,26 @@
 //! 1. **Single source of truth**: All hosted contracts are tracked in one cache
 //! 2. **Subscriber-primary eviction** (freenet/freenet-core#4642, subscriber-
 //!    primary rework): when over budget the eviction victim is chosen by
-//!    ascending `(subscriber_count, last_get_seq, key_bytes)` — the
-//!    FEWEST-subscriber contract first, ties broken by least-recent **real GET
-//!    read**, then a deterministic key-byte tiebreak. `subscriber_count` is
-//!    supplied by the caller (`HostingManager`) via the same closure that used
-//!    to be `should_retain`; it is the count of genuine demand (local client
-//!    subscriptions + downstream subscribers) and is `0` exactly when the
-//!    contract is NOT `contract_in_use`. In NORMAL over-budget operation
-//!    ([`MemoryPressure::AtCapacity`]) any subscribed contract (count >= 1) is
-//!    PINNED — only zero-subscriber contracts are evicted, so among the
-//!    candidate set `subscriber_count` is always 0 and the order reduces to
-//!    least-recent-GET. The subscriber-count gradation only bites at ADMISSION
-//!    (a later PR) and under the OOM valve ([`MemoryPressure::Overflow`]), where
-//!    the pin is pierced and the fewest-subscriber contract is shed to survive
-//!    genuine RAM overflow. `min_ttl` is preserved as the cold-start grace floor
-//!    for fresh zero-subscriber contracts.
+//!    ascending `(local_subscription_count, downstream_subscriber_count,
+//!    last_get_seq, key_bytes)` — the FEWEST-subscriber contract first (local
+//!    subscriptions weighed ahead of downstream), ties broken by least-recent
+//!    **real GET read**, then a deterministic key-byte tiebreak. The split
+//!    `(local, downstream)` counts are supplied by the caller (`HostingManager`)
+//!    via the same closure that used to be `should_retain`; they count genuine
+//!    demand (local client subscriptions + downstream subscribers) and sum to
+//!    `0` exactly when the contract is NOT `contract_in_use`. Subscriber count
+//!    is the ORDERING, NOT a hard pin: under NORMAL over-budget operation
+//!    ([`MemoryPressure::AtCapacity`]) a subscribed contract is ordered LAST and
+//!    survives while any contract with fewer subscribers is eligible, but when
+//!    the peer is still over budget and nothing fewer-subscriber is eligible the
+//!    fewest-subscriber contract IS shed as a last resort — including a
+//!    subscribed one (its subscription state is then torn down; see
+//!    [`RecordAccessResult::evicted_in_use_teardown`]). This is the change from
+//!    the shipped #4720 code, which hard-pinned every subscribed contract. The
+//!    OOM valve ([`MemoryPressure::Overflow`], trigger unwired) adds only one
+//!    extra power on top: it ALSO pierces the `min_ttl` cold-start floor.
+//!    `min_ttl` is preserved as the cold-start grace floor for fresh
+//!    zero-subscriber contracts.
 //! 3. **Subscription renewal**: All hosted contracts get subscription renewal
 //! 4. **Access type tracking**: Records how contract was accessed (GET/PUT/SUBSCRIBE)
 //!
@@ -49,6 +54,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::demand::NEUTRAL_DEMAND;
+use crate::ring::interest::PeerKey;
 use crate::util::time_source::TimeSource;
 use crate::wasm_runtime::read_total_ram_bytes;
 
@@ -238,13 +244,13 @@ pub(crate) struct HostingContractScore {
     /// eviction recency tiebreak (subscriber-primary rework, #4642). The cache
     /// orders zero-subscriber eviction candidates ascending by this.
     pub last_get_seq: u64,
-    /// Whether this entry is past its `min_ttl` age gate — the TTL half of the
-    /// `evict_over_budget` eviction filter (`age >= min_ttl && !should_retain`).
-    /// This is the only half the cache can decide on its own; the
-    /// `!should_retain` (in-use) half is folded in by the `HostingManager`
-    /// layer via [`super::HostingManager::is_eviction_eligible`]. Used by the
-    /// dashboard so the "next to evict" badge only marks a contract the
-    /// over-budget sweep would actually consider — never one it would skip.
+    /// Whether this entry is past its `min_ttl` age gate. Under normal
+    /// (`AtCapacity`) pressure this is the WHOLE eviction-eligibility filter
+    /// (`age >= min_ttl`): subscriber count no longer gates eligibility — a
+    /// subscribed contract is still eligible, just ordered LAST, and shed only
+    /// as a last resort (the change from the shipped #4720 `!should_retain`
+    /// hard pin). Used by the dashboard so the "next to evict" badge marks
+    /// contracts the over-budget sweep would actually consider.
     pub past_min_ttl: bool,
 }
 
@@ -360,6 +366,18 @@ pub struct RecordAccessResult {
     /// the shipped #4720 code carried). Captured atomically with the
     /// eviction decision to avoid a racy post-hoc `contract_in_use` re-read.
     pub evicted_in_use: Vec<ContractKey>,
+    /// The subscription state that `HostingManager::teardown_evicted_in_use_contract`
+    /// actually removed for each [`Self::evicted_in_use`] victim (one entry per
+    /// key). Populated by the `HostingManager` AFTER `evicted_in_use` drives the
+    /// teardown (empty at the cache layer, which decides the eviction but does
+    /// not own the subscription maps or the peer identities). The eviction
+    /// CONSUMER replays these removals against the `InterestManager` (which
+    /// lives on `OpManager`, not `HostingManager`) via
+    /// [`InterestManager::remove_evicted_in_use`](crate::ring::interest::InterestManager::remove_evicted_in_use)
+    /// so no ghost `interested_peers` / `peer_contracts` / `local_client_count`
+    /// entry survives to mis-target UPDATE broadcasts or inflate upstream
+    /// interest counts (PR #4734 Fix 1).
+    pub evicted_in_use_teardown: Vec<EvictedInUseTeardown>,
     /// Observed read-rate training sample (reads/second) for the accessed
     /// contract, or `None` when no meaningful rate is available (a seed/PUT, a
     /// brand-new entry, or a read with zero residency). `HostingManager` pairs
@@ -367,6 +385,28 @@ pub struct RecordAccessResult {
     /// prior (`super::demand::ProximityPrior`). Purely a training signal — it
     /// never affects THIS access's `keep_score`.
     pub observed_read_rate: Option<f64>,
+}
+
+/// The subscription state `HostingManager::teardown_evicted_in_use_contract`
+/// removed from the hosting maps for a single subscriber-primary eviction that
+/// shed a still-in-use contract. Carries exactly what the eviction consumer
+/// needs to replay against the `InterestManager` (per-peer downstream removals +
+/// a per-contract local-client count) so the two managers stay in sync. See
+/// [`RecordAccessResult::evicted_in_use_teardown`] and
+/// [`InterestManager::remove_evicted_in_use`](crate::ring::interest::InterestManager::remove_evicted_in_use).
+#[derive(Debug, Clone)]
+pub struct EvictedInUseTeardown {
+    /// The evicted contract.
+    pub key: ContractKey,
+    /// Downstream peer leases removed from `downstream_subscribers[key]`. The
+    /// consumer replays `remove_peer_interest(&key, peer)` +
+    /// `remove_downstream_subscriber(&key)` per peer (the
+    /// `handle_unsubscribe_inbound` pair).
+    pub downstream_peers: Vec<PeerKey>,
+    /// Number of local WebSocket client subscriptions removed from
+    /// `client_subscriptions[key.id()]`. The consumer replays
+    /// `remove_local_client(&key)` once per client (the client-disconnect path).
+    pub local_client_count: usize,
 }
 
 /// A single contract evicted by the over-budget sweep, with the metadata the
@@ -764,6 +804,18 @@ impl<T: TimeSource> HostingCache<T> {
                 let (local, downstream) = subscriber_counts(key);
                 let eligible = match pressure {
                     MemoryPressure::AtCapacity => {
+                        // KNOWN OPEN ITEM (pending Ian's decision — do NOT change
+                        // this gate without it): `min_ttl` is applied BEFORE the
+                        // subscriber-primary ordering, so a fresh zero-subscriber
+                        // contract still inside `min_ttl` is INELIGIBLE and thus
+                        // outranks (survives over) an older LOCAL-subscribed
+                        // contract that is past `min_ttl` — the cold-start floor
+                        // wins over subscriber count in that corner. Whether
+                        // subscriber-primary should override `min_ttl` (evict the
+                        // fresh zero-sub contract to keep the local-subscribed one)
+                        // is undecided. See `.claude/rules/hosting-invariants.md`
+                        // (Resolved decisions: "`min_ttl` KEPT as the cold-start
+                        // floor").
                         let age = now.saturating_duration_since(entry.last_accessed);
                         age >= self.min_ttl
                     }
@@ -861,14 +913,19 @@ impl<T: TimeSource> HostingCache<T> {
     /// Eviction respects TTL: age-0 entries are not eligible for eviction
     /// while `min_ttl > 0` (the production default — i.e. the new entry
     /// just inserted by this call cannot be evicted by the same call).
-    /// It also honors `subscriber_count`: a contract with `subscriber_count(key)
-    /// >= 1` (an active client subscription or downstream subscriber) is PINNED
-    /// and never evicted under normal ([`MemoryPressure::AtCapacity`]) pressure,
-    /// even past TTL. Evicting an in-use contract would orphan its on-disk state
-    /// — the caller skips disk reclamation for it, but the contract is then gone
-    /// from the cache and never revisited. (Only the OOM valve, wired via
-    /// `sweep_expired` under [`MemoryPressure::Overflow`], may pierce this pin;
-    /// a fresh insert always uses `AtCapacity`.)
+    /// Subscriber count ORDERS victims, it does not pin them: a contract with
+    /// `subscriber_count(key) >= 1` (an active client subscription or downstream
+    /// subscriber) is evicted LAST and survives while any contract with fewer
+    /// subscribers is eligible, but when the cache is still over budget past TTL
+    /// and nothing fewer-subscriber is eligible, the fewest-subscriber contract
+    /// IS shed as a last resort — even a subscribed one. When that happens the
+    /// returned `EvictedContract::was_in_use` flag is set so the caller tears
+    /// down the subscription state and reclaims the on-disk state (see
+    /// `HostingManager::teardown_evicted_in_use_contract`). This is the change
+    /// from the shipped #4720 code, which hard-pinned subscribed contracts. The
+    /// OOM valve ([`MemoryPressure::Overflow`], trigger unwired) adds only one
+    /// extra power: it ALSO pierces `min_ttl`; a fresh insert always uses
+    /// `AtCapacity`.
     ///
     /// `write_generation` is the current state-write generation for this
     /// contract (from `HostingManager::state_generation`). It is stored on
@@ -988,6 +1045,9 @@ impl<T: TimeSource> HostingCache<T> {
                 is_new: false,
                 evicted: Vec::new(),
                 evicted_in_use: Vec::new(),
+                // Filled by `HostingManager::record_contract_access` after the
+                // teardown loop; empty here (refresh path evicts nothing).
+                evicted_in_use_teardown: Vec::new(),
                 observed_read_rate,
             }
         } else {
@@ -1042,7 +1102,10 @@ impl<T: TimeSource> HostingCache<T> {
                 is_new: true,
                 evicted,
                 evicted_in_use,
-                // Brand-new entry has zero residency -> no rate sample yet.
+                // Filled by `HostingManager::record_contract_access` from the
+                // teardown loop (this layer knows WHICH keys are in-use but not
+                // the peer identities / client counts the manager tears down).
+                evicted_in_use_teardown: Vec::new(),
                 observed_read_rate: None,
             }
         }
@@ -1833,7 +1896,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sweep_respects_should_retain() {
+    fn test_sweep_orders_subscribed_last() {
         let (mut cache, time) = make_cache(200, Duration::from_secs(60));
         let key1 = make_key(1);
         let key2 = make_key(2);
@@ -1862,11 +1925,13 @@ mod tests {
         assert_eq!(cache.current_bytes(), 200);
     }
 
-    /// `record_access` must honor `should_retain`: an over-budget, past-TTL
-    /// entry whose `should_retain` returns true is NOT evicted; an
-    /// unretained past-TTL entry IS evicted.
+    /// `record_access` orders subscribed contracts LAST: over budget past TTL,
+    /// the subscribed entry survives while a zero-subscriber past-TTL entry is
+    /// shed instead (one eviction is enough to get back under budget). It is NOT
+    /// a hard pin — see `evict_all_subscribed_sheds_fewest_as_last_resort` for
+    /// the last-resort shed when EVERY contract is subscribed.
     #[test]
-    fn test_record_access_respects_should_retain() {
+    fn test_record_access_orders_subscribed_last() {
         let (mut cache, time) = make_cache(200, Duration::from_secs(60));
         let retained = make_key(1);
         let evictable = make_key(2);

@@ -1278,6 +1278,21 @@ async fn cache_contract_locally(
         op_manager.ring.mark_local_client_access(&key);
     }
 
+    // Sync the InterestManager for any subscribed contract the subscriber-primary
+    // eviction shed + tore down (#4642 invariant 3). Run BEFORE the
+    // `unregister_local_hosting` loop below so that call observes the now-zeroed
+    // subscriber counts and reports full interest loss (→ retraction via
+    // `removed_contracts`). Without this, ghost `interested_peers` /
+    // `peer_contracts` / `local_client_count` entries survive and mis-target
+    // UPDATE broadcasts / inflate upstream interest counts (PR #4734 Fix 1).
+    for teardown in &access_result.evicted_in_use_teardown {
+        op_manager.interest_manager.remove_evicted_in_use(
+            &teardown.key,
+            &teardown.downstream_peers,
+            teardown.local_client_count,
+        );
+    }
+
     let mut removed_contracts = Vec::new();
     for (evicted_key, expected_generation) in &access_result.evicted {
         if op_manager
@@ -4104,6 +4119,30 @@ mod tests {
              executor rejects the PutQuery. The legacy branch at \
              get.rs:2420-2435 continues these side effects on error; \
              the driver must match."
+        );
+    }
+
+    /// Pin (PR #4734 Fix 1): the GET eviction handler must sync the
+    /// InterestManager for any subscribed contract the subscriber-primary
+    /// eviction shed + tore down. `teardown_evicted_in_use_contract` clears the
+    /// hosting maps, but the InterestManager lives on `OpManager`, so a dropped
+    /// `remove_evicted_in_use` call leaves ghost `interested_peers` /
+    /// `peer_contracts` / `local_client_count` entries that mis-target UPDATE
+    /// broadcasts and do NOT self-heal. A refactor that drops the call must trip
+    /// this pin (the "manually-inlined side effect after a task-per-tx
+    /// migration" class — see .claude/rules/bug-prevention-patterns.md).
+    #[test]
+    fn cache_contract_locally_syncs_interest_on_subscribed_eviction() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn cache_contract_locally(");
+        assert!(
+            body.contains("evicted_in_use_teardown"),
+            "GET eviction handler must consume access_result.evicted_in_use_teardown"
+        );
+        assert!(
+            body.contains("remove_evicted_in_use"),
+            "GET eviction handler must call interest_manager.remove_evicted_in_use \
+             to sync the InterestManager after a subscribed eviction"
         );
     }
 

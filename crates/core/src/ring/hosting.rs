@@ -50,7 +50,7 @@ pub(crate) use cache::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
 /// the operator-facing default and the in-code fallback can never drift. The
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use cache::default_hosting_budget_bytes;
-pub use cache::{AccessType, RecordAccessResult};
+pub use cache::{AccessType, EvictedInUseTeardown, RecordAccessResult};
 use cache::{DEFAULT_MIN_TTL, HostingCache, HostingCacheStats};
 /// Clamp bounds re-exported only for the config-default round-trip test, which
 /// asserts the resolved default lands within [MIN, MAX] without hardcoding the
@@ -166,6 +166,19 @@ pub struct SubscribeResult {
     pub is_new: bool,
     /// When the subscription will expire.
     pub expires_at: Instant,
+}
+
+/// Result of a hosting-cache over-budget/expiry sweep
+/// ([`HostingManager::sweep_expired_hosting`]).
+#[derive(Debug, Default)]
+pub struct HostingSweepResult {
+    /// `(ContractKey, write_generation)` pairs the caller reclaims from disk.
+    pub expired: Vec<(ContractKey, u64)>,
+    /// Subscription state torn down for any still-in-use victim shed as a last
+    /// resort, so the caller can replay the removals against the
+    /// `InterestManager` (PR #4734 Fix 1). Empty in the common (zero-subscriber)
+    /// sweep.
+    pub evicted_in_use_teardown: Vec<EvictedInUseTeardown>,
 }
 
 /// Lease-tracked active subscription state.
@@ -1301,14 +1314,33 @@ impl HostingManager {
     ///   contract; clearing `client_subscriptions` likewise stops section 2
     ///   (client-subscription re-subscribe) from re-driving it.
     ///
+    /// Returns the removed subscription state so the eviction CONSUMER can
+    /// replay the identical removals against the `InterestManager` (which lives
+    /// on `OpManager`, not here) via
+    /// [`InterestManager::remove_evicted_in_use`](crate::ring::interest::InterestManager::remove_evicted_in_use);
+    /// otherwise ghost `interested_peers` / `peer_contracts` /
+    /// `local_client_count` entries survive and mis-target UPDATE broadcasts /
+    /// inflate upstream interest counts (PR #4734 Fix 1). See
+    /// [`EvictedInUseTeardown`].
+    ///
     /// Idempotent and safe to call on an already-clean key (each removal is a
     /// no-op when absent).
-    fn teardown_evicted_in_use_contract(&self, key: &ContractKey) {
-        let had_downstream = self.downstream_subscribers.remove(key).is_some();
-        let had_client = self.client_subscriptions.remove(key.id()).is_some();
+    fn teardown_evicted_in_use_contract(&self, key: &ContractKey) -> EvictedInUseTeardown {
+        let downstream_peers: Vec<PeerKey> = self
+            .downstream_subscribers
+            .remove(key)
+            .map(|(_, peers)| peers.into_keys().collect())
+            .unwrap_or_default();
+        let local_client_count = self
+            .client_subscriptions
+            .remove(key.id())
+            .map(|(_, clients)| clients.len())
+            .unwrap_or(0);
         // Drop our own upstream lease too (same as the sweep loop's belt-and-
         // suspenders `ring.unsubscribe`), so renewal section 1 won't re-drive it.
         self.unsubscribe(key);
+        let had_downstream = !downstream_peers.is_empty();
+        let had_client = local_client_count > 0;
         if had_downstream || had_client {
             debug!(
                 contract = %key,
@@ -1317,6 +1349,11 @@ impl HostingManager {
                 "Tore down subscription state for a subscriber-primary eviction \
                  (#4642 invariant 3); disk reclamation can now proceed"
             );
+        }
+        EvictedInUseTeardown {
+            key: *key,
+            downstream_peers,
+            local_client_count,
         }
     }
 
@@ -1485,7 +1522,7 @@ impl HostingManager {
         // before the hosting-cache write lock is taken (no nested lock order).
         let (distance, predicted_demand) = self.distance_and_demand(&key);
 
-        let result = self.hosting_cache.write().record_access_with_demand(
+        let mut result = self.hosting_cache.write().record_access_with_demand(
             key,
             size_bytes,
             access_type,
@@ -1502,9 +1539,16 @@ impl HostingManager {
         // freed (the memory-teardown the shipped #4720 code was missing). The
         // cache write lock is already dropped; the teardown touches only the
         // subscription DashMaps + active_subscriptions, never the hosting cache.
-        for evicted_key in &result.evicted_in_use {
-            self.teardown_evicted_in_use_contract(evicted_key);
-        }
+        //
+        // Collect what each teardown removed so the CONSUMER can replay the same
+        // removals against the `InterestManager` (which lives on `OpManager`, not
+        // here) — otherwise ghost `interested_peers` / `peer_contracts` /
+        // `local_client_count` entries survive (PR #4734 Fix 1).
+        result.evicted_in_use_teardown = result
+            .evicted_in_use
+            .iter()
+            .map(|evicted_key| self.teardown_evicted_in_use_contract(evicted_key))
+            .collect();
 
         // Train the proximity prior from this peer's own observed read rate for
         // the accessed contract (only reads yield a sample; PUT is a seed). The
@@ -1864,11 +1908,13 @@ impl HostingManager {
     /// after `SUBSCRIPTION_LEASE_DURATION` without renewal.
     /// Automatically removes persisted metadata for expired contracts.
     ///
-    /// Returns `(ContractKey, write_generation)` pairs — the generation
-    /// captured atomically under the hosting-cache write lock travels with
-    /// the `EvictContract` event so the deletion-time guard can detect a
-    /// re-host race.
-    pub fn sweep_expired_hosting(&self) -> Vec<(ContractKey, u64)> {
+    /// Returns a [`HostingSweepResult`]: the `(ContractKey, write_generation)`
+    /// reclaim pairs — the generation captured atomically under the hosting-cache
+    /// write lock travels with the `EvictContract` event so the deletion-time
+    /// guard can detect a re-host race — plus, for any still-in-use victim shed
+    /// as a last resort, the subscription state torn down so the caller can sync
+    /// the `InterestManager` (PR #4734 Fix 1).
+    pub fn sweep_expired_hosting(&self) -> HostingSweepResult {
         // AtCapacity: the Overflow `min_ttl`-pierce trigger is intentionally
         // unwired in production (see cache::MemoryPressure). AtCapacity itself
         // CAN now shed a subscribed contract as a last resort — see below.
@@ -1882,11 +1928,14 @@ impl HostingManager {
         // checks it and the disk state is actually freed (the memory-teardown the
         // shipped #4720 code was missing). Then strip to the `(key, generation)`
         // reclaim list the caller (`ring.rs` maintenance loop) already consumes.
+        // Collect each teardown so the caller can replay the removals against the
+        // `InterestManager` (which lives on `OpManager`, not here).
+        let mut evicted_in_use_teardown = Vec::new();
         let expired: Vec<(ContractKey, u64)> = evicted
             .iter()
             .map(|e| {
                 if e.was_in_use {
-                    self.teardown_evicted_in_use_contract(&e.key);
+                    evicted_in_use_teardown.push(self.teardown_evicted_in_use_contract(&e.key));
                 }
                 (e.key, e.write_generation)
             })
@@ -1917,7 +1966,10 @@ impl HostingManager {
             }
         }
 
-        expired
+        HostingSweepResult {
+            expired,
+            evicted_in_use_teardown,
+        }
     }
 
     // =========================================================================
@@ -4777,7 +4829,7 @@ mod tests {
     /// This test operates at the HostingCache level with MockTimeSrc so we
     /// can actually advance time past TTL and verify the ordering.
     #[test]
-    fn test_downstream_subscribers_evicted_after_zero_sub() {
+    fn test_zero_sub_evicted_before_downstream_subscribed() {
         use crate::ring::hosting::cache::HostingCache;
         use crate::util::time_source::SharedMockTimeSource;
 

@@ -781,6 +781,43 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
     }
 
+    /// Mirror a subscriber-primary eviction that tore down a still-in-use
+    /// contract's hosting subscription state (#4642 invariant 3, PR #4734).
+    ///
+    /// The `InterestManager` lives on `OpManager`, NOT on `HostingManager`, so
+    /// when `HostingManager::teardown_evicted_in_use_contract` clears the
+    /// hosting maps (`downstream_subscribers` + `client_subscriptions`) the
+    /// eviction CONSUMER must replay the identical removals here or ghost
+    /// `interested_peers` / `peer_contracts` / `local_client_count` entries
+    /// survive. Those ghosts are load-bearing — they drive UPDATE broadcast
+    /// targeting (`get_interested_peers`) and upstream interest counts — and do
+    /// NOT self-heal, because the reconcilers iterate the very hosting maps the
+    /// teardown just emptied.
+    ///
+    /// Mirrors, exactly:
+    /// - `handle_unsubscribe_inbound` per downstream peer: `remove_peer_interest`
+    ///   (clears `interested_peers` / `peer_contracts`) + `remove_downstream_subscriber`
+    ///   (decrements the local `downstream_subscriber_count`).
+    /// - the client-disconnect path per local client: `remove_local_client`
+    ///   (decrements `local_client_count`).
+    ///
+    /// Idempotent and safe on an already-clean contract (each removal is a
+    /// no-op when absent).
+    pub fn remove_evicted_in_use(
+        &self,
+        contract: &ContractKey,
+        downstream_peers: &[PeerKey],
+        local_client_count: usize,
+    ) {
+        for peer in downstream_peers {
+            self.remove_peer_interest(contract, peer);
+            self.remove_downstream_subscriber(contract);
+        }
+        for _ in 0..local_client_count {
+            self.remove_local_client(contract);
+        }
+    }
+
     /// Get or create local interest entry, returning mutable reference.
     pub fn with_local_interest<F, R>(&self, contract: &ContractKey, f: F) -> R
     where
@@ -1289,6 +1326,89 @@ mod tests {
 
         // Remove again returns false
         assert!(!manager.remove_peer_interest(&contract, &peer));
+    }
+
+    /// Regression for the InterestManager desync on subscribed eviction
+    /// (PR #4734 Fix 1). When a subscriber-primary eviction shed + tore down a
+    /// still-in-use contract, the hosting maps are cleared by
+    /// `HostingManager::teardown_evicted_in_use_contract`, but the
+    /// InterestManager lives on `OpManager` and must be synced separately by the
+    /// consumer via `remove_evicted_in_use`. Before this fix, ghost
+    /// `interested_peers` / `peer_contracts` / `local_client_count` entries
+    /// survived (they drive UPDATE broadcast targeting + upstream interest
+    /// counts) and did NOT self-heal. Assert every map is ZERO afterward — the
+    /// gap the HostingManager-level `torn_down_...` test did not cover.
+    #[test]
+    fn remove_evicted_in_use_clears_all_interest_maps() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let downstream_a = make_peer_key(1);
+        let downstream_b = make_peer_key(2);
+
+        // Mirror the real add path: per downstream peer,
+        // register_peer_interest (interested_peers/peer_contracts) +
+        // add_downstream_subscriber (downstream_subscriber_count). Plus two
+        // local client subscriptions (local_client_count).
+        manager.register_peer_interest(&contract, downstream_a.clone(), None, false);
+        manager.add_downstream_subscriber(&contract);
+        manager.register_peer_interest(&contract, downstream_b.clone(), None, false);
+        manager.add_downstream_subscriber(&contract);
+        manager.add_local_client(&contract);
+        manager.add_local_client(&contract);
+
+        // Sanity: interest present in all three maps before teardown.
+        assert_eq!(manager.get_interested_peers(&contract).len(), 2);
+        assert!(!manager.get_contracts_for_peer(&downstream_a).is_empty());
+        assert!(!manager.get_contracts_for_peer(&downstream_b).is_empty());
+        manager.with_local_interest(&contract, |li| {
+            assert_eq!(li.local_client_count, 2);
+            assert_eq!(li.downstream_subscriber_count, 2);
+        });
+
+        // Replay the hosting teardown against the InterestManager exactly as the
+        // eviction consumers do.
+        manager.remove_evicted_in_use(&contract, &[downstream_a.clone(), downstream_b.clone()], 2);
+
+        // interested_peers / peer_contracts / local_client_count all ZERO — no
+        // ghost survives to mis-target UPDATE broadcasts or inflate counts.
+        assert!(
+            manager.get_interested_peers(&contract).is_empty(),
+            "interested_peers must be cleared for the evicted contract"
+        );
+        assert!(
+            manager.get_contracts_for_peer(&downstream_a).is_empty(),
+            "peer_contracts[downstream_a] must be cleared"
+        );
+        assert!(
+            manager.get_contracts_for_peer(&downstream_b).is_empty(),
+            "peer_contracts[downstream_b] must be cleared"
+        );
+        // has_local_interest reads via `.get` (no entry re-creation), so a false
+        // result proves the local_interests entry — local_client_count and
+        // downstream_subscriber_count — is fully gone.
+        assert!(
+            !manager.has_local_interest(&contract),
+            "no local interest (client or downstream count) may remain"
+        );
+        let stats = manager.stats();
+        assert_eq!(
+            stats.total_contracts, 0,
+            "no contract may retain interested peers"
+        );
+        assert_eq!(stats.total_peer_interests, 0);
+        assert_eq!(
+            stats.local_interests, 0,
+            "no local_interests entry may survive"
+        );
+        assert_eq!(
+            stats.hash_index_size, 0,
+            "the contract hash index must be cleaned up once no interest remains"
+        );
+
+        // Idempotent: replaying on an already-clean contract is a no-op.
+        manager.remove_evicted_in_use(&contract, &[downstream_a], 1);
+        assert_eq!(manager.stats().total_contracts, 0);
+        assert_eq!(manager.stats().local_interests, 0);
     }
 
     #[test]
