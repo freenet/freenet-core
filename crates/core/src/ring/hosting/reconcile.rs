@@ -238,6 +238,26 @@ pub(crate) struct ReconcileInputs {
     /// silently dropped when the builder is written.
     pub has_farther_downstream_subscriber: bool,
 
+    /// A local client GET or PUT touched this contract recently (within the
+    /// renewal age gate, `SUBSCRIPTION_LEASE_DURATION`). This is REAL local
+    /// demand that is NOT a subscription: a read-only or write-only contract —
+    /// the River UI container, web/UI containers — is GET-read or PUT and never
+    /// subscribed, yet MUST stay renewed in the update mesh so later local reads
+    /// serve fresh state (`hosting-invariants.md` invariant 3: reads/PUTs are a
+    /// **permanent demand signal**, not merely a recency tiebreak).
+    ///
+    /// Set from `contracts_needing_renewal()` branch 3's signal
+    /// (`hosting_cache.has_recent_local_client_access`), which is refreshed by a
+    /// genuine local GET or PUT (`mark_local_client_access`) — never by automatic
+    /// subscription-renewal traffic. Together with
+    /// [`has_local_client`](Self::has_local_client) and
+    /// [`has_farther_downstream_subscriber`](Self::has_farther_downstream_subscriber)
+    /// this forms `contract_in_use`, the interest gate for renewal / collapse.
+    /// Without it, the FLIP's renewal gate ([`wants_renewal`]) drops a
+    /// read-only/PUT-only contract the builder still emits, its lease lapses, it
+    /// leaves the mesh, and later local reads serve stale.
+    pub has_recent_local_client_access: bool,
+
     /// We have the contract state locally (code + state present). Hosting requires
     /// state; a `Subscribe`/`Renew`/`ReRootSearch`/`Retract` may still be desired
     /// without it (they maintain the subscription/link/advertisement, not the
@@ -498,23 +518,30 @@ pub(crate) fn action_set_divergence_focused(
 }
 
 /// The interest gate (design doc §5a / §6): a peer keeps hosting AND keeps
-/// renewing iff it is `contract_in_use` — it has a **local client** OR a
+/// renewing iff it is `contract_in_use` — it has a **local client**, a
 /// **STRICTLY-farther** downstream subscriber (piece D: a downstream counts only
 /// when strictly farther from the key, so two mutual co-hosts cannot renew each
-/// other forever). This is the SINGLE predicate that drives both the collapse
-/// rule inside [`reconcile`] (teardown fires iff `!contract_in_use`) and the FLIP's
-/// renewal gate ([`wants_renewal`]) — "a peer keeps hosting exactly as long as it
-/// keeps renewing, and stops both together" (design §6).
+/// other forever), OR **recent local GET/PUT access**. Reads and PUTs are a
+/// permanent demand signal (`hosting-invariants.md` invariant 3): a contract
+/// that is only ever read or PUT and never subscribed — the River UI container,
+/// web/UI containers — must stay renewed in the mesh and retained. This is the
+/// SINGLE predicate that drives both the collapse rule inside [`reconcile`]
+/// (teardown fires iff `!contract_in_use`) and the FLIP's renewal gate
+/// ([`wants_renewal`]) — "a peer keeps hosting exactly as long as it keeps
+/// renewing, and stops both together" (design §6).
 pub(crate) fn contract_in_use(inputs: &ReconcileInputs) -> bool {
-    inputs.has_local_client || inputs.has_farther_downstream_subscriber
+    inputs.has_local_client
+        || inputs.has_farther_downstream_subscriber
+        || inputs.has_recent_local_client_access
 }
 
 /// The FLIP's RENEWAL gate (keystone sub-task 3, #4642; design doc §5a): whether
 /// the renewal loop should spawn a renewal for this contract this tick.
 ///
 /// This is exactly the controller's interest gate [`contract_in_use`] — renew
-/// while (and only while) a local client or a strictly-farther downstream
-/// subscriber depends on this peer hosting. When it goes false the renewal loop
+/// while (and only while) a local client, a strictly-farther downstream
+/// subscriber, or a recent local GET/PUT access depends on this peer hosting
+/// (reads/PUTs are permanent demand, invariant 3). When it goes false the renewal loop
 /// skips the spawn, the lease lapses, and the chain collapses inward — non-renewal
 /// IS the collapse primitive (§5a). Consumed by
 /// `OpManager::reconcile_wants_renewal`, which supplies the fresh snapshot.
@@ -537,8 +564,10 @@ pub(crate) fn wants_renewal(inputs: &ReconcileInputs) -> bool {
 /// The FLIP's COLLAPSE gate (keystone P6, #4642; design doc §5a / §6): the exact
 /// INVERSE of [`wants_renewal`]. "A peer keeps hosting exactly as long as it keeps
 /// renewing, and stops both together" (§6) — so an active collapse fires precisely
-/// when the interest gate goes false: no local client AND no STRICTLY-farther
-/// downstream subscriber. This is the same [`contract_in_use`] predicate the
+/// when the interest gate goes false: no local client, no STRICTLY-farther
+/// downstream subscriber, AND no recent local GET/PUT access (a recently read or
+/// PUT contract is in demand and does NOT collapse, invariant 3). This is the
+/// same [`contract_in_use`] predicate the
 /// [`reconcile`] teardown branch already keys `Collapse` off, surfaced as a
 /// standalone gate for the driver.
 ///
@@ -588,6 +617,7 @@ mod tests {
             computed_upstream: None,
             has_local_client: false,
             has_farther_downstream_subscriber: false,
+            has_recent_local_client_access: false,
             state_present: true,
             is_subscribed: false,
             is_advertised: false,
@@ -981,6 +1011,55 @@ mod tests {
             is_advertised: true,
             ..base()
         }));
+    }
+
+    /// REGRESSION (Codex P2, Ian 2026-07-08): a contract with ONLY recent local
+    /// GET/PUT access — NO local client subscription and NO downstream subscriber
+    /// — must be RENEWED, not collapsed. Reads and PUTs are a permanent demand
+    /// signal (`hosting-invariants.md` invariant 3): a read-only/PUT-only contract
+    /// (the River UI container, web/UI containers) is emitted by
+    /// `contracts_needing_renewal()` branch 3 but was DROPPED by the P6 flip's
+    /// gate, because that gate keyed only on subscriptions (`has_local_client ||
+    /// has_farther_downstream_subscriber`). Its lease then lapsed, it left the
+    /// update mesh, and later local reads served stale. This pins the FLIPPED
+    /// gate (the decision the renewal loop drives via
+    /// `OpManager::reconcile_wants_renewal`), not the builder the pre-existing
+    /// `test_local_client_access_enables_renewal` already covers. Fails before the
+    /// fix (recent access excluded from `contract_in_use`), passes after.
+    #[test]
+    fn recent_local_access_alone_renews_not_collapses() {
+        let recent_access_only = ReconcileInputs {
+            has_recent_local_client_access: true,
+            // Explicitly NOT subscribed by any client and NO downstream subscriber:
+            // this is the read-only / PUT-only demand the flip must not drop.
+            has_local_client: false,
+            has_farther_downstream_subscriber: false,
+            ..base()
+        };
+        assert!(
+            wants_renewal(&recent_access_only),
+            "recent local GET/PUT access alone must RENEW (invariant 3: reads/PUTs \
+             are permanent demand) — the P6 flip regression"
+        );
+        assert!(
+            !wants_collapse(&recent_access_only),
+            "recent local GET/PUT access alone must NOT collapse — collapse is the \
+             exact inverse of the demand-inclusive renewal gate"
+        );
+        // And it is genuinely `contract_in_use`, so the pure reconcile controller
+        // does not emit a teardown for it either.
+        assert!(contract_in_use(&recent_access_only));
+        assert!(!reconcile(&recent_access_only).contains(&Action::Collapse));
+
+        // Guard the demand direction: once BOTH the subscription signals AND recent
+        // access are absent, the contract is idle and DOES collapse (so the added
+        // term did not wire renewal permanently on).
+        let idle = ReconcileInputs {
+            has_recent_local_client_access: false,
+            ..base()
+        };
+        assert!(!wants_renewal(&idle));
+        assert!(wants_collapse(&idle));
     }
 
     /// `action_set_divergence` is the set-membership comparator the shadow

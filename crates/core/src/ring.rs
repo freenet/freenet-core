@@ -2329,9 +2329,11 @@ impl Ring {
                 // FLIP (#4642 keystone): interest-gated renewal DRIVEN by the
                 // reconcile controller's interest gate (design §5a
                 // `contract_in_use`). Build a FRESH snapshot at emission time and
-                // renew iff a local client OR a STRICTLY-farther downstream
-                // subscriber (piece D) depends on this peer hosting. When it goes
-                // false — no longer in use under the strict gate — SKIP: the lease
+                // renew iff a local client, a STRICTLY-farther downstream
+                // subscriber (piece D), OR recent local GET/PUT access (invariant
+                // 3: reads/PUTs are permanent demand — a read-only / PUT-only
+                // contract stays renewed without a subscription) depends on this
+                // peer hosting. When it goes false — no longer in use — SKIP: the lease
                 // lapses and the chain collapses inward (non-renewal is the collapse
                 // primitive; the #3763 storm fix). The gate narrows the
                 // ANY-downstream candidate set that `contracts_needing_renewal`
@@ -4078,6 +4080,13 @@ impl Ring {
     /// Check if a contract was accessed by a local client.
     pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
         self.hosting_manager.has_local_client_access(key)
+    }
+
+    /// Whether a local client GET/PUT touched this contract within the renewal age
+    /// gate (`SUBSCRIPTION_LEASE_DURATION`) — the read/PUT demand signal the
+    /// reconcile input-builder feeds into `contract_in_use` (invariant 3).
+    pub fn has_recent_local_client_access(&self, key: &ContractKey) -> bool {
+        self.hosting_manager.has_recent_local_client_access(key)
     }
 
     /// Sweep for expired entries in the hosting cache.

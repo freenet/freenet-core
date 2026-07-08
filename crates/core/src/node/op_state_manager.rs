@@ -876,6 +876,12 @@ impl OpManager {
             has_local_client: self.ring.has_client_subscriptions(contract),
             has_farther_downstream_subscriber: self
                 .has_farther_downstream_subscriber(contract, my_location),
+            // Recent local GET/PUT access is REAL demand (invariant 3): a
+            // read-only / PUT-only contract (River UI container, web/UI
+            // containers) is emitted by `contracts_needing_renewal()` branch 3
+            // but has no subscription, so without this the P6 renewal gate would
+            // drop its lease and it would leave the update mesh.
+            has_recent_local_client_access: self.ring.has_recent_local_client_access(contract),
             state_present: self.ring.contract_state_present(contract),
             is_subscribed: self.ring.is_subscribed(contract),
             is_advertised: self.neighbor_hosting.is_hosted_locally(contract),
@@ -972,10 +978,13 @@ impl OpManager {
     /// time (the TOCTOU revalidation guard — the decision is made from the live
     /// maps at the instant the renewal would fire, never a stale earlier read) and
     /// applies the controller's interest gate [`reconcile::wants_renewal`] =
-    /// design §5a `contract_in_use`: renew iff a **local client** OR a
-    /// **STRICTLY-farther** downstream subscriber depends on this peer hosting
-    /// (piece D: a downstream counts only when strictly farther from the key, so
-    /// two mutual co-hosts cannot renew each other forever).
+    /// design §5a `contract_in_use`: renew iff a **local client**, a
+    /// **STRICTLY-farther** downstream subscriber (piece D: a downstream counts
+    /// only when strictly farther from the key, so two mutual co-hosts cannot renew
+    /// each other forever), OR **recent local GET/PUT access** (invariant 3:
+    /// reads/PUTs are permanent demand — a read-only / PUT-only contract like the
+    /// River UI container must stay renewed even without a subscription) depends on
+    /// this peer hosting.
     ///
     /// Returns `false` when the contract is no longer `contract_in_use` under that
     /// strict gate. The renewal loop then SKIPS the spawn; the lease lapses and the
@@ -1044,12 +1053,18 @@ impl OpManager {
     /// renewing AND collapse does not fire while distance-blind, the contract simply
     /// stays hosted through startup, unchanged from prior behavior.
     ///
-    /// Because the strict gate is a SUPERSET of the legacy gate
-    /// (`!has_any_downstream ⟹ !has_farther_downstream`), the flip can only collapse
-    /// MORE, never less — it never leaks a chain the legacy predicate would have
-    /// cleaned up. The only added collapses are the mutual-co-host case the strict
-    /// gate targets, which v0.2.93 shadow measured at ~0% divergence from the legacy
-    /// predicate (the "collapse diff" ship-gate falsifier).
+    /// Relative to the recent-access-aware baseline below, the strict gate is a
+    /// SUPERSET of the legacy gate (`!has_any_downstream ⟹ !has_farther_downstream`),
+    /// so it can only collapse MORE, never less — it never leaks a chain the legacy
+    /// predicate would have cleaned up. The only added collapses are the
+    /// mutual-co-host case the strict gate targets, which v0.2.93 shadow measured at
+    /// ~0% divergence from the legacy predicate (the "collapse diff" ship-gate
+    /// falsifier). Recent local GET/PUT access is a demand term (invariant 3) shared
+    /// by BOTH gates: it holds a read-only / PUT-only contract open, so relative to
+    /// the raw subscriptions-only `should_unsubscribe_upstream` the gate collapses
+    /// LESS for such contracts. That term is factored out of the divergence counter
+    /// (the baseline ANDs in `!has_recent_local_client_access`) so the counter still
+    /// isolates the strict-farther difference.
     ///
     /// # Post-flip legibility counter
     ///
@@ -1080,8 +1095,12 @@ impl OpManager {
         // legacy ANY-downstream predicate it replaced (the "collapse diff"
         // ship-gate falsifier, ~0% in v0.2.93 shadow). Recorded on the SAME per-site
         // counter the pre-flip shadow used, so the metric is continuous across the
-        // flip.
-        let legacy = self.ring.should_unsubscribe_upstream(contract);
+        // flip. The recent-GET/PUT-access demand term (invariant 3) is factored out
+        // of BOTH sides (`&& !has_recent_local_client_access`) so this counter keeps
+        // isolating the ONE difference it measures — strict-farther vs ANY-downstream
+        // — rather than double-counting the read/PUT demand both gates now honor.
+        let legacy = self.ring.should_unsubscribe_upstream(contract)
+            && !self.ring.has_recent_local_client_access(contract);
         let divergence = if wants != legacy {
             reconcile::ReconcileActionDivergence {
                 collapse: true,
@@ -2447,6 +2466,32 @@ mod tests {
         assert!(
             !sub.contains("ring.should_unsubscribe_upstream"),
             "the inbound-unsubscribe collapse must no longer gate on ring.should_unsubscribe_upstream"
+        );
+    }
+
+    /// Wiring pin (Codex P2 fix, #4642): the reconcile input-builder MUST feed
+    /// recent local GET/PUT access into `has_recent_local_client_access`, and the
+    /// collapse-gate legibility baseline MUST factor it out. Without the builder
+    /// wiring, `contract_in_use` (which now ORs the field) would always see it
+    /// `false` and the P6 flip would drop a read-only / PUT-only contract's lease
+    /// even though `contracts_needing_renewal()` branch 3 keeps emitting it — the
+    /// regression this fix closes (invariant 3: reads/PUTs are permanent demand).
+    #[test]
+    fn build_reconcile_inputs_wires_recent_local_client_access() {
+        const SRC: &str = include_str!("op_state_manager.rs");
+        let builder = braced_block_after(SRC, "pub(crate) fn build_reconcile_inputs(");
+        assert!(
+            builder.contains("has_recent_local_client_access: self")
+                && builder.contains("has_recent_local_client_access(contract)"),
+            "build_reconcile_inputs must populate has_recent_local_client_access from \
+             ring.has_recent_local_client_access(contract) so the P6 renewal/collapse \
+             gate honors read/PUT demand (invariant 3)"
+        );
+        let gate = braced_block_after(SRC, "pub(crate) fn reconcile_wants_collapse(");
+        assert!(
+            gate.contains("!self.ring.has_recent_local_client_access(contract)"),
+            "the collapse-gate legibility baseline must factor out recent-access so the \
+             divergence counter isolates the strict-farther difference"
         );
     }
 
