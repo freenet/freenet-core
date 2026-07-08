@@ -2082,6 +2082,20 @@ impl HostingManager {
         self.hosting_cache.read().has_local_client_access(key)
     }
 
+    /// Whether a local client GET or PUT touched this contract within the renewal
+    /// age gate (`SUBSCRIPTION_LEASE_DURATION`) — real, time-bounded local demand
+    /// that is NOT a subscription. This is the exact signal
+    /// `contracts_needing_renewal()` branch 3 uses to keep a read-only / PUT-only
+    /// contract (River UI container, web/UI containers) renewed in the update mesh
+    /// (`hosting-invariants.md` invariant 3: reads/PUTs are permanent demand). The
+    /// reconcile input-builder ORs it into `contract_in_use` so the P6 renewal /
+    /// collapse gate does not drop such a contract's lease.
+    pub fn has_recent_local_client_access(&self, key: &ContractKey) -> bool {
+        self.hosting_cache
+            .read()
+            .has_recent_local_client_access(key, SUBSCRIPTION_LEASE_DURATION)
+    }
+
     /// Touch a contract in the hosting cache (refresh demand without adding).
     ///
     /// Called when a user GET serves a hosted contract from local cache — the

@@ -410,66 +410,13 @@ fn most_keyward_among(
         .map(|(pkl, _)| pkl)
 }
 
-/// Map a renewal-loop per-tick outcome to the Action set the reconcile
-/// controller is compared against in shadow mode (keystone step-2, #4642).
-///
-/// `acted` = the loop spawned a fresh SUBSCRIBE for this contract THIS TICK (vs
-/// skipped/deferred → nothing). `run_renewal_subscribe` issues a real SUBSCRIBE,
-/// which per [`reconcile::Action`]'s docs is `Renew` when we already hold the
-/// lease and `Subscribe` when we do not — so a section-2/3 not-subscribed entry
-/// maps to `Subscribe`, never a phantom `Renew`.
-fn renewal_shadow_actual(acted: bool, is_subscribed: bool) -> &'static [reconcile::Action] {
-    match (acted, is_subscribed) {
-        (false, _) => &[],
-        (true, true) => &[reconcile::Action::Renew],
-        (true, false) => &[reconcile::Action::Subscribe],
-    }
-}
-
-/// Record one reconcile-controller SHADOW comparison for the RENEWAL site
-/// (keystone step-2, #4642), respecting the per-tick sample `budget`. DRIVES
-/// NOTHING: it builds a [`reconcile::ReconcileInputs`] snapshot, computes what
-/// the controller WOULD do, maps the loop's per-tick outcome to an Action set
-/// via [`renewal_shadow_actual`], and records only the set-membership
-/// divergence.
-///
-/// Skips (without consuming budget) when the snapshot is distance-blind — an
-/// unknown own-location makes the computed upstream / verified-root / strict
-/// downstream-demand fields unmeasurable, so recording then would be noise
-/// (`build_reconcile_inputs` returns `None`). Otherwise consumes one unit of
-/// `budget`; when the budget is exhausted the remaining contracts this tick are
-/// left unmeasured (they rotate in on later ticks via the renewal-set shuffle).
-fn record_renewal_shadow(
-    op_manager: &crate::node::OpManager,
-    budget: &mut usize,
-    contract: &ContractKey,
-    acted: bool,
-) {
-    if *budget == 0 {
-        return;
-    }
-    let Some(inputs) = op_manager.build_reconcile_inputs(contract) else {
-        // Distance-blind snapshot (own-location unknown): unmeasurable this tick,
-        // don't pollute the signal. Not counted against the budget.
-        return;
-    };
-    *budget -= 1;
-    let reconcile_actions = reconcile::reconcile(&inputs);
-    let actual = renewal_shadow_actual(acted, inputs.is_subscribed);
-    let divergence = reconcile::action_set_divergence(&reconcile_actions, actual);
-    crate::node::network_status::record_reconcile_shadow_comparison(
-        crate::node::network_status::ReconcileShadowSite::Renewal,
-        divergence,
-    );
-    if divergence.any() {
-        tracing::debug!(
-            %contract,
-            ?reconcile_actions,
-            ?actual,
-            "reconcile shadow diverges from actual renewal outcome (#4642 keystone step-2)"
-        );
-    }
-}
+// NOTE (#4642 keystone sub-task 3, "the flip"): the RENEWAL-site shadow helpers
+// (`renewal_shadow_actual` + `record_renewal_shadow`) were REMOVED when the
+// renewal site was flipped from record-only shadow to actually DRIVING the
+// controller's decision. The drive lives in `OpManager::reconcile_wants_renewal`
+// (built from a fresh at-emission snapshot) and is consulted inline in the
+// renewal loop; the RENEWAL reconcile counter now measures the flip's
+// interest-gate suppression rate rather than a shadow divergence.
 
 /// Race an `.await` point in a background loop against the Ring shutdown
 /// token. Returns `true` if shutdown fired (the caller should stop its loop)
@@ -2248,8 +2195,16 @@ impl Ring {
                                 .remove_downstream_subscriber(contract);
                         }
 
-                        // Send Unsubscribe upstream if no remaining interest
-                        if ring.should_unsubscribe_upstream(contract) {
+                        // Send Unsubscribe upstream if no remaining interest.
+                        // FLIP (keystone P6, #4642): the collapse decision is driven
+                        // by the reconcile controller's strict-farther interest gate
+                        // (`reconcile_wants_collapse` = `!contract_in_use`), replacing
+                        // the legacy ANY-downstream `should_unsubscribe_upstream`. The
+                        // teardown still targets the STORED upstream (narrow flip).
+                        if op_manager.reconcile_wants_collapse(
+                            contract,
+                            crate::node::network_status::ReconcileShadowSite::Collapse,
+                        ) {
                             let op_mgr = op_manager.clone();
                             let contract = *contract;
                             GlobalExecutor::spawn(async move {
@@ -2325,23 +2280,34 @@ impl Ring {
 
             let mut attempted = 0;
             let mut skipped = 0;
+            // Per-tick budget on the number of interest-gate EVALUATIONS
+            // (`OpManager::reconcile_wants_renewal`) we run. Each evaluation builds
+            // a FRESH `ReconcileInputs` snapshot: a synchronous redb
+            // `get_state_size` read plus an `is_subscription_root` neighbor-map
+            // scan. The `attempted >= batch_limit` break below counts only SPAWNED
+            // renewals; a gate-SUPPRESSED candidate does `continue` WITHOUT
+            // advancing `attempted`, so on a high-hosting peer (every peer, now
+            // that every-hop placement is live) a single ~30s tick could otherwise
+            // build hundreds-to-thousands of these snapshots when the gate
+            // suppresses most candidates. Counting every gate evaluation against
+            // this budget restores the pre-flip `shadow_budget` bound: at most
+            // `batch_limit` snapshots per tick regardless of how many are
+            // suppressed. (Codex P2, #4725.)
+            let mut evaluated = 0;
 
-            // Reconcile-controller SHADOW comparison budget (keystone step-2,
-            // #4642), RENEWAL site. The shadow compare is INLINED into this loop
-            // (below) so the recorded "actual" equals what production actually did
-            // THIS TICK — `{}` for a skipped/deferred contract, else the fresh
-            // SUBSCRIBE the loop spawns (mapped to `Renew` vs `Subscribe` by
-            // whether we hold a lease; see `renewal_shadow_actual`). It DRIVES
-            // NOTHING. Gated by the same `batch_limit` as the real renewal work:
-            // each sample builds a `ReconcileInputs` snapshot (a synchronous redb
-            // state-store read + an `is_subscription_root` scan that clones the
-            // connections map, i.e. redb read + O(neighbors) per sample), so
-            // bounding the sample count keeps the per-tick cost from scaling with
-            // the whole renewal set on near-key gateways. The shuffle above
-            // rotates which contracts get sampled across ticks; contracts past the
-            // budget or past a `break` gate are simply unmeasured this tick.
-            let mut shadow_budget = batch_limit;
-
+            // Reconcile-controller FLIP (keystone sub-task 3, #4642), RENEWAL
+            // site. The controller no longer records a shadow divergence here; it
+            // DRIVES: for each candidate the loop calls
+            // `OpManager::reconcile_wants_renewal`, which builds a FRESH
+            // `ReconcileInputs` snapshot AT EMISSION time and renews only while the
+            // controller wants the contract's place in the mesh maintained. Each
+            // snapshot is a redb state-store read plus an `is_subscription_root`
+            // neighbor scan, so the per-tick cost is bounded by the `evaluated`
+            // budget below (at most `batch_limit` gate evaluations per tick),
+            // mirroring the old shadow sample budget. The `attempted >=
+            // batch_limit` break bounds only the SPAWNED renewals and must NOT be
+            // relied on to bound the evaluations, because a gate-suppressed
+            // candidate does not advance `attempted`.
             for contract in contracts_needing_renewal {
                 // Limit concurrent renewal attempts to avoid overwhelming the network
                 if attempted >= batch_limit {
@@ -2380,29 +2346,80 @@ impl Ring {
                         phase = "subscription_renewal_banned_skip",
                         "skipping subscription renewal for banned contract"
                     );
-                    // Shadow: production does NOTHING for a banned contract this
-                    // tick → actual is `{}`.
-                    record_renewal_shadow(&op_manager, &mut shadow_budget, &contract, false);
                     skipped += 1;
                     continue;
                 }
 
                 // Check spam prevention (respects exponential backoff and pending checks)
                 if !ring.can_request_subscription(&contract) {
-                    // Shadow: backoff/pending gate → production does NOTHING this
-                    // tick → actual is `{}`.
-                    record_renewal_shadow(&op_manager, &mut shadow_budget, &contract, false);
                     skipped += 1;
                     continue;
                 }
 
+                // Per-tick evaluation budget (Codex P2, #4725): stop building
+                // expensive `ReconcileInputs` snapshots once we've run
+                // `batch_limit` interest-gate evaluations this tick, whether they
+                // led to a spawn or a suppression. This is the bound that keeps a
+                // high-hosting peer from building hundreds-to-thousands of
+                // snapshots per tick when the gate suppresses most candidates (the
+                // `attempted >= batch_limit` break above does NOT cover this,
+                // because a suppressed candidate never advances `attempted`).
+                // Remaining candidates are retried next cycle.
+                if evaluated >= batch_limit {
+                    tracing::debug!(
+                        limit = batch_limit,
+                        attempted,
+                        skipped,
+                        "Reached max renewal-gate evaluations for this interval, \
+                         remaining will be tried next cycle"
+                    );
+                    break;
+                }
+                evaluated += 1;
+
+                // FLIP (#4642 keystone): interest-gated renewal DRIVEN by the
+                // reconcile controller's interest gate (design §5a
+                // `contract_in_use`). Build a FRESH snapshot at emission time and
+                // renew iff a local client, a STRICTLY-farther downstream
+                // subscriber (piece D), OR recent local GET/PUT access (invariant
+                // 3: reads/PUTs are permanent demand — a read-only / PUT-only
+                // contract stays renewed without a subscription) depends on this
+                // peer hosting. When it goes false — no longer in use — SKIP: the lease
+                // lapses and the chain collapses inward (non-renewal is the collapse
+                // primitive; the #3763 storm fix). The gate narrows the
+                // ANY-downstream candidate set that `contracts_needing_renewal`
+                // built to the strict gate; the suppression is recorded on the
+                // RENEWAL reconcile counter (post-flip that counter measures the
+                // flip's effect — the "renewal tracks active demand, not cache size"
+                // ship-gate falsifier — not a shadow divergence).
+                if !op_manager.reconcile_wants_renewal(&contract) {
+                    tracing::debug!(
+                        %contract,
+                        "renewal skipped: reconcile interest gate says not in use \
+                         (strict-farther gate) — letting the lease lapse so the \
+                         chain collapses inward"
+                    );
+                    crate::node::network_status::record_reconcile_shadow_comparison(
+                        crate::node::network_status::ReconcileShadowSite::Renewal,
+                        crate::ring::reconcile::ReconcileActionDivergence {
+                            renew: true,
+                            ..Default::default()
+                        },
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                // Renewal proceeds: record a non-divergent renewal-gate evaluation
+                // so the counter's denominator (`comparisons`) tracks total gate
+                // decisions and the suppression ratio stays legible.
+                crate::node::network_status::record_reconcile_shadow_comparison(
+                    crate::node::network_status::ReconcileShadowSite::Renewal,
+                    crate::ring::reconcile::ReconcileActionDivergence::default(),
+                );
+
                 // Mark as pending and spawn subscription request
                 if ring.mark_subscription_pending(contract) {
                     attempted += 1;
-                    // Shadow: production spawns a fresh SUBSCRIBE
-                    // (`run_renewal_subscribe`) for this contract this tick →
-                    // actual is `{Renew}` if we hold a lease, else `{Subscribe}`.
-                    record_renewal_shadow(&op_manager, &mut shadow_budget, &contract, true);
 
                     // Spread tasks across the interval to avoid thundering-herd bursts.
                     let jitter_ms = GlobalRng::random_range(0u64..=15_000);
@@ -2521,12 +2538,11 @@ impl Ring {
                             }),
                         );
                     });
-                } else {
-                    // `mark_subscription_pending` returned false: a renewal for
-                    // this contract is already in flight, so production does
-                    // NOTHING more this tick → shadow actual is `{}`.
-                    record_renewal_shadow(&op_manager, &mut shadow_budget, &contract, false);
                 }
+                // `mark_subscription_pending` returning false (a renewal for this
+                // contract is already in flight) needs no separate handling: the
+                // controller drive + counter above already ran for this contract
+                // this tick, and the in-flight guard is the per-contract dedup.
             }
 
             if attempted > 0 || skipped > 0 {
@@ -4288,6 +4304,13 @@ impl Ring {
     /// Check if a contract was accessed by a local client.
     pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
         self.hosting_manager.has_local_client_access(key)
+    }
+
+    /// Whether a local client GET/PUT touched this contract within the renewal age
+    /// gate (`SUBSCRIPTION_LEASE_DURATION`) — the read/PUT demand signal the
+    /// reconcile input-builder feeds into `contract_in_use` (invariant 3).
+    pub fn has_recent_local_client_access(&self, key: &ContractKey) -> bool {
+        self.hosting_manager.has_recent_local_client_access(key)
     }
 
     /// Sweep for expired entries in the hosting cache.
@@ -6529,64 +6552,192 @@ mod k_closest_source_tests {
         );
     }
 
-    /// Source-scrape pin (keystone step-2, #4642): the RENEWAL-site reconcile
-    /// shadow (`record_renewal_shadow`) must feed the controller's output ONLY
-    /// into the set-membership divergence comparator + the per-site counter — it
-    /// must DRIVE NOTHING. Symmetric to the collapse-site pin
-    /// (`send_unsubscribe_upstream_still_drives_and_shadow_is_record_only`). A
-    /// future edit that consumes the renewal-site controller output as a control
-    /// signal must trip this guard.
+    /// Source-scrape pin (keystone sub-task 3 "the flip", #4642): the RENEWAL
+    /// site is FLIPPED — it no longer records a shadow, it DRIVES. The renewal
+    /// loop must gate its real renewal spawn on the reconcile controller via
+    /// `OpManager::reconcile_wants_renewal`, and the record-only shadow helper
+    /// (`record_renewal_shadow`) must be gone. A regression that re-introduces the
+    /// record-only helper, or drops the drive gate, trips this guard.
     #[test]
-    fn renewal_shadow_is_record_only_not_drive() {
+    fn renewal_site_is_driven_not_shadowed() {
         let src = production_source();
-        let body = extract_fn_body(src, "fn record_renewal_shadow(");
+        // The record-only renewal shadow helper is removed by the flip.
         assert!(
-            body.contains("action_set_divergence"),
-            "record_renewal_shadow must compare via action_set_divergence"
+            !src.contains("fn record_renewal_shadow("),
+            "record_renewal_shadow must be REMOVED — the renewal site now drives, \
+             it does not record a shadow"
         );
         assert!(
-            body.contains("record_reconcile_shadow_comparison"),
-            "record_renewal_shadow must record the per-site divergence"
+            !src.contains("fn renewal_shadow_actual("),
+            "renewal_shadow_actual must be REMOVED — the renewal site now drives"
         );
-        // Record-only: the shadow helper must NOT drive any renewal/subscription
-        // action off the controller's output.
-        for driver in [
-            "mark_subscription_pending",
-            "run_renewal_subscribe",
-            "ring.subscribe",
-            ".unsubscribe(",
-        ] {
-            assert!(
-                !body.contains(driver),
-                "record_renewal_shadow must not drive `{driver}` — the renewal shadow is record-only"
-            );
-        }
-        // The real renewal loop still drives the actual renewal (unchanged) and
-        // wires the record-only shadow helper.
+        // The renewal loop drives the controller's interest gate before spawning.
         let loop_body = extract_fn_body(src, "async fn recover_orphaned_subscriptions(");
+        assert!(
+            loop_body.contains("reconcile_wants_renewal"),
+            "the renewal loop must gate its spawn on the reconcile controller \
+             (OpManager::reconcile_wants_renewal) — the flip"
+        );
         assert!(
             loop_body.contains("mark_subscription_pending"),
             "the renewal loop still drives the real renewal via mark_subscription_pending"
         );
+        // The gate must be consulted BEFORE the pending-mark/spawn (interest-gated
+        // renewal), not after the work is already scheduled.
+        let gate = loop_body
+            .find("reconcile_wants_renewal")
+            .expect("gate present");
+        let spawn = loop_body
+            .find("mark_subscription_pending(contract)")
+            .expect("spawn present");
         assert!(
-            loop_body.contains("record_renewal_shadow"),
-            "the renewal loop wires the record-only shadow helper"
+            gate < spawn,
+            "the reconcile interest gate must run BEFORE mark_subscription_pending \
+             so a torn-down contract is never renewed"
         );
     }
 
-    /// Unit (keystone step-2, #4642): `renewal_shadow_actual` maps the renewal
-    /// loop's per-tick outcome to the Action set the controller is compared
-    /// against. A not-acted (skipped/deferred) contract maps to `{}`; an acted
-    /// contract maps to `Renew` iff we already hold the lease, else `Subscribe` —
-    /// so a section-2/3 not-subscribed entry never records a phantom `Renew`.
+    /// Regression pin for the per-tick renewal-gate EVALUATION budget (Codex P2,
+    /// #4725). The interest gate `OpManager::reconcile_wants_renewal` builds a
+    /// fresh `ReconcileInputs` snapshot (a redb `get_state_size` read + an
+    /// `is_subscription_root` neighbor scan) on EVERY call. The pre-fix loop
+    /// bounded only SPAWNED renewals via `attempted >= batch_limit`, but a
+    /// gate-suppressed candidate `continue`s WITHOUT advancing `attempted`, so on
+    /// a high-hosting peer (every peer, now that every-hop placement is live) one
+    /// ~30s maintenance tick could evaluate the gate for the whole renewal set —
+    /// hundreds-to-thousands of snapshots instead of the intended ~`batch_limit`.
+    /// This pins that a DISTINCT evaluation budget (`evaluated`) breaks the loop
+    /// BEFORE the expensive gate runs, and is advanced on every gate evaluation
+    /// (not only on spawn, which is what `attempted` counts). A refactor that
+    /// drops the budget or reverts to an `attempted`-only bound fails CI here.
     #[test]
-    fn renewal_shadow_actual_maps_by_lease() {
-        use super::reconcile::Action::{Renew, Subscribe};
-        let empty: &[super::reconcile::Action] = &[];
-        assert_eq!(super::renewal_shadow_actual(false, true), empty);
-        assert_eq!(super::renewal_shadow_actual(false, false), empty);
-        assert_eq!(super::renewal_shadow_actual(true, true), &[Renew]);
-        assert_eq!(super::renewal_shadow_actual(true, false), &[Subscribe]);
+    fn renewal_gate_evaluations_bounded_before_gate() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn recover_orphaned_subscriptions(");
+
+        let budget_break = body.find("if evaluated >= batch_limit").expect(
+            "the renewal loop must bound the number of interest-gate evaluations \
+             per tick with `if evaluated >= batch_limit { break }` (Codex P2, \
+             #4725) — otherwise a gate-suppressed candidate never advances \
+             `attempted` and the loop builds an unbounded number of \
+             ReconcileInputs snapshots per tick",
+        );
+        let gate = body
+            .find("reconcile_wants_renewal(&contract)")
+            .expect("renewal loop must consult the reconcile interest gate");
+        assert!(
+            budget_break < gate,
+            "the evaluation-budget break (offset {budget_break}) must run BEFORE \
+             the expensive reconcile_wants_renewal gate (offset {gate}) so the \
+             per-snapshot cost is bounded by batch_limit"
+        );
+
+        // The budget must advance on every gate evaluation (between the break and
+        // the gate), which is what distinguishes it from the `attempted` spawn cap.
+        let increment = body.find("evaluated += 1").expect(
+            "the evaluation budget `evaluated` must be incremented per gate \
+             evaluation, not only when a renewal is spawned",
+        );
+        assert!(
+            budget_break < increment && increment < gate,
+            "`evaluated += 1` (offset {increment}) must sit between the budget \
+             break (offset {budget_break}) and the gate (offset {gate}) so every \
+             gate evaluation is counted toward the per-tick bound"
+        );
+    }
+
+    /// Behavioral regression for the per-tick evaluation budget (Codex P2,
+    /// #4725). Models the renewal loop's exact two-counter structure and asserts
+    /// the number of expensive interest-gate evaluations stays bounded by
+    /// `batch_limit` regardless of how many candidates the gate suppresses. The
+    /// pre-fix `attempted`-only bound (encoded in `simulate_attempted_only`)
+    /// evaluated the WHOLE candidate set when the gate suppressed everything —
+    /// this is the unbounded-per-heartbeat-read cost the fix removes.
+    #[test]
+    fn renewal_gate_evaluation_count_is_bounded_when_suppressed() {
+        // Faithful model of the loop's per-tick counting: `attempted` is the
+        // spawn cap (advanced only on a spawn) and `evaluated` is the evaluation
+        // budget (advanced on every gate call). Returns (evaluations, spawns).
+        fn simulate(
+            candidates: usize,
+            batch_limit: usize,
+            gate: impl Fn(usize) -> bool,
+        ) -> (usize, usize) {
+            let mut attempted = 0usize;
+            let mut evaluated = 0usize;
+            for i in 0..candidates {
+                if attempted >= batch_limit {
+                    break; // spawn cap
+                }
+                if evaluated >= batch_limit {
+                    break; // evaluation budget (the fix)
+                }
+                evaluated += 1;
+                if !gate(i) {
+                    continue; // suppressed: does NOT advance `attempted`
+                }
+                attempted += 1;
+            }
+            (evaluated, attempted)
+        }
+
+        // The pre-fix model: only the `attempted` spawn cap bounds the loop.
+        fn simulate_attempted_only(
+            candidates: usize,
+            batch_limit: usize,
+            gate: impl Fn(usize) -> bool,
+        ) -> usize {
+            let mut attempted = 0usize;
+            let mut evaluated = 0usize;
+            for i in 0..candidates {
+                if attempted >= batch_limit {
+                    break;
+                }
+                evaluated += 1;
+                if !gate(i) {
+                    continue;
+                }
+                attempted += 1;
+            }
+            evaluated
+        }
+
+        let batch_limit = 10usize;
+        let many = 5_000usize;
+
+        // Pathological case: the gate suppresses every candidate. Evaluations
+        // must still be capped at `batch_limit`, and nothing spawns.
+        let (evaluated, attempted) = simulate(many, batch_limit, |_| false);
+        assert!(
+            evaluated <= batch_limit,
+            "gate evaluations ({evaluated}) must be bounded by batch_limit \
+             ({batch_limit}) even when every candidate is suppressed"
+        );
+        assert_eq!(
+            attempted, 0,
+            "no renewals spawn when every candidate is suppressed"
+        );
+
+        // Demonstrates the bug the budget fixes: the old attempted-only bound
+        // evaluated the WHOLE set when the gate suppressed everything.
+        let unbounded = simulate_attempted_only(many, batch_limit, |_| false);
+        assert_eq!(
+            unbounded, many,
+            "sanity: without the evaluation budget an all-suppressing gate builds \
+             a snapshot for every candidate — the unbounded cost the fix removes"
+        );
+
+        // Happy path: the gate wants every candidate. The evaluation budget must
+        // NOT reduce throughput below the spawn cap.
+        let (evaluated, attempted) = simulate(many, batch_limit, |_| true);
+        assert_eq!(
+            attempted, batch_limit,
+            "the spawn cap is still reached in the happy path"
+        );
+        assert!(
+            evaluated <= batch_limit,
+            "evaluations never exceed batch_limit"
+        );
     }
 
     /// Hardening pin (keystone step-2 completion, #4642): the

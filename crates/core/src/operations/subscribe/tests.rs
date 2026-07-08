@@ -96,11 +96,14 @@ fn handle_unsubscribe_inbound_preserves_legacy_branches() {
          to drop the sender from the per-peer interest registry"
     );
     assert!(
-        body.contains("should_unsubscribe_upstream(&key)"),
-        "handle_unsubscribe_inbound must gate the upstream propagation on \
-         `ring.should_unsubscribe_upstream` — chain-propagating without \
-         the gate would over-unsubscribe contracts that still have \
-         downstream subscribers"
+        body.contains("reconcile_wants_collapse(")
+            && body.contains("ReconcileShadowSite::InboundUnsubscribe"),
+        "handle_unsubscribe_inbound must gate the upstream propagation on the \
+         reconcile controller's strict-farther interest gate \
+         (`op_manager.reconcile_wants_collapse`, InboundUnsubscribe site) — FLIPPED \
+         in P6 from the legacy ANY-downstream `should_unsubscribe_upstream`; \
+         chain-propagating without the gate would over-unsubscribe contracts that \
+         still have strict-farther downstream subscribers"
     );
     assert!(
         body.contains("send_unsubscribe_upstream(&key)"),

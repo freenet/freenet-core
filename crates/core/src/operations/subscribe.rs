@@ -766,44 +766,32 @@ pub(crate) async fn handle_unsubscribe_inbound(
         );
     }
 
-    // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
-    // INBOUND-UNSUBSCRIBE site. The downstream peer just left (removal above is
-    // complete, so the strict-farther gate reflects it); does that leave us
-    // not-in-use, i.e. would the controller tear down our lease? Focused on
-    // `Collapse`. Actual = `{Collapse}` iff production tears down the lease THIS
-    // event (`should_unsubscribe_upstream` AND we actually hold a lease —
-    // `ring.unsubscribe` is a no-op otherwise), else `{}`. The strict-farther
-    // "still-in-use by a CLOSER downstream, so keep hosting" case where the
-    // controller would collapse shows up here as a `collapse` diff. DRIVES
-    // NOTHING — the real decision below re-reads the gate and is unchanged.
-    {
-        let will_collapse = op_manager.ring.should_unsubscribe_upstream(&key);
-        op_manager.record_reconcile_shadow_event(
-            crate::node::network_status::ReconcileShadowSite::InboundUnsubscribe,
-            &key,
-            &[crate::ring::reconcile::Action::Collapse],
-            |inputs| {
-                if will_collapse && inputs.is_subscribed {
-                    vec![crate::ring::reconcile::Action::Collapse]
-                } else {
-                    Vec::new()
-                }
-            },
-        );
-    }
-
-    if op_manager.ring.should_unsubscribe_upstream(&key) {
+    // FLIP (keystone P6, #4642), INBOUND-UNSUBSCRIBE site. The downstream peer just
+    // left (removal above is complete, so the strict-farther gate reflects it);
+    // does that leave us not-in-use, i.e. should the controller tear down our lease?
+    // The collapse decision is now DRIVEN by the reconcile controller's
+    // strict-farther interest gate (`reconcile_wants_collapse` = `!contract_in_use`),
+    // replacing the legacy ANY-downstream `should_unsubscribe_upstream`. The strict
+    // gate collapses the "still-subscribed-only-by-a-CLOSER-downstream / mutual
+    // co-host" case the legacy predicate left hosting (v0.2.93 shadow measured this
+    // InboundUnsubscribe collapse diff at ~0.00%). The teardown still targets the
+    // STORED upstream (narrow flip keeps the flag); the repurposed `Collapse`
+    // reconcile counter is recorded inside `reconcile_wants_collapse`.
+    if op_manager.reconcile_wants_collapse(
+        &key,
+        crate::node::network_status::ReconcileShadowSite::InboundUnsubscribe,
+    ) {
         tracing::debug!(
             tx = %tx,
             contract = %key,
-            "No remaining subscribers, propagating unsubscribe upstream"
+            "No remaining strict-farther interest, propagating unsubscribe upstream"
         );
         op_manager.send_unsubscribe_upstream(&key).await;
     } else {
         tracing::debug!(
             tx = %tx,
             contract = %key,
-            "Still have subscribers, not propagating unsubscribe"
+            "Still have strict-farther interest, not propagating unsubscribe"
         );
     }
 }

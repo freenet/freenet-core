@@ -197,11 +197,14 @@ pub struct NetworkStatus {
     /// site's divergence must be separately gate-able — a single global tally
     /// would be dominated by the renewal set size and hide the other signals.
     ///
-    /// `collapse` and `renewal` are the MAINTENANCE sites (full action-set
-    /// comparison). The other three are single-aspect EDGE sites (focused
-    /// comparison on one action class): `inbound_unsubscribe` (teardown on a
-    /// downstream leave), `connection_drop` (re-root on an upstream loss),
-    /// `host_formation` (announce on first host).
+    /// `collapse`, `renewal`, and `inbound_unsubscribe` are the FLIPPED (P6) sites:
+    /// they no longer record a shadow divergence — the controller DRIVES — and their
+    /// counters are REPURPOSED to measure the flip's effect (renewal: strict gate
+    /// SUPPRESSED a renewal; collapse / inbound_unsubscribe: driven strict-farther
+    /// gate DISAGREED with the legacy `should_unsubscribe_upstream` predicate it
+    /// replaced, per collapse site). `connection_drop` (re-root on an upstream loss)
+    /// and `host_formation` (announce on first host) remain single-aspect EDGE
+    /// shadow sites (focused comparison, record-only).
     pub reconcile_shadow_collapse: ReconcileShadowStats,
     pub reconcile_shadow_renewal: ReconcileShadowStats,
     pub reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats,
@@ -238,14 +241,32 @@ pub struct UpstreamDivergenceStats {
 /// ONE focused action class (see `action_set_divergence_focused`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileShadowSite {
-    /// The interest-gated collapse (`OpManager::send_unsubscribe_upstream`).
+    /// The interest-gated collapse. **FLIPPED (keystone P6, #4642):** the collapse
+    /// DECISION is now DRIVEN by `OpManager::reconcile_wants_collapse` at the three
+    /// teardown sites (maintenance-loop downstream-expiry, client-disconnect,
+    /// inbound-unsubscribe), replacing the legacy ANY-downstream
+    /// `Ring::should_unsubscribe_upstream`. The counter is retained but repurposed:
+    /// `comparisons` counts collapse-gate decisions and `divergences`/`collapse`
+    /// count the times the driven strict-farther gate DISAGREED with that legacy
+    /// predicate — the "collapse diff" ship-gate falsifier (~0% in v0.2.93 shadow),
+    /// not a shadow divergence. Recorded in `reconcile_wants_collapse`.
     Collapse,
     /// The subscription-renewal set (`Ring::contracts_needing_renewal`, driven
-    /// by the recovery loop).
+    /// by the recovery loop). **FLIPPED (keystone sub-task 3, #4642):** this site
+    /// no longer records a shadow — it DRIVES (`OpManager::reconcile_wants_renewal`
+    /// gates the renewal spawn). The counter is retained but its meaning shifted:
+    /// `comparisons` now counts renewal-gate decisions and `divergences`/`renew`
+    /// count the times the STRICT-farther interest gate SUPPRESSED a renewal the
+    /// old ANY-downstream set would have done — the "renewal tracks active demand,
+    /// not cache size" ship-gate falsifier (design §5a / #3763), not a divergence.
     Renewal,
     /// A downstream peer unsubscribed (`subscribe::handle_unsubscribe_inbound`):
-    /// did that leave us not-in-use (strict-farther), i.e. would the controller
-    /// tear down? Focused on `Collapse`.
+    /// did that leave us not-in-use (strict-farther), i.e. should the controller
+    /// tear down? **FLIPPED (keystone P6, #4642):** this collapse decision now
+    /// DRIVES via `reconcile_wants_collapse` (passed this `site`). The counter is
+    /// retained but repurposed like `Collapse`: it measures how often the driven
+    /// strict-farther gate DISAGREED with the legacy `should_unsubscribe_upstream`
+    /// predicate at THIS site (~0.00% in v0.2.93 shadow), not a shadow divergence.
     InboundUnsubscribe,
     /// A ring connection dropped (`OpManager::on_ring_connection_lost`): for a
     /// contract that peer co-hosted, would the controller re-root (upstream
