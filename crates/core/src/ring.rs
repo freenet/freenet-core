@@ -3426,6 +3426,40 @@ impl Ring {
         self.hosting_manager.record_wasm_removed(blob_len as u64);
     }
 
+    /// Test-only passthroughs to the `HostingManager` disk-budget seams (#4683).
+    /// `hosting_manager` is a private field, so an executor-path test holding an
+    /// `Arc<OpManager>` cannot reach the seeding/budget helpers directly; these
+    /// forward to them so a wired `Executor<_>` can be driven into a disk-budget
+    /// rejection without waiting for the 60s recompute. No production behavior.
+    #[cfg(test)]
+    pub(crate) fn seed_disk_tracker_for_test<I>(&self, rows: I)
+    where
+        I: IntoIterator<Item = (ContractKey, u64)>,
+    {
+        self.hosting_manager.seed_disk_tracker_for_test(rows);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_disk_budget_for_test(&self, disk_pct: f64, max_hosting_disk: u64) {
+        self.hosting_manager
+            .configure_disk_budget(disk_pct, max_hosting_disk);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recompute_effective_budget_for_test(&self, available: u64) -> Option<u64> {
+        self.hosting_manager.recompute_effective_budget(available)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disk_budget_bytes_for_test(&self) -> u64 {
+        self.hosting_manager.disk_budget_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disk_usage_stats_for_test(&self) -> Option<hosting::DiskUsageStats> {
+        self.hosting_manager.disk_usage_stats()
+    }
+
     pub(crate) fn commit_state_write(&self, contract: &ContractKey, state_size: usize) {
         let new_gen = self.hosting_manager.bump_state_generation(contract);
         self.hosting_manager
