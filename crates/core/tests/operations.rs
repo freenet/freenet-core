@@ -4188,12 +4188,31 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
     Ok(())
 }
 
-/// Test that disconnecting a subscribed client triggers an upstream Unsubscribe message.
+/// Test that disconnecting a subscribed client does NOT trigger an *immediate*
+/// upstream Unsubscribe when the contract was recently read (demand-gated collapse).
 ///
-/// Scenario: node-b subscribes to a contract hosted on node-a. After verifying
-/// the subscription works (update propagates), client B disconnects. The test
-/// asserts that node-b sent an UnsubscribeSent event and the upstream peer
-/// logged an UnsubscribeReceived event in the aggregated event logs.
+/// Scenario: node-b GETs then subscribes to a contract hosted on node-a. After
+/// verifying the subscription works (update propagates), client B disconnects.
+///
+/// Post-flip (#4642) behavior — why the old immediate-unsubscribe assertion is
+/// stale: the reconcile controller now gates the destructive collapse on
+/// `reconcile_wants_collapse == !contract_in_use`, the exact INVERSE of the
+/// renewal gate (`wants_renewal == contract_in_use`), so a peer "keeps hosting
+/// exactly as long as it keeps renewing, and stops both together" (design §6).
+/// A recent local GET/PUT is a permanent demand signal
+/// (`has_recent_local_client_access`, recency window = `SUBSCRIPTION_LEASE_DURATION`
+/// = 8 min; `hosting-invariants.md` invariant 3). node-b's GET in setup is only
+/// seconds old, so `contract_in_use` stays true after the client disconnects: the
+/// peer keeps renewing and does NOT send an upstream Unsubscribe. Cleanup instead
+/// happens via lease-lapse once the read falls out of the recency window and
+/// renewal stops.
+///
+/// This test therefore asserts the demand-gated behavior — no upstream Unsubscribe
+/// fires while the read is recent. Driving recency past the 8-min window to prove
+/// the deferred collapse THEN fires needs an injected clock the node process does
+/// not expose to a `#[freenet_test]` (real nodes, real time), so it is out of
+/// scope here. Restoring evidence-gated instant cleanup on last-client-disconnect
+/// is tracked in #4738.
 #[freenet_test(
     nodes = ["gateway", "node-a", "node-b"],
     timeout_secs = 600,
@@ -4203,7 +4222,9 @@ async fn test_delegate_contract_get(ctx: &mut TestContext) -> TestResult {
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4
 )]
-async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestContext) -> TestResult {
+async fn test_client_disconnect_does_not_immediately_unsubscribe_with_recent_read(
+    ctx: &mut TestContext,
+) -> TestResult {
     const TEST_CONTRACT: &str = "test-contract-integration";
     let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
     let contract_key = contract.key();
@@ -4323,7 +4344,10 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
         "Client B should receive update notification while subscribed"
     );
 
-    // Phase 2: Disconnect client B — should trigger upstream Unsubscribe
+    // Phase 2: Disconnect client B — demand-gated: because node-b did a recent
+    // GET (setup above), the contract is still `contract_in_use`, so the collapse
+    // gate (`reconcile_wants_collapse == !contract_in_use`) stays false and NO
+    // immediate upstream Unsubscribe should fire. See the doc comment / #4738.
     tracing::info!("Phase 2: Disconnect client B");
     // Drain buffered responses so the client's background request_handler is not
     // blocked on response_tx.send() — otherwise it can't process the Disconnect.
@@ -4338,26 +4362,34 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
     );
     drop(client_b);
 
-    // Poll for Unsubscribe events with retries — the disconnect → unsubscribe
+    // Dwell and confirm NO upstream Unsubscribe fires while the GET is recent.
+    // The collapse decision (`reconcile_wants_collapse == !contract_in_use`) is
+    // the exact inverse of the renewal gate, and a recent GET/PUT keeps
+    // `contract_in_use` true (recency window = SUBSCRIPTION_LEASE_DURATION, 8 min),
+    // so the peer keeps renewing rather than tearing down. Cleanup happens later
+    // via lease-lapse (deferred instant cleanup tracked in #4738).
+    //
+    // We poll for 30s and fail fast if any Unsubscribe appears: the pre-flip
+    // immediate-collapse behavior delivered the Unsubscribe well within 30s
+    // (that was the window the old positive assertion relied on), so a regression
+    // to that behavior would surface here quickly. The disconnect → collapse
     // chain traverses multiple async hops (websocket → event loop → spawn →
-    // interest lookup → notification channel → transport → network → receive)
-    // so a single fixed sleep is insufficient under CI load.
+    // interest lookup → notification channel → transport → network → receive),
+    // which is exactly the path we assert stays silent.
     //
     // Note: tokio::time::Instant is fine here — this is a #[freenet_test]
     // integration test with real nodes, not a DST simulation test. The
     // TimeSource abstraction is only required within crates/core/src/.
     let instance_id = *contract_key.id();
-    let mut unsubscribe_sent_count = 0;
-    let mut unsubscribe_received_count = 0;
-    let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let dwell_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
-    while tokio::time::Instant::now() < poll_deadline {
+    while tokio::time::Instant::now() < dwell_deadline {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         let aggregator = ctx.aggregate_events().await?;
         let events = aggregator.get_all_events().await?;
 
-        unsubscribe_sent_count = events
+        let unsubscribe_sent_count = events
             .iter()
             .filter(|e| {
                 e.kind
@@ -4365,7 +4397,7 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
                     .is_some_and(|id| *id == instance_id)
             })
             .count();
-        unsubscribe_received_count = events
+        let unsubscribe_received_count = events
             .iter()
             .filter(|e| {
                 e.kind
@@ -4375,24 +4407,24 @@ async fn test_client_disconnect_triggers_upstream_unsubscribe(ctx: &mut TestCont
             .count();
 
         tracing::info!(
-            "Unsubscribe events for {}: sent={}, received={}",
+            "Unsubscribe events for {} (expected 0 while read is recent): sent={}, received={}",
             instance_id,
             unsubscribe_sent_count,
             unsubscribe_received_count
         );
 
-        if unsubscribe_received_count > 0 {
-            break;
-        }
+        // Demand-gated collapse (#4642): a recently-read contract stays
+        // `contract_in_use`, so neither an upstream Unsubscribe send nor receive
+        // may occur on the client disconnect. If either fires, the collapse gate
+        // has regressed to the pre-flip immediate-unsubscribe behavior.
+        assert!(
+            unsubscribe_sent_count == 0 && unsubscribe_received_count == 0,
+            "A recently-read contract must NOT trigger an immediate upstream Unsubscribe \
+             on client disconnect — collapse is demand-gated (inverse of renewal), and the \
+             GET keeps contract_in_use true (see #4642/#4738) \
+             (sent={unsubscribe_sent_count}, received={unsubscribe_received_count})"
+        );
     }
-
-    // The polling loop above waits up to 30s for UnsubscribeReceived.
-    // Assert the strong condition: upstream must have received the unsubscribe.
-    assert!(
-        unsubscribe_received_count > 0,
-        "Upstream node should have received the Unsubscribe message after client disconnect \
-         (sent={unsubscribe_sent_count}, received={unsubscribe_received_count})"
-    );
 
     // Cleanup
     client_a

@@ -2399,14 +2399,18 @@ fn test_subscribe_forwarding_ack_relay() {
 /// subscribed client disconnects, the node MUST emit an upstream Unsubscribe
 /// so the hoster can drop the downstream subscriber registration.
 ///
-/// This test exercises the same code path the failing integration test
-/// `test_client_disconnect_triggers_upstream_unsubscribe` exercises — the
+/// This test exercises the same disconnect code path as the integration test
+/// `test_client_disconnect_does_not_immediately_unsubscribe_with_recent_read` — the
 /// `ClientRequest::Disconnect` arm in `client_events::process_open_request`,
 /// which calls `remove_client_from_all_subscriptions` /
 /// `should_unsubscribe_upstream` / `send_unsubscribe_upstream` — but through
 /// the simulation harness where the bug's preconditions (completed PUT
 /// replay from GC, subscription resurrection, etc.) can be controlled and
-/// reproduced deterministically.
+/// reproduced deterministically. Note the two tests now assert OPPOSITE outcomes
+/// after the P6 reconcile flip (#4642): this sim node SUBSCRIBEs without a recent
+/// GET, so `contract_in_use` is false on disconnect and the collapse fires (an
+/// Unsubscribe is emitted); the integration test does a recent GET first, so its
+/// collapse is demand-gated and deferred to lease-lapse (see #4738).
 ///
 /// Before this test existed, `SimOperation` had no client-disconnect variant
 /// and simulation had NO coverage of the disconnect → unsubscribe chain —
