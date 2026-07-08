@@ -809,6 +809,18 @@ impl<T: TimeSource> HostingCache<T> {
                     // Op-scoped backstop: never evict the contract whose in-flight
                     // access triggered this sweep. Only trips on an already-broken
                     // peer because `protected` also has the highest recency_seq.
+                    //
+                    // KNOWN invariant-3 divergence (tracked in #4735, deferred): in
+                    // the corner where the cache is at budget and EVERY incumbent is
+                    // subscribed, excluding a zero-subscriber `protected` newcomer
+                    // from the candidate set forces the victim to be a subscribed
+                    // incumbent — the INVERSE of invariant 3's emergent refusal,
+                    // which says the fewest-subscriber contract (the newcomer) is the
+                    // one that should be refused, never displacing a 2+-subscriber
+                    // incumbent. The correct fix needs `host_contract` to signal
+                    // "served but not retained" so a zero-subscriber op doesn't have
+                    // to be protected here; until then this is left as-is (comment
+                    // only, no behavior change) — see #4735.
                     MemoryPressure::AtCapacity => protected != Some(key),
                     MemoryPressure::Overflow => true,
                 };
@@ -1117,6 +1129,15 @@ impl<T: TimeSource> HostingCache<T> {
             // constitutes genuine RAM overflow, so it must not pierce the op-scoped
             // backstop. The just-inserted `key` is the `protected` key, so this
             // call can never evict the contract it just added.
+            //
+            // KNOWN invariant-3 divergence (tracked in #4735, deferred): passing the
+            // zero-subscriber newcomer as `protected` means that, when the cache is
+            // at budget and every incumbent is subscribed, admitting this newcomer
+            // sheds a subscribed incumbent — the inverse of invariant 3's emergent
+            // refusal (the fewest-subscriber contract, i.e. the newcomer, should be
+            // the one refused). The proper fix needs `host_contract` to distinguish
+            // "served but not retained"; comment-only for now — see the matching note
+            // on the `protected` skip in `evict_over_budget`.
             let evicted =
                 self.evict_over_budget(&subscriber_counts, MemoryPressure::AtCapacity, Some(&key));
 

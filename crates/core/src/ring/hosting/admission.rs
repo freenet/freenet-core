@@ -49,8 +49,8 @@
 //! delivered by routing, not by the admission/eviction decision (invariant 3).
 //!
 //! The `last_get_seq` recency tiebreak means the same thing on both sides: it is
-//! **real-GET-only** — stamped by a real GET, never by SUBSCRIBE, PUT, or
-//! subscription renewal — in both `cache.rs` (see `HostedContract::last_get_seq`)
+//! stamped by a real **GET or PUT** (genuine client access), never by SUBSCRIBE or
+//! subscription renewal — in both `cache.rs` (see `HostedContract::recency_seq`)
 //! and here, so the shared tiebreak is consistent.
 //!
 //! # The decision (spec "Admission & Shedding"; task 7-bis)
@@ -227,15 +227,15 @@ pub(crate) struct AdmissionIncumbent {
     /// `!contract_in_use`, so the in-use pin here matches the eviction pin.
     pub subscriber_count: usize,
 
-    /// Monotonic real-GET recency sequence for this contract: a smaller value is a
-    /// less-recent real GET. The recency tiebreak in `cache::victim_order`. It is
-    /// **real-GET-only** — stamped ONLY by a real GET, never by SUBSCRIBE, PUT, or
-    /// subscription renewal (so renewal traffic doesn't make every subscribed
+    /// Monotonic real-access recency sequence for this contract: a smaller value is
+    /// a less-recent access. The recency tiebreak in `cache::victim_order`. It is
+    /// stamped by a real **GET or PUT** (genuine client access), never by SUBSCRIBE
+    /// or subscription renewal (so renewal traffic doesn't make every subscribed
     /// contract look equally fresh) — matching `cache.rs`'s
-    /// `HostedContract::last_get_seq` semantics exactly, so the shared tiebreak
-    /// means the same thing on both sides. A never-GET-read entry (e.g. a fresh PUT
-    /// seed) carries `0` and is the least-recent, evicted first within its
-    /// subscriber class.
+    /// `HostedContract::recency_seq` semantics exactly, so the shared tiebreak
+    /// means the same thing on both sides. An entry created without a real GET or
+    /// PUT (e.g. a SUBSCRIBE-only entry) carries `0` and is the least-recent,
+    /// evicted first within its subscriber class.
     pub last_get_seq: u64,
 }
 

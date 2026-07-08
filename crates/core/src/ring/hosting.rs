@@ -978,9 +978,12 @@ impl HostingManager {
                 .find(|entry| *entry.key().id() == instance_id)
                 .map(|entry| *entry.key());
             if let Some(contract) = contract {
-                // Client disconnect may have just transitioned the contract
-                // to no-longer-in-use. Record abandonment so over-budget
-                // eviction targets it first.
+                // Client disconnect may have just transitioned the contract to
+                // no-longer-in-use. Record abandonment so over-budget eviction
+                // does NOT shed it for an old last-read accrued while it was
+                // subscribed: `record_abandonment` resets its recency to the
+                // current frontier at termination, so the formerly-subscribed
+                // contract sorts LAST (freshest recency) and survives longest.
                 self.maybe_record_abandonment(&contract);
                 affected_contracts.push(contract);
             }
@@ -1057,9 +1060,12 @@ impl HostingManager {
             // Remove the map entry if no peers remain
             self.downstream_subscribers
                 .remove_if(contract, |_, peers| peers.is_empty());
-            // If the contract has just transitioned to no-longer-in-use,
-            // mark it as recently abandoned so over-budget eviction
-            // targets it before older-but-still-active entries.
+            // If the contract has just transitioned to no-longer-in-use, record
+            // abandonment: `record_abandonment` resets its recency to the current
+            // frontier at termination, so the formerly-subscribed contract sorts
+            // LAST (freshest recency) under over-budget eviction and survives
+            // longest, rather than being shed for an old last-read accrued while
+            // it was subscribed.
             self.maybe_record_abandonment(contract);
         }
         removed
@@ -1356,8 +1362,13 @@ impl HostingManager {
     /// Hook called from every code path that removes an "in-use" signal
     /// (client subscription, downstream subscriber, or stale-expiry of
     /// either). If the contract has just transitioned to no-longer-in-use,
-    /// mark it as recently abandoned in the hosting cache so the next
-    /// over-budget sweep evicts it before older-but-still-active entries.
+    /// record abandonment in the hosting cache: `record_abandonment` resets the
+    /// entry's recency to the current frontier at termination, so under the next
+    /// over-budget sweep the formerly-subscribed contract sorts LAST (freshest
+    /// recency) and survives longest — it is NOT evicted first. This stops it
+    /// being shed for an old last-read it accrued while parked in the
+    /// subscription tier (see `record_abandonment` /
+    /// `record_abandonment_resets_recency_at_subscription_termination`).
     ///
     /// Idle persistence is preserved: this changes eviction *order*, not
     /// eviction *eligibility*. A contract with no budget pressure on it
@@ -1409,8 +1420,10 @@ impl HostingManager {
             };
             if became_empty {
                 // Lease expiry may have just transitioned the contract to
-                // no-longer-in-use — record abandonment so the next
-                // over-budget sweep targets it first.
+                // no-longer-in-use — record abandonment so the next over-budget
+                // sweep does NOT shed it for an old last-read: `record_abandonment`
+                // resets its recency to the current frontier at termination, so it
+                // sorts LAST (freshest recency) and survives longest.
                 self.maybe_record_abandonment(&key);
             }
         }
