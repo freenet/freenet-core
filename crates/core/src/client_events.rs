@@ -1559,9 +1559,17 @@ async fn process_open_request(
                     );
                 }
 
-                // Send Unsubscribe upstream for contracts with no remaining interest
+                // Send Unsubscribe upstream for contracts with no remaining interest.
+                // FLIP (keystone P6, #4642): the collapse decision is driven by the
+                // reconcile controller's strict-farther interest gate
+                // (`reconcile_wants_collapse` = `!contract_in_use`), replacing the
+                // legacy ANY-downstream `should_unsubscribe_upstream`. The teardown
+                // still targets the STORED upstream (narrow flip keeps the flag).
                 for contract in &result.affected_contracts {
-                    if op_manager.ring.should_unsubscribe_upstream(contract) {
+                    if op_manager.reconcile_wants_collapse(
+                        contract,
+                        crate::node::network_status::ReconcileShadowSite::Collapse,
+                    ) {
                         let op_mgr = op_manager.clone();
                         let contract = *contract;
                         GlobalExecutor::spawn(async move {

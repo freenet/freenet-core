@@ -1631,6 +1631,12 @@ async fn run_relay_subscribe(
 /// without originating traffic), extend `OpCtx::send_to_and_await`
 /// to emit a stat update on `Err(_elapsed)` via a hook rather than
 /// reintroducing the signal on each relay driver.
+// NAMING LANDMINE: "relay" is a fossil of the hollow-relay firefight (#3763). This
+// driver IS the standalone SUBSCRIBE hop, the one genuinely hollow relay, being
+// retired as subscribe folds into GET/PUT (a routed GET/PUT is itself demand, so
+// those peers HOST rather than relay). Slated for removal/rename by piece D (chain
+// peers become real hosts). Do not name new code "relay".
+// See .claude/rules/hosting-invariants.md terminology + epic #4642.
 async fn drive_relay_subscribe(
     op_manager: &Arc<OpManager>,
     incoming_tx: Transaction,
