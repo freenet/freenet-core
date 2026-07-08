@@ -1017,11 +1017,109 @@ impl OpManager {
         reconcile::wants_renewal(&inputs)
     }
 
-    /// Send an Unsubscribe message to the upstream peer for a contract.
+    /// Reconcile-controller FLIP of the COLLAPSE-site interest gate (keystone P6,
+    /// #4642; design doc §5a / §6). The exact INVERSE of
+    /// [`reconcile_wants_renewal`](Self::reconcile_wants_renewal): whether the
+    /// active teardown (`send_unsubscribe_upstream`) should fire for this contract.
+    ///
+    /// The three collapse-decision sites — the maintenance loop's downstream-expiry
+    /// teardown (`Ring::recover_orphaned_subscriptions`), the client-disconnect
+    /// teardown (`client_events`), and the inbound-unsubscribe teardown
+    /// (`subscribe::handle_unsubscribe_inbound`) — now gate on THIS instead of the
+    /// legacy ANY-downstream `Ring::should_unsubscribe_upstream` predicate. It
+    /// builds a FRESH [`reconcile::ReconcileInputs`] snapshot AT EMISSION time and
+    /// applies the controller's interest gate [`reconcile::wants_collapse`] =
+    /// `!contract_in_use`: tear down iff NO local client AND NO **STRICTLY-farther**
+    /// downstream subscriber (piece D: a downstream counts only when strictly
+    /// farther from the key, so two mutual co-hosts cannot perpetuate each other's
+    /// leases forever — the #3763 hollow-relay-storm fix). The teardown it gates
+    /// still drives the wire `Unsubscribe` toward the **STORED** `is_upstream`
+    /// upstream (the narrow flip KEEPS the stored flag; see
+    /// `send_unsubscribe_upstream`).
+    ///
+    /// Fails **SAFE** (`false`, DO NOT collapse) when the snapshot is distance-blind
+    /// (own ring location unknown at startup) — the mirror of
+    /// `reconcile_wants_renewal`'s fail-safe (which keeps renewing): neither ever
+    /// tears a chain down on an unmeasurable snapshot. Because renewal keeps
+    /// renewing AND collapse does not fire while distance-blind, the contract simply
+    /// stays hosted through startup, unchanged from prior behavior.
+    ///
+    /// Because the strict gate is a SUPERSET of the legacy gate
+    /// (`!has_any_downstream ⟹ !has_farther_downstream`), the flip can only collapse
+    /// MORE, never less — it never leaks a chain the legacy predicate would have
+    /// cleaned up. The only added collapses are the mutual-co-host case the strict
+    /// gate targets, which v0.2.93 shadow measured at ~0% divergence from the legacy
+    /// predicate (the "collapse diff" ship-gate falsifier).
+    ///
+    /// # Post-flip legibility counter
+    ///
+    /// Records how often the driven strict-farther gate DISAGREES with the legacy
+    /// predicate it replaced (the "collapse diff" ship-gate falsifier, ~0% in
+    /// v0.2.93 shadow), so the metric stays legible in `router_snapshot` telemetry
+    /// after the flip — repurposed exactly as the RENEWAL counter was. The `site`
+    /// argument preserves the pre-flip per-site counter mapping: the maintenance-loop
+    /// and client-disconnect teardowns record on `Collapse` (both went through
+    /// `send_unsubscribe_upstream`'s `Collapse` shadow before the flip), the
+    /// inbound-unsubscribe teardown records on `InboundUnsubscribe` (its own
+    /// focused-`Collapse` shadow before the flip). Skips recording (like the shadow
+    /// builder) when distance-blind, to avoid noise.
+    pub(crate) fn reconcile_wants_collapse(
+        &self,
+        contract: &ContractKey,
+        site: crate::node::network_status::ReconcileShadowSite,
+    ) -> bool {
+        let Some(inputs) = self.build_reconcile_inputs(contract) else {
+            // Distance-blind snapshot: never actively tear down a chain on a blind
+            // read (fail SAFE = do not collapse). Do not record — no measurable
+            // comparison exists at startup (mirrors the shadow builder's skip).
+            return false;
+        };
+        let wants = reconcile::wants_collapse(&inputs);
+
+        // Post-flip legibility: measure the driven strict-farther gate against the
+        // legacy ANY-downstream predicate it replaced (the "collapse diff"
+        // ship-gate falsifier, ~0% in v0.2.93 shadow). Recorded on the SAME per-site
+        // counter the pre-flip shadow used, so the metric is continuous across the
+        // flip.
+        let legacy = self.ring.should_unsubscribe_upstream(contract);
+        let divergence = if wants != legacy {
+            reconcile::ReconcileActionDivergence {
+                collapse: true,
+                ..Default::default()
+            }
+        } else {
+            reconcile::ReconcileActionDivergence::default()
+        };
+        crate::node::network_status::record_reconcile_shadow_comparison(site, divergence);
+        if wants != legacy {
+            tracing::debug!(
+                contract = %contract,
+                ?site,
+                reconcile_wants_collapse = wants,
+                legacy_should_unsubscribe = legacy,
+                "collapse gate: driven strict-farther gate disagrees with legacy \
+                 ANY-downstream predicate (#4642 P6 flip; expected ~0%)"
+            );
+        }
+        wants
+    }
+
+    /// Send an Unsubscribe message to the upstream peer for a contract — the
+    /// interest-gated COLLAPSE teardown.
     ///
     /// Finds the upstream peer from the interest manager, resolves its address,
     /// and sends a fire-and-forget Unsubscribe message via the operation routing
     /// mechanism. Also removes the local active subscription and interest tracking.
+    ///
+    /// FLIP (keystone P6, #4642): the DECISION to fire this teardown is now driven
+    /// by the reconcile controller — every caller gates on
+    /// [`reconcile_wants_collapse`](Self::reconcile_wants_collapse) (`!contract_in_use`,
+    /// the strict-farther interest gate), replacing the legacy ANY-downstream
+    /// `should_unsubscribe_upstream`. The UPSTREAM IDENTITY, however, stays on the
+    /// stored `is_upstream` flag: the narrow flip does NOT compute-upstream-
+    /// everywhere, so the wire `Unsubscribe` still targets the stored upstream and
+    /// the computed-vs-stored divergence (#4671) stays under the SHADOW telemetry
+    /// recorded below (`record_upstream_divergence_comparison`), unflipped.
     pub async fn send_unsubscribe_upstream(&self, contract: &ContractKey) {
         // Find the upstream peer for this contract
         let upstream = self
@@ -1072,54 +1170,14 @@ impl OpManager {
             }
         }
 
-        // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
-        // COLLAPSE site. This function is the interest-gated collapse. Build the
-        // reconcile snapshot, compute what the pure controller would do, and
-        // compare BY SET MEMBERSHIP. DRIVES NOTHING — the teardown below runs
-        // unchanged. Skipped when the snapshot is distance-blind
-        // (`build_reconcile_inputs` returns `None`: own-location unknown), so a
-        // startup transient does not pollute the collapse-site signal.
-        //
-        // Actual→Action mapping (mirrors what this function actually EFFECTS):
-        //   - `Collapse` iff we hold a lease at snapshot (`is_subscribed`):
-        //     `ring.unsubscribe` is a NO-OP when not subscribed (hosting.rs), and
-        //     reconcile likewise emits `Collapse` only for a held lease — so a
-        //     verified-root / hosted-only (not-subscribed) contract collapsing on
-        //     last-client-leave must NOT record a false `collapse` diff, keeping
-        //     `collapse_diffs` the clean "controller would collapse a real lease"
-        //     signal.
-        //   - `Unsubscribe` iff a stored upstream was located (`upstream.is_some()`):
-        //     the wire `Unsubscribe` is sent whenever the stored flag resolves an
-        //     upstream, regardless of `is_subscribed`. The rare edge where a
-        //     located upstream fails later address resolution still counts as the
-        //     intent to unsubscribe. The `unsubscribe` diff thus captures the
-        //     stored-vs-computed upstream disagreement (#4671) at action
-        //     granularity.
-        // This site NEVER retracts a hosting advertisement, so reconcile's
-        // `Retract` (emitted when `is_advertised`) is a genuine recorded gap.
-        if let Some(inputs) = self.build_reconcile_inputs(contract) {
-            let reconcile_actions = reconcile::reconcile(&inputs);
-            let mut actual_actions: Vec<reconcile::Action> = Vec::new();
-            if inputs.is_subscribed {
-                actual_actions.push(reconcile::Action::Collapse);
-            }
-            if upstream.is_some() {
-                actual_actions.push(reconcile::Action::Unsubscribe);
-            }
-            let divergence = reconcile::action_set_divergence(&reconcile_actions, &actual_actions);
-            crate::node::network_status::record_reconcile_shadow_comparison(
-                crate::node::network_status::ReconcileShadowSite::Collapse,
-                divergence,
-            );
-            if divergence.any() {
-                tracing::debug!(
-                    contract = %contract,
-                    ?reconcile_actions,
-                    ?actual_actions,
-                    "reconcile shadow diverges from actual collapse behavior (#4642 keystone step-2)"
-                );
-            }
-        }
+        // NOTE (keystone P6 flip, #4642): the reconcile COLLAPSE decision no longer
+        // lives here as a record-only shadow — it DRIVES, one level up. Every caller
+        // of `send_unsubscribe_upstream` now gates on `reconcile_wants_collapse`
+        // (the strict-farther `!contract_in_use` gate), which also owns the
+        // repurposed `Collapse` reconcile counter (driven strict-vs-legacy
+        // divergence). So this function performs the teardown it is asked to; the
+        // only shadow it still records is the upstream-IDENTITY comparison above
+        // (stored vs computed), which stays UNFLIPPED per the narrow-flip scope.
 
         let Some((peer_key, _)) = upstream else {
             tracing::debug!(
@@ -2259,15 +2317,18 @@ mod tests {
         panic!("unbalanced braces after anchor: {anchor}");
     }
 
-    /// Behavior-preserving guard (keystone step-2, #4642): the collapse site
-    /// `send_unsubscribe_upstream` must STILL drive its decision off the stored
-    /// `is_upstream` flag and the local `ring.unsubscribe`, and the reconcile
-    /// controller must only RECORD a shadow comparison there — its `Vec<Action>`
-    /// flows ONLY into the set-membership divergence comparator, never into a
-    /// driver. This source-scrape pin fails if the flip lands (drive the action)
-    /// without a deliberate update, keeping the "drives nothing" invariant honest.
+    /// FLIP pin (keystone P6, #4642): the collapse teardown
+    /// `send_unsubscribe_upstream` still drives the wire `Unsubscribe` off the
+    /// STORED `is_upstream` flag and the local `ring.unsubscribe` (the narrow flip
+    /// KEEPS the stored upstream identity — it does NOT compute-upstream-
+    /// everywhere), and it STILL records the upstream-IDENTITY shadow
+    /// (`record_upstream_divergence_comparison`, unflipped). The record-only
+    /// reconcile COLLAPSE action-set shadow that used to live inside this function
+    /// is GONE — the collapse DECISION now DRIVES one level up
+    /// (`reconcile_wants_collapse` at the callers), so the function must no longer
+    /// build a reconcile snapshot or run the action-set comparator here.
     #[test]
-    fn send_unsubscribe_upstream_still_drives_and_shadow_is_record_only() {
+    fn send_unsubscribe_upstream_drives_off_stored_upstream_after_flip() {
         const SRC: &str = include_str!("op_state_manager.rs");
         let start = SRC
             .find("pub async fn send_unsubscribe_upstream(")
@@ -2281,57 +2342,120 @@ mod tests {
             .unwrap_or(SRC.len());
         let body = &SRC[start..end];
 
-        // Production still drives the collapse:
+        // Teardown still uses the STORED upstream identity + local ring.unsubscribe:
         assert!(
             body.contains("interest.is_upstream"),
-            "collapse must still locate the upstream via the stored is_upstream flag"
+            "collapse must still locate the upstream via the stored is_upstream flag \
+             (narrow flip keeps the stored flag)"
         );
         assert!(
             body.contains("self.ring.unsubscribe(contract)"),
             "collapse must still drop the local lease via ring.unsubscribe"
         );
-        // Reconcile is wired in SHADOW mode here and is record-only:
+        // The upstream-IDENTITY shadow (stored vs computed) STAYS wired, unflipped:
         assert!(
-            body.contains("record_reconcile_shadow_comparison"),
-            "the reconcile shadow comparison must be wired at the collapse site"
+            body.contains("record_upstream_divergence_comparison"),
+            "the upstream computed-vs-stored IDENTITY shadow must keep running \
+             (unflipped per the narrow-flip scope)"
+        );
+        // The record-only reconcile COLLAPSE action-set shadow is GONE from here —
+        // the decision drives at the callers (reconcile_wants_collapse). No reconcile
+        // snapshot build and no action-set comparator inside this function.
+        assert!(
+            !body.contains("build_reconcile_inputs"),
+            "the collapse decision drives one level up (reconcile_wants_collapse); \
+             send_unsubscribe_upstream must no longer build a reconcile snapshot"
         );
         assert!(
-            body.contains("action_set_divergence(&reconcile_actions"),
-            "reconcile output must flow ONLY into the set-membership divergence \
-             comparator (record-only), not into a driver/wire send"
+            !body.contains("action_set_divergence(&reconcile_actions"),
+            "the record-only collapse action-set shadow must be removed after the flip"
+        );
+        assert!(
+            !body.contains("ReconcileShadowSite::Collapse"),
+            "send_unsubscribe_upstream must no longer record the Collapse shadow — \
+             the repurposed Collapse counter is recorded in reconcile_wants_collapse"
+        );
+    }
+
+    /// FLIP pin (keystone P6, #4642): the COLLAPSE decision is DRIVEN by the
+    /// reconcile controller. `reconcile_wants_collapse` applies the pure
+    /// `reconcile::wants_collapse` gate, fails SAFE (does NOT collapse) on a
+    /// distance-blind snapshot, and all three collapse-decision sites gate on it
+    /// instead of the legacy ANY-downstream `should_unsubscribe_upstream`.
+    #[test]
+    fn collapse_decision_is_reconcile_driven() {
+        const SRC: &str = include_str!("op_state_manager.rs");
+        let gate = braced_block_after(SRC, "pub(crate) fn reconcile_wants_collapse(");
+        assert!(
+            gate.contains("reconcile::wants_collapse(&inputs)"),
+            "reconcile_wants_collapse must apply the pure wants_collapse gate"
+        );
+        assert!(
+            gate.contains("build_reconcile_inputs"),
+            "reconcile_wants_collapse must build a FRESH at-emission snapshot"
+        );
+        // Fail-safe: the distance-blind (`else`) arm must return false (do NOT
+        // collapse) — the mirror of reconcile_wants_renewal's keep-renewing default.
+        let blind = gate
+            .find("build_reconcile_inputs(contract) else")
+            .expect("reconcile_wants_collapse must guard the distance-blind snapshot");
+        let after = &gate[blind..];
+        let arm_end = after.find('}').expect("let-else arm must close");
+        assert!(
+            after[..arm_end].contains("return false"),
+            "reconcile_wants_collapse must FAIL SAFE (return false, do not collapse) \
+             when the snapshot is distance-blind"
         );
 
-        // NEGATIVE assertion (mirroring the renewal / edge-site pins): the shadow
-        // BLOCK itself must contain no driver call — reconcile's output can only
-        // be compared, never applied. Extract just the `if let Some(inputs) =
-        // self.build_reconcile_inputs(contract) { ... }` block so the function's
-        // real teardown drivers (which live OUTSIDE the block) don't trip it.
-        let block = braced_block_after(
-            SRC,
-            "if let Some(inputs) = self.build_reconcile_inputs(contract)",
+        // All three collapse-decision sites gate on reconcile_wants_collapse, each
+        // passing its pre-flip per-site counter (maintenance-loop + client-disconnect
+        // → Collapse; inbound-unsubscribe → InboundUnsubscribe).
+        let ring = include_str!("../ring.rs");
+        assert!(
+            ring.contains("op_manager.reconcile_wants_collapse(")
+                && ring.contains("ReconcileShadowSite::Collapse"),
+            "the renewal-loop downstream-expiry collapse must gate on \
+             reconcile_wants_collapse (Collapse site)"
         );
-        for driver in [
-            ".send(",
-            "self.ring.subscribe",
-            "self.ring.unsubscribe",
-            "send_unsubscribe",
-            "remove_peer_interest",
-            "on_contract_hosted",
-            "on_contract_unhosted",
-            "mark_subscription_pending",
-        ] {
-            assert!(
-                !block.contains(driver),
-                "collapse shadow block must not drive `{driver}` — it records only"
-            );
-        }
+        let client = include_str!("../client_events.rs");
+        assert!(
+            client.contains("op_manager.reconcile_wants_collapse(")
+                && client.contains("ReconcileShadowSite::Collapse"),
+            "the client-disconnect collapse must gate on reconcile_wants_collapse \
+             (Collapse site)"
+        );
+        let sub = include_str!("../operations/subscribe.rs");
+        assert!(
+            sub.contains("op_manager.reconcile_wants_collapse(")
+                && sub.contains("ReconcileShadowSite::InboundUnsubscribe"),
+            "the inbound-unsubscribe collapse must gate on reconcile_wants_collapse \
+             (InboundUnsubscribe site)"
+        );
+        // The legacy ANY-downstream predicate must no longer GATE any of the three
+        // collapse teardowns (matched on the `ring.should_unsubscribe_upstream(`
+        // call form, so the explanatory comments that name it don't false-trip). It
+        // survives only as the post-flip legibility baseline inside
+        // reconcile_wants_collapse and as a Ring/hosting helper.
+        assert!(
+            !ring.contains("if ring.should_unsubscribe_upstream(contract)"),
+            "the renewal-loop collapse must no longer gate on ring.should_unsubscribe_upstream"
+        );
+        assert!(
+            !client.contains("ring.should_unsubscribe_upstream"),
+            "the client-disconnect collapse must no longer gate on ring.should_unsubscribe_upstream"
+        );
+        assert!(
+            !sub.contains("ring.should_unsubscribe_upstream"),
+            "the inbound-unsubscribe collapse must no longer gate on ring.should_unsubscribe_upstream"
+        );
     }
 
     /// Hardening pin (keystone step-2 completion, #4642): the shared edge-site
     /// helper `record_reconcile_shadow_event` DRIVES NOTHING — reconcile's output
     /// flows only into the focused divergence comparator + the per-site counter.
-    /// One pin covers all four edge sites (inbound-unsubscribe, connection-drop,
-    /// host-formation) since they all route through this helper.
+    /// One pin covers the still-SHADOW edge sites (connection-drop, host-formation)
+    /// since they route through this helper. (The inbound-unsubscribe collapse was
+    /// FLIPPED to driving in P6 and no longer uses this record-only helper.)
     #[test]
     fn record_reconcile_shadow_event_drives_nothing() {
         const SRC: &str = include_str!("op_state_manager.rs");
@@ -2362,16 +2486,17 @@ mod tests {
         }
     }
 
-    /// Hardening pin (keystone step-2 completion, #4642): each of the four
-    /// EDGE decision sites is wired to the record-only helper with its own
+    /// Hardening pin (keystone step-2 completion, #4642): each still-SHADOW EDGE
+    /// decision site is wired to the record-only helper with its own
     /// `ReconcileShadowSite`, and the connection-drop site still runs the
     /// production disconnect bookkeeping unchanged. A future edit that drops a
-    /// site's shadow (or the production bookkeeping) fails here.
+    /// site's shadow (or the production bookkeeping) fails here. (Inbound-unsubscribe
+    /// was FLIPPED to driving in P6 — it is covered by
+    /// `collapse_decision_is_reconcile_driven`, not this shadow pin.)
     #[test]
     fn edge_sites_wire_the_record_only_helper() {
-        // Inbound-unsubscribe + host-formation live in operations/subscribe.rs.
+        // Host-formation lives in operations/subscribe.rs.
         let sub = include_str!("../operations/subscribe.rs");
-        assert!(sub.contains("ReconcileShadowSite::InboundUnsubscribe"));
         assert!(sub.contains("ReconcileShadowSite::HostFormation"));
         assert!(sub.contains("record_reconcile_shadow_event"));
         // Host-formation GET path lives in operations/get/op_ctx_task.rs.
