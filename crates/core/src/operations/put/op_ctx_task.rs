@@ -1168,6 +1168,13 @@ fn put_routing_should_terminate(
     descended_to_here && next_hop_moves_away
 }
 
+// NAMING LANDMINE: "relay" is a fossil of the hollow-relay firefight (#3763).
+// Forwarding a PUT does NOT make a peer a hollow relay; a routed PUT is demand, so
+// the peer HOSTS the contract (routing and hosting co-occur; there is no
+// forward-without-hosting for GET/PUT). The only true hollow relay was the
+// standalone SUBSCRIBE hop, being retired (subscribe folds into GET/PUT). Slated for
+// removal/rename by piece D (chain peers become real hosts). Do not name new code
+// "relay". See .claude/rules/hosting-invariants.md terminology + epic #4642.
 #[allow(clippy::too_many_arguments)]
 async fn drive_relay_put<CB>(
     op_manager: &Arc<OpManager>,
@@ -1195,6 +1202,10 @@ where
     );
 
     // ── Step 1: Store contract locally (all nodes cache) ────────────────────
+    // NAMING LANDMINE: "cache" here = HOSTING. Storing on a routed PUT is
+    // legitimate hosting (a routed PUT is demand), evictable under LRU, not a
+    // lesser cache tier. To be renamed hosting-* after 0.2.94.
+    // See .claude/rules/hosting-invariants.md + #4642.
     // Originator-loopback (a local client's own PUT, mapped to
     // upstream_addr=own_addr in dispatch) is ClientLocal so it lands in the
     // reserved fair-queue lane; a genuine relay store stays NetworkRelay (#4534).
@@ -1850,6 +1861,12 @@ fn put_store_priority(
     }
 }
 
+// NAMING LANDMINE: "store" (and the "relay_" prefix) here means HOSTING, not a
+// lesser cache tier or a hollow relay. A peer stores a contract because a PUT routed
+// through it, and a routed PUT is a demand signal, so the peer HOSTS the contract
+// (WASM+state, kept fresh in the update mesh) until LRU eviction. There is no cache
+// tier and no forward-without-hosting. Slated to be renamed hosting-* AFTER 0.2.94.
+// See .claude/rules/hosting-invariants.md terminology + epic #4642.
 #[allow(clippy::too_many_arguments)]
 async fn relay_put_store_locally(
     op_manager: &Arc<OpManager>,

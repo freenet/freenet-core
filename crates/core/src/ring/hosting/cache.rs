@@ -56,6 +56,15 @@
 //! the peer's own ring location — see [`super::demand`]) purely so the
 //! estimator keeps training and the dashboard column stays populated.
 
+// NAMING LANDMINE: "cache" throughout this module means HOSTING, not a lesser
+// cache tier. A peer stores a contract because a GET or PUT routed through it, and
+// a routed GET/PUT is a demand signal, so the peer HOSTS the contract (holds
+// WASM+state, kept fresh in the update mesh) until LRU eviction. There is no cache
+// tier. This naming confuses humans and LLMs; slated to be renamed to hosting-* in
+// a follow-up refactor AFTER 0.2.94 (deferred to avoid conflicting with the
+// in-flight eviction rewrite of this file). See .claude/rules/hosting-invariants.md
+// terminology + epic #4642.
+
 use freenet_stdlib::prelude::ContractKey;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -583,6 +592,10 @@ pub struct HostedContract {
 ///
 /// ALL contracts in this cache should have their subscriptions renewed automatically.
 /// This is the key fix for the bug where GET-triggered subscriptions weren't being renewed.
+// NAMING LANDMINE: "cache" here = HOSTING, not a lesser tier. Entries are contracts
+// this peer HOSTS (WASM+state, kept fresh in the update mesh) because a GET/PUT
+// routed through it, and a routed GET/PUT is demand. No cache tier exists; to be
+// renamed hosting-* after 0.2.94. See .claude/rules/hosting-invariants.md + #4642.
 pub struct HostingCache<T: TimeSource> {
     /// Maximum bytes to use for cached contracts
     budget_bytes: u64,

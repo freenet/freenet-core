@@ -1172,6 +1172,11 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 ///    (i.e., `access_result.is_new && put_persisted`). NOT gated on
 ///    `is_client_requester`; legacy announces on any first-time relay
 ///    cache too (`get.rs:2278, 2370`).
+// NAMING LANDMINE: "cache"/"store" here means HOSTING, not a lesser cache tier. A
+// peer stores a contract because a GET routed through it, and a routed GET is a
+// demand signal, so the peer HOSTS the contract (WASM+state, kept fresh in the
+// update mesh) until LRU eviction. There is no cache tier. Slated to be renamed
+// hosting-* AFTER 0.2.94. See .claude/rules/hosting-invariants.md + epic #4642.
 async fn cache_contract_locally(
     op_manager: &OpManager,
     key: ContractKey,
@@ -2164,6 +2169,13 @@ async fn run_relay_get<CB>(
     }
 }
 
+// NAMING LANDMINE: "relay" is a fossil of the hollow-relay firefight (#3763).
+// Forwarding a GET does NOT make a peer a hollow relay; a routed GET is demand, so
+// the peer HOSTS the contract (routing and hosting co-occur; there is no
+// forward-without-hosting for GET/PUT). The only true hollow relay was the
+// standalone SUBSCRIBE hop, being retired (subscribe folds into GET/PUT). Slated for
+// removal/rename by piece D (chain peers become real hosts). Do not name new code
+// "relay". See .claude/rules/hosting-invariants.md terminology + epic #4642.
 #[allow(clippy::too_many_arguments)]
 async fn drive_relay_get<CB>(
     op_manager: &Arc<OpManager>,
