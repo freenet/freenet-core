@@ -88,6 +88,10 @@ pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
 pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
+/// Pre-write admission-gate rejection type (#4683, PR 3). Surfaced to the
+/// executor chokepoints so a write that would overflow the aggregate disk
+/// budget is refused before any bytes land.
+pub(crate) use hosting::DiskBudgetExceeded;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
 /// instead of keeping the historically-pinned default (#4565).
@@ -102,6 +106,10 @@ pub(crate) use hosting::default_hosting_budget_bytes;
 /// build inputs and run the shadow compare (keystone step-2, #4642).
 pub(crate) use hosting::reconcile;
 pub use hosting::{AccessType, RecordAccessResult};
+/// Aggregate disk-budget defaults (#4683). `config` resolves the persisted
+/// `hosting-disk-pct` / `max-hosting-disk` defaults from these so the operator-
+/// facing defaults and the in-code sizing math share one source of truth.
+pub(crate) use hosting::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
 /// Clamp bounds re-exported only for the config-default round-trip test.
 #[cfg(test)]
 pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
@@ -2660,7 +2668,7 @@ impl Ring {
             // compile-cache totals so telemetry stays fresh. Observational only
             // in this PR — no admission/eviction decision reads these yet.
             //
-            // Both operations are synchronous, blocking disk I/O: a recursive
+            // The seed + refresh are synchronous, blocking disk I/O: a recursive
             // `std::fs` walk of `contracts_dir` + the wasmtime cache dir on every
             // tick, plus a one-time sync redb `load_all_hosting_metadata` on the
             // seeding tick. `contracts_dir` is unbounded and non-self-pruning, so
@@ -2680,6 +2688,22 @@ impl Ring {
                 // sweep loop, but it must not be swallowed silently either.
                 tracing::warn!(%err, "disk-usage accounting maintenance task failed");
             }
+
+            // Eviction floor (#4683, PR 2): recompute
+            // `effective = min(ram_budget, disk_budget)` and install it as the
+            // hosting-cache budget so the next `evict_over_budget` sheds state
+            // down to the tighter of the two resource floors. The free-space read
+            // is the determinism seam — production reads the data-dir mount; a
+            // failed read falls back to `u64::MAX`, which makes the disk budget
+            // clamp to its cap (degrade to "cap only", never to zero). The
+            // du-walks above already ran OUTSIDE any cache lock (in the blocking
+            // task); only the O(1) `set_budget_bytes` inside
+            // `recompute_effective_budget` takes the cache write lock.
+            let available = ring
+                .hosting_manager
+                .disk_available_bytes()
+                .unwrap_or(u64::MAX);
+            ring.hosting_manager.recompute_effective_budget(available);
         }
     }
 
@@ -2817,9 +2841,15 @@ impl Ring {
         &self,
         contracts_dir: std::path::PathBuf,
         wasmtime_cache_dir: std::path::PathBuf,
+        hosting_disk_pct: f64,
+        max_hosting_disk: u64,
     ) {
         self.hosting_manager
             .configure_disk_tracker(contracts_dir, wasmtime_cache_dir);
+        // #4683 eviction-floor sizing knobs (mirrors the disk paths install; the
+        // config is only reachable here). The 60s sweep's recompute reads them.
+        self.hosting_manager
+            .configure_disk_budget(hosting_disk_pct, max_hosting_disk);
     }
 
     /// Drop the ring's clones of the redb `Storage` handle (hosting metadata +
@@ -3332,6 +3362,104 @@ impl Ring {
     /// pattern in `.claude/rules/bug-prevention-patterns.md` lists this
     /// exact failure mode: one site drops the report and governance
     /// silently undercounts that path for months before anyone notices.
+    /// Pre-write admission gate for a state write (#4683, PR 3). Call this
+    /// BEFORE the `state_store.{store,update}` at every chokepoint: it rejects a
+    /// write that would push aggregate on-disk usage past the disk budget, so no
+    /// bytes ever land for a rejected write (no rollback needed for the write
+    /// itself). Read-only — the `+delta` is applied by
+    /// [`Self::commit_state_write`] only on the post-write success path, so a
+    /// rejected or later-failed write never mutates the tracker.
+    ///
+    /// A no-op admit until the disk tracker is seeded (early startup), so it
+    /// never spuriously blocks a write before the aggregate is meaningful.
+    ///
+    /// On rejection the chokepoint converts the error to a non-fatal
+    /// `ExecutorError::request(StdContractError::Put/Update)` → `new_value: Err`,
+    /// which for PUT rides `PutMsg::Error` to the client and the network.
+    pub(crate) fn admit_state_write(
+        &self,
+        contract: &ContractKey,
+        new_size: usize,
+    ) -> Result<(), DiskBudgetExceeded> {
+        self.hosting_manager
+            .admit_state_write(contract, new_size as u64)
+    }
+
+    /// Pre-write admission gate for a state **UPDATE** to an already-hosted
+    /// contract (#4683). Growth-only: a shrinking or size-holding UPDATE
+    /// (`new_size <= old`) is admitted unconditionally, even when the aggregate
+    /// is over budget, because an UPDATE mutates an already-counted footprint and
+    /// rejecting it would stall CRDT convergence without freeing any bytes (and a
+    /// relayed UPDATE rejection is silently dropped — no one would learn of the
+    /// stall). Only genuine growth is subjected to the aggregate bound. Use this
+    /// at UPDATE / re-PUT-merge chokepoints; PUT of a NEW contract keeps the hard
+    /// [`Self::admit_state_write`] gate.
+    pub(crate) fn admit_state_update(
+        &self,
+        contract: &ContractKey,
+        new_size: usize,
+    ) -> Result<(), DiskBudgetExceeded> {
+        self.hosting_manager
+            .admit_state_update(contract, new_size as u64)
+    }
+
+    /// Pre-write admission gate for a newly-stored (deduped) WASM code blob
+    /// (#4683, PR 3). Call this BEFORE `runtime.store_contract` for a blob that
+    /// is not already on disk. See [`Self::admit_state_write`] for the
+    /// deferred-delta / rollback discipline.
+    pub(crate) fn admit_wasm_write(&self, blob_len: usize) -> Result<(), DiskBudgetExceeded> {
+        self.hosting_manager.admit_wasm_write(blob_len as u64)
+    }
+
+    /// Charge a newly-stored (deduped) WASM code blob to the disk tracker on the
+    /// post-store success path (#4683). Call this AFTER a successful
+    /// `runtime.store_contract` for a blob that was not already on disk, so the
+    /// aggregate reflects it immediately (burst protection + so the state gate on
+    /// the same PUT sees it). See [`super::hosting::HostingManager::record_wasm_write`].
+    pub(crate) fn record_wasm_write(&self, blob_len: usize) {
+        self.hosting_manager.record_wasm_write(blob_len as u64);
+    }
+
+    /// Subtract a WASM code blob's contribution from the disk tracker on contract
+    /// removal (#4683). Mirror of [`Self::record_wasm_write`].
+    pub(crate) fn record_wasm_removed(&self, blob_len: usize) {
+        self.hosting_manager.record_wasm_removed(blob_len as u64);
+    }
+
+    /// Test-only passthroughs to the `HostingManager` disk-budget seams (#4683).
+    /// `hosting_manager` is a private field, so an executor-path test holding an
+    /// `Arc<OpManager>` cannot reach the seeding/budget helpers directly; these
+    /// forward to them so a wired `Executor<_>` can be driven into a disk-budget
+    /// rejection without waiting for the 60s recompute. No production behavior.
+    #[cfg(test)]
+    pub(crate) fn seed_disk_tracker_for_test<I>(&self, rows: I)
+    where
+        I: IntoIterator<Item = (ContractKey, u64)>,
+    {
+        self.hosting_manager.seed_disk_tracker_for_test(rows);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_disk_budget_for_test(&self, disk_pct: f64, max_hosting_disk: u64) {
+        self.hosting_manager
+            .configure_disk_budget(disk_pct, max_hosting_disk);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recompute_effective_budget_for_test(&self, available: u64) -> Option<u64> {
+        self.hosting_manager.recompute_effective_budget(available)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disk_budget_bytes_for_test(&self) -> u64 {
+        self.hosting_manager.disk_budget_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disk_usage_stats_for_test(&self) -> Option<hosting::DiskUsageStats> {
+        self.hosting_manager.disk_usage_stats()
+    }
+
     pub(crate) fn commit_state_write(&self, contract: &ContractKey, state_size: usize) {
         let new_gen = self.hosting_manager.bump_state_generation(contract);
         self.hosting_manager

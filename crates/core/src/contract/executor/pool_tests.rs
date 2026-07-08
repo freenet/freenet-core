@@ -1,6 +1,7 @@
 //! Tests for the contract executor module.
 
 mod conformance_tests;
+mod disk_budget_gate_tests;
 mod merge_rejected_tests;
 mod non_idempotent_detector_tests;
 mod related_contract_tests;

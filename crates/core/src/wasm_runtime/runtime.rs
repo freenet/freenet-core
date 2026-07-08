@@ -233,6 +233,35 @@ impl Default for RuntimeConfig {
 pub type StateWriteCallback =
     Arc<dyn Fn(&freenet_stdlib::prelude::ContractKey, usize) + Send + Sync + 'static>;
 
+/// Pre-write admission gate for V2 delegate state writes (#4683, PR 3).
+///
+/// V2 `put_contract_state_sync` / `update_contract_state_sync` bypass the
+/// executor's `state_store.{store,update}` chokepoints, so the disk-budget
+/// admission gate the executor applies there does not run for them. This
+/// callback restores it: invoked with `(key, new_state_size)` BEFORE the raw
+/// `Storage` write, it returns `Err(cause)` when the write would push aggregate
+/// disk past the budget, and the native-API method aborts without writing (no
+/// rollback needed — nothing landed). The wiring lives outside `wasm_runtime/`
+/// (Ring is in `crates/core/src/ring.rs`), so — like [`StateWriteCallback`] —
+/// it is plumbed via a trait object to keep `wasm_runtime` ring-independent.
+/// The `Err` payload is a human-readable cause string surfaced to the delegate
+/// caller.
+///
+/// The `is_update` flag selects the admission semantics (#4683): `false` for a
+/// V2 PUT (`put_contract_state_sync`) applies the HARD gate (any write that
+/// would push the aggregate over budget is rejected); `true` for a V2 UPDATE
+/// (`update_contract_state_sync`) applies the GROWTH-ONLY gate (a shrinking or
+/// size-holding write is always admitted, even over budget, so a CRDT merge
+/// never blocks convergence — only genuine growth is bounded). This mirrors the
+/// executor-side split between `admit_state_write` (PUT) and
+/// `admit_state_update` (UPDATE / re-PUT merge).
+pub type StateAdmitCallback = Arc<
+    dyn Fn(&freenet_stdlib::prelude::ContractKey, usize, bool) -> Result<(), String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
 pub struct Runtime {
     /// The WASM engine backend (wasmtime).
     pub(super) engine: Engine,
@@ -259,6 +288,12 @@ pub struct Runtime {
     /// hosting-cache snapshot from the V2 path (which bypasses the executor
     /// chokepoints). See `StateWriteCallback`.
     pub(crate) state_write_callback: Option<StateWriteCallback>,
+
+    /// Optional pre-write disk-budget admission gate for V2 delegate state
+    /// writes (#4683, PR 3). Installed alongside `state_write_callback`; when
+    /// present it runs BEFORE the raw `Storage` write and can abort it. See
+    /// [`StateAdmitCallback`].
+    pub(crate) state_admit_callback: Option<StateAdmitCallback>,
 }
 
 impl Runtime {
@@ -283,6 +318,14 @@ impl Runtime {
     /// re-host race stays open for V2 delegate writes.
     pub fn set_state_write_callback(&mut self, cb: StateWriteCallback) {
         self.state_write_callback = Some(cb);
+    }
+
+    /// Install a pre-write disk-budget admission gate for V2 delegate state
+    /// writes (#4683, PR 3). See [`StateAdmitCallback`]. Without it, V2
+    /// PUT/UPDATE bypass the executor's admission gate and can overflow the
+    /// aggregate disk budget.
+    pub fn set_state_admit_callback(&mut self, cb: StateAdmitCallback) {
+        self.state_admit_callback = Some(cb);
     }
 
     /// Export every secret under `scope` from this runtime's secrets store into
@@ -387,6 +430,7 @@ impl Runtime {
             delegate_contexts: super::native_api::new_delegate_context_cache(),
             state_store_db: None,
             state_write_callback: None,
+            state_admit_callback: None,
         })
     }
 
@@ -451,6 +495,7 @@ impl Runtime {
             delegate_contexts,
             state_store_db: None,
             state_write_callback: None,
+            state_admit_callback: None,
         })
     }
 
