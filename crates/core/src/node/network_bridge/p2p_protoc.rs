@@ -897,6 +897,52 @@ pub(crate) fn version_supports_subscribe_hint(
     remote.is_some_and(|v| v >= floor)
 }
 
+/// Minimum negotiated protocol version a peer must report before this node
+/// may emit the summary-first PUT probe/dispatch variants
+/// ([`PutMsg::ProbeRequest`](crate::operations::put::PutMsg) /
+/// `PutMsg::ProbeResponse`).
+///
+/// # INERT (#4642, step 3-bis)
+///
+/// No code emits those variants yet — the probe→dispatch driver and its
+/// send path are a LATER piece paired with every-hop placement. This floor
+/// and [`version_supports_summary_first_put`] are the emission gate that
+/// later piece will consult, so a pre-floor peer — which cannot
+/// bincode-deserialize the appended tags and would drop the connection —
+/// never receives them. The value is the release that first carries the
+/// variants in the enum (this scaffolding PR); the emitting piece MUST
+/// confirm/raise it to the release that first EMITS if that is later. Only
+/// peer pairs both on `>= this floor` will exchange probes, so activation
+/// ramps with fleet upgrade rather than switching on everywhere at once
+/// (the SubscribeHint model). Frozen once emission ships, per the
+/// wire-gated-floor rule in `docs/RELEASING.md`.
+///
+/// INERT: read only by the gate's own unit tests today; the emitting piece
+/// (later) is its first production consumer.
+#[allow(dead_code)]
+pub(crate) const SUMMARY_FIRST_PUT_MIN_VERSION: (u8, u8, u16) = (0, 2, 93);
+
+/// Pure version-gate for the summary-first PUT probe/dispatch variants,
+/// mirroring [`version_supports_subscribe_hint`]: returns `true` iff
+/// `remote` is known (`Some`) AND at least `floor`.
+///
+/// An unknown remote version is treated as unsupported (fail-closed): an
+/// older peer that cannot deserialize the appended `ProbeRequest` /
+/// `ProbeResponse` wire tag would drop the connection, so when in doubt we
+/// do NOT emit. Factored out (with an explicit `floor` param) so the gate
+/// is unit-testable independent of the production
+/// [`SUMMARY_FIRST_PUT_MIN_VERSION`].
+///
+/// INERT: no caller emits yet (see [`SUMMARY_FIRST_PUT_MIN_VERSION`]); this
+/// is the predicate the emitting piece will guard its send path with.
+#[allow(dead_code)]
+pub(crate) fn version_supports_summary_first_put(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
 /// Upper bound on the number of hosted contracts examined per new-peer
 /// migration trigger. Each examined contract may emit a best-effort
 /// non-blocking `try_send` (the SubscribeHint nudge), so an unbounded scan
@@ -3458,7 +3504,10 @@ mod tests {
     }
 
     mod version_gate {
-        use super::super::{SUBSCRIBE_HINT_MIN_VERSION, version_supports_subscribe_hint};
+        use super::super::{
+            SUBSCRIBE_HINT_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
+            version_supports_subscribe_hint, version_supports_summary_first_put,
+        };
 
         const FLOOR: (u8, u8, u16) = (0, 2, 73);
 
@@ -3503,6 +3552,78 @@ mod tests {
             // (this is the simulation/test floor behavior).
             assert!(version_supports_subscribe_hint(Some((0, 0, 0)), (0, 0, 0)));
             assert!(!version_supports_subscribe_hint(None, (0, 0, 0)));
+        }
+
+        // ---- Summary-first PUT probe/dispatch gate (INERT, #4642) ----
+        // Same fail-closed semantics as the SubscribeHint gate. These are
+        // the emission gate a LATER piece consults before sending the
+        // `PutMsg::ProbeRequest` / `ProbeResponse` variants; nothing emits
+        // them yet, so this asserts the gate is correct in isolation.
+
+        const SF_FLOOR: (u8, u8, u16) = (0, 2, 93);
+
+        /// The mixed-version interop guarantee, expressed at the gate: an
+        /// UNKNOWN remote version fails closed, so a summary-first-capable
+        /// node NEVER emits the probe to a peer whose version it hasn't
+        /// captured (it would fail to deserialize the appended tag and drop
+        /// the connection). This is the "old peer never receives the probe"
+        /// property that keeps the appended wire variants additive-safe.
+        #[test]
+        fn summary_first_unknown_remote_version_fails_closed() {
+            assert!(!version_supports_summary_first_put(None, SF_FLOOR));
+        }
+
+        /// A pre-floor peer (older than the release that first carries the
+        /// probe variants) is never sent the probe — it could not decode it.
+        #[test]
+        fn summary_first_older_remote_version_is_rejected() {
+            assert!(!version_supports_summary_first_put(
+                Some((0, 2, 92)),
+                SF_FLOOR
+            ));
+            assert!(!version_supports_summary_first_put(
+                Some((0, 1, 40)),
+                SF_FLOOR
+            ));
+        }
+
+        /// A peer at or above the floor understands the appended variants
+        /// and may receive the probe. Both-sides-capable is the activation
+        /// condition (ramps with fleet upgrade, SubscribeHint model).
+        #[test]
+        fn summary_first_equal_or_newer_remote_version_is_accepted() {
+            assert!(version_supports_summary_first_put(
+                Some((0, 2, 93)),
+                SF_FLOOR
+            ));
+            assert!(version_supports_summary_first_put(
+                Some((0, 2, 94)),
+                SF_FLOOR
+            ));
+            assert!(version_supports_summary_first_put(
+                Some((0, 3, 0)),
+                SF_FLOOR
+            ));
+            assert!(version_supports_summary_first_put(
+                Some((1, 0, 0)),
+                SF_FLOOR
+            ));
+        }
+
+        /// The production floor const is wired to the same fail-closed
+        /// predicate (guards against a future refactor that swaps the
+        /// predicate for one that admits `None`).
+        #[test]
+        fn summary_first_production_floor_fails_closed_on_unknown() {
+            assert!(!version_supports_summary_first_put(
+                None,
+                SUMMARY_FIRST_PUT_MIN_VERSION
+            ));
+            // A peer exactly at the production floor qualifies.
+            assert!(version_supports_summary_first_put(
+                Some(SUMMARY_FIRST_PUT_MIN_VERSION),
+                SUMMARY_FIRST_PUT_MIN_VERSION
+            ));
         }
 
         // Superseded: the placement migration was RE-ENABLED at `(0, 2, 80)` by
