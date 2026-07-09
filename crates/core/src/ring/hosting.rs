@@ -2075,6 +2075,13 @@ impl HostingManager {
     }
 
     /// Check if a contract was accessed by a local client.
+    ///
+    /// Test-only since serve-DURING (#4642 R3 piece C) removed the production
+    /// caller (the originator GET gate). The underlying flag is still maintained
+    /// (`mark_local_client_access`) and consulted via the recency variant
+    /// (`has_recent_local_client_access`), which the reconcile renewal path uses;
+    /// this plain accessor survives only for the hosting unit tests.
+    #[cfg(test)]
     pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
         self.hosting_cache.read().has_local_client_access(key)
     }

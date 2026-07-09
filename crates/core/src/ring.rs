@@ -2933,6 +2933,24 @@ impl Ring {
         self.hosting_manager.record_local_get_forward();
     }
 
+    /// Number of client GETs this node answered from local hosted state (A3
+    /// serve-DURING hit counter). Read accessor for the counter incremented by
+    /// [`Self::record_get_served_locally`]; used by the serve-DURING sim
+    /// falsifier to assert a demandless-copy GET was served locally, not routed.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn local_get_serves(&self) -> u64 {
+        self.hosting_manager.local_get_serves()
+    }
+
+    /// Number of client GETs this node routed to the network (A3 forward/miss
+    /// counter). Read accessor for the counter incremented by
+    /// [`Self::record_get_forwarded`]; the serve-DURING falsifier asserts this
+    /// stays `0` for a demandless-copy GET (the node never went dark).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn local_get_forwards(&self) -> u64 {
+        self.hosting_manager.local_get_forwards()
+    }
+
     /// Whether this node is hosting this contract (has it in cache).
     #[inline]
     pub fn is_hosting_contract(&self, key: &ContractKey) -> bool {
@@ -4350,10 +4368,13 @@ impl Ring {
         self.hosting_manager.mark_local_client_access(key)
     }
 
-    /// Check if a contract was accessed by a local client.
-    pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
-        self.hosting_manager.has_local_client_access(key)
-    }
+    // NOTE: `has_local_client_access` (the plain, non-recency variant) had its
+    // only production caller removed by serve-DURING (#4642 R3 piece C): the
+    // originator GET gate now serves on `interest_manager.has_local_interest`
+    // (a fresh in-mesh copy) rather than on whether the LOCAL user had touched
+    // the contract. The flag is still maintained (`mark_local_client_access`)
+    // and read via the recency variant below; the plain read accessor survives
+    // only on `HostingManager` for its unit tests.
 
     /// Whether a local client GET/PUT touched this contract within the renewal age
     /// gate (`SUBSCRIPTION_LEASE_DURATION`) — the read/PUT demand signal the
