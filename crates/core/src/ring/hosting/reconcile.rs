@@ -47,16 +47,20 @@
 //! computed upstream (#4671) diverges from the stored flag materially, so the
 //! `Unsubscribe` TARGET stays the stored one and that divergence stays under the
 //! SHADOW telemetry (`record_upstream_divergence_comparison`), still running so it
-//! can be re-measured before a future full flip. The remaining sites also stay in
-//! **shadow mode** (record-only, drive nothing): the connection-drop re-root
-//! (`ReRootSearch`) and the host-formation announce (`Announce`, needs the
-//! `actively_acquiring` source). The `Retract` action likewise stays deferred — it
-//! is wired live on EVICTION (#4722) but NOT yet driven from collapse/renewal
-//! teardown. Each shadow site builds a [`ReconcileInputs`] snapshot, computes what
-//! [`reconcile`] WOULD do, and records the divergence via [`action_set_divergence`]
-//! → `node::network_status::ReconcileShadowStats`. Because those drivers and the
-//! `Retract`/`ReRootSearch` hooks are still unwired, some surface here is exercised
-//! only by the shadow compare and tests, so `#[allow(dead_code)]` stays.
+//! can be re-measured before a future full flip. The connection-drop re-root
+//! (`ReRootSearch`) was also FLIPPED to driving in piece F (#4642): on a co-host
+//! disconnect, `OpManager::spawn_prompt_reroots` drives a storm-safe PROMPT
+//! re-subscribe for the in-use contracts the dropped peer stranded (interest-gated
+//! via `reconcile_wants_reroot`, single-target, make-before-break, per-drop-capped
+//! + jittered). The one remaining SHADOW site is the host-formation announce
+//! (`Announce`, needs the `actively_acquiring` source). The `Retract` action
+//! likewise stays deferred — it is wired live on EVICTION (#4722) but NOT yet
+//! driven from collapse/renewal teardown. The shadow site builds a
+//! [`ReconcileInputs`] snapshot, computes what [`reconcile`] WOULD do, and records
+//! the divergence via [`action_set_divergence`] →
+//! `node::network_status::ReconcileShadowStats`. Because the `Announce` driver and
+//! the `Retract` hook are still unwired, some surface here is exercised only by the
+//! shadow compare and tests, so `#[allow(dead_code)]` stays.
 //!
 //! Hosting is BINARY throughout: [`ReconcileInputs::state_present`] means this
 //! peer holds the FULL contract (code + params + state), never a partial tier.

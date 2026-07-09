@@ -93,6 +93,24 @@ const CONNECTION_DROP_SHADOW_SAMPLE_CAP: usize = 32;
 /// diagnostic counter).
 const CONNECTION_DROP_SHADOW_SCAN_CAP: usize = 1024;
 
+/// Storm-safety cap on the number of PROMPT re-roots spawned in response to ONE
+/// connection-drop event (#4642 piece F, the connection-drop re-root FLIP).
+///
+/// This is THE re-root-storm bound. When a hub/gateway that co-hosted many of a
+/// peer's in-use contracts drops, the peer must NOT fire a re-subscribe for every
+/// affected contract at once — that thundering herd is exactly the hollow-relay
+/// storm the #3763 firefight fought. The prompt path re-roots at most this many
+/// contracts per drop; the remainder are re-rooted by the ordinary ~30s renewal
+/// loop at ITS own rate cap (`MAX_RECOVERY_ATTEMPTS_PER_INTERVAL`), so a mass
+/// disconnect degrades to a bounded trickle instead of an O(contracts) burst.
+/// Kept below the renewal loop's per-tick cap: a drop is a spikier trigger than a
+/// scheduled tick, so its prompt burst is deliberately smaller. Per-contract
+/// backoff (`can_request_subscription`) and pending-dedup
+/// (`mark_subscription_pending`) prevent repeated drops from re-firing the same
+/// contract, and per-task jitter (`spawn_renewal_subscribe_task`) spreads even
+/// this bounded batch.
+const MAX_PROMPT_REROOTS_PER_DROP: usize = 6;
+
 /// Pure core of the piece-D **strictly-farther** downstream-subscriber filter
 /// (keystone step-2, #4642): `true` iff at least one subscriber distance is
 /// STRICTLY greater than `my_distance` (both measured to the contract key).
@@ -1572,9 +1590,9 @@ impl OpManager {
     /// interest manager's `downstream_subscriber_count` and triggers upstream
     /// unsubscribe when appropriate.
     pub(crate) fn on_ring_connection_lost(&self, pub_key: &TransportPublicKey) {
-        // Reconcile-controller SHADOW comparison (keystone step-2, #4642),
-        // CONNECTION-DROP re-root site. Capture the contracts the dropped peer
-        // co-hosted BEFORE `on_peer_disconnected` clears them. DRIVES NOTHING.
+        // CONNECTION-DROP re-root FLIP (#4642 piece F). Capture the contracts the
+        // dropped peer co-hosted BEFORE `on_peer_disconnected` clears them, so the
+        // post-drop computed-upstream recomputation below already excludes it.
         let dropped_contracts = self.neighbor_hosting.contracts_for_peer(pub_key);
 
         // Production disconnect bookkeeping (unchanged).
@@ -1582,42 +1600,198 @@ impl OpManager {
         self.interest_manager
             .schedule_deferred_removal(&PeerKey::from(pub_key.clone()));
 
-        // Shadow: production does NO re-root on a connection drop (the F/#4655
-        // hook), so for each dropped-peer-co-hosted contract we hold, ask whether
-        // the controller WOULD re-root (upstream lost, demand intact) — actual is
-        // always `{}`, focused on `ReRootSearch`. Run AFTER `on_peer_disconnected`
-        // so the computed upstream already excludes the dropped peer.
+        // FLIP: this site used to only RECORD a shadow ("production never re-roots
+        // on a connection drop today"). It now DRIVES a storm-safe PROMPT re-root —
+        // piece F's event-driven re-subscribe, which reacts to the drop rather than
+        // waiting for the lease-expiry timer (invariant 4). Every storm-safety guard
+        // lives in `spawn_prompt_reroots`: interest-gated (only contracts the
+        // reconcile controller would `ReRootSearch`), single-target strictly-closer
+        // (one `run_renewal_subscribe` toward the key), make-before-break (fresh
+        // subscribe, no teardown-first), per-drop cap + jitter + per-contract
+        // backoff/dedup, and a zero-connection guard. Contracts beyond the per-drop
+        // cap are re-rooted by the ordinary ~30s renewal loop at its own rate cap,
+        // so a mass disconnect degrades to a bounded trickle, never the O(contracts)
+        // burst the #3763 hollow-relay firefight fought.
         //
-        // We resolve the dropped peer's co-hosted instance-ids to OUR
-        // `ContractKey`s via `subscribed_keys_in` (a bounded, sort-free scan of
-        // active subscriptions). The reason is purely mechanical: there is no
-        // instance-id → `ContractKey` index in this crate, and lease-holders are
-        // the cheapest set that yields the full key without reconstruction. It is
-        // NOT a completeness claim — `contract_in_use = has_local_client ||
-        // has_farther_downstream_subscriber` is INDEPENDENT of `is_subscribed`
-        // (reconcile.rs), so a state-present, in-use, no-upstream, non-root
-        // contract we host WITHOUT an active lease (e.g. a former host whose
-        // upstream lease just lapsed while a local client is still subscribed)
-        // would also be a re-root candidate and is MISSED here. That is a narrow,
-        // transient case that biases this one-sided count slightly LOW; acceptable
-        // for a diagnostic counter, and it goes away when the flip drives re-root
-        // from the reconcile snapshot directly. Both the scan and the build count
-        // are bounded per drop (see the two caps above).
+        // The candidate set is still the dropped peer's co-hosted instance-ids
+        // resolved to OUR `ContractKey`s via `subscribed_keys_in` (lease-holders):
+        // a state-present, in-use, no-upstream contract we host WITHOUT an active
+        // lease is still MISSED by the prompt path (narrow, transient) but is
+        // covered by the renewal loop's own re-root — same bias the shadow noted.
         if !dropped_contracts.is_empty() {
-            for key in self.ring.subscribed_keys_in(
-                &dropped_contracts,
-                CONNECTION_DROP_SHADOW_SCAN_CAP,
-                CONNECTION_DROP_SHADOW_SAMPLE_CAP,
-            ) {
-                self.record_reconcile_shadow_event(
-                    crate::node::network_status::ReconcileShadowSite::ConnectionDrop,
-                    &key,
-                    &[reconcile::Action::ReRootSearch],
-                    // Production never re-roots on a connection drop today.
-                    |_| Vec::new(),
-                );
+            if let Some(op_manager) = self.ring.upgrade_op_manager() {
+                let shutdown = self.ring.shutdown_token();
+                self.spawn_prompt_reroots(&dropped_contracts, &op_manager, &shutdown);
             }
         }
+    }
+
+    /// Whether the reconcile controller would `ReRootSearch` this contract right
+    /// now — the interest gate for the connection-drop PROMPT re-root (#4642 piece
+    /// F flip; mirrors [`reconcile_wants_renewal`](Self::reconcile_wants_renewal)
+    /// and [`reconcile_wants_collapse`](Self::reconcile_wants_collapse)).
+    ///
+    /// Builds a FRESH [`reconcile::ReconcileInputs`] snapshot at emission time and
+    /// returns `true` iff [`reconcile::reconcile`] emits [`reconcile::Action::ReRootSearch`]:
+    /// demand is intact (`contract_in_use`), the computed upstream is gone
+    /// (strictly-closer connected co-host vanished), we are NOT the verified root,
+    /// and we are not already acquiring. This is the partition-vs-collapse
+    /// distinction — a demandless copy reconciles to a `Collapse`/`Retract`
+    /// teardown, never `ReRootSearch`, so it is never re-rooted (the anti-storm
+    /// property).
+    ///
+    /// Fails **SAFE** (`false`, DO NOT prompt-re-root) when the snapshot is
+    /// distance-blind (own ring location unknown at startup): we cannot tell
+    /// whether the upstream was truly lost, and spuriously re-rooting on a blind
+    /// read would add subscribe traffic; the ordinary renewal loop re-roots this
+    /// contract on a later tick once our location is known.
+    ///
+    /// # Post-flip legibility counter
+    ///
+    /// Repurposes the pre-flip `ConnectionDrop` shadow counter exactly as the
+    /// RENEWAL/COLLAPSE flips repurposed theirs: every evaluation bumps the
+    /// `comparisons` denominator and a driven prompt re-root sets `reroot_search`,
+    /// so `ConnectionDrop` reads in `router_snapshot` telemetry as "of N
+    /// drop-affected in-use candidates evaluated, K drove a prompt re-root".
+    pub(crate) fn reconcile_wants_reroot(&self, contract: &ContractKey) -> bool {
+        let Some(inputs) = self.build_reconcile_inputs(contract) else {
+            // Distance-blind: skip the prompt re-root (fail closed, storm-safe).
+            // Do not record — no measurable snapshot at startup (mirrors the other
+            // gates' distance-blind skip).
+            return false;
+        };
+        let wants = reconcile::reconcile(&inputs).contains(&reconcile::Action::ReRootSearch);
+        let divergence = if wants {
+            reconcile::ReconcileActionDivergence {
+                reroot_search: true,
+                ..Default::default()
+            }
+        } else {
+            reconcile::ReconcileActionDivergence::default()
+        };
+        crate::node::network_status::record_reconcile_shadow_comparison(
+            crate::node::network_status::ReconcileShadowSite::ConnectionDrop,
+            divergence,
+        );
+        wants
+    }
+
+    /// Drive storm-safe PROMPT re-roots for the in-use contracts a just-dropped
+    /// co-host peer left stranded (#4642 piece F). The connection-drop FLIP's whole
+    /// storm-safety lives here; `on_ring_connection_lost` is a thin caller.
+    ///
+    /// The guards, in order, and which prompt requirement each satisfies:
+    /// 1. **Zero-connection guard.** No ring connections ⇒ nowhere to route a
+    ///    re-subscribe ⇒ return (wait for re-bootstrap).
+    /// 2. **Bounded candidate scan.** `subscribed_keys_in` caps both the scan
+    ///    (`SCAN_CAP`) and the matches (`SAMPLE_CAP`), so losing one co-host on a
+    ///    near-key gateway cannot become an O(subscribed-set) sweep.
+    /// 3. **Per-drop cap (THE storm bound).** At most `MAX_PROMPT_REROOTS_PER_DROP`
+    ///    prompt re-roots per drop, however many contracts routed through the
+    ///    dropped peer; the rest are re-rooted by the ordinary renewal loop.
+    /// 4. **Ban + per-contract backoff + dedup.** Banned contracts are skipped;
+    ///    `can_request_subscription` respects exponential backoff and
+    ///    `mark_subscription_pending` blocks a second concurrent re-root/renewal —
+    ///    together these stop repeated drops (a mass disconnect firing many
+    ///    `on_ring_connection_lost` calls) from re-firing the SAME contract.
+    /// 5. **Interest gate + single-target.** `reconcile_wants_reroot` re-roots only
+    ///    a contract the controller would `ReRootSearch` (real demand, upstream
+    ///    lost, not root); a demandless every-hop copy is NEVER re-rooted.
+    /// 6. **Make-before-break + jitter.** The shared `spawn_renewal_subscribe_task`
+    ///    issues a fresh SUBSCRIBE toward the key (single strictly-closer target,
+    ///    no fan-out, no teardown-first) after up-to-15s jitter that spreads even
+    ///    the bounded batch.
+    pub(crate) fn spawn_prompt_reroots(
+        &self,
+        dropped_contracts: &HashSet<ContractInstanceId>,
+        op_manager: &Arc<Self>,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) {
+        let selected = self.select_prompt_reroots(dropped_contracts);
+
+        let mut spawned = 0usize;
+        for key in selected {
+            // Guard 6: make-before-break — claim the pending slot, then spawn a
+            // fresh subscribe via the SHARED renewal path (no teardown-first). The
+            // claim can lose to a concurrent renewal that grabbed the slot between
+            // selection and here; that key is simply left to the renewal loop.
+            if self.ring.mark_subscription_pending(key) {
+                crate::ring::Ring::spawn_renewal_subscribe_task(
+                    op_manager.clone(),
+                    key,
+                    shutdown.clone(),
+                );
+                spawned += 1;
+            }
+        }
+
+        // Simulation-test observability (no-op in production — gated on a current
+        // network name): record this drop's prompt re-root batch so the
+        // re-root-storm falsifier can assert `max_reroot_batch <=
+        // MAX_PROMPT_REROOTS_PER_DROP` per node. Skip a zero batch (it never raises
+        // the per-node max).
+        if spawned > 0 {
+            if let Some(addr) = self.ring.connection_manager.get_own_addr() {
+                crate::ring::topology_registry::record_reroot_batch(addr, spawned as u64);
+            }
+        }
+    }
+
+    /// The storm-safe SELECTION half of the connection-drop prompt re-root (#4642
+    /// piece F): pick the at-most-`MAX_PROMPT_REROOTS_PER_DROP` contracts to
+    /// promptly re-root after a co-host peer dropped, applying every non-spawning
+    /// guard. Pure selection (no task spawning, no pending-mark), so the storm
+    /// bound and interest gate are DETERMINISTICALLY unit-testable on the returned
+    /// list. [`spawn_prompt_reroots`](Self::spawn_prompt_reroots) is the thin
+    /// driver that marks + spawns each returned key.
+    ///
+    /// Guard order (see `spawn_prompt_reroots` doc for the prompt-requirement each
+    /// serves): zero-connection → bounded scan → per-drop cap → ban → per-contract
+    /// backoff/pending → interest gate (`reconcile_wants_reroot`).
+    pub(crate) fn select_prompt_reroots(
+        &self,
+        dropped_contracts: &HashSet<ContractInstanceId>,
+    ) -> Vec<ContractKey> {
+        // Guard 1: zero-connection — nowhere to route a re-subscribe.
+        if self.ring.open_connections() == 0 {
+            return Vec::new();
+        }
+
+        // Guard 2: bounded candidate scan (our lease-holders the dropped peer
+        // co-hosted). Caps BOTH the scan and the number of matches.
+        let candidates = self.ring.subscribed_keys_in(
+            dropped_contracts,
+            CONNECTION_DROP_SHADOW_SCAN_CAP,
+            CONNECTION_DROP_SHADOW_SAMPLE_CAP,
+        );
+
+        let mut selected = Vec::new();
+        for key in candidates {
+            // Guard 3: per-drop cap — THE re-root-storm bound. However many
+            // contracts routed through the dropped peer, select at most
+            // MAX_PROMPT_REROOTS_PER_DROP; the rest are re-rooted by the renewal
+            // loop at its own rate cap.
+            if selected.len() >= MAX_PROMPT_REROOTS_PER_DROP {
+                break;
+            }
+            // Guard 4a: never re-subscribe a banned contract.
+            if self.ring.contract_ban_list.is_banned(key.id()) {
+                continue;
+            }
+            // Guard 4b: per-contract backoff + in-flight dedup — stops repeated
+            // drops from re-firing the SAME contract.
+            if !self.ring.can_request_subscription(&key) {
+                continue;
+            }
+            // Guard 5: interest gate — only re-root what the controller would
+            // ReRootSearch (demand intact, upstream lost, not root); a demandless
+            // copy reconciles to a teardown and is never re-rooted (anti-storm).
+            if !self.reconcile_wants_reroot(&key) {
+                continue;
+            }
+            selected.push(key);
+        }
+        selected
     }
 }
 
@@ -2531,13 +2705,13 @@ mod tests {
         }
     }
 
-    /// Hardening pin (keystone step-2 completion, #4642): each still-SHADOW EDGE
-    /// decision site is wired to the record-only helper with its own
-    /// `ReconcileShadowSite`, and the connection-drop site still runs the
-    /// production disconnect bookkeeping unchanged. A future edit that drops a
-    /// site's shadow (or the production bookkeeping) fails here. (Inbound-unsubscribe
-    /// was FLIPPED to driving in P6 — it is covered by
-    /// `collapse_decision_is_reconcile_driven`, not this shadow pin.)
+    /// Hardening pin (keystone step-2 completion, #4642): the still-SHADOW EDGE
+    /// decision site (host-formation) is wired to the record-only helper with its
+    /// own `ReconcileShadowSite`. A future edit that drops its shadow fails here.
+    /// (Inbound-unsubscribe was FLIPPED to driving in P6 — covered by
+    /// `collapse_decision_is_reconcile_driven`. Connection-drop was FLIPPED to
+    /// driving in piece F — covered by `connection_drop_re_root_is_driven`, no
+    /// longer a shadow site.)
     #[test]
     fn edge_sites_wire_the_record_only_helper() {
         // Host-formation lives in operations/subscribe.rs.
@@ -2548,22 +2722,335 @@ mod tests {
         let get = include_str!("../operations/get/op_ctx_task.rs");
         assert!(get.contains("ReconcileShadowSite::HostFormation"));
         assert!(get.contains("record_reconcile_shadow_event"));
-        // Connection-drop lives here, in on_ring_connection_lost.
+        // Connection-drop still runs its production disconnect bookkeeping
+        // (behavior-preserving) even though its re-root now DRIVES.
         const SRC: &str = include_str!("op_state_manager.rs");
         let drop_body = braced_block_after(SRC, "pub(crate) fn on_ring_connection_lost(");
-        assert!(
-            drop_body.contains("ReconcileShadowSite::ConnectionDrop"),
-            "connection-drop shadow must be wired in on_ring_connection_lost"
-        );
-        assert!(
-            drop_body.contains("record_reconcile_shadow_event"),
-            "connection-drop must route through the record-only helper"
-        );
-        // Production disconnect bookkeeping must remain (behavior-preserving).
         assert!(
             drop_body.contains("on_peer_disconnected")
                 && drop_body.contains("schedule_deferred_removal"),
             "on_ring_connection_lost must still do the production disconnect bookkeeping"
+        );
+    }
+
+    /// FLIP pin (#4642 piece F): the connection-drop re-root is DRIVEN, not a
+    /// record-only shadow, AND is interest-gated + storm-safe. This is the
+    /// counterpart to `collapse_decision_is_reconcile_driven` for the piece-F flip.
+    ///
+    /// Asserts, by source scrape:
+    /// - `on_ring_connection_lost` no longer records the ConnectionDrop shadow
+    ///   (`record_reconcile_shadow_event` gone from its body) and instead drives a
+    ///   PROMPT re-root via `spawn_prompt_reroots` — i.e. the old
+    ///   record-only-with-`|_| Vec::new()` arm is gone.
+    /// - `spawn_prompt_reroots` carries every storm-safety guard: the zero-connection
+    ///   guard, the bounded candidate scan, the per-drop cap
+    ///   (`MAX_PROMPT_REROOTS_PER_DROP`), the per-contract backoff/dedup
+    ///   (`can_request_subscription` + `mark_subscription_pending`), the interest
+    ///   gate (`reconcile_wants_reroot`, so a demandless copy is NOT re-rooted), and
+    ///   the shared make-before-break spawn path (`spawn_renewal_subscribe_task`).
+    #[test]
+    fn connection_drop_re_root_is_driven() {
+        const SRC: &str = include_str!("op_state_manager.rs");
+
+        let drop_body = braced_block_after(SRC, "pub(crate) fn on_ring_connection_lost(");
+        assert!(
+            drop_body.contains("spawn_prompt_reroots"),
+            "on_ring_connection_lost must DRIVE a prompt re-root via spawn_prompt_reroots"
+        );
+        assert!(
+            !drop_body.contains("record_reconcile_shadow_event"),
+            "the connection-drop re-root must DRIVE, not record a shadow — the \
+             record-only helper must be gone from on_ring_connection_lost"
+        );
+        assert!(
+            !drop_body.contains("|_| Vec::new()"),
+            "the shadow's `production never re-roots` (|_| Vec::new()) arm must be gone"
+        );
+
+        // The non-spawning storm-safety guards live in the SELECTION half.
+        let select = braced_block_after(SRC, "pub(crate) fn select_prompt_reroots(");
+        // Guard 1: zero-connection.
+        assert!(
+            select.contains("open_connections() == 0"),
+            "select_prompt_reroots must have a zero-connection guard"
+        );
+        // Guards 2 + 3: bounded scan + per-drop storm cap.
+        assert!(
+            select.contains("subscribed_keys_in") && select.contains("MAX_PROMPT_REROOTS_PER_DROP"),
+            "select_prompt_reroots must bound the candidate scan AND cap re-roots per \
+             drop (the storm bound)"
+        );
+        // Guard 4: per-contract backoff.
+        assert!(
+            select.contains("can_request_subscription"),
+            "select_prompt_reroots must apply per-contract backoff"
+        );
+        // Guard 5: interest gate — demandless copies are NOT re-rooted.
+        assert!(
+            select.contains("reconcile_wants_reroot"),
+            "select_prompt_reroots must be interest-gated via reconcile_wants_reroot"
+        );
+        // Guard 6 (spawn half): pending-dedup claim + shared make-before-break spawn.
+        let reroot = braced_block_after(SRC, "pub(crate) fn spawn_prompt_reroots(");
+        assert!(
+            reroot.contains("mark_subscription_pending"),
+            "spawn_prompt_reroots must claim the per-contract slot (pending-dedup)"
+        );
+        assert!(
+            reroot.contains("spawn_renewal_subscribe_task"),
+            "spawn_prompt_reroots must spawn via the shared renewal path \
+             (make-before-break, single source of truth)"
+        );
+
+        // The interest gate keys on the ReRootSearch action specifically.
+        let gate = braced_block_after(SRC, "pub(crate) fn reconcile_wants_reroot(");
+        assert!(
+            gate.contains("Action::ReRootSearch"),
+            "reconcile_wants_reroot must gate on the ReRootSearch action"
+        );
+        assert!(
+            gate.contains("return false"),
+            "reconcile_wants_reroot must fail SAFE (do not re-root) on a \
+             distance-blind snapshot"
+        );
+    }
+
+    // ===== Connection-drop PROMPT re-root behavioral tests (#4642 piece F) =====
+
+    /// Build a minimal real `OpManager` (Local mode) for the connection-drop
+    /// re-root behavioral tests. Mirrors the executor pool_tests builder. Returns
+    /// the op_manager plus a guard box that keeps the receivers + task monitor
+    /// alive for the test scope.
+    async fn build_reroot_test_op_manager(id: &str) -> (Arc<OpManager>, Box<dyn std::any::Any>) {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        let guards: Box<dyn std::any::Any> = Box::new((
+            notification_rx,
+            ch_channel,
+            wait_for_event,
+            result_router_rx,
+            task_monitor,
+        ));
+        (op_manager, guards)
+    }
+
+    /// Give the node a known own address (so reconcile snapshots are not
+    /// distance-blind — `own_location().location()` derives from the own address)
+    /// plus one live connection (so the zero-connection guard passes). The
+    /// connection is NOT announced as co-hosting anything, so it never becomes
+    /// anyone's computed upstream.
+    fn seed_location_and_one_connection(op_manager: &OpManager) {
+        let self_addr: std::net::SocketAddr = "127.0.0.1:12000".parse().unwrap();
+        op_manager.ring.connection_manager.set_own_addr(self_addr);
+        assert!(
+            op_manager
+                .ring
+                .connection_manager
+                .own_location()
+                .location()
+                .is_some(),
+            "own location must be resolvable so reconcile snapshots are not distance-blind"
+        );
+        let peer_kp = crate::transport::TransportKeypair::new();
+        let peer_addr: std::net::SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.9),
+            peer_addr,
+            peer_kp.public().clone(),
+            false,
+        ));
+        assert!(op_manager.ring.open_connections() > 0);
+    }
+
+    fn reroot_contract_key(seed: u8) -> ContractKey {
+        ContractKey::from_id_and_code(
+            ContractInstanceId::new([seed; 32]),
+            freenet_stdlib::prelude::CodeHash::new([seed.wrapping_add(1); 32]),
+        )
+    }
+
+    /// Register `hub` as co-hosting every `contracts` instance, returning the set
+    /// the disconnect handler would resolve (`contracts_for_peer`).
+    fn register_hub_cohosting(
+        op_manager: &OpManager,
+        hub: &crate::transport::TransportPublicKey,
+        contracts: &[ContractInstanceId],
+    ) -> HashSet<ContractInstanceId> {
+        op_manager.neighbor_hosting.handle_message(
+            hub,
+            crate::message::NeighborHostingMessage::HostingAnnounce {
+                added: contracts.to_vec(),
+                removed: vec![],
+                is_response: false,
+            },
+        );
+        op_manager.neighbor_hosting.contracts_for_peer(hub)
+    }
+
+    /// THE re-root-storm falsifier (#4642 piece F, the load-bearing test). Drop a
+    /// hub that co-hosted MANY of this peer's in-use contracts and assert the
+    /// prompt re-root batch is bounded by `MAX_PROMPT_REROOTS_PER_DROP` — NOT
+    /// O(contracts) simultaneous re-subscribes (the #3763 hollow-relay storm). The
+    /// remaining affected contracts are left to the ordinary renewal loop at its
+    /// own rate cap. Uses `select_prompt_reroots` (the non-spawning selection half)
+    /// so the bound is deterministic, no task scheduling involved.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_drop_prompt_reroot_is_storm_bounded() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("reroot-storm").await;
+        seed_location_and_one_connection(&op_manager);
+
+        // M >> cap in-use contracts, ALL co-hosted by ONE hub peer. Kept within the
+        // per-drop SAMPLE cap so the scan returns them all and it is the per-drop
+        // re-root cap (not the scan cap) that does the bounding this test measures.
+        const _: () =
+            assert!(MAX_PROMPT_REROOTS_PER_DROP * 3 + 1 <= CONNECTION_DROP_SHADOW_SAMPLE_CAP);
+        let m = MAX_PROMPT_REROOTS_PER_DROP * 3 + 1;
+        let mut instance_ids = Vec::new();
+        for i in 0..m {
+            let key = reroot_contract_key(i as u8);
+            let iid = *key.id();
+            op_manager.ring.subscribe(key); // active lease → is_subscribed
+            op_manager
+                .ring
+                .add_client_subscription(&iid, crate::client_events::ClientId::FIRST); // local client → in-use
+            instance_ids.push(iid);
+        }
+        let hub = crate::transport::TransportKeypair::new().public().clone();
+        let dropped = register_hub_cohosting(&op_manager, &hub, &instance_ids);
+        assert_eq!(dropped.len(), m, "hub must co-host all {m} contracts");
+
+        // Simulate the disconnect bookkeeping, then run the storm-safe selection.
+        op_manager.neighbor_hosting.on_peer_disconnected(&hub);
+        let selected = op_manager.select_prompt_reroots(&dropped);
+
+        // THE STORM BOUND: exactly the per-drop cap, independent of m.
+        assert_eq!(
+            selected.len(),
+            MAX_PROMPT_REROOTS_PER_DROP,
+            "a hub drop affecting {m} in-use contracts must yield exactly the per-drop \
+             cap ({MAX_PROMPT_REROOTS_PER_DROP}) prompt re-roots, not {m} — the re-root \
+             storm bound"
+        );
+        // Every selected key is one of ours AND a genuine ReRootSearch candidate.
+        for key in &selected {
+            assert!(
+                instance_ids.contains(key.id()),
+                "selected must be one of ours"
+            );
+            assert!(
+                op_manager.reconcile_wants_reroot(key),
+                "selected must be a real re-root candidate"
+            );
+        }
+    }
+
+    /// Interest-gate falsifier (#4642 piece F): a DEMANDLESS copy co-hosted by the
+    /// dropped hub is NOT re-rooted (re-rooting a demandless copy on a drop is the
+    /// storm), while an IN-USE contract IS. This is the anti-storm property the
+    /// whole flip hinges on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_drop_prompt_reroot_is_interest_gated() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("reroot-interest-gate").await;
+        seed_location_and_one_connection(&op_manager);
+
+        // In-use: a local client subscription ⇒ contract_in_use ⇒ ReRootSearch.
+        let in_use = reroot_contract_key(1);
+        op_manager.ring.subscribe(in_use);
+        op_manager
+            .ring
+            .add_client_subscription(in_use.id(), crate::client_events::ClientId::FIRST);
+
+        // Demandless: an active lease but NO local client / no downstream / no
+        // recent access ⇒ NOT contract_in_use ⇒ reconcile emits a teardown, never
+        // ReRootSearch.
+        let idle = reroot_contract_key(2);
+        op_manager.ring.subscribe(idle);
+
+        let hub = crate::transport::TransportKeypair::new().public().clone();
+        let dropped = register_hub_cohosting(&op_manager, &hub, &[*in_use.id(), *idle.id()]);
+        op_manager.neighbor_hosting.on_peer_disconnected(&hub);
+
+        let selected = op_manager.select_prompt_reroots(&dropped);
+        assert!(
+            selected.contains(&in_use),
+            "the in-use contract must be re-rooted after its upstream dropped"
+        );
+        assert!(
+            !selected.contains(&idle),
+            "the demandless contract must NOT be re-rooted (anti-storm interest gate)"
+        );
+        assert!(op_manager.reconcile_wants_reroot(&in_use));
+        assert!(!op_manager.reconcile_wants_reroot(&idle));
+    }
+
+    /// Make-before-break falsifier (#4642 piece F, storm-safety guard 3): issuing a
+    /// prompt re-root does NOT tear down the existing subscription first — the fresh
+    /// SUBSCRIBE is sent while the old lease is still held (the old upstream
+    /// registration lapses on its own; the peer keeps serving its copy meanwhile,
+    /// invariant 1 serve-DURING). Also confirms the per-contract pending slot is
+    /// claimed (dedup) so a concurrent renewal cannot double-fire the same contract.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_drop_prompt_reroot_is_make_before_break() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("reroot-mbb").await;
+        seed_location_and_one_connection(&op_manager);
+
+        let key = reroot_contract_key(3);
+        op_manager.ring.subscribe(key);
+        op_manager
+            .ring
+            .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+        assert!(
+            op_manager.ring.is_subscribed(&key),
+            "precondition: subscribed"
+        );
+
+        let hub = crate::transport::TransportKeypair::new().public().clone();
+        let dropped = register_hub_cohosting(&op_manager, &hub, &[*key.id()]);
+        op_manager.neighbor_hosting.on_peer_disconnected(&hub);
+
+        let shutdown = op_manager.ring.shutdown_token();
+        let op_arc = op_manager.clone();
+        op_manager.spawn_prompt_reroots(&dropped, &op_arc, &shutdown);
+
+        // Make-before-break: the lease is STILL held immediately after issuing the
+        // prompt re-root (the spawned subscribe is still in its jitter window and,
+        // regardless, never tears the old lease down first).
+        assert!(
+            op_manager.ring.is_subscribed(&key),
+            "the existing lease must NOT be torn down by the prompt re-root \
+             (make-before-break)"
+        );
+        // The per-contract slot was claimed → a duplicate concurrent re-root/renewal
+        // is blocked (dedup, storm-safety).
+        assert!(
+            !op_manager.ring.can_request_subscription(&key),
+            "the prompt re-root must have claimed the pending slot (per-contract dedup)"
         );
     }
 

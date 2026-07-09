@@ -215,6 +215,16 @@ pub struct RenewalMetrics {
     /// regression guard for the cap (#4601); if the cap were removed, a node
     /// with N > 10 simultaneously-eligible contracts would record N here.
     pub max_cycle_batch: u64,
+    /// Largest number of PROMPT re-root subscribes this node spawned in response
+    /// to ANY single connection-drop event (#4642 piece F). This is the
+    /// deterministic measurement of the re-root storm cap: `spawn_prompt_reroots`
+    /// caps its spawns at `MAX_PROMPT_REROOTS_PER_DROP`, so however many contracts
+    /// routed through the dropped peer, this value can never exceed that cap. The
+    /// re-root-storm falsifier asserts `max_reroot_batch <= MAX_PROMPT_REROOTS_PER_DROP`
+    /// per node; without the cap, dropping a hub that co-hosted N of a peer's
+    /// in-use contracts would record N here (the thundering-herd the #3763
+    /// hollow-relay firefight fought).
+    pub max_reroot_batch: u64,
 }
 
 static RENEWAL_METRICS_REGISTRY: LazyLock<DashMap<(String, SocketAddr), RenewalMetrics>> =
@@ -257,6 +267,21 @@ pub fn record_renewal_cycle_batch(peer_addr: SocketAddr, batch_size: u64) {
     }
 }
 
+/// Record the number of PROMPT re-root subscribes spawned in response to ONE
+/// connection-drop event (#4642 piece F), keeping the per-node running maximum.
+/// No-op outside a simulation context (no current network name). Used by the
+/// re-root-storm falsifier to assert the per-drop re-root cap holds per node.
+pub fn record_reroot_batch(peer_addr: SocketAddr, batch_size: u64) {
+    if let Some(network_name) = get_current_network_name() {
+        let mut entry = RENEWAL_METRICS_REGISTRY
+            .entry((network_name, peer_addr))
+            .or_default();
+        if batch_size > entry.max_reroot_batch {
+            entry.max_reroot_batch = batch_size;
+        }
+    }
+}
+
 /// Get the renewal metrics for a specific peer in a network.
 pub fn get_renewal_metrics(network_name: &str, peer_addr: &SocketAddr) -> Option<RenewalMetrics> {
     RENEWAL_METRICS_REGISTRY
@@ -290,6 +315,7 @@ pub fn aggregate_renewal_metrics(network_name: &str) -> RenewalMetrics {
             // count), so the aggregate stays meaningful as "worst single-cycle
             // batch any node reached".
             acc.max_cycle_batch = acc.max_cycle_batch.max(entry.value().max_cycle_batch);
+            acc.max_reroot_batch = acc.max_reroot_batch.max(entry.value().max_reroot_batch);
             acc
         })
 }

@@ -268,10 +268,13 @@ pub enum ReconcileShadowSite {
     /// strict-farther gate DISAGREED with the legacy `should_unsubscribe_upstream`
     /// predicate at THIS site (~0.00% in v0.2.93 shadow), not a shadow divergence.
     InboundUnsubscribe,
-    /// A ring connection dropped (`OpManager::on_ring_connection_lost`): for a
-    /// contract that peer co-hosted, would the controller re-root (upstream
-    /// lost, demand intact)? Production does nothing today. Focused on
-    /// `ReRootSearch`.
+    /// A ring connection dropped (`OpManager::on_ring_connection_lost`): DRIVES a
+    /// storm-safe PROMPT re-root via `reconcile_wants_reroot` /
+    /// `spawn_prompt_reroots` (#4642 piece F flip). The counter is retained but
+    /// repurposed like `Collapse`/`InboundUnsubscribe`: every drop-affected in-use
+    /// candidate evaluated bumps the denominator and a driven prompt re-root sets
+    /// `reroot_search`, so this reads as "of N candidates, K drove a prompt
+    /// re-root", not a shadow divergence. Focused on `ReRootSearch`.
     ConnectionDrop,
     /// A peer finished host formation and announced hosting
     /// (`finalize_originator_subscribe`, GET `cache_contract_locally`): does the
