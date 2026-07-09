@@ -69,12 +69,13 @@
 //! contract itself, so the only way it can hold the contract locally is to
 //! fetch it. It cannot rely on PUT replication: the originator PUT on
 //! `host-peer` finalizes at `host-peer` (already at the contract location) and
-//! replicates exactly **one hop** toward the contract neighbourhood
-//! (`relay_put_replicate_forward`, #4509), which lands on the *gateway* (closer
-//! to the contract than `nat-peer`) — not on `nat-peer`. So a bare SUBSCRIBE on
-//! `nat-peer` raced contract presence that, for the farthest peer, often never
-//! arrives at all; that is the flake tracked in #4524 (a "contract not cached
-//! locally" rejection ~7-9s in).
+//! only leaves copies on the hops along its route toward the contract
+//! neighbourhood — none of which is `nat-peer` (half a ring away, off that
+//! route). (The PUT no longer even replicates one hop PAST the terminus: R3
+//! piece E retired `relay_put_replicate_forward`, #4509.) So a bare SUBSCRIBE
+//! on `nat-peer` raced contract presence that, for the farthest peer, often
+//! never arrives at all; that is the flake tracked in #4524 (a "contract not
+//! cached locally" rejection ~7-9s in).
 //!
 //! The deterministic fix is to use the supported non-host path: `nat-peer`
 //! issues `GET` with `subscribe=true`. The GET routes *toward* the contract

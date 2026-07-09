@@ -6362,6 +6362,87 @@ fn verify_contract_propagation(
     peer_states
 }
 
+/// Ground-truth STATE-convergence assertion for the demand-driven hosting
+/// convergence gate (#4642 R3 piece E — retiring `relay_put_replicate_forward`).
+///
+/// Reads each node's ACTUAL final stored state for `key` directly from its
+/// `MockStateStorage` (NOT log-scraped) and asserts:
+///   1. at least `min_holders` non-excluded nodes hold the contract (presence),
+///   2. every holder holds byte-identical state (`unique hashes == 1`), and
+///   3. that single converged hash equals `expected_hash`.
+///
+/// This is strictly stronger than a presence / ≥N-peers check, which passes
+/// vacuously for the #4509 failure class two different ways:
+///   * a v20-vs-v30 STATE SPLIT — holders "present" on ≥4 peers but at
+///     divergent versions (caught by check 2), and
+///   * convergence at a STALE value — every holder agreeing on the initial
+///     PUT state because no UPDATE propagated (all agree, but on the wrong
+///     hash; caught by check 3).
+///
+/// `exclude` drops nodes that are intentionally partitioned/crashed and hence
+/// legitimately frozen at a pre-crash state (their stale copy must not count
+/// against convergence). Returns the surviving holder→hash map for logging.
+fn assert_state_convergence(
+    result: &freenet::dev_tool::ControlledSimulationResult,
+    key: &freenet_stdlib::prelude::ContractKey,
+    min_holders: usize,
+    expected_hash: &str,
+    exclude: &[freenet::dev_tool::NodeLabel],
+) -> BTreeMap<freenet::dev_tool::NodeLabel, String> {
+    let holders: BTreeMap<freenet::dev_tool::NodeLabel, String> = result
+        .node_storages
+        .iter()
+        .filter_map(|(label, storage)| {
+            if exclude.contains(label) {
+                return None;
+            }
+            storage
+                .get_stored_state(key)
+                .map(|ws| (label.clone(), freenet::tracing::state_hash_full(&ws)))
+        })
+        .collect();
+
+    let unique: std::collections::HashSet<&String> = holders.values().collect();
+    tracing::info!(
+        "state-convergence check for {:?}: {} holder(s) (need >= {}), {} unique hash(es), \
+         expected {}: {:?}",
+        key,
+        holders.len(),
+        min_holders,
+        unique.len(),
+        expected_hash,
+        holders,
+    );
+
+    assert!(
+        holders.len() >= min_holders,
+        "contract {:?} held by only {} node(s), expected >= {}. Holders: {:?}",
+        key,
+        holders.len(),
+        min_holders,
+        holders,
+    );
+    assert_eq!(
+        unique.len(),
+        1,
+        "contract {:?} STATE SPLIT: {} distinct final-state hashes across {} holders \
+         (the #4509 divergence class a presence check misses). Holders: {:?}",
+        key,
+        unique.len(),
+        holders.len(),
+        holders,
+    );
+    let converged = holders.values().next().expect("holders is non-empty");
+    assert_eq!(
+        converged, expected_hash,
+        "contract {:?} converged at {} but expected the final-update hash {} — all holders \
+         AGREE but on a STALE value, i.e. the UPDATE never propagated (vacuous convergence)",
+        key, converged, expected_hash,
+    );
+
+    holders
+}
+
 /// Six-peer multi-contract lifecycle test — direct replacement for River's
 /// six-peer regression test.
 ///
@@ -6471,14 +6552,228 @@ fn test_six_peer_contract_lifecycle() {
         result.turmoil_result.err()
     );
 
-    // Verify both contracts propagated to at least 4 of 6 peers
+    // Verify both contracts propagated to at least 4 of 6 peers (log-scraped
+    // presence + agreement).
     let states_a = verify_contract_propagation(&rt, &logs_handle, contract_a_key, 4);
     let states_b = verify_contract_propagation(&rt, &logs_handle, contract_b_key, 4);
 
+    // STRENGTHENED convergence gate (#4642 R3 piece E, retiring
+    // `relay_put_replicate_forward`): assert STATE convergence from
+    // ground-truth final storage — every holder ends at the SAME hash AND that
+    // hash is the final-update (v50) value. This is the load-bearing assertion
+    // for the removal: the #4509 failure was a v20-vs-v30 state split that a
+    // ≥4/6 presence check passes vacuously. The last write in this scenario is
+    // node 2's v50 update (versions 10/20/30 from gw0, then 40/50 from node 2),
+    // and the CRDT LWW-by-version merge (data is version-independent) must
+    // converge every holder to create_crdt_state(50, seed).
+    let expected_a = freenet::tracing::state_hash_full(
+        &freenet_stdlib::prelude::WrappedState::new(SimOperation::create_crdt_state(50, 0xA1u8)),
+    );
+    let expected_b = freenet::tracing::state_hash_full(
+        &freenet_stdlib::prelude::WrappedState::new(SimOperation::create_crdt_state(50, 0xB2u8)),
+    );
+    let converged_a = assert_state_convergence(&result, &contract_a_key, 4, &expected_a, &[]);
+    let converged_b = assert_state_convergence(&result, &contract_b_key, 4, &expected_b, &[]);
+
     tracing::info!(
-        "test_six_peer_contract_lifecycle PASSED: contract_a on {} peers, contract_b on {} peers",
+        "test_six_peer_contract_lifecycle PASSED: contract_a converged on {} holders at v50, \
+         contract_b on {} holders at v50 (log-scraped presence: a={}, b={})",
+        converged_a.len(),
+        converged_b.len(),
         states_a.len(),
-        states_b.len()
+        states_b.len(),
+    );
+}
+
+/// No-subscriber convergence variant for retiring `relay_put_replicate_forward`
+/// (#4642 R3 piece E). A contract is PUT withOUT subscribe and NEVER
+/// subscribed, then UPDATEd once. Each hop the PUT routed through left a
+/// demandless every-hop copy (the every-hop store, live since v0.2.93); those
+/// copies are advertised co-hosts, so live fan-out (no interest check) must
+/// carry the UPDATE to all of them. Retiring the past-terminus replication
+/// forward only drops the copy ONE hop PAST the routing terminus — which has
+/// no demand and correctly should not host — so every ON-path copy must still
+/// converge on the updated state.
+///
+/// The teeth are in `assert_state_convergence`: no holder may be stranded at
+/// the initial PUT state (that is a split — check 2), and the converged value
+/// must be the UPDATE (v50), not the PUT (v1) — check 3. `min_holders = 1` is
+/// deliberately weak on presence (a zero-subscriber copy is a legitimate
+/// eviction candidate, so the surviving holder count is not pinned); the
+/// discriminating assertion is that whatever copies survive are FRESH.
+#[test_log::test]
+fn test_put_no_subscriber_update_convergence() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4642_E5B0_0001;
+    const NETWORK_NAME: &str = "piece-e-no-subscriber";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async { SimNetwork::new(NETWORK_NAME, 2, 4, 10, 5, 15, 3, SEED).await });
+
+    let seed_byte = 0xC3u8;
+    let contract = SimOperation::create_test_contract(seed_byte);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let operations = vec![
+        // Gateway 0 PUTs withOUT subscribe — zero client demand network-wide.
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_crdt_state(1, seed_byte),
+                subscribe: false,
+            },
+        ),
+        // Gateway 0 UPDATEs to v50. With no subscribers, the only way the
+        // forward-path demandless copies can learn v50 is live fan-out to
+        // advertised co-hosts.
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(50, seed_byte),
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "no-subscriber convergence sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let expected = freenet::tracing::state_hash_full(&freenet_stdlib::prelude::WrappedState::new(
+        SimOperation::create_crdt_state(50, seed_byte),
+    ));
+    // Every holder that exists must have received the UPDATE via live fan-out —
+    // none stranded at the initial PUT state, and the converged value is v50.
+    let holders = assert_state_convergence(&result, &contract_key, 1, &expected, &[]);
+    tracing::info!(
+        "test_put_no_subscriber_update_convergence PASSED: {} demandless holder(s) all at v50 \
+         (no on-path copy stranded at the initial PUT state)",
+        holders.len(),
+    );
+}
+
+/// Churn convergence variant for retiring `relay_put_replicate_forward`
+/// (#4642 R3 piece E). Same subscribed lifecycle as the six-peer test, but a
+/// mid-chain subscriber is CRASHED partway through the UPDATE sequence. The
+/// surviving subscribed holders must still converge on the final state — i.e.
+/// the demand-driven update mesh (subscribe-chain + live fan-out +
+/// anti-entropy) keeps the network convergent across churn WITHOUT the retired
+/// past-terminus PUT replication.
+///
+/// NOTE: this asserts convergence among SURVIVORS. It does not require the
+/// crashed node's chain to be re-rooted onto a new upstream — the prompt
+/// event-driven re-subscribe that would do that is a separate change not on
+/// `main` (see `test_scripted_node_crash_mid_run`). The crashed node's own
+/// (frozen, pre-crash) copy is excluded from the convergence check.
+#[test_log::test]
+fn test_put_replicate_forward_removal_churn_convergence() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4642_E0C0_0001;
+    const NETWORK_NAME: &str = "piece-e-churn";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async { SimNetwork::new(NETWORK_NAME, 2, 4, 10, 5, 15, 3, SEED).await });
+
+    let seed_byte = 0xD4u8;
+    let contract = SimOperation::create_test_contract(seed_byte);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    // Crash a mid-chain subscriber (node 3) partway through the updates.
+    let crashed = NodeLabel::node(NETWORK_NAME, 3);
+
+    let mut operations = vec![
+        // Gateway 0 PUTs with subscribe=true.
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_crdt_state(1, seed_byte),
+                subscribe: true,
+            },
+        ),
+    ];
+    // gateway 1 + nodes 2..=5 subscribe.
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 1),
+        SimOperation::Subscribe { contract_id },
+    ));
+    for i in 2..=5 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    // Two early updates every subscriber should get before the crash.
+    for v in [10u64, 20] {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(v, seed_byte),
+            },
+        ));
+    }
+    // Crash node 3 mid-lifecycle.
+    operations.push(ScheduledOperation::new(
+        crashed.clone(),
+        SimOperation::CrashNode,
+    ));
+    // Later updates (from node 2) the SURVIVORS must still converge on
+    // (final = v50), driven through the mesh without the crashed relay.
+    for v in [30u64, 40, 50] {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(v, seed_byte),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "churn convergence sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let expected = freenet::tracing::state_hash_full(&freenet_stdlib::prelude::WrappedState::new(
+        SimOperation::create_crdt_state(50, seed_byte),
+    ));
+    // Survivors (all holders except the crashed node) must converge at v50.
+    let holders =
+        assert_state_convergence(&result, &contract_key, 3, &expected, &[crashed.clone()]);
+    tracing::info!(
+        "test_put_replicate_forward_removal_churn_convergence PASSED: {} surviving holders \
+         converged at v50 after mid-run crash of {:?}",
+        holders.len(),
+        crashed,
     );
 }
 
