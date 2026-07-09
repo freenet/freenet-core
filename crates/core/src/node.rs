@@ -348,7 +348,7 @@ pub struct NodeConfig {
     /// by `ConnectionManager::supports_summary_first_put`, the send gate the
     /// originator's PUT driver checks before probing a target.
     ///
-    /// In production this is `None` → the real `(0, 2, 94)` floor (untouched).
+    /// In production this is `None` → the real `(0, 2, 95)` floor (untouched).
     ///
     /// In simulations every `SimNetwork` defaults this to an unreachable
     /// floor (`SimNetwork::SIM_MIGRATION_DISABLED_FLOOR`), mirroring

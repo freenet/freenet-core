@@ -2053,19 +2053,24 @@ mod tests {
         cm.record_remote_version(pre_floor_addr, (0, 2, 80));
         assert!(!cm.supports_summary_first_put(pre_floor_addr));
 
-        // The exact staggered-rollout boundary (#4642 step 3-bis): a 0.2.93
-        // peer carries the probe wire variants INERT (it can decode a probe
-        // but has no handler to process it), so a 0.2.94 emitter must fall
-        // back to a full-state PUT and NEVER send it a summary probe. The
-        // floor being strictly greater than 0.2.93 is what enforces this.
-        let inert_variant_peer = make_addr(9005);
-        cm.record_remote_version(inert_variant_peer, (0, 2, 93));
+        // The exact staggered-rollout boundary (#4642 step 3-bis): the probe
+        // wire variants (PutMsg tags 6/7/8) first ship in 0.2.95 (this PR).
+        // 0.2.94 is the HIGHEST already-released version and carries NONE of
+        // them, so a 0.2.94 peer cannot even decode a probe — the decode
+        // failure would drop the connection. A summary-first-capable emitter
+        // must therefore fall back to a full-state PUT and NEVER send it a
+        // probe. The floor being strictly greater than 0.2.94 enforces this.
+        let pre_variant_peer = make_addr(9005);
+        cm.record_remote_version(pre_variant_peer, (0, 2, 94));
         assert!(
-            !cm.supports_summary_first_put(inert_variant_peer),
-            "a 0.2.93 peer decodes but cannot process a probe; emitter must \
-             fall back to full-state PUT"
+            !cm.supports_summary_first_put(pre_variant_peer),
+            "a 0.2.94 peer has no probe variants; a probe would fail to decode \
+             and drop the connection, so the emitter must fall back to a \
+             full-state PUT"
         );
 
+        // A peer at the floor (0.2.95, the first release carrying the probe
+        // variants + handler) is accepted.
         let at_floor_addr = make_addr(9004);
         cm.record_remote_version(at_floor_addr, crate::node::SUMMARY_FIRST_PUT_MIN_VERSION);
         assert!(cm.supports_summary_first_put(at_floor_addr));
