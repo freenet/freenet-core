@@ -363,9 +363,9 @@ pub enum AccessType {
     Subscribe,
 }
 
-/// Coarse memory-pressure state handed to the over-budget eviction sweep — the
-/// eviction half of invariant 3 ("admission and eviction are ONE demand-vs-
-/// capacity decision"). Kept minimal because the eviction sweep only runs once
+/// Coarse memory-pressure state handed to the over-budget eviction sweep, which
+/// implements invariant 3's ONE demand-ordered eviction decision. Kept minimal
+/// because the eviction sweep only runs once
 /// the byte budget is already exceeded, so it only needs to distinguish "at
 /// capacity" from "genuine RAM overflow".
 ///
@@ -764,13 +764,6 @@ pub struct HostingCache<T: TimeSource> {
 /// subscriber counts via keyward routing gravity, and byte-only / distance-based
 /// eviction are the anti-patterns the hosting-invariants rule exists to keep out
 /// (see `.claude/rules/hosting-invariants.md`).
-///
-/// The inert admission core (#4717, not wired to production) reuses this ordering
-/// with `local_subscription_count` held at 0 — its model tracks only a single
-/// combined `subscriber_count`, and `(0, n, seq, key)` ordering reduces exactly
-/// to ordering by that combined count. That shim keeps ONE canonical ordering
-/// until admission is reconciled with the split model (or removed per the
-/// demand-driven-hosting model, which has no separate admission decision).
 pub(crate) fn victim_order(
     a: (usize, usize, u64, &ContractKey),
     b: (usize, usize, u64, &ContractKey),
