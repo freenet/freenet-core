@@ -235,6 +235,17 @@ pub enum SimOperation {
     /// point (e.g. to observe re-routing / re-subscription). Handled specially
     /// by `run_controlled_simulation` (it is not a client request).
     CrashNode,
+    /// Recover a previously [`CrashNode`](Self::CrashNode)-crashed node mid-run,
+    /// un-blocking its inbound/outbound messages via the per-network fault
+    /// injector, in-order with the surrounding events.
+    ///
+    /// The inverse of [`CrashNode`](Self::CrashNode): the node was never torn
+    /// down (message-blocking crash), so recovering simply lets its traffic flow
+    /// again. Use it to reconnect a node after it has deliberately missed some
+    /// traffic (e.g. an update fan-out), so a test can observe it re-converge via
+    /// anti-entropy. Handled specially by `run_controlled_simulation` (it is not
+    /// a client request).
+    RecoverNode,
 }
 
 impl SimOperation {
@@ -363,6 +374,12 @@ impl SimOperation {
             SimOperation::CrashNode => {
                 panic!(
                     "CrashNode is not a client request — it must be handled \
+                     by run_controlled_simulation during event dispatch"
+                )
+            }
+            SimOperation::RecoverNode => {
+                panic!(
+                    "RecoverNode is not a client request — it must be handled \
                      by run_controlled_simulation during event dispatch"
                 )
             }
@@ -4237,7 +4254,8 @@ impl SimNetwork {
                 // `special_ops` at numbering time rather than to a node's
                 // client-request generator.
                 | SimOperation::AdvanceHostingClock { .. }
-                | SimOperation::CrashNode => event_ops.push(scheduled_op),
+                | SimOperation::CrashNode
+                | SimOperation::RecoverNode => event_ops.push(scheduled_op),
             }
         }
 
@@ -4275,6 +4293,7 @@ impl SimNetwork {
         enum SpecialDispatch {
             AdvanceHostingClock(Duration),
             CrashNode(SocketAddr),
+            RecoverNode(SocketAddr),
         }
 
         // Build a map of label -> list of (event_id, operation)
@@ -4304,6 +4323,18 @@ impl SimNetwork {
                             )
                         });
                     special_ops.insert(event_id, SpecialDispatch::CrashNode(addr));
+                }
+                SimOperation::RecoverNode => {
+                    let addr = *self
+                        .node_addresses
+                        .get(&scheduled_op.node)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "RecoverNode: node {:?} has no known address",
+                                scheduled_op.node
+                            )
+                        });
+                    special_ops.insert(event_id, SpecialDispatch::RecoverNode(addr));
                 }
                 op @ (SimOperation::Put { .. }
                 | SimOperation::Get { .. }
@@ -4619,6 +4650,25 @@ impl SimNetwork {
                                     event_id,
                                     node = %node_label,
                                     "CrashNode scheduled but no fault injector registered"
+                                );
+                            }
+                        }
+                        SpecialDispatch::RecoverNode(addr) => {
+                            if let Some(injector) = crate::node::network_bridge::get_fault_injector(
+                                &network_name_for_client,
+                            ) {
+                                injector.lock().unwrap().config.recover_node(addr);
+                                tracing::info!(
+                                    event_id,
+                                    node = %node_label,
+                                    ?addr,
+                                    "Recovered node via fault injector (messages flow again)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    event_id,
+                                    node = %node_label,
+                                    "RecoverNode scheduled but no fault injector registered"
                                 );
                             }
                         }
