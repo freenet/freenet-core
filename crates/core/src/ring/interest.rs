@@ -1128,6 +1128,65 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
     }
 
+    /// Get the size (in bytes) of the locally-stored state for a contract.
+    ///
+    /// Mirrors [`get_contract_summary`](Self::get_contract_summary): a bounded
+    /// (`BROADCAST_CH_TIMEOUT`) `GetQuery` against the contract handler,
+    /// returning the stored state's `size()` or `None` if it can't be read.
+    /// Used by the summary-first PUT reverse leg to feed
+    /// [`compute_delta`](Self::compute_delta)'s efficiency gate with the
+    /// holder's own state size (the holder-side mirror of the originator's
+    /// `merged_value.size()`).
+    pub async fn get_contract_state_size(
+        &self,
+        op_manager: &crate::node::OpManager,
+        key: &ContractKey,
+    ) -> Option<usize> {
+        use crate::contract::ContractHandlerEvent;
+
+        match op_manager
+            .notify_contract_handler_with_timeout(
+                ContractHandlerEvent::GetQuery {
+                    instance_id: *key.id(),
+                    return_contract_code: false,
+                },
+                BROADCAST_CH_TIMEOUT,
+            )
+            .await
+        {
+            Ok(ContractHandlerEvent::GetResponse {
+                response: Ok(store_response),
+                ..
+            }) => store_response.state.map(|state| state.size()),
+            Ok(ContractHandlerEvent::GetResponse {
+                response: Err(e), ..
+            }) => {
+                tracing::debug!(
+                    contract = %key,
+                    error = %e,
+                    "Failed to get contract state size"
+                );
+                None
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    contract = %key,
+                    response = ?other,
+                    "Unexpected response to GetQuery (state size)"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::debug!(
+                    contract = %key,
+                    error = %e,
+                    "Error getting contract state size"
+                );
+                None
+            }
+        }
+    }
+
     /// Compute a state delta for a peer given their cached summary.
     ///
     /// Uses the contract handler to compute the delta via the contract's

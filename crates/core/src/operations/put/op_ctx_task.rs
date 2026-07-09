@@ -712,13 +712,14 @@ async fn try_summary_first_put(
     };
 
     #[allow(clippy::wildcard_enum_match_arm)]
-    let (holder_found, probe_hop_count, holder_summary) = match reply {
+    let (holder_found, probe_hop_count, holder_summary, reverse_delta) = match reply {
         NetMessage::V1(NetMessageV1::Put(PutMsg::ProbeResponse {
             holder_found,
             hop_count,
             holder_summary,
+            reverse_delta,
             ..
-        })) => (holder_found, hop_count, holder_summary),
+        })) => (holder_found, hop_count, holder_summary, reverse_delta),
         _other => {
             tracing::debug!(
                 tx = %client_tx,
@@ -760,6 +761,49 @@ async fn try_summary_first_put(
         );
         return SummaryFirstOutcome::FallThrough;
     };
+
+    // Reverse leg of the bidirectional reconcile (#4642 step 3-bis): if the
+    // holder was ahead, it shipped back `reverse_delta` = what WE (the
+    // originator) are missing relative to the holder. Apply it to our own
+    // local copy via the SAME commutative UPDATE/merge path the holder uses
+    // for the forward `ProbeReconcile`, BEFORE we report client success, so
+    // the originator converges to the full merged state in this same
+    // round-trip instead of only healing later via anti-entropy. Best-effort:
+    // a merge failure does NOT un-complete the PUT — our own client value is
+    // already stored locally (step (a)), and we converge on the next
+    // read/anti-entropy instead. `Priority::ClientLocal` matches step (a)'s
+    // originator-loopback store.
+    if let Some(reverse_delta) = reverse_delta {
+        match crate::operations::update::update_contract(
+            op_manager,
+            key,
+            UpdateData::Delta(reverse_delta),
+            RelatedContracts::default(),
+            crate::contract::Priority::ClientLocal,
+        )
+        .await
+        {
+            Ok(_) => {
+                tracing::debug!(
+                    tx = %client_tx,
+                    contract = %key,
+                    phase = "summary_first_reverse_delta_merged",
+                    "PUT summary-first: applied holder's reverse delta to local \
+                     copy (originator converged in the same round-trip)"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    tx = %client_tx,
+                    contract = %key,
+                    error = %err,
+                    phase = "summary_first_reverse_delta_merge_failed",
+                    "PUT summary-first: reverse-delta merge failed (best-effort, \
+                     PUT still completes; originator converges via anti-entropy)"
+                );
+            }
+        }
+    }
 
     let our_state_size = merged_value.size();
     let delta = match op_manager
@@ -3442,6 +3486,7 @@ impl Drop for RelayProbeInflightGuard {
 /// `send_fire_and_forget` with a real target), never via
 /// `send_local_loopback` — but the check is kept for defensive symmetry
 /// with the PUT relay path.
+#[allow(clippy::too_many_arguments)]
 async fn relay_probe_send_response(
     op_manager: &OpManager,
     incoming_tx: Transaction,
@@ -3449,6 +3494,7 @@ async fn relay_probe_send_response(
     holder_found: bool,
     hop_count: usize,
     holder_summary: Option<StateSummary<'static>>,
+    reverse_delta: Option<StateDelta<'static>>,
     upstream_addr: SocketAddr,
 ) -> Result<(), OpError> {
     let msg = NetMessage::from(PutMsg::ProbeResponse {
@@ -3457,6 +3503,7 @@ async fn relay_probe_send_response(
         holder_found,
         hop_count,
         holder_summary,
+        reverse_delta,
     });
     let mut ctx = op_manager.op_ctx(incoming_tx);
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
@@ -3469,6 +3516,87 @@ async fn relay_probe_send_response(
             .await
             .map_err(|_| OpError::NotificationError)
     }
+}
+
+/// Compute the reverse-leg delta a fresh holder ships back to a summary-first
+/// PUT originator (#4642 step 3-bis, bidirectional reconcile): the delta the
+/// ORIGINATOR is missing relative to the holder's state. This is the exact
+/// mirror of the originator's forward delta — the holder already has both
+/// inputs (the originator's summary arrived on the `ProbeRequest`, and it has
+/// its own state) — so it reuses `InterestManager::compute_delta`, and
+/// therefore the SAME `is_delta_efficient` gate the forward leg uses (a
+/// summary-size proxy for delta size: the delta is skipped when the
+/// originator's summary is ≥ ~50% of the holder's state size).
+///
+/// Returns `None` (skip the reverse leg — the originator heals via a normal
+/// GET / anti-entropy rather than receiving a bloated or absent delta) when:
+/// - the originator is already current (`compute_delta` → `Ok(None)`, empty
+///   delta),
+/// - the reverse delta would be inefficient or is uncomputable
+///   (`compute_delta` → `Err`), or
+/// - the holder's own state size can't be read (no efficiency input).
+async fn compute_probe_reverse_delta(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: &ContractKey,
+    originator_summary: &StateSummary<'static>,
+    holder_summary: &StateSummary<'static>,
+) -> Option<StateDelta<'static>> {
+    let Some(our_state_size) = op_manager
+        .interest_manager
+        .get_contract_state_size(op_manager, key)
+        .await
+    else {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            phase = "relay_probe_reverse_delta_no_state_size",
+            "PUT probe: could not read holder state size for the reverse \
+             delta; skipping reverse leg (originator heals via GET/anti-entropy)"
+        );
+        return None;
+    };
+
+    // `their_summary` = the originator's summary (what the originator has);
+    // `our_summary` = the holder's summary. `compute_delta` returns the delta
+    // that transforms the originator's state into ours — i.e. exactly what
+    // the originator is missing.
+    let computed = op_manager
+        .interest_manager
+        .compute_delta(
+            op_manager,
+            key,
+            originator_summary,
+            holder_summary,
+            our_state_size,
+        )
+        .await;
+    if let Err(ref err) = computed {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            error = %err,
+            phase = "relay_probe_reverse_delta_skipped",
+            "PUT probe: reverse delta unavailable (inefficient or compute \
+             failed); originator heals via GET/anti-entropy"
+        );
+    }
+    reverse_delta_from_compute_result(computed)
+}
+
+/// Map an [`InterestManager::compute_delta`](crate::ring::interest::InterestManager::compute_delta)
+/// result to the reverse-leg delta a holder ships in
+/// `PutMsg::ProbeResponse::reverse_delta`.
+///
+/// `Ok(Some)` ships the delta; `Ok(None)` (the originator is already current —
+/// the contract produced an empty delta) and `Err` (the delta is inefficient
+/// or uncomputable) both ship nothing (`None`), leaving the originator to
+/// heal via a normal GET / anti-entropy. Kept as a pure function so the three
+/// arms are unit-testable without a live contract handler.
+fn reverse_delta_from_compute_result(
+    computed: Result<Option<StateDelta<'static>>, String>,
+) -> Option<StateDelta<'static>> {
+    computed.unwrap_or(None)
 }
 
 /// Routes a `PutMsg::ProbeRequest` toward `key`, or answers it directly when
@@ -3508,6 +3636,20 @@ async fn drive_relay_probe(
             .await;
         return match holder_summary {
             Some(s) => {
+                // Reverse leg of the bidirectional reconcile (#4642 step
+                // 3-bis): compute the delta the ORIGINATOR is missing
+                // relative to our (the holder's) state — the mirror of the
+                // originator's forward delta. `summary` is the originator's
+                // summary carried on the ProbeRequest; `s` is our own. We
+                // ship it back in `ProbeResponse::reverse_delta` so the
+                // originator converges to the full merged state in the SAME
+                // round-trip instead of healing only later via anti-entropy.
+                // `None` (skip the reverse leg — originator heals via a
+                // normal GET / anti-entropy) when the originator is already
+                // current (empty delta) or the reverse delta would be
+                // inefficient / uncomputable; see `compute_probe_reverse_delta`.
+                let reverse_delta =
+                    compute_probe_reverse_delta(op_manager, incoming_tx, &key, &summary, &s).await;
                 relay_probe_send_response(
                     op_manager,
                     incoming_tx,
@@ -3515,6 +3657,7 @@ async fn drive_relay_probe(
                     true,
                     hop_count,
                     Some(s),
+                    reverse_delta,
                     upstream_addr,
                 )
                 .await
@@ -3541,6 +3684,7 @@ async fn drive_relay_probe(
                     key,
                     false,
                     hop_count,
+                    None,
                     None,
                     upstream_addr,
                 )
@@ -3585,6 +3729,7 @@ async fn drive_relay_probe(
                     false,
                     hop_count,
                     None,
+                    None,
                     upstream_addr,
                 )
                 .await;
@@ -3599,6 +3744,7 @@ async fn drive_relay_probe(
                         false,
                         hop_count,
                         None,
+                        None,
                         upstream_addr,
                     )
                     .await;
@@ -3612,6 +3758,7 @@ async fn drive_relay_probe(
                 key,
                 false,
                 hop_count,
+                None,
                 None,
                 upstream_addr,
             )
@@ -3649,8 +3796,13 @@ async fn drive_relay_probe(
             holder_found,
             hop_count: downstream_hop_count,
             holder_summary,
+            reverse_delta,
             ..
         })) => {
+            // Pass the reverse leg straight through: only the terminal
+            // holder can compute the delta the originator is missing, so an
+            // intermediate routing hop just relays it upstream unchanged
+            // (same as `holder_summary`).
             relay_probe_send_response(
                 op_manager,
                 incoming_tx,
@@ -3658,6 +3810,7 @@ async fn drive_relay_probe(
                 holder_found,
                 downstream_hop_count,
                 holder_summary,
+                reverse_delta,
                 upstream_addr,
             )
             .await
@@ -3841,6 +3994,51 @@ mod tests {
 
     fn dummy_tx() -> Transaction {
         Transaction::new::<PutMsg>()
+    }
+
+    /// Bidirectional summary-first reconcile (#4642 step 3-bis): the
+    /// reverse-leg mapping ships a `ProbeResponse::reverse_delta` ONLY when
+    /// the holder is genuinely ahead. All three `compute_delta` outcomes map
+    /// correctly:
+    /// - `Ok(Some)` → ship the delta (holder ahead),
+    /// - `Ok(None)` (originator already current — contract returned an empty
+    ///   delta) → ship NOTHING,
+    /// - `Err` (delta inefficient / uncomputable — SAME gate as the forward
+    ///   leg) → ship NOTHING.
+    ///
+    /// The two `None` arms are the "originator already current / heal via a
+    /// normal GET or anti-entropy" fallback: the reconcile must not emit a
+    /// phantom reverse delta when there is nothing (or nothing efficient) to
+    /// send. This is the deterministic falsifier for the "empty-reverse-delta
+    /// case sends nothing" requirement — the CRDT mock never emits an empty
+    /// delta, so the `Ok(None)` path can't be reached in the sim tests and is
+    /// pinned here instead.
+    #[test]
+    fn reverse_delta_from_compute_result_maps_all_arms() {
+        // Holder ahead: a real reverse delta is shipped back to the originator.
+        let shipped = reverse_delta_from_compute_result(Ok(Some(StateDelta::from(vec![1, 2, 3]))));
+        assert_eq!(
+            shipped.as_ref().map(|d| d.as_ref().to_vec()),
+            Some(vec![1, 2, 3]),
+            "Ok(Some) must ship the holder's reverse delta"
+        );
+
+        // Originator already current (empty delta from the contract): send nothing.
+        let already_current = reverse_delta_from_compute_result(Ok(None));
+        assert!(
+            already_current.is_none(),
+            "Ok(None) (originator already current) must send NO reverse delta"
+        );
+
+        // Delta inefficient or uncomputable: send nothing — the originator
+        // heals via a normal GET / anti-entropy instead of receiving a
+        // bloated or absent delta.
+        let inefficient =
+            reverse_delta_from_compute_result(Err("Delta not efficient for this contract".into()));
+        assert!(
+            inefficient.is_none(),
+            "Err (inefficient/uncomputable) must send NO reverse delta"
+        );
     }
 
     /// Regression for #4363: on a sparse/bootstrap topology a PUT

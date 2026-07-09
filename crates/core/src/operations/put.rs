@@ -301,6 +301,22 @@ mod messages {
         Ok(value.map(StateSummary::into_owned))
     }
 
+    /// Deserializes an `Option<StateDelta>` into its owned (`'static`)
+    /// form, mapping the `Some` arm through `StateDelta::into_owned`.
+    /// Mirrors [`deser_opt_state_summary`] (a borrowed `StateDelta<'de>` is
+    /// not `DeserializeOwned` and cannot cross the bincode boundary as a
+    /// plain field). Used by `PutMsg::ProbeResponse::reverse_delta` (the
+    /// summary-first PUT reverse leg), which is `Some` only when the holder
+    /// is ahead of the originator and the reverse delta is efficient, and
+    /// `None` otherwise.
+    fn deser_opt_state_delta<'de, D>(deser: D) -> Result<Option<StateDelta<'static>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <Option<StateDelta> as Deserialize>::deserialize(deser)?;
+        Ok(value.map(StateDelta::into_owned))
+    }
+
     /// PUT operation messages.
     ///
     /// The PUT operation stores a contract and its initial state in the network.
@@ -518,6 +534,33 @@ mod messages {
             /// layout stays refinable until first emission ships.
             #[serde(default, deserialize_with = "deser_opt_state_summary")]
             holder_summary: Option<StateSummary<'static>>,
+            /// **Reverse leg of the bidirectional reconcile (#4642, step
+            /// 3-bis).** The delta the ORIGINATOR is missing relative to the
+            /// holder's state, computed by the holder as the mirror of the
+            /// originator's forward delta: `compute_delta(their_summary =
+            /// ProbeRequest::summary (the originator's summary), our_summary
+            /// = holder's summary)`. The originator applies it to its own
+            /// local copy (same commutative UPDATE/merge path a holder uses
+            /// for the forward `ProbeReconcile`) BEFORE reporting client
+            /// success, so both sides converge to the full merged state in a
+            /// single round-trip instead of the originator healing only
+            /// later via anti-entropy.
+            ///
+            /// `Some(D_rev)` only when `holder_found == true`, the holder is
+            /// genuinely ahead, AND the reverse delta passes the SAME
+            /// efficiency gate the forward delta uses (`compute_delta` /
+            /// `is_delta_efficient`). `None` when no holder was found, when
+            /// the originator is already current (empty delta), or when the
+            /// reverse delta would be inefficient / uncomputable — in the
+            /// last two the originator falls back to healing via a normal
+            /// GET / anti-entropy rather than shipping a bloated delta.
+            /// Deserialized owned (`'static`) via the local
+            /// `deser_opt_state_delta` helper. Appended AFTER
+            /// `holder_summary` so tag 7's existing prefix (including
+            /// `holder_summary`) stays byte-for-byte identical; the variant
+            /// first ships in 0.2.95, so the field layout is still refinable.
+            #[serde(default, deserialize_with = "deser_opt_state_delta")]
+            reverse_delta: Option<StateDelta<'static>>,
         },
 
         /// **Summary-first PUT — reconcile write (#4642, step 3-bis, see
@@ -665,15 +708,18 @@ mod messages {
                     key,
                     holder_found,
                     holder_summary,
+                    reverse_delta,
                     ..
                 } => {
                     write!(
                         f,
-                        "PutProbeResponse(id: {}, key: {}, holder_found: {}, holder_summary: {})",
+                        "PutProbeResponse(id: {}, key: {}, holder_found: {}, holder_summary: {}, \
+                         reverse_delta: {})",
                         id,
                         key,
                         holder_found,
-                        holder_summary.is_some()
+                        holder_summary.is_some(),
+                        reverse_delta.is_some()
                     )
                 }
                 Self::ProbeReconcile {
@@ -885,6 +931,7 @@ mod tests {
                     holder_found: false,
                     hop_count: 0,
                     holder_summary: None,
+                    reverse_delta: None,
                 },
             ),
             (
@@ -960,20 +1007,33 @@ mod tests {
         }
     }
 
-    /// Summary-first PUT dispatch reply (INERT scaffolding, #4642): the
-    /// new-vs-existing signal (`holder_found`), `hop_count`, and the
-    /// trailing `holder_summary` round-trip through bincode for both
-    /// boolean cases, including a `Some` summary whose opaque bytes must
-    /// survive intact via the `deser_opt_state_summary` owned-deserialize
-    /// path.
+    /// Summary-first PUT dispatch reply (#4642): the new-vs-existing signal
+    /// (`holder_found`), `hop_count`, the trailing `holder_summary`, and the
+    /// bidirectional-reconcile `reverse_delta` round-trip through bincode.
+    /// Covers the `None`/`Some` cross-product for both opaque trailing fields
+    /// so the `deser_opt_state_summary` and `deser_opt_state_delta`
+    /// owned-deserialize paths are both exercised (including the case where
+    /// the holder ships a reverse delta back to a behind originator).
     #[test]
     fn put_msg_probe_response_serde_roundtrip() {
         let key = make_contract_key(4);
-        let cases: [(bool, usize, Option<Vec<u8>>); 2] = [
-            (false, 0usize, None),
-            (true, 5usize, Some(vec![0x11, 0x22, 0x33, 0x44])),
+        // (holder_found, hop_count, holder_summary bytes, reverse_delta bytes)
+        let cases: [(bool, usize, Option<Vec<u8>>, Option<Vec<u8>>); 3] = [
+            // No holder: both trailing fields absent.
+            (false, 0usize, None, None),
+            // Holder found, originator current-or-ahead: summary present, no
+            // reverse delta shipped.
+            (true, 5usize, Some(vec![0x11, 0x22, 0x33, 0x44]), None),
+            // Holder found AND ahead: summary present and a reverse delta
+            // shipped back to the behind originator.
+            (
+                true,
+                2usize,
+                Some(vec![0xAA, 0xBB]),
+                Some(vec![0x55, 0x66, 0x77, 0x88, 0x99]),
+            ),
         ];
-        for (holder_found, hop_count, summary_bytes) in cases {
+        for (holder_found, hop_count, summary_bytes, reverse_delta_bytes) in cases {
             let tx = Transaction::new::<PutMsg>();
             let msg = PutMsg::ProbeResponse {
                 id: tx,
@@ -981,6 +1041,7 @@ mod tests {
                 holder_found,
                 hop_count,
                 holder_summary: summary_bytes.clone().map(StateSummary::from),
+                reverse_delta: reverse_delta_bytes.clone().map(StateDelta::from),
             };
             let bytes = bincode::serialize(&msg).expect("serialize");
             let decoded: PutMsg = bincode::deserialize(&bytes).expect("deserialize");
@@ -991,6 +1052,7 @@ mod tests {
                     holder_found: decoded_holder,
                     hop_count: decoded_hops,
                     holder_summary: decoded_summary,
+                    reverse_delta: decoded_reverse,
                 } => {
                     assert_eq!(id, tx);
                     assert_eq!(decoded_key, key);
@@ -1008,6 +1070,20 @@ mod tests {
                         _ => panic!(
                             "holder_summary presence mismatch: decoded {decoded_summary:?} vs \
                              expected {summary_bytes:?}"
+                        ),
+                    }
+                    match (&decoded_reverse, &reverse_delta_bytes) {
+                        (Some(decoded), Some(expected)) => {
+                            assert_eq!(
+                                decoded.as_ref(),
+                                expected.as_slice(),
+                                "opaque reverse_delta bytes must survive the bincode round-trip"
+                            );
+                        }
+                        (None, None) => {}
+                        _ => panic!(
+                            "reverse_delta presence mismatch: decoded {decoded_reverse:?} vs \
+                             expected {reverse_delta_bytes:?}"
                         ),
                     }
                 }
@@ -1080,6 +1156,7 @@ mod tests {
             holder_found: true,
             hop_count: 0,
             holder_summary: None,
+            reverse_delta: None,
         };
         let reconcile = PutMsg::ProbeReconcile {
             id: tx,
