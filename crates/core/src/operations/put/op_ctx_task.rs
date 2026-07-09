@@ -1283,17 +1283,22 @@ where
                 // the UPDATE broadcast tree stays connected (#4509 convergence).
                 // See `relay_put_replicate_forward` for why both are required.
                 if let Some(next_addr) = peer.socket_addr() {
-                    relay_put_replicate_forward(
-                        op_manager,
-                        next_addr,
-                        key,
-                        contract.clone(),
-                        related_contracts.clone(),
-                        merged_value.clone(),
-                        htl,
-                        new_skip_list.clone(),
-                    )
-                    .await;
+                    // R&D gate (NOT FOR MERGE): env kill-switch so the honest
+                    // convergence gate can measure control vs. removal in one
+                    // binary. Unset env == pristine main.
+                    if !replicate_forward_disabled() {
+                        relay_put_replicate_forward(
+                            op_manager,
+                            next_addr,
+                            key,
+                            contract.clone(),
+                            related_contracts.clone(),
+                            merged_value.clone(),
+                            htl,
+                            new_skip_list.clone(),
+                        )
+                        .await;
+                    }
                 }
                 let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                 return relay_put_finalize_local(
@@ -1996,6 +2001,28 @@ async fn relay_put_store_locally(
     );
 
     Ok(merged_value)
+}
+
+/// R&D MEASUREMENT GATE (NOT FOR MERGE) — runtime kill-switch for
+/// `relay_put_replicate_forward` (#4509), used by the honest convergence gate
+/// (`simulation_integration.rs::honest_convergence_*`) to measure control vs.
+/// removal in the SAME binary with IDENTICAL scheduling.
+///
+/// When `FREENET_DISABLE_REPLICATE_FORWARD` is set in the environment, the two
+/// terminus call sites skip the past-terminus replication forward entirely.
+/// With the flag UNSET the behavior is byte-for-byte the pristine `origin/main`
+/// path (`if !false { forward }` == `forward`), so the control config is a
+/// faithful `main`. With the flag SET the forward never fires, which is
+/// behaviorally identical to deleting the hop + both call sites (the "removal"
+/// config #4749 built by editing the source).
+///
+/// Read once per process via `OnceLock`, so the config is fixed for a whole
+/// multi-seed sweep and can be swept by launching the test binary twice with
+/// different env. DELETE this and inline the call once the design decision is
+/// made.
+fn replicate_forward_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var("FREENET_DISABLE_REPLICATE_FORWARD").is_ok())
 }
 
 /// Fire-and-forget a replication-only `PutMsg::Request` to `next_addr`
@@ -2825,17 +2852,21 @@ where
     // broadcast tree stays connected (#4509). Mirrors the non-streaming guard
     // branch; see `relay_put_replicate_forward`.
     if let Some((next_addr, contract, related_contracts)) = replicate_payload {
-        relay_put_replicate_forward(
-            op_manager,
-            next_addr,
-            key,
-            contract,
-            related_contracts,
-            merged_value.clone(),
-            htl,
-            new_skip_list.clone(),
-        )
-        .await;
+        // R&D gate (NOT FOR MERGE): env kill-switch (see the non-streaming site
+        // above). Unset env == pristine main.
+        if !replicate_forward_disabled() {
+            relay_put_replicate_forward(
+                op_manager,
+                next_addr,
+                key,
+                contract,
+                related_contracts,
+                merged_value.clone(),
+                htl,
+                new_skip_list.clone(),
+            )
+            .await;
+        }
     }
 
     // ── Step 7: Await downstream reply (if piping), then bubble upstream ──

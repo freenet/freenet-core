@@ -13711,3 +13711,388 @@ fn test_piece_e_unsubscribed_stale_serve_gate() {
     // Avoid leaking the CRDT registration into other tests sharing this process.
     freenet::dev_tool::clear_crdt_contracts();
 }
+
+// =============================================================================
+// HONEST UPDATE-MESH CONVERGENCE GATE (R&D MEASUREMENT — NOT FOR MERGE)
+// (demand-driven-hosting redesign; epic freenet/freenet-core#4642, piece E;
+//  supersedes the CONFOUNDED convergence gates in PR #4749 / #4750)
+// =============================================================================
+//
+// PURPOSE
+// -------
+// Decide, rigorously, whether removing `relay_put_replicate_forward` (the single
+// past-#4363-terminus PUT replication hop, added for #4509) actually regresses
+// UPDATE convergence on current `origin/main`.
+//
+// WHY THE EXISTING GATES (#4749/#4750) WERE UNRELIABLE
+// ----------------------------------------------------
+// Their six-peer "convergence" tests had subscribers issue a BARE
+// `SimOperation::Subscribe`, which the node REJECTS unless the contract WASM is
+// already cached locally ("Rejecting SUBSCRIBE: contract WASM not cached
+// locally", `client_events.rs`). So those subscribers NEVER joined the update
+// mesh (never became `is_receiving_updates`); the test measured how far the PUT
+// physically reached, NOT whether the update mesh converges. At 6 peers the
+// signal was also scheduling-noise-dominated.
+//
+// THE HONEST GATE (this module)
+// -----------------------------
+//   1. Subscribers REALLY join the mesh: they use GET-with-subscribe
+//      (`SimOperation::Get { subscribe: true }`), which fetches+caches the WASM
+//      and state and registers the subscription (`maybe_subscribe_child` ->
+//      `run_client_subscribe` -> downstream-subscriber edge). We then VERIFY
+//      the mesh formed via `ControlledSimulationResult::is_node_receiving_updates`
+//      (an active network OR local client subscription — NOT a mere cache copy)
+//      before trusting any convergence number. A run whose mesh did not form is
+//      reported INVALID, not "not converged".
+//   2. Larger network: 2 gateways + 14 nodes = 16 peers (proven scale; cf.
+//      `test_max_downstream_limit_reached`, `test_thundering_herd_connect_storm`),
+//      so scheduling noise does not dominate.
+//   3. Ground-truth STATE convergence: read each mesh member's final
+//      `MockStateStorage` and require all mesh holders byte-identical AND equal
+//      to the final update (v50) — catches both a version SPLIT (unique>1) and a
+//      vacuous "all agree on a stale value" (at_final<holders). Higher CRDT
+//      version always wins, so the converged value is deterministic = v50.
+//   4. Multi-seed (>=15): report the convergence RATE per config, aggregated,
+//      not a single-seed pass/fail.
+//   5. Several updates from MULTIPLE sources at varied ring positions, so the
+//      multi-hop broadcast tree is actually exercised.
+//
+// CONTROL vs REMOVAL, in ONE binary
+// ---------------------------------
+// The removal is expressed as a process-wide runtime kill-switch,
+// `FREENET_DISABLE_REPLICATE_FORWARD` (read once in
+// `put/op_ctx_task.rs::replicate_forward_disabled`). UNSET == pristine `main`
+// (the forward fires). SET == the forward never fires, behaviorally identical to
+// deleting the hop + both call sites (what #4749 did by editing source). Running
+// both configs from the SAME binary with IDENTICAL scheduling removes the
+// rebuild/scheduling confounds.
+//
+// These are `#[ignore]` MEASUREMENT harnesses (like #4750), not CI gates: they
+// PRINT per-seed + aggregate `HONEST_CONVERGE` lines and assert only that every
+// sim ran. The verdict comes from diffing the printed control vs removal
+// summaries. Run with:
+//   cargo test -p freenet --features simulation_tests,testing --test \
+//     simulation_integration -- --ignored --nocapture honest_convergence
+// and with `FREENET_DISABLE_REPLICATE_FORWARD=1` for the removal config.
+
+/// Per-seed outcome of one honest-convergence run. All counts are over the
+/// INTENDED subscribers (excluding a crashed node in the churn variant).
+#[derive(Debug, Clone, Copy)]
+struct HonestConvergenceOutcome {
+    /// Intended mesh subscribers considered this run (16, or 15 with churn).
+    intended: usize,
+    /// Intended subscribers that ended `is_receiving_updates` (REAL mesh members).
+    mesh_members: usize,
+    /// Mesh members that also hold stored state for the key.
+    mesh_holders: usize,
+    /// Distinct final-state hashes across mesh holders (1 == converged shape).
+    unique_hashes: usize,
+    /// Mesh holders whose final state equals the v50 final update.
+    at_final: usize,
+    /// The controlled sim completed without a turmoil error.
+    turmoil_ok: bool,
+    /// Packets dropped by the scripted crash (>0 proves churn took effect).
+    crash_dropped: u64,
+}
+
+impl HonestConvergenceOutcome {
+    /// The mesh formed well enough for the convergence measurement to be
+    /// meaningful (>= 75% of intended subscribers actually receiving updates).
+    fn mesh_formed(&self) -> bool {
+        self.turmoil_ok && self.mesh_members * 4 >= self.intended * 3
+    }
+
+    /// The update mesh FULLY converged: mesh formed, every mesh member holds
+    /// state, all byte-identical, all equal to the v50 final update.
+    fn converged(&self) -> bool {
+        self.mesh_formed()
+            && self.mesh_members > 0
+            && self.mesh_holders == self.mesh_members
+            && self.unique_hashes == 1
+            && self.at_final == self.mesh_holders
+    }
+}
+
+/// Run one honest-convergence seed. `churn` crashes a mid-mesh node partway
+/// through the update sequence (its frozen copy is excluded from the mesh /
+/// convergence accounting). Returns the measured outcome; never panics on a
+/// convergence failure (that IS the measurement).
+fn honest_convergence_seed(seed: u64, churn: bool) -> HonestConvergenceOutcome {
+    use freenet::dev_tool::{
+        NodeLabel, ScheduledOperation, SimNetwork, SimOperation, register_crdt_contract,
+    };
+
+    // 2 gateways + 14 nodes = 16 peers. Node labels are node(N_GW..N_GW+N_NODES)
+    // (regular nodes are numbered starting at the gateway count — using node(0..)
+    // would target nonexistent labels that are silently skipped).
+    const N_GW: usize = 2;
+    const N_NODES: usize = 14;
+    const CRASH_IDX: usize = N_GW + N_NODES / 2; // node(9) — a mid-mesh subscriber
+
+    setup_deterministic_state(seed);
+    // Config tag makes the per-node on-disk config dir (`/tmp/freenet-{label}`)
+    // UNIQUE per config, so the control and removal runs of the same test/seed
+    // can execute CONCURRENTLY without racing on an identical dir path (the tag
+    // does not feed the sim RNG, so it is behavior-neutral for the measurement).
+    let cfg_tag = if std::env::var("FREENET_DISABLE_REPLICATE_FORWARD").is_ok() {
+        "rm"
+    } else {
+        "ctl"
+    };
+    let network = format!(
+        "honest-conv-{}{cfg_tag}-{seed:x}",
+        if churn { "churn-" } else { "steady-" }
+    );
+
+    let seed_byte = 0x7Eu8;
+    let contract = SimOperation::create_test_contract(seed_byte);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let gw0 = NodeLabel::gateway(&network, 0);
+    let gw1 = NodeLabel::gateway(&network, 1);
+
+    // Intended mesh: gw0 (subscribes via PUT), then gw1 + node(2..=15) via
+    // GET-with-subscribe.
+    let mut intended: Vec<NodeLabel> = vec![gw0.clone(), gw1.clone()];
+    for n in N_GW..(N_GW + N_NODES) {
+        intended.push(NodeLabel::node(&network, n));
+    }
+
+    let crashed: Option<NodeLabel> = churn.then(|| NodeLabel::node(&network, CRASH_IDX));
+
+    // Update sources at varied ring positions (none is the crashed node), so the
+    // multi-hop broadcast tree is genuinely exercised. LWW-by-version: v50 wins.
+    let src_v20 = NodeLabel::node(&network, N_GW + 2); // node(4)
+    let src_v30 = NodeLabel::node(&network, N_GW + N_NODES - 1); // node(15), far side
+    let src_v40 = NodeLabel::node(&network, N_GW + N_NODES / 3 + 1); // node(6)
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        // ring_max_htl=10, rnd_if_htl_above=5, max_connections=10, min_connections=3.
+        SimNetwork::new(&network, N_GW, N_NODES, 10, 5, 10, 3, seed).await
+    });
+
+    let mut operations = Vec::new();
+    // 1. gw0 PUTs with subscribe=true (root of the mesh, holds v1).
+    operations.push(ScheduledOperation::new(
+        gw0.clone(),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, seed_byte),
+            subscribe: true,
+        },
+    ));
+    // 2. Every other intended peer GET-with-subscribe: fetch+cache the WASM/state
+    //    AND register the subscription, genuinely joining the update mesh.
+    for label in intended.iter().skip(1) {
+        operations.push(ScheduledOperation::new(
+            label.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
+        ));
+    }
+    // 3. Early updates every subscriber should get before any crash.
+    operations.push(ScheduledOperation::new(
+        gw0.clone(),
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(10, seed_byte),
+        },
+    ));
+    operations.push(ScheduledOperation::new(
+        src_v20,
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(20, seed_byte),
+        },
+    ));
+    // 4. Crash a mid-mesh subscriber (churn variant only).
+    if let Some(ref c) = crashed {
+        operations.push(ScheduledOperation::new(c.clone(), SimOperation::CrashNode));
+    }
+    // 5. Later updates from multiple sources — survivors must still converge on
+    //    the final value (v50) through the multi-hop tree, without the crashed
+    //    relay and (in the removal config) without the past-terminus forward.
+    operations.push(ScheduledOperation::new(
+        src_v30,
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(30, seed_byte),
+        },
+    ));
+    operations.push(ScheduledOperation::new(
+        src_v40,
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(40, seed_byte),
+        },
+    ));
+    operations.push(ScheduledOperation::new(
+        gw1.clone(),
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(50, seed_byte),
+        },
+    ));
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(120),
+    );
+
+    // Accounting: consider intended subscribers minus the crashed node (its
+    // pre-crash frozen copy must not count for OR against convergence).
+    let considered: Vec<&NodeLabel> = intended
+        .iter()
+        .filter(|l| Some(*l) != crashed.as_ref())
+        .collect();
+
+    let expected = freenet::tracing::state_hash_full(&freenet_stdlib::prelude::WrappedState::new(
+        SimOperation::create_crdt_state(50, seed_byte),
+    ));
+
+    let mut mesh_members = 0usize;
+    let mut hashes: Vec<String> = Vec::new();
+    for label in &considered {
+        if result.is_node_receiving_updates(label, &contract_key) {
+            mesh_members += 1;
+            if let Some(ws) = result
+                .node_storages
+                .get(*label)
+                .and_then(|s| s.get_stored_state(&contract_key))
+            {
+                hashes.push(freenet::tracing::state_hash_full(&ws));
+            }
+        }
+    }
+    let mesh_holders = hashes.len();
+    let unique_hashes = hashes.iter().collect::<HashSet<&String>>().len();
+    let at_final = hashes.iter().filter(|h| **h == expected).count();
+
+    let outcome = HonestConvergenceOutcome {
+        intended: considered.len(),
+        mesh_members,
+        mesh_holders,
+        unique_hashes,
+        at_final,
+        turmoil_ok: result.turmoil_result.is_ok(),
+        crash_dropped: result.crash_packets_dropped(),
+    };
+
+    freenet::dev_tool::clear_crdt_contracts();
+    outcome
+}
+
+/// The 15 fixed seeds for the honest-convergence sweep (diverse topologies).
+const HONEST_SEEDS: [u64; 15] = [
+    0x4642_E5B0_0001,
+    0x4642_E5B0_0002,
+    0x4642_E5B0_0003,
+    0x4642_E5B0_0005,
+    0x4642_E5B0_0007,
+    0x4642_E5B0_000B,
+    0x4642_E5B0_000D,
+    0x4642_E5B0_0011,
+    0x4642_E5B0_0013,
+    0x4642_E5B0_0017,
+    0x4642_E5B0_001D,
+    0x4642_E5B0_001F,
+    0x4642_E5B0_0025,
+    0x4642_E5B0_0029,
+    0x4642_E5B0_002B,
+];
+
+/// Aggregate a multi-seed honest-convergence sweep and PRINT the result. `label`
+/// names the config (e.g. "steady/control"). Returns nothing — this is a
+/// measurement, not a gate.
+fn run_honest_convergence_sweep(label: &str, churn: bool) {
+    let seeds: usize = std::env::var("FREENET_HONEST_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(HONEST_SEEDS.len())
+        .min(HONEST_SEEDS.len());
+    let disabled = std::env::var("FREENET_DISABLE_REPLICATE_FORWARD").is_ok();
+    let config = if disabled { "REMOVAL" } else { "control" };
+
+    tracing::info!(target: "honest_converge",
+        "===== HONEST CONVERGENCE SWEEP [{label}] config={config} (replicate_forward {}) \
+         seeds={seeds} net=2gw+14node =====",
+        if disabled { "DISABLED" } else { "present" });
+
+    let mut mesh_formed_ct = 0usize;
+    let mut converged_ct = 0usize;
+    let mut total_crash = 0u64;
+    let mut mesh_sizes: Vec<usize> = Vec::new();
+
+    for &seed in HONEST_SEEDS.iter().take(seeds) {
+        let o = honest_convergence_seed(seed, churn);
+        assert!(
+            o.turmoil_ok,
+            "seed={seed:x} [{label}]: controlled sim did not complete"
+        );
+        if o.mesh_formed() {
+            mesh_formed_ct += 1;
+        }
+        if o.converged() {
+            converged_ct += 1;
+        }
+        total_crash += o.crash_dropped;
+        mesh_sizes.push(o.mesh_members);
+        tracing::info!(target: "honest_converge",
+            "  seed=0x{seed:X} [{label}/{config}]: mesh={}/{} formed={} \
+             holders={} unique={} at_v50={} converged={} crash_drop={}",
+            o.mesh_members, o.intended, o.mesh_formed(),
+            o.mesh_holders, o.unique_hashes, o.at_final, o.converged(), o.crash_dropped);
+    }
+
+    let n = seeds.max(1);
+    let mean_mesh = mesh_sizes.iter().sum::<usize>() as f64 / n as f64;
+    let mesh_rate = mesh_formed_ct as f64 / n as f64;
+    // Convergence rate among the runs whose mesh actually formed (the honest
+    // denominator), plus the overall rate for reference.
+    let conv_rate_valid = if mesh_formed_ct == 0 {
+        f64::NAN
+    } else {
+        converged_ct as f64 / mesh_formed_ct as f64
+    };
+    let conv_rate_all = converged_ct as f64 / n as f64;
+
+    // Single greppable summary line per config.
+    tracing::info!(target: "honest_converge",
+        "HONEST_CONVERGE label={label} config={config} seeds={seeds} \
+         mesh_formed={mesh_formed_ct}/{seeds} ({mesh_rate:.2}) mean_mesh={mean_mesh:.1} \
+         converged_of_formed={converged_ct}/{mesh_formed_ct} ({conv_rate_valid:.2}) \
+         converged_overall={converged_ct}/{seeds} ({conv_rate_all:.2}) crash_drops={total_crash}");
+    tracing::info!(target: "honest_converge", "===== END HONEST CONVERGENCE SWEEP [{label}] =====");
+
+    if churn {
+        assert!(
+            total_crash > 0,
+            "[{label}]: scripted CrashNode dropped no packets across any seed — churn had no effect"
+        );
+    }
+}
+
+/// Honest convergence gate — STEADY (no churn). Run once with
+/// `FREENET_DISABLE_REPLICATE_FORWARD` unset (control) and once set (removal),
+/// then diff the printed `HONEST_CONVERGE` lines.
+#[ignore = "R&D measurement harness (not a CI gate); run with --ignored --nocapture"]
+#[test_log::test]
+fn honest_convergence_gate_steady() {
+    run_honest_convergence_sweep("steady", false);
+}
+
+/// Honest convergence gate — CHURN (crash a mid-mesh subscriber mid-run). Same
+/// control-vs-removal protocol as the steady gate.
+#[ignore = "R&D measurement harness (not a CI gate); run with --ignored --nocapture"]
+#[test_log::test]
+fn honest_convergence_gate_churn() {
+    run_honest_convergence_sweep("churn", true);
+}

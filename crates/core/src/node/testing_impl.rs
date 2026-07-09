@@ -487,6 +487,22 @@ impl ControlledSimulationResult {
             .is_some_and(|ring| ring.is_hosting_contract(key))
     }
 
+    /// Whether `label`'s node was actually in the UPDATE MESH for `key` at the
+    /// end of the run — i.e. `Ring::is_receiving_updates` (an active network
+    /// subscription OR a local client subscription), NOT merely holding a cache
+    /// copy. This is the honest mesh-membership signal the convergence gate uses
+    /// to VERIFY the mesh formed before it trusts a convergence measurement:
+    /// `is_hosting_contract()` is true for a demandless cache copy that is not
+    /// kept fresh, so it is NOT a valid mesh-membership check (see
+    /// `hosting-invariants` — only `is_receiving_updates()` guarantees a fresh,
+    /// update-carrying copy). Returns `false` if the node never published its
+    /// Ring.
+    pub fn is_node_receiving_updates(&self, label: &NodeLabel, key: &ContractKey) -> bool {
+        self.node_rings
+            .get(label)
+            .is_some_and(|ring| ring.is_receiving_updates(key))
+    }
+
     /// Number of contracts `label`'s node held in its hosting cache at the end
     /// of the run (its "cache size"). Returns 0 if the node never published its
     /// Ring. See [`Ring::hosting_contracts_count`](crate::ring::Ring::hosting_contracts_count).
