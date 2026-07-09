@@ -13711,3 +13711,275 @@ fn test_piece_e_unsubscribed_stale_serve_gate() {
     // Avoid leaking the CRDT registration into other tests sharing this process.
     freenet::dev_tool::clear_crdt_contracts();
 }
+
+/// R3 piece B — anti-entropy HEALS a demandless every-hop copy that missed a
+/// live-fan-out update. This is the positive complement of
+/// [`test_piece_e_unsubscribed_stale_serve_gate`] (which crash-isolates an
+/// unsubscribed copy and proves it STAYS stale while never recovering): here we
+/// crash-isolate the copy across the UPDATE, then RECOVER it and let the
+/// ~5-min InterestSync / `Summaries` anti-entropy heartbeat run, and assert the
+/// copy converges to the current state.
+///
+/// Why this de-risks piece E (`replicate_forward` removal): once the durable
+/// store-at-every-hop copy is removed, a demandless copy that misses a live
+/// fan-out (e.g. it was briefly disconnected) can ONLY be brought current by the
+/// anti-entropy layer — there is no subscription pushing it and no
+/// `replicate_forward` re-seeding it. This test proves that layer actually heals
+/// such a copy end-to-end.
+///
+/// The heal is attributable to anti-entropy, not the update broadcast, because:
+///   * the isolated copy is UNSUBSCRIBED (GET subscribe=false), so the HOST never
+///     re-broadcasts the UPDATE to it after recovery; and
+///   * the isolated node was CRASH-ISOLATED across the UPDATE (asserted:
+///     `crash_packets_dropped() > 0`), so it provably missed the live fan-out —
+///     exactly what the sibling gate proves keeps it stale absent recovery.
+/// So an end-of-run hash equal to the current (v2) state can only have arrived
+/// via the InterestSync/`Summaries` push heal (`SyncStateToPeer`), which a
+/// demandless hosting-only copy participates in purely by `hosting = true`.
+///
+/// Timeline (1 gateway + 8 nodes, roles by ring distance to the key):
+///   0. HOST near the key seeds v1 (subscribed source of truth).
+///   1. REACHABLE + ISOLATED GET(subscribe=false) v1 → demandless hosting copies.
+///   2. MESH GET(subscribe=true) v1 → join the update mesh (positive control).
+///   3. CRASH-ISOLATE the ISOLATED node so the UPDATE's live fan-out cannot reach it.
+///   4. HOST UPDATEs to v2 (CRDT-versioned so v2 genuinely wins).
+///   5. RECOVER the ISOLATED node (messages flow again, but nothing re-pushes v2).
+///   6. Long post-op wait (> one 300 s heartbeat interval) → anti-entropy heals it.
+#[test_log::test]
+fn test_piece_b_anti_entropy_heals_demandless_copy() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0x4642_B0B0_57A1;
+    const NETWORK_NAME: &str = "piece-b-anti-entropy-heal";
+    const NUM_NODES: usize = 8;
+
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0xB7);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    // CRDT-versioned states: the InterestSync heal pushes full state and the
+    // receiver MERGES it. With MockRuntime's default byte-merge the higher-hash
+    // state wins non-deterministically, which could "converge" to the stale v1;
+    // CRDT mode makes the higher VERSION win, so v2 deterministically wins and a
+    // stale copy pushing v1 back is a no-op (as required by the heal's
+    // "push-on-differ, rely-on-monotonic-merge" contract).
+    freenet::dev_tool::register_crdt_contract(contract_id);
+    let state_v1 = SimOperation::create_crdt_state(1, 0x11);
+    let state_v2 = SimOperation::create_crdt_state(2, 0x22);
+
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let node_locations: Vec<f64> = (0..NUM_NODES)
+        .map(|i| wrap(key_loc + i as f64 / NUM_NODES as f64))
+        .collect();
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,
+            NUM_NODES,
+            10,
+            7,
+            8,
+            3,
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    let host_no = ranked[0]; // nearest the key: source of truth
+    let reachable_no = ranked[1]; // demandless copy that stays reachable (control)
+    let isolated_no = ranked[2]; // demandless copy, crash-isolated then RECOVERED
+    let mesh_nos = [ranked[3], ranked[4]]; // update mesh (positive control)
+
+    let host = NodeLabel::node(NETWORK_NAME, host_no);
+    let reachable = NodeLabel::node(NETWORK_NAME, reachable_no);
+    let isolated = NodeLabel::node(NETWORK_NAME, isolated_no);
+    let mesh: Vec<NodeLabel> = mesh_nos
+        .iter()
+        .map(|n| NodeLabel::node(NETWORK_NAME, *n))
+        .collect();
+
+    tracing::info!(
+        key_loc,
+        host = host_no,
+        reachable = reachable_no,
+        isolated = isolated_no,
+        mesh = ?mesh_nos,
+        "piece-B anti-entropy heal: roles by ring distance to key"
+    );
+
+    let mut operations = Vec::new();
+    // 0. Source of truth near the key.
+    operations.push(ScheduledOperation::new(
+        host.clone(),
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state: state_v1.clone(),
+        },
+    ));
+    // 1. Two read-only GETs cache v1 (demandless hosting copies).
+    for n in [&reachable, &isolated] {
+        operations.push(ScheduledOperation::new(
+            n.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+    // 2. Mesh: GET-with-subscribe joins the update mesh (positive control).
+    for m in &mesh {
+        operations.push(ScheduledOperation::new(
+            m.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
+        ));
+    }
+    // 3. Crash-isolate the ISOLATED node BEFORE the UPDATE so its live fan-out is
+    //    dropped — this is the "missed a committed UPDATE" condition.
+    operations.push(ScheduledOperation::new(
+        isolated.clone(),
+        SimOperation::CrashNode,
+    ));
+    // 4. UPDATE to v2: HOST + reachable + mesh refresh; the isolated copy misses it.
+    operations.push(ScheduledOperation::new(
+        host.clone(),
+        SimOperation::Update {
+            key: contract_key,
+            data: state_v2.clone(),
+        },
+    ));
+    // 5. RECOVER the ISOLATED node: messages flow again, but it is UNSUBSCRIBED so
+    //    nothing re-pushes v2 — only anti-entropy can bring it current.
+    operations.push(ScheduledOperation::new(
+        isolated.clone(),
+        SimOperation::RecoverNode,
+    ));
+
+    let logs_handle = sim.event_logs_handle();
+    // Post-op wait must exceed one interest-heartbeat interval (300 s) plus the
+    // per-peer spread + push round-trip, so the periodic InterestSync/Summaries
+    // exchange fires at least once after recovery. Turmoil virtual time makes
+    // this cheap in wall-clock.
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(720),
+        Duration::from_secs(680),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "anti-entropy heal sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let metrics = compute_piece_e_metrics(
+        &result,
+        &logs,
+        &contract_key,
+        &host,
+        &[reachable.clone(), isolated.clone()],
+        &mesh,
+    );
+
+    let v1_hash = freenet::tracing::state_hash_short(&freenet_stdlib::prelude::WrappedState::new(
+        state_v1.clone(),
+    ));
+    let v2_hash = freenet::tracing::state_hash_short(&freenet_stdlib::prelude::WrappedState::new(
+        state_v2.clone(),
+    ));
+    let hash_of = |label: &NodeLabel| -> Option<String> {
+        result
+            .node_storages
+            .get(label)
+            .and_then(|s| s.get_stored_state(&contract_key))
+            .map(|ws| freenet::tracing::state_hash_short(&ws))
+    };
+    let host_current = hash_of(&host);
+    let isolated_hash = hash_of(&isolated);
+    let reachable_hash = hash_of(&reachable);
+    let isolated_hosting = result.is_node_hosting(&isolated, &contract_key);
+
+    tracing::info!(target: "piece_b_heal",
+        "===== PIECE-B ANTI-ENTROPY HEAL (seed=0x{SEED:X}) =====");
+    tracing::info!(target: "piece_b_heal", "  v1={v1_hash} v2={v2_hash} host_current={host_current:?}");
+    tracing::info!(target: "piece_b_heal",
+        "  ISOLATED demandless copy: hash={isolated_hash:?} hosting={isolated_hosting} (recovered; must HEAL to v2)");
+    tracing::info!(target: "piece_b_heal",
+        "  REACHABLE demandless copy: hash={reachable_hash:?} (control; healed via broadcast)");
+    tracing::info!(target: "piece_b_heal",
+        "  holders: {} of {} fresh (stale={})",
+        metrics.fresh_holders, metrics.total_holders, metrics.stale_holders);
+    tracing::info!(target: "piece_b_heal",
+        "  demandless requesters fresh after heal: {}/{} (stale={})",
+        metrics.requesters_fresh, metrics.requesters_total, metrics.requesters_stale);
+    tracing::info!(target: "piece_b_heal",
+        "  crash packets dropped (isolation took effect): {}", result.crash_packets_dropped());
+    tracing::info!(target: "piece_b_heal", "===== END =====");
+
+    // --- Assertions ---
+    // (1) The UPDATE is a real state change.
+    assert_ne!(
+        v1_hash, v2_hash,
+        "v1 and v2 must differ — the UPDATE must be a real state change"
+    );
+    // (2) The UPDATE applied at HOST (defines "current" = v2).
+    assert_eq!(
+        host_current.as_deref(),
+        Some(v2_hash.as_str()),
+        "UPDATE must apply at HOST (host_current should equal v2)"
+    );
+    // (3) The isolation genuinely took effect — the isolated copy provably missed
+    //     the live fan-out (mirrors the sibling gate's forced-stale control).
+    assert!(
+        result.crash_packets_dropped() > 0,
+        "crash-isolation had no effect (no packets dropped) — the copy did not miss the update"
+    );
+    // (4) The healed copy is a genuine DEMANDLESS hosting copy: it hosts the
+    //     contract (register_local_hosting via the read-only GET) and carries NO
+    //     subscription (it never issued Subscribe / GET-with-subscribe, and is not
+    //     in the mesh set), so any convergence is subscription-free.
+    assert!(
+        isolated_hosting,
+        "isolated node must be a hosting copy (demandless every-hop hosting), got hosting=false"
+    );
+    assert!(
+        !mesh.contains(&isolated),
+        "test wiring error: the isolated (demandless) node must not be in the subscribed mesh"
+    );
+    // (5) POSITIVE CONTROL: the mesh subscribers ended fresh — update propagation
+    //     and freshness detection both work.
+    assert_eq!(
+        metrics.subscribers_fresh, metrics.subscribers_total,
+        "mesh subscribers must all be fresh after the UPDATE (propagation positive control)"
+    );
+    // (6) PRIMARY (piece B): the recovered demandless copy HEALED to the current
+    //     state via anti-entropy — final hash equality with v2 / the source of
+    //     truth. If this FAILS, anti-entropy did NOT heal a demandless copy that
+    //     missed the fan-out → a real gap for piece E to resolve.
+    assert_eq!(
+        isolated_hash.as_deref(),
+        Some(v2_hash.as_str()),
+        "PIECE-B: the recovered demandless copy MUST heal to v2 via anti-entropy \
+         (isolated_hash={isolated_hash:?}, v2={v2_hash}, host_current={host_current:?})"
+    );
+    assert_eq!(
+        isolated_hash.as_deref(),
+        host_current.as_deref(),
+        "PIECE-B: the recovered demandless copy MUST converge with the source of truth"
+    );
+
+    // Avoid leaking the CRDT registration into other tests sharing this process.
+    freenet::dev_tool::clear_crdt_contracts();
+}
