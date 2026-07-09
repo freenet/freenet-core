@@ -52,7 +52,7 @@
 //! disconnect, `OpManager::spawn_prompt_reroots` drives a storm-safe PROMPT
 //! re-subscribe for the in-use contracts the dropped peer stranded (interest-gated
 //! via `reconcile_wants_reroot`, single-target, make-before-break, per-drop-capped
-//! + jittered). The one remaining SHADOW site is the host-formation announce
+//! and jittered). The one remaining SHADOW site is the host-formation announce
 //! (`Announce`, needs the `actively_acquiring` source). The `Retract` action
 //! likewise stays deferred — it is wired live on EVICTION (#4722) but NOT yet
 //! driven from collapse/renewal teardown. The shadow site builds a

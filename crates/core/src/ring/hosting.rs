@@ -2216,14 +2216,19 @@ impl HostingManager {
         !self.subscription_backoff.read().is_in_backoff(contract)
     }
 
-    /// Mark a subscription request as in-flight.
-    /// Returns false if already pending.
+    /// Mark a subscription request as in-flight, claiming the pending slot.
+    /// Returns true if THIS call claimed the slot (the contract was not already
+    /// pending), false if another caller already holds the claim.
+    ///
+    /// The claim is atomic: `DashSet::insert` returns true iff the value was
+    /// newly inserted, so the check-and-claim is a single locked operation. A
+    /// separate `contains()` then `insert()` would leave a TOCTOU window where
+    /// two concurrent callers (the ~30s renewal loop and the connection-drop
+    /// prompt re-root, #4642 piece F) could both observe "not pending" and each
+    /// believe it owns the claim. Callers own the pending slot on a true return
+    /// and are responsible for clearing it via `complete_subscription_request`.
     pub fn mark_subscription_pending(&self, contract: ContractKey) -> bool {
-        if self.pending_subscription_requests.contains(&contract) {
-            return false;
-        }
-        self.pending_subscription_requests.insert(contract);
-        true
+        self.pending_subscription_requests.insert(contract)
     }
 
     /// Mark a subscription request as completed.

@@ -109,6 +109,14 @@ const CONNECTION_DROP_SHADOW_SCAN_CAP: usize = 1024;
 /// (`mark_subscription_pending`) prevent repeated drops from re-firing the same
 /// contract, and per-task jitter (`spawn_renewal_subscribe_task`) spreads even
 /// this bounded batch.
+///
+/// Scope of the guarantee: this caps prompt re-roots **per connection-drop
+/// event**, NOT per node. One `on_ring_connection_lost` call spawns at most 6.
+/// A simultaneous multi-hub disconnect fires one such call per dropped hub, so
+/// the whole-node burst is bounded by 6 × (number of hubs that dropped at once)
+/// — but each of those is a single per-contract-deduped, backoff-respecting,
+/// jittered SUBSCRIBE toward the key, so the aggregate is still a bounded spread,
+/// never the O(contracts) thundering herd this cap exists to prevent.
 const MAX_PROMPT_REROOTS_PER_DROP: usize = 6;
 
 /// Pure core of the piece-D **strictly-farther** downstream-subscriber filter
