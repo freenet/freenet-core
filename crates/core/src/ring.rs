@@ -4350,10 +4350,13 @@ impl Ring {
         self.hosting_manager.mark_local_client_access(key)
     }
 
-    /// Check if a contract was accessed by a local client.
-    pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
-        self.hosting_manager.has_local_client_access(key)
-    }
+    // NOTE: `has_local_client_access` (the plain, non-recency variant) had its
+    // only production caller removed by serve-DURING (#4642 R3 piece C): the
+    // originator GET gate now serves on `interest_manager.has_local_interest`
+    // (a fresh in-mesh copy) rather than on whether the LOCAL user had touched
+    // the contract. The flag is still maintained (`mark_local_client_access`)
+    // and read via the recency variant below; the plain read accessor survives
+    // only on `HostingManager` for its unit tests.
 
     /// Whether a local client GET/PUT touched this contract within the renewal age
     /// gate (`SUBSCRIPTION_LEASE_DURATION`) — the read/PUT demand signal the

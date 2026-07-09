@@ -1575,7 +1575,7 @@ fn advance_to_next_peer(
 ///
 /// For `blocking_subscribe = true`, awaits the subscribe driver inline.
 /// For `blocking_subscribe = false`, spawns a fire-and-forget task.
-async fn maybe_subscribe_child(
+pub(crate) async fn maybe_subscribe_child(
     op_manager: &Arc<OpManager>,
     client_tx: Transaction,
     key: ContractKey,

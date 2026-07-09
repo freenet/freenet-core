@@ -117,6 +117,45 @@ async fn register_subscription_listener(
     }
 }
 
+/// serve-DURING gate (#4642 R3 piece C — `hosting-invariants.md` invariant 1).
+///
+/// Decides whether a client GET is answered from this node's LOCAL copy
+/// immediately, or routed through the network. The originator serves its best
+/// local copy the instant it holds a FRESH one — it never blocks a read on a
+/// network round-trip to confirm freshness (serve-DURING).
+///
+/// Serve locally when we have valid local state (`local_satisfies_request`) AND
+/// any of:
+/// 1. **No connections** — an isolated node can only answer from local state.
+/// 2. **Actively receiving updates** (`is_subscribed`) — a network/client
+///    subscription keeps the copy fresh.
+/// 3. **Local interest** (`has_local_interest`) — this node is a fresh in-mesh
+///    HOST of the contract. `has_local_interest` is true for a demandless
+///    every-hop hosting copy (it registers `hosting = true` and joins the
+///    InterestSync anti-entropy heartbeat — #4744 piece B), a local-client-
+///    subscribed copy, or a copy with a downstream subscriber. This is the SAME
+///    predicate the TERMINUS serve gate uses (`check_local_with_interest_gate`
+///    → `InterestManager::has_local_interest`), so the originator no longer
+///    routes a whole GET for a copy it already holds fresh.
+///
+/// Term 3 REPLACES the pre-serve-DURING `is_hosting_contract &&
+/// has_local_client_access` gate, which served only copies the LOCAL user had
+/// touched and forced a demandless hosted copy to route the whole GET — the
+/// exact "goes dark on a read it could answer" gap serve-DURING closes.
+/// Freshness is NOT confirmed here; it rides on the anti-entropy mesh
+/// (invariant 1), and an isolated holder serves best-effort at the ~5-9%
+/// near-miss floor. `local_satisfies_request` already guarantees valid state is
+/// present, so a phantom (interested-but-stateless, #4440) copy is excluded even
+/// though it can register interest via a downstream subscriber.
+fn should_serve_local_copy(
+    local_satisfies_request: bool,
+    connection_count: usize,
+    is_subscribed: bool,
+    has_local_interest: bool,
+) -> bool {
+    local_satisfies_request && (connection_count == 0 || is_subscribed || has_local_interest)
+}
+
 /// Report an operation init failure to the client via the result router.
 async fn report_op_init_error(
     op_manager: &OpManager,
@@ -916,23 +955,31 @@ async fn process_open_request(
                             }
                         }
 
-                        // Serve from local cache only if the local user requested
-                        // this contract (not just relay-cached).
-                        let is_locally_hosted = full_key
+                        // serve-DURING (#4642 R3 piece C): serve immediately when
+                        // this node HAS LOCAL INTEREST in the contract — i.e. it is
+                        // a fresh in-mesh host. `has_local_interest` is true for a
+                        // demandless every-hop copy (registers `hosting = true`,
+                        // joins anti-entropy — #4744 piece B), a locally-subscribed
+                        // copy, or one with a downstream subscriber. This is the
+                        // SAME predicate the TERMINUS serve gate uses
+                        // (`check_local_with_interest_gate`), replacing the old
+                        // `has_local_client_access` gate that forced a demandless
+                        // hosted copy to route a whole GET through the network.
+                        let has_local_interest = full_key
                             .as_ref()
-                            .map(|k| {
-                                op_manager.ring.is_hosting_contract(k)
-                                    && op_manager.ring.has_local_client_access(k)
-                            })
+                            .map(|k| op_manager.interest_manager.has_local_interest(k))
                             .unwrap_or(false);
 
                         // Return local cache if we have valid state AND any of:
                         // 1. No connections (isolated node)
                         // 2. Actively subscribed (cache kept fresh via updates)
-                        // 3. Locally hosted (subscription may be in progress)
-                        if local_satisfies_request
-                            && (connection_count == 0 || is_subscribed || is_locally_hosted)
-                        {
+                        // 3. We hold a fresh in-mesh copy (serve-DURING)
+                        if should_serve_local_copy(
+                            local_satisfies_request,
+                            connection_count,
+                            is_subscribed,
+                            has_local_interest,
+                        ) {
                             let full_key = full_key.unwrap();
                             let state = state.unwrap();
 
@@ -942,7 +989,7 @@ async fn process_open_request(
                                 peer = %peer_id,
                                 contract = %full_key,
                                 is_subscribed,
-                                is_locally_hosted,
+                                has_local_interest,
                                 connection_count,
                                 phase = "local_cache",
                                 "Returning locally cached contract state"
@@ -972,6 +1019,37 @@ async fn process_open_request(
                                         contract = %full_key,
                                         "GET with subscribe=true but no subscription_listener (expected for HTTP clients)"
                                     );
+                                }
+
+                                // serve-DURING (#4642 R3 piece C): a subscribe=true GET
+                                // served from a LOCAL copy did NOT route through the
+                                // network, which is where the subscribe normally rides
+                                // (`maybe_subscribe_child`, the sole GET subscribe
+                                // path). If we were not already receiving updates (a
+                                // demandless every-hop copy), establish the upstream
+                                // subscription in the BACKGROUND so the client gets
+                                // ongoing updates — never blocking the served read.
+                                //
+                                // A subscribe=FALSE read establishes NOTHING: no durable
+                                // demand is created, the demandless copy stays fresh via
+                                // anti-entropy and is NEVER re-rooted (re-root is
+                                // connection-drop-driven — P0 / #4642 piece F — and its
+                                // interest gate refuses a demandless copy), so a burst of
+                                // serve-DURING reads fans out ZERO re-links. This kick
+                                // fires only on an EXPLICIT client subscribe, and the
+                                // subscribe op is internally deduped + backoff-guarded, so
+                                // it cannot become a read storm. Gated on `!is_subscribed`
+                                // to avoid a redundant subscribe when an upstream already
+                                // exists.
+                                if !is_subscribed {
+                                    get::op_ctx_task::maybe_subscribe_child(
+                                        &op_manager,
+                                        crate::message::Transaction::new::<get::GetMsg>(),
+                                        full_key,
+                                        true,  // subscribe
+                                        false, // blocking_subscribe: never block the served read
+                                    )
+                                    .await;
                                 }
                             }
 
@@ -1681,3 +1759,84 @@ async fn process_open_request(
 use tokio::sync::mpsc;
 // Re-export Arc for use in this module
 use std::sync::Arc;
+
+#[cfg(test)]
+mod serve_during_gate_tests {
+    use super::should_serve_local_copy;
+
+    // Ring distinctions used below (from `LocalInterest::is_interested` +
+    // `is_receiving_updates`): a demandless every-hop hosting copy has
+    // `has_local_interest = true` (hosting flag) but `is_subscribed = false`.
+
+    /// serve-DURING falsifier (#4642 R3 piece C): a DEMANDLESS but interested
+    /// hosted copy — `has_local_interest = true`, `is_subscribed = false` — on a
+    /// node WITH connections MUST be served locally. Before serve-DURING the
+    /// third gate term was `is_hosting_contract && has_local_client_access`,
+    /// which is `false` for a demandless copy (no local client ever touched it),
+    /// so the whole GET was routed through the network — the "goes dark on a read
+    /// it could answer" gap. This asserts the flipped behavior; it fails against
+    /// the pre-serve-DURING client-access gate.
+    #[test]
+    fn demandless_interested_copy_serves_locally_with_connections() {
+        assert!(
+            should_serve_local_copy(
+                /* local_satisfies_request */ true, /* connection_count       */ 8,
+                /* is_subscribed           */ false, /* has_local_interest      */ true,
+            ),
+            "a demandless-but-interested hosted copy must serve locally (serve-DURING), \
+             not route through the network"
+        );
+    }
+
+    /// A copy with NO local interest and NO subscription on a connected node must
+    /// still route (we have no fresh in-mesh copy to serve). Guards against
+    /// over-broadening the gate to serve any stored bytes regardless of mesh
+    /// membership (which would re-introduce stale-serve, invariant 1).
+    #[test]
+    fn uninterested_copy_forwards_with_connections() {
+        assert!(
+            !should_serve_local_copy(
+                /* local_satisfies_request */ true, /* connection_count       */ 8,
+                /* is_subscribed           */ false, /* has_local_interest      */ false,
+            ),
+            "a stored copy with no local interest and no subscription must route \
+             (serve-DURING serves only a fresh in-mesh copy)"
+        );
+    }
+
+    /// Never serve when local state does not satisfy the request, regardless of
+    /// interest/subscription/connectivity.
+    #[test]
+    fn missing_local_state_never_serves() {
+        for is_subscribed in [false, true] {
+            for has_local_interest in [false, true] {
+                for connection_count in [0usize, 8] {
+                    assert!(
+                        !should_serve_local_copy(
+                            /* local_satisfies_request */ false,
+                            connection_count,
+                            is_subscribed,
+                            has_local_interest,
+                        ),
+                        "must not serve without valid local state \
+                         (is_subscribed={is_subscribed}, \
+                         has_local_interest={has_local_interest}, \
+                         connection_count={connection_count})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The three pre-existing serve reasons are preserved: isolated node
+    /// (no connections), active subscription, and the new local-interest term.
+    #[test]
+    fn each_serve_reason_holds_independently() {
+        // Isolated node: serves purely on zero connections.
+        assert!(should_serve_local_copy(true, 0, false, false));
+        // Actively receiving updates.
+        assert!(should_serve_local_copy(true, 8, true, false));
+        // Fresh in-mesh host (serve-DURING).
+        assert!(should_serve_local_copy(true, 8, false, true));
+    }
+}
