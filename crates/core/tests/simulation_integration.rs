@@ -13711,3 +13711,424 @@ fn test_piece_e_unsubscribed_stale_serve_gate() {
     // Avoid leaking the CRDT registration into other tests sharing this process.
     freenet::dev_tool::clear_crdt_contracts();
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+// R&D PROTOTYPE — bounded near-key replication: convergence-vs-cost measurement
+// (#4642 R3 piece E alternative — DO NOT MERGE).
+//
+// These tests port the strengthened STATE-convergence gate from draft PR #4749
+// and run it against the bounded near-key replication spread that replaces the
+// single past-terminus hop (`nearkey_replicate_spread` in put/op_ctx_task.rs).
+//
+// The near-key replication factor R_MAX and band D are read at process start
+// from `FREENET_NEARKEY_R_MAX` / `FREENET_NEARKEY_BAND_D`, so the sweep runs
+// one process per value:
+//
+//   for r in 1 2 3 4 5 6 7 8; do
+//     FREENET_NEARKEY_R_MAX=$r cargo test -p freenet \
+//       --features simulation_tests,testing --test simulation_integration \
+//       nearkey_ -- --ignored --nocapture --test-threads=1 ;
+//   done
+//
+// (The tests are #[ignore] by default — they are a measurement harness, not a
+// CI regression gate — so `--ignored` is required to run them. Optionally set
+// FREENET_NEARKEY_SEED to vary the RNG seed and FREENET_NEARKEY_BAND_D for the
+// near-key band. R_MAX=1 is the negative control: no spread = removal.)
+//
+// Every convergence assertion is preceded by a greppable measurement line
+//   NEARKEY_MEASURE ...
+// (emitted via `nearkey_measure_and_log`) so a FAILING R_MAX still yields its
+// cost numbers (copies placed) for the curve.
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Optional per-run seed override so the sweep can also vary the RNG seed
+/// (`FREENET_NEARKEY_SEED`) to test whether a convergence outcome is robust or
+/// seed-marginal. Falls back to the test's baked-in constant.
+fn nearkey_seed(default: u64) -> u64 {
+    std::env::var("FREENET_NEARKEY_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Config the sweep is running under, for the measurement log line. Defaults
+/// MUST match `NEARKEY_R_MAX_DEFAULT` / `NEARKEY_BAND_D_DEFAULT` in
+/// put/op_ctx_task.rs.
+fn nearkey_cfg() -> (usize, f64) {
+    let r = std::env::var("FREENET_NEARKEY_R_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&r| r >= 1)
+        .unwrap_or(2);
+    let d = std::env::var("FREENET_NEARKEY_BAND_D")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|d: &f64| d.is_finite() && *d >= 0.0)
+        .unwrap_or(0.30);
+    (r, d)
+}
+
+/// Ground-truth holder→hash map read directly from each node's MockStateStorage
+/// (NOT log-scraped). `exclude` drops intentionally-crashed nodes whose frozen
+/// pre-crash copy must not count against convergence.
+fn nearkey_holder_hashes(
+    result: &freenet::dev_tool::ControlledSimulationResult,
+    key: &freenet_stdlib::prelude::ContractKey,
+    exclude: &[freenet::dev_tool::NodeLabel],
+) -> BTreeMap<freenet::dev_tool::NodeLabel, String> {
+    result
+        .node_storages
+        .iter()
+        .filter_map(|(label, storage)| {
+            if exclude.contains(label) {
+                return None;
+            }
+            storage
+                .get_stored_state(key)
+                .map(|ws| (label.clone(), freenet::tracing::state_hash_full(&ws)))
+        })
+        .collect()
+}
+
+/// Emit the greppable measurement line and return `(copies, unique_hashes,
+/// converged_at_expected)`. Called BEFORE any convergence assertion so the
+/// sweep captures cost even for a failing R_MAX.
+fn nearkey_measure_and_log(
+    test: &str,
+    scenario: &str,
+    result: &freenet::dev_tool::ControlledSimulationResult,
+    key: &freenet_stdlib::prelude::ContractKey,
+    expected_hash: &str,
+    exclude: &[freenet::dev_tool::NodeLabel],
+) -> (usize, usize, bool) {
+    let (r_max, band_d) = nearkey_cfg();
+    let holders = nearkey_holder_hashes(result, key, exclude);
+    let unique: std::collections::HashSet<&String> = holders.values().collect();
+    let converged =
+        unique.len() == 1 && holders.values().next() == Some(&expected_hash.to_string());
+    // Single greppable line for the sweep harness.
+    tracing::info!(
+        "NEARKEY_MEASURE test={} scenario={} r_max={} band_d={} copies={} unique_hashes={} converged={}",
+        test,
+        scenario,
+        r_max,
+        band_d,
+        holders.len(),
+        unique.len(),
+        converged,
+    );
+    tracing::info!("NEARKEY_MEASURE_DETAIL test={} holders={:?}", test, holders);
+    (holders.len(), unique.len(), converged)
+}
+
+/// Strengthened STATE-convergence assertion (ported from draft PR #4749):
+///   1. at least `min_holders` non-excluded nodes hold the contract,
+///   2. every holder holds byte-identical state (no v20-vs-v30 split), and
+///   3. that converged hash equals `expected_hash` (not a vacuous stale value).
+fn nearkey_assert_state_convergence(
+    result: &freenet::dev_tool::ControlledSimulationResult,
+    key: &freenet_stdlib::prelude::ContractKey,
+    min_holders: usize,
+    expected_hash: &str,
+    exclude: &[freenet::dev_tool::NodeLabel],
+) -> BTreeMap<freenet::dev_tool::NodeLabel, String> {
+    let holders = nearkey_holder_hashes(result, key, exclude);
+    let unique: std::collections::HashSet<&String> = holders.values().collect();
+    assert!(
+        holders.len() >= min_holders,
+        "contract {:?} held by only {} node(s), expected >= {}. Holders: {:?}",
+        key,
+        holders.len(),
+        min_holders,
+        holders,
+    );
+    assert_eq!(
+        unique.len(),
+        1,
+        "contract {:?} STATE SPLIT: {} distinct final-state hashes across {} holders \
+         (the #4509 divergence class a presence check misses). Holders: {:?}",
+        key,
+        unique.len(),
+        holders.len(),
+        holders,
+    );
+    let converged = holders.values().next().expect("holders is non-empty");
+    assert_eq!(
+        converged, expected_hash,
+        "contract {:?} converged at {} but expected the final-update hash {} — all holders \
+         AGREE but on a STALE value, i.e. the UPDATE never propagated (vacuous convergence)",
+        key, converged, expected_hash,
+    );
+    holders
+}
+
+/// PROTOTYPE convergence gate — subscribed six-peer lifecycle. Identical
+/// scenario to `test_six_peer_contract_lifecycle` but with the strengthened
+/// ground-truth v50 state-convergence gate. This is the load-bearing test: the
+/// #4509 removal regressed it into a v20-vs-v30 split (draft PR #4749); the
+/// near-key spread must heal it.
+// R&D PROTOTYPE measurement harness (not a CI regression gate). Pass/fail is
+// parametrized by FREENET_NEARKEY_R_MAX, and the subscribed gate is confounded
+// by bare-SUBSCRIBE-requires-local-cache (see report). Ignored by default; run
+// explicitly via the FREENET_NEARKEY_R_MAX sweep documented above.
+#[ignore = "R&D near-key-replication measurement harness; run via FREENET_NEARKEY_R_MAX sweep"]
+#[test_log::test]
+fn nearkey_six_peer_state_convergence() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4642_E560_0001;
+    const NETWORK_NAME: &str = "nearkey-six-peer";
+    let seed = nearkey_seed(SEED);
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(seed);
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async { SimNetwork::new(NETWORK_NAME, 2, 4, 10, 5, 15, 3, seed).await });
+
+    let seed_byte = 0xA1u8;
+    let contract = SimOperation::create_test_contract(seed_byte);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, seed_byte),
+            subscribe: true,
+        },
+    )];
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 1),
+        SimOperation::Subscribe { contract_id },
+    ));
+    for i in 2..=5 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    // gw0 updates 10/20/30, then node 2 updates 40/50 (final = v50).
+    for v in [10u64, 20, 30] {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(v, seed_byte),
+            },
+        ));
+    }
+    for v in [40u64, 50] {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(v, seed_byte),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "six-peer convergence sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let expected = freenet::tracing::state_hash_full(&freenet_stdlib::prelude::WrappedState::new(
+        SimOperation::create_crdt_state(50, seed_byte),
+    ));
+    nearkey_measure_and_log(
+        "nearkey_six_peer_state_convergence",
+        "subscribed",
+        &result,
+        &contract_key,
+        &expected,
+        &[],
+    );
+    nearkey_assert_state_convergence(&result, &contract_key, 4, &expected, &[]);
+    freenet::dev_tool::clear_crdt_contracts();
+}
+
+/// PROTOTYPE cost + convergence gate — PUT withOUT subscribe, then one UPDATE.
+/// No client demand network-wide, so the only copies are the every-hop store
+/// copies + the near-key spread copies. This is the CLEAN cost measurement:
+/// `copies` in the NEARKEY_MEASURE line is the per-PUT replication cost. The
+/// convergence teeth: no surviving copy may be stranded at the PUT (v1) state.
+// R&D PROTOTYPE measurement harness (not a CI regression gate). Cleanest cost
+// signal: copies placed per PUT. Ignored by default; run via the sweep.
+#[ignore = "R&D near-key-replication measurement harness; run via FREENET_NEARKEY_R_MAX sweep"]
+#[test_log::test]
+fn nearkey_put_no_subscriber_convergence() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4642_E5B0_0001;
+    const NETWORK_NAME: &str = "nearkey-no-sub";
+    let seed = nearkey_seed(SEED);
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(seed);
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async { SimNetwork::new(NETWORK_NAME, 2, 4, 10, 5, 15, 3, seed).await });
+
+    let seed_byte = 0xC3u8;
+    let contract = SimOperation::create_test_contract(seed_byte);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_crdt_state(1, seed_byte),
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(50, seed_byte),
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "no-subscriber convergence sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let expected = freenet::tracing::state_hash_full(&freenet_stdlib::prelude::WrappedState::new(
+        SimOperation::create_crdt_state(50, seed_byte),
+    ));
+    nearkey_measure_and_log(
+        "nearkey_put_no_subscriber_convergence",
+        "no_subscriber",
+        &result,
+        &contract_key,
+        &expected,
+        &[],
+    );
+    nearkey_assert_state_convergence(&result, &contract_key, 1, &expected, &[]);
+    freenet::dev_tool::clear_crdt_contracts();
+}
+
+/// PROTOTYPE convergence-under-churn gate — subscribed lifecycle with a
+/// mid-chain subscriber crashed partway through the UPDATE sequence. Survivors
+/// must still converge on v50 via the near-key cluster + update mesh WITHOUT the
+/// retired past-terminus hop. The crashed node's frozen copy is excluded.
+// R&D PROTOTYPE measurement harness (not a CI regression gate). Churn signal:
+// R_MAX needed for survivors to converge. Ignored by default; run via the sweep.
+#[ignore = "R&D near-key-replication measurement harness; run via FREENET_NEARKEY_R_MAX sweep"]
+#[test_log::test]
+fn nearkey_churn_convergence() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4642_E0C0_0001;
+    const NETWORK_NAME: &str = "nearkey-churn";
+    let seed = nearkey_seed(SEED);
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(seed);
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async { SimNetwork::new(NETWORK_NAME, 2, 4, 10, 5, 15, 3, seed).await });
+
+    let seed_byte = 0xD4u8;
+    let contract = SimOperation::create_test_contract(seed_byte);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let crashed = NodeLabel::node(NETWORK_NAME, 3);
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, seed_byte),
+            subscribe: true,
+        },
+    )];
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 1),
+        SimOperation::Subscribe { contract_id },
+    ));
+    for i in 2..=5 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    for v in [10u64, 20] {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(v, seed_byte),
+            },
+        ));
+    }
+    operations.push(ScheduledOperation::new(
+        crashed.clone(),
+        SimOperation::CrashNode,
+    ));
+    for v in [30u64, 40, 50] {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 2),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(v, seed_byte),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "churn convergence sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let expected = freenet::tracing::state_hash_full(&freenet_stdlib::prelude::WrappedState::new(
+        SimOperation::create_crdt_state(50, seed_byte),
+    ));
+    nearkey_measure_and_log(
+        "nearkey_churn_convergence",
+        "churn",
+        &result,
+        &contract_key,
+        &expected,
+        std::slice::from_ref(&crashed),
+    );
+    nearkey_assert_state_convergence(
+        &result,
+        &contract_key,
+        3,
+        &expected,
+        std::slice::from_ref(&crashed),
+    );
+    freenet::dev_tool::clear_crdt_contracts();
+}

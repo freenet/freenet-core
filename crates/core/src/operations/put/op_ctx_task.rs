@@ -305,6 +305,12 @@ async fn drive_client_put_inner(
                     .get_own_addr()
                     .into_iter()
                     .collect::<HashSet<_>>(),
+                // R&D PROTOTYPE: a client's initial PUT carries NO replication
+                // budget. The budget is MINTED fresh (`R_MAX`) at the routing
+                // terminus; carrying it from the originator would make every
+                // relay hop short-circuit as a spread copy before the terminus
+                // is reached. See `nearkey_replicate_spread`.
+                replication_budget: 0,
             })
         }
 
@@ -830,6 +836,10 @@ pub(crate) async fn start_relay_put<CB>(
     htl: usize,
     skip_list: HashSet<SocketAddr>,
     upstream_addr: SocketAddr,
+    // R&D PROTOTYPE (near-key replication): remaining near-key replication
+    // budget carried by a spread copy; 0 for a normal PUT. See
+    // `nearkey_replicate_spread`.
+    replication_budget: usize,
 ) -> Result<(), OpError>
 where
     CB: NetworkBridge + Clone + Send + 'static,
@@ -882,6 +892,7 @@ where
         htl,
         skip_list,
         upstream_addr,
+        replication_budget,
     ));
     Ok(())
 }
@@ -916,6 +927,7 @@ async fn run_relay_put<CB>(
     htl: usize,
     skip_list: HashSet<SocketAddr>,
     upstream_addr: SocketAddr,
+    replication_budget: usize,
 ) where
     CB: NetworkBridge + Clone + Send + 'static,
 {
@@ -931,6 +943,7 @@ async fn run_relay_put<CB>(
         htl,
         skip_list,
         upstream_addr,
+        replication_budget,
     )
     .await;
 
@@ -1186,6 +1199,7 @@ async fn drive_relay_put<CB>(
     htl: usize,
     skip_list: HashSet<SocketAddr>,
     upstream_addr: SocketAddr,
+    incoming_replication_budget: usize,
 ) -> Result<(), OpError>
 where
     CB: NetworkBridge + Clone + Send + 'static,
@@ -1197,6 +1211,7 @@ where
         contract = %key,
         htl,
         %upstream_addr,
+        incoming_replication_budget,
         phase = "relay_put_request",
         "PUT relay: processing Request"
     );
@@ -1227,6 +1242,32 @@ where
     new_skip_list.insert(upstream_addr);
     if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
         new_skip_list.insert(own_addr);
+    }
+
+    // ── R&D PROTOTYPE near-key replication: spread-copy short-circuit ───────
+    // A spread copy (`incoming_replication_budget > 0`) is a lateral,
+    // fire-and-forget replica already within the near-key band. It has stored
+    // locally (Step 1 above) and now RE-SPREADS its remaining budget to ITS own
+    // near-key neighbors, then returns. It must NOT (a) re-mint `R_MAX`
+    // (recursion would explode), (b) route onward toward the key (the spread is
+    // lateral, not descent), or (c) finalize/bubble a Response upstream (the
+    // spread copy rides a FRESH fire-and-forget tx with no waiter). The budget
+    // is clamped to `R_MAX` on receipt — this is the DoS bound (an attacker
+    // inflating the field is capped here). See `nearkey_replicate_spread`.
+    if incoming_replication_budget > 0 {
+        let budget = incoming_replication_budget.min(nearkey_r_max());
+        nearkey_replicate_spread(
+            op_manager,
+            key,
+            contract,
+            related_contracts,
+            merged_value,
+            htl,
+            new_skip_list,
+            budget,
+        )
+        .await;
+        return Ok(());
     }
 
     let next_hop = if htl > 0 {
@@ -1279,22 +1320,27 @@ where
                     "PUT relay: chain descended here and next hop moves away; finalizing here (#4363)"
                 );
                 // Finalize the operation at this closest-seen node (#4363
-                // placement) but STILL replicate the contract one hop onward so
-                // the UPDATE broadcast tree stays connected (#4509 convergence).
-                // See `relay_put_replicate_forward` for why both are required.
-                if let Some(next_addr) = peer.socket_addr() {
-                    relay_put_replicate_forward(
-                        op_manager,
-                        next_addr,
-                        key,
-                        contract.clone(),
-                        related_contracts.clone(),
-                        merged_value.clone(),
-                        htl,
-                        new_skip_list.clone(),
-                    )
-                    .await;
-                }
+                // placement). R&D PROTOTYPE: instead of the single past-terminus
+                // hop the old `relay_put_replicate_forward` used to keep the
+                // UPDATE broadcast tree connected (#4509), MINT a fresh `R_MAX`
+                // budget and begin a BOUNDED near-key replication spread. The
+                // spread places up to `R_MAX` copies (INCLUDING this terminus)
+                // on a CONNECTED cluster of neighbors within band `D` of the
+                // key, so the multi-hop UPDATE tree is reconstructed robustly
+                // rather than by a single fragile hop. At `R_MAX = 2` this
+                // reduces to "terminus + nearest near-key neighbor", i.e. the
+                // retired single-hop behavior. See `nearkey_replicate_spread`.
+                nearkey_replicate_spread(
+                    op_manager,
+                    key,
+                    contract.clone(),
+                    related_contracts.clone(),
+                    merged_value.clone(),
+                    htl,
+                    new_skip_list.clone(),
+                    nearkey_r_max(),
+                )
+                .await;
                 let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                 return relay_put_finalize_local(
                     op_manager,
@@ -1560,6 +1606,10 @@ where
                 value: merged_value.clone(),
                 htl: new_htl,
                 skip_list: new_skip_list,
+                // Normal toward-key forward: a spread copy short-circuits before
+                // this point, so this is reached only for a non-spread PUT
+                // (`incoming_replication_budget == 0`). Carried for correctness.
+                replication_budget: incoming_replication_budget,
             });
             if let Err(err) = ctx.send_fire_and_forget(next_addr, forward).await {
                 tracing::warn!(
@@ -1674,6 +1724,8 @@ where
             value: merged_value,
             htl: new_htl,
             skip_list: new_skip_list,
+            // Normal toward-key forward (non-spread PUT only; see above).
+            replication_budget: incoming_replication_budget,
         });
         tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(next_addr, forward)).await
     };
@@ -1998,52 +2050,114 @@ async fn relay_put_store_locally(
     Ok(merged_value)
 }
 
-/// Fire-and-forget a replication-only `PutMsg::Request` to `next_addr`
-/// when the #4363 terminus guard finalizes the operation locally.
+// ─────────────────────────────────────────────────────────────────────────
+// R&D PROTOTYPE — bounded near-key replication (#4642 R3 piece E alternative)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// EXPERIMENTAL, DO NOT MERGE. This replaces the single past-terminus hop
+// (`relay_put_replicate_forward`, #4509) with a principled, bounded, local-
+// information-only near-key replication cluster, so Ian can pick the
+// parameters from convergence-vs-cost data.
+
+/// Default near-key replication factor `R_MAX` (total copies in the near-key
+/// cluster INCLUDING the terminus). `R_MAX = 2` reduces to the retired
+/// single-hop past-terminus behavior ("terminus + nearest near-key neighbor").
+/// Overridable at process start via `FREENET_NEARKEY_R_MAX` for the sweep.
+const NEARKEY_R_MAX_DEFAULT: usize = 2;
+
+/// Default near-key distance band `D` (ring distance in `[0, 0.5]`). A neighbor
+/// counts as "near-key" if its ring distance to the contract key is `<= D`.
+/// Governs how much of the cluster lands beyond the connectivity floor.
+/// Overridable at process start via `FREENET_NEARKEY_BAND_D`.
+const NEARKEY_BAND_D_DEFAULT: f64 = 0.30;
+
+/// Process-global `R_MAX`, read once from `FREENET_NEARKEY_R_MAX` (DoS clamp
+/// ceiling + terminus mint value). A single process runs one whole sim, so all
+/// sim peers share the same value; the sweep runs a fresh process per value.
+fn nearkey_r_max() -> usize {
+    use std::sync::OnceLock;
+    static R_MAX: OnceLock<usize> = OnceLock::new();
+    *R_MAX.get_or_init(|| {
+        std::env::var("FREENET_NEARKEY_R_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&r| r >= 1)
+            .unwrap_or(NEARKEY_R_MAX_DEFAULT)
+    })
+}
+
+/// Process-global near-key band `D`, read once from `FREENET_NEARKEY_BAND_D`.
+fn nearkey_band_d() -> f64 {
+    use std::sync::OnceLock;
+    static BAND_D: OnceLock<f64> = OnceLock::new();
+    *BAND_D.get_or_init(|| {
+        std::env::var("FREENET_NEARKEY_BAND_D")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|d| d.is_finite() && *d >= 0.0)
+            .unwrap_or(NEARKEY_BAND_D_DEFAULT)
+    })
+}
+
+/// Bounded near-key replication spread (R&D PROTOTYPE).
 ///
-/// # Why the guard must still replicate (issue #4509 convergence fix)
+/// # Why this replaces the single past-terminus hop (#4509)
 ///
-/// The terminus guard makes the *closest-seen* node the authoritative
-/// finalizer (it sends the upstream `PutMsg::Response`, so the originator's
-/// reply and `hop_count` reflect placement at the contract neighbourhood —
-/// the #4363 goal). But finalizing must NOT also stop the contract from
-/// replicating onward: this codebase forms the UPDATE broadcast tree along
-/// the PUT forward path (each relay `host_contract` + `announce_contract_hosted`
-/// in `relay_put_store_locally`). If the guard simply returns after the
-/// upstream Response, the next hop — and everything past it — never receives
-/// the contract, so a later UPDATE that the router fans out to one of those
-/// peers fails with `missing contract` and the network splits into divergent
-/// state groups (observed in `test_six_peer_contract_lifecycle`: contract on
-/// 4/6 peers, a 2/2 v20-vs-v30 split, node-2's updates reaching no one).
+/// The retired `relay_put_replicate_forward` fired ONE fire-and-forget copy one
+/// hop past the #4363 routing terminus purely to keep the multi-hop UPDATE
+/// broadcast tree connected: without it, a later UPDATE the router fans out to
+/// a peer past the terminus fails with `missing contract` and the network
+/// splits into divergent state groups (the #4509 v20-vs-v30 signature). Live
+/// fan-out alone does not heal this — it only reaches DIRECTLY-connected
+/// co-hosts and does not reconstruct the tree.
 ///
-/// To keep placement (#4363) AND replication breadth (convergence), the guard
-/// finalizes locally *and* forwards a replication copy onward with a FRESH
-/// transaction so it does not collide with the upstream finalization waiter
-/// (the originator is already satisfied by this node's Response). The forward
-/// is fire-and-forget: no reply is awaited, and the downstream relay drives
-/// its own replication (including re-applying the same guard one hop deeper).
-/// The skip list — which already contains `upstream_addr` and `own_addr` —
-/// rides along unchanged, and HTL is decremented, so the replication copy is
-/// bounded and cannot loop back upstream. This is the "ensure terminated PUTs
-/// still replicate to the contract neighbourhood" resolution.
+/// This spread generalizes that single hop into a BOUNDED, CONNECTED near-key
+/// cluster. Local information only:
+///
+/// 1. The caller has already stored locally, so this node is copy #1. We spend
+///    1 of `budget` on self; `remaining = budget - 1`.
+/// 2. We enumerate our own connected neighbors, keep those within band `D` of
+///    the key (a LOCAL distance check), and — as a CONNECTIVITY FLOOR — always
+///    keep the single nearest-to-key neighbor even if band `D` excluded it, so
+///    the terminus never no-ops and the tree stays connected. (At `R_MAX = 2`
+///    this floor alone reproduces the retired single-hop replica.)
+/// 3. We split `remaining` across those targets (evenly, each `>= 1`) and send
+///    each a fire-and-forget replication `PutMsg::Request` carrying its
+///    sub-budget. The recipient stores, spends 1, and RE-SPREADS the rest to
+///    ITS near-key neighbors — until budget hits 0 or no near-key neighbor
+///    remains.
+///
+/// Because every copy lands at a DIRECT NEIGHBOR of an existing copy, the
+/// result is a connected co-host cluster near the key — exactly the property
+/// convergence needs, now robust to any single peer rather than one fragile
+/// hop. Bounding: the budget strictly decreases by `>= 1` per spread hop
+/// (total copies `<= budget <= R_MAX`); HTL is decremented too; and the skip
+/// list (which already contains `upstream_addr`, `own_addr`, and — added here
+/// — the sibling targets) prevents loops and sibling double-cover. The `R_MAX`
+/// clamp on receipt (`drive_relay_put`) is the DoS bound.
 #[allow(clippy::too_many_arguments)]
-async fn relay_put_replicate_forward(
+async fn nearkey_replicate_spread(
     op_manager: &OpManager,
-    next_addr: SocketAddr,
     key: ContractKey,
     contract: ContractContainer,
     related_contracts: RelatedContracts<'static>,
     merged_value: WrappedState,
     htl: usize,
+    // Already contains `upstream_addr` + `own_addr`.
     skip_list: HashSet<SocketAddr>,
+    // Total near-key copies INCLUDING this node (already clamped to `R_MAX`).
+    budget: usize,
 ) {
-    // The replication copy is sent as a single `PutMsg::Request`. For a
-    // payload that would need streaming we skip the replication forward rather
-    // than re-implement the piped-stream upgrade here: the local store already
-    // placed the authoritative replica at this closest-seen node (#4363), and
-    // the convergence regression this restores (#4509) is on the small-state
-    // non-streaming path. A large-contract terminus is rare; skipping leaves
-    // placement correct and only forgoes the extra broadcast-path replica.
+    // Self is copy #1 (stored by the caller). Spend it.
+    let remaining = budget.saturating_sub(1);
+    if remaining == 0 || htl == 0 {
+        return;
+    }
+
+    // Streaming-size payloads: skip (parity with the retired single-hop
+    // forward, which also skipped streaming; the convergence regression is on
+    // the small-state non-streaming path, and re-implementing the piped-stream
+    // upgrade here is out of scope for the prototype).
     let payload = PutStreamingPayload {
         contract: contract.clone(),
         related_contracts: related_contracts.clone(),
@@ -2053,46 +2167,116 @@ async fn relay_put_replicate_forward(
     if crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_size) {
         tracing::debug!(
             contract = %key,
-            target = %next_addr,
             payload_size,
-            phase = "relay_put_terminus_replicate",
-            "PUT relay: terminus replication skipped for streaming-size payload (placement still correct)"
+            phase = "nearkey_replicate_spread",
+            "PUT near-key spread skipped for streaming-size payload (placement still correct)"
         );
         return;
     }
 
-    // Fresh tx: the upstream Response under `incoming_tx` already satisfies
-    // the originator's waiter; reusing it would (a) make the downstream relay
-    // bubble a second Response back to a node with no waiter and (b) trip the
-    // per-node dedup gate on `incoming_tx`. A new transaction keeps the
-    // replication copy a clean, independent fire-and-forget op.
-    let replication_tx = Transaction::new::<PutMsg>();
-    let forward = NetMessage::from(PutMsg::Request {
-        id: replication_tx,
-        contract,
-        related_contracts,
-        value: merged_value,
-        htl: htl.saturating_sub(1),
-        skip_list,
+    // Local-only near-key neighbor selection. Enumerate our connections, drop
+    // skip-listed / transient ones, and rank by ring distance to the key.
+    let band = nearkey_band_d();
+    let target_loc = crate::ring::Location::from(&key);
+    let connections = op_manager
+        .ring
+        .connection_manager
+        .get_connections_by_location();
+    let mut candidates: Vec<(SocketAddr, f64)> = Vec::new();
+    for conns in connections.values() {
+        for conn in conns {
+            let Some(addr) = conn.location.socket_addr() else {
+                continue;
+            };
+            if skip_list.contains(&addr) {
+                continue;
+            }
+            if op_manager.ring.connection_manager.is_transient(addr) {
+                continue;
+            }
+            let Some(loc) = conn.location.location() else {
+                continue;
+            };
+            let dist = target_loc.distance(loc).as_f64();
+            candidates.push((addr, dist));
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    // Deterministic: nearest-to-key first, addr as tiebreak.
+    candidates.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
     });
-    let mut ctx = op_manager.op_ctx(replication_tx);
-    if let Err(err) = ctx.send_fire_and_forget(next_addr, forward).await {
-        tracing::debug!(
-            replication_tx = %replication_tx,
-            contract = %key,
-            target = %next_addr,
-            error = %err,
-            phase = "relay_put_terminus_replicate",
-            "PUT relay: terminus replication forward failed (best-effort)"
-        );
-    } else {
-        tracing::debug!(
-            replication_tx = %replication_tx,
-            contract = %key,
-            target = %next_addr,
-            phase = "relay_put_terminus_replicate",
-            "PUT relay: finalized locally but forwarded replication copy onward (#4509)"
-        );
+
+    // Band filter, with the connectivity floor (always keep the nearest).
+    let mut near: Vec<(SocketAddr, f64)> = candidates
+        .iter()
+        .copied()
+        .filter(|(_, d)| *d <= band)
+        .collect();
+    if near.is_empty() {
+        near.push(candidates[0]);
+    }
+
+    let n_targets = near.len().min(remaining);
+    if n_targets == 0 {
+        return;
+    }
+    let targets: Vec<SocketAddr> = near.iter().take(n_targets).map(|(a, _)| *a).collect();
+
+    // Even budget split (each target gets >= 1 since n_targets <= remaining).
+    let base = remaining / n_targets;
+    let extra = remaining % n_targets;
+
+    // Sibling skip: each spread copy skips self + all sibling targets so the
+    // cluster does not double-cover the same neighbors.
+    let mut sibling_skip = skip_list.clone();
+    for t in &targets {
+        sibling_skip.insert(*t);
+    }
+    if let Some(own) = op_manager.ring.connection_manager.get_own_addr() {
+        sibling_skip.insert(own);
+    }
+
+    for (i, target) in targets.iter().enumerate() {
+        let sub_budget = base + if i < extra { 1 } else { 0 };
+        // Fresh tx: the replication copy is a clean fire-and-forget op with no
+        // waiter (the terminus already satisfied the originator via its
+        // Response), so it cannot collide with any upstream finalization.
+        let replication_tx = Transaction::new::<PutMsg>();
+        let forward = NetMessage::from(PutMsg::Request {
+            id: replication_tx,
+            contract: contract.clone(),
+            related_contracts: related_contracts.clone(),
+            value: merged_value.clone(),
+            htl: htl.saturating_sub(1),
+            skip_list: sibling_skip.clone(),
+            replication_budget: sub_budget,
+        });
+        let mut ctx = op_manager.op_ctx(replication_tx);
+        if let Err(err) = ctx.send_fire_and_forget(*target, forward).await {
+            tracing::debug!(
+                replication_tx = %replication_tx,
+                contract = %key,
+                target = %target,
+                sub_budget,
+                error = %err,
+                phase = "nearkey_replicate_spread",
+                "PUT near-key spread copy send failed (best-effort)"
+            );
+        } else {
+            tracing::debug!(
+                replication_tx = %replication_tx,
+                contract = %key,
+                target = %target,
+                sub_budget,
+                phase = "nearkey_replicate_spread",
+                "PUT near-key spread copy sent"
+            );
+        }
     }
 }
 
@@ -2580,13 +2764,13 @@ where
     // just stops piping the replica to a farther peer the contract
     // neighbourhood will never descend to. The away-move alone is not a
     // sufficient stop condition; see `put_routing_should_terminate`.
-    // When the terminus guard fires it drops `next_hop` (stops piping), but
-    // the contract must still replicate one hop onward to keep the UPDATE
-    // broadcast tree connected (#4509 convergence — see
-    // `relay_put_replicate_forward`). The streaming payload isn't assembled
-    // until step 5, so we remember the next-hop address here and forward a
-    // replication copy after the local store in step 6.
-    let mut terminus_replicate_to: Option<SocketAddr> = None;
+    // When the terminus guard fires it drops `next_hop` (stops piping). R&D
+    // PROTOTYPE: to keep the UPDATE broadcast tree connected (#4509) we run the
+    // bounded near-key replication spread after the local store (step 6),
+    // minting a fresh `R_MAX` budget — the same spread the non-streaming
+    // terminus uses. The streaming payload isn't assembled until step 5, so we
+    // just remember THAT the terminus fired here and spread after the store.
+    let mut terminus_finalized_here = false;
     let next_hop = match next_hop {
         Some(peer) => {
             let target = crate::ring::Location::from(&contract_key);
@@ -2612,7 +2796,7 @@ where
                     phase = "relay_put_streaming_terminus",
                     "PUT streaming relay: chain descended here and next hop moves away; finalizing here (#4363)"
                 );
-                terminus_replicate_to = peer.socket_addr();
+                terminus_finalized_here = true;
                 None
             } else {
                 Some(peer)
@@ -2802,10 +2986,13 @@ where
     }
 
     // ── Step 6: Store contract locally (shared helper with slice A) ──────
-    // Clone the contract/related-contracts for a possible terminus replication
-    // forward (#4509) before the store consumes `related_contracts`.
-    let replicate_payload =
-        terminus_replicate_to.map(|addr| (addr, contract.clone(), related_contracts.clone()));
+    // R&D PROTOTYPE: clone the contract/related-contracts for a possible
+    // near-key replication spread before the store consumes them.
+    let spread_payload = if terminus_finalized_here {
+        Some((contract.clone(), related_contracts.clone()))
+    } else {
+        None
+    };
     // Originator-loopback client PUT → ClientLocal reserved lane (#4534).
     let store_priority = put_store_priority(op_manager, upstream_addr);
     let merged_value = relay_put_store_locally(
@@ -2820,20 +3007,20 @@ where
     )
     .await?;
 
-    // Terminus guard fired (#4363) on the streaming path: finalize here but
-    // still replicate the assembled contract one hop onward so the UPDATE
-    // broadcast tree stays connected (#4509). Mirrors the non-streaming guard
-    // branch; see `relay_put_replicate_forward`.
-    if let Some((next_addr, contract, related_contracts)) = replicate_payload {
-        relay_put_replicate_forward(
+    // Terminus guard fired (#4363) on the streaming path: finalize here and run
+    // the bounded near-key replication spread so the UPDATE broadcast tree
+    // stays connected (#4509). Mirrors the non-streaming terminus branch; mints
+    // a fresh `R_MAX` budget. See `nearkey_replicate_spread`.
+    if let Some((contract, related_contracts)) = spread_payload {
+        nearkey_replicate_spread(
             op_manager,
-            next_addr,
             key,
             contract,
             related_contracts,
             merged_value.clone(),
             htl,
             new_skip_list.clone(),
+            nearkey_r_max(),
         )
         .await;
     }
@@ -4180,6 +4367,7 @@ mod tests {
             value: WrappedState::new(vec![1u8]),
             htl: 5,
             skip_list: HashSet::new(),
+            replication_budget: 0,
         }));
         assert!(matches!(
             classify_reply(&msg),
@@ -4642,7 +4830,7 @@ mod tests {
 
         // The guard must finalize locally on its terminus branch (so the
         // closest-seen node is the authoritative finalizer, #4363) AND still
-        // replicate the contract one hop onward (so the UPDATE broadcast tree
+        // replicate the contract near the key (so the UPDATE broadcast tree
         // stays connected, #4509) — not just log, and not fall through to the
         // forward. Both calls live in the terminus branch before the forward.
         let guard_region = &body[guard_pos..forward_pos];
@@ -4651,12 +4839,16 @@ mod tests {
             "the terminus branch MUST finalize locally via \
              relay_put_finalize_local, not fall through to the forward"
         );
+        // R&D PROTOTYPE: the single past-terminus hop (relay_put_replicate_forward)
+        // is replaced by the bounded near-key replication spread. Pin that the
+        // terminus branch begins the spread so a future change can't silently
+        // drop the #4509 convergence safeguard.
         assert!(
-            guard_region.contains("relay_put_replicate_forward("),
-            "the terminus branch MUST still replicate the contract onward via \
-             relay_put_replicate_forward (#4509) — finalizing without \
-             replicating orphans the UPDATE broadcast path and splits the \
-             network into divergent state groups"
+            guard_region.contains("nearkey_replicate_spread("),
+            "the terminus branch MUST begin the bounded near-key replication \
+             spread (nearkey_replicate_spread, #4509 convergence) — finalizing \
+             without replicating orphans the UPDATE broadcast path and splits \
+             the network into divergent state groups"
         );
     }
 
@@ -4698,19 +4890,20 @@ mod tests {
              locally"
         );
 
-        // The streaming guard records the dropped next hop in
-        // `terminus_replicate_to` and, after the local store, replicates the
-        // contract one hop onward via `relay_put_replicate_forward` (#4509) so
-        // the streaming path does not orphan the UPDATE broadcast tree either.
+        // R&D PROTOTYPE: the streaming guard records THAT the terminus fired
+        // (`terminus_finalized_here`) and, after the local store, runs the
+        // bounded near-key replication spread (`nearkey_replicate_spread`,
+        // #4509) so the streaming path does not orphan the UPDATE broadcast
+        // tree either.
         assert!(
-            body.contains("terminus_replicate_to"),
-            "streaming guard MUST record the dropped next hop in \
-             terminus_replicate_to for the #4509 replication forward"
+            body.contains("terminus_finalized_here"),
+            "streaming guard MUST record that the terminus fired in \
+             terminus_finalized_here for the #4509 near-key spread"
         );
         assert!(
-            body.contains("relay_put_replicate_forward("),
-            "streaming terminus path MUST still replicate the contract onward \
-             via relay_put_replicate_forward (#4509)"
+            body.contains("nearkey_replicate_spread("),
+            "streaming terminus path MUST run the bounded near-key replication \
+             spread (nearkey_replicate_spread, #4509)"
         );
     }
 

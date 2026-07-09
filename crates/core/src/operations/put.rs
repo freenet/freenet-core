@@ -298,6 +298,18 @@ mod messages {
             htl: usize,
             /// Addresses to skip when selecting next hop (prevents loops)
             skip_list: HashSet<std::net::SocketAddr>,
+            /// R&D PROTOTYPE — near-key replication (#4642 R3 piece E
+            /// alternative). Remaining near-key replication budget carried by a
+            /// SPREAD copy. `0` for a normal client/relay PUT — the routing
+            /// terminus mints `R_MAX` locally and begins the spread. `>0` only on
+            /// the fire-and-forget replication copies emitted by
+            /// `nearkey_replicate_spread`: the budget is spent 1-per-hop and is
+            /// locally CLAMPED to `R_MAX` on receipt (the DoS bound — an attacker
+            /// inflating this field is capped). `#[serde(default)]` for
+            /// source-level clarity; bincode is positional, so this rides after
+            /// `skip_list` and all sim peers run the same build.
+            #[serde(default)]
+            replication_budget: usize,
         },
         /// Response indicating the PUT completed. Routed hop-by-hop back to originator
         /// using each node's stored upstream_addr.
@@ -604,6 +616,7 @@ mod tests {
                     value: WrappedState::new(vec![]),
                     htl: 0,
                     skip_list: Default::default(),
+                    replication_budget: 0,
                 },
             ),
             (

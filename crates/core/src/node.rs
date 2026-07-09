@@ -1177,6 +1177,7 @@ where
                         value,
                         htl,
                         skip_list,
+                        replication_budget,
                     } => {
                         if let Err(err) = put::op_ctx_task::start_relay_put(
                             op_manager.clone(),
@@ -1188,6 +1189,7 @@ where
                             *htl,
                             skip_list.clone(),
                             upstream_addr,
+                            *replication_budget,
                         )
                         .await
                         {
@@ -4765,6 +4767,7 @@ mod tests {
                 value: WrappedState::new(vec![1u8]),
                 htl: 5,
                 skip_list: std::collections::HashSet::new(),
+                replication_budget: 0,
             };
 
             let taken = put_branch_would_forward(&op, Some(&tx));
