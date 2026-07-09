@@ -1027,8 +1027,24 @@ async fn process_open_request(
                                 // (`maybe_subscribe_child`, the sole GET subscribe
                                 // path). If we were not already receiving updates (a
                                 // demandless every-hop copy), establish the upstream
-                                // subscription in the BACKGROUND so the client gets
-                                // ongoing updates — never blocking the served read.
+                                // subscription so the client gets ongoing updates. The
+                                // state itself was already served from the LOCAL copy
+                                // above (serve-DURING) regardless of the flag — only the
+                                // subscribe-registration wait differs here.
+                                //
+                                // `blocking_subscribe` is the client's real wire-API flag
+                                // and is LOAD-BEARING (#4524): when `true`, the served read
+                                // is held until the upstream subscription is registered, so
+                                // the client cannot see the `GetResponse` before its
+                                // downstream-subscriber chain exists (else an UPDATE sent
+                                // immediately after the response would race registration and
+                                // be missed — the exact bug #4524 fixed). Hardcoding `false`
+                                // here would silently downgrade an explicit
+                                // `blocking_subscribe=true` GET to fire-and-forget the moment
+                                // serve-DURING fires — a regression vs the network path,
+                                // which passes the real flag. When `false`, the subscribe is
+                                // spawned in the background and the served read returns
+                                // immediately.
                                 //
                                 // A subscribe=FALSE read establishes NOTHING: no durable
                                 // demand is created, the demandless copy stays fresh via
@@ -1036,18 +1052,19 @@ async fn process_open_request(
                                 // connection-drop-driven — P0 / #4642 piece F — and its
                                 // interest gate refuses a demandless copy), so a burst of
                                 // serve-DURING reads fans out ZERO re-links. This kick
-                                // fires only on an EXPLICIT client subscribe, and the
-                                // subscribe op is internally deduped + backoff-guarded, so
-                                // it cannot become a read storm. Gated on `!is_subscribed`
-                                // to avoid a redundant subscribe when an upstream already
-                                // exists.
+                                // fires only on an EXPLICIT client subscribe — the
+                                // client-subscribe origination path has no per-contract
+                                // dedup, so re-link volume is bounded by explicit client
+                                // subscribes plus the `!is_subscribed` gate (which skips a
+                                // redundant subscribe when an upstream already exists), not
+                                // by internal dedup. It therefore cannot become a read storm.
                                 if !is_subscribed {
                                     get::op_ctx_task::maybe_subscribe_child(
                                         &op_manager,
                                         crate::message::Transaction::new::<get::GetMsg>(),
                                         full_key,
-                                        true,  // subscribe
-                                        false, // blocking_subscribe: never block the served read
+                                        true,               // subscribe
+                                        blocking_subscribe, // honor the client's #4524 flag
                                     )
                                     .await;
                                 }
@@ -1838,5 +1855,57 @@ mod serve_during_gate_tests {
         assert!(should_serve_local_copy(true, 8, true, false));
         // Fresh in-mesh host (serve-DURING).
         assert!(should_serve_local_copy(true, 8, false, true));
+    }
+
+    /// #4524 regression guard (source-scrape): the serve-DURING subscribe kick
+    /// MUST forward the client's real `blocking_subscribe` flag to
+    /// `maybe_subscribe_child`, NOT a hardcoded `false`.
+    ///
+    /// `blocking_subscribe` is load-bearing (#4524): when `true` the served read
+    /// must be held until the upstream subscription is registered, so the client
+    /// cannot see the `GetResponse` before its downstream-subscriber chain exists
+    /// (else an UPDATE sent immediately after the response races registration and
+    /// is missed). Hardcoding `false` here silently downgrades an explicit
+    /// `blocking_subscribe=true` GET to fire-and-forget the moment serve-DURING
+    /// fires — a regression vs the network path, which passes the real flag.
+    ///
+    /// This deterministically FAILS on the pre-fix code (the fifth positional
+    /// arg was `false`) and PASSES once the real flag is forwarded. It mirrors
+    /// the codebase's source-scrape pin idiom (e.g.
+    /// `maybe_subscribe_child_short_circuits_on_false` in get/op_ctx_task.rs).
+    #[test]
+    fn serve_during_kick_forwards_real_blocking_subscribe_flag() {
+        const SOURCE: &str = include_str!("client_events.rs");
+        let call_start = SOURCE
+            .find("get::op_ctx_task::maybe_subscribe_child(")
+            .expect("serve-DURING kick must call maybe_subscribe_child");
+        // Slice the call up to its terminating `.await`.
+        let call_tail = &SOURCE[call_start..];
+        let call_end = call_tail
+            .find(".await")
+            .expect("maybe_subscribe_child call must be awaited");
+        let call = &call_tail[..call_end];
+
+        // Strip line comments so the pre-fix comment ("// blocking_subscribe:
+        // never block the served read") cannot mask the hardcoded `false`.
+        let args_only: String = call
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            args_only.contains("blocking_subscribe"),
+            "serve-DURING kick must forward the client's real `blocking_subscribe` \
+             flag to maybe_subscribe_child (#4524), not a hardcoded value. \
+             Call args: {args_only:?}"
+        );
+        assert!(
+            !args_only.contains("false"),
+            "serve-DURING kick must NOT pass a hardcoded `false` for \
+             blocking_subscribe — that silently downgrades an explicit \
+             blocking_subscribe=true GET to fire-and-forget (#4524 regression). \
+             Call args: {args_only:?}"
+        );
     }
 }

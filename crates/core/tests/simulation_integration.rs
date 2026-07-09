@@ -11011,6 +11011,142 @@ fn test_contract_migrates_to_close_cluster_resolving_get_dead_end() {
     );
 }
 
+/// serve-DURING e2e falsifier (#4642 R3 piece C): a CONNECTED node holding a
+/// DEMANDLESS every-hop copy answers a client GET from its LOCAL copy instead of
+/// routing the whole request through the network ("never dark on a read it could
+/// answer").
+///
+/// The node is seeded with `SeedDemandlessCopy`, which installs exactly the state
+/// a production every-hop GET/PUT store leaves on a relay hop: state present,
+/// `is_hosting_contract` true, `has_local_interest` true (interest `hosting`
+/// flag), but NO subscription (`is_receiving_updates` false) and NO prior local
+/// client access. That is the copy the PRE-serve-DURING originator gate
+/// (`is_hosting && has_local_client_access`) would REFUSE to serve — on `main`
+/// this GET forwards to the network. With serve-DURING (this branch) the gate's
+/// third term is `has_local_interest`, so the GET is served locally.
+///
+/// The falsifier reads the A3 hit/miss counters directly: a local serve
+/// increments `local_get_serves` (via `record_get_served_locally`) and a
+/// network forward increments `local_get_forwards` (via `record_get_forwarded`)
+/// — the two are mutually exclusive on the client GET path, so `serves >= 1 AND
+/// forwards == 0` proves the node never went dark. The node is asserted CONNECTED
+/// first, so the local serve is attributable to serve-DURING interest and NOT to
+/// the isolated-node (`connection_count == 0`) fallback.
+#[test_log::test]
+fn test_serve_during_demandless_copy_served_locally_never_dark() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0x5E27_D021_0001;
+    const NETWORK_NAME: &str = "serve-during-never-dark";
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0x5D);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new(
+            NETWORK_NAME,
+            1, // 1 gateway
+            3, // 3 regular nodes (node-1 holds the demandless copy)
+            7, // ring_max_htl
+            3, // rnd_if_htl_above
+            5, // max_connections
+            2, // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    // node-1 is the demandless-copy holder + the GET requester.
+    let holder = NodeLabel::node(NETWORK_NAME, 1);
+
+    let operations = vec![
+        // Seed a DEMANDLESS every-hop copy on node-1 (hosting + local interest,
+        // NO subscription, NO local client access). No network propagation.
+        ScheduledOperation::new(
+            holder.clone(),
+            SimOperation::SeedDemandlessCopy {
+                contract: contract.clone(),
+                state: vec![7, 7, 7, 7],
+            },
+        ),
+        // node-1 GETs the contract it already holds demandlessly. subscribe=false
+        // so this is a pure read (serve-DURING must serve it locally; a
+        // subscribe=false read establishes nothing).
+        ScheduledOperation::new(
+            holder.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // Precondition 1: node-1 is CONNECTED. Without this a local serve could be
+    // the isolated-node (`connection_count == 0`) fallback rather than
+    // serve-DURING, and the test would not exercise the piece-C gate.
+    let connections = result.node_open_connections(&holder);
+    assert!(
+        connections >= 1,
+        "node-1 must be connected for the serve to be attributable to \
+         serve-DURING interest (open_connections={connections})"
+    );
+
+    // Precondition 2: node-1 hosts the demandless copy.
+    assert!(
+        result.is_node_hosting(&holder, &contract_key),
+        "node-1 must hold the seeded demandless copy"
+    );
+
+    // Precondition 3: node-1 is NOT receiving updates (no subscription) — this is
+    // a demandless copy, so a local serve is attributable to `has_local_interest`
+    // and not to an active subscription keeping the copy fresh.
+    assert!(
+        !result.node_is_receiving_updates(&holder, &contract_key),
+        "the seeded copy must be DEMANDLESS (not subscribed) — otherwise the serve \
+         would be attributable to the subscription term, not serve-DURING"
+    );
+
+    // CORE FALSIFIER: the demandless-copy GET was served LOCALLY and the node
+    // never went dark. On `main` (pre-serve-DURING) this GET forwards, so
+    // `local_get_forwards` would be >= 1 and `local_get_serves` == 0.
+    let serves = result.node_local_get_serves(&holder);
+    let forwards = result.node_local_get_forwards(&holder);
+    assert_eq!(
+        forwards, 0,
+        "serve-DURING regression: a demandless-copy GET was ROUTED to the network \
+         (local_get_forwards={forwards}, local_get_serves={serves}) — the node went \
+         dark on a read it could answer locally"
+    );
+    assert!(
+        serves >= 1,
+        "serve-DURING: the demandless-copy GET must be answered from the local copy \
+         (local_get_serves={serves}, local_get_forwards={forwards})"
+    );
+
+    tracing::info!(
+        connections,
+        serves,
+        forwards,
+        "serve-DURING: demandless-copy GET served locally (never dark)"
+    );
+}
+
 /// Negative control for `test_contract_migrates_to_close_cluster_resolving_get_dead_end`.
 ///
 /// IDENTICAL scenario, but WITHOUT `enable_placement_migration()` — so the

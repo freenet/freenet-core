@@ -196,6 +196,29 @@ pub enum SimOperation {
         /// Initial state bytes
         state: Vec<u8>,
     },
+    /// Seed a **demandless every-hop copy** into a node's local store: state
+    /// present, `is_hosting_contract` true, `has_local_interest` true, but NO
+    /// subscription (`is_receiving_updates` false) and NO prior local client
+    /// access.
+    ///
+    /// This is the state a production every-hop GET/PUT store leaves on a RELAY
+    /// hop (`get`/`put` `op_ctx_task` call `register_local_hosting` without
+    /// `ring.subscribe` and, on a non-originator hop, without
+    /// `mark_local_client_access`). Unlike
+    /// [`SeedHostedContract`](Self::SeedHostedContract) — which registers an
+    /// active subscription, so the pre-serve-DURING gate already served it — a
+    /// demandless copy is exactly what the pre-serve-DURING originator gate
+    /// (`is_hosting && has_local_client_access`) would REFUSE to serve, forcing
+    /// a whole GET through the network for a copy the node already held fresh.
+    /// Use this to exercise serve-DURING (#4642 R3 piece C): a connected node
+    /// holding a demandless copy must answer a GET from its local copy instead
+    /// of going dark on the network.
+    SeedDemandlessCopy {
+        /// The contract container (code + parameters)
+        contract: ContractContainer,
+        /// Initial state bytes
+        state: Vec<u8>,
+    },
     /// Simulate a client disconnecting from this node.
     ///
     /// Emits `ClientRequest::Disconnect` through the same
@@ -362,6 +385,12 @@ impl SimOperation {
             SimOperation::SeedHostedContract { .. } => {
                 panic!(
                     "SeedHostedContract is not a client request — it must be handled \
+                     by run_controlled_simulation before event dispatch"
+                )
+            }
+            SimOperation::SeedDemandlessCopy { .. } => {
+                panic!(
+                    "SeedDemandlessCopy is not a client request — it must be handled \
                      by run_controlled_simulation before event dispatch"
                 )
             }
@@ -561,6 +590,49 @@ impl ControlledSimulationResult {
     /// its Ring). Handy for iterating per-node assertions.
     pub fn captured_node_labels(&self) -> Vec<NodeLabel> {
         self.node_rings.keys().cloned().collect()
+    }
+
+    /// Number of open ring connections `label`'s node held at the end of the run.
+    /// Returns 0 if the node never published its Ring. Used by the serve-DURING
+    /// falsifier to confirm the serving node was CONNECTED (so a local serve is
+    /// attributable to serve-DURING interest, not the isolated-node fallback).
+    pub fn node_open_connections(&self, label: &NodeLabel) -> usize {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.open_connections())
+            .unwrap_or(0)
+    }
+
+    /// Whether `label`'s node was actively receiving updates for `key` (has a
+    /// live network/client subscription keeping the copy fresh) at the end of the
+    /// run. Returns `false` if the node never published its Ring. The serve-DURING
+    /// falsifier asserts this is `false` for a demandless copy, so the local serve
+    /// is attributable to `has_local_interest`, not an active subscription.
+    pub fn node_is_receiving_updates(&self, label: &NodeLabel, key: &ContractKey) -> bool {
+        self.node_rings
+            .get(label)
+            .is_some_and(|ring| ring.is_receiving_updates(key))
+    }
+
+    /// Number of client GETs `label`'s node answered from local hosted state (A3
+    /// serve-DURING hit counter). Returns 0 if the node never published its Ring.
+    /// See [`Ring::local_get_serves`](crate::ring::Ring::local_get_serves).
+    pub fn node_local_get_serves(&self, label: &NodeLabel) -> u64 {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.local_get_serves())
+            .unwrap_or(0)
+    }
+
+    /// Number of client GETs `label`'s node routed to the network (A3 forward/miss
+    /// counter). Returns 0 if the node never published its Ring. The serve-DURING
+    /// falsifier asserts this stays 0 for a demandless-copy GET (never went dark).
+    /// See [`Ring::local_get_forwards`](crate::ring::Ring::local_get_forwards).
+    pub fn node_local_get_forwards(&self, label: &NodeLabel) -> u64 {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.local_get_forwards())
+            .unwrap_or(0)
     }
 
     /// Subscription-renewal metrics for the peer at `addr` (captured before the
@@ -951,11 +1023,39 @@ type DefaultRegistry = CombinedRegister<2>;
 #[cfg(not(feature = "trace-ot"))]
 type DefaultRegistry = TestEventListener;
 
+/// How a startup-seeded contract is registered on its owning node.
+///
+/// Threads the distinction between the two seed primitives from
+/// `run_controlled_simulation` down into [`in_memory::append_contracts`], which
+/// runs at node startup. Both store the state locally with no network
+/// propagation; they differ ONLY in the hosting/demand bookkeeping they install,
+/// which is exactly what the serve-DURING gate keys on.
+///
+/// The variants are only ever constructed by `run_controlled_simulation`
+/// (`#[cfg(any(test, feature = "testing"))]`), but `testing_impl` itself compiles
+/// in every build (e.g. `trace-ot`), where `append_contracts` still matches on
+/// this enum. So in a non-testing build the variants are legitimately never
+/// constructed — allow dead_code there, keeping the lint live under testing.
+#[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SeedMode {
+    /// Genuine host WITH an active subscription (`SeedHostedContract`):
+    /// `host_contract` + `ring.subscribe`, so `is_receiving_updates` is true.
+    Subscribed,
+    /// Demandless every-hop copy (`SeedDemandlessCopy`): `host_contract` +
+    /// `register_local_hosting` (interest `hosting = true`), with NO subscription
+    /// and NO prior local client access. This is the exact state a production
+    /// every-hop GET/PUT store leaves on a RELAY hop (`is_hosting_contract` and
+    /// `has_local_interest` true, `is_receiving_updates` false), which the
+    /// serve-DURING originator gate (#4642 R3 piece C) must serve locally.
+    Demandless,
+}
+
 pub(super) struct Builder<ER> {
     pub config: NodeConfig,
     contract_handler_name: String,
     event_register: ER,
-    contracts: Vec<(ContractContainer, WrappedState, bool)>,
+    contracts: Vec<(ContractContainer, WrappedState, SeedMode)>,
     contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     /// Pre-formed ring connections injected at node startup, bypassing the
     /// organic CONNECT handshake. Each entry is a peer this node should already
@@ -4230,6 +4330,11 @@ impl SimNetwork {
         // nodes are drained into Turmoil host closures) so startup
         // `append_contracts` registers genuine hosting + subscription.
         let mut seed_hosted_ops: Vec<(NodeLabel, ContractContainer, Vec<u8>)> = Vec::new();
+        // SeedDemandlessCopy operations: like seed_hosted_ops, but injected with
+        // `SeedMode::Demandless` so `append_contracts` registers a demandless
+        // every-hop copy (hosting + local interest, NO subscription) rather than
+        // a subscribed host. See serve-DURING (#4642 R3 piece C).
+        let mut seed_demandless_ops: Vec<(NodeLabel, ContractContainer, Vec<u8>)> = Vec::new();
         let mut event_ops: Vec<ScheduledOperation> = Vec::new();
         for scheduled_op in operations {
             match scheduled_op.operation {
@@ -4244,6 +4349,12 @@ impl SimNetwork {
                     ref state,
                 } => {
                     seed_hosted_ops.push((scheduled_op.node, contract.clone(), state.clone()));
+                }
+                SimOperation::SeedDemandlessCopy {
+                    ref contract,
+                    ref state,
+                } => {
+                    seed_demandless_ops.push((scheduled_op.node, contract.clone(), state.clone()));
                 }
                 SimOperation::Put { .. }
                 | SimOperation::Get { .. }
@@ -4280,11 +4391,38 @@ impl SimNetwork {
                         .find(|(_, cfg)| cfg.label == target_label)
                         .map(|(node, _)| &mut node.contracts)
                 })
-                .map(|contracts| contracts.push((contract, wrapped, true)))
+                .map(|contracts| contracts.push((contract, wrapped, SeedMode::Subscribed)))
                 .is_some();
             assert!(
                 injected,
                 "SeedHostedContract: node {target_label:?} not found among gateways/nodes"
+            );
+        }
+
+        // Inject SeedDemandlessCopy contracts with `SeedMode::Demandless`. Same
+        // injection point as the hosted seed above, but startup
+        // `append_contracts` installs a demandless every-hop copy (hosting +
+        // local interest, no subscription, no local client access) — the state a
+        // production every-hop store leaves on a relay hop, which serve-DURING
+        // (#4642 R3 piece C) must serve locally.
+        for (target_label, contract, state) in seed_demandless_ops {
+            let wrapped = WrappedState::new(state);
+            let injected = self
+                .nodes
+                .iter_mut()
+                .find(|(_, label)| *label == target_label)
+                .map(|(node, _)| &mut node.contracts)
+                .or_else(|| {
+                    self.gateways
+                        .iter_mut()
+                        .find(|(_, cfg)| cfg.label == target_label)
+                        .map(|(node, _)| &mut node.contracts)
+                })
+                .map(|contracts| contracts.push((contract, wrapped, SeedMode::Demandless)))
+                .is_some();
+            assert!(
+                injected,
+                "SeedDemandlessCopy: node {target_label:?} not found among gateways/nodes"
             );
         }
 
@@ -4349,9 +4487,12 @@ impl SimNetwork {
                 }
                 // Seed ops were split out before the numbering loop (see the
                 // separation match above), so they never reach here.
-                SimOperation::SeedContract { .. } | SimOperation::SeedHostedContract { .. } => {
+                SimOperation::SeedContract { .. }
+                | SimOperation::SeedHostedContract { .. }
+                | SimOperation::SeedDemandlessCopy { .. } => {
                     unreachable!(
-                        "SeedContract/SeedHostedContract are separated out before numbering"
+                        "SeedContract/SeedHostedContract/SeedDemandlessCopy are separated out \
+                         before numbering"
                     )
                 }
             }

@@ -2933,6 +2933,24 @@ impl Ring {
         self.hosting_manager.record_local_get_forward();
     }
 
+    /// Number of client GETs this node answered from local hosted state (A3
+    /// serve-DURING hit counter). Read accessor for the counter incremented by
+    /// [`Self::record_get_served_locally`]; used by the serve-DURING sim
+    /// falsifier to assert a demandless-copy GET was served locally, not routed.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn local_get_serves(&self) -> u64 {
+        self.hosting_manager.local_get_serves()
+    }
+
+    /// Number of client GETs this node routed to the network (A3 forward/miss
+    /// counter). Read accessor for the counter incremented by
+    /// [`Self::record_get_forwarded`]; the serve-DURING falsifier asserts this
+    /// stays `0` for a demandless-copy GET (the node never went dark).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn local_get_forwards(&self) -> u64 {
+        self.hosting_manager.local_get_forwards()
+    }
+
     /// Whether this node is hosting this contract (has it in cache).
     #[inline]
     pub fn is_hosting_contract(&self, key: &ContractKey) -> bool {

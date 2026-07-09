@@ -479,12 +479,12 @@ impl<ER> Builder<ER> {
 /// Append contracts to the op_manager before starting the event loop.
 async fn append_contracts(
     op_manager: &Arc<OpManager>,
-    contracts: Vec<(ContractContainer, WrappedState, bool)>,
+    contracts: Vec<(ContractContainer, WrappedState, super::SeedMode)>,
     _contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
     advertise_seeded_hosts: bool,
 ) -> anyhow::Result<()> {
     use crate::contract::ContractHandlerEvent;
-    for (contract, state, subscription) in contracts {
+    for (contract, state, mode) in contracts {
         let key: ContractKey = contract.key();
         let state_size = state.size() as u64;
         op_manager
@@ -496,35 +496,61 @@ async fn append_contracts(
             })
             .await?;
         tracing::debug!(
-            "Appended contract {} to peer {}",
+            "Appended contract {} to peer {} (mode {:?})",
             key,
-            op_manager.ring.connection_manager.get_own_addr().unwrap()
+            op_manager.ring.connection_manager.get_own_addr().unwrap(),
+            mode,
         );
-        if subscription {
-            op_manager
-                .ring
-                .host_contract(key, state_size, crate::ring::AccessType::Put);
-            // In the new lease-based model, register an active subscription
-            op_manager.ring.subscribe(key);
-            // OPT-IN (default off): register the contract in the
-            // neighbor-hosting advertised set so the connection-established
-            // HostingStateResponse exchange advertises it to neighbors.
-            //
-            // Without this, a startup-hosted contract (SeedHostedContract)
-            // leaves `my_contracts` empty and neighbors never learn this node
-            // hosts it. That matches the harness's historical behavior, so it
-            // stays the default — existing tests (e.g. the migration dead-end
-            // controls) rely on a seeded host NOT advertising, which keeps a
-            // key-routed GET dead-ending. A test that needs the seeded host to
-            // genuinely advertise (so the terminal advertisement consult can
-            // reach it) opts in via
-            // `SimNetwork::enable_seeded_host_advertisements`.
-            //
-            // The returned announcement is dropped because the node has no ring
-            // connections yet at startup (the exchange runs later, on
-            // connection-established).
-            if advertise_seeded_hosts {
-                let _ = op_manager.neighbor_hosting.on_contract_hosted(&key);
+        match mode {
+            super::SeedMode::Subscribed => {
+                op_manager
+                    .ring
+                    .host_contract(key, state_size, crate::ring::AccessType::Put);
+                // In the new lease-based model, register an active subscription
+                op_manager.ring.subscribe(key);
+                // OPT-IN (default off): register the contract in the
+                // neighbor-hosting advertised set so the connection-established
+                // HostingStateResponse exchange advertises it to neighbors.
+                //
+                // Without this, a startup-hosted contract (SeedHostedContract)
+                // leaves `my_contracts` empty and neighbors never learn this node
+                // hosts it. That matches the harness's historical behavior, so it
+                // stays the default — existing tests (e.g. the migration dead-end
+                // controls) rely on a seeded host NOT advertising, which keeps a
+                // key-routed GET dead-ending. A test that needs the seeded host to
+                // genuinely advertise (so the terminal advertisement consult can
+                // reach it) opts in via
+                // `SimNetwork::enable_seeded_host_advertisements`.
+                //
+                // The returned announcement is dropped because the node has no ring
+                // connections yet at startup (the exchange runs later, on
+                // connection-established).
+                if advertise_seeded_hosts {
+                    let _ = op_manager.neighbor_hosting.on_contract_hosted(&key);
+                }
+            }
+            super::SeedMode::Demandless => {
+                // Demandless every-hop copy (serve-DURING, #4642 R3 piece C).
+                // Install EXACTLY the state a production every-hop GET/PUT store
+                // leaves on a RELAY hop: the hosting-cache entry
+                // (`host_contract`, AccessType::Get — this is a stored copy, not
+                // a client-originated access) plus `register_local_hosting`,
+                // which sets the interest `hosting = true` flag so
+                // `has_local_interest` is true. Deliberately NO `ring.subscribe`
+                // (so `is_receiving_updates` stays false — this is a demandless,
+                // non-subscribed copy) and NO `mark_local_client_access` (no local
+                // client ever touched it). This is the state the pre-serve-DURING
+                // originator gate would NOT serve (its third term was
+                // `is_hosting && has_local_client_access`), forcing a whole GET
+                // through the network for a copy the node already held fresh.
+                op_manager
+                    .ring
+                    .host_contract(key, state_size, crate::ring::AccessType::Get);
+                let _ = op_manager.interest_manager.register_local_hosting(&key);
+                // Advertisement is a separate concern from the local serve gate
+                // (which keys on `has_local_interest`, a purely local signal), so
+                // a demandless copy is not advertised even under the opt-in — it
+                // matches the default "seeded host does not advertise" behavior.
             }
         }
         // Note: contract_subscribers is ignored in the new model.
