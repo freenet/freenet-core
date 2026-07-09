@@ -3766,6 +3766,46 @@ async fn drive_relay_probe(
         }
     };
 
+    // Mixed-version safety (#4642 step 3-bis staggered rollout): the routed
+    // next hop must ALSO understand the probe wire variants, not just the
+    // originator. `supports_summary_first_put` is applied at the originator
+    // (`drive_client_put_inner`), but a relay selects `next_addr` purely by
+    // routing (`closest_potentially_hosting`), so it can land on a pre-0.2.95
+    // peer that carries none of the `PutMsg` probe tags (6/7/8). Such a peer
+    // cannot bincode-deserialize the appended `ProbeRequest` tag and would
+    // DROP the connection on the decode failure — the exact connection churn
+    // the emission gate exists to prevent. Fail closed: treat THIS relay as
+    // the probe terminus and reply no-holder upstream, so the originator falls
+    // back to a full-state PUT (a summary-first failure must never break a
+    // PUT). Never emit the probe variant to an unsupported peer. See
+    // `ConnectionManager::supports_summary_first_put` and the originator gate.
+    if !op_manager
+        .ring
+        .connection_manager
+        .supports_summary_first_put(next_addr)
+    {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            %next_addr,
+            phase = "relay_probe_next_hop_pre_floor",
+            "PUT probe relay: next hop does not support summary-first probes; \
+             failing closed (reply no-holder) so the originator falls back to \
+             a full-state PUT"
+        );
+        return relay_probe_send_response(
+            op_manager,
+            incoming_tx,
+            key,
+            false,
+            hop_count,
+            None,
+            None,
+            upstream_addr,
+        )
+        .await;
+    }
+
     let new_htl = htl.saturating_sub(1);
     let forward = NetMessage::from(PutMsg::ProbeRequest {
         id: incoming_tx,
@@ -3959,6 +3999,33 @@ async fn drive_relay_probe_reconcile(
         }
         None => return Ok(()),
     };
+
+    // Mixed-version safety (#4642 step 3-bis staggered rollout): same
+    // fail-closed reasoning as `drive_relay_probe`, but `ProbeReconcile` is
+    // fire-and-forget with no reply variant. A pre-0.2.95 next hop carries
+    // none of the `PutMsg` probe tags (6/7/8), cannot bincode-deserialize the
+    // appended `ProbeReconcile` tag, and would DROP the connection on the
+    // decode failure. Do NOT forward it. Dropping is safe: the reconcile is
+    // best-effort, and with the bidirectional reverse-delta the originator's
+    // copy is already complete, so anti-entropy heals the downstream holder.
+    // Return Ok(()) like the other terminus-drop branches so nothing is
+    // escalated or crashed. See `ConnectionManager::supports_summary_first_put`.
+    if !op_manager
+        .ring
+        .connection_manager
+        .supports_summary_first_put(next_addr)
+    {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            %next_addr,
+            phase = "relay_probe_reconcile_next_hop_pre_floor",
+            "PUT probe-reconcile relay: next hop does not support \
+             summary-first; dropping (best-effort, anti-entropy heals the \
+             downstream holder)"
+        );
+        return Ok(());
+    }
 
     let new_htl = htl.saturating_sub(1);
     let forward = NetMessage::from(PutMsg::ProbeReconcile {
@@ -6899,6 +6966,99 @@ mod tests {
             body.contains("update::update_contract("),
             "drive_relay_probe_reconcile must merge via update::update_contract \
              so normal UPDATE fan-out propagates the delta"
+        );
+    }
+
+    /// Falsifier (mixed-version wire safety — Codex review of #4733): a relay
+    /// forwarding a `PutMsg::ProbeRequest` selects `next_addr` purely by
+    /// routing (`closest_potentially_hosting`), so the originator's emission
+    /// gate (`drive_client_put_inner`) does NOT cover it. Without a re-check
+    /// on the routed next hop, a relay can send the probe tag to a pre-0.2.95
+    /// peer that cannot bincode-deserialize it and would DROP the connection
+    /// during the staggered rollout. This pins that `drive_relay_probe`
+    /// re-checks `supports_summary_first_put(next_addr)` BEFORE constructing
+    /// the `ProbeRequest`, and that the unsupported branch fails closed
+    /// (replies no-holder so the originator falls back to a full-state PUT),
+    /// pinned via its distinctive tracing phase marker.
+    ///
+    /// Falsifies the pre-fix code: the relay body contained NO
+    /// `supports_summary_first_put` call at all, so `find` returned `None` and
+    /// the `expect` below panicked. Passes only with the fail-closed guard.
+    #[test]
+    fn drive_relay_probe_gates_probe_forward_on_next_hop_version() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_probe(")
+            .expect("drive_relay_probe not found");
+        let end = src[start..]
+            .find("\npub(crate) async fn start_relay_probe_reconcile(")
+            .expect("end of drive_relay_probe section not found")
+            + start;
+        let body = &src[start..end];
+
+        let gate_pos = body.find("supports_summary_first_put(next_addr)").expect(
+            "drive_relay_probe must re-check the ROUTED next hop's version \
+             support before emitting a ProbeRequest (mixed-version rollout \
+             safety) — a relay picks next_addr by routing, not covered by the \
+             originator's gate",
+        );
+        let forward_pos = body
+            .find("PutMsg::ProbeRequest {")
+            .expect("ProbeRequest forward construction missing");
+        assert!(
+            gate_pos < forward_pos,
+            "the version gate must run BEFORE the ProbeRequest is constructed \
+             and sent — a pre-0.2.95 next hop must never receive the probe tag",
+        );
+        assert!(
+            body.contains("relay_probe_next_hop_pre_floor"),
+            "the unsupported-next-hop branch must fail closed (reply \
+             no-holder), pinned via its distinctive tracing phase marker",
+        );
+    }
+
+    /// Falsifier (mixed-version wire safety — Codex review of #4733): the
+    /// `ProbeReconcile` relay forward has the SAME gap as the probe forward —
+    /// it selects `next_addr` by routing and must re-check the next hop's
+    /// version before emitting the `PutMsg::ProbeReconcile` tag. Because
+    /// `ProbeReconcile` is fire-and-forget with no reply variant, the
+    /// fail-closed behavior is to DROP (return `Ok(())`) rather than reply:
+    /// the reconcile is best-effort, and with the bidirectional reverse-delta
+    /// the originator's copy is already complete, so anti-entropy heals the
+    /// downstream holder.
+    ///
+    /// Falsifies the pre-fix code (no `supports_summary_first_put` call in the
+    /// reconcile relay body); passes only with the fail-closed guard.
+    #[test]
+    fn drive_relay_probe_reconcile_gates_forward_on_next_hop_version() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_probe_reconcile(")
+            .expect("drive_relay_probe_reconcile not found");
+        let end = src[start..]
+            .find("\n// ── End of relay PROBE driver")
+            .expect("end of drive_relay_probe_reconcile section not found")
+            + start;
+        let body = &src[start..end];
+
+        let gate_pos = body.find("supports_summary_first_put(next_addr)").expect(
+            "drive_relay_probe_reconcile must re-check the ROUTED next hop's \
+             version support before emitting a ProbeReconcile (mixed-version \
+             rollout safety)",
+        );
+        let forward_pos = body
+            .find("PutMsg::ProbeReconcile {")
+            .expect("ProbeReconcile forward construction missing");
+        assert!(
+            gate_pos < forward_pos,
+            "the version gate must run BEFORE the ProbeReconcile is \
+             constructed and sent — a pre-0.2.95 next hop must never receive \
+             the tag",
+        );
+        assert!(
+            body.contains("relay_probe_reconcile_next_hop_pre_floor"),
+            "the unsupported-next-hop branch must fail closed (drop, return \
+             Ok(())), pinned via its distinctive tracing phase marker",
         );
     }
 }
