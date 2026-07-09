@@ -744,11 +744,11 @@ impl Ring {
     /// A clone of the background-task shutdown token. Long-lived loops race
     /// their sleeps against [`CancellationToken::cancelled`] on this token via
     /// `tokio::select!`.
-    fn shutdown_token(&self) -> CancellationToken {
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
     }
 
-    fn upgrade_op_manager(&self) -> Option<Arc<OpManager>> {
+    pub(crate) fn upgrade_op_manager(&self) -> Option<Arc<OpManager>> {
         self.op_manager
             .read()
             .as_ref()
@@ -2421,123 +2421,18 @@ impl Ring {
                 if ring.mark_subscription_pending(contract) {
                     attempted += 1;
 
-                    // Spread tasks across the interval to avoid thundering-herd bursts.
-                    let jitter_ms = GlobalRng::random_range(0u64..=15_000);
-
-                    let op_manager_clone = op_manager.clone();
-                    let contract_key = contract;
-                    let task_shutdown = shutdown.clone();
-
-                    GlobalExecutor::spawn(async move {
-                        // Guard ensures complete_subscription_request is called even on panic.
-                        // Created BEFORE the jitter sleep so an early shutdown return below
-                        // still clears the `mark_subscription_pending` flag set above — the
-                        // guard's Drop marks the request failed (#4278).
-                        let guard =
-                            SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);
-
-                        // The jitter can be up to 15s; bail (dropping the guard, which
-                        // completes the pending request as failed) before doing any
-                        // renewal work if the node is shutting down (#4278).
-                        if sleep_or_shutdown(
-                            &task_shutdown,
-                            tokio::time::sleep(Duration::from_millis(jitter_ms)),
-                        )
-                        .await
-                        {
-                            return;
-                        }
-
-                        let instance_id = *contract_key.id();
-                        // Renewal driver: same machinery as
-                        // client-initiated SUBSCRIBE, with delivery
-                        // returned to this task instead of via
-                        // `result_router_tx`. `is_renewal=true` so
-                        // the responder skips sending state.
-                        //
-                        // Outer renewal cancel deadline: a pure backstop for a
-                        // *genuinely wedged* driver. In normal operation the
-                        // renewal driver self-terminates within
-                        // `RENEWAL_TASK_BUDGET` (slow peer) and then runs its
-                        // cleanup, so this deadline never fires.
-                        //
-                        // Issue #4350: the driver clamps each attempt's wait to
-                        // the budget remaining until its own task deadline
-                        // (`RENEWAL_TASK_BUDGET`, 20 s), so no attempt — first
-                        // or retry — is still awaiting when this outer cancel
-                        // fires; and the deadline is sized
-                        // (`renewal_outer_cancel`, 55 s) to clear the driver's
-                        // worst case (full-budget attempt + a fully
-                        // backpressured `release_pending_op_slot` cleanup, up to
-                        // `NOTIFICATION_SEND_TIMEOUT`). A task outliving the 30 s
-                        // recovery interval is safe: `mark_subscription_pending`
-                        // (released by `SubscriptionRecoveryGuard` on completion
-                        // or cancel) blocks a second concurrent renewal for the
-                        // same contract.
-                        let renewal_tx = crate::message::Transaction::new::<
-                            crate::operations::subscribe::SubscribeMsg,
-                        >();
-                        let renewal_deadline = Self::renewal_outer_cancel();
-                        let outcome_enum = match tokio::time::timeout(
-                            renewal_deadline,
-                            crate::operations::subscribe::run_renewal_subscribe(
-                                op_manager_clone.clone(),
-                                instance_id,
-                                renewal_tx,
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(outcome) => outcome,
-                            Err(_) => crate::operations::subscribe::RenewalOutcome::Failed {
-                                reason: format!(
-                                    "renewal task exceeded {}s cycle deadline",
-                                    renewal_deadline.as_secs()
-                                ),
-                            },
-                        };
-
-                        let (outcome, error_msg) = match outcome_enum {
-                            crate::operations::subscribe::RenewalOutcome::Success => {
-                                tracing::info!(
-                                    %contract_key,
-                                    "Subscription renewal succeeded"
-                                );
-                                guard.complete(true);
-                                ("success", None)
-                            }
-                            crate::operations::subscribe::RenewalOutcome::ChannelCongestion => {
-                                // Channel congestion is a local resource issue, not a
-                                // protocol failure. Don't penalize with backoff — just
-                                // clear the pending mark so the contract is eligible on
-                                // the next cycle.
-                                tracing::warn!(
-                                    %contract_key,
-                                    "Subscription renewal skipped (channel full), will retry next cycle"
-                                );
-                                guard.complete(true);
-                                ("dropped_channel_full", None)
-                            }
-                            crate::operations::subscribe::RenewalOutcome::Failed { reason } => {
-                                tracing::debug!(
-                                    %contract_key,
-                                    error = %reason,
-                                    "Subscription renewal failed (will retry with backoff)"
-                                );
-                                guard.complete(false);
-                                ("failed", Some(reason))
-                            }
-                        };
-
-                        crate::tracing::telemetry::send_standalone_event(
-                            "subscription_renewal_outcome",
-                            serde_json::json!({
-                                "contract": contract_key.to_string(),
-                                "outcome": outcome,
-                                "error": error_msg,
-                            }),
-                        );
-                    });
+                    // Re-root and renewal share ONE spawn path. Per design §5b
+                    // "re-rooting is just the renewal stream following the computed
+                    // upstream", the connection-drop PROMPT re-root (#4642 piece F,
+                    // `OpManager::spawn_prompt_reroots`) calls this SAME helper, so
+                    // the storm-safety scaffolding (jitter, recovery guard,
+                    // outer-cancel deadline, per-contract pending dedup) has a single
+                    // source of truth and cannot drift between the two callers.
+                    Self::spawn_renewal_subscribe_task(
+                        op_manager.clone(),
+                        contract,
+                        shutdown.clone(),
+                    );
                 }
                 // `mark_subscription_pending` returning false (a renewal for this
                 // contract is already in flight) needs no separate handling: the
@@ -2570,6 +2465,160 @@ impl Ring {
                 }
             }
         }
+    }
+
+    /// Spawn ONE renewal / re-root subscribe task for `contract_key` and return
+    /// immediately. The single storm-safe spawn path shared by the periodic
+    /// renewal loop ([`recover_orphaned_subscriptions`]) and the event-driven
+    /// connection-drop PROMPT re-root ([`OpManager::spawn_prompt_reroots`], #4642
+    /// piece F).
+    ///
+    /// # Why one helper, not two
+    ///
+    /// Per the demand-driven-hosting design §5b, "re-rooting is not a separate
+    /// operation — it is just the renewal stream following the computed upstream."
+    /// A prompt re-root and a scheduled renewal are the SAME wire action
+    /// (`run_renewal_subscribe`, which routes a single SUBSCRIBE toward the key to
+    /// the current computed upstream); the only difference is the trigger (a drop
+    /// event vs. a lease-age tick). Keeping ONE spawn path means the storm-safety
+    /// scaffolding lives in one place and cannot drift between callers (the
+    /// "manually-mirrored side effect" bug class, `bug-prevention-patterns.md`).
+    ///
+    /// # Make-before-break
+    ///
+    /// This issues a fresh SUBSCRIBE; it does NOT tear down any existing lease
+    /// first. The old upstream registration lapses on its own once this peer stops
+    /// renewing toward it (design §5b / §6), and the peer keeps serving its local
+    /// copy throughout (invariant 1 serve-DURING). So a re-root never drops the
+    /// subscription before the new root is acquired.
+    ///
+    /// # Per-contract rate cap (caller-owned)
+    ///
+    /// The caller MUST have already claimed the per-contract slot via
+    /// `mark_subscription_pending` (which blocks a second concurrent
+    /// renewal/re-root for the same contract until this task's
+    /// [`SubscriptionRecoveryGuard`] releases it) — that mark, plus
+    /// `can_request_subscription`'s exponential backoff, is the per-contract wire
+    /// rate cap. This helper only owns the jitter spread + outer-cancel deadline.
+    pub(crate) fn spawn_renewal_subscribe_task(
+        op_manager: Arc<OpManager>,
+        contract_key: ContractKey,
+        shutdown: CancellationToken,
+    ) {
+        // Spread tasks across the interval to avoid thundering-herd bursts. On a
+        // mass disconnect this jitter is what turns O(contracts) simultaneous
+        // re-subscribes into a spread-out trickle — the storm-safety knob for the
+        // piece-F prompt re-root caller as much as for the renewal loop.
+        let jitter_ms = GlobalRng::random_range(0u64..=15_000);
+
+        GlobalExecutor::spawn(async move {
+            // Guard ensures complete_subscription_request is called even on panic.
+            // Created BEFORE the jitter sleep so an early shutdown return below
+            // still clears the `mark_subscription_pending` flag set above — the
+            // guard's Drop marks the request failed (#4278).
+            let guard = SubscriptionRecoveryGuard::new(op_manager.clone(), contract_key);
+
+            // The jitter can be up to 15s; bail (dropping the guard, which
+            // completes the pending request as failed) before doing any
+            // renewal work if the node is shutting down (#4278).
+            if sleep_or_shutdown(
+                &shutdown,
+                tokio::time::sleep(Duration::from_millis(jitter_ms)),
+            )
+            .await
+            {
+                return;
+            }
+
+            let instance_id = *contract_key.id();
+            // Renewal driver: same machinery as
+            // client-initiated SUBSCRIBE, with delivery
+            // returned to this task instead of via
+            // `result_router_tx`. `is_renewal=true` so
+            // the responder skips sending state.
+            //
+            // Outer renewal cancel deadline: a pure backstop for a
+            // *genuinely wedged* driver. In normal operation the
+            // renewal driver self-terminates within
+            // `RENEWAL_TASK_BUDGET` (slow peer) and then runs its
+            // cleanup, so this deadline never fires.
+            //
+            // Issue #4350: the driver clamps each attempt's wait to
+            // the budget remaining until its own task deadline
+            // (`RENEWAL_TASK_BUDGET`, 20 s), so no attempt — first
+            // or retry — is still awaiting when this outer cancel
+            // fires; and the deadline is sized
+            // (`renewal_outer_cancel`, 55 s) to clear the driver's
+            // worst case (full-budget attempt + a fully
+            // backpressured `release_pending_op_slot` cleanup, up to
+            // `NOTIFICATION_SEND_TIMEOUT`). A task outliving the 30 s
+            // recovery interval is safe: `mark_subscription_pending`
+            // (released by `SubscriptionRecoveryGuard` on completion
+            // or cancel) blocks a second concurrent renewal for the
+            // same contract.
+            let renewal_tx =
+                crate::message::Transaction::new::<crate::operations::subscribe::SubscribeMsg>();
+            let renewal_deadline = Self::renewal_outer_cancel();
+            let outcome_enum = match tokio::time::timeout(
+                renewal_deadline,
+                crate::operations::subscribe::run_renewal_subscribe(
+                    op_manager.clone(),
+                    instance_id,
+                    renewal_tx,
+                ),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => crate::operations::subscribe::RenewalOutcome::Failed {
+                    reason: format!(
+                        "renewal task exceeded {}s cycle deadline",
+                        renewal_deadline.as_secs()
+                    ),
+                },
+            };
+
+            let (outcome, error_msg) = match outcome_enum {
+                crate::operations::subscribe::RenewalOutcome::Success => {
+                    tracing::info!(
+                        %contract_key,
+                        "Subscription renewal succeeded"
+                    );
+                    guard.complete(true);
+                    ("success", None)
+                }
+                crate::operations::subscribe::RenewalOutcome::ChannelCongestion => {
+                    // Channel congestion is a local resource issue, not a
+                    // protocol failure. Don't penalize with backoff — just
+                    // clear the pending mark so the contract is eligible on
+                    // the next cycle.
+                    tracing::warn!(
+                        %contract_key,
+                        "Subscription renewal skipped (channel full), will retry next cycle"
+                    );
+                    guard.complete(true);
+                    ("dropped_channel_full", None)
+                }
+                crate::operations::subscribe::RenewalOutcome::Failed { reason } => {
+                    tracing::debug!(
+                        %contract_key,
+                        error = %reason,
+                        "Subscription renewal failed (will retry with backoff)"
+                    );
+                    guard.complete(false);
+                    ("failed", Some(reason))
+                }
+            };
+
+            crate::tracing::telemetry::send_standalone_event(
+                "subscription_renewal_outcome",
+                serde_json::json!({
+                    "contract": contract_key.to_string(),
+                    "outcome": outcome,
+                    "error": error_msg,
+                }),
+            );
+        });
     }
 
     /// Background task to sweep expired entries from the GET subscription cache.
@@ -6597,6 +6646,42 @@ mod k_closest_source_tests {
         );
     }
 
+    /// Single-source-of-truth pin (#4642 piece F): the periodic renewal loop and
+    /// the event-driven connection-drop PROMPT re-root spawn through the SAME
+    /// helper (`spawn_renewal_subscribe_task`), so the storm-safety scaffolding
+    /// (jitter, recovery guard, outer-cancel deadline) cannot drift between the two
+    /// callers — the "manually-mirrored side effect" bug class
+    /// (`bug-prevention-patterns.md`). The re-root caller (`spawn_prompt_reroots`)
+    /// lives in `op_state_manager.rs` and is pinned from that side by
+    /// `connection_drop_re_root_is_driven`; this end pins the renewal loop.
+    #[test]
+    fn renewal_and_reroot_share_one_spawn_path() {
+        let src = production_source();
+        // The shared helper exists and owns the actual renewal wire action.
+        assert!(
+            src.contains("fn spawn_renewal_subscribe_task("),
+            "the shared renewal/re-root spawn helper must exist"
+        );
+        assert!(
+            src.contains("run_renewal_subscribe("),
+            "the shared spawn helper must drive run_renewal_subscribe"
+        );
+        // The renewal loop delegates to the shared helper rather than inlining the
+        // spawn (which is what let it drift from the re-root path before extraction).
+        let loop_body = extract_fn_body(src, "async fn recover_orphaned_subscriptions(");
+        assert!(
+            loop_body.contains("spawn_renewal_subscribe_task"),
+            "the renewal loop must delegate its spawn to spawn_renewal_subscribe_task, \
+             not inline it — otherwise the re-root path silently rots against it"
+        );
+        // ...and does NOT re-inline the run_renewal_subscribe call directly.
+        assert!(
+            !loop_body.contains("run_renewal_subscribe("),
+            "the renewal loop must NOT inline run_renewal_subscribe — it belongs to \
+             the shared helper so both callers stay in lockstep"
+        );
+    }
+
     /// Regression pin for the per-tick renewal-gate EVALUATION budget (Codex P2,
     /// #4725). The interest gate `OpManager::reconcile_wants_renewal` builds a
     /// fresh `ReconcileInputs` snapshot (a redb `get_state_size` read + an
@@ -6892,13 +6977,17 @@ mod renewal_ban_gate_source_tests {
             "ban gate (offset {gate_pos}) must run BEFORE \
              mark_subscription_pending (offset {mark_pending_pos})"
         );
+        // The outbound-egress driver (`run_renewal_subscribe`) now lives in the
+        // shared `spawn_renewal_subscribe_task` helper (#4642 piece F extraction);
+        // the loop reaches it via that call, which must only run for non-banned
+        // contracts.
         let spawn_pos = body
-            .find("run_renewal_subscribe(")
-            .expect("renewal loop must still spawn run_renewal_subscribe");
+            .find("spawn_renewal_subscribe_task(")
+            .expect("renewal loop must still spawn via spawn_renewal_subscribe_task");
         assert!(
             gate_pos < spawn_pos,
             "ban gate (offset {gate_pos}) must run BEFORE the \
-             run_renewal_subscribe outbound-egress spawn (offset {spawn_pos})"
+             spawn_renewal_subscribe_task outbound-egress spawn (offset {spawn_pos})"
         );
     }
 }

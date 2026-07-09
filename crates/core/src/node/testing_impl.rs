@@ -582,6 +582,7 @@ impl ControlledSimulationResult {
                 acc.terminus_satisfied += m.terminus_satisfied;
                 // Per-node peak → aggregate as the max across peers.
                 acc.max_cycle_batch = acc.max_cycle_batch.max(m.max_cycle_batch);
+                acc.max_reroot_batch = acc.max_reroot_batch.max(m.max_reroot_batch);
                 acc
             },
         )
