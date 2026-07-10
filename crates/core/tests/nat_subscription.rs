@@ -69,12 +69,11 @@
 //! contract itself, so the only way it can hold the contract locally is to
 //! fetch it. It cannot rely on PUT replication: the originator PUT on
 //! `host-peer` finalizes at `host-peer` (already at the contract location) and
-//! replicates exactly **one hop** toward the contract neighbourhood
-//! (`relay_put_replicate_forward`, #4509), which lands on the *gateway* (closer
-//! to the contract than `nat-peer`) — not on `nat-peer`. So a bare SUBSCRIBE on
-//! `nat-peer` raced contract presence that, for the farthest peer, often never
-//! arrives at all; that is the flake tracked in #4524 (a "contract not cached
-//! locally" rejection ~7-9s in).
+//! is not pushed onward to `nat-peer` (the PUT places copies along its routed
+//! path toward the contract, none of which is the far-side `nat-peer`). So a
+//! bare SUBSCRIBE on `nat-peer` raced contract presence that, for the farthest
+//! peer, often never arrives at all; that is the flake tracked in #4524 (a
+//! "contract not cached locally" rejection ~7-9s in).
 //!
 //! The deterministic fix is to use the supported non-host path: `nat-peer`
 //! issues `GET` with `subscribe=true`. The GET routes *toward* the contract
@@ -427,9 +426,9 @@ async fn test_nat_peer_remote_subscription_receives_update(ctx: &mut TestContext
     // NAT peer fetches the contract (with BLOCKING auto-subscribe) instead of
     // issuing a bare SUBSCRIBE. A bare `Subscribe` would be rejected "contract
     // WASM not cached locally" because nat-peer is the provable non-host and
-    // does not reliably receive the contract via PUT replication (the PUT
-    // replicates one hop toward the contract neighbourhood — onto the closer
-    // gateway, not nat-peer). `GET` routes *toward* the contract, so it reliably
+    // does not receive the contract via PUT replication (the PUT places copies
+    // along its routed path toward the contract, not on the far-side nat-peer).
+    // `GET` routes *toward* the contract, so it reliably
     // resolves on gateway/host-peer, fetches and caches the body on nat-peer,
     // and the GET driver registers the subscription through the SAME relay path:
     // the wire `SubscribeMsg::Request` carries no address, so each hop
