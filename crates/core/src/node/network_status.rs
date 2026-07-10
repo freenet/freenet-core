@@ -1174,6 +1174,26 @@ pub struct HostingSnapshot {
     /// budget pressure is first). May be truncated by the renderer; the full
     /// count is `contract_count`.
     pub contracts: Vec<HostedContractEntry>,
+    /// Aggregate on-disk bytes used by persisted contract state
+    /// (`DiskUsageTracker::stats().state_bytes`, #4683). `None` until the
+    /// disk tracker is configured and seeded (early startup) — distinct from
+    /// `Some(0)`, which means seeded-and-empty.
+    pub disk_state_bytes: Option<u64>,
+    /// Aggregate on-disk bytes used by `*.wasm` code blobs. Same
+    /// seeded-gate semantics as `disk_state_bytes`.
+    pub disk_wasm_bytes: Option<u64>,
+    /// Aggregate on-disk bytes used by the wasmtime compile cache. Same
+    /// seeded-gate semantics as `disk_state_bytes`.
+    pub disk_compile_cache_bytes: Option<u64>,
+    /// Sum of `disk_state_bytes` + `disk_wasm_bytes` + `disk_compile_cache_bytes`
+    /// — the aggregate the disk budget bounds. Same seeded-gate semantics.
+    pub disk_total_bytes: Option<u64>,
+    /// The aggregate disk budget the admission gate checks projected writes
+    /// against (`HostingManager::disk_budget_bytes`, #4702). `None` while it
+    /// is still `u64::MAX` — i.e. before the first 60s recompute installs a
+    /// real value — so the panel can distinguish "not yet computed" from a
+    /// genuine (if enormous) budget.
+    pub disk_budget_bytes: Option<u64>,
 }
 
 /// One hosted contract's demand-driven eviction row for the dashboard.

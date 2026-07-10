@@ -3841,6 +3841,24 @@ impl Ring {
             })
             .collect();
 
+        // Aggregate on-disk usage (#4683) + the disk budget the admission gate
+        // checks against (#4702), for the same "measuring…" pre-seed gate the
+        // `hosting_disk_*` telemetry gauges use (see the population above at
+        // the `RouterSnapshot` disk-usage block): `None` until the tracker is
+        // seeded, so an unseeded tracker is distinguishable from genuine zero
+        // usage.
+        let disk = self.hosting_manager.disk_usage_stats();
+        let disk_state_bytes = disk.map(|d| d.state_bytes);
+        let disk_wasm_bytes = disk.map(|d| d.wasm_bytes);
+        let disk_compile_cache_bytes = disk.map(|d| d.compile_cache_bytes);
+        let disk_total_bytes = disk.map(|d| d.total_bytes);
+        // `disk_budget_bytes` starts at `u64::MAX` until the first 60s
+        // recompute installs a real value (see `HostingManager::
+        // recompute_effective_budget`); surface that as `None` rather than an
+        // astronomical byte count.
+        let raw_disk_budget = self.hosting_manager.disk_budget_bytes();
+        let disk_budget_bytes = (raw_disk_budget != u64::MAX).then_some(raw_disk_budget);
+
         ns::HostingSnapshot {
             budget_bytes: stats.budget_bytes,
             used_bytes: stats.current_bytes,
@@ -3848,6 +3866,11 @@ impl Ring {
             budget_evictions_total: stats.budget_evictions_total,
             evictions_of_recently_read_total: stats.evictions_of_recently_read_total,
             contracts,
+            disk_state_bytes,
+            disk_wasm_bytes,
+            disk_compile_cache_bytes,
+            disk_total_bytes,
+            disk_budget_bytes,
         }
     }
 

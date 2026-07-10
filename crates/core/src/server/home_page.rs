@@ -2155,6 +2155,7 @@ mod tests {
                     eviction_eligible: false,
                 },
             ],
+            ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
@@ -2221,6 +2222,7 @@ mod tests {
                 // Higher score, but actually eligible → this is the real victim.
                 mk_hosted_entry("EVICTABLE", 2.0, true),
             ],
+            ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         let pinned_idx = html.find("PINNED_FULL").expect("pinned row present");
@@ -2256,6 +2258,7 @@ mod tests {
                 mk_hosted_entry("A", 0.10, false),
                 mk_hosted_entry("B", 2.0, false),
             ],
+            ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
         assert!(
@@ -2265,6 +2268,97 @@ mod tests {
         assert!(
             !html.contains("next to evict"),
             "no row may be badged when nothing is eviction-eligible — got:\n{html}"
+        );
+    }
+
+    // ─── Disk-usage tiles (follow-up to #4683/#4702) ────────────────
+
+    #[test]
+    fn hosting_card_disk_tiles_show_measuring_before_seed() {
+        use crate::node::network_status::HostingSnapshot;
+        // Disk fields default to `None` (tracker not yet seeded / budget not
+        // yet recomputed). The panel must render "measuring…" rather than a
+        // bogus 0 B or an astronomical u64::MAX byte count.
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 1,
+            budget_evictions_total: 0,
+            evictions_of_recently_read_total: 0,
+            contracts: vec![mk_hosted_entry("A", 1.0, false)],
+            disk_state_bytes: None,
+            disk_wasm_bytes: None,
+            disk_compile_cache_bytes: None,
+            disk_total_bytes: None,
+            disk_budget_bytes: None,
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Disk used"),
+            "disk-used tile label present — got:\n{html}"
+        );
+        assert!(
+            html.contains("Disk budget"),
+            "disk-budget tile label present — got:\n{html}"
+        );
+        assert!(
+            html.contains("Disk headroom"),
+            "disk-headroom tile label present — got:\n{html}"
+        );
+        let measuring_count = html.matches("measuring…").count();
+        assert_eq!(
+            measuring_count, 3,
+            "all three disk tiles must show 'measuring…' pre-seed — got:\n{html}"
+        );
+        assert!(
+            !html.contains("18446744073709551615"),
+            "u64::MAX must never leak into the rendered disk budget — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn hosting_card_disk_tiles_render_seeded_values() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 64 * 1024 * 1024,
+            contract_count: 1,
+            budget_evictions_total: 0,
+            evictions_of_recently_read_total: 0,
+            contracts: vec![mk_hosted_entry("A", 1.0, false)],
+            disk_state_bytes: Some(100 * 1024 * 1024),
+            disk_wasm_bytes: Some(20 * 1024 * 1024),
+            disk_compile_cache_bytes: Some(5 * 1024 * 1024),
+            disk_total_bytes: Some(125 * 1024 * 1024),
+            disk_budget_bytes: Some(500 * 1024 * 1024),
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            !html.contains("measuring…"),
+            "seeded snapshot must not show 'measuring…' — got:\n{html}"
+        );
+        assert!(
+            html.contains("125.0 MB"),
+            "disk-used total tile — got:\n{html}"
+        );
+        assert!(html.contains("500.0 MB"), "disk-budget tile — got:\n{html}");
+        // Headroom = budget(500) - used(125) = 375 MB.
+        assert!(
+            html.contains("375.0 MB"),
+            "disk-headroom tile (budget - used) — got:\n{html}"
+        );
+        // Breakdown surfaced in the title tooltip.
+        assert!(
+            html.contains("State: 100.0 MB")
+                && html.contains("WASM: 20.0 MB")
+                && html.contains("Compile cache: 5.0 MB"),
+            "per-component breakdown in tooltip — got:\n{html}"
+        );
+        assert!(
+            html.contains("min(RAM budget, disk budget)"),
+            "explanatory paragraph must mention the #4702 min(ram, disk) eviction floor — got:\n{html}"
         );
     }
 
