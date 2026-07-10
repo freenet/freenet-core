@@ -245,6 +245,74 @@ async fn drive_client_put_inner(
         None => op_manager.ring.connection_manager.own_location(),
     };
 
+    // ── Summary-first PUT (#4642 step 3-bis) ────────────────────────────────
+    //
+    // Best-effort front-end to the full-state retry loop below. On ANY
+    // failure (version gate closed, probe timeout/error, no holder found)
+    // this falls straight through to the unchanged `PutRetryDriver` loop —
+    // a summary-first failure must never break a PUT (risk-bounded graceful
+    // fallback; the full-state path remains the default and the fallback,
+    // per the hosting redesign's demand-driven invariants).
+    if let Some(target_addr) = current_target.socket_addr() {
+        if op_manager
+            .ring
+            .connection_manager
+            .supports_summary_first_put(target_addr)
+        {
+            if let SummaryFirstOutcome::ReconciledExisting { target, hop_count } =
+                try_summary_first_put(
+                    op_manager,
+                    client_tx,
+                    key,
+                    &contract,
+                    &related,
+                    &value,
+                    htl,
+                    &current_target,
+                    target_addr,
+                )
+                .await
+            {
+                // Existing-mesh delta case: the reconcile (if any delta was
+                // needed) has already been dispatched best-effort and the
+                // PUT is complete. The originator already holds a
+                // locally-merged copy from `try_summary_first_put`'s local
+                // store step, so it converges immediately at this node;
+                // confirming the reconcile landed at the remote holder
+                // (reverse-leg convergence) is a deliberate follow-up, not
+                // required for this PUT to report success correctly.
+                op_manager.completed(client_tx);
+                crate::node::network_status::record_op_result(
+                    crate::node::network_status::OpType::Put,
+                    true,
+                );
+                super::finalize_put_at_originator(
+                    op_manager,
+                    client_tx,
+                    key,
+                    PutFinalizationData {
+                        sender: target,
+                        hop_count: Some(hop_count),
+                        state_hash: None,
+                        state_size: None,
+                    },
+                    false,
+                    false,
+                )
+                .await;
+
+                maybe_subscribe_child(op_manager, client_tx, key, subscribe, blocking_subscribe)
+                    .await;
+
+                return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+                    ContractResponse::PutResponse { key },
+                ))));
+            }
+            // FallThrough: no holder found, or the probe failed — continue
+            // to the existing full-state driver below, unchanged.
+        }
+    }
+
     // Retry loop via shared driver (#3807).
     struct PutRetryDriver<'a> {
         op_manager: &'a OpManager,
@@ -502,6 +570,334 @@ async fn drive_client_put_inner(
         }
         RetryLoopOutcome::Unexpected => Err(OpError::UnexpectedOpState),
         RetryLoopOutcome::InfraError(err) => Err(err),
+    }
+}
+
+// --- Summary-first PUT (originator pre-phase, #4642 step 3-bis) ---
+
+/// Outcome of [`try_summary_first_put`].
+enum SummaryFirstOutcome {
+    /// A holder was found; a reconcile delta (if any was needed) has
+    /// already been dispatched best-effort and the PUT is complete. Carries
+    /// what `drive_client_put_inner` needs to finalize: the probed peer and
+    /// the forward-path hop count the `ProbeResponse` reported.
+    ReconciledExisting {
+        target: PeerKeyLocation,
+        hop_count: usize,
+    },
+    /// No holder found (genuinely new contract), or any step of the probe
+    /// failed — the caller falls through to the unchanged full-state
+    /// `PutRetryDriver` loop.
+    FallThrough,
+}
+
+/// Summary-first PUT attempt: best-effort front-end to the full-state
+/// retry loop in `drive_client_put_inner`. Probes `target` with just a
+/// state summary; if the mesh already holds the contract, ships only a
+/// delta instead of the full state. On ANY failure (local-store error,
+/// summary-compute error, probe timeout/error, no holder found) returns
+/// [`SummaryFirstOutcome::FallThrough`] — this function must never be the
+/// reason a PUT fails; the caller always has the full-state driver as a
+/// fallback.
+///
+/// Precondition: caller has already confirmed `target_addr` passes
+/// `ConnectionManager::supports_summary_first_put` (the mixed-version
+/// emission gate).
+#[allow(clippy::too_many_arguments)]
+async fn try_summary_first_put(
+    op_manager: &Arc<OpManager>,
+    client_tx: Transaction,
+    key: ContractKey,
+    contract: &ContractContainer,
+    related: &RelatedContracts<'static>,
+    value: &WrappedState,
+    htl: usize,
+    target: &PeerKeyLocation,
+    target_addr: SocketAddr,
+) -> SummaryFirstOutcome {
+    // (a) Store locally first — the same local-store path a relay hop uses
+    // (`relay_put_store_locally`: put_contract + host_contract +
+    // register_local_hosting + announce_contract_hosted) — so the
+    // originator can summarize/delta by key and becomes a genuine host
+    // (demand-driven: a real client-initiated PUT is genuine local
+    // demand). `ClientLocal` priority matches the originator-loopback arm
+    // of `put_store_priority`.
+    let merged_value = match relay_put_store_locally(
+        op_manager,
+        client_tx,
+        key,
+        value.clone(),
+        contract,
+        related.clone(),
+        htl,
+        crate::contract::Priority::ClientLocal,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::debug!(
+                tx = %client_tx,
+                contract = %key,
+                error = %err,
+                phase = "summary_first_local_store_failed",
+                "PUT summary-first: local store failed; falling through to full-state driver"
+            );
+            return SummaryFirstOutcome::FallThrough;
+        }
+    };
+
+    // (b) Compute our own summary of what we just stored.
+    let our_summary = match op_manager
+        .interest_manager
+        .get_contract_summary(op_manager, &key)
+        .await
+    {
+        Some(s) => s,
+        None => {
+            tracing::debug!(
+                tx = %client_tx,
+                contract = %key,
+                phase = "summary_first_summary_failed",
+                "PUT summary-first: failed to compute own summary; falling through \
+                 to full-state driver"
+            );
+            return SummaryFirstOutcome::FallThrough;
+        }
+    };
+
+    // (c) Probe `target` with the summary and await its reply on a fresh
+    // transaction — `send_and_await`/`send_to_and_await` are single-use per
+    // tx (see `OpCtx` rustdoc), and this probe is a separate round-trip
+    // from whatever attempt tx the full-state fallback may later use.
+    let probe_tx = Transaction::new::<PutMsg>();
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let probe_msg = NetMessage::from(PutMsg::ProbeRequest {
+        id: probe_tx,
+        contract_key: key,
+        summary: our_summary.clone(),
+        htl,
+        skip_list: own_addr.into_iter().collect::<HashSet<_>>(),
+    });
+    let mut ctx = op_manager.op_ctx(probe_tx);
+    let probe_timeout =
+        compute_put_attempt_timeout(op_manager.streaming_threshold, value, contract);
+    let round_trip =
+        tokio::time::timeout(probe_timeout, ctx.send_to_and_await(target_addr, probe_msg)).await;
+    op_manager.release_pending_op_slot(probe_tx).await;
+
+    let reply = match round_trip {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(err)) => {
+            tracing::debug!(
+                tx = %client_tx,
+                probe_tx = %probe_tx,
+                contract = %key,
+                error = %err,
+                phase = "summary_first_probe_failed",
+                "PUT summary-first: probe failed; falling through to full-state driver"
+            );
+            return SummaryFirstOutcome::FallThrough;
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                tx = %client_tx,
+                probe_tx = %probe_tx,
+                contract = %key,
+                phase = "summary_first_probe_timeout",
+                "PUT summary-first: probe timed out; falling through to full-state driver"
+            );
+            return SummaryFirstOutcome::FallThrough;
+        }
+    };
+
+    #[allow(clippy::wildcard_enum_match_arm)]
+    let (holder_found, probe_hop_count, holder_summary, reverse_delta) = match reply {
+        NetMessage::V1(NetMessageV1::Put(PutMsg::ProbeResponse {
+            holder_found,
+            hop_count,
+            holder_summary,
+            reverse_delta,
+            ..
+        })) => (holder_found, hop_count, holder_summary, reverse_delta),
+        _other => {
+            tracing::debug!(
+                tx = %client_tx,
+                probe_tx = %probe_tx,
+                contract = %key,
+                phase = "summary_first_unexpected_reply",
+                "PUT summary-first: unexpected probe reply; falling through to full-state driver"
+            );
+            return SummaryFirstOutcome::FallThrough;
+        }
+    };
+
+    if !holder_found {
+        tracing::debug!(
+            tx = %client_tx,
+            contract = %key,
+            phase = "summary_first_new_contract",
+            "PUT summary-first: no holder found (new contract); falling through \
+             to full-state driver"
+        );
+        let full_state_bytes = value
+            .size()
+            .saturating_add(contract.data().len())
+            .saturating_add(contract.params().size()) as u64;
+        record_put_probe_outcome(true, full_state_bytes);
+        return SummaryFirstOutcome::FallThrough;
+    }
+
+    let Some(their_summary) = holder_summary else {
+        // Wire invariant violation (`holder_found` without `holder_summary`)
+        // — treat defensively as a probe failure rather than trust a
+        // malformed/unexpected reply.
+        tracing::warn!(
+            tx = %client_tx,
+            contract = %key,
+            phase = "summary_first_missing_holder_summary",
+            "PUT summary-first: holder_found=true but holder_summary missing; \
+             falling through to full-state driver"
+        );
+        return SummaryFirstOutcome::FallThrough;
+    };
+
+    // Reverse leg of the bidirectional reconcile (#4642 step 3-bis): if the
+    // holder was ahead, it shipped back `reverse_delta` = what WE (the
+    // originator) are missing relative to the holder. Apply it to our own
+    // local copy via the SAME commutative UPDATE/merge path the holder uses
+    // for the forward `ProbeReconcile`, BEFORE we report client success, so
+    // the originator converges to the full merged state in this same
+    // round-trip instead of only healing later via anti-entropy. Best-effort:
+    // a merge failure does NOT un-complete the PUT — our own client value is
+    // already stored locally (step (a)), and we converge on the next
+    // read/anti-entropy instead. `Priority::ClientLocal` matches step (a)'s
+    // originator-loopback store.
+    if let Some(reverse_delta) = reverse_delta {
+        match crate::operations::update::update_contract(
+            op_manager,
+            key,
+            UpdateData::Delta(reverse_delta),
+            RelatedContracts::default(),
+            crate::contract::Priority::ClientLocal,
+        )
+        .await
+        {
+            Ok(_) => {
+                tracing::debug!(
+                    tx = %client_tx,
+                    contract = %key,
+                    phase = "summary_first_reverse_delta_merged",
+                    "PUT summary-first: applied holder's reverse delta to local \
+                     copy (originator converged in the same round-trip)"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    tx = %client_tx,
+                    contract = %key,
+                    error = %err,
+                    phase = "summary_first_reverse_delta_merge_failed",
+                    "PUT summary-first: reverse-delta merge failed (best-effort, \
+                     PUT still completes; originator converges via anti-entropy)"
+                );
+            }
+        }
+    }
+
+    let our_state_size = merged_value.size();
+    let delta = match op_manager
+        .interest_manager
+        .compute_delta(
+            op_manager,
+            &key,
+            &their_summary,
+            &our_summary,
+            our_state_size,
+        )
+        .await
+    {
+        Ok(delta) => delta,
+        Err(err) => {
+            tracing::debug!(
+                tx = %client_tx,
+                contract = %key,
+                error = %err,
+                phase = "summary_first_delta_failed",
+                "PUT summary-first: delta computation failed; falling through to \
+                 full-state driver"
+            );
+            return SummaryFirstOutcome::FallThrough;
+        }
+    };
+
+    // `Ok(None)` = the contract's delta relative to the holder's summary is
+    // empty (peer's state is already logically equivalent to ours) — the
+    // existing-mesh case still holds, just with nothing to send.
+    let delta_bytes = match delta {
+        Some(delta) => {
+            let bytes = delta.size() as u64;
+            let reconcile_tx = Transaction::new::<PutMsg>();
+            let reconcile_msg = NetMessage::from(PutMsg::ProbeReconcile {
+                id: reconcile_tx,
+                key,
+                delta,
+                htl,
+                skip_list: own_addr.into_iter().collect::<HashSet<_>>(),
+            });
+            let mut reconcile_ctx = op_manager.op_ctx(reconcile_tx);
+            if let Err(err) = reconcile_ctx
+                .send_fire_and_forget(target_addr, reconcile_msg)
+                .await
+            {
+                // Best-effort: `ProbeReconcile` is fire-and-forget by design
+                // (see its rustdoc). A dispatch failure here does not
+                // un-complete the PUT — the originator's own copy is
+                // already stored locally (step (a)); the target mesh just
+                // doesn't get this delta pushed proactively (it converges
+                // on the next read/update instead).
+                tracing::debug!(
+                    tx = %client_tx,
+                    reconcile_tx = %reconcile_tx,
+                    contract = %key,
+                    error = %err,
+                    phase = "summary_first_reconcile_dispatch_failed",
+                    "PUT summary-first: ProbeReconcile dispatch failed \
+                     (best-effort, PUT still completes)"
+                );
+            }
+            op_manager.release_pending_op_slot(reconcile_tx).await;
+            bytes
+        }
+        None => 0,
+    };
+
+    record_put_probe_outcome(false, delta_bytes);
+
+    SummaryFirstOutcome::ReconciledExisting {
+        target: target.clone(),
+        hop_count: probe_hop_count,
+    }
+}
+
+/// Feeds both the in-process test counter (`GlobalTestMetrics`) and the
+/// live dashboard counter (`network_status`) from a single call site, so
+/// the two can never drift relative to each other — see
+/// `.claude/rules/bug-prevention-patterns.md` ("Manually-mirrored
+/// telemetry counters").
+fn record_put_probe_outcome(new_contract: bool, bytes: u64) {
+    if new_contract {
+        crate::config::GlobalTestMetrics::record_put_probe_new_contract(bytes);
+        crate::node::network_status::record_put_bytes(
+            crate::node::network_status::PutProbeCase::NewContract,
+            bytes,
+        );
+    } else {
+        crate::config::GlobalTestMetrics::record_put_probe_existing_mesh_delta(bytes);
+        crate::node::network_status::record_put_bytes(
+            crate::node::network_status::PutProbeCase::ExistingMeshDelta,
+            bytes,
+        );
     }
 }
 
@@ -2989,6 +3385,672 @@ where
 
 // ── End of relay PUT driver ─────────────────────────────────────────────────
 
+// ── Relay PROBE driver (summary-first PUT, #4642 step 3-bis) ───────────────
+
+/// Spawn a relay driver for a fresh inbound `PutMsg::ProbeRequest`.
+///
+/// Mirrors [`start_relay_put`]'s dispatch shape (dedup via the shared
+/// `active_relay_put_txs` set, RAII inflight guard constructed before
+/// spawn, spawn), but the probe driver itself
+/// ([`drive_relay_probe`]) is much simpler: pure routing plus an
+/// `is_receiving_updates` check, never a local store. Gated by the same
+/// dispatch site in `node.rs::handle_pure_network_message_v1` and by the
+/// version-gated emission at the send side
+/// (`ConnectionManager::supports_summary_first_put`) — a pre-floor peer
+/// never receives this variant, so this driver needs no additional
+/// version check on the receive side.
+pub(crate) async fn start_relay_probe(
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    summary: StateSummary<'static>,
+    htl: usize,
+    skip_list: HashSet<SocketAddr>,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError> {
+    // Shares the PUT relay dedup set (same tx space; a `ProbeRequest`'s
+    // `id` never collides with a concurrent `PutMsg::Request`'s tx because
+    // every attempt/probe allocates a fresh `Transaction`).
+    if !op_manager.active_relay_put_txs.insert(incoming_tx) {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            %upstream_addr,
+            phase = "relay_probe_dedup_reject",
+            "PUT probe relay: duplicate ProbeRequest for in-flight tx, dropping"
+        );
+        return Ok(());
+    }
+
+    let guard = RelayProbeInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
+
+    GlobalExecutor::spawn(async move {
+        let _guard = guard;
+        if let Err(err) = drive_relay_probe(
+            &op_manager,
+            incoming_tx,
+            key,
+            summary,
+            htl,
+            skip_list,
+            upstream_addr,
+        )
+        .await
+        {
+            tracing::debug!(
+                tx = %incoming_tx,
+                contract = %key,
+                error = %err,
+                phase = "relay_probe_error",
+                "PUT probe relay: driver returned error"
+            );
+        }
+        // Release at driver exit — every path below either awaits a
+        // downstream reply via `send_to_and_await` (already interim-released,
+        // see `drive_relay_probe`) or sends the upstream `ProbeResponse` via
+        // `send_fire_and_forget`/`send_local_loopback`, both of which leave a
+        // fresh `pending_op_results[incoming_tx]` entry that only this
+        // release reclaims (mirrors `run_relay_put`'s non-loopback release).
+        op_manager.release_pending_op_slot(incoming_tx).await;
+    });
+    Ok(())
+}
+
+/// RAII guard removing `incoming_tx` from `active_relay_put_txs` on drop.
+/// Constructed BEFORE spawn (see `start_relay_probe`) so a pre-poll drop of
+/// the spawned future cannot permanently leak the dedup entry. Deliberately
+/// lighter than [`RelayPutInflightGuard`]: probes are not real PUT relays,
+/// so they do not touch the `RELAY_PUT_*` counters.
+struct RelayProbeInflightGuard {
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+}
+
+impl Drop for RelayProbeInflightGuard {
+    fn drop(&mut self) {
+        self.op_manager
+            .active_relay_put_txs
+            .remove(&self.incoming_tx);
+    }
+}
+
+/// Send `PutMsg::ProbeResponse` upstream. Mirrors
+/// [`relay_put_send_response`]'s loopback-aware shape: fire-and-forget over
+/// the wire, or `send_local_loopback` when this driver happens to be
+/// running on the originator's own node. In practice a probe relay's
+/// `upstream_addr` is always a genuine remote peer address — `ProbeRequest`
+/// is only ever dispatched over the wire (`send_to_and_await` /
+/// `send_fire_and_forget` with a real target), never via
+/// `send_local_loopback` — but the check is kept for defensive symmetry
+/// with the PUT relay path.
+#[allow(clippy::too_many_arguments)]
+async fn relay_probe_send_response(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    holder_found: bool,
+    hop_count: usize,
+    holder_summary: Option<StateSummary<'static>>,
+    reverse_delta: Option<StateDelta<'static>>,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError> {
+    let msg = NetMessage::from(PutMsg::ProbeResponse {
+        id: incoming_tx,
+        key,
+        holder_found,
+        hop_count,
+        holder_summary,
+        reverse_delta,
+    });
+    let mut ctx = op_manager.op_ctx(incoming_tx);
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    if Some(upstream_addr) == own_addr {
+        ctx.send_local_loopback(msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    } else {
+        ctx.send_fire_and_forget(upstream_addr, msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    }
+}
+
+/// Compute the reverse-leg delta a fresh holder ships back to a summary-first
+/// PUT originator (#4642 step 3-bis, bidirectional reconcile): the delta the
+/// ORIGINATOR is missing relative to the holder's state. This is the exact
+/// mirror of the originator's forward delta — the holder already has both
+/// inputs (the originator's summary arrived on the `ProbeRequest`, and it has
+/// its own state) — so it reuses `InterestManager::compute_delta`, and
+/// therefore the SAME `is_delta_efficient` gate the forward leg uses (a
+/// summary-size proxy for delta size: the delta is skipped when the
+/// originator's summary is ≥ ~50% of the holder's state size).
+///
+/// Returns `None` (skip the reverse leg — the originator heals via a normal
+/// GET / anti-entropy rather than receiving a bloated or absent delta) when:
+/// - the originator is already current (`compute_delta` → `Ok(None)`, empty
+///   delta),
+/// - the reverse delta would be inefficient or is uncomputable
+///   (`compute_delta` → `Err`), or
+/// - the holder's own state size can't be read (no efficiency input).
+async fn compute_probe_reverse_delta(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: &ContractKey,
+    originator_summary: &StateSummary<'static>,
+    holder_summary: &StateSummary<'static>,
+) -> Option<StateDelta<'static>> {
+    let Some(our_state_size) = op_manager
+        .interest_manager
+        .get_contract_state_size(op_manager, key)
+        .await
+    else {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            phase = "relay_probe_reverse_delta_no_state_size",
+            "PUT probe: could not read holder state size for the reverse \
+             delta; skipping reverse leg (originator heals via GET/anti-entropy)"
+        );
+        return None;
+    };
+
+    // `their_summary` = the originator's summary (what the originator has);
+    // `our_summary` = the holder's summary. `compute_delta` returns the delta
+    // that transforms the originator's state into ours — i.e. exactly what
+    // the originator is missing.
+    let computed = op_manager
+        .interest_manager
+        .compute_delta(
+            op_manager,
+            key,
+            originator_summary,
+            holder_summary,
+            our_state_size,
+        )
+        .await;
+    if let Err(ref err) = computed {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            error = %err,
+            phase = "relay_probe_reverse_delta_skipped",
+            "PUT probe: reverse delta unavailable (inefficient or compute \
+             failed); originator heals via GET/anti-entropy"
+        );
+    }
+    reverse_delta_from_compute_result(computed)
+}
+
+/// Map an [`InterestManager::compute_delta`](crate::ring::interest::InterestManager::compute_delta)
+/// result to the reverse-leg delta a holder ships in
+/// `PutMsg::ProbeResponse::reverse_delta`.
+///
+/// `Ok(Some)` ships the delta; `Ok(None)` (the originator is already current —
+/// the contract produced an empty delta) and `Err` (the delta is inefficient
+/// or uncomputable) both ship nothing (`None`), leaving the originator to
+/// heal via a normal GET / anti-entropy. Kept as a pure function so the three
+/// arms are unit-testable without a live contract handler.
+fn reverse_delta_from_compute_result(
+    computed: Result<Option<StateDelta<'static>>, String>,
+) -> Option<StateDelta<'static>> {
+    computed.unwrap_or(None)
+}
+
+/// Routes a `PutMsg::ProbeRequest` toward `key`, or answers it directly when
+/// this hop is a fresh holder.
+///
+/// # Lazy host-on-next-read (Fable F5 amplification fix)
+///
+/// This function never calls `put_contract` / `host_contract` /
+/// `announce_contract_hosted` — a probe-routing hop that does not already
+/// host `key` must only ROUTE, never store or fetch. Do NOT add a local
+/// store here — see `.claude/rules/hosting-invariants.md` invariant 2
+/// (hosting is demand-driven, never manufactured by a route-through) and
+/// the "Relay-caching" anti-pattern. Hosting for a genuinely new contract
+/// happens on the full-state `PutMsg::Request` path (every-hop placement,
+/// `relay_put_store_locally`); hosting for an existing mesh happens lazily
+/// on the contract's next real read.
+async fn drive_relay_probe(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    summary: StateSummary<'static>,
+    htl: usize,
+    skip_list: HashSet<SocketAddr>,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError> {
+    let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+
+    // `is_receiving_updates` (subscribed OR local-client-subscribed) is the
+    // FRESH-holder signal, not `is_hosting_contract` (mere cache membership,
+    // which may be stale — see `.claude/rules/hosting-invariants.md`,
+    // `feedback_hosted_cache_freshness`). A stale cached copy must not
+    // short-circuit the probe into reporting a holder.
+    if op_manager.ring.is_receiving_updates(&key) {
+        let holder_summary = op_manager
+            .interest_manager
+            .get_contract_summary(op_manager, &key)
+            .await;
+        return match holder_summary {
+            Some(s) => {
+                // Reverse leg of the bidirectional reconcile (#4642 step
+                // 3-bis): compute the delta the ORIGINATOR is missing
+                // relative to our (the holder's) state — the mirror of the
+                // originator's forward delta. `summary` is the originator's
+                // summary carried on the ProbeRequest; `s` is our own. We
+                // ship it back in `ProbeResponse::reverse_delta` so the
+                // originator converges to the full merged state in the SAME
+                // round-trip instead of healing only later via anti-entropy.
+                // `None` (skip the reverse leg — originator heals via a
+                // normal GET / anti-entropy) when the originator is already
+                // current (empty delta) or the reverse delta would be
+                // inefficient / uncomputable; see `compute_probe_reverse_delta`.
+                let reverse_delta =
+                    compute_probe_reverse_delta(op_manager, incoming_tx, &key, &summary, &s).await;
+                relay_probe_send_response(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    true,
+                    hop_count,
+                    Some(s),
+                    reverse_delta,
+                    upstream_addr,
+                )
+                .await
+            }
+            None => {
+                // Summary computation failed despite being a genuine
+                // holder. Fail safe: report no-holder so the originator
+                // falls through to the full-state `Request` path. Shipping
+                // full state to a peer that already hosts the contract is
+                // an idempotent no-op at the contract layer (extra bytes,
+                // not a correctness break) — the risk-bounded
+                // graceful-fallback design.
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    phase = "relay_probe_summary_failed",
+                    "PUT probe: is_receiving_updates but summary computation \
+                     failed; reporting no-holder so the originator falls \
+                     through to full-state PUT"
+                );
+                relay_probe_send_response(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    false,
+                    hop_count,
+                    None,
+                    None,
+                    upstream_addr,
+                )
+                .await
+            }
+        };
+    }
+
+    // Not a fresh holder here: route toward the key, mirroring
+    // `drive_relay_put`'s next-hop selection and #4363 terminus guard
+    // (`put_routing_should_terminate`), without any of the storage side
+    // effects.
+    let mut new_skip_list = skip_list;
+    new_skip_list.insert(upstream_addr);
+    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+        new_skip_list.insert(own_addr);
+    }
+
+    let next_hop = if htl > 0 {
+        op_manager
+            .ring
+            .closest_potentially_hosting(&key, &new_skip_list)
+    } else {
+        None
+    };
+
+    let next_addr = match next_hop {
+        Some(peer) => {
+            let target = crate::ring::Location::from(&key);
+            let own_loc = op_manager.ring.connection_manager.own_location().location();
+            let upstream_loc = op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_addr(upstream_addr)
+                .and_then(|p| p.location());
+            let next_hop_loc = peer.location();
+            if put_routing_should_terminate(upstream_loc, own_loc, next_hop_loc, target) {
+                return relay_probe_send_response(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    false,
+                    hop_count,
+                    None,
+                    None,
+                    upstream_addr,
+                )
+                .await;
+            }
+            match peer.socket_addr() {
+                Some(a) => a,
+                None => {
+                    return relay_probe_send_response(
+                        op_manager,
+                        incoming_tx,
+                        key,
+                        false,
+                        hop_count,
+                        None,
+                        None,
+                        upstream_addr,
+                    )
+                    .await;
+                }
+            }
+        }
+        None => {
+            return relay_probe_send_response(
+                op_manager,
+                incoming_tx,
+                key,
+                false,
+                hop_count,
+                None,
+                None,
+                upstream_addr,
+            )
+            .await;
+        }
+    };
+
+    // Mixed-version safety (#4642 step 3-bis staggered rollout): the routed
+    // next hop must ALSO understand the probe wire variants, not just the
+    // originator. `supports_summary_first_put` is applied at the originator
+    // (`drive_client_put_inner`), but a relay selects `next_addr` purely by
+    // routing (`closest_potentially_hosting`), so it can land on a pre-0.2.95
+    // peer that carries none of the `PutMsg` probe tags (6/7/8). Such a peer
+    // cannot bincode-deserialize the appended `ProbeRequest` tag and would
+    // DROP the connection on the decode failure — the exact connection churn
+    // the emission gate exists to prevent. Fail closed: treat THIS relay as
+    // the probe terminus and reply no-holder upstream, so the originator falls
+    // back to a full-state PUT (a summary-first failure must never break a
+    // PUT). Never emit the probe variant to an unsupported peer. See
+    // `ConnectionManager::supports_summary_first_put` and the originator gate.
+    if !op_manager
+        .ring
+        .connection_manager
+        .supports_summary_first_put(next_addr)
+    {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            %next_addr,
+            phase = "relay_probe_next_hop_pre_floor",
+            "PUT probe relay: next hop does not support summary-first probes; \
+             failing closed (reply no-holder) so the originator falls back to \
+             a full-state PUT"
+        );
+        return relay_probe_send_response(
+            op_manager,
+            incoming_tx,
+            key,
+            false,
+            hop_count,
+            None,
+            None,
+            upstream_addr,
+        )
+        .await;
+    }
+
+    let new_htl = htl.saturating_sub(1);
+    let forward = NetMessage::from(PutMsg::ProbeRequest {
+        id: incoming_tx,
+        contract_key: key,
+        summary,
+        htl: new_htl,
+        skip_list: new_skip_list,
+    });
+
+    let mut ctx = op_manager.op_ctx(incoming_tx);
+    let round_trip =
+        tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(next_addr, forward)).await;
+    // Interim release, mirroring `drive_relay_put`'s post-`send_to_and_await`
+    // release: the downstream reply has already arrived (or timed out), and
+    // the upstream `ProbeResponse` send below re-registers under the same
+    // tx; the final release happens at `start_relay_probe`'s driver exit.
+    op_manager.release_pending_op_slot(incoming_tx).await;
+
+    let reply = match round_trip {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(err)) => return Err(err),
+        Err(_elapsed) => return Err(OpError::UnexpectedOpState),
+    };
+
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match reply {
+        NetMessage::V1(NetMessageV1::Put(PutMsg::ProbeResponse {
+            holder_found,
+            hop_count: downstream_hop_count,
+            holder_summary,
+            reverse_delta,
+            ..
+        })) => {
+            // Pass the reverse leg straight through: only the terminal
+            // holder can compute the delta the originator is missing, so an
+            // intermediate routing hop just relays it upstream unchanged
+            // (same as `holder_summary`).
+            relay_probe_send_response(
+                op_manager,
+                incoming_tx,
+                key,
+                holder_found,
+                downstream_hop_count,
+                holder_summary,
+                reverse_delta,
+                upstream_addr,
+            )
+            .await
+        }
+        _other => Err(OpError::UnexpectedOpState),
+    }
+}
+
+/// Spawn a relay driver for a fresh inbound `PutMsg::ProbeReconcile`.
+///
+/// Mirrors [`start_relay_probe`]'s dispatch shape. `ProbeReconcile` has no
+/// reply variant (fire-and-forget both directions — see the type's
+/// rustdoc), so unlike the probe driver there is no downstream round-trip
+/// to await; [`drive_relay_probe_reconcile`] either merges locally or
+/// forwards once and returns.
+pub(crate) async fn start_relay_probe_reconcile(
+    op_manager: Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    delta: StateDelta<'static>,
+    htl: usize,
+    skip_list: HashSet<SocketAddr>,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError> {
+    if !op_manager.active_relay_put_txs.insert(incoming_tx) {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            %upstream_addr,
+            phase = "relay_probe_reconcile_dedup_reject",
+            "PUT probe-reconcile relay: duplicate ProbeReconcile for in-flight tx, dropping"
+        );
+        return Ok(());
+    }
+
+    let guard = RelayProbeInflightGuard {
+        op_manager: op_manager.clone(),
+        incoming_tx,
+    };
+
+    GlobalExecutor::spawn(async move {
+        let _guard = guard;
+        if let Err(err) = drive_relay_probe_reconcile(
+            &op_manager,
+            incoming_tx,
+            key,
+            delta,
+            htl,
+            skip_list,
+            upstream_addr,
+        )
+        .await
+        {
+            tracing::debug!(
+                tx = %incoming_tx,
+                contract = %key,
+                error = %err,
+                phase = "relay_probe_reconcile_error",
+                "PUT probe-reconcile relay: driver returned error"
+            );
+        }
+        // A forwarded reconcile (fire-and-forget) registers a fresh
+        // `pending_op_results[incoming_tx]` entry that nothing will ever
+        // reply to (no `ProbeReconcile` response variant); reclaim it here.
+        // A no-op if the merge branch ran instead (nothing was registered).
+        op_manager.release_pending_op_slot(incoming_tx).await;
+    });
+    Ok(())
+}
+
+/// Merge an inbound delta at a fresh holder, or forward the reconcile
+/// toward `key` when this hop is not (yet) a holder.
+///
+/// Best-effort: a reconcile that reaches a routing terminus with no holder
+/// is dropped rather than escalated — the wire invariant is that
+/// `ProbeReconcile` is only ever sent after a `ProbeResponse` proved a
+/// holder exists somewhere along this route (a genuinely new contract goes
+/// the no-holder full-state `PutMsg::Request` path instead — see
+/// `try_summary_first_put`). Same lazy host-on-next-read note as
+/// [`drive_relay_probe`] applies: a non-holder hop only routes, it never
+/// stores.
+async fn drive_relay_probe_reconcile(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    delta: StateDelta<'static>,
+    htl: usize,
+    skip_list: HashSet<SocketAddr>,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError> {
+    if op_manager.ring.is_receiving_updates(&key) {
+        // Merge via the same path an UPDATE uses; the contract executor
+        // fans the change out to the rest of the subscriber mesh
+        // automatically on a real state change (`BroadcastStateChange`,
+        // see `contract.rs`) — no explicit broadcast call needed here.
+        if let Err(err) = crate::operations::update::update_contract(
+            op_manager,
+            key,
+            UpdateData::Delta(delta),
+            RelatedContracts::default(),
+            crate::contract::Priority::NetworkRelay,
+        )
+        .await
+        {
+            tracing::debug!(
+                tx = %incoming_tx,
+                contract = %key,
+                error = %err,
+                phase = "relay_probe_reconcile_merge_failed",
+                "PUT probe-reconcile: delta merge failed (best-effort)"
+            );
+        }
+        return Ok(());
+    }
+
+    let mut new_skip_list = skip_list;
+    new_skip_list.insert(upstream_addr);
+    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+        new_skip_list.insert(own_addr);
+    }
+
+    if htl == 0 {
+        return Ok(());
+    }
+
+    let next_hop = op_manager
+        .ring
+        .closest_potentially_hosting(&key, &new_skip_list);
+    let next_addr = match next_hop {
+        Some(peer) => {
+            let target = crate::ring::Location::from(&key);
+            let own_loc = op_manager.ring.connection_manager.own_location().location();
+            let upstream_loc = op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_addr(upstream_addr)
+                .and_then(|p| p.location());
+            let next_hop_loc = peer.location();
+            if put_routing_should_terminate(upstream_loc, own_loc, next_hop_loc, target) {
+                return Ok(());
+            }
+            match peer.socket_addr() {
+                Some(a) => a,
+                None => return Ok(()),
+            }
+        }
+        None => return Ok(()),
+    };
+
+    // Mixed-version safety (#4642 step 3-bis staggered rollout): same
+    // fail-closed reasoning as `drive_relay_probe`, but `ProbeReconcile` is
+    // fire-and-forget with no reply variant. A pre-0.2.95 next hop carries
+    // none of the `PutMsg` probe tags (6/7/8), cannot bincode-deserialize the
+    // appended `ProbeReconcile` tag, and would DROP the connection on the
+    // decode failure. Do NOT forward it. Dropping is safe: the reconcile is
+    // best-effort, and with the bidirectional reverse-delta the originator's
+    // copy is already complete, so anti-entropy heals the downstream holder.
+    // Return Ok(()) like the other terminus-drop branches so nothing is
+    // escalated or crashed. See `ConnectionManager::supports_summary_first_put`.
+    if !op_manager
+        .ring
+        .connection_manager
+        .supports_summary_first_put(next_addr)
+    {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            %next_addr,
+            phase = "relay_probe_reconcile_next_hop_pre_floor",
+            "PUT probe-reconcile relay: next hop does not support \
+             summary-first; dropping (best-effort, anti-entropy heals the \
+             downstream holder)"
+        );
+        return Ok(());
+    }
+
+    let new_htl = htl.saturating_sub(1);
+    let forward = NetMessage::from(PutMsg::ProbeReconcile {
+        id: incoming_tx,
+        key,
+        delta,
+        htl: new_htl,
+        skip_list: new_skip_list,
+    });
+    let mut ctx = op_manager.op_ctx(incoming_tx);
+    if let Err(err) = ctx.send_fire_and_forget(next_addr, forward).await {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            target = %next_addr,
+            error = %err,
+            phase = "relay_probe_reconcile_forward_failed",
+            "PUT probe-reconcile: forward failed (best-effort)"
+        );
+    }
+    Ok(())
+}
+
+// ── End of relay PROBE driver ───────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2999,6 +4061,51 @@ mod tests {
 
     fn dummy_tx() -> Transaction {
         Transaction::new::<PutMsg>()
+    }
+
+    /// Bidirectional summary-first reconcile (#4642 step 3-bis): the
+    /// reverse-leg mapping ships a `ProbeResponse::reverse_delta` ONLY when
+    /// the holder is genuinely ahead. All three `compute_delta` outcomes map
+    /// correctly:
+    /// - `Ok(Some)` → ship the delta (holder ahead),
+    /// - `Ok(None)` (originator already current — contract returned an empty
+    ///   delta) → ship NOTHING,
+    /// - `Err` (delta inefficient / uncomputable — SAME gate as the forward
+    ///   leg) → ship NOTHING.
+    ///
+    /// The two `None` arms are the "originator already current / heal via a
+    /// normal GET or anti-entropy" fallback: the reconcile must not emit a
+    /// phantom reverse delta when there is nothing (or nothing efficient) to
+    /// send. This is the deterministic falsifier for the "empty-reverse-delta
+    /// case sends nothing" requirement — the CRDT mock never emits an empty
+    /// delta, so the `Ok(None)` path can't be reached in the sim tests and is
+    /// pinned here instead.
+    #[test]
+    fn reverse_delta_from_compute_result_maps_all_arms() {
+        // Holder ahead: a real reverse delta is shipped back to the originator.
+        let shipped = reverse_delta_from_compute_result(Ok(Some(StateDelta::from(vec![1, 2, 3]))));
+        assert_eq!(
+            shipped.as_ref().map(|d| d.as_ref().to_vec()),
+            Some(vec![1, 2, 3]),
+            "Ok(Some) must ship the holder's reverse delta"
+        );
+
+        // Originator already current (empty delta from the contract): send nothing.
+        let already_current = reverse_delta_from_compute_result(Ok(None));
+        assert!(
+            already_current.is_none(),
+            "Ok(None) (originator already current) must send NO reverse delta"
+        );
+
+        // Delta inefficient or uncomputable: send nothing — the originator
+        // heals via a normal GET / anti-entropy instead of receiving a
+        // bloated or absent delta.
+        let inefficient =
+            reverse_delta_from_compute_result(Err("Delta not efficient for this contract".into()));
+        assert!(
+            inefficient.is_none(),
+            "Err (inefficient/uncomputable) must send NO reverse delta"
+        );
     }
 
     /// Regression for #4363: on a sparse/bootstrap topology a PUT
@@ -5692,6 +6799,266 @@ mod tests {
              channel-safety rule: never `send().await` from inside a \
              driver body. The helper must use `try_send` and drop+log \
              on Full instead."
+        );
+    }
+
+    // ============ Summary-first PUT pin tests (#4642 step 3-bis) ============
+
+    /// Pin: the summary-first block in `drive_client_put_inner` MUST check
+    /// `supports_summary_first_put` BEFORE calling `try_summary_first_put` —
+    /// the mixed-version emission gate has to run first so a pre-floor peer
+    /// is never probed (it cannot bincode-deserialize the appended
+    /// `ProbeRequest` tag). Also pins that the full-state `PutRetryDriver`
+    /// loop remains reachable afterward (the gate-closed / FallThrough
+    /// path), i.e. summary-first PUT is a strict front-end, never a
+    /// replacement.
+    #[test]
+    fn drive_client_put_inner_gates_summary_first_emission_on_version_support() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_client_put_inner(")
+            .expect("drive_client_put_inner not found");
+        let end = src[start..]
+            .find("\n// --- Summary-first PUT (originator pre-phase")
+            .expect("end of drive_client_put_inner not found")
+            + start;
+        let body = &src[start..end];
+        let gate_pos = body
+            .find("supports_summary_first_put(target_addr)")
+            .expect("version gate call missing");
+        let try_pos = body
+            .find("try_summary_first_put(")
+            .expect("try_summary_first_put call missing");
+        assert!(
+            gate_pos < try_pos,
+            "drive_client_put_inner must check supports_summary_first_put \
+             BEFORE calling try_summary_first_put"
+        );
+        assert!(
+            body.contains("struct PutRetryDriver"),
+            "the full-state PutRetryDriver loop must remain reachable \
+             (FallThrough / gate-closed path) after the summary-first block"
+        );
+    }
+
+    /// Pin: `drive_relay_probe` must NEVER store, host, or announce the
+    /// contract locally. A probe-routing hop that does not already host the
+    /// contract must only ROUTE — see the lazy host-on-next-read note
+    /// (Fable F5 amplification fix) on the function itself and
+    /// `.claude/rules/hosting-invariants.md` invariant 2. Mirrors the style
+    /// of `drive_relay_put_stores_locally_before_forwarding`, but asserts
+    /// the opposite property for the probe path.
+    #[test]
+    fn drive_relay_probe_never_stores_locally() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_probe(")
+            .expect("drive_relay_probe not found");
+        let end = src[start..]
+            .find("\npub(crate) async fn start_relay_probe_reconcile(")
+            .expect("end of drive_relay_probe section not found")
+            + start;
+        let body = &src[start..end];
+        assert!(
+            !body.contains("relay_put_store_locally("),
+            "drive_relay_probe must NEVER call relay_put_store_locally — a \
+             probe-routing hop that is not already a holder must only ROUTE"
+        );
+        assert!(
+            !body.contains("host_contract("),
+            "drive_relay_probe must NEVER call host_contract directly"
+        );
+        assert!(
+            !body.contains("put_contract("),
+            "drive_relay_probe must NEVER call put_contract directly"
+        );
+    }
+
+    /// Pin: probe holder detection MUST use `Ring::is_receiving_updates`
+    /// (subscribed OR local-client-subscribed — the fresh-holder signal),
+    /// never `is_hosting_contract` (mere cache membership, which may be
+    /// stale). See `.claude/rules/hosting-invariants.md`,
+    /// `feedback_hosted_cache_freshness`.
+    #[test]
+    fn drive_relay_probe_uses_is_receiving_updates_not_is_hosting_contract() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_probe(")
+            .expect("drive_relay_probe not found");
+        let end = src[start..]
+            .find("\npub(crate) async fn start_relay_probe_reconcile(")
+            .expect("end of drive_relay_probe section not found")
+            + start;
+        let body = &src[start..end];
+        assert!(
+            body.contains("is_receiving_updates(&key)"),
+            "drive_relay_probe must gate holder detection on \
+             Ring::is_receiving_updates"
+        );
+        assert!(
+            !body.contains("is_hosting_contract("),
+            "drive_relay_probe must NOT use is_hosting_contract for holder \
+             detection"
+        );
+    }
+
+    /// Pin: the probe forward decrements htl (mirroring `drive_relay_put`)
+    /// and both holder-found and no-holder replies are reachable — the
+    /// driver must be able to answer `ProbeResponse` with `holder_found`
+    /// true (fresh holder answers directly) as well as false (summary
+    /// failed, routing terminus, no next hop, or a bubbled-up downstream
+    /// no-holder reply).
+    #[test]
+    fn drive_relay_probe_forwards_with_decremented_htl_and_responds_both_holder_states() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_probe(")
+            .expect("drive_relay_probe not found");
+        let end = src[start..]
+            .find("\npub(crate) async fn start_relay_probe_reconcile(")
+            .expect("end of drive_relay_probe section not found")
+            + start;
+        let body = &src[start..end];
+        assert!(
+            body.contains("let new_htl = htl.saturating_sub(1);"),
+            "drive_relay_probe must decrement htl before forwarding"
+        );
+        assert!(
+            body.contains("htl: new_htl,"),
+            "the forwarded ProbeRequest must carry the decremented htl"
+        );
+        let call_count = body.matches("relay_probe_send_response(").count();
+        assert!(
+            call_count >= 4,
+            "expected at least 4 relay_probe_send_response call sites \
+             (holder found, summary-failed, terminus, no-next-hop) — \
+             found {call_count}"
+        );
+    }
+
+    /// Pin: `drive_relay_probe_reconcile` merges via the same
+    /// `is_receiving_updates` fresh-holder signal as the probe path (never
+    /// `is_hosting_contract`), and merges through `update::update_contract`
+    /// rather than hand-rolling a contract-handler call — this is what
+    /// lets normal UPDATE fan-out propagate the reconciled delta to the
+    /// rest of the subscriber mesh automatically.
+    #[test]
+    fn drive_relay_probe_reconcile_merges_via_update_contract_on_holder() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_probe_reconcile(")
+            .expect("drive_relay_probe_reconcile not found");
+        let end = src[start..]
+            .find("\n// ── End of relay PROBE driver")
+            .expect("end of drive_relay_probe_reconcile section not found")
+            + start;
+        let body = &src[start..end];
+        assert!(
+            body.contains("is_receiving_updates(&key)"),
+            "drive_relay_probe_reconcile must gate the merge decision on \
+             Ring::is_receiving_updates"
+        );
+        assert!(
+            !body.contains("is_hosting_contract("),
+            "drive_relay_probe_reconcile must NOT use is_hosting_contract"
+        );
+        assert!(
+            body.contains("update::update_contract("),
+            "drive_relay_probe_reconcile must merge via update::update_contract \
+             so normal UPDATE fan-out propagates the delta"
+        );
+    }
+
+    /// Falsifier (mixed-version wire safety — Codex review of #4733): a relay
+    /// forwarding a `PutMsg::ProbeRequest` selects `next_addr` purely by
+    /// routing (`closest_potentially_hosting`), so the originator's emission
+    /// gate (`drive_client_put_inner`) does NOT cover it. Without a re-check
+    /// on the routed next hop, a relay can send the probe tag to a pre-0.2.95
+    /// peer that cannot bincode-deserialize it and would DROP the connection
+    /// during the staggered rollout. This pins that `drive_relay_probe`
+    /// re-checks `supports_summary_first_put(next_addr)` BEFORE constructing
+    /// the `ProbeRequest`, and that the unsupported branch fails closed
+    /// (replies no-holder so the originator falls back to a full-state PUT),
+    /// pinned via its distinctive tracing phase marker.
+    ///
+    /// Falsifies the pre-fix code: the relay body contained NO
+    /// `supports_summary_first_put` call at all, so `find` returned `None` and
+    /// the `expect` below panicked. Passes only with the fail-closed guard.
+    #[test]
+    fn drive_relay_probe_gates_probe_forward_on_next_hop_version() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_probe(")
+            .expect("drive_relay_probe not found");
+        let end = src[start..]
+            .find("\npub(crate) async fn start_relay_probe_reconcile(")
+            .expect("end of drive_relay_probe section not found")
+            + start;
+        let body = &src[start..end];
+
+        let gate_pos = body.find("supports_summary_first_put(next_addr)").expect(
+            "drive_relay_probe must re-check the ROUTED next hop's version \
+             support before emitting a ProbeRequest (mixed-version rollout \
+             safety) — a relay picks next_addr by routing, not covered by the \
+             originator's gate",
+        );
+        let forward_pos = body
+            .find("PutMsg::ProbeRequest {")
+            .expect("ProbeRequest forward construction missing");
+        assert!(
+            gate_pos < forward_pos,
+            "the version gate must run BEFORE the ProbeRequest is constructed \
+             and sent — a pre-0.2.95 next hop must never receive the probe tag",
+        );
+        assert!(
+            body.contains("relay_probe_next_hop_pre_floor"),
+            "the unsupported-next-hop branch must fail closed (reply \
+             no-holder), pinned via its distinctive tracing phase marker",
+        );
+    }
+
+    /// Falsifier (mixed-version wire safety — Codex review of #4733): the
+    /// `ProbeReconcile` relay forward has the SAME gap as the probe forward —
+    /// it selects `next_addr` by routing and must re-check the next hop's
+    /// version before emitting the `PutMsg::ProbeReconcile` tag. Because
+    /// `ProbeReconcile` is fire-and-forget with no reply variant, the
+    /// fail-closed behavior is to DROP (return `Ok(())`) rather than reply:
+    /// the reconcile is best-effort, and with the bidirectional reverse-delta
+    /// the originator's copy is already complete, so anti-entropy heals the
+    /// downstream holder.
+    ///
+    /// Falsifies the pre-fix code (no `supports_summary_first_put` call in the
+    /// reconcile relay body); passes only with the fail-closed guard.
+    #[test]
+    fn drive_relay_probe_reconcile_gates_forward_on_next_hop_version() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_probe_reconcile(")
+            .expect("drive_relay_probe_reconcile not found");
+        let end = src[start..]
+            .find("\n// ── End of relay PROBE driver")
+            .expect("end of drive_relay_probe_reconcile section not found")
+            + start;
+        let body = &src[start..end];
+
+        let gate_pos = body.find("supports_summary_first_put(next_addr)").expect(
+            "drive_relay_probe_reconcile must re-check the ROUTED next hop's \
+             version support before emitting a ProbeReconcile (mixed-version \
+             rollout safety)",
+        );
+        let forward_pos = body
+            .find("PutMsg::ProbeReconcile {")
+            .expect("ProbeReconcile forward construction missing");
+        assert!(
+            gate_pos < forward_pos,
+            "the version gate must run BEFORE the ProbeReconcile is \
+             constructed and sent — a pre-0.2.95 next hop must never receive \
+             the tag",
+        );
+        assert!(
+            body.contains("relay_probe_reconcile_next_hop_pre_floor"),
+            "the unsupported-next-hop branch must fail closed (drop, return \
+             Ok(())), pinned via its distinctive tracing phase marker",
         );
     }
 }

@@ -900,27 +900,44 @@ pub(crate) fn version_supports_subscribe_hint(
 /// Minimum negotiated protocol version a peer must report before this node
 /// may emit the summary-first PUT probe/dispatch variants
 /// ([`PutMsg::ProbeRequest`](crate::operations::put::PutMsg) /
-/// `PutMsg::ProbeResponse`).
+/// `PutMsg::ProbeResponse` / `PutMsg::ProbeReconcile`).
 ///
-/// # INERT (#4642, step 3-bis)
+/// # Emission gate (#4642, step 3-bis)
 ///
-/// No code emits those variants yet — the probe→dispatch driver and its
-/// send path are a LATER piece paired with every-hop placement. This floor
-/// and [`version_supports_summary_first_put`] are the emission gate that
-/// later piece will consult, so a pre-floor peer — which cannot
-/// bincode-deserialize the appended tags and would drop the connection —
-/// never receives them. The value is the release that first carries the
-/// variants in the enum (this scaffolding PR); the emitting piece MUST
-/// confirm/raise it to the release that first EMITS if that is later. Only
-/// peer pairs both on `>= this floor` will exchange probes, so activation
-/// ramps with fleet upgrade rather than switching on everywhere at once
-/// (the SubscribeHint model). Frozen once emission ships, per the
-/// wire-gated-floor rule in `docs/RELEASING.md`.
+/// Consulted by `ConnectionManager::supports_summary_first_put`, which the
+/// originator's PUT driver (`operations::put::op_ctx_task`) checks before
+/// probing a target: a pre-floor peer cannot bincode-deserialize the
+/// appended tags and would drop the connection, so it must never receive
+/// them.
 ///
-/// INERT: read only by the gate's own unit tests today; the emitting piece
-/// (later) is its first production consumer.
-#[allow(dead_code)]
-pub(crate) const SUMMARY_FIRST_PUT_MIN_VERSION: (u8, u8, u16) = (0, 2, 93);
+/// The floor MUST equal the version that first carries the probe/dispatch
+/// wire variants AND their handler — both land together in this PR, there is
+/// no separate inert-scaffolding release. A peer on any earlier release does
+/// not carry the `ProbeRequest`/`ProbeResponse`/`ProbeReconcile` variants at
+/// all (`PutMsg` tags 6/7/8): it cannot bincode-deserialize the appended tag,
+/// and the decode failure DROPS the connection. Emitting a probe to such a
+/// peer during the 0-4h staggered rollout would churn live connections. The
+/// floor therefore must equal the first release that carries these variants.
+///
+/// The `ProbeRequest`/`ProbeResponse`/`ProbeReconcile` variants and their
+/// handler first ship together in **0.2.95** (this PR). The earlier
+/// scaffolding PR #4718 was NEVER merged, so no released version carries the
+/// variants inert: 0.2.93 and 0.2.94 are both already released and have NONE
+/// of the probe variants. Per the wire-gated-floor rule in `docs/RELEASING.md`
+/// ("set the floor to exactly the release that first EMITS the feature, then
+/// freeze"), the floor is `(0, 2, 95)`, the release this behavioral piece
+/// ships in. Only peer pairs both on `>= this floor` will exchange probes, so
+/// activation ramps with fleet upgrade rather than switching on everywhere at
+/// once (the SubscribeHint model).
+///
+/// RELEASE-TIME CHECK (do NOT skip): this constant MUST equal the actual
+/// shipping version. If the release that first emits the probe ends up being
+/// something other than 0.2.95 (a slipped or renumbered release), update this
+/// constant to match that version before cutting the release, then freeze it.
+/// A floor lower than the shipping version reintroduces the decode-failure
+/// connection-drop rollout bug above; a floor higher silently disables the
+/// feature against fully-capable peers.
+pub(crate) const SUMMARY_FIRST_PUT_MIN_VERSION: (u8, u8, u16) = (0, 2, 95);
 
 /// Pure version-gate for the summary-first PUT probe/dispatch variants,
 /// mirroring [`version_supports_subscribe_hint`]: returns `true` iff
@@ -932,10 +949,6 @@ pub(crate) const SUMMARY_FIRST_PUT_MIN_VERSION: (u8, u8, u16) = (0, 2, 93);
 /// do NOT emit. Factored out (with an explicit `floor` param) so the gate
 /// is unit-testable independent of the production
 /// [`SUMMARY_FIRST_PUT_MIN_VERSION`].
-///
-/// INERT: no caller emits yet (see [`SUMMARY_FIRST_PUT_MIN_VERSION`]); this
-/// is the predicate the emitting piece will guard its send path with.
-#[allow(dead_code)]
 pub(crate) fn version_supports_summary_first_put(
     remote: Option<(u8, u8, u16)>,
     floor: (u8, u8, u16),
@@ -3554,13 +3567,17 @@ mod tests {
             assert!(!version_supports_subscribe_hint(None, (0, 0, 0)));
         }
 
-        // ---- Summary-first PUT probe/dispatch gate (INERT, #4642) ----
-        // Same fail-closed semantics as the SubscribeHint gate. These are
-        // the emission gate a LATER piece consults before sending the
-        // `PutMsg::ProbeRequest` / `ProbeResponse` variants; nothing emits
-        // them yet, so this asserts the gate is correct in isolation.
+        // ---- Summary-first PUT probe/dispatch gate (#4642) ----
+        // Same fail-closed semantics as the SubscribeHint gate. This is the
+        // emission gate the originator's PUT driver consults before sending
+        // the `PutMsg::ProbeRequest` / `ProbeResponse` / `ProbeReconcile`
+        // variants (this PR wires that emission); the tests assert the gate
+        // is correct in isolation.
 
-        const SF_FLOOR: (u8, u8, u16) = (0, 2, 93);
+        // Mirrors the production `SUMMARY_FIRST_PUT_MIN_VERSION`: the probe
+        // variants + handler first ship together in 0.2.95 (this PR), so the
+        // floor is (0, 2, 95). No released version carries the variants inert.
+        const SF_FLOOR: (u8, u8, u16) = (0, 2, 95);
 
         /// The mixed-version interop guarantee, expressed at the gate: an
         /// UNKNOWN remote version fails closed, so a summary-first-capable
@@ -3575,8 +3592,22 @@ mod tests {
 
         /// A pre-floor peer (older than the release that first carries the
         /// probe variants) is never sent the probe — it could not decode it.
+        /// `(0, 2, 94)` is explicitly included: it is the HIGHEST already-
+        /// released version, and it does NOT carry the probe variants (they
+        /// first ship in 0.2.95, this PR — the earlier scaffolding PR #4718
+        /// never merged). So a 0.2.94 peer must be rejected just like any
+        /// other pre-floor peer; a probe would fail to decode and drop the
+        /// connection.
         #[test]
         fn summary_first_older_remote_version_is_rejected() {
+            assert!(!version_supports_summary_first_put(
+                Some((0, 2, 94)),
+                SF_FLOOR
+            ));
+            assert!(!version_supports_summary_first_put(
+                Some((0, 2, 93)),
+                SF_FLOOR
+            ));
             assert!(!version_supports_summary_first_put(
                 Some((0, 2, 92)),
                 SF_FLOOR
@@ -3593,11 +3624,7 @@ mod tests {
         #[test]
         fn summary_first_equal_or_newer_remote_version_is_accepted() {
             assert!(version_supports_summary_first_put(
-                Some((0, 2, 93)),
-                SF_FLOOR
-            ));
-            assert!(version_supports_summary_first_put(
-                Some((0, 2, 94)),
+                Some((0, 2, 95)),
                 SF_FLOOR
             ));
             assert!(version_supports_summary_first_put(

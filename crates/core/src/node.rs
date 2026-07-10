@@ -57,6 +57,15 @@ pub(crate) use network_bridge::{
 // (The module-cache metrics were a sibling process-global until #4488 made them
 // a per-node `Arc`.)
 pub(crate) use network_bridge::broadcast_queue::BROADCAST_STREAM_METRICS;
+// Re-export the summary-first PUT version gate (#4642 step 3-bis) so
+// `ring::connection_manager::ConnectionManager::supports_summary_first_put`
+// can consult it — the gate lives behind the private `network_bridge`
+// module, so a sibling top-level module (`ring`) needs a targeted
+// re-export rather than a path through `network_bridge` directly. Mirrors
+// `BROADCAST_STREAM_METRICS` above.
+pub(crate) use network_bridge::p2p_protoc::{
+    SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_summary_first_put,
+};
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
 // Re-export types for dev_tool and testing
@@ -332,6 +341,27 @@ pub struct NodeConfig {
     /// `#[serde(skip)]`; never serialized.
     #[serde(skip)]
     pub(crate) subscribe_hint_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the summary-first PUT probe version floor
+    /// (`SUMMARY_FIRST_PUT_MIN_VERSION`). Threaded exactly like
+    /// `subscribe_hint_floor_override` above: consulted as
+    /// `summary_first_put_floor_override().unwrap_or(SUMMARY_FIRST_PUT_MIN_VERSION)`
+    /// by `ConnectionManager::supports_summary_first_put`, the send gate the
+    /// originator's PUT driver checks before probing a target.
+    ///
+    /// In production this is `None` → the real `(0, 2, 95)` floor (untouched).
+    ///
+    /// In simulations every `SimNetwork` defaults this to an unreachable
+    /// floor (`SimNetwork::SIM_MIGRATION_DISABLED_FLOOR`), mirroring
+    /// `subscribe_hint_floor_override`'s fail-closed default: summary-first
+    /// PUT is genuinely opt-in per sim via
+    /// `SimNetwork::enable_summary_first_put`, rather than firing in every
+    /// sim once the crate version passes the real floor.
+    ///
+    /// Not cfg-gated for the same reason as `subscribe_hint_floor_override`:
+    /// `node::testing_impl` sets it and is compiled unconditionally.
+    /// `#[serde(skip)]`; never serialized.
+    #[serde(skip)]
+    pub(crate) summary_first_put_floor_override: Option<(u8, u8, u16)>,
     /// Test-only harness flag: when set, a startup-hosted contract
     /// (`SeedHostedContract`, i.e. `append_contracts` with `subscription =
     /// true`) is registered in the neighbor-hosting advertised set so the
@@ -497,6 +527,7 @@ impl NodeConfig {
             },
             governance_config_override: None,
             subscribe_hint_floor_override: None,
+            summary_first_put_floor_override: None,
             advertise_seeded_hosts: false,
             hosting_time_source_override: None,
         })
@@ -1123,6 +1154,7 @@ where
                 put::PutMsg::Response { .. }
                     | put::PutMsg::ResponseStreaming { .. }
                     | put::PutMsg::Error { .. }
+                    | put::PutMsg::ProbeResponse { .. }
             ) && try_forward_driver_reply(
                 pending_op_result.as_ref(),
                 NetMessage::V1(NetMessageV1::Put((*op).clone())),
@@ -1139,6 +1171,8 @@ where
             let banned_key = match op {
                 put::PutMsg::Request { contract, .. } => Some(contract.key()),
                 put::PutMsg::RequestStreaming { contract_key, .. } => Some(*contract_key),
+                put::PutMsg::ProbeRequest { contract_key, .. } => Some(*contract_key),
+                put::PutMsg::ProbeReconcile { key, .. } => Some(*key),
                 _ => None,
             };
             if let Some(key) = banned_key {
@@ -1230,13 +1264,65 @@ where
                             );
                         }
                     }
+                    put::PutMsg::ProbeRequest {
+                        id,
+                        contract_key,
+                        summary,
+                        htl,
+                        skip_list,
+                    } => {
+                        if let Err(err) = put::op_ctx_task::start_relay_probe(
+                            op_manager.clone(),
+                            *id,
+                            *contract_key,
+                            summary.clone(),
+                            *htl,
+                            skip_list.clone(),
+                            upstream_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                contract = %contract_key,
+                                error = %err,
+                                "PUT relay dispatch: start_relay_probe failed"
+                            );
+                        }
+                    }
+                    put::PutMsg::ProbeReconcile {
+                        id,
+                        key,
+                        delta,
+                        htl,
+                        skip_list,
+                    } => {
+                        if let Err(err) = put::op_ctx_task::start_relay_probe_reconcile(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            delta.clone(),
+                            *htl,
+                            skip_list.clone(),
+                            upstream_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                contract = %key,
+                                error = %err,
+                                "PUT relay dispatch: start_relay_probe_reconcile failed"
+                            );
+                        }
+                    }
                     _ => {
                         tracing::debug!(
                             tx = %op.id(),
                             ?op,
                             "PUT: non-dispatch variant ignored \
-                             (Response/ResponseStreaming/Error already \
-                             handled by bypass; ForwardingAck is no-op)"
+                             (Response/ResponseStreaming/Error/ProbeResponse \
+                             already handled by bypass; ForwardingAck is no-op)"
                         );
                     }
                 }

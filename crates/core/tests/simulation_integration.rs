@@ -14119,3 +14119,467 @@ fn test_piece_b_anti_entropy_heals_demandless_copy() {
     // Avoid leaking the CRDT registration into other tests sharing this process.
     freenet::dev_tool::clear_crdt_contracts();
 }
+
+// =============================================================================
+// Summary-first PUT (#4642 step 3-bis) — behavioral simulation tests
+// =============================================================================
+//
+// These two simulations exercise `try_summary_first_put` end-to-end through
+// `run_controlled_simulation`. Summary-first PUT is OFF by default in every
+// simulation (`SimNetwork::SIM_MIGRATION_DISABLED_FLOOR` — same fail-closed
+// default as placement migration); both tests opt in via
+// `enable_summary_first_put()`.
+
+/// **Test A — holder-found ships a delta, not full state.**
+///
+/// Maps to spec step 3-bis "holder-found → reconcile a delta, no full state
+/// to existing hosts": establishes a fresh (subscribed) holder for a CRDT-mode
+/// contract, then PUTs the SAME contract with a higher-version state from a
+/// DIFFERENT peer. Asserts the holder-found branch fires
+/// (`put_probe_existing_mesh_delta_sends`), the no-holder branch does NOT
+/// (`put_probe_new_contract_sends == 0`), and the bytes actually shipped
+/// (delta only) are strictly fewer than a full-state PUT of the same payload
+/// would have shipped (state + contract code + params) — the byte-savings
+/// claim the falsifier counters exist to prove or disprove.
+///
+/// Uses CRDT emulation mode (`register_crdt_contract` /
+/// `SimOperation::create_crdt_state`) because `MockRuntime`'s default
+/// (non-CRDT) `get_contract_state_delta` unconditionally returns an error
+/// ("MockRuntime cannot compute deltas - use full state sync"): with a plain
+/// test contract, `try_summary_first_put`'s delta-computation step would
+/// always fail and fall through, so the delta path could never be exercised
+/// without CRDT emulation. See `mock_runtime.rs::get_contract_state_delta`.
+///
+/// **Role choice is load-bearing, not arbitrary:** the second (probing) PUT
+/// MUST originate from the GATEWAY, not the regular node. `RemoteConnection::
+/// remote_protoc_version` is `None` on the joiner->gateway path ("the
+/// gateway's AckConnection payload carries no version" — see
+/// `transport/peer_connection.rs`), so a regular node's `ConnectionManager`
+/// never records its gateway's negotiated version and `supports_summary_first_put`
+/// fails closed for EVERY PUT a regular node routes through its gateway link —
+/// in production as much as in sim, this is not a simulation-harness gap.
+/// Only the gateway's connection TO the node carries the node's version, so
+/// only a gateway-originated PUT can pass the emission gate in a
+/// gateway/regular-node topology. (Confirmed empirically: with the roles
+/// reversed, the regular node's PUT never even logs a
+/// `PUT summary-first: ...` line — the whole block is skipped, not merely
+/// falling through inside it.)
+#[test_log::test]
+fn test_summary_first_put_holder_found_ships_delta() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4642_5F01_CAFE;
+    const NETWORK_NAME: &str = "summary-first-put-delta";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(NETWORK_NAME, 0);
+    let node1 = NodeLabel::node(NETWORK_NAME, 1);
+
+    let contract = SimOperation::create_test_contract(0x5F);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    // v1: node1's initial holder state. v2: the gateway's contribution — a
+    // higher CRDT version so `apply_crdt_delta`'s LWW merge accepts it
+    // unconditionally (to_version > current_version).
+    let state_v1 = SimOperation::create_crdt_state(1, 0x11);
+    let state_v2 = SimOperation::create_crdt_state(2, 0x22);
+
+    // What a full-state PUT of this exact payload would have shipped: the
+    // CRDT state plus the contract's code+params (48 bytes: 32-byte code +
+    // 16-byte params, per `SimOperation::create_test_contract`). The delta
+    // must beat this because it never re-ships code/params to a peer that
+    // already hosts the contract.
+    const CODE_PARAMS_BYTES: u64 = 32 + 16;
+    let full_state_bytes_if_shipped_whole = state_v2.len() as u64 + CODE_PARAMS_BYTES;
+
+    let mut sim =
+        rt.block_on(async { SimNetwork::new(NETWORK_NAME, 1, 1, 7, 3, 10, 2, SEED).await });
+    // Opt this simulation into summary-first PUT (off by default in every
+    // sim — see `SimNetwork::SIM_MIGRATION_DISABLED_FLOOR`).
+    sim.enable_summary_first_put();
+
+    let operations = vec![
+        // node1 PUTs + subscribes: becomes a fresh holder
+        // (`Ring::is_receiving_updates` true via its own client subscription).
+        // Its own PUT never touches the probe counters (see rustdoc above:
+        // its connection to the gateway can't carry the gateway's version),
+        // so this is a clean, counter-neutral way to seed the holder.
+        ScheduledOperation::new(
+            node1.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state_v1.clone(),
+                subscribe: true,
+            },
+        ),
+        // Gateway PUTs the SAME contract with a higher-version state. Its
+        // only known peer is node1, so `closest_potentially_hosting` targets
+        // it directly — the probe reaches the fresh holder in one hop, and
+        // the gateway's connection TO node1 does carry node1's negotiated
+        // version, so `supports_summary_first_put` passes.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state_v2.clone(),
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "summary-first PUT delta sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let new_contract_sends = GlobalTestMetrics::put_probe_new_contract_sends();
+    let delta_sends = GlobalTestMetrics::put_probe_existing_mesh_delta_sends();
+    let delta_bytes = GlobalTestMetrics::put_probe_existing_mesh_delta_bytes();
+
+    tracing::info!(
+        new_contract_sends,
+        delta_sends,
+        delta_bytes,
+        full_state_bytes_if_shipped_whole,
+        "summary-first PUT delta test: probe outcome counters"
+    );
+
+    // node1's own PUT never touches these counters: its connection to the
+    // gateway never carries the gateway's negotiated version (see rustdoc
+    // above), so `supports_summary_first_put` fails closed and the whole
+    // summary-first block is skipped for node1's PUT — only the gateway's
+    // PUT can move them.
+    assert_eq!(
+        new_contract_sends, 0,
+        "no-holder path must NOT fire: the gateway's PUT found a fresh \
+         holder (node1), so the summary-first probe must take the \
+         holder-found branch, never the no-holder fallback"
+    );
+    assert_eq!(
+        delta_sends, 1,
+        "holder-found path must fire exactly once (the gateway's PUT \
+         probing the node1 holder)"
+    );
+    assert!(
+        delta_bytes > 0,
+        "the delta must be non-empty — v2's data genuinely differs from v1"
+    );
+    assert!(
+        delta_bytes < full_state_bytes_if_shipped_whole,
+        "the existing-mesh delta ({delta_bytes} bytes) must ship strictly \
+         fewer bytes than a full-state PUT of the same payload would have \
+         ({full_state_bytes_if_shipped_whole} bytes = state + code + params) \
+         — this is the byte-savings claim the falsifier counters exist to \
+         prove or disprove"
+    );
+
+    // PUT reported success and the holder still hosts: node1's live Ring
+    // still shows it hosting the contract...
+    assert!(
+        result.is_node_hosting(&node1, &contract_key),
+        "node1 (the holder) should still host the contract after the \
+         reconcile"
+    );
+    // ...and the reconcile actually MERGED at the holder: its stored state
+    // advanced to the gateway's higher CRDT version. This is end-to-end proof
+    // that `ProbeReconcile`'s delta was received, decoded, and applied via
+    // the UPDATE path — not just that the counter was incremented locally at
+    // the originator.
+    let node1_final_state = result
+        .node_storages
+        .get(&node1)
+        .and_then(|s| s.get_stored_state(&contract_key))
+        .expect("node1 should have a stored state for the contract");
+    let node1_version = u64::from_le_bytes(
+        node1_final_state.as_ref()[0..8]
+            .try_into()
+            .expect("CRDT state must have an 8-byte version prefix"),
+    );
+    assert_eq!(
+        node1_version, 2,
+        "the holder's stored state must have merged the gateway's v2 \
+         contribution via the ProbeReconcile delta (PUT reported success \
+         end-to-end, not just at the originator's local copy)"
+    );
+
+    // Avoid leaking the CRDT registration into other tests sharing this process.
+    freenet::dev_tool::clear_crdt_contracts();
+}
+
+/// **Test B — no-holder ships full state hop-by-hop.**
+///
+/// Maps to spec "no holder → full state hop-by-hop, hops become hosts": PUTs
+/// a genuinely NEW contract (no prior holder anywhere) from a regular node
+/// into a small network. Asserts the probe finds no holder
+/// (`put_probe_new_contract_sends`), never the holder-found branch
+/// (`put_probe_existing_mesh_delta_sends == 0`), and that the existing
+/// (unchanged) full-state `PutMsg::Request` path actually propagated the
+/// contract onto more than just the originator's own local-store copy —
+/// proving the no-holder fallback genuinely ran the legacy hop-by-hop
+/// hosting behavior rather than silently doing nothing.
+///
+/// The PUT originates from the GATEWAY, not a regular node — see the rustdoc
+/// on `test_summary_first_put_holder_found_ships_delta` for why: a regular
+/// node's connection to its gateway never carries the gateway's negotiated
+/// version (`RemoteConnection::remote_protoc_version` is `None` on the
+/// joiner->gateway path in both production and sim), so `supports_summary_first_put`
+/// fails closed and a regular-node-originated PUT here would skip the
+/// summary-first block entirely rather than exercising the no-holder branch.
+#[test_log::test]
+fn test_summary_first_put_no_holder_ships_full_state() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x4642_5F02_CAFE;
+    const NETWORK_NAME: &str = "summary-first-put-new-contract";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(NETWORK_NAME, 0);
+    // node1 is the gateway's only known peer — the hop the no-holder
+    // full-state fallback must propagate to (checked explicitly below).
+    let node1 = NodeLabel::node(NETWORK_NAME, 1);
+
+    // A brand-new contract nobody has ever PUT — no holder exists anywhere.
+    let contract = SimOperation::create_test_contract(0x5A);
+    let contract_key = contract.key();
+    let state = SimOperation::create_test_state(0x5A);
+
+    let mut sim =
+        rt.block_on(async { SimNetwork::new(NETWORK_NAME, 1, 1, 7, 3, 10, 2, SEED).await });
+    sim.enable_summary_first_put();
+
+    let operations = vec![ScheduledOperation::new(
+        gateway.clone(),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: state.clone(),
+            subscribe: false,
+        },
+    )];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "summary-first PUT new-contract sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let new_contract_sends = GlobalTestMetrics::put_probe_new_contract_sends();
+    let delta_sends = GlobalTestMetrics::put_probe_existing_mesh_delta_sends();
+
+    tracing::info!(
+        new_contract_sends,
+        delta_sends,
+        "summary-first PUT new-contract test: probe outcome counters"
+    );
+
+    assert_eq!(
+        delta_sends, 0,
+        "holder-found path must NOT fire: this is a genuinely new contract, \
+         no peer hosts it"
+    );
+    assert_eq!(
+        new_contract_sends, 1,
+        "no-holder path must fire exactly once (the gateway's PUT probing \
+         node1, which has never seen this contract)"
+    );
+
+    // The no-holder fallback must have actually run the legacy hop-by-hop
+    // full-state PUT, not silently done nothing beyond the originator's own
+    // local-store step: at least one OTHER peer besides the gateway must
+    // also end up hosting the contract.
+    let hosting_labels: Vec<_> = result
+        .captured_node_labels()
+        .into_iter()
+        .filter(|label| result.is_node_hosting(label, &contract_key))
+        .collect();
+
+    tracing::info!(?hosting_labels, "nodes hosting the new contract");
+
+    assert!(
+        hosting_labels.contains(&gateway),
+        "the originator (the gateway) must host its own PUT"
+    );
+    assert!(
+        hosting_labels.contains(&node1),
+        "the no-holder full-state fallback must propagate the contract to \
+         node1 (the gateway's only peer and the sole possible hop) — hop-by-hop \
+         hosting, not just the originator's own local-store copy — got only \
+         {hosting_labels:?}"
+    );
+    assert!(
+        hosting_labels.len() >= 2,
+        "the no-holder full-state fallback must propagate the contract to \
+         at least one hop beyond the originator's own local-store copy \
+         (hop-by-hop hosting) — got only {hosting_labels:?}"
+    );
+}
+
+/// **Test C — bidirectional reconcile: the originator converges via the
+/// reverse delta (#4642 step 3-bis).**
+///
+/// The falsifier for the reverse leg. Mirrors Test A but with the version
+/// ordering SWAPPED so the HOLDER is AHEAD of the originator: node1 holds v2,
+/// then the gateway PUTs the SAME contract at the LOWER v1. Summary-first PUT
+/// used to be write-forward-only: the originator shipped its forward delta to
+/// the holder and reported client success at its OWN (older) state, healing to
+/// the merged state only later via anti-entropy. With the reverse leg the
+/// holder computes what the originator is missing and ships it back on the
+/// `ProbeResponse`, and the originator merges it BEFORE reporting success — so
+/// BOTH sides converge to the full merged state (v2) in a single round-trip.
+///
+/// **The load-bearing assertion is that the gateway (originator) ends at v2,
+/// not the v1 it PUT** — direct proof it received and applied node1's reverse
+/// delta. node1 (the ahead holder) stays at v2 (the originator's forward delta
+/// is for the older v1, so it merges to NoChange there).
+///
+/// Uses CRDT emulation for the same reason as Test A (MockRuntime's default
+/// `get_contract_state_delta` can't compute deltas) and originates the probing
+/// PUT from the gateway for the same version-gate reason (a regular node's link
+/// to its gateway carries no negotiated version). See
+/// `test_summary_first_put_holder_found_ships_delta` for the full rationale.
+#[test_log::test]
+fn test_summary_first_put_reverse_delta_converges_originator() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4642_5F03_CAFE;
+    const NETWORK_NAME: &str = "summary-first-put-reverse-delta";
+
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let gateway = NodeLabel::gateway(NETWORK_NAME, 0);
+    let node1 = NodeLabel::node(NETWORK_NAME, 1);
+
+    let contract = SimOperation::create_test_contract(0x5C);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    // Holder (node1) is AHEAD at v2; originator (gateway) PUTs the LOWER v1.
+    // The reverse delta must carry v2's data back to the gateway.
+    let state_v2 = SimOperation::create_crdt_state(2, 0x22);
+    let state_v1 = SimOperation::create_crdt_state(1, 0x11);
+
+    let mut sim =
+        rt.block_on(async { SimNetwork::new(NETWORK_NAME, 1, 1, 7, 3, 10, 2, SEED).await });
+    sim.enable_summary_first_put();
+
+    let operations = vec![
+        // node1 PUTs v2 + subscribes: becomes a fresh holder AHEAD of the
+        // originator. (Its own PUT never touches the probe counters — its
+        // link to the gateway carries no gateway version, see Test A.)
+        ScheduledOperation::new(
+            node1.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state_v2.clone(),
+                subscribe: true,
+            },
+        ),
+        // Gateway PUTs the SAME contract at the LOWER v1. It probes node1
+        // (the fresh holder), learns node1 is ahead, and must merge node1's
+        // reverse delta into its own copy BEFORE reporting client success.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state_v1.clone(),
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "summary-first PUT reverse-delta sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let new_contract_sends = GlobalTestMetrics::put_probe_new_contract_sends();
+    let delta_sends = GlobalTestMetrics::put_probe_existing_mesh_delta_sends();
+
+    tracing::info!(
+        new_contract_sends,
+        delta_sends,
+        "summary-first PUT reverse-delta test: probe outcome counters"
+    );
+
+    // The gateway's PUT found the fresh holder (node1), so it took the
+    // holder-found branch (where the reverse leg lives), not the no-holder
+    // fallback.
+    assert_eq!(
+        new_contract_sends, 0,
+        "no-holder path must NOT fire: the gateway's PUT found a fresh holder \
+         (node1)"
+    );
+    assert_eq!(
+        delta_sends, 1,
+        "holder-found path must fire exactly once (the gateway probing node1)"
+    );
+
+    // node1 (the holder) stays at v2 — the originator's forward delta targets
+    // the OLDER v1, so it merges to NoChange at the ahead holder.
+    let node1_final_state = result
+        .node_storages
+        .get(&node1)
+        .and_then(|s| s.get_stored_state(&contract_key))
+        .expect("node1 should have a stored state for the contract");
+    let node1_version = u64::from_le_bytes(
+        node1_final_state.as_ref()[0..8]
+            .try_into()
+            .expect("CRDT state must have an 8-byte version prefix"),
+    );
+    assert_eq!(
+        node1_version, 2,
+        "the holder must stay at v2 (the originator's forward delta was for \
+         the older v1)"
+    );
+
+    // THE FALSIFIER: the gateway (originator) must have converged to v2 by
+    // applying node1's REVERSE delta — not remained at the v1 it PUT. Without
+    // the reverse leg this is v1 (the originator would heal only later via
+    // anti-entropy); with it, both sides converge in one round-trip.
+    let gateway_final_state = result
+        .node_storages
+        .get(&gateway)
+        .and_then(|s| s.get_stored_state(&contract_key))
+        .expect("the gateway (originator) should have a stored state for the contract");
+    let gateway_version = u64::from_le_bytes(
+        gateway_final_state.as_ref()[0..8]
+            .try_into()
+            .expect("CRDT state must have an 8-byte version prefix"),
+    );
+    assert_eq!(
+        gateway_version, 2,
+        "the originator (gateway) must converge to the full merged state (v2) \
+         by applying the holder's reverse delta in the SAME round-trip — it \
+         PUT v1 and would remain at v1 without the reverse leg"
+    );
+
+    // Avoid leaking the CRDT registration into other tests sharing this process.
+    freenet::dev_tool::clear_crdt_contracts();
+}

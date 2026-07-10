@@ -1293,6 +1293,16 @@ pub struct SimNetwork {
     /// real production floor (#4601). Production is untouched: `NodeConfig::new`
     /// sets this to `None`, which resolves to the real `SUBSCRIBE_HINT_MIN_VERSION`.
     subscribe_hint_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node summary-first PUT probe version-floor override (see
+    /// [`SimNetwork::enable_summary_first_put`]). Mirrors
+    /// `subscribe_hint_floor_override` exactly: defaults to
+    /// `Some(SIM_MIGRATION_DISABLED_FLOOR)` (an unreachable floor) so the
+    /// probe/dispatch cascade is FAIL-CLOSED — OFF — in every sim regardless
+    /// of build version, and only a test that explicitly calls
+    /// `enable_summary_first_put` gets summary-first PUT. Production is
+    /// untouched: `NodeConfig::new` sets this to `None`, which resolves to
+    /// the real `SUMMARY_FIRST_PUT_MIN_VERSION`.
+    summary_first_put_floor_override: Option<(u8, u8, u16)>,
     /// Optional controllable hosting clock injected into every node's
     /// `HostingManager` (via `NodeConfig::hosting_time_source_override`). When
     /// set, hosting-cache TTL and subscription-lease eviction advance ONLY when
@@ -1480,6 +1490,10 @@ impl SimNetwork {
             // the 500-node nightly red. Defaulting to an unreachable floor keeps
             // migration genuinely opt-in, as the docs have always claimed.
             subscribe_hint_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            // Fail-closed by default, same rationale as
+            // `subscribe_hint_floor_override` above: summary-first PUT is
+            // genuinely opt-in per sim via `enable_summary_first_put`.
+            summary_first_put_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
             hosting_clock: None,
             hosting_budget_override: None,
             shared_rings: HashMap::new(),
@@ -1744,6 +1758,54 @@ impl SimNetwork {
         }
         for (builder, _) in self.nodes.iter_mut() {
             builder.config.subscribe_hint_floor_override = floor;
+        }
+        self
+    }
+
+    /// Enable summary-first PUT (#4642, step 3-bis) for this simulation by
+    /// lowering the probe version floor to [`Self::SIM_MIGRATION_ENABLED_FLOOR`]
+    /// (`(0,0,0)`) on every node.
+    ///
+    /// Summary-first PUT is OFF by default in every `SimNetwork` (the
+    /// per-node floor defaults to the unreachable
+    /// [`Self::SIM_MIGRATION_DISABLED_FLOOR`] — see `new_inner`), so this
+    /// makes the probe/dispatch cascade genuinely opt-in: only a test that
+    /// specifically exercises it calls this to force it ON regardless of
+    /// build version; every other sim is left untouched. Mirrors
+    /// [`enable_placement_migration`](Self::enable_placement_migration) —
+    /// same sentinel floors, same patch-already-built-configs shape, distinct
+    /// override field (`summary_first_put_floor_override`).
+    #[allow(dead_code)]
+    pub fn enable_summary_first_put(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.summary_first_put_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.summary_first_put_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.summary_first_put_floor_override = floor;
+        }
+        self
+    }
+
+    /// Force summary-first PUT OFF for this simulation by pinning the
+    /// per-node probe version floor to the unreachable
+    /// [`Self::SIM_MIGRATION_DISABLED_FLOOR`].
+    ///
+    /// The mirror of [`enable_summary_first_put`](Self::enable_summary_first_put),
+    /// following [`disable_placement_migration`](Self::disable_placement_migration)'s
+    /// belt-and-suspenders rationale: the cascade is already OFF by default in
+    /// every sim, so this just makes a test's "summary-first PUT must stay
+    /// off" premise explicit at the call site.
+    #[allow(dead_code)]
+    pub fn disable_summary_first_put(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
+        self.summary_first_put_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.summary_first_put_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.summary_first_put_floor_override = floor;
         }
         self
     }
@@ -2377,6 +2439,7 @@ impl SimNetwork {
                 .unwrap();
             config.governance_config_override = self.governance_config_override.clone();
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
+            config.summary_first_put_floor_override = self.summary_first_put_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
@@ -2476,6 +2539,7 @@ impl SimNetwork {
                 .unwrap();
             config.governance_config_override = self.governance_config_override.clone();
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
+            config.summary_first_put_floor_override = self.summary_first_put_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()

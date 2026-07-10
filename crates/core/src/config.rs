@@ -3412,6 +3412,15 @@ std::thread_local! {
     static GLOBAL_TERMINAL_CONSULT_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_TERMINAL_CONSULT_RESOLVED_FOUND: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_TERMINAL_CONSULT_STILL_NOT_FOUND: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // Summary-first PUT (#4642 step 3-bis) — PUT-bytes-by-case falsifier.
+    // Count + bytes for the new-contract case (no holder found; full state
+    // ships hop-by-hop via the existing `PutMsg::Request` path).
+    static GLOBAL_PUT_PROBE_NEW_CONTRACT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_PUT_PROBE_NEW_CONTRACT_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // Count + bytes for the existing-mesh case (holder found; only a
+    // `StateDelta` ships via `ProbeReconcile`).
+    static GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Global test metrics for tracking events across the simulation network.
@@ -3451,6 +3460,10 @@ impl GlobalTestMetrics {
         GLOBAL_TERMINAL_CONSULT_HITS.with(|c| c.set(0));
         GLOBAL_TERMINAL_CONSULT_RESOLVED_FOUND.with(|c| c.set(0));
         GLOBAL_TERMINAL_CONSULT_STILL_NOT_FOUND.with(|c| c.set(0));
+        GLOBAL_PUT_PROBE_NEW_CONTRACT_COUNT.with(|c| c.set(0));
+        GLOBAL_PUT_PROBE_NEW_CONTRACT_BYTES.with(|c| c.set(0));
+        GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT.with(|c| c.set(0));
+        GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
@@ -3585,6 +3598,50 @@ impl GlobalTestMetrics {
 
     pub fn terminal_consult_still_not_found() -> u64 {
         GLOBAL_TERMINAL_CONSULT_STILL_NOT_FOUND.with(|c| c.get())
+    }
+
+    // --- Summary-first PUT (#4642 step 3-bis): PUT-bytes-by-case falsifier ---
+    //
+    // Proves (or disproves) the byte-savings claim: how many originator PUTs
+    // took the new-contract path (full state shipped, the pre-existing
+    // behavior) versus the existing-mesh path (only a delta shipped via
+    // `ProbeReconcile`), and how many bytes each path actually moved. Fed
+    // from a single call site (`operations::put::op_ctx_task::
+    // record_put_probe_outcome`) so this thread-local counter and the
+    // per-node `node::network_status` dashboard counter never drift
+    // relative to each other.
+
+    /// Record a summary-first PUT probe that found no holder (genuinely new
+    /// contract): `bytes` is the full-state payload size about to ship
+    /// hop-by-hop via the existing `PutMsg::Request` path.
+    pub fn record_put_probe_new_contract(bytes: u64) {
+        GLOBAL_PUT_PROBE_NEW_CONTRACT_COUNT.with(|c| c.set(c.get() + 1));
+        GLOBAL_PUT_PROBE_NEW_CONTRACT_BYTES.with(|c| c.set(c.get() + bytes));
+    }
+
+    pub fn put_probe_new_contract_sends() -> u64 {
+        GLOBAL_PUT_PROBE_NEW_CONTRACT_COUNT.with(|c| c.get())
+    }
+
+    pub fn put_probe_new_contract_bytes() -> u64 {
+        GLOBAL_PUT_PROBE_NEW_CONTRACT_BYTES.with(|c| c.get())
+    }
+
+    /// Record a summary-first PUT probe that found an existing holder:
+    /// `bytes` is the `StateDelta` size shipped via `ProbeReconcile` (0 if
+    /// the delta was empty — the holder's state was already logically
+    /// equivalent to ours, so nothing was sent).
+    pub fn record_put_probe_existing_mesh_delta(bytes: u64) {
+        GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT.with(|c| c.set(c.get() + 1));
+        GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES.with(|c| c.set(c.get() + bytes));
+    }
+
+    pub fn put_probe_existing_mesh_delta_sends() -> u64 {
+        GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT.with(|c| c.get())
+    }
+
+    pub fn put_probe_existing_mesh_delta_bytes() -> u64 {
+        GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES.with(|c| c.get())
     }
 }
 
