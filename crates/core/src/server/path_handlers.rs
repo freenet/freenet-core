@@ -3730,6 +3730,40 @@ mod tests {
         );
     }
 
+    // Regression guard for the OOPIF zero-copy send() fix. wasm-bindgen hands
+    // send() a Uint8Array, which is NOT `instanceof ArrayBuffer`; the pre-fix
+    // code therefore left the postMessage transfer list empty and every
+    // outbound WS frame was structured-clone COPIED across the process
+    // boundary (a ~2.7 s main-thread CPU burst on tab-focus flush). The fix
+    // transfers the backing buffer for ArrayBuffer *views* too, copying the
+    // view out via `.slice()` first so it never detaches WASM linear memory.
+    // The behavioural coverage is in tests/playwright/tests/websocket-shim.spec.ts
+    // (a real browser asserting the actual transfer list); this content guard
+    // runs in the default CI job and fails fast if the JS is reverted.
+    #[test]
+    fn shim_js_transfers_array_buffer_views_zero_copy() {
+        // The old, buggy one-liner must be gone.
+        assert!(
+            !WEBSOCKET_SHIM_JS.contains("data instanceof ArrayBuffer ? [data] : []"),
+            "shim send() must not use the copy-everything transfer check (OOPIF copy regression)"
+        );
+        // Views (Uint8Array) must be recognised and their buffer transferred.
+        assert!(
+            WEBSOCKET_SHIM_JS.contains("ArrayBuffer.isView(data)"),
+            "shim send() must transfer ArrayBuffer views zero-copy"
+        );
+        // The view must be copied out (.slice()) before transfer so WASM
+        // linear memory is never detached.
+        assert!(
+            WEBSOCKET_SHIM_JS.contains("data.slice()"),
+            "shim send() must copy the view out before transferring its buffer"
+        );
+        assert!(
+            WEBSOCKET_SHIM_JS.contains("transfer = [copy.buffer]"),
+            "shim send() must transfer the copied buffer, not the shared/WASM one"
+        );
+    }
+
     #[test]
     fn get_path_v1() {
         let req_path = "/v1/contract/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/state.html";
