@@ -679,6 +679,20 @@ impl TopologyManager {
             None => Vec::new(),
         };
 
+        // PROTOTYPE: never shed either guaranteed nearest-neighbor edge, even
+        // under resource pressure. Match candidates by signed distance (bijective
+        // with the neighbor Location for a fixed own-location).
+        let protected_signed: Vec<f64> = match my_location {
+            Some(my_loc) => protected_nearest_neighbors(my_location, neighbor_locations)
+                .iter()
+                .map(|loc| my_loc.signed_distance(*loc))
+                .collect(),
+            None => Vec::new(),
+        };
+        let is_protected = |sd: Option<f64>| -> bool {
+            matches!(sd, Some(d) if protected_signed.iter().any(|p| (p - d).abs() < 1e-12))
+        };
+
         // Build a peer-location index for O(1) lookup (avoids O(N²) scan).
         // Stores (signed_distance, peers_at_same_location) for each peer.
         let peer_to_loc_info: std::collections::HashMap<PeerKeyLocation, (f64, usize)> =
@@ -750,6 +764,10 @@ impl TopologyManager {
         let mut worst: Option<(PeerKeyLocation, f64)> = None;
 
         for c in &candidates {
+            // PROTOTYPE: skip a guaranteed nearest-neighbor edge.
+            if is_protected(c.peer_signed_distance) {
+                continue;
+            }
             let normalized_routing = if max_routing > 0.0 {
                 c.routing_value / max_routing
             } else {
@@ -874,8 +892,11 @@ impl TopologyManager {
         // Note: uses raw request count (not requests/bandwidth like the removal path)
         // because swap decisions care about routing utility, not bandwidth cost.
         // Both paths normalize to [0,1] so the ranking within each is correct.
+        // PROTOTYPE: never swap away either guaranteed nearest-neighbor edge.
+        let protected = protected_nearest_neighbors(my_location, neighbor_locations);
         let peers_with_routing: Vec<_> = neighbor_locations
             .iter()
+            .filter(|(loc, _)| !protected.contains(loc))
             .flat_map(|(loc, conns)| {
                 let count = conns.len();
                 conns.iter().map(move |conn| (loc, conn, count))
@@ -1040,6 +1061,47 @@ fn composite_score(
     Some(normalized_routing + TOPOLOGY_WEIGHT * topo)
 }
 
+/// PROTOTYPE (nearest-neighbor findability experiment — see
+/// `crate::ring::connection_manager::NN_NEAREST_EDGE_CLAUSE`). Both-sides
+/// variant: returns this peer's ring-CLOSEST neighbor on the SUCCESSOR side
+/// (clockwise / higher location, wrapping) and on the PREDECESSOR side
+/// (counter-clockwise / lower location, wrapping) — the two Chord-style edges
+/// the acceptance clause guarantees. Empty when the clause is disabled, own
+/// location is unknown, or there are no neighbors. The prune/swap paths use this
+/// to keep BOTH guaranteed edges from being dropped, so an over-max acceptance
+/// never sheds the very edge it just added.
+fn protected_nearest_neighbors(
+    my_location: &Option<Location>,
+    neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+) -> Vec<Location> {
+    if !crate::ring::nn_nearest_edge_clause_enabled() {
+        return Vec::new();
+    }
+    let Some(my_loc) = *my_location else {
+        return Vec::new();
+    };
+    let mut protected = Vec::with_capacity(2);
+    for successor_side in [true, false] {
+        let nearest = neighbor_locations
+            .keys()
+            .filter(|loc| {
+                let sd = my_loc.signed_distance(**loc);
+                (sd > 0.0) == successor_side
+            })
+            .min_by(|a, b| {
+                my_loc
+                    .signed_distance(**a)
+                    .abs()
+                    .total_cmp(&my_loc.signed_distance(**b).abs())
+            })
+            .copied();
+        if let Some(loc) = nearest {
+            protected.push(loc);
+        }
+    }
+    protected
+}
+
 /// Select the least topologically important peer to drop as a fallback.
 ///
 /// Computes the removal gap for each peer and picks the one whose removal
@@ -1063,9 +1125,13 @@ fn select_fallback_peer_to_drop(
         .map(|nloc| my_loc.signed_distance(*nloc))
         .collect();
 
+    // PROTOTYPE: never drop either guaranteed nearest-neighbor edge.
+    let protected = protected_nearest_neighbors(my_location, neighbor_locations);
+
     // Pick the peer whose removal creates the smallest gap (least important)
     neighbor_locations
         .iter()
+        .filter(|(loc, _)| !protected.contains(loc))
         .flat_map(|(loc, conns)| conns.iter().map(move |conn| (loc, conn)))
         .min_by(|(loc_a, _), (loc_b, _)| {
             let (gap_a, _) = small_world_rand::removal_gap_directional(

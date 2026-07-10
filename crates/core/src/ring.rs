@@ -85,6 +85,11 @@ mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
 pub(crate) use connection_manager::ConnectionManager;
+// PROTOTYPE nearest-neighbor findability experiment (NOT for ship). The setter is
+// re-exported `pub` so `dev_tool` can toggle the clause from an integration test;
+// the predicate is `pub(crate)` for the prune/swap path in `crate::topology`.
+pub(crate) use connection_manager::nn_nearest_edge_clause_enabled;
+pub use connection_manager::set_nn_nearest_edge_clause;
 mod connection;
 mod hosting;
 pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
