@@ -13619,6 +13619,1002 @@ fn test_piece_e_findability_sparse_ring_gate() {
     );
 }
 
+// =============================================================================
+// PROTOTYPE nearest-neighbor findability EXPERIMENT (NOT a ship gate).
+//
+// Hypothesis: greedy routing cannot reliably reach the peer CLOSEST to a key
+// because the connection-acceptance gate never GUARANTEES the exact-nearest
+// edge (it scores by Kleinberg gap-fill and can reject a closer peer for link
+// diversity). Adding a Chord-style "always keep an edge to your nearest
+// successor AND nearest predecessor" rule should let a SINGLE seeded copy (no
+// PUT scatter) be findable. These tests MEASURE that, two arms on identical
+// seeds: Arm A = current code (clause off), Arm B = clause on.
+// =============================================================================
+
+/// Per-arm result of one lone-holder findability run.
+#[derive(Clone, Debug)]
+struct LoneHolderMetrics {
+    client_findability_rate: f64,
+    requesters_with_state: usize,
+    requesters_total: usize,
+    holder_hosting: bool,
+    /// End-of-run count of nodes storing ANY copy of the contract. Detects the
+    /// GET-return-path every-hop-cache confound: if this is >> 1 the "lone
+    /// holder" self-scattered via successful GETs, so a high Arm-A findability
+    /// is not evidence that routing reached the SINGLE seeded copy.
+    total_holders: usize,
+    isolated_nodes: usize,
+    min_conn: usize,
+    max_conn: usize,
+    mean_conn: f64,
+    /// Fraction of regular nodes that have >= 1 neighbor on BOTH ring sides.
+    both_edge_coverage: f64,
+    /// Premise (clause-took-effect): the seed holder has a successor edge.
+    holder_has_successor: bool,
+    /// Premise (clause-took-effect): the seed holder has a predecessor edge.
+    holder_has_predecessor: bool,
+}
+
+/// Signed shortest-arc distance from `from` to `to` on the unit ring.
+/// Positive = clockwise / successor side; negative = predecessor side.
+fn ring_signed(from: f64, to: f64) -> f64 {
+    let diff = to - from;
+    if diff > 0.5 {
+        diff - 1.0
+    } else if diff < -0.5 {
+        diff + 1.0
+    } else {
+        diff
+    }
+}
+
+/// One lone-holder findability run at `seed`. A single copy is SEEDED (no PUT,
+/// no scatter, no churn) on the node NEAREST the key; the 8 farthest nodes issue
+/// real read-only GETs. `nn_enabled` selects the arm (clause off/on). Returns the
+/// findability metrics plus premise/topology introspection.
+fn run_lone_holder_seed(seed: u64, nn_enabled: bool) -> LoneHolderMetrics {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+    const NUM_NODES: usize = 15; // + 1 gateway = 16 peers
+
+    setup_deterministic_state(seed);
+    // Clause is a thread-local (see connection_manager). Set it AFTER
+    // setup_deterministic_state (which does not touch it) and reset in the driver.
+    freenet::dev_tool::set_nn_nearest_edge_clause(nn_enabled);
+
+    let arm = if nn_enabled { "b" } else { "a" };
+    let network = format!("nn-lone-{arm}-{seed:x}");
+
+    let contract = SimOperation::create_test_contract(0xA5);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let state_v1 = SimOperation::create_test_state(1);
+
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let node_locations: Vec<f64> = (0..NUM_NODES)
+        .map(|i| wrap(key_loc + i as f64 / NUM_NODES as f64))
+        .collect();
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network,
+            1,
+            NUM_NODES,
+            10,
+            7,
+            5,
+            2,
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    let holder_no = ranked[0]; // NEAREST the key: the lone seeded copy
+    // Requesters: the 8 FARTHEST nodes (distant read-only GETs).
+    let requester_nos: Vec<usize> = ranked[7..15].to_vec();
+
+    let holder = NodeLabel::node(&network, holder_no);
+    let get_requesters: Vec<NodeLabel> = requester_nos
+        .iter()
+        .map(|n| NodeLabel::node(&network, *n))
+        .collect();
+
+    let mut operations = Vec::new();
+    // Seed ONE copy on the nearest-key node. NO PUT scatter, NO churn.
+    operations.push(ScheduledOperation::new(
+        holder.clone(),
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state: state_v1.clone(),
+        },
+    ));
+    for r in &get_requesters {
+        operations.push(ScheduledOperation::new(
+            r.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let logs_handle = sim.event_logs_handle();
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x} nn={nn_enabled}: lone-holder sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let metrics =
+        compute_piece_e_metrics(&result, &logs, &contract_key, &holder, &get_requesters, &[]);
+
+    // ---- premise checks + topology introspection ----
+    let holder_hosting = result.is_node_hosting(&holder, &contract_key);
+
+    // Per-node connection counts + both-edge coverage over the REGULAR nodes.
+    let mut conn_counts = Vec::new();
+    let mut isolated_nodes = 0usize;
+    let mut both_edge_nodes = 0usize;
+    for n in 1..=NUM_NODES {
+        let label = NodeLabel::node(&network, n);
+        let c = result.node_open_connections(&label);
+        conn_counts.push(c);
+        if c == 0 {
+            isolated_nodes += 1;
+        }
+        let own = locs[n];
+        let nbrs = result.node_neighbor_locations(&label);
+        let has_succ = nbrs.iter().any(|&nb| ring_signed(own, nb) > 0.0);
+        let has_pred = nbrs.iter().any(|&nb| ring_signed(own, nb) < 0.0);
+        if has_succ && has_pred {
+            both_edge_nodes += 1;
+        }
+    }
+    let min_conn = conn_counts.iter().copied().min().unwrap_or(0);
+    let max_conn = conn_counts.iter().copied().max().unwrap_or(0);
+    let mean_conn = conn_counts.iter().sum::<usize>() as f64 / conn_counts.len() as f64;
+    let both_edge_coverage = both_edge_nodes as f64 / NUM_NODES as f64;
+
+    // Seed-holder edges (Arm B clause-took-effect premise).
+    let holder_own = locs[holder_no];
+    let holder_nbrs = result.node_neighbor_locations(&holder);
+    let holder_has_successor = holder_nbrs
+        .iter()
+        .any(|&nb| ring_signed(holder_own, nb) > 0.0);
+    let holder_has_predecessor = holder_nbrs
+        .iter()
+        .any(|&nb| ring_signed(holder_own, nb) < 0.0);
+
+    LoneHolderMetrics {
+        client_findability_rate: metrics.client_findability_rate,
+        requesters_with_state: metrics.requesters_with_state,
+        requesters_total: metrics.requesters_total,
+        holder_hosting,
+        total_holders: metrics.total_holders,
+        isolated_nodes,
+        min_conn,
+        max_conn,
+        mean_conn,
+        both_edge_coverage,
+        holder_has_successor,
+        holder_has_predecessor,
+    }
+}
+
+/// EXPERIMENT — lone-holder (seeded, no scatter) findability, Arm A (clause off)
+/// vs Arm B (Chord successor+predecessor clause on), across the piece-E gate
+/// seeds. This is a MEASUREMENT to bring back, not a pass/fail ship gate. It
+/// prints the full per-seed table first, THEN asserts only the validity premises
+/// (so the numbers always surface even when findability is low).
+#[test_log::test]
+fn test_nn_clause_lone_holder_findability_experiment() {
+    const SEEDS: [u64; 6] = [
+        0x4642_E0A0_5A1D,
+        0x4642_E0A0_0002,
+        0x4642_E0A0_0003,
+        0x4642_E0A0_0005,
+        0x4642_E0A0_0007,
+        0x4642_E0A0_000B,
+    ];
+
+    let mut arm_a = Vec::new();
+    let mut arm_b = Vec::new();
+    for seed in SEEDS {
+        // Arm A then Arm B on the SAME seed/topology.
+        let a = run_lone_holder_seed(seed, false);
+        let b = run_lone_holder_seed(seed, true);
+        arm_a.push((seed, a));
+        arm_b.push((seed, b));
+    }
+    // Reset the thread-local so a reused test thread starts clean.
+    freenet::dev_tool::set_nn_nearest_edge_clause(false);
+
+    let mean = |v: &[(u64, LoneHolderMetrics)]| -> f64 {
+        v.iter()
+            .map(|(_, m)| m.client_findability_rate)
+            .sum::<f64>()
+            / v.len() as f64
+    };
+
+    tracing::info!(target: "nn_experiment",
+        "===== NN-CLAUSE LONE-HOLDER FINDABILITY EXPERIMENT (sparse 15+1, seeded, NO scatter) =====");
+    tracing::info!(target: "nn_experiment",
+        "seed              | ARM A find (n/N) | ARM B find (n/N) | B: holder_edges(S,P) both_cov | conns A/B(min-mean-max)");
+    for i in 0..SEEDS.len() {
+        let (seed, a) = &arm_a[i];
+        let (_, b) = &arm_b[i];
+        tracing::info!(target: "nn_experiment",
+            "0x{seed:012X} | A {:.3} ({}/{}) | B {:.3} ({}/{}) | holders A={} B={} | edges S={} P={} cov={:.2} | conns A[{}-{:.1}-{}] B[{}-{:.1}-{}] isolA={} isolB={}",
+            a.client_findability_rate, a.requesters_with_state, a.requesters_total,
+            b.client_findability_rate, b.requesters_with_state, b.requesters_total,
+            a.total_holders, b.total_holders,
+            b.holder_has_successor, b.holder_has_predecessor, b.both_edge_coverage,
+            a.min_conn, a.mean_conn, a.max_conn,
+            b.min_conn, b.mean_conn, b.max_conn,
+            a.isolated_nodes, b.isolated_nodes);
+    }
+    let mean_a = mean(&arm_a);
+    let mean_b = mean(&arm_b);
+    tracing::info!(target: "nn_experiment",
+        "MEAN client-findability: ARM A (clause off) = {mean_a:.3}   ARM B (clause on) = {mean_b:.3}   delta = {:+.3}",
+        mean_b - mean_a);
+    tracing::info!(target: "nn_experiment", "===== END NN-CLAUSE EXPERIMENT =====");
+
+    // ---- Validity premises (assert AFTER printing so numbers always surface). ----
+    for (seed, m) in arm_a.iter().chain(arm_b.iter()) {
+        assert!(
+            m.holder_hosting,
+            "seed=0x{seed:X}: seed holder must host the contract (else findability is meaningless)"
+        );
+        assert_eq!(
+            m.requesters_total, 8,
+            "seed=0x{seed:X}: expected 8 distant requesters"
+        );
+    }
+    // Arm B clause-took-effect premise: on identical topology, the clause must
+    // actually change the ring — the seed holder gets BOTH guaranteed edges. A
+    // null findability result with this premise satisfied is an honest negative;
+    // without it, the clause silently never ran.
+    for (seed, m) in arm_b.iter() {
+        assert!(
+            m.holder_has_successor && m.holder_has_predecessor,
+            "seed=0x{seed:X} ARM B: NN clause did not establish BOTH holder edges \
+             (successor={}, predecessor={}) — premise for a valid measurement",
+            m.holder_has_successor,
+            m.holder_has_predecessor
+        );
+    }
+}
+
+/// One ISOLATED single-GET run: a lone seeded copy on the nearest-key node, and
+/// EXACTLY ONE distant requester (rank `requester_rank`) issues one read-only
+/// GET. With a single GET there is no sibling self-scatter, so the outcome is a
+/// clean test of whether greedy routing REACHED the lone copy (the GET-return
+/// cache only populates the return path AFTER the holder answers, so it cannot
+/// help the forward routing). Returns `(get_succeeded, total_holders_at_end)`.
+fn run_single_get_seed(seed: u64, nn_enabled: bool, requester_rank: usize) -> (bool, usize) {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+    const NUM_NODES: usize = 15;
+
+    setup_deterministic_state(seed);
+    freenet::dev_tool::set_nn_nearest_edge_clause(nn_enabled);
+
+    let arm = if nn_enabled { "b" } else { "a" };
+    let network = format!("nn-single-{arm}-{seed:x}-r{requester_rank}");
+
+    let contract = SimOperation::create_test_contract(0xA5);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let state_v1 = SimOperation::create_test_state(1);
+
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let node_locations: Vec<f64> = (0..NUM_NODES)
+        .map(|i| wrap(key_loc + i as f64 / NUM_NODES as f64))
+        .collect();
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network,
+            1,
+            NUM_NODES,
+            10,
+            7,
+            5,
+            2,
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    let holder = NodeLabel::node(&network, ranked[0]);
+    let requester = NodeLabel::node(&network, ranked[requester_rank]);
+
+    let operations = vec![
+        ScheduledOperation::new(
+            holder.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: state_v1.clone(),
+            },
+        ),
+        ScheduledOperation::new(
+            requester.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let logs_handle = sim.event_logs_handle();
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x} nn={nn_enabled} r={requester_rank}: single-GET sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let metrics = compute_piece_e_metrics(
+        &result,
+        &logs,
+        &contract_key,
+        &holder,
+        std::slice::from_ref(&requester),
+        &[],
+    );
+    assert!(
+        result.is_node_hosting(&holder, &contract_key),
+        "seed={seed:x}: seed holder must host"
+    );
+    (metrics.requesters_with_state == 1, metrics.total_holders)
+}
+
+/// EXPERIMENT (DECISIVE isolation) — removes the multi-GET self-scatter confound
+/// from the lone-holder experiment: each run has EXACTLY ONE distant GET, so a
+/// success means greedy routing reached the SINGLE seeded copy (no sibling
+/// scatter could have planted a nearby copy first). Arm A (clause off) vs Arm B
+/// (clause on), swept over seeds × distant ranks. If Arm A already succeeds
+/// often, the routing-can't-reach-the-nearest hypothesis is DISPROVEN here.
+#[test_log::test]
+fn test_nn_clause_single_get_isolation() {
+    const SEEDS: [u64; 6] = [
+        0x4642_E0A0_5A1D,
+        0x4642_E0A0_0002,
+        0x4642_E0A0_0003,
+        0x4642_E0A0_0005,
+        0x4642_E0A0_0007,
+        0x4642_E0A0_000B,
+    ];
+    // Distant requester ranks (0 = holder, 14 = farthest).
+    const RANKS: [usize; 2] = [12, 14];
+
+    let mut a_hits = 0usize;
+    let mut b_hits = 0usize;
+    let mut total = 0usize;
+    let mut rows: Vec<(u64, usize, bool, usize, bool, usize)> = Vec::new();
+    for seed in SEEDS {
+        for rank in RANKS {
+            let (a_ok, a_holders) = run_single_get_seed(seed, false, rank);
+            let (b_ok, b_holders) = run_single_get_seed(seed, true, rank);
+            a_hits += a_ok as usize;
+            b_hits += b_ok as usize;
+            total += 1;
+            rows.push((seed, rank, a_ok, a_holders, b_ok, b_holders));
+        }
+    }
+    freenet::dev_tool::set_nn_nearest_edge_clause(false);
+
+    tracing::info!(target: "nn_experiment",
+        "===== NN-CLAUSE SINGLE-GET ISOLATION (one distant GET; no sibling self-scatter) =====");
+    tracing::info!(target: "nn_experiment",
+        "seed              rank | ARM A ok (holders) | ARM B ok (holders)");
+    for (seed, rank, a_ok, a_h, b_ok, b_h) in &rows {
+        tracing::info!(target: "nn_experiment",
+            "0x{seed:012X} r{rank:>2} | A {a_ok} (holders={a_h}) | B {b_ok} (holders={b_h})");
+    }
+    tracing::info!(target: "nn_experiment",
+        "SINGLE-GET success: ARM A = {a_hits}/{total} ({:.3})   ARM B = {b_hits}/{total} ({:.3})",
+        a_hits as f64 / total as f64, b_hits as f64 / total as f64);
+    tracing::info!(target: "nn_experiment", "===== END SINGLE-GET ISOLATION =====");
+}
+
+/// EXPERIMENT — run the existing PUT-scattered piece-E findability scenario with
+/// the NN clause ON, across the same gate seeds, and report whether it changes
+/// findability vs. the documented main baseline (mean ~0.85, floor 0.60).
+/// Report-only (no hard findability assertion); the clause's effect on the
+/// scatter path is the datum.
+#[test_log::test]
+fn test_nn_clause_piece_e_gate_scenario_report() {
+    const SEEDS: [u64; 6] = [
+        0x4642_E0A0_5A1D,
+        0x4642_E0A0_0002,
+        0x4642_E0A0_0003,
+        0x4642_E0A0_0005,
+        0x4642_E0A0_0007,
+        0x4642_E0A0_000B,
+    ];
+    let mut rates = Vec::new();
+    for seed in SEEDS {
+        freenet::dev_tool::set_nn_nearest_edge_clause(true);
+        let (m, holder_hosting, _crash) = run_findability_seed(seed);
+        assert!(m.get_attempts > 0, "seed={seed:x}: no GET attempts");
+        rates.push((seed, m.client_findability_rate, holder_hosting));
+    }
+    freenet::dev_tool::set_nn_nearest_edge_clause(false);
+
+    tracing::info!(target: "nn_experiment",
+        "===== NN-CLAUSE on the PUT-SCATTERED piece-E gate scenario (main floor 0.60, main mean ~0.85) =====");
+    for (seed, r, host) in &rates {
+        tracing::info!(target: "nn_experiment",
+            "  0x{seed:012X}: client_findability={r:.3} holder_hosting={host}");
+    }
+    let mean = rates.iter().map(|(_, r, _)| *r).sum::<f64>() / rates.len() as f64;
+    tracing::info!(target: "nn_experiment",
+        "  MEAN (clause ON) = {mean:.3}");
+    tracing::info!(target: "nn_experiment", "===== END =====");
+    for (seed, _, host) in &rates {
+        assert!(host, "seed=0x{seed:X}: PUT origin must still host");
+    }
+}
+
+// =============================================================================
+// DECISIVE PUT-reach / GET-reach ISOLATION EXPERIMENT (NOT a ship gate).
+//
+// Findability is invariant 5 (the demand epic's core goal). Two clean questions:
+//  (1) PUT-reach: does a scatter-free PUT from a far node land its single copy on
+//      the peer CLOSEST to the key (rank 0), or stop short?
+//  (2) GET-reach: does a distant GET reach the closest peer (rank 0) where a
+//      correctly-placed copy lives, or dead-end elsewhere?
+// For every miss, the WHY: connectivity gap (terminus has NO connected neighbor
+// closer to the key) vs routing give-up (a closer neighbor exists but HTL / the
+// one-retry relay cap / the visited filter / next-hop selection / the #4363
+// terminus guard cut the walk off).
+//
+// Cleanliness is MANDATORY (past runs were confounded by self-scatter): the
+// `findability_probe` scatter-disable hook makes the every-hop PUT store, the
+// terminus PUT replication, the relay-path GET-return cache AND the piece-C
+// advertisement consult all no-ops, so the seeded / PUT copy stays SINGULAR and
+// the GET-reach number is PURE greedy routing. Holder-count is premise-checked at
+// every measurement point. Per-op terminus traces (rank / HTL / hop / stop reason
+// / closer-neighbor) come from `take_op_traces`.
+//
+// Run SERIALLY (parallel sims corrupt topology under CPU load):
+//   cargo test -p freenet --features "simulation_tests,testing" \
+//     --test simulation_integration -- --test-threads=1 --nocapture \
+//     findability_isolation
+// =============================================================================
+
+const FINDABILITY_ISOLATION_SEEDS: [u64; 6] = [
+    0x4642_E0A0_5A1D,
+    0x4642_E0A0_0002,
+    0x4642_E0A0_0003,
+    0x4642_E0A0_0005,
+    0x4642_E0A0_0007,
+    0x4642_E0A0_000B,
+];
+
+/// Ring rank of `loc` = number of peers (of `all_locs`, incl. gateway) strictly
+/// closer to `key_loc`. rank 0 = the globally-closest peer to the key.
+fn fi_rank_of_loc(all_locs: &[f64], key_loc: f64, loc: f64) -> usize {
+    let rd = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let d = rd(loc, key_loc);
+    all_locs.iter().filter(|&&p| rd(p, key_loc) < d - 1e-12).count()
+}
+
+/// A terminus observation lifted from an `OpTraceRecord` and ranked.
+#[derive(Clone, Debug)]
+struct FiTerminus {
+    rank: usize,
+    stop_reason: freenet::dev_tool::ProbeStopReason,
+    own_dist: f64,
+    htl_remaining: usize,
+    hop_count: usize,
+    num_neighbors: usize,
+    /// rank of the closest connected neighbor strictly closer to the key (None =
+    /// connectivity gap: no closer connected neighbor).
+    closer_rank: Option<usize>,
+    closer_visited: Option<bool>,
+}
+
+/// Build node locations evenly spread around the ring, offset from `key_loc`, so
+/// index 0 sits AT the key (rank 0). Matches the piece-E findability scenario.
+fn fi_node_locations(key_loc: f64, num_nodes: usize) -> Vec<f64> {
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    (0..num_nodes)
+        .map(|i| wrap(key_loc + i as f64 / num_nodes as f64))
+        .collect()
+}
+
+/// GET-reach single-requester run (clean isolation). Seeds ONE copy on rank 0
+/// (nearest the key), scatter+cache+consult OFF, and issues exactly ONE distant
+/// GET(subscribe=false) from the node at `requester_rank`. Returns the outcome
+/// plus the pure-routing terminus for a miss.
+struct GetReachRun {
+    found: bool,
+    total_holders: usize,
+    /// holders ⊆ {rank-0 holder} ∪ {requester} — routing was not confounded.
+    premise_ok: bool,
+    /// The GET reached the rank-0 copy (a `Found` trace at rank 0).
+    reached_rank0: bool,
+    /// Deepest (min-rank) pure-routing terminus of a miss.
+    deepest_terminus: Option<FiTerminus>,
+}
+
+fn fi_run_get_reach(seed: u64, nn: bool, num_nodes: usize, requester_rank: usize) -> GetReachRun {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    setup_deterministic_state(seed);
+    freenet::dev_tool::set_scatter_disabled(true);
+    freenet::dev_tool::set_nn_nearest_edge_clause(nn);
+    freenet::dev_tool::clear_op_traces();
+
+    let arm = if nn { "b" } else { "a" };
+    let network = format!("fi-get-{arm}-{seed:x}-n{num_nodes}-r{requester_rank}");
+    let contract = SimOperation::create_test_contract(0xA5);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let state_v1 = SimOperation::create_test_state(1);
+    let node_locations = fi_node_locations(key_loc, num_nodes);
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network,
+            1,
+            num_nodes,
+            10, // ring_max_htl
+            7,  // rnd_if_htl_above
+            5,  // max_connections (sparse ring)
+            2,  // min_connections
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, num_nodes, key_loc);
+    let holder = NodeLabel::node(&network, ranked[0]);
+    let requester = NodeLabel::node(&network, ranked[requester_rank]);
+
+    let operations = vec![
+        ScheduledOperation::new(
+            holder.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: state_v1.clone(),
+            },
+        ),
+        ScheduledOperation::new(
+            requester.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let logs_handle = sim.event_logs_handle();
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x} nn={nn} r={requester_rank}: GET-reach sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let traces = freenet::dev_tool::take_op_traces();
+    freenet::dev_tool::set_scatter_disabled(false);
+    freenet::dev_tool::set_nn_nearest_edge_clause(false);
+
+    let metrics = compute_piece_e_metrics(
+        &result,
+        &logs,
+        &contract_key,
+        &holder,
+        std::slice::from_ref(&requester),
+        &[],
+    );
+    assert!(
+        result.is_node_hosting(&holder, &contract_key),
+        "seed={seed:x}: seed holder must host"
+    );
+
+    // Premise: the only holders are the rank-0 seed and (on a hit) the requester.
+    let mut total_holders = 0usize;
+    let mut premise_ok = true;
+    for (label, storage) in result.node_storages.iter() {
+        if storage.get_stored_state(&contract_key).is_some() {
+            total_holders += 1;
+            if label != &holder && label != &requester {
+                premise_ok = false;
+            }
+        }
+    }
+
+    let found = metrics.requesters_with_state == 1;
+    let reached_rank0 = traces.iter().any(|t| {
+        matches!(t.kind, freenet::dev_tool::ProbeOpKind::Get)
+            && matches!(t.stop_reason, freenet::dev_tool::ProbeStopReason::Found)
+            && fi_rank_of_loc(&locs, key_loc, t.own_loc) == 0
+    });
+
+    // Deepest pure-routing terminus of a miss (min rank among GET give-ups).
+    let deepest_terminus = traces
+        .iter()
+        .filter(|t| {
+            matches!(t.kind, freenet::dev_tool::ProbeOpKind::Get)
+                && matches!(
+                    t.stop_reason,
+                    freenet::dev_tool::ProbeStopReason::RoutingExhausted
+                        | freenet::dev_tool::ProbeStopReason::HtlZero
+                )
+        })
+        .map(|t| FiTerminus {
+            rank: fi_rank_of_loc(&locs, key_loc, t.own_loc),
+            stop_reason: t.stop_reason,
+            own_dist: t.own_dist,
+            htl_remaining: t.htl_remaining,
+            hop_count: t.hop_count,
+            num_neighbors: t.num_neighbors,
+            closer_rank: t.closer_neighbor_loc.map(|l| fi_rank_of_loc(&locs, key_loc, l)),
+            closer_visited: t.closer_neighbor_visited,
+        })
+        .min_by_key(|t| t.rank);
+
+    GetReachRun {
+        found,
+        total_holders,
+        premise_ok,
+        reached_rank0,
+        deepest_terminus,
+    }
+}
+
+/// PUT-reach run (clean isolation). PUTs one copy from the FARTHEST node with
+/// scatter fully OFF, so the copy lands only at the routing terminus. Returns the
+/// landing rank + the PUT terminus record.
+struct PutReachRun {
+    landing_rank: Option<usize>,
+    total_holders: usize,
+    premise_ok: bool,
+    origin_rank: usize,
+    terminus: Option<FiTerminus>,
+}
+
+fn fi_run_put_reach(seed: u64, nn: bool, num_nodes: usize) -> PutReachRun {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    setup_deterministic_state(seed);
+    freenet::dev_tool::set_scatter_disabled(true);
+    freenet::dev_tool::set_nn_nearest_edge_clause(nn);
+    freenet::dev_tool::clear_op_traces();
+
+    let arm = if nn { "b" } else { "a" };
+    let network = format!("fi-put-{arm}-{seed:x}-n{num_nodes}");
+    let contract = SimOperation::create_test_contract(0xA5);
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let state_v1 = SimOperation::create_test_state(1);
+    let node_locations = fi_node_locations(key_loc, num_nodes);
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network, 1, num_nodes, 10, 7, 5, 2, seed, &node_locations,
+        )
+        .await
+    });
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, num_nodes, key_loc);
+    // PUT origin: the FARTHEST regular node from the key.
+    let origin_no = ranked[num_nodes - 1];
+    let origin = NodeLabel::node(&network, origin_no);
+    let origin_rank = fi_rank_of_loc(&locs, key_loc, locs[origin_no]);
+
+    let operations = vec![ScheduledOperation::new(
+        origin.clone(),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: state_v1.clone(),
+            subscribe: false,
+        },
+    )];
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x} nn={nn}: PUT-reach sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let traces = freenet::dev_tool::take_op_traces();
+    freenet::dev_tool::set_scatter_disabled(false);
+    freenet::dev_tool::set_nn_nearest_edge_clause(false);
+
+    // Holders (should be exactly the single terminus copy).
+    let mut total_holders = 0usize;
+    let mut landing_loc: Option<f64> = None;
+    for (label, storage) in result.node_storages.iter() {
+        if storage.get_stored_state(&contract_key).is_some() {
+            total_holders += 1;
+            // Recover the holder's location from get_peer_locations by label idx.
+            if let Some(idx) = (0..locs.len()).find(|&i| fi_label_is(&network, label.clone(), i)) {
+                landing_loc = Some(locs[idx]);
+            }
+        }
+    }
+    let landing_rank = landing_loc.map(|l| fi_rank_of_loc(&locs, key_loc, l));
+    let premise_ok = total_holders == 1;
+
+    let terminus = traces
+        .iter()
+        .find(|t| matches!(t.kind, freenet::dev_tool::ProbeOpKind::Put))
+        .map(|t| FiTerminus {
+            rank: fi_rank_of_loc(&locs, key_loc, t.own_loc),
+            stop_reason: t.stop_reason,
+            own_dist: t.own_dist,
+            htl_remaining: t.htl_remaining,
+            hop_count: t.hop_count,
+            num_neighbors: t.num_neighbors,
+            closer_rank: t.closer_neighbor_loc.map(|l| fi_rank_of_loc(&locs, key_loc, l)),
+            closer_visited: t.closer_neighbor_visited,
+        });
+
+    PutReachRun {
+        landing_rank,
+        total_holders,
+        premise_ok,
+        origin_rank,
+        terminus,
+    }
+}
+
+/// Match a NodeLabel back to a peer index. Gateway is index 0 (`gw`), regular
+/// nodes are 1..=num. `NodeLabel::node(net, i)` for i>=1 gives "net-node-i";
+/// index 0 is the gateway with a different label, so probe both spellings.
+fn fi_label_is(network: &str, label: freenet::dev_tool::NodeLabel, idx: usize) -> bool {
+    use freenet::dev_tool::NodeLabel;
+    if idx == 0 {
+        label == NodeLabel::gateway(network, 0)
+    } else {
+        label == NodeLabel::node(network, idx)
+    }
+}
+
+/// Cycle-completeness premise (condition ii): fraction of peers with BOTH a
+/// successor and a predecessor ring edge, plus the list of peers missing one.
+fn fi_cycle_completeness(
+    result: &freenet::dev_tool::ControlledSimulationResult,
+    network: &str,
+    num_nodes: usize,
+    locs: &[f64],
+) -> (usize, usize, Vec<(usize, bool, bool)>) {
+    use freenet::dev_tool::NodeLabel;
+    let mut both = 0usize;
+    let mut missing = Vec::new();
+    // Peers = gateway (idx 0) + regular nodes (1..=num_nodes).
+    for idx in 0..=num_nodes {
+        let label = if idx == 0 {
+            NodeLabel::gateway(network, 0)
+        } else {
+            NodeLabel::node(network, idx)
+        };
+        let own = locs[idx];
+        let nbrs = result.node_neighbor_locations(&label);
+        let has_succ = nbrs.iter().any(|&nb| ring_signed(own, nb) > 0.0);
+        let has_pred = nbrs.iter().any(|&nb| ring_signed(own, nb) < 0.0);
+        if has_succ && has_pred {
+            both += 1;
+        } else {
+            missing.push((idx, has_succ, has_pred));
+        }
+    }
+    (both, num_nodes + 1, missing)
+}
+
+/// EXPERIMENT — PUT-reach isolation across seeds × {stock, nn-clause}, at 16 and
+/// 48 peers. Prints the rank-landing distribution and the terminus WHY.
+#[test_log::test]
+fn test_findability_isolation_put_reach() {
+    for &num_nodes in &[15usize, 47usize] {
+        let peers = num_nodes + 1;
+        tracing::info!(target: "fi_experiment",
+            "===== PUT-REACH ISOLATION ({peers} peers = 1 gw + {num_nodes} nodes; scatter OFF; single copy) =====");
+        for cond_nn in [false, true] {
+            let cond = if cond_nn { "ii nn-clause" } else { "i  stock  " };
+            let mut land0 = 0usize;
+            let mut valid = 0usize;
+            let mut invalid = 0usize;
+            for seed in FINDABILITY_ISOLATION_SEEDS {
+                let r = fi_run_put_reach(seed, cond_nn, num_nodes);
+                let t = r.terminus.as_ref();
+                let terminus_str = match t {
+                    Some(t) => format!(
+                        "rank={} stop={:?} htl_rem={} hops={} nbrs={} closer_rank={:?} closer_visited={:?}",
+                        t.rank, t.stop_reason, t.htl_remaining, t.hop_count, t.num_neighbors,
+                        t.closer_rank, t.closer_visited
+                    ),
+                    None => "NONE (PUT never reached an instrumented finalize)".to_string(),
+                };
+                if !r.premise_ok {
+                    invalid += 1;
+                    tracing::info!(target: "fi_experiment",
+                        "  [{cond}] 0x{seed:012X} INVALID premise (total_holders={} != 1) \
+                         origin_rank={} landing_rank={:?} | terminus: {terminus_str}",
+                        r.total_holders, r.origin_rank, r.landing_rank);
+                    continue;
+                }
+                valid += 1;
+                if r.landing_rank == Some(0) {
+                    land0 += 1;
+                }
+                tracing::info!(target: "fi_experiment",
+                    "  [{cond}] 0x{seed:012X} origin_rank={} -> landing_rank={:?} | terminus: {terminus_str}",
+                    r.origin_rank, r.landing_rank);
+            }
+            tracing::info!(target: "fi_experiment",
+                "  [{cond}] PUT lands at rank 0: {land0}/{valid} valid ({invalid} invalid premise)");
+        }
+        tracing::info!(target: "fi_experiment", "===== END PUT-REACH ({peers} peers) =====");
+    }
+}
+
+/// EXPERIMENT — GET-reach isolation across seeds × distant ranks × {stock,
+/// nn-clause}, at 16 and 48 peers. Prints find-rate and, per miss, the pure
+/// greedy-routing terminus rank + connectivity-gap-vs-give-up split.
+#[test_log::test]
+fn test_findability_isolation_get_reach() {
+    // 48-peer is intentionally omitted: the cycle-completeness probe shows the
+    // sim harness does NOT form a 48-node topology (far-side nodes never connect
+    // / publish their ring), so a 48-peer GET-reach sweep would measure an
+    // unformed network. 16 peers (1 gw + 15) is the validated scale.
+    for &num_nodes in &[15usize] {
+        let peers = num_nodes + 1;
+        // Distant requester ranks: every non-holder regular node.
+        let ranks: Vec<usize> = (1..=14).collect();
+        tracing::info!(target: "fi_experiment",
+            "===== GET-REACH ISOLATION ({peers} peers; seed 1 copy @rank0; scatter+consult OFF; PURE routing) =====");
+        for cond_nn in [false, true] {
+            let cond = if cond_nn { "ii nn-clause" } else { "i  stock  " };
+            let mut found = 0usize;
+            let mut total = 0usize; // valid runs
+            let mut invalid = 0usize;
+            let mut gap_misses = 0usize; // connectivity gap
+            let mut giveup_visited = 0usize; // routing give-up: closer nbr visited
+            let mut giveup_unvisited = 0usize; // routing give-up: closer nbr unvisited
+            for seed in FINDABILITY_ISOLATION_SEEDS {
+                for &rank in &ranks {
+                    let r = fi_run_get_reach(seed, cond_nn, num_nodes, rank);
+                    if !r.premise_ok {
+                        invalid += 1;
+                        tracing::info!(target: "fi_experiment",
+                            "  [{cond}] 0x{seed:012X} r{rank:>2} INVALID premise \
+                             (holders outside {{rank0,requester}}, total={})",
+                            r.total_holders);
+                        continue;
+                    }
+                    total += 1;
+                    if r.found {
+                        found += 1;
+                    } else {
+                        // Classify the miss by its deepest routing terminus.
+                        match &r.deepest_terminus {
+                            Some(t) => match t.closer_rank {
+                                None => gap_misses += 1,
+                                Some(_) => {
+                                    if t.closer_visited == Some(true) {
+                                        giveup_visited += 1;
+                                    } else {
+                                        giveup_unvisited += 1;
+                                    }
+                                }
+                            },
+                            None => {}
+                        }
+                        let t = r.deepest_terminus.as_ref();
+                        tracing::info!(target: "fi_experiment",
+                            "  [{cond}] MISS 0x{seed:012X} r{rank:>2} reached_rank0={} | deepest terminus: {}",
+                            r.reached_rank0,
+                            match t {
+                                Some(t) => format!(
+                                    "rank={} stop={:?} htl_rem={} hops={} nbrs={} closer_rank={:?} closer_visited={:?}",
+                                    t.rank, t.stop_reason, t.htl_remaining, t.hop_count,
+                                    t.num_neighbors, t.closer_rank, t.closer_visited
+                                ),
+                                None => "NONE (no give-up trace — check originator-side exhaustion)".to_string(),
+                            });
+                    }
+                }
+            }
+            let misses = total - found;
+            tracing::info!(target: "fi_experiment",
+                "  [{cond}] GET-reach find-rate = {found}/{total} ({:.3}) [{invalid} invalid] | misses={misses}: \
+                 connectivity_gap={gap_misses} give_up_visited={giveup_visited} give_up_unvisited={giveup_unvisited}",
+                if total > 0 { found as f64 / total as f64 } else { 0.0 });
+        }
+        tracing::info!(target: "fi_experiment", "===== END GET-REACH ({peers} peers) =====");
+    }
+}
+
+/// EXPERIMENT — condition-ii cycle-completeness premise: with the both-sides
+/// nearest-neighbor clause ON, assert (report) how complete the ring cycle is.
+#[test_log::test]
+fn test_findability_isolation_cycle_completeness() {
+    use freenet::dev_tool::{Location, SimNetwork, SimOperation};
+    for &num_nodes in &[15usize, 47usize] {
+        let peers = num_nodes + 1;
+        tracing::info!(target: "fi_experiment",
+            "===== CYCLE-COMPLETENESS (condition ii, nn-clause ON, {peers} peers) =====");
+        for seed in FINDABILITY_ISOLATION_SEEDS {
+            setup_deterministic_state(seed);
+            freenet::dev_tool::set_nn_nearest_edge_clause(true);
+            let network = format!("fi-cycle-{seed:x}-n{num_nodes}");
+            let contract = SimOperation::create_test_contract(0xA5);
+            let key_loc = Location::from(&contract.key()).as_f64();
+            let node_locations = fi_node_locations(key_loc, num_nodes);
+            let rt = create_runtime();
+            let sim = rt.block_on(async {
+                SimNetwork::new_with_node_locations(
+                    &network, 1, num_nodes, 10, 7, 5, 2, seed, &node_locations,
+                )
+                .await
+            });
+            let locs = sim.get_peer_locations();
+            let result = sim.run_controlled_simulation(
+                seed,
+                Vec::<freenet::dev_tool::ScheduledOperation>::new(),
+                Duration::from_secs(120),
+                Duration::from_secs(60),
+            );
+            freenet::dev_tool::set_nn_nearest_edge_clause(false);
+            assert!(result.turmoil_result.is_ok());
+            let (both, tot, missing) = fi_cycle_completeness(&result, &network, num_nodes, &locs);
+            tracing::info!(target: "fi_experiment",
+                "  0x{seed:012X}: both-edge coverage {both}/{tot}; missing={:?} (idx, has_succ, has_pred)",
+                missing);
+        }
+        tracing::info!(target: "fi_experiment", "===== END CYCLE-COMPLETENESS ({peers} peers) =====");
+    }
+}
+
 /// GATE B — invariant-1 STRUCTURAL guard + forced-stale DETECTOR positive control.
 ///
 /// HONEST SCOPE (do not mistake this for a discriminating stale-serve gate): a

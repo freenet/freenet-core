@@ -54,6 +54,37 @@ const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 /// score is too noisy to be useful.
 const KLEINBERG_FILTER_MIN_CONNECTIONS: usize = 3;
 
+// PROTOTYPE (nearest-neighbor findability experiment — NOT for ship).
+//
+// When enabled, `should_accept` unconditionally accepts a candidate that would
+// become this peer's new nearest ring-neighbor ON ITS SIDE (Chord-style
+// successor OR predecessor), independent of the Kleinberg gap-fill score and
+// even over `max_connections`; and the topology prune/swap path (see
+// `crate::topology`) never drops either guaranteed nearest-neighbor edge.
+// Default = disabled = current (v0.2.95) behavior.
+//
+// THREAD-LOCAL on purpose: the simulation harness runs every node on the test's
+// own current-thread runtime and relies on thread-local globals (`GlobalRng`,
+// `GlobalSimulationTime`) to stay parallel-test-safe. A process-global flag
+// would bleed into concurrently-running sim tests on other threads. This flag
+// is flipped per experiment arm and exists only to falsify the hypothesis that
+// guaranteeing the nearest-neighbor edges makes a lone contract copy findable
+// without PUT scatter. Do NOT wire this into production config.
+thread_local! {
+    static NN_NEAREST_EDGE_CLAUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable the prototype nearest-neighbor acceptance clause for the
+/// CURRENT THREAD (see the `NN_NEAREST_EDGE_CLAUSE` thread-local). Experiment-only.
+pub fn set_nn_nearest_edge_clause(enabled: bool) {
+    NN_NEAREST_EDGE_CLAUSE.with(|c| c.set(enabled));
+}
+
+/// Read the prototype nearest-neighbor clause flag for the current thread.
+pub(crate) fn nn_nearest_edge_clause_enabled() -> bool {
+    NN_NEAREST_EDGE_CLAUSE.with(|c| c.get())
+}
+
 /// Maximum number of concurrent CONNECT operations a gateway will route simultaneously.
 /// This prevents thundering-herd scenarios where many joiners hit the same gateway at once.
 /// The value 8 balances throughput (parallel joins) against overload protection. Non-gateways
@@ -616,6 +647,57 @@ impl ConnectionManager {
             return true;
         }
 
+        // PROTOTYPE nearest-neighbor clause (experiment-only; see
+        // NN_NEAREST_EDGE_CLAUSE). Both-sides (Chord successor+predecessor)
+        // variant: if enabled, force-accept a candidate that would become this
+        // peer's new nearest ring-neighbor ON ITS OWN SIDE — its successor side
+        // (clockwise / higher location, signed_distance > 0) or its predecessor
+        // side (counter-clockwise / lower location, signed_distance < 0) —
+        // regardless of gap score or max_connections. Guaranteeing BOTH edges
+        // gives greedy routing a lattice with no directional dead-ends: a GET
+        // descending from either direction can always step to a strictly-closer
+        // peer and reach the globally-closest. `open >= 1` here (open == 0 already
+        // returned above). Self-bounding: on each side it only fires for a
+        // candidate closer than every current connection on that side, a strictly
+        // decreasing sequence, so it cannot accept every close peer.
+        let nn_override = if nn_nearest_edge_clause_enabled() {
+            if let Some(me) = self.get_stored_location() {
+                let cand_signed = me.signed_distance(location);
+                let cand_dist = cand_signed.abs();
+                let cand_successor_side = cand_signed > 0.0;
+                // Nearest current connection on the candidate's own side.
+                let current_nearest_same_side = self
+                    .connections_by_location
+                    .read()
+                    .keys()
+                    .filter_map(|loc| {
+                        let sd = me.signed_distance(*loc);
+                        if (sd > 0.0) == cand_successor_side {
+                            Some(sd.abs())
+                        } else {
+                            None
+                        }
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                let fires = cand_dist > 0.0 && cand_dist < current_nearest_same_side;
+                if fires {
+                    tracing::debug!(
+                        addr = %addr,
+                        peer_location = %location,
+                        cand_dist,
+                        current_nearest_same_side,
+                        side = if cand_successor_side { "successor" } else { "predecessor" },
+                        "should_accept: NN-clause force-accept (new nearest neighbor on its side)"
+                    );
+                }
+                fires
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Use actual open connections (not inflated total_conn) for the
         // min_connections threshold. Pending reservations are speculative —
         // many fail to complete — so counting them pushes nodes into the
@@ -708,6 +790,10 @@ impl ConnectionManager {
             );
             accepted
         };
+        // PROTOTYPE: force-accept the new-nearest-neighbor candidate (over max if
+        // needed; the over-max prune path — which protects the NN edge — brings
+        // the node back under max by dropping a farther/less-critical connection).
+        let accepted = accepted || nn_override;
         tracing::debug!(
             addr = %addr,
             peer_location = %location,

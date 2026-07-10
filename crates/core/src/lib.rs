@@ -103,6 +103,19 @@ pub mod dev_tool {
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
 
+    // PROTOTYPE nearest-neighbor findability experiment (NOT for ship): lets an
+    // integration test flip the nearest-neighbor acceptance clause per arm.
+    pub use ring::set_nn_nearest_edge_clause;
+
+    // EXPERIMENT-ONLY findability probe (NOT for ship): scatter/cache-disable hook
+    // (guarantees a single copy) + per-op terminus tracing (rank / HTL / hop /
+    // stop-reason / connectivity-gap-vs-give-up). See operations::findability_probe.
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::findability_probe::{
+        clear_op_traces, scatter_disabled, set_scatter_disabled, take_op_traces, OpTraceRecord,
+        ProbeOpKind, ProbeStopReason,
+    };
+
     // Test hooks: per-op driver call counters. Tests assert these
     // increment to confirm wire variants dispatch through their
     // driver (not a local-cache shortcut or legacy path).
