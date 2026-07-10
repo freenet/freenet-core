@@ -3735,11 +3735,13 @@ mod tests {
     // code therefore left the postMessage transfer list empty and every
     // outbound WS frame was structured-clone COPIED across the process
     // boundary (a ~2.7 s main-thread CPU burst on tab-focus flush). The fix
-    // transfers the backing buffer for ArrayBuffer *views* too, copying the
-    // view out via `.slice()` first so it never detaches WASM linear memory.
-    // The behavioural coverage is in tests/playwright/tests/websocket-shim.spec.ts
-    // (a real browser asserting the actual transfer list); this content guard
-    // runs in the default CI job and fails fast if the JS is reverted.
+    // transfers the backing buffer for ArrayBuffer *views* too, copying exactly
+    // the view window off `data.buffer` first (works for TypedArrays AND a
+    // DataView, which has no `.slice()`) so it never detaches WASM linear
+    // memory. The behavioural coverage is in
+    // tests/playwright/tests/websocket-shim.spec.ts (a real browser asserting
+    // the actual transfer list); this content guard runs in the default CI job
+    // and fails fast if the JS is reverted.
     #[test]
     fn shim_js_transfers_array_buffer_views_zero_copy() {
         // The old, buggy one-liner must be gone.
@@ -3747,20 +3749,26 @@ mod tests {
             !WEBSOCKET_SHIM_JS.contains("data instanceof ArrayBuffer ? [data] : []"),
             "shim send() must not use the copy-everything transfer check (OOPIF copy regression)"
         );
-        // Views (Uint8Array) must be recognised and their buffer transferred.
+        // Views (Uint8Array / DataView) must be recognised and their buffer
+        // transferred.
         assert!(
             WEBSOCKET_SHIM_JS.contains("ArrayBuffer.isView(data)"),
             "shim send() must transfer ArrayBuffer views zero-copy"
         );
-        // The view must be copied out (.slice()) before transfer so WASM
-        // linear memory is never detached.
+        // The view window must be copied off data.buffer (NOT data.slice(),
+        // which a DataView lacks) before transfer, so WASM linear memory is
+        // never detached.
         assert!(
-            WEBSOCKET_SHIM_JS.contains("data.slice()"),
-            "shim send() must copy the view out before transferring its buffer"
+            WEBSOCKET_SHIM_JS.contains("data.buffer.slice("),
+            "shim send() must copy the view window off data.buffer (handles DataView too)"
         );
         assert!(
-            WEBSOCKET_SHIM_JS.contains("transfer = [copy.buffer]"),
-            "shim send() must transfer the copied buffer, not the shared/WASM one"
+            !WEBSOCKET_SHIM_JS.contains("data.slice()"),
+            "shim send() must not call data.slice() (a DataView has no .slice())"
+        );
+        assert!(
+            WEBSOCKET_SHIM_JS.contains("transfer = [buf]"),
+            "shim send() must transfer the freshly copied buffer, not the shared/WASM one"
         );
     }
 

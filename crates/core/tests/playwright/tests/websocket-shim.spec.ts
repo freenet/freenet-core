@@ -57,6 +57,11 @@ type SendProbe = {
 type Probes = {
   uint8: SendProbe;
   subarrayView: SendProbe & { sharedBufferByteLength: number };
+  dataView: SendProbe & {
+    threw: boolean;
+    callerBufferByteLength: number;
+    transfer0IsCallerBuffer: boolean;
+  };
   arraybuffer: SendProbe & { dataIsTransfer0: boolean };
   string: SendProbe & { dataEquals: boolean };
 };
@@ -151,6 +156,36 @@ test("send() transfers ArrayBuffer views zero-copy without detaching WASM memory
       transfer0IsSharedBuffer: sub.transfer[0] === shared.buffer,
     };
 
+    // 2b) A DataView is ALSO an ArrayBuffer view, but unlike a TypedArray it has
+    // no `.slice()`. Copying the window off `data.buffer` (not `data.slice()`)
+    // must handle it WITHOUT throwing, transferring a fresh copy of exactly the
+    // view window and never the caller's buffer.
+    const dvBuf = new Uint8Array([10, 20, 30, 40]).buffer; // 4-byte buffer
+    const dv = new DataView(dvBuf, 1, 2); // window [20,30], byteOffset 1, length 2
+    let dvThrew = false;
+    let dvSend: { message: { data: unknown }; transfer: Transferable[] } | null =
+      null;
+    try {
+      dvSend = capture(dv);
+    } catch (_e) {
+      dvThrew = true;
+    }
+    const dvProbe = dvSend
+      ? probe(dvSend)
+      : {
+          transferLen: 0,
+          transfer0IsArrayBuffer: false,
+          transfer0ByteLength: null as number | null,
+          dataBytes: [] as number[],
+          dataBufferIsTransferred: false,
+        };
+    const dataView = {
+      ...dvProbe,
+      threw: dvThrew,
+      callerBufferByteLength: dvBuf.byteLength,
+      transfer0IsCallerBuffer: dvSend ? dvSend.transfer[0] === dvBuf : false,
+    };
+
     // 3) A real ArrayBuffer still transfers itself (unchanged behaviour).
     const ab = new Uint8Array([9, 9]).buffer;
     const abSend = capture(ab);
@@ -166,7 +201,7 @@ test("send() transfers ArrayBuffer views zero-copy without detaching WASM memory
       dataEquals: strSend.message.data === "hello",
     };
 
-    return { uint8, subarrayView, arraybuffer, string };
+    return { uint8, subarrayView, dataView, arraybuffer, string };
   }, shimSource)) as unknown as Probes & {
     subarrayView: { transfer0IsSharedBuffer: boolean };
   };
@@ -197,6 +232,26 @@ test("send() transfers ArrayBuffer views zero-copy without detaching WASM memory
     probes.subarrayView.sharedBufferByteLength,
     "shared backing buffer must remain intact (not detached)",
   ).toBe(6);
+
+  // 2b) DataView: must not throw (a DataView has no `.slice()`), and must
+  // transfer a fresh 2-byte copy of exactly the view window, never the caller's
+  // buffer, with bytes preserved.
+  expect(
+    probes.dataView.threw,
+    "send(DataView) must not throw (DataView has no .slice())",
+  ).toBe(false);
+  expect(probes.dataView.transferLen).toBe(1);
+  expect(probes.dataView.transfer0IsArrayBuffer).toBe(true);
+  expect(probes.dataView.transfer0ByteLength).toBe(2);
+  expect(probes.dataView.dataBytes).toEqual([20, 30]);
+  expect(
+    probes.dataView.transfer0IsCallerBuffer,
+    "must NOT transfer the caller's backing buffer",
+  ).toBe(false);
+  expect(
+    probes.dataView.callerBufferByteLength,
+    "caller's backing buffer must remain intact (not detached)",
+  ).toBe(4);
 
   // 3) ArrayBuffer: unchanged — transfers itself.
   expect(probes.arraybuffer.transferLen).toBe(1);
