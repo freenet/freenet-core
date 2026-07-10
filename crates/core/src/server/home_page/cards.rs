@@ -1190,10 +1190,40 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         String::new()
     };
 
+    // On-disk usage tiles (#4683/#4702 follow-up): `None` renders "measuring…"
+    // so an unseeded disk tracker (early startup) is visually distinct from
+    // genuine zero usage, mirroring the `hosting_disk_*` telemetry gate.
+    const MEASURING: &str = "measuring…";
+    let disk_used_value = match h.disk_total_bytes {
+        Some(total) => format_bytes(total),
+        None => MEASURING.to_string(),
+    };
+    let disk_breakdown_title = match (
+        h.disk_state_bytes,
+        h.disk_wasm_bytes,
+        h.disk_compile_cache_bytes,
+    ) {
+        (Some(state), Some(wasm), Some(cache)) => format!(
+            "State: {state} · WASM: {wasm} · Compile cache: {cache}",
+            state = format_bytes(state),
+            wasm = format_bytes(wasm),
+            cache = format_bytes(cache),
+        ),
+        _ => "Disk tracker not yet seeded".to_string(),
+    };
+    let disk_budget_value = match h.disk_budget_bytes {
+        Some(budget) => format_bytes(budget),
+        None => MEASURING.to_string(),
+    };
+    let disk_headroom_value = match (h.disk_total_bytes, h.disk_budget_bytes) {
+        (Some(used), Some(budget)) => format_bytes(budget.saturating_sub(used)),
+        _ => MEASURING.to_string(),
+    };
+
     format!(
         r##"<div class="card">
             <div class="card-header"><h2>Demand-driven eviction</h2><span class="g-mode g-mode-enforce">piece A</span></div>
-            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven: contracts with the lowest predicted read-demand (keep-score) are evicted first when over the RAM budget.</p>
+            <p class="empty" style="margin: 0.2rem 0.9rem 0.4rem; font-size: 0.82rem; color: var(--text-muted, #888);">Retention is demand-driven: contracts with the lowest predicted read-demand (keep-score) are evicted first when over budget. Since #4702 the eviction floor is min(RAM budget, disk budget) — either resource running low can trigger eviction.</p>
             <div class="g-verdict-row">
                 <div class="g-norms">
                     <div class="g-norm"><div class="g-norm-label">RAM used</div><div class="g-norm-value">{used} / {budget} ({pct:.0}%)</div></div>
@@ -1201,6 +1231,13 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                     <div class="g-norm"><div class="g-norm-label">Hosted</div><div class="g-norm-value">{count}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Budget evictions</div><div class="g-norm-value">{budget_evictions}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Evicted w/ demand</div><div class="g-norm-value">{recently_read}</div></div>
+                </div>
+            </div>
+            <div class="g-verdict-row">
+                <div class="g-norms">
+                    <div class="g-norm" title="{disk_breakdown_title}"><div class="g-norm-label">Disk used</div><div class="g-norm-value">{disk_used}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Disk budget</div><div class="g-norm-value">{disk_budget}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Disk headroom</div><div class="g-norm-value">{disk_headroom}</div></div>
                 </div>
             </div>
             <div class="table-wrap">
@@ -1218,6 +1255,10 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         count = h.contract_count,
         budget_evictions = h.budget_evictions_total,
         recently_read = recently_read_value,
+        disk_breakdown_title = html_escape(&disk_breakdown_title),
+        disk_used = disk_used_value,
+        disk_budget = disk_budget_value,
+        disk_headroom = disk_headroom_value,
         rows = rows,
         footer = footer,
     )

@@ -645,7 +645,12 @@ impl HostingManager {
 
     /// The current aggregate disk budget the admission gate checks against
     /// (#4683). `u64::MAX` until the first 60s recompute installs a real value.
-    #[cfg(test)]
+    ///
+    /// Also read by the dashboard's "Demand-driven eviction" panel
+    /// (`Ring::dashboard_hosting_snapshot`, follow-up to #4683/#4702) to
+    /// surface disk usage next to the RAM budget: `u64::MAX` maps to `None`
+    /// there so an unseeded/not-yet-recomputed budget reads as "measuring…"
+    /// instead of a nonsensical astronomical byte count.
     pub(crate) fn disk_budget_bytes(&self) -> u64 {
         self.disk_budget_bytes.load(Ordering::Relaxed)
     }
@@ -6146,6 +6151,90 @@ mod tests {
             manager
                 .admit_state_write(&make_contract_key(1), u64::MAX / 2)
                 .is_ok()
+        );
+    }
+
+    // --- Dashboard disk-usage panel population (follow-up to #4683/#4702) ----
+    //
+    // `Ring::dashboard_hosting_snapshot` maps `disk_usage_stats()` and
+    // `disk_budget_bytes()` straight into `HostingSnapshot`'s `Option<u64>`
+    // disk fields (`None` while unseeded / not yet recomputed). These tests
+    // exercise the two `HostingManager` accessors the mapping reads, so a
+    // regression in the seeded/unseeded gate is caught at the source rather
+    // than only through the heavier `Ring`-level plumbing.
+
+    /// No tracker configured at all (mirrors a node with hosting disabled or
+    /// very early startup before `configure_disk_tracker` runs): both
+    /// accessors report the "not yet meaningful" values the dashboard maps to
+    /// `None` — `disk_usage_stats()` is `None` and `disk_budget_bytes()` is
+    /// `u64::MAX`.
+    #[test]
+    fn dashboard_disk_fields_absent_without_tracker() {
+        let manager = HostingManager::new(1024 * 1024 * 1024);
+        assert!(
+            manager.disk_usage_stats().is_none(),
+            "no tracker configured → disk_usage_stats must be None"
+        );
+        assert_eq!(
+            manager.disk_budget_bytes(),
+            u64::MAX,
+            "no recompute has run → disk_budget_bytes stays u64::MAX"
+        );
+    }
+
+    /// Tracker configured but not yet seeded (the window between
+    /// `configure_disk_tracker` and the first successful `seed`): still
+    /// `None` / `u64::MAX` — an in-flight seed must not leak a
+    /// zero-initialized (misleadingly "empty") snapshot to the dashboard.
+    #[test]
+    fn dashboard_disk_fields_absent_while_unseeded() {
+        let manager = HostingManager::new(1024 * 1024 * 1024);
+        manager.configure_disk_tracker(
+            std::path::PathBuf::from("/nonexistent/contracts"),
+            std::path::PathBuf::from("/nonexistent/cache"),
+        );
+        assert!(
+            manager.disk_usage_stats().is_none(),
+            "configured-but-unseeded tracker → disk_usage_stats must stay None"
+        );
+        assert_eq!(manager.disk_budget_bytes(), u64::MAX);
+    }
+
+    /// Once seeded, `disk_usage_stats()` reports `Some` with the exact
+    /// component breakdown (state/wasm/compile-cache/total) the dashboard
+    /// renders. `disk_budget_bytes()` stays `u64::MAX` (→ `None`-mapped)
+    /// until `recompute_effective_budget` has ALSO run — seeding alone does
+    /// not install a budget.
+    #[test]
+    fn dashboard_disk_usage_populated_after_seed_budget_after_recompute() {
+        const MIB: u64 = 1024 * 1024;
+        let manager = HostingManager::new(64 * 1024 * MIB);
+        manager.seed_disk_tracker_for_test([
+            (make_contract_key(1), 100 * MIB),
+            (make_contract_key(2), 50 * MIB),
+        ]);
+
+        let stats = manager
+            .disk_usage_stats()
+            .expect("seeded tracker → Some usage stats");
+        assert_eq!(stats.state_bytes, 150 * MIB);
+        assert_eq!(stats.total_bytes, 150 * MIB);
+        // Seeding alone (no recompute) leaves the budget unset.
+        assert_eq!(
+            manager.disk_budget_bytes(),
+            u64::MAX,
+            "budget stays u64::MAX until recompute_effective_budget runs"
+        );
+
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        manager
+            .recompute_effective_budget(150 * MIB)
+            .expect("seeded → recompute installs a budget");
+        let budget = manager.disk_budget_bytes();
+        assert_ne!(
+            budget,
+            u64::MAX,
+            "after recompute the dashboard must see a real (non-MAX) budget"
         );
     }
 
