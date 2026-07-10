@@ -35,13 +35,28 @@
   FreenetWebSocket.prototype.send = function (data) {
     if (this.readyState !== 1)
       throw new DOMException('WebSocket is not open', 'InvalidStateError');
-    var transfer = data instanceof ArrayBuffer ? [data] : [];
+    var payload = data;
+    var transfer = [];
+    if (data instanceof ArrayBuffer) {
+      transfer = [data];
+    } else if (ArrayBuffer.isView(data)) {
+      // wasm-bindgen hands us a Uint8Array that may be a view into WASM linear
+      // memory; copy exactly this view's window into a fresh buffer so we can
+      // transfer ownership without detaching that. Use data.buffer.slice (not
+      // data.slice) so a DataView — which has no .slice — is handled too.
+      var buf = data.buffer.slice(
+        data.byteOffset,
+        data.byteOffset + data.byteLength,
+      );
+      payload = new Uint8Array(buf);
+      transfer = [buf];
+    }
     window.parent.postMessage(
       {
         __freenet_ws__: true,
         type: 'send',
         id: this._id,
-        data: data,
+        data: payload,
       },
       '*',
       transfer,
