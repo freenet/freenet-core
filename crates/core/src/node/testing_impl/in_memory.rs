@@ -592,13 +592,15 @@ async fn append_contracts(
 ///
 /// It deliberately does NOT pre-register the subscriber's interest/subscription
 /// for any contract. Broadcast fan-out (`get_broadcast_targets_update`)
-/// enumerates the interest manager + proximity cache, not the raw connection
-/// set — and those are populated organically when each subscriber runs its real
-/// `Subscribe` operation, which now routes directly to the gateway over the
-/// injected connection (`subscribe.rs` calls `register_peer_interest` /
-/// `add_downstream_subscriber` on the host as it processes the inbound
-/// subscribe). So the scenario keeps using the genuine subscribe + interest +
-/// broadcast machinery; the ONLY thing replaced is the CONNECT handshake.
+/// enumerates the proximity cache of advertised co-hosts (Source 1; the
+/// interest-manager Source-2 arm was removed in #4642 step 9), not the raw
+/// connection set — and that is populated organically when each subscriber runs
+/// its real `Subscribe` operation, which now routes directly to the gateway
+/// over the injected connection (`subscribe.rs` calls `register_peer_interest` /
+/// `add_downstream_subscriber` and `announce_contract_hosted` on the host as it
+/// processes the inbound subscribe). So the scenario keeps using the genuine
+/// subscribe + advertisement + broadcast machinery; the ONLY thing replaced is
+/// the CONNECT handshake.
 ///
 /// `was_reserved: false` is correct because no reservation was ever made for
 /// these synthetic connections. A peer that the cap rejects (over
