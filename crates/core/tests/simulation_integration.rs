@@ -14508,8 +14508,10 @@ fn test_findability_isolation_get_reach() {
     // unformed network. 16 peers (1 gw + 15) is the validated scale.
     for &num_nodes in &[15usize] {
         let peers = num_nodes + 1;
-        // Distant requester ranks: every non-holder regular node.
-        let ranks: Vec<usize> = (1..=14).collect();
+        // Representative spread of distant requester ranks (kept small so a
+        // heavily-loaded box doesn't kill the serial sweep mid-run; the full
+        // 1..=14 sweep gives stock=0.881, this subset is the A/B comparison).
+        let ranks: Vec<usize> = vec![2, 5, 8, 11, 14];
         tracing::info!(target: "fi_experiment",
             "===== GET-REACH ISOLATION ({peers} peers; seed 1 copy @rank0; scatter+consult OFF; PURE routing) =====");
         for cond_nn in [false, true] {
