@@ -309,9 +309,20 @@ impl P2pConnManager {
                 // accepted at the protocol level (the CONNECT terminus handler in connect.rs) and NAT traversal
                 // already succeeded. Re-evaluating the probabilistic Kleinberg filter
                 // would discard hard-won connections for no capacity reason (#3545).
-                // Only enforce the hard max_connections cap as a resource safety limit.
+                // Enforce the hard max_connections cap as a resource safety limit,
+                // EXCEPT for a strictly-closer per-side nearest-neighbor lattice
+                // edge within the bounded over-max ceiling (mechanism 3). Without
+                // this exception the cap silently drops the guaranteed
+                // successor/predecessor edge on the REAL CONNECT/promotion path,
+                // making mechanism 3's at-capacity displacement inert in
+                // production (nodes routinely sit at max). The same predicate is
+                // re-checked in add_connection; the over-max topology prune sheds a
+                // farther non-lattice link next tick. See
+                // connection_manager.rs::{admits_lattice_edge_over_cap, LATTICE_OVERMAX_SLACK}.
                 let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections {
+                if current >= connection_manager.max_connections
+                    && !connection_manager.admits_lattice_edge_over_cap(loc)
+                {
                     tracing::warn!(
                         tx = %tx,
                         %peer,
@@ -1160,9 +1171,20 @@ impl P2pConnManager {
                 // establishment (NAT traversal) already succeeded. Re-evaluating
                 // the probabilistic Kleinberg filter would discard hard-won
                 // connections for no capacity reason (#3545).
-                // Only enforce the hard max_connections cap below.
+                // Enforce the hard max_connections cap below, EXCEPT for a
+                // strictly-closer per-side nearest-neighbor lattice edge within
+                // the bounded over-max ceiling (mechanism 3). Without this
+                // exception the cap silently drops the guaranteed
+                // successor/predecessor edge on the REAL CONNECT/promotion path,
+                // making mechanism 3's at-capacity displacement inert in
+                // production (nodes routinely sit at max). The same predicate is
+                // re-checked in add_connection; the over-max topology prune sheds a
+                // farther non-lattice link next tick. See
+                // connection_manager.rs::{admits_lattice_edge_over_cap, LATTICE_OVERMAX_SLACK}.
                 let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections {
+                if current >= connection_manager.max_connections
+                    && !connection_manager.admits_lattice_edge_over_cap(loc)
+                {
                     tracing::warn!(
                         %peer_addr,
                         current_connections = current,

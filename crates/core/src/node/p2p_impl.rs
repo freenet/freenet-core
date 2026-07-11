@@ -523,14 +523,24 @@ impl NodeP2P {
                 (peer_id, own_pub_key)
             };
             let rate_limiter = &ring_stats.update_rate_limiter;
+            let cm = &ring_stats.connection_manager;
+            let succ = cm.nearest_lattice_neighbor_dist(true);
+            let pred = cm.nearest_lattice_neighbor_dist(false);
+            let (probes_issued, probe_improvements) = cm.lattice_probe_stats();
             super::network_status::RingStatsSnapshot {
-                connection_count: ring_stats.connection_manager.connection_count() as u32,
+                connection_count: cm.connection_count() as u32,
                 hosted_contracts: ring_stats.hosting_contracts_count() as u32,
                 peer_id,
                 own_pub_key,
                 updates_accepted: rate_limiter.accepted_total(),
                 updates_rate_limited: rate_limiter.rejected_total(),
                 updates_capacity_dropped: rate_limiter.capacity_rejected_total(),
+                lattice_has_successor: succ.is_some(),
+                lattice_has_predecessor: pred.is_some(),
+                lattice_successor_distance: succ,
+                lattice_predecessor_distance: pred,
+                lattice_probes_issued: probes_issued,
+                lattice_probe_improvements: probe_improvements,
             }
         }));
 

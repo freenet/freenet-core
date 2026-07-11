@@ -229,6 +229,19 @@ impl TopologyManager {
         self.limits = limits;
     }
 
+    /// Whether the nearest-neighbor ring lattice retention exemption is ACTIVE
+    /// for this peer: the flag is set AND `max_connections` clears the
+    /// minimum-degree floor ([`crate::ring::NN_LATTICE_MIN_MAX_CONNECTIONS`]).
+    /// Mirrors `ConnectionManager::nn_lattice_active` (same gate, this side's
+    /// budget), so the retention exemption is active exactly when the acceptance
+    /// clause and discovery probe are. Passed into the free-function
+    /// `protected_nearest_neighbors` / `select_fallback_peer_to_drop` so the
+    /// score-based swap/prune paths never protect a lattice edge when the feature
+    /// is gated off (e.g. the sparse-`max_connections` broad simulation suite).
+    fn nn_lattice_active(&self) -> bool {
+        crate::ring::nn_lattice_active_for(self.limits.max_connections)
+    }
+
     /// Report the use of a resource with multiple attribution sources, splitting the usage
     /// evenly between the sources.
     /// This should be done in the lowest-level functions that consume the resource, taking
@@ -551,7 +564,11 @@ impl TopologyManager {
         if current_connections > self.limits.max_connections {
             let mut adj = adjustment.unwrap_or(TopologyAdjustment::NoChange);
             if matches!(adj, TopologyAdjustment::NoChange) {
-                if let Some(peer) = select_fallback_peer_to_drop(neighbor_locations, my_location) {
+                if let Some(peer) = select_fallback_peer_to_drop(
+                    self.nn_lattice_active(),
+                    neighbor_locations,
+                    my_location,
+                ) {
                     info!(
                         current_connections,
                         max_connections = self.limits.max_connections,
@@ -679,6 +696,25 @@ impl TopologyManager {
             None => Vec::new(),
         };
 
+        // Never shed a guaranteed nearest-neighbor lattice edge to relieve
+        // resource pressure (mechanism 4). Match protected candidates by signed
+        // distance (bijective with the neighbor Location for a fixed own
+        // location). This path only runs above min_connections, so at least one
+        // non-lattice candidate always remains. The exemption is gated on the
+        // lattice being ACTIVE for this peer's budget (below the minimum-degree
+        // floor it is empty, so the score paths behave exactly as pre-lattice).
+        let nn_active = self.nn_lattice_active();
+        let protected_signed: Vec<f64> = match my_location {
+            Some(my_loc) => protected_nearest_neighbors(nn_active, my_location, neighbor_locations)
+                .iter()
+                .map(|loc| my_loc.signed_distance(*loc))
+                .collect(),
+            None => Vec::new(),
+        };
+        let is_protected = |sd: Option<f64>| -> bool {
+            matches!(sd, Some(d) if protected_signed.iter().any(|p| (p - d).abs() < 1e-12))
+        };
+
         // Build a peer-location index for O(1) lookup (avoids O(N²) scan).
         // Stores (signed_distance, peers_at_same_location) for each peer.
         let peer_to_loc_info: std::collections::HashMap<PeerKeyLocation, (f64, usize)> =
@@ -750,6 +786,10 @@ impl TopologyManager {
         let mut worst: Option<(PeerKeyLocation, f64)> = None;
 
         for c in &candidates {
+            // Skip guaranteed lattice edges (mechanism 4).
+            if is_protected(c.peer_signed_distance) {
+                continue;
+            }
             let normalized_routing = if max_routing > 0.0 {
                 c.routing_value / max_routing
             } else {
@@ -800,7 +840,7 @@ impl TopologyManager {
             // All candidates were topology-critical, but we're under resource
             // pressure and must shed load. Fall back to least-topology-important.
             event!(Level::WARN, "All peers topology-critical, using fallback");
-            match select_fallback_peer_to_drop(neighbor_locations, my_location) {
+            match select_fallback_peer_to_drop(nn_active, neighbor_locations, my_location) {
                 Some(peer) => TopologyAdjustment::RemoveConnections(vec![peer]),
                 None => TopologyAdjustment::NoChange,
             }
@@ -870,12 +910,19 @@ impl TopologyManager {
             return TopologyAdjustment::NoChange;
         }
 
+        // Never swap away a guaranteed nearest-neighbor lattice edge
+        // (mechanism 4). Gated on the lattice being active for this peer's budget
+        // (empty below the minimum-degree floor).
+        let protected =
+            protected_nearest_neighbors(self.nn_lattice_active(), my_location, neighbor_locations);
+
         // Collect raw routing values for normalization.
         // Note: uses raw request count (not requests/bandwidth like the removal path)
         // because swap decisions care about routing utility, not bandwidth cost.
         // Both paths normalize to [0,1] so the ranking within each is correct.
         let peers_with_routing: Vec<_> = neighbor_locations
             .iter()
+            .filter(|(loc, _)| !protected.contains(loc))
             .flat_map(|(loc, conns)| {
                 let count = conns.len();
                 conns.iter().map(move |conn| (loc, conn, count))
@@ -1040,12 +1087,74 @@ fn composite_score(
     Some(normalized_routing + TOPOLOGY_WEIGHT * topo)
 }
 
+/// The (up to two) nearest-neighbor lattice edges this peer must not shed:
+/// its ring-closest connected neighbor on the SUCCESSOR side (higher location,
+/// wrapping) and on the PREDECESSOR side (lower location, wrapping). These are
+/// the guaranteed base-lattice edges (mechanism 4 — retention exemption); the
+/// remaining connections are ordinary long links, freely prunable/swappable.
+///
+/// Derived on demand from the live connection set (not tracked as separate
+/// state), so exactly one edge per side is ever protected and a superseded
+/// former-nearest is automatically demoted to the long-link pool. Empty when
+/// the lattice is inactive (`nn_active == false` — the flag is off, e.g. the
+/// test control arm, OR this peer's `max_connections` is below the minimum-degree
+/// floor), own location is unknown, or there are no neighbors. `nn_active` is the
+/// full activation gate computed by the caller from its own `max_connections`
+/// (`TopologyManager::nn_lattice_active`).
+///
+/// F2 (MEDIUM, known limitation — follow-up, not fixed here): protection is keyed
+/// by `Location`, and `Location` is address-masked (a whole IPv4 /24 or IPv6 /48
+/// collapses to one `Location`). So when two DISTINCT peers happen to share the
+/// masked per-side-nearest `Location`, BOTH are exempted from score-based
+/// swap/prune, not just the single edge. Narrowing to the specific edge peer is
+/// NOT cheap here: the entire topology score/swap/prune layer is `Location`-keyed
+/// (the candidate filters, `is_protected`, and the fallback drop all compare on
+/// `Location`, and the "edge" is fundamentally a routing `Location`, not a peer
+/// identity), and threading per-connection identity through all of them is a
+/// larger, riskier change on a high-risk surface. The over-protection is bounded
+/// and rare (only peers colliding on a /24-/48 mask, which are already ring-close)
+/// and is a topology-efficiency nit, not a correctness or eclipse-cost change —
+/// the exemption still only removes score-based swap, never liveness eviction.
+fn protected_nearest_neighbors(
+    nn_active: bool,
+    my_location: &Option<Location>,
+    neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+) -> Vec<Location> {
+    if !nn_active {
+        return Vec::new();
+    }
+    let Some(my_loc) = *my_location else {
+        return Vec::new();
+    };
+    let mut protected = Vec::with_capacity(2);
+    for successor_side in [true, false] {
+        let nearest = neighbor_locations
+            .keys()
+            .filter(|loc| {
+                let sd = my_loc.signed_distance(**loc);
+                sd != 0.0 && (sd > 0.0) == successor_side
+            })
+            .min_by(|a, b| {
+                my_loc
+                    .signed_distance(**a)
+                    .abs()
+                    .total_cmp(&my_loc.signed_distance(**b).abs())
+            })
+            .copied();
+        if let Some(loc) = nearest {
+            protected.push(loc);
+        }
+    }
+    protected
+}
+
 /// Select the least topologically important peer to drop as a fallback.
 ///
 /// Computes the removal gap for each peer and picks the one whose removal
 /// creates the smallest gap (least important topologically). Falls back to
 /// an arbitrary peer if own location is unknown.
 fn select_fallback_peer_to_drop(
+    nn_active: bool,
     neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
     my_location: &Option<Location>,
 ) -> Option<PeerKeyLocation> {
@@ -1063,22 +1172,31 @@ fn select_fallback_peer_to_drop(
         .map(|nloc| my_loc.signed_distance(*nloc))
         .collect();
 
-    // Pick the peer whose removal creates the smallest gap (least important)
-    neighbor_locations
-        .iter()
-        .flat_map(|(loc, conns)| conns.iter().map(move |conn| (loc, conn)))
-        .min_by(|(loc_a, _), (loc_b, _)| {
-            let (gap_a, _) = small_world_rand::removal_gap_directional(
-                my_loc.signed_distance(**loc_a),
-                &all_signed_distances,
-            );
-            let (gap_b, _) = small_world_rand::removal_gap_directional(
-                my_loc.signed_distance(**loc_b),
-                &all_signed_distances,
-            );
-            gap_a.partial_cmp(&gap_b).unwrap_or(Ordering::Equal)
-        })
-        .map(|(_, conn)| conn.location.clone())
+    // Prefer not to drop a guaranteed nearest-neighbor lattice edge
+    // (mechanism 4). This is the last-resort over-max enforcement path, so
+    // SAFETY takes priority over the exemption: if every connection is a
+    // protected lattice edge (a degenerate tiny-max config), fall back to the
+    // unfiltered set rather than leaving the node permanently over max.
+    let protected = protected_nearest_neighbors(nn_active, my_location, neighbor_locations);
+    let pick_least_important = |exclude_protected: bool| -> Option<PeerKeyLocation> {
+        neighbor_locations
+            .iter()
+            .filter(|(loc, _)| !exclude_protected || !protected.contains(loc))
+            .flat_map(|(loc, conns)| conns.iter().map(move |conn| (loc, conn)))
+            .min_by(|(loc_a, _), (loc_b, _)| {
+                let (gap_a, _) = small_world_rand::removal_gap_directional(
+                    my_loc.signed_distance(**loc_a),
+                    &all_signed_distances,
+                );
+                let (gap_b, _) = small_world_rand::removal_gap_directional(
+                    my_loc.signed_distance(**loc_b),
+                    &all_signed_distances,
+                );
+                gap_a.partial_cmp(&gap_b).unwrap_or(Ordering::Equal)
+            })
+            .map(|(_, conn)| conn.location.clone())
+    };
+    pick_least_important(true).or_else(|| pick_least_important(false))
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -1175,6 +1293,24 @@ mod tests {
     use super::*;
     use crate::ring::Distance;
     use std::time::Duration;
+
+    /// Restores the per-thread nearest-neighbor lattice overrides to their
+    /// production defaults (flag ON, floor-bypass OFF) on drop — even on panic —
+    /// so a lattice test that calls `set_nn_lattice_enabled` cannot leak the
+    /// floor-bypass to a later test on the SAME thread under plain `cargo test`
+    /// (nextest is process-isolated, but `cargo test` reuses threads).
+    /// `set_nn_lattice_enabled(true)` also force-activates (bypasses the
+    /// minimum-degree floor), so the guard clears that explicitly rather than
+    /// relying on a bare `set_nn_lattice_enabled(true)` cleanup that would itself
+    /// leak force-active ON. Mirrors `NnLatticeTestGuard` in
+    /// `tests/simulation_integration.rs`.
+    struct NnLatticeOverrideGuard;
+    impl Drop for NnLatticeOverrideGuard {
+        fn drop(&mut self) {
+            crate::ring::set_nn_lattice_enabled(true);
+            crate::ring::set_nn_lattice_force_active(false);
+        }
+    }
 
     #[test_log::test]
     fn test_resource_manager_report() {
@@ -2442,7 +2578,10 @@ mod tests {
         neighbor_locations.insert(close_loc_2, vec![Connection::new(close_peer_2.clone())]);
         neighbor_locations.insert(far_loc, vec![Connection::new(far_peer.clone())]);
 
-        let dropped = select_fallback_peer_to_drop(&neighbor_locations, &Some(my_loc));
+        // Pure topology-fallback test, orthogonal to the lattice: pass
+        // nn_active=false so it exercises the unfiltered least-important selection
+        // (its pre-lattice semantics).
+        let dropped = select_fallback_peer_to_drop(false, &neighbor_locations, &Some(my_loc));
         let dropped = dropped.expect("Should select a peer to drop");
 
         // The old logic would drop the most distant (far_peer).
@@ -2451,6 +2590,340 @@ mod tests {
             dropped, far_peer,
             "Should NOT drop the distant peer (topology-critical unique long-range link)"
         );
+    }
+
+    // ============ nearest-neighbor lattice retention (mechanism 4) ============
+
+    /// `protected_nearest_neighbors` returns EXACTLY the per-side nearest edge
+    /// (successor + predecessor), never the farther neighbors on either side.
+    #[test_log::test]
+    fn protected_nearest_neighbors_returns_per_side_nearest() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        crate::ring::set_nn_lattice_enabled(true);
+        let my_loc = Location::new(0.5);
+        let succ_near = Location::new(0.52);
+        let succ_far = Location::new(0.60);
+        let pred_near = Location::new(0.48);
+        let pred_far = Location::new(0.40);
+        let mut nb = BTreeMap::new();
+        for l in [succ_near, succ_far, pred_near, pred_far] {
+            nb.insert(l, vec![Connection::new(PeerKeyLocation::random())]);
+        }
+        let protected = protected_nearest_neighbors(true, &Some(my_loc), &nb);
+        assert_eq!(
+            protected.len(),
+            2,
+            "exactly two edges (one per side) protected"
+        );
+        assert!(
+            protected.contains(&succ_near) && protected.contains(&pred_near),
+            "must protect the per-side NEAREST edges: {protected:?}"
+        );
+        assert!(
+            !protected.contains(&succ_far) && !protected.contains(&pred_far),
+            "must NOT protect the farther per-side neighbors: {protected:?}"
+        );
+    }
+
+    /// Over-max last-resort SAFETY (rule-review Info): when EVERY remaining
+    /// connection is a protected per-side nearest lattice edge, the fallback drop
+    /// must still return a victim (the unfiltered `.or_else` branch) rather than
+    /// None — otherwise a node could sit permanently over max. Degenerate
+    /// tiny-config case, reachable in practice only via the test-only force-active
+    /// override (production gates the lattice at `max_connections >= 25`, so being
+    /// over max with <= 2 total connections cannot happen there), but it guards a
+    /// real safety property. Without the `.or_else(|| pick_least_important(false))`
+    /// fallback this returns None and the caller cannot shed down to max.
+    #[test_log::test]
+    fn fallback_drop_returns_victim_when_all_connections_are_protected() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        crate::ring::set_nn_lattice_enabled(true);
+        let my_loc = Location::new(0.5);
+        // Exactly one connection per side, each the per-side nearest, so BOTH are
+        // protected lattice edges and the protected-excluding filter yields nothing.
+        let succ = Location::new(0.52);
+        let pred = Location::new(0.48);
+        let succ_peer = PeerKeyLocation::random();
+        let pred_peer = PeerKeyLocation::random();
+        let mut nb = BTreeMap::new();
+        nb.insert(succ, vec![Connection::new(succ_peer.clone())]);
+        nb.insert(pred, vec![Connection::new(pred_peer.clone())]);
+
+        // Precondition: both edges are protected, so `pick_least_important(true)`
+        // (exclude-protected) has no candidate and must fall through.
+        let protected = protected_nearest_neighbors(true, &Some(my_loc), &nb);
+        assert_eq!(protected.len(), 2, "both edges protected: {protected:?}");
+        assert!(protected.contains(&succ) && protected.contains(&pred));
+
+        // The safety fallback must still yield a victim (never None) so the node
+        // does not stay permanently over max.
+        let dropped = select_fallback_peer_to_drop(true, &nb, &Some(my_loc))
+            .expect("all-protected fallback must still return a victim, not None");
+        assert!(
+            dropped == succ_peer || dropped == pred_peer,
+            "the fallback victim must be one of the (only) connections: {dropped:?}"
+        );
+    }
+
+    /// The exemption is gated by the lattice flag: disabled → the activation gate
+    /// (`nn_lattice_active_for`) is false → nothing protected (stock behavior).
+    /// `_nn_guard` restores the thread to the production default on drop.
+    #[test_log::test]
+    fn protected_nearest_neighbors_empty_when_lattice_disabled() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        crate::ring::set_nn_lattice_enabled(false);
+        let my_loc = Location::new(0.5);
+        let mut nb = BTreeMap::new();
+        nb.insert(
+            Location::new(0.52),
+            vec![Connection::new(PeerKeyLocation::random())],
+        );
+        // Production-scale budget, so the gate tracks the flag: disabled → false.
+        let nn_active = crate::ring::nn_lattice_active_for(200);
+        assert!(protected_nearest_neighbors(nn_active, &Some(my_loc), &nb).is_empty());
+    }
+
+    /// The score-based fallback drop never selects a per-side nearest lattice
+    /// edge, even in a setup where those edges are the least topologically
+    /// important (redundant with a near-duplicate) and would otherwise be prime
+    /// drop candidates. With the lattice OFF the exemption is empty and the
+    /// fallback's result comes from the FULL candidate set (including the nearest
+    /// edges) — this pair of checks shows the exemption is what spares them.
+    #[test_log::test]
+    fn score_fallback_never_drops_lattice_edge() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        let my_loc = Location::new(0.5);
+        // Nearest edge on each side is redundant (has a near-duplicate), so its
+        // removal makes a tiny gap — a prime least-important drop candidate.
+        let succ_near = Location::new(0.505);
+        let succ_dup = Location::new(0.506);
+        let pred_near = Location::new(0.495);
+        let pred_dup = Location::new(0.494);
+        let far = Location::new(0.9);
+        let succ_near_peer = PeerKeyLocation::random();
+        let pred_near_peer = PeerKeyLocation::random();
+        let mut nb = BTreeMap::new();
+        nb.insert(succ_near, vec![Connection::new(succ_near_peer.clone())]);
+        nb.insert(succ_dup, vec![Connection::new(PeerKeyLocation::random())]);
+        nb.insert(pred_near, vec![Connection::new(pred_near_peer.clone())]);
+        nb.insert(pred_dup, vec![Connection::new(PeerKeyLocation::random())]);
+        nb.insert(far, vec![Connection::new(PeerKeyLocation::random())]);
+
+        // Exemption ON: the nearest edges are removed from the candidate set, so
+        // the drop is one of the non-protected peers.
+        crate::ring::set_nn_lattice_enabled(true);
+        let protected = protected_nearest_neighbors(true, &Some(my_loc), &nb);
+        assert!(
+            protected.contains(&succ_near) && protected.contains(&pred_near),
+            "the nearest per-side edges must be the protected set: {protected:?}"
+        );
+        let dropped = select_fallback_peer_to_drop(true, &nb, &Some(my_loc))
+            .expect("must select a droppable peer");
+        assert_ne!(
+            dropped, succ_near_peer,
+            "must NOT drop the nearest successor (protected lattice edge)"
+        );
+        assert_ne!(
+            dropped, pred_near_peer,
+            "must NOT drop the nearest predecessor (protected lattice edge)"
+        );
+
+        // Exemption OFF: nothing is protected, so the full set (including the
+        // nearest edges) is in play — proving the ON result was the exemption's
+        // doing, not an unrelated property of the setup.
+        crate::ring::set_nn_lattice_enabled(false);
+        assert!(
+            protected_nearest_neighbors(
+                crate::ring::nn_lattice_active_for(200),
+                &Some(my_loc),
+                &nb
+            )
+            .is_empty(),
+            "lattice OFF must protect nothing"
+        );
+        // `_nn_guard` restores the production default on drop (even on panic).
+    }
+
+    /// The score-based topology SWAP (`maybe_swap_connection`) never selects a
+    /// per-side nearest lattice edge as the drop victim, even when that edge is
+    /// the least-valuable candidate (zero routing) and would otherwise be the
+    /// natural drop. Covers the swap-path exemption (the fallback-drop path is
+    /// covered by `score_fallback_never_drops_lattice_edge`).
+    #[test_log::test]
+    fn maybe_swap_connection_never_swaps_lattice_edge() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x5A1D_C0DE);
+        let _nn_guard = NnLatticeOverrideGuard;
+        crate::ring::set_nn_lattice_enabled(true);
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(100000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut tm = TopologyManager::new(limits);
+        let my_location = Location::new(0.5);
+
+        // Per-side NEAREST edges (protected), each with ZERO routing so they are
+        // the least-valuable and would be the natural swap victims absent the
+        // exemption.
+        let succ_near = Location::new(0.502);
+        let pred_near = Location::new(0.498);
+        let succ_near_peer = PeerKeyLocation::random();
+        let pred_near_peer = PeerKeyLocation::random();
+        let mut nb: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
+        nb.insert(succ_near, vec![Connection::new(succ_near_peer.clone())]);
+        nb.insert(pred_near, vec![Connection::new(pred_near_peer.clone())]);
+        // Non-protected clustered peers with high routing (kept), plus one
+        // non-protected redundant low-routing peer that is the intended victim.
+        for off in [0.010_f64, 0.012, 0.014, -0.010, -0.012] {
+            let loc = Location::new_rounded(my_location.as_f64() + off);
+            let peer = PeerKeyLocation::random();
+            for _ in 0..50 {
+                tm.outbound_request_counter.record_request(peer.clone());
+            }
+            nb.entry(loc).or_default().push(Connection::new(peer));
+        }
+        let redundant = Location::new_rounded(my_location.as_f64() + 0.0141);
+        nb.entry(redundant)
+            .or_default()
+            .push(Connection::new(PeerKeyLocation::random()));
+
+        let protected = protected_nearest_neighbors(true, &Some(my_location), &nb);
+        assert!(
+            protected.contains(&succ_near) && protected.contains(&pred_near),
+            "the per-side nearest edges must be protected: {protected:?}"
+        );
+
+        let n = nb.values().map(|v| v.len()).sum::<usize>();
+        let mut saw_swap = false;
+        for _ in 0..400 {
+            if let TopologyAdjustment::SwapConnection { remove, .. } =
+                tm.maybe_swap_connection(&Some(my_location), &nb, n)
+            {
+                saw_swap = true;
+                assert_ne!(
+                    remove, succ_near_peer,
+                    "swap must NOT drop the protected nearest successor"
+                );
+                assert_ne!(
+                    remove, pred_near_peer,
+                    "swap must NOT drop the protected nearest predecessor"
+                );
+            }
+        }
+        assert!(
+            saw_swap,
+            "expected the clustered topology to trigger a swap"
+        );
+    }
+
+    /// The resource-pressure removal path (`select_connections_to_remove`) never
+    /// selects a per-side nearest lattice edge, even when that edge is the
+    /// least-valuable candidate. Covers the third exemption site (the swap path
+    /// and the fallback-drop path are covered by the two tests above).
+    #[test_log::test]
+    fn select_connections_to_remove_never_drops_lattice_edge() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        crate::ring::set_nn_lattice_enabled(true);
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(100000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut tm = TopologyManager::new(limits);
+        let my_location = Location::new(0.5);
+
+        // Build peers at chosen key locations; the nearest per-side edges are the
+        // protected lattice edges. Give the protected edges the LOWEST routing
+        // usage so, absent the exemption, they would be the removal victims.
+        let succ_near = Location::new(0.502);
+        let pred_near = Location::new(0.498);
+        let succ_near_peer = PeerKeyLocation::random();
+        let pred_near_peer = PeerKeyLocation::random();
+        // Non-protected farther peers (high usage → kept).
+        let far_a = (Location::new(0.520), PeerKeyLocation::random());
+        let far_b = (Location::new(0.480), PeerKeyLocation::random());
+        let far_c = (Location::new(0.540), PeerKeyLocation::random());
+
+        let mut nb: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
+        for (loc, peer) in [
+            (succ_near, succ_near_peer.clone()),
+            (pred_near, pred_near_peer.clone()),
+            far_a.clone(),
+            far_b.clone(),
+            far_c.clone(),
+        ] {
+            nb.entry(loc).or_default().push(Connection::new(peer));
+        }
+
+        let protected = protected_nearest_neighbors(true, &Some(my_location), &nb);
+        assert!(
+            protected.contains(&succ_near) && protected.contains(&pred_near),
+            "per-side nearest edges must be protected: {protected:?}"
+        );
+
+        // Report inbound-bandwidth usage: protected edges get tiny usage (most
+        // prunable by routing_value), the farther peers get large usage.
+        let at_time = Instant::now();
+        let report_time = at_time - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        for (peer, amount) in [
+            (&succ_near_peer, 1.0_f64),
+            (&pred_near_peer, 1.0),
+            (&far_a.1, 5000.0),
+            (&far_b.1, 5000.0),
+            (&far_c.1, 5000.0),
+        ] {
+            let src = AttributionSource::Peer(peer.clone());
+            for seconds in 1..600u64 {
+                let t = report_time - Duration::from_secs(600 - seconds);
+                tm.meter
+                    .report(&src, ResourceType::InboundBandwidthBytes, amount, t);
+            }
+            // Backdate the source creation time out of the ramp-up window.
+            tm.source_creation_times.insert(src, report_time);
+        }
+        // Give the protected peers essentially no routing usefulness and the
+        // far peers plenty, so the composite score ranks the protected edges as
+        // least valuable (they'd be dropped absent the exemption).
+        tm.outbound_request_counter
+            .record_request(succ_near_peer.clone());
+        for peer in [&far_a.1, &far_b.1, &far_c.1] {
+            for _ in 0..100 {
+                tm.outbound_request_counter.record_request(peer.clone());
+            }
+        }
+
+        let adj = tm.select_connections_to_remove(
+            &ResourceType::InboundBandwidthBytes,
+            at_time,
+            &Some(my_location),
+            &nb,
+        );
+        // Assert the outcome IS a removal (not `NoChange`): under this resource
+        // pressure the method must shed load, and pinning the variant is what
+        // stops the test from passing vacuously if a future refactor makes it
+        // return `NoChange` (the protected-edge check would then never run).
+        let TopologyAdjustment::RemoveConnections(peers) = adj else {
+            panic!(
+                "expected RemoveConnections under resource pressure, got {adj:?}; \
+                 a NoChange here would make the protected-edge assertions vacuous"
+            );
+        };
+        assert!(
+            !peers.is_empty(),
+            "resource pressure must remove at least one peer"
+        );
+        for p in &peers {
+            assert_ne!(
+                *p, succ_near_peer,
+                "removal must NOT drop the protected nearest successor"
+            );
+            assert_ne!(
+                *p, pred_near_peer,
+                "removal must NOT drop the protected nearest predecessor"
+            );
+        }
     }
 
     /// Regression test for #3630: low bandwidth should not trigger connection

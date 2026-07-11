@@ -23,7 +23,7 @@ use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -54,11 +54,176 @@ const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 /// score is too noisy to be useful.
 const KLEINBERG_FILTER_MIN_CONNECTIONS: usize = 3;
 
+// ---------------------------------------------------------------------------
+// Nearest-neighbor ring lattice (successor + predecessor base edges)
+// ---------------------------------------------------------------------------
+//
+// Kleinberg gap-fill (the k-2 long links) gives O(log^2 n) routing *iff* the
+// short-range base lattice — each peer's immediate ring neighbors — is also
+// present. Freenet builds the long links but never guaranteed the base lattice:
+// the gap-fill objective scores the *nearest* candidate LOWEST (an ordinal
+// "who is my immediate neighbor" property cannot emerge from a log-distance
+// metric), so greedy routing dead-ends at local minima with no connected
+// neighbor closer to the key. This module adds the two-tier structure Chord and
+// Symphony ship: guarantee an edge to the nearest connected SUCCESSOR (closest
+// higher location, wrapping) AND the nearest connected PREDECESSOR (closest
+// lower location), leaving the remaining slots to the untouched Kleinberg
+// machinery. Two guaranteed edges per peer is all Kleinberg needs (Theta(1)
+// lattice edges); routing stays O(log^2 n).
+//
+// The behavior is UNCONDITIONALLY ON in production (`nn_lattice_enabled()`
+// folds to `const true` and the branch optimizes away). Under `test`/`testing`
+// a thread-local override lets a validation harness run the stock (lattice-off)
+// arm against the fix (lattice-on) arm on identical seeds. The override is
+// THREAD-LOCAL because the simulation harness runs every node on the test's own
+// current-thread runtime and relies on thread-local globals (`GlobalRng`,
+// simulation time) to stay parallel-test-safe; a process-global flag would
+// bleed across concurrently-running sim tests on other threads. It is NOT a
+// production config knob.
+#[cfg(any(test, feature = "testing"))]
+thread_local! {
+    static NN_LATTICE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    // Test-only "force active regardless of the min-`max_connections` floor"
+    // override (see `nn_lattice_active_for`). DEFAULTS TO FALSE so the broad
+    // simulation suite — which never touches these toggles and runs at a sparse
+    // `max_connections` (e.g. 5) far below the floor — observes the REAL
+    // production gate (feature off below the floor). The dedicated control-vs-fix
+    // / benefit tests explicitly opt in via `set_nn_lattice_enabled(true)`, which
+    // sets this too so those tests keep exercising the ON path at their sparse
+    // `max_connections`.
+    static NN_LATTICE_FORCE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enable/disable the nearest-neighbor ring lattice for the CURRENT THREAD
+/// (test/validation only — production is always enabled). The control arm of the
+/// findability validation calls `set_nn_lattice_enabled(false)` to reproduce
+/// stock (v0.2.95) topology behavior on the same seed as the treatment arm.
+///
+/// This ALSO sets the `NN_LATTICE_FORCE_ACTIVE` override to `enabled`: any test
+/// that explicitly opts into the lattice runs it FULLY ACTIVE regardless of the
+/// [`NN_LATTICE_MIN_MAX_CONNECTIONS`] floor (so the dedicated benefit/unit tests
+/// keep exercising the mechanism at a sparse `max_connections`). Tests that never
+/// call this — the broad simulation suite — keep the default (force-active FALSE)
+/// and therefore see the real production gate: the feature is OFF below the floor.
+#[cfg(any(test, feature = "testing"))]
+pub fn set_nn_lattice_enabled(enabled: bool) {
+    NN_LATTICE_ENABLED.with(|c| c.set(enabled));
+    NN_LATTICE_FORCE_ACTIVE.with(|c| c.set(enabled));
+}
+
+/// Set ONLY the min-`max_connections` floor bypass for the CURRENT THREAD
+/// (test/validation only). Independent of the enabled flag. Its main use is the
+/// benefit-test cleanup guard, which restores the TRUE production default —
+/// enabled `true` (via [`set_nn_lattice_enabled`]) but force-active `false` (the
+/// floor applies) — after a run, since `set_nn_lattice_enabled(true)` alone would
+/// leave force-active set.
+#[cfg(any(test, feature = "testing"))]
+pub fn set_nn_lattice_force_active(force: bool) {
+    NN_LATTICE_FORCE_ACTIVE.with(|c| c.set(force));
+}
+
+/// Whether the min-`max_connections` floor is being bypassed on this thread
+/// (test-only; always `false` in production). See [`set_nn_lattice_enabled`] and
+/// [`nn_lattice_active_for`].
+#[inline]
+pub(crate) fn nn_lattice_force_active() -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        NN_LATTICE_FORCE_ACTIVE.with(|c| c.get())
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        false
+    }
+}
+
+/// Whether the nearest-neighbor ring lattice flag is set. Always `true` in
+/// production; overridable per-thread in test/testing builds (see
+/// [`set_nn_lattice_enabled`]).
+///
+/// NOTE: this is the raw flag, NOT the full activation gate — a peer with too
+/// small a connection budget disables the feature even when this is `true`. Every
+/// gate site uses the full gate [`nn_lattice_active_for`] (or
+/// `ConnectionManager::nn_lattice_active`); this bare predicate exists only as the
+/// flag input to `nn_lattice_active_for` itself.
+#[inline]
+pub(crate) fn nn_lattice_enabled() -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        NN_LATTICE_ENABLED.with(|c| c.get())
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        true
+    }
+}
+
+/// Minimum CONFIGURED `max_connections` at which the nearest-neighbor ring
+/// lattice (mechanisms 1-4) activates. Below this floor the feature disables
+/// itself. Anchored to [`Ring::DEFAULT_MIN_CONNECTIONS`].
+///
+/// This is keyed on the CONFIGURED `max_connections` (the cap a node is built
+/// with — 200 by default in production via `DEFAULT_MAX_CONNECTIONS`), NOT the
+/// live connection count. So in PRODUCTION every node is above the floor and the
+/// feature is always active; the floor's only real effect is to disable the
+/// feature at the sparse scales used by the simulation harness. The gate is
+/// therefore production-neutral: any value in `(max sim config, 200)` behaves
+/// identically in production.
+///
+/// Two-tier routing (2 reserved base-lattice edges + `k - 2` Kleinberg long
+/// links) needs enough long links to keep the O(log^2 n) structure; below a
+/// minimum degree, reserving the 2 edges destabilizes routing. `DEFAULT_MIN_CONNECTIONS`
+/// (25) is the principled anchor: a node whose configured `max_connections` is
+/// below the network's own minimum-degree target cannot sustain the two-tier
+/// structure, so it should not run the lattice.
+///
+/// Setting the floor at `DEFAULT_MIN_CONNECTIONS` also keeps the WHOLE sparse
+/// simulation suite at its pre-lattice baseline: sim configs top out at
+/// `max_connections = 16` (with a handful of production-scale max=200 tests that
+/// DO exercise the lattice and pass), so a floor of 25 disables the feature for
+/// every sparse sim test — they run exactly as they did before this feature
+/// existed. A lower floor (e.g. 15) was evaluated but rejected: the sim's DEFAULT
+/// config is max=15/16, so a 15 floor would flip those default hosting /
+/// subscription / determinism tests to feature-ON — a change from their stock
+/// baseline — for no production benefit (the gate reads CONFIGURED max, which is
+/// 200 in production, so 15 vs 25 is identical for real nodes). Keeping the sparse
+/// suite feature-off is the lower-risk choice.
+pub(crate) const NN_LATTICE_MIN_MAX_CONNECTIONS: usize = super::Ring::DEFAULT_MIN_CONNECTIONS;
+
+/// Whether the nearest-neighbor ring lattice is ACTIVE for a peer whose
+/// connection budget is `max_connections`. This is the full activation gate used
+/// at every feature gate site (acceptance clause, over-cap admission, discovery
+/// probe, retention exemption): the flag must be set AND the budget must clear
+/// the [`NN_LATTICE_MIN_MAX_CONNECTIONS`] floor (or the test-only force override
+/// bypasses the floor — see [`nn_lattice_force_active`]).
+#[inline]
+pub(crate) fn nn_lattice_active_for(max_connections: usize) -> bool {
+    nn_lattice_enabled()
+        && (nn_lattice_force_active() || max_connections >= NN_LATTICE_MIN_MAX_CONNECTIONS)
+}
+
 /// Maximum number of concurrent CONNECT operations a gateway will route simultaneously.
 /// This prevents thundering-herd scenarios where many joiners hit the same gateway at once.
 /// The value 8 balances throughput (parallel joins) against overload protection. Non-gateways
 /// use `usize::MAX` since they see far fewer concurrent connects.
 const MAX_CONCURRENT_GATEWAY_CONNECTS: usize = 8;
+
+/// Absolute over-`max_connections` slack within which a strictly-closer per-side
+/// nearest-neighbor lattice edge (mechanism 3) may be admitted at capacity.
+///
+/// A lattice edge that arrives while the node is at `max_connections` is admitted
+/// over the cap (it displaces a long link), but only while the established count
+/// is below `max_connections + LATTICE_OVERMAX_SLACK`. This is a HARD ceiling: it
+/// bounds the transient over-max excess to a small constant so a burst of
+/// ever-closer lattice arrivals can never grow the connection set without limit
+/// (the security lens's "no unbounded over-max" requirement). The topology
+/// maintenance loop's over-max prune (`topology.rs`, which never sheds a
+/// protected lattice edge) sheds a farther non-lattice link each tick to bring
+/// the node back to `max_connections`, so the ceiling is only ever reached
+/// transiently between ticks. Sized at 2 = the two reserved lattice slots
+/// (successor + predecessor), so both edges can tighten in the same window before
+/// the prune catches up.
+pub(crate) const LATTICE_OVERMAX_SLACK: usize = 2;
 
 /// Base TTL for a peer address in the recently-failed cache after a NAT traversal
 /// failure. Repeated failures to the same address scale the TTL exponentially:
@@ -366,6 +531,13 @@ pub(crate) struct ConnectionManager {
     /// Key: peer socket address
     /// Value: AcceptorStats (successes, attempts, last_updated)
     acceptor_reliability: Arc<parking_lot::RwLock<BTreeMap<SocketAddr, AcceptorStats>>>,
+    /// Nearest-neighbor lattice discovery health counters (telemetry only).
+    /// `lattice_probes_issued`: route-to-self probes fired since startup;
+    /// `lattice_probe_improvements`: probes that found a strictly-closer peer
+    /// (filled or tightened an edge). Incremented from the maintenance loop,
+    /// surfaced via the dashboard ring-stats provider.
+    lattice_probes_issued: Arc<AtomicU64>,
+    lattice_probe_improvements: Arc<AtomicU64>,
 }
 
 impl ConnectionManager {
@@ -499,6 +671,8 @@ impl ConnectionManager {
             peer_health: Arc::new(Mutex::new(PeerHealthTracker::new())),
             connect_jitter_failures: Arc::new(parking_lot::Mutex::new((0, None))),
             acceptor_reliability: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+            lattice_probes_issued: Arc::new(AtomicU64::new(0)),
+            lattice_probe_improvements: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -526,8 +700,9 @@ impl ConnectionManager {
     /// Whether a node should accept a new node connection or not based
     /// on the relative location and other conditions.
     ///
-    /// # Panic
-    /// Will panic if the node checking for this condition has no location assigned.
+    /// Does not panic when this node has no location assigned yet: every clause
+    /// that needs the own location guards `get_stored_location()` and falls
+    /// through to a location-independent decision.
     pub fn should_accept(&self, location: Location, addr: SocketAddr) -> bool {
         // Don't accept connections from ourselves
         if let Some(own_addr) = self.get_own_addr() {
@@ -615,6 +790,88 @@ impl ConnectionManager {
             );
             return true;
         }
+
+        // Nearest-neighbor lattice clause (mechanism 3). BEFORE the Kleinberg
+        // score paths: unconditionally accept a candidate that would become this
+        // peer's new nearest ring-neighbor ON ITS OWN SIDE — its successor side
+        // (higher location, signed_distance > 0) or its predecessor side (lower
+        // location, signed_distance < 0). The test is STRICTLY PER-SIDE: a
+        // candidate on the successor side is compared only to the current nearest
+        // successor, never to the predecessor. A global "closer than any current
+        // connection" test would only ever tighten ONE edge and let the other
+        // side go quiet, which dead-ends ~half of last-mile lookups; both edges
+        // are required for the closed undirected cycle greedy-to-closest needs.
+        //
+        // Under `max_connections` this fires for a fill OR a tighten (bypassing
+        // Kleinberg, no displacement). AT/OVER max a strictly-closer per-side
+        // nearest (tighten OR fill) is admitted up to the bounded ceiling
+        // `max_connections + LATTICE_OVERMAX_SLACK` — see
+        // `admits_lattice_edge_over_cap`. Admitting over max displaces one long
+        // link (the over-max prune in topology.rs then drops a farther,
+        // non-lattice connection — never a protected lattice edge). TIGHTENING at
+        // capacity is deliberate: the lattice continuously pulls each peer toward
+        // its TRUE nearest ring neighbors, not just filling empty sides.
+        // Self-bounding on each side: it fires only for a candidate closer than
+        // every current connection on that side, a strictly decreasing sequence,
+        // so it cannot admit an unbounded stream.
+        //
+        // SECURITY (eclipse) — DISCLOSED and ACCEPTED tradeoff: this makes
+        // per-side nearest admission DETERMINISTIC (pre-lattice a very-close peer
+        // was often REJECTED by the probabilistic Kleinberg evaluator), and the
+        // retention exemption (topology.rs) removes the score-based swap as a
+        // safety valve, leaving LIVENESS eviction only — a responsive-but-malicious
+        // nearest neighbor is not shed by scoring. The candidate location is
+        // ADDRESS-DERIVED (`Location::from_address` masks host bits — a whole IPv4
+        // /24, or IPv6 /48, collapses to one location; port participates only for
+        // loopback), and the operator blocklist is checked in connect.rs BEFORE
+        // should_accept so this force-accept cannot bypass it.
+        //
+        // The IPv6 cost is NOT symmetric with IPv4, and the honest disclosure is:
+        // a single routed IPv6 allocation (an ISP hands out a /48, /56, or /64 per
+        // customer) already yields a VAST number of distinct /48 `Location`s
+        // essentially for free, so an attacker can cheaply mint locations that
+        // straddle a chosen victim's own location and become BOTH of that victim's
+        // per-side nearest edges — a targeted last-mile eclipse of that one
+        // victim's 2 lattice slots. What it is NOT: a network partition or a global
+        // takeover. The damage is bounded to the two slots of a
+        // SPECIFICALLY-TARGETED victim (it does not compound across the ring), the
+        // exemption only ever protects whoever is GENUINELY per-side nearest, and a
+        // closer HONEST peer force-displaces the attacker. The project lead has
+        // EXPLICITLY ACCEPTED this tradeoff: cheap IPv6 last-mile eclipse of a
+        // single victim's 2 slots, in exchange for the findability the guaranteed
+        // lattice buys. A routing-correctness eviction signal (shedding a
+        // responsive peer that drops/corrupts payloads) is future work.
+        let nn_override = if self.nn_lattice_active() {
+            if let Some(me) = self.get_stored_location() {
+                let cand_signed = me.signed_distance(location);
+                let cand_dist = cand_signed.abs();
+                if cand_dist == 0.0 {
+                    // A candidate exactly at own location is on neither side.
+                    false
+                } else {
+                    let successor_side = cand_signed > 0.0;
+                    let current_nearest = self
+                        .nearest_lattice_neighbor_dist(successor_side)
+                        .unwrap_or(f64::INFINITY);
+                    let fires = cand_dist < current_nearest;
+                    if fires {
+                        tracing::debug!(
+                            addr = %addr,
+                            peer_location = %location,
+                            cand_dist,
+                            current_nearest,
+                            side = if successor_side { "successor" } else { "predecessor" },
+                            "should_accept: nearest-neighbor lattice force-accept (new nearest on its side)"
+                        );
+                    }
+                    fires
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         // Use actual open connections (not inflated total_conn) for the
         // min_connections threshold. Pending reservations are speculative —
@@ -708,6 +965,18 @@ impl ConnectionManager {
             );
             accepted
         };
+        // Nearest-neighbor lattice force-accept (mechanism 3). A new per-side
+        // nearest neighbor is admitted regardless of the Kleinberg verdict. UNDER
+        // max this admits a fill OR a tighten (no displacement, just bypassing
+        // Kleinberg). AT/OVER max, a strictly-closer per-side nearest (tighten OR
+        // fill) is admitted within the over-cap ceiling, displacing a non-lattice
+        // long link on the next over-max prune tick (see
+        // `admits_lattice_edge_over_cap`).
+        let accepted = accepted
+            || (nn_override && total_conn < self.max_connections)
+            // At/over max, admit a strictly-closer per-side nearest (tighten OR
+            // fill) within the over-cap ceiling.
+            || self.admits_lattice_edge_over_cap(location);
         tracing::debug!(
             addr = %addr,
             peer_location = %location,
@@ -750,6 +1019,248 @@ impl ConnectionManager {
                 std::iter::repeat_n(my_location.distance(*loc).as_f64(), conns.len())
             }),
         )
+    }
+
+    /// Unsigned ring distance to this peer's nearest connected neighbor on the
+    /// given side (`successor_side = true` → closest higher location wrapping;
+    /// `false` → closest lower location). `None` when own location is unknown or
+    /// there is no connected neighbor on that side.
+    ///
+    /// This is the "who holds my reserved lattice slot on this side" query used
+    /// by the per-side acceptance clause and by the route-to-self discovery
+    /// probe. The reserved slot is derived on demand from the live connection set
+    /// rather than tracked as separate state, so a strictly-closer arrival
+    /// automatically becomes the new slot holder and the superseded former
+    /// nearest demotes back into the ordinary long-link pool with no bookkeeping.
+    pub(crate) fn nearest_lattice_neighbor_dist(&self, successor_side: bool) -> Option<f64> {
+        self.nearest_lattice_neighbor_dist_in(&self.connections_by_location.read(), successor_side)
+    }
+
+    /// [`Self::nearest_lattice_neighbor_dist`] computed against an ALREADY-HELD
+    /// `connections_by_location` map instead of taking a fresh read lock. This lets
+    /// the atomic over-cap admission in [`Self::add_connection`] run the fill check
+    /// under the SAME write guard that performs the insert (see the F4 note there),
+    /// so the over-cap ceiling holds even under concurrent adds.
+    fn nearest_lattice_neighbor_dist_in(
+        &self,
+        connections: &BTreeMap<Location, Vec<Connection>>,
+        successor_side: bool,
+    ) -> Option<f64> {
+        let me = self.get_stored_location()?;
+        connections
+            .keys()
+            .filter_map(|loc| {
+                let sd = me.signed_distance(*loc);
+                // A neighbor exactly at own location (sd == 0.0) belongs to
+                // neither side; exclude it.
+                if sd != 0.0 && (sd > 0.0) == successor_side {
+                    Some(sd.abs())
+                } else {
+                    None
+                }
+            })
+            .fold(None, |acc, d| Some(acc.map_or(d, |a: f64| a.min(d))))
+    }
+
+    /// Record that a route-to-self lattice discovery probe was ISSUED. Telemetry
+    /// only — surfaced via the dashboard ring-stats provider.
+    pub(crate) fn record_lattice_probe_issued(&self) {
+        self.lattice_probes_issued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that the lattice IMPROVED (a side filled or an edge tightened
+    /// toward the true nearest). Counted INDEPENDENTLY of probe issuance because
+    /// the improvement lands a few maintenance ticks after the probe that caused
+    /// it (the CONNECT completes asynchronously), so tying the two together (the
+    /// old coupled counter) miscounted — it scored the first probe as an
+    /// improvement on failure and missed the fill that ended a probe burst.
+    /// Telemetry only.
+    pub(crate) fn record_lattice_probe_improvement(&self) {
+        self.lattice_probe_improvements
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Discovery-health counters: (probes issued, probes that found a strictly
+    /// closer peer) since startup.
+    pub(crate) fn lattice_probe_stats(&self) -> (u64, u64) {
+        (
+            self.lattice_probes_issued.load(Ordering::Relaxed),
+            self.lattice_probe_improvements.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Whether the nearest-neighbor ring lattice is ACTIVE for THIS peer: the
+    /// flag is set AND this peer's `max_connections` clears the minimum-degree
+    /// floor ([`NN_LATTICE_MIN_MAX_CONNECTIONS`]). This is the single activation
+    /// gate for every feature site on the acceptance path (the per-side
+    /// acceptance clause and the over-cap admission); the discovery probe
+    /// (`ring.rs`) and the retention exemption (`topology.rs`) apply the same gate
+    /// via [`nn_lattice_active_for`] against their own `max_connections`.
+    #[inline]
+    pub(crate) fn nn_lattice_active(&self) -> bool {
+        nn_lattice_active_for(self.max_connections)
+    }
+
+    /// Whether a candidate at `loc` would become this peer's new NEAREST connected
+    /// neighbor on its own ring side — strictly closer to own location than the
+    /// current per-side nearest. An EMPTY side is the degenerate case (current
+    /// nearest = +inf), so this test also covers the FILL case: a fill is just the
+    /// tighten where there was nothing to tighten against.
+    ///
+    /// This is the "tighten OR fill" predicate that TIGHTENING-AT-CAPACITY needs
+    /// (see [`Self::admits_lattice_edge_over_cap`]): the lattice must continuously
+    /// pull each peer toward its TRUE nearest ring neighbors, not merely fill empty
+    /// sides. The former-nearest is demoted automatically — the reserved slot is
+    /// derived on demand from the live connection set
+    /// ([`Self::nearest_lattice_neighbor_dist_in`]), so once the strictly-closer
+    /// candidate connects it IS the new per-side nearest and the superseded peer
+    /// falls back into the ordinary long-link pool (the topology retention
+    /// exemption then protects the new nearest, not the old one).
+    fn is_strictly_closer_lattice_edge_in(
+        &self,
+        connections: &BTreeMap<Location, Vec<Connection>>,
+        loc: Location,
+    ) -> bool {
+        if !self.nn_lattice_active() {
+            return false;
+        }
+        let Some(me) = self.get_stored_location() else {
+            return false;
+        };
+        let sd = me.signed_distance(loc);
+        if sd == 0.0 {
+            // A candidate exactly at own location is on neither side.
+            return false;
+        }
+        let successor_side = sd > 0.0;
+        let current_nearest = self
+            .nearest_lattice_neighbor_dist_in(connections, successor_side)
+            .unwrap_or(f64::INFINITY);
+        sd.abs() < current_nearest
+    }
+
+    /// Whether a candidate at `loc` may be admitted even though the node is at or
+    /// over `max_connections`. Over-cap admission fires for any candidate that
+    /// would become this peer's new per-side NEAREST ring neighbor — a TIGHTEN of
+    /// an already-held side OR a FILL of an empty one
+    /// ([`Self::is_strictly_closer_lattice_edge_in`]) — within the absolute
+    /// over-max ceiling (`max_connections + LATTICE_OVERMAX_SLACK`).
+    ///
+    /// TIGHTENING-AT-CAPACITY (the mechanism this predicate exists for): the
+    /// lattice must CONTINUOUSLY pull each peer toward its TRUE nearest ring
+    /// neighbors, not merely fill empty sides. A strictly-closer arrival at
+    /// capacity is admitted over the cap; it becomes the new per-side nearest (the
+    /// reserved slot is derived on demand, so the superseded former-nearest
+    /// demotes into the long-link pool automatically), and the topology
+    /// maintenance loop's over-max prune sheds the least-valuable NON-lattice long
+    /// link next tick (`topology.rs`; protected lattice edges are never the prune
+    /// victim), bringing the node back to `max_connections`.
+    ///
+    /// This is the SINGLE over-cap admission predicate shared by every gate that
+    /// can add a ring connection: `should_accept`, the two connection-lifecycle
+    /// promotion gates (`p2p_protoc/connection_lifecycle.rs`), and
+    /// [`Self::add_connection`]. Keeping the decision in one place is deliberate —
+    /// before it was wired through the lifecycle gates, mechanism 3's over-cap
+    /// displacement was inert on the real CONNECT path (the gates rejected at
+    /// `>= max_connections` first).
+    ///
+    /// SPECULATIVE-STATE CEILING (bounds the amplification an established-only
+    /// check would leave open): the ceiling counts ESTABLISHED connections PLUS
+    /// non-stale pending reservations, per the ring.md speculative-state invariant
+    /// ("am I over-committed?" checks use speculative, not actual, state). Without
+    /// the reservation term a FULL node (established count at `max_connections`)
+    /// fed a stream of strictly-closer FRESH-ADDRESS requests would re-fire the
+    /// over-cap accept on EVERY request — recording pending state and emitting an
+    /// accept + NAT-traversal per request — because a pending reservation does not
+    /// advance the established per-side nearest, so none of the requests raises the
+    /// bar the next must beat, and per-target backoff does not bind them (each
+    /// straddles the victim from a fresh IPv6 `Location`/address, so no single
+    /// target repeats). Counting non-stale reservations bounds concurrent over-cap
+    /// acceptances to [`LATTICE_OVERMAX_SLACK`] per reservation-TTL window
+    /// ([`PENDING_RESERVATION_TTL`]), so what was a per-request accept+NAT
+    /// amplification is now a small fixed number per window — squarely inside the
+    /// cheap-IPv6 eclipse / NAT-amplification envelope the project lead already
+    /// accepted (see the `should_accept` SECURITY note, F3).
+    ///
+    /// The reservation term counts ALL non-stale reservations, so the SLACK budget
+    /// is GLOBAL (shared with unrelated in-flight handshakes), not lattice-private:
+    /// a node genuinely AT max whose budget is already consumed by ordinary CONNECT
+    /// traffic has its over-cap tightening throttled until those reservations drain
+    /// or expire (bounded by [`PENDING_RESERVATION_TTL`]; the continuous discovery
+    /// loop retries). This bites only for nodes at max (mostly busy gateways) — a
+    /// peer below max tightens via the under-cap path, which never consults this
+    /// ceiling. A lattice-private budget is a possible future refinement.
+    ///
+    /// This ceiling term is DISTINCT from the dropped F1 clause and much simpler:
+    /// F1 was a PER-SIDE reservation clause (bounding concurrent over-cap FILLS to
+    /// one per EMPTY side), whose concern — a concurrent fill flood on an empty
+    /// side of a full node — was a near-non-case (a node at 200 connections almost
+    /// always has both ring sides populated), so it was rightly dropped. The term
+    /// here is instead a GLOBAL speculative count against the absolute ceiling; it
+    /// needs no per-side bookkeeping and simply conforms the over-cap admission to
+    /// the same speculative-state rule every other cap check already follows.
+    ///
+    /// SELF-BOUNDING for the ESTABLISHED set (a second, independent bound): each
+    /// over-cap candidate that actually ESTABLISHES advances the per-side
+    /// current-nearest, so a following establisher must be strictly closer STILL —
+    /// the established sequence on one side is strictly decreasing in distance (a
+    /// short records chain, O(log) expected), and the absolute ceiling hard-bounds
+    /// the ESTABLISHED count regardless.
+    pub(crate) fn admits_lattice_edge_over_cap(&self, loc: Location) -> bool {
+        self.admits_lattice_edge_over_cap_in(&self.connections_by_location.read(), loc)
+    }
+
+    /// [`Self::admits_lattice_edge_over_cap`] evaluated against an ALREADY-HELD
+    /// `connections_by_location` map, so [`Self::add_connection`] can run the
+    /// count-check under the SAME write guard that performs the insert. This is
+    /// what makes the over-cap ceiling (`max_connections + LATTICE_OVERMAX_SLACK`)
+    /// a HARD invariant under concurrent adds rather than a racy check-then-insert
+    /// (F4). `connections` is the held map; the strict-closer check and the count
+    /// both read it directly, no re-locking.
+    fn admits_lattice_edge_over_cap_in(
+        &self,
+        connections: &BTreeMap<Location, Vec<Connection>>,
+        loc: Location,
+    ) -> bool {
+        // Cheap ordinal check first: most candidates are not a strictly-closer
+        // per-side nearest, so bail before taking the `pending_reservations` lock.
+        if !self.is_strictly_closer_lattice_edge_in(connections, loc) {
+            return false;
+        }
+        let established: usize = connections.values().map(|conns| conns.len()).sum();
+        // Count NON-STALE pending reservations toward the over-cap ceiling too.
+        // This is the ring.md speculative-state invariant ("am I over-committed?"
+        // checks use speculative state) applied to the over-cap admission: a
+        // pending reservation will establish and consume a slot, so a full node
+        // fed a burst of strictly-closer FRESH-ADDRESS requests must not re-fire
+        // the over-cap accept (and its NAT-traversal) on every one — the
+        // amplification the established-only check left open. Counting them bounds
+        // concurrent over-cap acceptances to LATTICE_OVERMAX_SLACK per
+        // reservation-TTL window. This counts ALL non-stale reservations, not just
+        // over-cap lattice ones, so the SLACK budget is GLOBAL (shared with
+        // unrelated in-flight handshakes), not lattice-private: single-candidate
+        // tightening has room only when the node holds fewer than SLACK other
+        // non-stale reservations, and a node at max whose budget is already
+        // consumed by ordinary CONNECT traffic throttles tightening until those
+        // drain or expire (PENDING_RESERVATION_TTL). That is bounded and the
+        // continuous discovery loop retries; the global count is also the more
+        // conservative choice for the hard ceiling. It only bites at nodes
+        // genuinely AT max (mostly busy gateways) — a peer below max tightens via
+        // the under-cap path, which never consults this ceiling. A lattice-private
+        // budget (counting only over-cap lattice reservations) would give
+        // tightening dedicated slots and is a possible future refinement, not
+        // taken here for simplicity.
+        // Lock order: the caller holds `connections_by_location` (#2);
+        // `pending_reservations` (#3) is acquired here, AFTER it — the documented
+        // order (see the module-level hierarchy), never the reverse.
+        let now = Instant::now();
+        let pending: usize = self
+            .pending_reservations
+            .read()
+            .values()
+            .filter(|(_, created)| now.duration_since(*created) <= PENDING_RESERVATION_TTL)
+            .count();
+        established + pending < self.max_connections + LATTICE_OVERMAX_SLACK
     }
 
     /// Record the advertised location for a peer that we have decided to accept.
@@ -1227,51 +1738,134 @@ impl ConnectionManager {
         drop(lop);
 
         // Enforce the global cap when adding a new peer (relocations reuse the existing slot).
-        if previous_location.is_none() && self.connection_count() >= self.max_connections {
-            tracing::warn!(
-                addr = %addr,
-                peer_location = %loc,
-                max = self.max_connections,
-                "add_connection: rejecting new connection to enforce cap"
-            );
-            // Roll back bookkeeping since we're refusing the connection.
-            self.location_for_peer.write().remove(&addr);
-            if was_reserved {
-                self.pending_reservations.write().remove(&addr);
-            }
-            return false;
-        }
-
-        if let Some(prev_loc) = previous_location {
-            tracing::debug!(
-                addr = %addr,
-                prev_location = %prev_loc,
-                new_location = %loc,
-                "add_connection: replacing existing connection for peer"
-            );
+        // EXCEPTION (mechanism 3): admit a strictly-closer per-side
+        // nearest-neighbor lattice edge even at capacity — it displaces a farther
+        // long link rather than being rejected — but only within the bounded
+        // over-max ceiling (`admits_lattice_edge_over_cap`, see
+        // LATTICE_OVERMAX_SLACK). The over-max topology prune sheds a non-lattice
+        // connection on the next maintenance tick (lattice edges are protected
+        // there), bringing the node back to max. The two connection-lifecycle
+        // promotion gates apply the SAME predicate before reaching here, so a
+        // lattice edge is no longer silently dropped at the cap on the real
+        // CONNECT path.
+        //
+        // F4 (atomicity): the cap count-check, the over-cap admission check, the
+        // relocation removal, and the insert all run under ONE held
+        // `connections_by_location` write guard, so the ceiling
+        // (`max_connections + LATTICE_OVERMAX_SLACK`) is a HARD invariant even
+        // under concurrent adds. Previously the check read `connection_count()`
+        // (a separate read lock) and the insert took a fresh write lock — a
+        // non-atomic check-then-insert that two concurrent adders could both pass,
+        // each inserting past the ceiling (the stress tests breached it to 60+ vs
+        // a ceiling of 52). In production every add runs on the single p2p
+        // event-loop task so the race never fired, but holding the guard across
+        // the whole decision makes the bound hold regardless. Lock ordering is
+        // preserved: `location_for_peer` (lock #1) is inserted above and rolled
+        // back below OUTSIDE this guard (never acquired while it is held); the
+        // over-cap admission check reads the already-held `connections_by_location`
+        // map (#2) and BRIEFLY acquires `pending_reservations` (#3) for its
+        // speculative-count term — in the documented order (#2 before #3), never
+        // the reverse, so no ABBA (prune_connection nests #1→#2→#3 identically).
+        // The candidate's own reservation was already removed above (`was_reserved`
+        // → remove), so it is not double-counted against the ceiling here. (In the
+        // `was_reserved == false` edge a lingering stale self-reservation for the
+        // same addr would over-count, never under-count — a spurious retryable
+        // reject at worst, never a ceiling breach; on the real over-cap lattice
+        // path `was_reserved` is reliably true.)
+        let count_after = {
             let mut cbl = self.connections_by_location.write();
-            if let Some(prev_list) = cbl.get_mut(&prev_loc) {
-                if let Some(pos) = prev_list
-                    .iter()
-                    .position(|c| c.location.socket_addr() == Some(addr))
-                {
-                    prev_list.swap_remove(pos);
-                }
-                if prev_list.is_empty() {
-                    cbl.remove(&prev_loc);
+
+            // Relocation removal FIRST, tracking whether an established entry was
+            // actually removed. A peer with a `previous_location` is only a true
+            // relocation (net-zero, cap-exempt) if it was genuinely present in the
+            // ring; otherwise `previous_location` is a stale/pending
+            // `location_for_peer` entry (e.g. a `record_pending_location` from
+            // `should_accept` that never became a ring connection) and the insert
+            // below is a genuine net-add that the cap MUST gate. Ordering the
+            // removal before the count-check is what makes the ceiling hold on the
+            // relocation path too — otherwise a `previous_location`-Some insert
+            // skipped the cap entirely and could overshoot under concurrent adds.
+            let mut removed_established = false;
+            if let Some(prev_loc) = previous_location {
+                tracing::debug!(
+                    addr = %addr,
+                    prev_location = %prev_loc,
+                    new_location = %loc,
+                    "add_connection: replacing existing connection for peer"
+                );
+                if let Some(prev_list) = cbl.get_mut(&prev_loc) {
+                    if let Some(pos) = prev_list
+                        .iter()
+                        .position(|c| c.location.socket_addr() == Some(addr))
+                    {
+                        prev_list.swap_remove(pos);
+                        removed_established = true;
+                    }
+                    if prev_list.is_empty() {
+                        cbl.remove(&prev_loc);
+                    }
                 }
             }
-        }
 
-        {
-            let mut cbl = self.connections_by_location.write();
+            // `current` is the post-removal count. A genuine net-add (the peer was
+            // not already an established ring connection) must respect the cap; a
+            // true relocation (net-zero) does not change the count and is exempt.
+            let current: usize = cbl.values().map(|conns| conns.len()).sum();
+            if !removed_established && current >= self.max_connections {
+                // Admit a strictly-closer per-side nearest (tighten OR fill) within
+                // the over-cap ceiling; the over-max prune sheds a non-lattice long
+                // link next tick and the superseded former-nearest demotes into the
+                // long-link pool automatically (the reserved slot is derived on
+                // demand from the live connection set).
+                if self.admits_lattice_edge_over_cap_in(&cbl, loc) {
+                    tracing::debug!(
+                        addr = %addr,
+                        peer_location = %loc,
+                        max = self.max_connections,
+                        "add_connection: admitting nearest-neighbor lattice edge over cap (a long link will be pruned)"
+                    );
+                } else {
+                    // Release the ring write lock BEFORE touching lock #1
+                    // (`location_for_peer`): acquiring it while holding
+                    // `connections_by_location` would reverse the documented lock
+                    // ordering.
+                    drop(cbl);
+                    tracing::warn!(
+                        addr = %addr,
+                        peer_location = %loc,
+                        max = self.max_connections,
+                        "add_connection: rejecting new connection to enforce cap"
+                    );
+                    // Roll back bookkeeping since we're refusing the connection.
+                    self.location_for_peer.write().remove(&addr);
+                    if was_reserved {
+                        self.pending_reservations.write().remove(&addr);
+                    }
+                    return false;
+                }
+            }
+
             cbl.entry(loc)
                 .or_default()
                 .push(Connection::new(PeerKeyLocation::new(pub_key, addr)));
-        }
+
+            // Count AFTER the insert, still under the same write guard. Because the
+            // count-check above and this insert are now atomic, the ceiling holds
+            // even under concurrent adds — KEEP this assertion as the guard.
+            let count_after: usize = cbl.values().map(|conns| conns.len()).sum();
+            debug_assert!(
+                count_after <= self.max_connections + LATTICE_OVERMAX_SLACK,
+                "connection_count {count_after} exceeded the over-cap lattice ceiling \
+                 (max_connections {} + LATTICE_OVERMAX_SLACK {LATTICE_OVERMAX_SLACK}); the \
+                 over-cap ceiling check-then-insert is now atomic under the \
+                 connections_by_location write guard, so a breach means that atomic \
+                 region was bypassed (e.g. a new add site that inserts without it)",
+                self.max_connections,
+            );
+            count_after
+        };
 
         // Verify the insertion actually persisted — detect silent state corruption.
-        let count_after = self.connection_count();
         let in_location_map = self.location_for_peer.read().contains_key(&addr);
         if !in_location_map || count_after == 0 {
             tracing::error!(
@@ -2011,6 +2605,25 @@ mod tests {
         }
     }
 
+    /// Restores the per-thread nearest-neighbor lattice overrides to their
+    /// production defaults (flag ON, floor-bypass OFF) on drop — even on panic —
+    /// so a test that toggles them via `set_nn_lattice_enabled` cannot leak the
+    /// floor-bypass to a later test on the SAME thread under plain `cargo test`
+    /// (nextest is process-isolated, but `cargo test` reuses threads, and a sparse
+    /// test running after a leaked force-active sees the lattice forced ON below
+    /// the minimum-degree floor — an order-dependent failure).
+    /// `set_nn_lattice_enabled(true)` also force-activates (bypasses the floor),
+    /// so a naive `set_nn_lattice_enabled(true)` cleanup would itself leak
+    /// force-active ON; the guard clears it explicitly. Mirrors `NnLatticeTestGuard`
+    /// in `tests/simulation_integration.rs`.
+    struct NnLatticeOverrideGuard;
+    impl Drop for NnLatticeOverrideGuard {
+        fn drop(&mut self) {
+            set_nn_lattice_enabled(true);
+            set_nn_lattice_force_active(false);
+        }
+    }
+
     // ============ summary-first PUT version-gate tests (#4642 step 3-bis) ============
 
     /// `record_remote_version` / `remote_version` round-trip: an address
@@ -2313,6 +2926,16 @@ mod tests {
         // It rejects when total_conn >= max_connections
         // So with max=4 and 3 open connections: total_conn = 0 + 1 + 3 = 4 >= 4, rejected
         // Therefore we can only have max_connections - 1 open before the next is rejected
+        //
+        // Mechanism 3 (nearest-neighbor lattice) force-accepts a strictly-closer
+        // per-side nearest even over max (here the 4th candidate is a new per-side
+        // nearest given the derived own location), so disable the lattice to
+        // isolate the pure cap arithmetic. The over-max lattice admission is
+        // exercised by add_connection_admits_lattice_edge_over_max,
+        // admits_lattice_edge_over_cap_predicate, and
+        // lifecycle_gates_apply_lattice_over_cap_predicate.
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(false);
         let cm = make_connection_manager(Some(make_addr(8000)), 1, 4, false);
         let keypair = TransportKeypair::new();
 
@@ -2338,6 +2961,9 @@ mod tests {
         let addr4 = make_addr(8004);
         let loc4 = Location::new(0.4);
         assert!(!cm.should_accept(loc4, addr4));
+        // `_nn_guard` restores the production default (flag ON, floor RE-ARMED) on
+        // drop — even on panic — so this test's `set_nn_lattice_enabled(false)`
+        // cannot leak to a later same-thread test.
     }
 
     #[test]
@@ -2385,6 +3011,427 @@ mod tests {
         let pruned_loc = cm.prune_alive_connection(addr);
         assert_eq!(pruned_loc, Some(loc));
         assert_eq!(cm.connection_count(), 0);
+    }
+
+    /// Mechanism 4 liveness bound: the retention exemption lives ONLY in the
+    /// score-based topology paths (topology.rs). The liveness prune STILL evicts
+    /// a lattice edge — the exemption is never a permanent pin to a dead neighbor.
+    #[test]
+    fn prune_evicts_lattice_edge_liveness_not_gated() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        // own_addr None so the location starts unset; update_location then pins
+        // it to 0.5 (update_location is a no-op once a location is already set).
+        let cm = make_connection_manager(None, 2, 10, false);
+        cm.update_location(Some(Location::new(0.5)));
+        assert_eq!(cm.get_stored_location(), Some(Location::new(0.5)));
+        let keypair = TransportKeypair::new();
+        let addr = make_addr(8101);
+        // A nearest-successor lattice edge.
+        cm.add_connection(Location::new(0.52), addr, keypair.public().clone(), false);
+        assert!(
+            cm.nearest_lattice_neighbor_dist(true).is_some(),
+            "the added edge is the current nearest successor (a lattice edge)"
+        );
+        // Liveness prune removes it despite being a lattice edge.
+        let pruned = cm.prune_alive_connection(addr);
+        assert!(
+            pruned.is_some(),
+            "liveness prune must evict even a lattice edge"
+        );
+        assert_eq!(cm.connection_count(), 0);
+        assert!(
+            cm.nearest_lattice_neighbor_dist(true).is_none(),
+            "the successor slot is now empty (re-discovery will re-fill it)"
+        );
+    }
+
+    /// Mechanism 3, TIGHTENING-AT-CAPACITY (the core guard): a peer AT capacity
+    /// ACQUIRES a strictly-closer per-side nearest by admitting it over the cap.
+    /// The former nearest is demoted automatically (the reserved slot is derived
+    /// on demand, so `nearest_lattice_neighbor_dist` immediately reports the closer
+    /// arrival and the superseded peer becomes an ordinary long link — pruned by
+    /// the over-max prune in topology.rs, tested there). The absolute ceiling
+    /// (`max_connections + LATTICE_OVERMAX_SLACK`) hard-bounds the transient
+    /// excess even against an ever-closer stream. Reverses the earlier fill-only
+    /// restriction: the lattice must continuously pull toward the TRUE nearest.
+    #[test]
+    fn add_connection_admits_lattice_tighten_over_max_bounded_by_ceiling() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        let max = 3usize;
+        let cm = make_connection_manager(None, 2, max, false);
+        cm.update_location(Some(Location::new(0.5)));
+        assert_eq!(cm.get_stored_location(), Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        let approx = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+        // Fill the SUCCESSOR side to max (nearest successor is 0.60, dist 0.10).
+        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(8210 + i as u16),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert_eq!(
+            cm.connection_count(),
+            max,
+            "filled to max on the successor side"
+        );
+        assert!(
+            approx(cm.nearest_lattice_neighbor_dist(true), 0.10),
+            "nearest successor starts at dist 0.10 (loc 0.60)"
+        );
+        // A strictly-closer SUCCESSOR (0.55, dist 0.05) is a TIGHTEN of an
+        // already-filled side -> now ACQUIRED over max (was rejected as fill-only).
+        let tighten = cm.add_connection(
+            Location::new(0.55),
+            make_addr(8220),
+            kp.public().clone(),
+            false,
+        );
+        assert!(
+            tighten,
+            "a strictly-closer tighten must be acquired over max"
+        );
+        assert_eq!(
+            cm.connection_count(),
+            max + 1,
+            "over max by 1 until the over-max prune tick restores it"
+        );
+        assert!(
+            approx(cm.nearest_lattice_neighbor_dist(true), 0.05),
+            "the closer 0.55 is now the nearest successor (former 0.60 demoted, still connected)"
+        );
+        // An even-closer successor (0.53, dist 0.03) tightens again -> reaches the
+        // over-max ceiling (max + LATTICE_OVERMAX_SLACK).
+        let tighten2 = cm.add_connection(
+            Location::new(0.53),
+            make_addr(8221),
+            kp.public().clone(),
+            false,
+        );
+        assert!(
+            tighten2,
+            "a second strictly-closer tighten is acquired within the slack"
+        );
+        assert_eq!(
+            cm.connection_count(),
+            max + LATTICE_OVERMAX_SLACK,
+            "at the over-max ceiling"
+        );
+        assert!(
+            approx(cm.nearest_lattice_neighbor_dist(true), 0.03),
+            "0.53 is now the nearest successor"
+        );
+        // The ceiling HARD-bounds further admits: an even-closer 0.52 is strictly
+        // closer STILL but REFUSED because the count is already at the ceiling.
+        let over_ceiling = cm.add_connection(
+            Location::new(0.52),
+            make_addr(8222),
+            kp.public().clone(),
+            false,
+        );
+        assert!(
+            !over_ceiling,
+            "an admit past the ceiling is refused even if strictly closer"
+        );
+        assert_eq!(
+            cm.connection_count(),
+            max + LATTICE_OVERMAX_SLACK,
+            "ceiling held: count never exceeds max + LATTICE_OVERMAX_SLACK"
+        );
+        // A FILL of the still-empty predecessor side is only refused here because
+        // the ceiling is saturated — subsumption of fill by strict-closer is
+        // covered by `admits_lattice_edge_over_cap_predicate`.
+        let pred_fill = cm.add_connection(
+            Location::new(0.45),
+            make_addr(8223),
+            kp.public().clone(),
+            false,
+        );
+        assert!(
+            !pred_fill,
+            "even a fill is refused once the ceiling is saturated"
+        );
+    }
+
+    /// The SINGLE over-cap admission predicate `admits_lattice_edge_over_cap`
+    /// admits any strictly-closer per-side nearest — a TIGHTEN of a filled side OR
+    /// a FILL of an empty one — within the over-max ceiling. A candidate no closer
+    /// than the current per-side nearest (a farther non-lattice peer) is never
+    /// admissible. It is the exact decision both connection-lifecycle promotion
+    /// gates apply on the real CONNECT path (see the source-scrape pin below).
+    #[test]
+    fn admits_lattice_edge_over_cap_predicate() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        let max = 3usize;
+        let cm = make_connection_manager(None, 2, max, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        // Successor side filled to the cap; predecessor side empty. Nearest
+        // successor is 0.60 (dist 0.10).
+        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(8310 + i as u16),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert_eq!(cm.connection_count(), max, "at the cap");
+        // FILLING the EMPTY predecessor side is admissible over the cap (the
+        // degenerate strict-closer case: current nearest = +inf).
+        assert!(
+            cm.admits_lattice_edge_over_cap(Location::new(0.45)),
+            "filling an empty lattice side is admissible over the cap"
+        );
+        // TIGHTENING the already-filled successor side (0.55, dist 0.05, strictly
+        // closer than the current nearest 0.60/dist 0.10) is NOW admissible over
+        // the cap — the lattice continuously pulls toward the true nearest.
+        assert!(
+            cm.admits_lattice_edge_over_cap(Location::new(0.55)),
+            "a strictly-closer tighten of a filled side is admissible over the cap"
+        );
+        // A successor NO closer than the current nearest is a farther non-lattice
+        // peer — never admissible over the cap.
+        assert!(
+            !cm.admits_lattice_edge_over_cap(Location::new(0.65)),
+            "a successor farther than the current nearest (0.60) is not admissible"
+        );
+        assert!(
+            !cm.admits_lattice_edge_over_cap(Location::new(0.95)),
+            "a far non-lattice peer is not admissible over the cap"
+        );
+        // Disabling the lattice makes the predicate a no-op.
+        set_nn_lattice_enabled(false);
+        assert!(!cm.admits_lattice_edge_over_cap(Location::new(0.45)));
+        // `_nn_guard` restores the production default (flag ON, floor RE-ARMED) on
+        // drop — even on panic — instead of a bare `set_nn_lattice_enabled(true)`
+        // that would leak force-active ON to a later same-thread test.
+    }
+
+    /// Regression for the speculative-state over-cap ceiling: non-stale pending
+    /// reservations count toward `max_connections + LATTICE_OVERMAX_SLACK`, so a
+    /// full node fed a burst of strictly-closer fresh-address requests stops
+    /// re-firing the over-cap accept (+ NAT-traversal) after SLACK concurrent
+    /// pending acceptances, instead of once per request. Stale reservations do NOT
+    /// count (they expire via `PENDING_RESERVATION_TTL`), and a genuine single
+    /// tightening candidate still has room. Without the reservation term this
+    /// would be an unbounded per-request accept/NAT amplification vector.
+    #[test]
+    fn over_cap_ceiling_counts_non_stale_pending_reservations() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        let max = 3usize;
+        let cm = make_connection_manager(None, 2, max, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        // Successor side filled to the cap; nearest successor is 0.60 (dist 0.10).
+        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(8410 + i as u16),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert_eq!(cm.connection_count(), max, "at the cap");
+
+        // Baseline: a strictly-closer tighten (0.55) is admissible with no pending.
+        let tighten = Location::new(0.55);
+        assert!(
+            cm.admits_lattice_edge_over_cap(tighten),
+            "strictly-closer tighten admissible with zero pending reservations"
+        );
+
+        // One non-stale pending reservation: established(3) + pending(1) = 4 <
+        // max(3) + SLACK(2) = 5. Still admissible — single-candidate tightening
+        // keeps its headroom.
+        {
+            let mut pending = cm.pending_reservations.write();
+            pending.insert(make_addr(8420), (Location::new(0.10), Instant::now()));
+        }
+        assert!(
+            cm.admits_lattice_edge_over_cap(tighten),
+            "one pending reservation leaves room for a single tighten"
+        );
+
+        // A SECOND non-stale pending reservation reaches the ceiling:
+        // established(3) + pending(2) = 5, NOT < 5 → refused. This is the bound:
+        // concurrent over-cap acceptances are capped at LATTICE_OVERMAX_SLACK per
+        // reservation-TTL window rather than firing once per fresh-address request.
+        {
+            let mut pending = cm.pending_reservations.write();
+            pending.insert(make_addr(8421), (Location::new(0.15), Instant::now()));
+        }
+        assert_eq!(LATTICE_OVERMAX_SLACK, 2, "test assumes SLACK == 2");
+        assert!(
+            !cm.admits_lattice_edge_over_cap(tighten),
+            "SLACK non-stale pending reservations exhaust the over-cap ceiling"
+        );
+
+        // Backdate both reservations past the TTL: stale reservations do NOT count,
+        // so the ceiling frees up and the tighten is admissible again.
+        {
+            let mut pending = cm.pending_reservations.write();
+            for addr in [make_addr(8420), make_addr(8421)] {
+                if let Some(entry) = pending.get_mut(&addr) {
+                    entry.1 = Instant::now() - (PENDING_RESERVATION_TTL + Duration::from_secs(1));
+                }
+            }
+        }
+        assert!(
+            cm.admits_lattice_edge_over_cap(tighten),
+            "stale (expired-TTL) reservations do not count toward the ceiling"
+        );
+    }
+
+    /// Companion to `over_cap_ceiling_counts_non_stale_pending_reservations` that
+    /// drives the PRODUCTION `should_accept` path rather than the predicate
+    /// directly (external-review coverage-gap finding): in `should_accept` the
+    /// candidate inserts its OWN pending reservation BEFORE the over-cap check, so
+    /// at capacity the FIRST strictly-closer over-cap candidate is accepted
+    /// (leaving a reservation) and the SECOND is throttled by the speculative-count
+    /// ceiling (established + its own reservation + the first's == max + SLACK).
+    /// Also pins that the throttled candidate's reservation is cleaned up on the
+    /// reject path. Guards against a regression that breaks the self-count or the
+    /// reject-path cleanup while the predicate-only test still passes.
+    #[test]
+    fn should_accept_over_cap_throttles_after_slack_pending() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        assert_eq!(LATTICE_OVERMAX_SLACK, 2, "test assumes SLACK == 2");
+        let max = 3usize;
+        let own = make_addr(8500);
+        let cm = make_connection_manager(Some(own), 2, max, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        // Successor side filled to the cap; nearest established successor is 0.60
+        // (dist 0.10). The accepted-but-only-RESERVED candidates below never enter
+        // connections_by_location, so this nearest does not move during the test.
+        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(8510 + i as u16),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert_eq!(cm.connection_count(), max, "at the cap");
+        assert_eq!(cm.get_reserved_connections(), 0, "no reservations yet");
+
+        // First strictly-closer over-cap candidate (0.55, dist 0.05 < 0.10):
+        // established(3) + its own reservation(1) = 4 < max(3) + SLACK(2) = 5, so
+        // `should_accept` admits it over the cap and it holds a pending reservation.
+        assert!(
+            cm.should_accept(Location::new(0.55), make_addr(8520)),
+            "first over-cap tighten accepted at capacity via should_accept"
+        );
+        assert_eq!(
+            cm.get_reserved_connections(),
+            1,
+            "accepted over-cap candidate holds a pending reservation"
+        );
+
+        // Second, even-closer candidate (0.54, dist 0.06 < 0.10 vs the unchanged
+        // established nearest 0.60): established(3) + its own reservation + the
+        // first's = 5, NOT < 5, so the speculative ceiling throttles it. It must be
+        // REJECTED and must NOT leak a reservation (reject-path cleanup).
+        assert!(
+            !cm.should_accept(Location::new(0.54), make_addr(8521)),
+            "second over-cap tighten throttled once SLACK reservations are held"
+        );
+        assert_eq!(
+            cm.get_reserved_connections(),
+            1,
+            "throttled candidate's reservation was cleaned up (only the first remains)"
+        );
+    }
+
+    /// Regression for the `add_connection` atomicity refactor's cap-bypass
+    /// semantics (rule-review coverage-gap warning): a STALE `location_for_peer`
+    /// entry with NO matching established `connections_by_location` entry (a
+    /// `record_pending_location` that never became a ring connection) must NOT
+    /// exempt a peer from the `max_connections` cap. Before the refactor ANY
+    /// `previous_location.is_some()` skipped the cap (treating it as a net-zero
+    /// relocation); now the cap is skipped only when an established entry is
+    /// actually removed (`removed_established`), so a stale pending entry is a
+    /// genuine net-add the cap must gate. Without the fix this add overshoots the
+    /// cap to `max + 1`.
+    #[test]
+    fn add_connection_stale_previous_location_still_enforces_cap() {
+        // Deliberately NO NnLatticeOverrideGuard: at max=3 (below the lattice
+        // floor) the lattice is inactive, AND the candidate below is a FAR
+        // successor (dist 0.40 >> nearest 0.10), so it is not a strictly-closer
+        // lattice edge and the over-cap exception cannot admit it regardless of
+        // the lattice flag state. This isolates pure cap enforcement.
+        let max = 3usize;
+        let own = make_addr(8600);
+        let cm = make_connection_manager(Some(own), 2, max, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        // Fill the successor side to the cap; nearest established successor 0.60.
+        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(8610 + i as u16),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert_eq!(cm.connection_count(), max, "at the cap");
+
+        // Register a STALE pending location for a peer that never establishes a
+        // ring connection: location_for_peer gets an entry, connections_by_location
+        // does not. This is the `record_pending_location`-without-establish case.
+        let stale_addr = make_addr(8620);
+        cm.record_pending_location(stale_addr, Location::new(0.62));
+        assert_eq!(
+            cm.connection_count(),
+            max,
+            "record_pending_location does not create an established connection"
+        );
+
+        // add_connection for that addr at capacity, to a FAR successor (0.90). Its
+        // stale previous_location (0.62) has no established entry to remove, so
+        // removed_established stays false and this is a genuine net-add the cap
+        // must reject — NOT a cap-exempt relocation.
+        let admitted =
+            cm.add_connection(Location::new(0.90), stale_addr, kp.public().clone(), false);
+        assert!(
+            !admitted,
+            "a stale previous_location must not exempt a net-add from the cap"
+        );
+        assert_eq!(
+            cm.connection_count(),
+            max,
+            "cap enforced: count did not overshoot via the stale-previous-location path"
+        );
+    }
+
+    /// Source-scrape pin (B1 regression guard): BOTH connection-lifecycle
+    /// promotion gates must apply the shared `admits_lattice_edge_over_cap`
+    /// exception to their `>= max_connections` reject. Without this a lattice edge
+    /// is silently dropped at the cap on the real CONNECT path and mechanism 3's
+    /// at-capacity displacement is inert — the exact defect the external review
+    /// caught (the over-max unit test passed only because it bypassed the gate).
+    /// If a future refactor drops the exception from a gate, this fails instead of
+    /// silently regressing.
+    #[test]
+    fn lifecycle_gates_apply_lattice_over_cap_predicate() {
+        const LIFECYCLE_SRC: &str =
+            include_str!("../node/network_bridge/p2p_protoc/connection_lifecycle.rs");
+        let hits = LIFECYCLE_SRC
+            .matches("admits_lattice_edge_over_cap(loc)")
+            .count();
+        assert!(
+            hits >= 2,
+            "both lifecycle promotion cap-gates must apply \
+             admits_lattice_edge_over_cap(loc); found {hits} call site(s)"
+        );
     }
 
     #[test]
@@ -3916,6 +4963,107 @@ mod tests {
         for (i, r) in results.into_iter().enumerate() {
             r.unwrap_or_else(|e| panic!("task {i} panicked: {e}"));
         }
+    }
+
+    /// F4 regression (targeted): the over-cap lattice ceiling
+    /// (`max_connections + LATTICE_OVERMAX_SLACK`) holds atomically under
+    /// CONCURRENT `add_connection` calls. Before f214dab the over-cap admission
+    /// did a non-atomic check-then-insert (read `connection_count()` under one
+    /// lock, insert under a fresh write lock), so many concurrent adders each read
+    /// the same stale count and all inserted past the ceiling (the broad stress
+    /// tests breached it to 60-73 vs a ceiling of 52). The fix holds the
+    /// `connections_by_location` write guard across the whole count-check +
+    /// admission-check + insert, making the ceiling a HARD bound.
+    ///
+    /// This is a FOCUSED complement to the broad lifecycle/prune stress tests: it
+    /// pre-fills a node to exactly `max` on one ring side, then races many tasks
+    /// that each attempt a strictly-closer successor edge (each admissible over
+    /// cap the instant it checks). The asserted invariant is a BOUND, so it never
+    /// flakes on interleaving; a non-atomic regression breaches the ceiling
+    /// (tripping the F4 `debug_assert` inside `add_connection` in debug/test
+    /// builds, and this post-condition assert regardless). Uses `max >= 25` so the
+    /// lattice is active via the real minimum-degree floor on every worker thread
+    /// (the per-thread force-active override does not propagate across
+    /// `tokio::spawn`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_over_cap_lattice_adds_never_breach_ceiling() {
+        use std::sync::Arc;
+
+        // `_nn_guard` defensively restores this thread's lattice overrides on drop.
+        // The test relies on the REAL floor (max >= NN_LATTICE_MIN_MAX_CONNECTIONS),
+        // not a force override, so the lattice is active on the spawned worker
+        // threads too (a thread-local force-active would not propagate there).
+        let _nn_guard = NnLatticeOverrideGuard;
+        const MAX: usize = 30;
+        const NUM_TASKS: usize = 48;
+        // Compile-time: `MAX` must clear the minimum-degree floor so the lattice is
+        // active via the real gate on every worker thread (a per-thread
+        // force-active override does not propagate across `tokio::spawn`).
+        const _: () = assert!(MAX >= NN_LATTICE_MIN_MAX_CONNECTIONS);
+
+        let cm = Arc::new(make_connection_manager(None, 5, MAX, false));
+        cm.update_location(Some(Location::new(0.5)));
+        assert_eq!(cm.get_stored_location(), Some(Location::new(0.5)));
+
+        // Pre-fill EXACTLY `max` established connections, all on the successor side
+        // at distance >= 0.10 (nearest successor ends at 0.60, dist 0.10). Each add
+        // is under the cap, so it inserts unconditionally. The predecessor side is
+        // left empty.
+        let kp = TransportKeypair::new();
+        for i in 0..MAX {
+            let loc = Location::new(0.60 + i as f64 * 0.002);
+            cm.add_connection(loc, make_addr(19000 + i as u16), kp.public().clone(), false);
+        }
+        assert_eq!(cm.connection_count(), MAX, "pre-filled to exactly max");
+
+        // Race many tasks, each adding a DISTINCT successor location strictly
+        // closer than the pre-filled nearest (0.10) — every one is admissible over
+        // the cap at the moment it checks, so a non-atomic check-then-insert lets
+        // several slip in past the ceiling simultaneously.
+        let barrier = Arc::new(tokio::sync::Barrier::new(NUM_TASKS));
+        let mut handles = Vec::with_capacity(NUM_TASKS);
+        for task_id in 0..NUM_TASKS {
+            let cm = Arc::clone(&cm);
+            let barrier = Arc::clone(&barrier);
+            let kp = kp.clone();
+            handles.push(tokio::spawn(async move {
+                // 0.589 .. 0.542: all in (0.5, 0.6), dist (0.042, 0.089) < 0.10,
+                // all distinct, all strictly-closer successor tightens.
+                let loc = Location::new(0.589 - task_id as f64 * 0.001);
+                barrier.wait().await;
+                cm.add_connection(
+                    loc,
+                    make_addr(20000 + task_id as u16),
+                    kp.public().clone(),
+                    false,
+                );
+            }));
+        }
+        let result =
+            tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(handles)).await;
+        for (i, r) in result
+            .expect(
+                "DEADLOCK DETECTED: concurrent over-cap adds did not complete within 30 seconds",
+            )
+            .into_iter()
+            .enumerate()
+        {
+            r.unwrap_or_else(|e| panic!("task {i} panicked: {e}"));
+        }
+
+        let final_count = cm.connection_count();
+        assert!(
+            final_count <= MAX + LATTICE_OVERMAX_SLACK,
+            "over-cap ceiling breached under concurrent adds: {final_count} > \
+             {MAX} + {LATTICE_OVERMAX_SLACK} (the atomic check-then-insert guard was defeated)"
+        );
+        // At count == max the first admissible racing add always succeeds, so at
+        // least one over-cap admit MUST have happened — otherwise the test is
+        // vacuous (it never exercised the over-cap path).
+        assert!(
+            final_count > MAX,
+            "expected at least one over-cap lattice admit; got {final_count} (over-cap path not exercised)"
+        );
     }
 
     /// Stress test: concurrent admission control under gateway limits.

@@ -33,6 +33,61 @@ WHEN accepting a new connection (should_accept):
       (default 8, separate from TTL). Each uphill hop decrements budget by 1.
       See PR #3621, which replaced the TTL halving from PR #3582.
   2. CHECK: Are we at max_connections (open + pending)? → REJECT
+     EXCEPTION (nearest-neighbor lattice, mechanism 3): a candidate that
+     would become this peer's new per-side NEAREST ring neighbor — a TIGHTEN
+     of an already-held side OR a FILL of an empty one (any strictly-closer
+     successor or predecessor) — is force-accepted even at/over max, up to a
+     HARD over-max ceiling (max_connections + LATTICE_OVERMAX_SLACK). It
+     displaces a farther non-lattice long link,
+     which the topology maintenance loop's over-max prune sheds next tick
+     (protected lattice edges are never the prune victim). Applied via the
+     shared predicate admits_lattice_edge_over_cap() in should_accept, in
+     add_connection, AND in BOTH connection-lifecycle promotion gates
+     (p2p_protoc/connection_lifecycle.rs) so the exception is live on the
+     real CONNECT path, not just should_accept. See connection_manager.rs.
+     MINIMUM-DEGREE FLOOR: the whole lattice feature (this exception, the
+     per-side acceptance clause, the route-to-self discovery probe, and the
+     topology.rs retention exemption) is GATED OFF when this peer's CONFIGURED
+     max_connections is below NN_LATTICE_MIN_MAX_CONNECTIONS (= 25 =
+     DEFAULT_MIN_CONNECTIONS). Two-tier routing needs enough long links left
+     after the 2-slot base-lattice reserve; below the network's own
+     minimum-degree target a node can't sustain the structure. The gate reads
+     CONFIGURED max (200 in production), NOT the live connection count, so
+     production peers are always active and the floor's real job is to keep the
+     sparse simulation suite (configs top out at max=16) at its pre-lattice
+     baseline — only the production-scale max=200 sim tests exercise the lattice.
+     The single activation gate is nn_lattice_active_for(max_connections) /
+     ConnectionManager::nn_lattice_active(); the test-only override that flips
+     the stock/fix validation arm also force-activates below the floor (so the
+     dedicated benefit tests exercise the ON path at max=5).
+     TIGHTENING-AT-CAPACITY: over-cap admission fires for any strictly-closer
+     per-side nearest — a TIGHTEN of an already-held side OR a FILL of an empty
+     one — so the lattice CONTINUOUSLY pulls each peer toward its true nearest
+     ring neighbors, not merely filling empty sides. The superseded
+     former-nearest demotes into the long-link pool automatically (the reserved
+     slot is derived on demand from the live connection set). SPECULATIVE-STATE
+     CEILING: the over-cap ceiling counts ESTABLISHED connections PLUS non-stale
+     pending reservations (the speculative-state invariant below: "am I
+     over-committed?" checks use speculative, not actual, state), which bounds
+     concurrent over-cap acceptances to LATTICE_OVERMAX_SLACK per
+     reservation-TTL window and stops a full node re-firing an accept plus
+     NAT-traversal on every strictly-closer fresh-address request. This global
+     speculative-count term is DISTINCT from and simpler than the dropped per-side
+     F1 clause (which bounded concurrent over-cap FILLS to one per EMPTY side, a
+     near-non-case since a node at max almost always has both ring sides
+     populated). The SLACK budget is GLOBAL (counts all non-stale reservations,
+     not just over-cap lattice ones), so on a node AT max unrelated in-flight
+     handshakes can throttle tightening until they drain (bounded by the TTL;
+     continuous discovery retries). This only bites nodes genuinely at max (mostly
+     busy gateways); a peer below max tightens via the under-cap path, which never
+     consults this ceiling. A lattice-private budget is a possible future
+     refinement. A second, independent bound: each admitted candidate that
+     ESTABLISHES advances the per-side current-nearest, so the established sequence
+     is strictly decreasing (a short records chain) and the absolute ceiling
+     hard-bounds the ESTABLISHED set. The route-to-self discovery probe
+     likewise runs CONTINUOUSLY (decaying toward tau_max, never stopping when both
+     sides are filled) so a filled-but-loose edge keeps tightening. See
+     connection_manager.rs and ring.rs.
   3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
      → Map all connection distances to log-space (1/d = uniform in log)
      → Score = min distance to nearest neighbor in log-space
