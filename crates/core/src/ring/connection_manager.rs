@@ -1035,9 +1035,21 @@ impl ConnectionManager {
     /// automatically becomes the new slot holder and the superseded former
     /// nearest demotes back into the ordinary long-link pool with no bookkeeping.
     pub(crate) fn nearest_lattice_neighbor_dist(&self, successor_side: bool) -> Option<f64> {
+        self.nearest_lattice_neighbor_dist_in(&self.connections_by_location.read(), successor_side)
+    }
+
+    /// [`Self::nearest_lattice_neighbor_dist`] computed against an ALREADY-HELD
+    /// `connections_by_location` map instead of taking a fresh read lock. This lets
+    /// the atomic over-cap admission in [`Self::add_connection`] run the fill check
+    /// under the SAME write guard that performs the insert (see the F4 note there),
+    /// so the over-cap ceiling holds even under concurrent adds.
+    fn nearest_lattice_neighbor_dist_in(
+        &self,
+        connections: &BTreeMap<Location, Vec<Connection>>,
+        successor_side: bool,
+    ) -> Option<f64> {
         let me = self.get_stored_location()?;
-        self.connections_by_location
-            .read()
+        connections
             .keys()
             .filter_map(|loc| {
                 let sd = me.signed_distance(*loc);
@@ -1099,7 +1111,22 @@ impl ConnectionManager {
     /// merely TIGHTENING an already-held side. Only a fill justifies displacing a
     /// long link over the `max_connections` cap; see
     /// [`Self::admits_lattice_edge_over_cap`].
+    // Production now runs the fill check under a held write guard via
+    // `would_fill_empty_lattice_side_in` (see `admits_lattice_edge_over_cap_in`),
+    // so this fresh-read-lock wrapper is exercised only by unit tests. Kept for
+    // the test API and for symmetry with `nearest_lattice_neighbor_dist`.
+    #[allow(dead_code)]
     pub(crate) fn would_fill_empty_lattice_side(&self, loc: Location) -> bool {
+        self.would_fill_empty_lattice_side_in(&self.connections_by_location.read(), loc)
+    }
+
+    /// [`Self::would_fill_empty_lattice_side`] against an ALREADY-HELD
+    /// `connections_by_location` map (see [`Self::nearest_lattice_neighbor_dist_in`]).
+    fn would_fill_empty_lattice_side_in(
+        &self,
+        connections: &BTreeMap<Location, Vec<Connection>>,
+        loc: Location,
+    ) -> bool {
         if !self.nn_lattice_active() {
             return false;
         }
@@ -1112,7 +1139,8 @@ impl ConnectionManager {
         }
         let successor_side = sd > 0.0;
         // The side currently holds NO connected neighbor (an empty lattice slot).
-        self.nearest_lattice_neighbor_dist(successor_side).is_none()
+        self.nearest_lattice_neighbor_dist_in(connections, successor_side)
+            .is_none()
     }
 
     /// Whether a candidate at `loc` may be admitted even though the node is at or
@@ -1157,8 +1185,32 @@ impl ConnectionManager {
         loc: Location,
         exclude_addr: Option<SocketAddr>,
     ) -> bool {
-        self.would_fill_empty_lattice_side(loc)
-            && self.connection_count() < self.max_connections + LATTICE_OVERMAX_SLACK
+        self.admits_lattice_edge_over_cap_in(
+            &self.connections_by_location.read(),
+            loc,
+            exclude_addr,
+        )
+    }
+
+    /// [`Self::admits_lattice_edge_over_cap`] evaluated against an ALREADY-HELD
+    /// `connections_by_location` map, so [`Self::add_connection`] can run the
+    /// count-check under the SAME write guard that performs the insert. This is
+    /// what makes the over-cap ceiling (`max_connections + LATTICE_OVERMAX_SLACK`)
+    /// a HARD invariant under concurrent adds rather than a racy check-then-insert
+    /// (F4). `connections` is the held map; the fill check and the count both read
+    /// it directly. `pending_reservation_on_side` takes its own `pending_reservations`
+    /// read lock, which is lock #3 — acquired AFTER `connections_by_location` (#2),
+    /// consistent with the documented lock ordering, so holding the write guard
+    /// across this call cannot deadlock.
+    fn admits_lattice_edge_over_cap_in(
+        &self,
+        connections: &BTreeMap<Location, Vec<Connection>>,
+        loc: Location,
+        exclude_addr: Option<SocketAddr>,
+    ) -> bool {
+        let count: usize = connections.values().map(|conns| conns.len()).sum();
+        self.would_fill_empty_lattice_side_in(connections, loc)
+            && count < self.max_connections + LATTICE_OVERMAX_SLACK
             && !self.pending_reservation_on_side(loc, exclude_addr)
     }
 
@@ -1679,82 +1731,114 @@ impl ConnectionManager {
         // promotion gates apply the SAME predicate before reaching here, so a
         // lattice edge is no longer silently dropped at the cap on the real
         // CONNECT path.
-        if previous_location.is_none() && self.connection_count() >= self.max_connections {
-            // Exclude this candidate's own reservation (still present here — it is
-            // pruned only in the reject branch below) from the reservation-aware
-            // per-side concurrency bound (F1).
-            if self.admits_lattice_edge_over_cap(loc, Some(addr)) {
+        //
+        // F4 (atomicity): the cap count-check, the over-cap admission check, the
+        // relocation removal, and the insert all run under ONE held
+        // `connections_by_location` write guard, so the ceiling
+        // (`max_connections + LATTICE_OVERMAX_SLACK`) is a HARD invariant even
+        // under concurrent adds. Previously the check read `connection_count()`
+        // (a separate read lock) and the insert took a fresh write lock — a
+        // non-atomic check-then-insert that two concurrent adders could both pass,
+        // each inserting past the ceiling (the stress tests breached it to 60+ vs
+        // a ceiling of 52). In production every add runs on the single p2p
+        // event-loop task so the race never fired, but holding the guard across
+        // the whole decision makes the bound hold regardless. Lock ordering is
+        // preserved: `location_for_peer` (lock #1) is inserted above and rolled
+        // back below OUTSIDE this guard (never acquired while it is held), and
+        // `pending_reservation_on_side` acquires `pending_reservations` (#3) AFTER
+        // `connections_by_location` (#2).
+        let count_after = {
+            let mut cbl = self.connections_by_location.write();
+
+            // Relocation removal FIRST, tracking whether an established entry was
+            // actually removed. A peer with a `previous_location` is only a true
+            // relocation (net-zero, cap-exempt) if it was genuinely present in the
+            // ring; otherwise `previous_location` is a stale/pending
+            // `location_for_peer` entry (e.g. a `record_pending_location` from
+            // `should_accept` that never became a ring connection) and the insert
+            // below is a genuine net-add that the cap MUST gate. Ordering the
+            // removal before the count-check is what makes the ceiling hold on the
+            // relocation path too — otherwise a `previous_location`-Some insert
+            // skipped the cap entirely and could overshoot under concurrent adds.
+            let mut removed_established = false;
+            if let Some(prev_loc) = previous_location {
                 tracing::debug!(
                     addr = %addr,
-                    peer_location = %loc,
-                    max = self.max_connections,
-                    "add_connection: admitting nearest-neighbor lattice edge over cap (a long link will be pruned)"
+                    prev_location = %prev_loc,
+                    new_location = %loc,
+                    "add_connection: replacing existing connection for peer"
                 );
-            } else {
-                tracing::warn!(
-                    addr = %addr,
-                    peer_location = %loc,
-                    max = self.max_connections,
-                    "add_connection: rejecting new connection to enforce cap"
-                );
-                // Roll back bookkeeping since we're refusing the connection.
-                self.location_for_peer.write().remove(&addr);
-                if was_reserved {
-                    self.pending_reservations.write().remove(&addr);
-                }
-                return false;
-            }
-        }
-
-        if let Some(prev_loc) = previous_location {
-            tracing::debug!(
-                addr = %addr,
-                prev_location = %prev_loc,
-                new_location = %loc,
-                "add_connection: replacing existing connection for peer"
-            );
-            let mut cbl = self.connections_by_location.write();
-            if let Some(prev_list) = cbl.get_mut(&prev_loc) {
-                if let Some(pos) = prev_list
-                    .iter()
-                    .position(|c| c.location.socket_addr() == Some(addr))
-                {
-                    prev_list.swap_remove(pos);
-                }
-                if prev_list.is_empty() {
-                    cbl.remove(&prev_loc);
+                if let Some(prev_list) = cbl.get_mut(&prev_loc) {
+                    if let Some(pos) = prev_list
+                        .iter()
+                        .position(|c| c.location.socket_addr() == Some(addr))
+                    {
+                        prev_list.swap_remove(pos);
+                        removed_established = true;
+                    }
+                    if prev_list.is_empty() {
+                        cbl.remove(&prev_loc);
+                    }
                 }
             }
-        }
 
-        {
-            let mut cbl = self.connections_by_location.write();
+            // `current` is the post-removal count. A genuine net-add (the peer was
+            // not already an established ring connection) must respect the cap; a
+            // true relocation (net-zero) does not change the count and is exempt.
+            let current: usize = cbl.values().map(|conns| conns.len()).sum();
+            if !removed_established && current >= self.max_connections {
+                // Exclude this candidate's own reservation (still present here — it
+                // is pruned only in the reject branch below) from the
+                // reservation-aware per-side concurrency bound (F1).
+                if self.admits_lattice_edge_over_cap_in(&cbl, loc, Some(addr)) {
+                    tracing::debug!(
+                        addr = %addr,
+                        peer_location = %loc,
+                        max = self.max_connections,
+                        "add_connection: admitting nearest-neighbor lattice edge over cap (a long link will be pruned)"
+                    );
+                } else {
+                    // Release the ring write lock BEFORE touching lock #1
+                    // (`location_for_peer`): acquiring it while holding
+                    // `connections_by_location` would reverse the documented lock
+                    // ordering.
+                    drop(cbl);
+                    tracing::warn!(
+                        addr = %addr,
+                        peer_location = %loc,
+                        max = self.max_connections,
+                        "add_connection: rejecting new connection to enforce cap"
+                    );
+                    // Roll back bookkeeping since we're refusing the connection.
+                    self.location_for_peer.write().remove(&addr);
+                    if was_reserved {
+                        self.pending_reservations.write().remove(&addr);
+                    }
+                    return false;
+                }
+            }
+
             cbl.entry(loc)
                 .or_default()
                 .push(Connection::new(PeerKeyLocation::new(pub_key, addr)));
-        }
+
+            // Count AFTER the insert, still under the same write guard. Because the
+            // count-check above and this insert are now atomic, the ceiling holds
+            // even under concurrent adds — KEEP this assertion as the guard.
+            let count_after: usize = cbl.values().map(|conns| conns.len()).sum();
+            debug_assert!(
+                count_after <= self.max_connections + LATTICE_OVERMAX_SLACK,
+                "connection_count {count_after} exceeded the over-cap lattice ceiling \
+                 (max_connections {} + LATTICE_OVERMAX_SLACK {LATTICE_OVERMAX_SLACK}); the \
+                 over-cap ceiling check-then-insert is now atomic under the \
+                 connections_by_location write guard, so a breach means that atomic \
+                 region was bypassed (e.g. a new add site that inserts without it)",
+                self.max_connections,
+            );
+            count_after
+        };
 
         // Verify the insertion actually persisted — detect silent state corruption.
-        let count_after = self.connection_count();
-        // F4: the over-cap lattice ceiling (`admits_lattice_edge_over_cap`) is a
-        // check-then-insert: it reads `connection_count()` under `max +
-        // LATTICE_OVERMAX_SLACK`, then this method inserts. That is NOT atomic, so
-        // the ceiling only holds because EVERY connection add runs on the single
-        // p2p event-loop task (`connection_lifecycle.rs`) — there is no concurrent
-        // adder to race the check against the insert. If a future refactor moves
-        // connection-add off that single task, this check-then-insert must be made
-        // atomic (or the count re-checked under a lock) or the ceiling can be
-        // overshot. This assertion catches a ceiling breach in test/debug builds so
-        // that invariant violation is loud rather than silent.
-        debug_assert!(
-            count_after <= self.max_connections + LATTICE_OVERMAX_SLACK,
-            "connection_count {count_after} exceeded the over-cap lattice ceiling \
-             (max_connections {} + LATTICE_OVERMAX_SLACK {LATTICE_OVERMAX_SLACK}); the \
-             non-atomic ceiling check-then-insert relies on all connection adds \
-             running on the single p2p event-loop task — a breach means that \
-             single-task invariant was violated",
-            self.max_connections,
-        );
         let in_location_map = self.location_for_peer.read().contains_key(&addr);
         if !in_location_map || count_after == 0 {
             tracing::error!(
