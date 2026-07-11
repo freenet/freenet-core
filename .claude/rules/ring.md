@@ -75,7 +75,13 @@ WHEN accepting a new connection (should_accept):
      speculative-count term is DISTINCT from and simpler than the dropped per-side
      F1 clause (which bounded concurrent over-cap FILLS to one per EMPTY side, a
      near-non-case since a node at max almost always has both ring sides
-     populated). A second, independent bound: each admitted candidate that
+     populated). The SLACK budget is GLOBAL (counts all non-stale reservations,
+     not just over-cap lattice ones), so on a node AT max unrelated in-flight
+     handshakes can throttle tightening until they drain (bounded by the TTL;
+     continuous discovery retries). This only bites nodes genuinely at max (mostly
+     busy gateways); a peer below max tightens via the under-cap path, which never
+     consults this ceiling. A lattice-private budget is a possible future
+     refinement. A second, independent bound: each admitted candidate that
      ESTABLISHES advances the per-side current-nearest, so the established sequence
      is strictly decreasing (a short records chain) and the absolute ceiling
      hard-bounds the ESTABLISHED set. The route-to-self discovery probe

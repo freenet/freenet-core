@@ -1182,6 +1182,15 @@ impl ConnectionManager {
     /// cheap-IPv6 eclipse / NAT-amplification envelope the project lead already
     /// accepted (see the `should_accept` SECURITY note, F3).
     ///
+    /// The reservation term counts ALL non-stale reservations, so the SLACK budget
+    /// is GLOBAL (shared with unrelated in-flight handshakes), not lattice-private:
+    /// a node genuinely AT max whose budget is already consumed by ordinary CONNECT
+    /// traffic has its over-cap tightening throttled until those reservations drain
+    /// or expire (bounded by [`PENDING_RESERVATION_TTL`]; the continuous discovery
+    /// loop retries). This bites only for nodes at max (mostly busy gateways) — a
+    /// peer below max tightens via the under-cap path, which never consults this
+    /// ceiling. A lattice-private budget is a possible future refinement.
+    ///
     /// This ceiling term is DISTINCT from the dropped F1 clause and much simpler:
     /// F1 was a PER-SIDE reservation clause (bounding concurrent over-cap FILLS to
     /// one per EMPTY side), whose concern — a concurrent fill flood on an empty
@@ -1227,10 +1236,20 @@ impl ConnectionManager {
         // the over-cap accept (and its NAT-traversal) on every one — the
         // amplification the established-only check left open. Counting them bounds
         // concurrent over-cap acceptances to LATTICE_OVERMAX_SLACK per
-        // reservation-TTL window. Genuine single-candidate tightening still has
-        // room (its lone self-reservation is < SLACK), and a probe throttled
-        // during a pending burst is retried by the continuous discovery loop once
-        // the in-flight reservations drain or expire (PENDING_RESERVATION_TTL).
+        // reservation-TTL window. This counts ALL non-stale reservations, not just
+        // over-cap lattice ones, so the SLACK budget is GLOBAL (shared with
+        // unrelated in-flight handshakes), not lattice-private: single-candidate
+        // tightening has room only when the node holds fewer than SLACK other
+        // non-stale reservations, and a node at max whose budget is already
+        // consumed by ordinary CONNECT traffic throttles tightening until those
+        // drain or expire (PENDING_RESERVATION_TTL). That is bounded and the
+        // continuous discovery loop retries; the global count is also the more
+        // conservative choice for the hard ceiling. It only bites at nodes
+        // genuinely AT max (mostly busy gateways) — a peer below max tightens via
+        // the under-cap path, which never consults this ceiling. A lattice-private
+        // budget (counting only over-cap lattice reservations) would give
+        // tightening dedicated slots and is a possible future refinement, not
+        // taken here for simplicity.
         // Lock order: the caller holds `connections_by_location` (#2);
         // `pending_reservations` (#3) is acquired here, AFTER it — the documented
         // order (see the module-level hierarchy), never the reverse.
@@ -1748,7 +1767,11 @@ impl ConnectionManager {
         // speculative-count term — in the documented order (#2 before #3), never
         // the reverse, so no ABBA (prune_connection nests #1→#2→#3 identically).
         // The candidate's own reservation was already removed above (`was_reserved`
-        // → remove), so it is not double-counted against the ceiling here.
+        // → remove), so it is not double-counted against the ceiling here. (In the
+        // `was_reserved == false` edge a lingering stale self-reservation for the
+        // same addr would over-count, never under-count — a spurious retryable
+        // reject at worst, never a ceiling breach; on the real over-cap lattice
+        // path `was_reserved` is reliably true.)
         let count_after = {
             let mut cbl = self.connections_by_location.write();
 
@@ -3263,6 +3286,68 @@ mod tests {
         assert!(
             cm.admits_lattice_edge_over_cap(tighten),
             "stale (expired-TTL) reservations do not count toward the ceiling"
+        );
+    }
+
+    /// Companion to `over_cap_ceiling_counts_non_stale_pending_reservations` that
+    /// drives the PRODUCTION `should_accept` path rather than the predicate
+    /// directly (external-review coverage-gap finding): in `should_accept` the
+    /// candidate inserts its OWN pending reservation BEFORE the over-cap check, so
+    /// at capacity the FIRST strictly-closer over-cap candidate is accepted
+    /// (leaving a reservation) and the SECOND is throttled by the speculative-count
+    /// ceiling (established + its own reservation + the first's == max + SLACK).
+    /// Also pins that the throttled candidate's reservation is cleaned up on the
+    /// reject path. Guards against a regression that breaks the self-count or the
+    /// reject-path cleanup while the predicate-only test still passes.
+    #[test]
+    fn should_accept_over_cap_throttles_after_slack_pending() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        assert_eq!(LATTICE_OVERMAX_SLACK, 2, "test assumes SLACK == 2");
+        let max = 3usize;
+        let own = make_addr(8500);
+        let cm = make_connection_manager(Some(own), 2, max, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        // Successor side filled to the cap; nearest established successor is 0.60
+        // (dist 0.10). The accepted-but-only-RESERVED candidates below never enter
+        // connections_by_location, so this nearest does not move during the test.
+        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(8510 + i as u16),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert_eq!(cm.connection_count(), max, "at the cap");
+        assert_eq!(cm.get_reserved_connections(), 0, "no reservations yet");
+
+        // First strictly-closer over-cap candidate (0.55, dist 0.05 < 0.10):
+        // established(3) + its own reservation(1) = 4 < max(3) + SLACK(2) = 5, so
+        // `should_accept` admits it over the cap and it holds a pending reservation.
+        assert!(
+            cm.should_accept(Location::new(0.55), make_addr(8520)),
+            "first over-cap tighten accepted at capacity via should_accept"
+        );
+        assert_eq!(
+            cm.get_reserved_connections(),
+            1,
+            "accepted over-cap candidate holds a pending reservation"
+        );
+
+        // Second, even-closer candidate (0.54, dist 0.06 < 0.10 vs the unchanged
+        // established nearest 0.60): established(3) + its own reservation + the
+        // first's = 5, NOT < 5, so the speculative ceiling throttles it. It must be
+        // REJECTED and must NOT leak a reservation (reject-path cleanup).
+        assert!(
+            !cm.should_accept(Location::new(0.54), make_addr(8521)),
+            "second over-cap tighten throttled once SLACK reservations are held"
+        );
+        assert_eq!(
+            cm.get_reserved_connections(),
+            1,
+            "throttled candidate's reservation was cleaned up (only the first remains)"
         );
     }
 
