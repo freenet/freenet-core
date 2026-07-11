@@ -1164,34 +1164,39 @@ impl ConnectionManager {
     /// displacement was inert on the real CONNECT path (the gates rejected at
     /// `>= max_connections` first).
     ///
-    /// SELF-BOUNDING for the ESTABLISHED set (why no reservation-aware clause is
-    /// needed): each over-cap candidate that actually ESTABLISHES advances the
-    /// per-side current-nearest, so a following establisher must be strictly closer
-    /// STILL — the established sequence on one side is strictly decreasing in
-    /// distance (a short records chain, O(log) expected), and the absolute ceiling
-    /// ([`LATTICE_OVERMAX_SLACK`]) hard-bounds the ESTABLISHED count regardless. The
-    /// earlier F1 reservation-aware clause (bounding concurrent over-cap fills to
-    /// one per empty side) was DROPPED: its concern was a concurrent fill flood on
-    /// an EMPTY side of a FULL node — a near-non-case (a node at 200 connections
-    /// essentially always has both ring sides populated) — and the ceiling already
-    /// hard-bounds the established set.
+    /// SPECULATIVE-STATE CEILING (bounds the amplification an established-only
+    /// check would leave open): the ceiling counts ESTABLISHED connections PLUS
+    /// non-stale pending reservations, per the ring.md speculative-state invariant
+    /// ("am I over-committed?" checks use speculative, not actual, state). Without
+    /// the reservation term a FULL node (established count at `max_connections`)
+    /// fed a stream of strictly-closer FRESH-ADDRESS requests would re-fire the
+    /// over-cap accept on EVERY request — recording pending state and emitting an
+    /// accept + NAT-traversal per request — because a pending reservation does not
+    /// advance the established per-side nearest, so none of the requests raises the
+    /// bar the next must beat, and per-target backoff does not bind them (each
+    /// straddles the victim from a fresh IPv6 `Location`/address, so no single
+    /// target repeats). Counting non-stale reservations bounds concurrent over-cap
+    /// acceptances to [`LATTICE_OVERMAX_SLACK`] per reservation-TTL window
+    /// ([`PENDING_RESERVATION_TTL`]), so what was a per-request accept+NAT
+    /// amplification is now a small fixed number per window — squarely inside the
+    /// cheap-IPv6 eclipse / NAT-amplification envelope the project lead already
+    /// accepted (see the `should_accept` SECURITY note, F3).
     ///
-    /// RESIDUAL (honestly disclosed, NOT closed here): this predicate checks the
-    /// ESTABLISHED count, and a pending reservation from `should_accept` does NOT
-    /// advance the established per-side nearest. So a FULL node (established count
-    /// at `max_connections`) fed a stream of strictly-closer FRESH-ADDRESS requests
-    /// re-fires the over-cap accept on EVERY request — recording pending state and
-    /// emitting an accept + NAT-traversal per request — because none of them
-    /// establishes and so none advances the nearest the next candidate must beat.
-    /// Per-target connection backoff does NOT bound this: each request straddles the
-    /// victim from a different fresh IPv6 `Location`/address, so no single target
-    /// repeats. It is instead TTL-bounded (each pending reservation expires at
-    /// [`PENDING_RESERVATION_TTL`]) and falls squarely within the cheap-IPv6 eclipse
-    /// / NAT-amplification tradeoff the project lead has already accepted (see the
-    /// `should_accept` SECURITY note, F3) — it is not a NEW unbounded lattice
-    /// path. Counting non-stale reservations toward the ceiling would close the
-    /// residual, but that is a DEFERRED decision (it would resurrect a
-    /// reservation-aware bound like the dropped F1 clause), not done here.
+    /// This ceiling term is DISTINCT from the dropped F1 clause and much simpler:
+    /// F1 was a PER-SIDE reservation clause (bounding concurrent over-cap FILLS to
+    /// one per EMPTY side), whose concern — a concurrent fill flood on an empty
+    /// side of a full node — was a near-non-case (a node at 200 connections almost
+    /// always has both ring sides populated), so it was rightly dropped. The term
+    /// here is instead a GLOBAL speculative count against the absolute ceiling; it
+    /// needs no per-side bookkeeping and simply conforms the over-cap admission to
+    /// the same speculative-state rule every other cap check already follows.
+    ///
+    /// SELF-BOUNDING for the ESTABLISHED set (a second, independent bound): each
+    /// over-cap candidate that actually ESTABLISHES advances the per-side
+    /// current-nearest, so a following establisher must be strictly closer STILL —
+    /// the established sequence on one side is strictly decreasing in distance (a
+    /// short records chain, O(log) expected), and the absolute ceiling hard-bounds
+    /// the ESTABLISHED count regardless.
     pub(crate) fn admits_lattice_edge_over_cap(&self, loc: Location) -> bool {
         self.admits_lattice_edge_over_cap_in(&self.connections_by_location.read(), loc)
     }
@@ -1208,9 +1213,35 @@ impl ConnectionManager {
         connections: &BTreeMap<Location, Vec<Connection>>,
         loc: Location,
     ) -> bool {
-        let count: usize = connections.values().map(|conns| conns.len()).sum();
-        self.is_strictly_closer_lattice_edge_in(connections, loc)
-            && count < self.max_connections + LATTICE_OVERMAX_SLACK
+        // Cheap ordinal check first: most candidates are not a strictly-closer
+        // per-side nearest, so bail before taking the `pending_reservations` lock.
+        if !self.is_strictly_closer_lattice_edge_in(connections, loc) {
+            return false;
+        }
+        let established: usize = connections.values().map(|conns| conns.len()).sum();
+        // Count NON-STALE pending reservations toward the over-cap ceiling too.
+        // This is the ring.md speculative-state invariant ("am I over-committed?"
+        // checks use speculative state) applied to the over-cap admission: a
+        // pending reservation will establish and consume a slot, so a full node
+        // fed a burst of strictly-closer FRESH-ADDRESS requests must not re-fire
+        // the over-cap accept (and its NAT-traversal) on every one — the
+        // amplification the established-only check left open. Counting them bounds
+        // concurrent over-cap acceptances to LATTICE_OVERMAX_SLACK per
+        // reservation-TTL window. Genuine single-candidate tightening still has
+        // room (its lone self-reservation is < SLACK), and a probe throttled
+        // during a pending burst is retried by the continuous discovery loop once
+        // the in-flight reservations drain or expire (PENDING_RESERVATION_TTL).
+        // Lock order: the caller holds `connections_by_location` (#2);
+        // `pending_reservations` (#3) is acquired here, AFTER it — the documented
+        // order (see the module-level hierarchy), never the reverse.
+        let now = Instant::now();
+        let pending: usize = self
+            .pending_reservations
+            .read()
+            .values()
+            .filter(|(_, created)| now.duration_since(*created) <= PENDING_RESERVATION_TTL)
+            .count();
+        established + pending < self.max_connections + LATTICE_OVERMAX_SLACK
     }
 
     /// Record the advertised location for a peer that we have decided to accept.
@@ -1712,8 +1743,12 @@ impl ConnectionManager {
         // the whole decision makes the bound hold regardless. Lock ordering is
         // preserved: `location_for_peer` (lock #1) is inserted above and rolled
         // back below OUTSIDE this guard (never acquired while it is held); the
-        // over-cap admission check reads only the already-held
-        // `connections_by_location` map (#2), taking no further lock.
+        // over-cap admission check reads the already-held `connections_by_location`
+        // map (#2) and BRIEFLY acquires `pending_reservations` (#3) for its
+        // speculative-count term — in the documented order (#2 before #3), never
+        // the reverse, so no ABBA (prune_connection nests #1→#2→#3 identically).
+        // The candidate's own reservation was already removed above (`was_reserved`
+        // → remove), so it is not double-counted against the ceiling here.
         let count_after = {
             let mut cbl = self.connections_by_location.write();
 
@@ -3153,6 +3188,82 @@ mod tests {
         // `_nn_guard` restores the production default (flag ON, floor RE-ARMED) on
         // drop — even on panic — instead of a bare `set_nn_lattice_enabled(true)`
         // that would leak force-active ON to a later same-thread test.
+    }
+
+    /// Regression for the speculative-state over-cap ceiling: non-stale pending
+    /// reservations count toward `max_connections + LATTICE_OVERMAX_SLACK`, so a
+    /// full node fed a burst of strictly-closer fresh-address requests stops
+    /// re-firing the over-cap accept (+ NAT-traversal) after SLACK concurrent
+    /// pending acceptances, instead of once per request. Stale reservations do NOT
+    /// count (they expire via `PENDING_RESERVATION_TTL`), and a genuine single
+    /// tightening candidate still has room. Without the reservation term this
+    /// would be an unbounded per-request accept/NAT amplification vector.
+    #[test]
+    fn over_cap_ceiling_counts_non_stale_pending_reservations() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        let max = 3usize;
+        let cm = make_connection_manager(None, 2, max, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        // Successor side filled to the cap; nearest successor is 0.60 (dist 0.10).
+        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(8410 + i as u16),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert_eq!(cm.connection_count(), max, "at the cap");
+
+        // Baseline: a strictly-closer tighten (0.55) is admissible with no pending.
+        let tighten = Location::new(0.55);
+        assert!(
+            cm.admits_lattice_edge_over_cap(tighten),
+            "strictly-closer tighten admissible with zero pending reservations"
+        );
+
+        // One non-stale pending reservation: established(3) + pending(1) = 4 <
+        // max(3) + SLACK(2) = 5. Still admissible — single-candidate tightening
+        // keeps its headroom.
+        {
+            let mut pending = cm.pending_reservations.write();
+            pending.insert(make_addr(8420), (Location::new(0.10), Instant::now()));
+        }
+        assert!(
+            cm.admits_lattice_edge_over_cap(tighten),
+            "one pending reservation leaves room for a single tighten"
+        );
+
+        // A SECOND non-stale pending reservation reaches the ceiling:
+        // established(3) + pending(2) = 5, NOT < 5 → refused. This is the bound:
+        // concurrent over-cap acceptances are capped at LATTICE_OVERMAX_SLACK per
+        // reservation-TTL window rather than firing once per fresh-address request.
+        {
+            let mut pending = cm.pending_reservations.write();
+            pending.insert(make_addr(8421), (Location::new(0.15), Instant::now()));
+        }
+        assert_eq!(LATTICE_OVERMAX_SLACK, 2, "test assumes SLACK == 2");
+        assert!(
+            !cm.admits_lattice_edge_over_cap(tighten),
+            "SLACK non-stale pending reservations exhaust the over-cap ceiling"
+        );
+
+        // Backdate both reservations past the TTL: stale reservations do NOT count,
+        // so the ceiling frees up and the tighten is admissible again.
+        {
+            let mut pending = cm.pending_reservations.write();
+            for addr in [make_addr(8420), make_addr(8421)] {
+                if let Some(entry) = pending.get_mut(&addr) {
+                    entry.1 = Instant::now() - (PENDING_RESERVATION_TTL + Duration::from_secs(1));
+                }
+            }
+        }
+        assert!(
+            cm.admits_lattice_edge_over_cap(tighten),
+            "stale (expired-TTL) reservations do not count toward the ceiling"
+        );
     }
 
     /// Source-scrape pin (B1 regression guard): BOTH connection-lifecycle

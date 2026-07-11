@@ -65,13 +65,20 @@ WHEN accepting a new connection (should_accept):
      one — so the lattice CONTINUOUSLY pulls each peer toward its true nearest
      ring neighbors, not merely filling empty sides. The superseded
      former-nearest demotes into the long-link pool automatically (the reserved
-     slot is derived on demand from the live connection set). No reservation-aware
-     clause: each admitted candidate ADVANCES the per-side current-nearest, so the
-     admitted sequence is strictly decreasing (a short records chain) and the
-     absolute ceiling already hard-bounds the ESTABLISHED set; the earlier F1
-     one-fill-per-side clause was DROPPED (its concern was a concurrent fill flood
-     on an EMPTY side of a FULL node — a near-non-case, since a node at max almost
-     always has both ring sides populated). The route-to-self discovery probe
+     slot is derived on demand from the live connection set). SPECULATIVE-STATE
+     CEILING: the over-cap ceiling counts ESTABLISHED connections PLUS non-stale
+     pending reservations (the speculative-state invariant below: "am I
+     over-committed?" checks use speculative, not actual, state), which bounds
+     concurrent over-cap acceptances to LATTICE_OVERMAX_SLACK per
+     reservation-TTL window and stops a full node re-firing an accept plus
+     NAT-traversal on every strictly-closer fresh-address request. This global
+     speculative-count term is DISTINCT from and simpler than the dropped per-side
+     F1 clause (which bounded concurrent over-cap FILLS to one per EMPTY side, a
+     near-non-case since a node at max almost always has both ring sides
+     populated). A second, independent bound: each admitted candidate that
+     ESTABLISHES advances the per-side current-nearest, so the established sequence
+     is strictly decreasing (a short records chain) and the absolute ceiling
+     hard-bounds the ESTABLISHED set. The route-to-self discovery probe
      likewise runs CONTINUOUSLY (decaying toward tau_max, never stopping when both
      sides are filled) so a filled-but-loose edge keeps tightening. See
      connection_manager.rs and ring.rs.
