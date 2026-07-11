@@ -104,12 +104,15 @@ pub mod dev_tool {
     pub use transport::{TransportKeypair, TransportPublicKey};
 
     // Nearest-neighbor ring lattice (successor+predecessor base edges). Always
-    // ON in production; this setter is the test-only per-thread override the
-    // findability validation harness flips to run the stock (lattice-off) arm
-    // against the fix (lattice-on) arm on identical seeds. No-op in production
-    // builds (compiled out).
+    // ON in production above the minimum-degree floor; `set_nn_lattice_enabled` is
+    // the test-only per-thread override the findability validation harness flips
+    // to run the stock (lattice-off) arm against the fix (lattice-on) arm on
+    // identical seeds — it ALSO force-activates the lattice below the floor so the
+    // benefit tests exercise the ON path at their sparse max_connections.
+    // `set_nn_lattice_force_active` resets only the floor bypass (used by the
+    // benefit-test cleanup guard). No-op in production builds (compiled out).
     #[cfg(any(test, feature = "testing"))]
-    pub use ring::set_nn_lattice_enabled;
+    pub use ring::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 
     // Test-only findability measurement harness (NOT for ship): scatter/cache
     // disable hook (guarantees a single copy) + per-op terminus tracing (rank /

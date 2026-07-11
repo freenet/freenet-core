@@ -85,14 +85,17 @@ mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
 pub(crate) use connection_manager::ConnectionManager;
-// Nearest-neighbor ring lattice (successor+predecessor base edges). The
-// predicate is `pub(crate)` for the acceptance clause, the discovery probe, and
-// the retention path (`crate::topology`). The setter is `pub` so `dev_tool` can
-// flip the stock/fix arm from the findability validation harness; it is a
-// no-op-in-production, test-only override (see the module docs).
-pub(crate) use connection_manager::nn_lattice_enabled;
+// Nearest-neighbor ring lattice (successor+predecessor base edges).
+// `nn_lattice_active_for` is the full activation gate — the flag AND the
+// minimum-degree floor (`NN_LATTICE_MIN_MAX_CONNECTIONS`) — used by the
+// free-function retention path in `crate::topology`; the acceptance clause and
+// discovery probe apply the same gate via `ConnectionManager::nn_lattice_active`.
+// The setter is `pub` so `dev_tool` can flip the stock/fix arm from the
+// findability validation harness; it is a no-op-in-production, test-only override
+// (see the module docs).
+pub(crate) use connection_manager::nn_lattice_active_for;
 #[cfg(any(test, feature = "testing"))]
-pub use connection_manager::set_nn_lattice_enabled;
+pub use connection_manager::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 mod connection;
 mod hosting;
 pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
@@ -5323,7 +5326,7 @@ impl Ring {
             // accepted; a strictly-closer peer that appears later is adopted
             // PASSIVELY when its own discovery reaches this node, and a lost edge
             // re-triggers probing immediately.
-            if crate::ring::nn_lattice_enabled() {
+            if self.connection_manager.nn_lattice_active() {
                 if let Some(me) = self.connection_manager.get_stored_location() {
                     let probe_now = self.time_source.now();
                     let succ = self.connection_manager.nearest_lattice_neighbor_dist(true);

@@ -83,20 +83,69 @@ const KLEINBERG_FILTER_MIN_CONNECTIONS: usize = 3;
 #[cfg(any(test, feature = "testing"))]
 thread_local! {
     static NN_LATTICE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    // Test-only "force active regardless of the min-`max_connections` floor"
+    // override (see `nn_lattice_active_for`). DEFAULTS TO FALSE so the broad
+    // simulation suite — which never touches these toggles and runs at a sparse
+    // `max_connections` (e.g. 5) far below the floor — observes the REAL
+    // production gate (feature off below the floor). The dedicated control-vs-fix
+    // / benefit tests explicitly opt in via `set_nn_lattice_enabled(true)`, which
+    // sets this too so those tests keep exercising the ON path at their sparse
+    // `max_connections`.
+    static NN_LATTICE_FORCE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Enable/disable the nearest-neighbor ring lattice for the CURRENT THREAD
 /// (test/validation only — production is always enabled). The control arm of the
 /// findability validation calls `set_nn_lattice_enabled(false)` to reproduce
 /// stock (v0.2.95) topology behavior on the same seed as the treatment arm.
+///
+/// This ALSO sets the `NN_LATTICE_FORCE_ACTIVE` override to `enabled`: any test
+/// that explicitly opts into the lattice runs it FULLY ACTIVE regardless of the
+/// [`NN_LATTICE_MIN_MAX_CONNECTIONS`] floor (so the dedicated benefit/unit tests
+/// keep exercising the mechanism at a sparse `max_connections`). Tests that never
+/// call this — the broad simulation suite — keep the default (force-active FALSE)
+/// and therefore see the real production gate: the feature is OFF below the floor.
 #[cfg(any(test, feature = "testing"))]
 pub fn set_nn_lattice_enabled(enabled: bool) {
     NN_LATTICE_ENABLED.with(|c| c.set(enabled));
+    NN_LATTICE_FORCE_ACTIVE.with(|c| c.set(enabled));
 }
 
-/// Whether the nearest-neighbor ring lattice is active. Always `true` in
+/// Set ONLY the min-`max_connections` floor bypass for the CURRENT THREAD
+/// (test/validation only). Independent of the enabled flag. Its main use is the
+/// benefit-test cleanup guard, which restores the TRUE production default —
+/// enabled `true` (via [`set_nn_lattice_enabled`]) but force-active `false` (the
+/// floor applies) — after a run, since `set_nn_lattice_enabled(true)` alone would
+/// leave force-active set.
+#[cfg(any(test, feature = "testing"))]
+pub fn set_nn_lattice_force_active(force: bool) {
+    NN_LATTICE_FORCE_ACTIVE.with(|c| c.set(force));
+}
+
+/// Whether the min-`max_connections` floor is being bypassed on this thread
+/// (test-only; always `false` in production). See [`set_nn_lattice_enabled`] and
+/// [`nn_lattice_active_for`].
+#[inline]
+pub(crate) fn nn_lattice_force_active() -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        NN_LATTICE_FORCE_ACTIVE.with(|c| c.get())
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        false
+    }
+}
+
+/// Whether the nearest-neighbor ring lattice flag is set. Always `true` in
 /// production; overridable per-thread in test/testing builds (see
 /// [`set_nn_lattice_enabled`]).
+///
+/// NOTE: this is the raw flag, NOT the full activation gate — a peer with too
+/// small a connection budget disables the feature even when this is `true`. Every
+/// gate site uses the full gate [`nn_lattice_active_for`] (or
+/// `ConnectionManager::nn_lattice_active`); this bare predicate exists only as the
+/// flag input to `nn_lattice_active_for` itself.
 #[inline]
 pub(crate) fn nn_lattice_enabled() -> bool {
     #[cfg(any(test, feature = "testing"))]
@@ -107,6 +156,50 @@ pub(crate) fn nn_lattice_enabled() -> bool {
     {
         true
     }
+}
+
+/// Minimum CONFIGURED `max_connections` at which the nearest-neighbor ring
+/// lattice (mechanisms 1-4) activates. Below this floor the feature disables
+/// itself. Anchored to [`Ring::DEFAULT_MIN_CONNECTIONS`].
+///
+/// This is keyed on the CONFIGURED `max_connections` (the cap a node is built
+/// with — 200 by default in production via `DEFAULT_MAX_CONNECTIONS`), NOT the
+/// live connection count. So in PRODUCTION every node is above the floor and the
+/// feature is always active; the floor's only real effect is to disable the
+/// feature at the sparse scales used by the simulation harness. The gate is
+/// therefore production-neutral: any value in `(max sim config, 200)` behaves
+/// identically in production.
+///
+/// Two-tier routing (2 reserved base-lattice edges + `k - 2` Kleinberg long
+/// links) needs enough long links to keep the O(log^2 n) structure; below a
+/// minimum degree, reserving the 2 edges destabilizes routing. `DEFAULT_MIN_CONNECTIONS`
+/// (25) is the principled anchor: a node whose configured `max_connections` is
+/// below the network's own minimum-degree target cannot sustain the two-tier
+/// structure, so it should not run the lattice.
+///
+/// Setting the floor at `DEFAULT_MIN_CONNECTIONS` also keeps the WHOLE sparse
+/// simulation suite at its pre-lattice baseline: sim configs top out at
+/// `max_connections = 16` (with a handful of production-scale max=200 tests that
+/// DO exercise the lattice and pass), so a floor of 25 disables the feature for
+/// every sparse sim test — they run exactly as they did before this feature
+/// existed. A lower floor (e.g. 15) was evaluated but rejected: the sim's DEFAULT
+/// config is max=15/16, so a 15 floor would flip those default hosting /
+/// subscription / determinism tests to feature-ON — a change from their stock
+/// baseline — for no production benefit (the gate reads CONFIGURED max, which is
+/// 200 in production, so 15 vs 25 is identical for real nodes). Keeping the sparse
+/// suite feature-off is the lower-risk choice.
+pub(crate) const NN_LATTICE_MIN_MAX_CONNECTIONS: usize = super::Ring::DEFAULT_MIN_CONNECTIONS;
+
+/// Whether the nearest-neighbor ring lattice is ACTIVE for a peer whose
+/// connection budget is `max_connections`. This is the full activation gate used
+/// at every feature gate site (acceptance clause, over-cap admission, discovery
+/// probe, retention exemption): the flag must be set AND the budget must clear
+/// the [`NN_LATTICE_MIN_MAX_CONNECTIONS`] floor (or the test-only force override
+/// bypasses the floor — see [`nn_lattice_force_active`]).
+#[inline]
+pub(crate) fn nn_lattice_active_for(max_connections: usize) -> bool {
+    nn_lattice_enabled()
+        && (nn_lattice_force_active() || max_connections >= NN_LATTICE_MIN_MAX_CONNECTIONS)
 }
 
 /// Maximum number of concurrent CONNECT operations a gateway will route simultaneously.
@@ -723,22 +816,33 @@ impl ConnectionManager {
         // side, a strictly decreasing sequence, so it cannot admit an unbounded
         // stream.
         //
-        // SECURITY (eclipse) — acceptable with disclosure: this makes per-side
-        // nearest admission DETERMINISTIC (pre-lattice a very-close peer was often
-        // REJECTED by the probabilistic Kleinberg evaluator), and the retention
-        // exemption (topology.rs) removes the score-based swap as a safety valve,
-        // leaving LIVENESS eviction only — a responsive-but-malicious nearest
-        // neighbor is not shed by scoring. The Sybil cost is unchanged and
-        // bounded: the candidate location is ADDRESS-DERIVED
-        // (`Location::from_address` masks host bits — a whole IPv4 /24, or IPv6
-        // /48, collapses to one location; port participates only for loopback), so
-        // distinct lattice locations require distinct /24 (v4) or /48 (v6)
-        // prefixes, and the operator blocklist is checked in connect.rs BEFORE
-        // should_accept so this force-accept cannot bypass it. The exemption only
-        // ever protects whoever is GENUINELY per-side nearest, and a closer honest
-        // peer force-displaces an attacker. A routing-correctness eviction signal
-        // (shedding a responsive peer that drops/corrupts payloads) is future work.
-        let nn_override = if nn_lattice_enabled() {
+        // SECURITY (eclipse) — DISCLOSED and ACCEPTED tradeoff: this makes
+        // per-side nearest admission DETERMINISTIC (pre-lattice a very-close peer
+        // was often REJECTED by the probabilistic Kleinberg evaluator), and the
+        // retention exemption (topology.rs) removes the score-based swap as a
+        // safety valve, leaving LIVENESS eviction only — a responsive-but-malicious
+        // nearest neighbor is not shed by scoring. The candidate location is
+        // ADDRESS-DERIVED (`Location::from_address` masks host bits — a whole IPv4
+        // /24, or IPv6 /48, collapses to one location; port participates only for
+        // loopback), and the operator blocklist is checked in connect.rs BEFORE
+        // should_accept so this force-accept cannot bypass it.
+        //
+        // The IPv6 cost is NOT symmetric with IPv4, and the honest disclosure is:
+        // a single routed IPv6 allocation (an ISP hands out a /48, /56, or /64 per
+        // customer) already yields a VAST number of distinct /48 `Location`s
+        // essentially for free, so an attacker can cheaply mint locations that
+        // straddle a chosen victim's own location and become BOTH of that victim's
+        // per-side nearest edges — a targeted last-mile eclipse of that one
+        // victim's 2 lattice slots. What it is NOT: a network partition or a global
+        // takeover. The damage is bounded to the two slots of a
+        // SPECIFICALLY-TARGETED victim (it does not compound across the ring), the
+        // exemption only ever protects whoever is GENUINELY per-side nearest, and a
+        // closer HONEST peer force-displaces the attacker. The project lead has
+        // EXPLICITLY ACCEPTED this tradeoff: cheap IPv6 last-mile eclipse of a
+        // single victim's 2 slots, in exchange for the findability the guaranteed
+        // lattice buys. A routing-correctness eviction signal (shedding a
+        // responsive peer that drops/corrupts payloads) is future work.
+        let nn_override = if self.nn_lattice_active() {
             if let Some(me) = self.get_stored_location() {
                 let cand_signed = me.signed_distance(location);
                 let cand_dist = cand_signed.abs();
@@ -871,7 +975,10 @@ impl ConnectionManager {
         // `admits_lattice_edge_over_cap`).
         let accepted = accepted
             || (nn_override && total_conn < self.max_connections)
-            || self.admits_lattice_edge_over_cap(location);
+            // Exclude THIS candidate's just-inserted reservation (added above) so
+            // the reservation-aware per-side concurrency bound counts only OTHER
+            // in-flight fills (F1).
+            || self.admits_lattice_edge_over_cap(location, Some(addr));
         tracing::debug!(
             addr = %addr,
             peer_location = %location,
@@ -972,6 +1079,18 @@ impl ConnectionManager {
         )
     }
 
+    /// Whether the nearest-neighbor ring lattice is ACTIVE for THIS peer: the
+    /// flag is set AND this peer's `max_connections` clears the minimum-degree
+    /// floor ([`NN_LATTICE_MIN_MAX_CONNECTIONS`]). This is the single activation
+    /// gate for every feature site on the acceptance path (the per-side
+    /// acceptance clause and the over-cap admission); the discovery probe
+    /// (`ring.rs`) and the retention exemption (`topology.rs`) apply the same gate
+    /// via [`nn_lattice_active_for`] against their own `max_connections`.
+    #[inline]
+    pub(crate) fn nn_lattice_active(&self) -> bool {
+        nn_lattice_active_for(self.max_connections)
+    }
+
     /// Whether a candidate at `loc` would FILL an EMPTY per-side lattice slot: it
     /// is on a ring side (successor if higher location wrapping, predecessor if
     /// lower) that currently has NO connected neighbor at all. This is the strict
@@ -981,7 +1100,7 @@ impl ConnectionManager {
     /// long link over the `max_connections` cap; see
     /// [`Self::admits_lattice_edge_over_cap`].
     pub(crate) fn would_fill_empty_lattice_side(&self, loc: Location) -> bool {
-        if !nn_lattice_enabled() {
+        if !self.nn_lattice_active() {
             return false;
         }
         let Some(me) = self.get_stored_location() else {
@@ -1021,9 +1140,58 @@ impl ConnectionManager {
     /// [`LATTICE_OVERMAX_SLACK`]); with fill-only admission the excess is at most
     /// the number of empty sides (<= 2), so the ceiling is a defensive transient
     /// bound rather than a frequently-binding limit.
-    pub(crate) fn admits_lattice_edge_over_cap(&self, loc: Location) -> bool {
+    ///
+    /// RESERVATION-AWARE (F1): the fill decision reads the ESTABLISHED connection
+    /// set only (`would_fill_empty_lattice_side`), so without this it would
+    /// re-fire for EVERY concurrent candidate on the same empty side — a full node
+    /// with an empty side would force-accept + reserve + NAT-complete all of them,
+    /// piling several over-cap fills onto one side. We therefore also require that
+    /// no OTHER in-flight pending reservation already targets that side
+    /// ([`Self::pending_reservation_on_side`]), bounding concurrent over-cap fills
+    /// to ONE per side. `exclude_addr` is the candidate under evaluation, whose own
+    /// reservation `should_accept`/`add_connection` may have already inserted;
+    /// pass `Some(addr)` so it is not counted against itself (`None` when there is
+    /// no such self-reservation to exclude).
+    pub(crate) fn admits_lattice_edge_over_cap(
+        &self,
+        loc: Location,
+        exclude_addr: Option<SocketAddr>,
+    ) -> bool {
         self.would_fill_empty_lattice_side(loc)
             && self.connection_count() < self.max_connections + LATTICE_OVERMAX_SLACK
+            && !self.pending_reservation_on_side(loc, exclude_addr)
+    }
+
+    /// Whether any OTHER TTL-valid pending reservation already targets the same
+    /// ring side as `loc` (successor vs predecessor, relative to own location),
+    /// ignoring `exclude_addr` (the candidate currently under evaluation, whose
+    /// own reservation the caller has already inserted). Used by
+    /// [`Self::admits_lattice_edge_over_cap`] to bound concurrent over-cap lattice
+    /// fills to one per side (F1). Returns `false` (nothing blocks) when own
+    /// location is unknown or `loc` sits exactly on own location.
+    fn pending_reservation_on_side(&self, loc: Location, exclude_addr: Option<SocketAddr>) -> bool {
+        let Some(me) = self.get_stored_location() else {
+            return false;
+        };
+        let sd = me.signed_distance(loc);
+        if sd == 0.0 {
+            return false;
+        }
+        let successor_side = sd > 0.0;
+        let now = Instant::now();
+        self.pending_reservations
+            .read()
+            .iter()
+            .any(|(resv_addr, (resv_loc, created))| {
+                if Some(*resv_addr) == exclude_addr {
+                    return false;
+                }
+                if now.duration_since(*created) > PENDING_RESERVATION_TTL {
+                    return false;
+                }
+                let rsd = me.signed_distance(*resv_loc);
+                rsd != 0.0 && (rsd > 0.0) == successor_side
+            })
     }
 
     /// Record the advertised location for a peer that we have decided to accept.
@@ -1512,7 +1680,10 @@ impl ConnectionManager {
         // lattice edge is no longer silently dropped at the cap on the real
         // CONNECT path.
         if previous_location.is_none() && self.connection_count() >= self.max_connections {
-            if self.admits_lattice_edge_over_cap(loc) {
+            // Exclude this candidate's own reservation (still present here — it is
+            // pruned only in the reject branch below) from the reservation-aware
+            // per-side concurrency bound (F1).
+            if self.admits_lattice_edge_over_cap(loc, Some(addr)) {
                 tracing::debug!(
                     addr = %addr,
                     peer_location = %loc,
@@ -1565,6 +1736,25 @@ impl ConnectionManager {
 
         // Verify the insertion actually persisted — detect silent state corruption.
         let count_after = self.connection_count();
+        // F4: the over-cap lattice ceiling (`admits_lattice_edge_over_cap`) is a
+        // check-then-insert: it reads `connection_count()` under `max +
+        // LATTICE_OVERMAX_SLACK`, then this method inserts. That is NOT atomic, so
+        // the ceiling only holds because EVERY connection add runs on the single
+        // p2p event-loop task (`connection_lifecycle.rs`) — there is no concurrent
+        // adder to race the check against the insert. If a future refactor moves
+        // connection-add off that single task, this check-then-insert must be made
+        // atomic (or the count re-checked under a lock) or the ceiling can be
+        // overshot. This assertion catches a ceiling breach in test/debug builds so
+        // that invariant violation is loud rather than silent.
+        debug_assert!(
+            count_after <= self.max_connections + LATTICE_OVERMAX_SLACK,
+            "connection_count {count_after} exceeded the over-cap lattice ceiling \
+             (max_connections {} + LATTICE_OVERMAX_SLACK {LATTICE_OVERMAX_SLACK}); the \
+             non-atomic ceiling check-then-insert relies on all connection adds \
+             running on the single p2p event-loop task — a breach means that \
+             single-task invariant was violated",
+            self.max_connections,
+        );
         let in_location_map = self.location_for_peer.read().contains_key(&addr);
         if !in_location_map || count_after == 0 {
             tracing::error!(
@@ -2824,9 +3014,11 @@ mod tests {
             );
         }
         assert_eq!(cm.connection_count(), max, "at the cap");
-        // Filling the EMPTY predecessor side is admissible over the cap.
+        // Filling the EMPTY predecessor side is admissible over the cap. No
+        // competing reservation (`None`), so the reservation-aware bound is a
+        // no-op here.
         assert!(
-            cm.admits_lattice_edge_over_cap(Location::new(0.45)),
+            cm.admits_lattice_edge_over_cap(Location::new(0.45), None),
             "filling an empty lattice side is admissible over the cap"
         );
         assert!(
@@ -2836,7 +3028,7 @@ mod tests {
         // A TIGHTEN of the already-filled successor side is NOT admissible over
         // the cap (it waits for an under-max slot).
         assert!(
-            !cm.admits_lattice_edge_over_cap(Location::new(0.55)),
+            !cm.admits_lattice_edge_over_cap(Location::new(0.55), None),
             "a tighten of a filled side is not admissible over the cap"
         );
         assert!(
@@ -2845,20 +3037,79 @@ mod tests {
         );
         // A farther non-lattice peer is not admissible over the cap.
         assert!(
-            !cm.admits_lattice_edge_over_cap(Location::new(0.95)),
+            !cm.admits_lattice_edge_over_cap(Location::new(0.95), None),
             "a farther non-lattice peer is not admissible over the cap"
         );
         // Disabling the lattice makes the predicate a no-op.
         set_nn_lattice_enabled(false);
-        assert!(!cm.admits_lattice_edge_over_cap(Location::new(0.45)));
+        assert!(!cm.admits_lattice_edge_over_cap(Location::new(0.45), None));
+        set_nn_lattice_enabled(true);
+    }
+
+    /// F1 regression: the over-cap lattice admission is RESERVATION-AWARE, so a
+    /// full node with an empty lattice side cannot force-accept EVERY concurrent
+    /// candidate on that side — a pending reservation already targeting the side
+    /// blocks a second concurrent over-cap fill (bounding concurrent fills to one
+    /// per side). `exclude_addr` skips the candidate's own reservation.
+    #[test]
+    fn admits_lattice_over_cap_is_reservation_aware() {
+        set_nn_lattice_enabled(true);
+        let max = 3usize;
+        let cm = make_connection_manager(None, 2, max, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        // Successor side filled to the cap; predecessor side empty.
+        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(8410 + i as u16),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert_eq!(cm.connection_count(), max, "at the cap");
+        let pred = Location::new(0.45);
+        // With no competing reservation, filling the empty predecessor side is
+        // admissible over the cap.
+        assert!(
+            cm.admits_lattice_edge_over_cap(pred, None),
+            "a fill with no competing reservation is admissible"
+        );
+        // A concurrent pending reservation ALREADY targeting the predecessor side
+        // blocks a second over-cap fill on that side.
+        let other = make_addr(8420);
+        cm.pending_reservations
+            .write()
+            .insert(other, (Location::new(0.47), Instant::now()));
+        assert!(
+            !cm.admits_lattice_edge_over_cap(pred, None),
+            "a competing predecessor-side reservation blocks a concurrent fill"
+        );
+        // Excluding that reservation (as when it IS the candidate itself)
+        // re-admits — self must not block itself.
+        assert!(
+            cm.admits_lattice_edge_over_cap(pred, Some(other)),
+            "excluding the candidate's own reservation re-admits the fill"
+        );
+        // A reservation on the OTHER (successor) side does not block a predecessor
+        // fill — the bound is strictly per-side.
+        cm.pending_reservations.write().clear();
+        cm.pending_reservations
+            .write()
+            .insert(make_addr(8430), (Location::new(0.65), Instant::now()));
+        assert!(
+            cm.admits_lattice_edge_over_cap(pred, None),
+            "a reservation on the opposite side does not block a predecessor fill"
+        );
         set_nn_lattice_enabled(true);
     }
 
     /// Source-scrape pin (B1 regression guard): BOTH connection-lifecycle
-    /// promotion gates must apply the shared `admits_lattice_edge_over_cap(loc)`
-    /// exception to their `>= max_connections` reject. Without this a lattice
-    /// edge is silently dropped at the cap on the real CONNECT path and
-    /// mechanism 3's at-capacity displacement is inert — the exact defect the
+    /// promotion gates must apply the shared `admits_lattice_edge_over_cap`
+    /// exception (reservation-aware, so they pass the candidate's `peer_addr` to
+    /// exclude its own reservation) to their `>= max_connections` reject. Without
+    /// this a lattice edge is silently dropped at the cap on the real CONNECT path
+    /// and mechanism 3's at-capacity displacement is inert — the exact defect the
     /// external review caught (the over-max unit test passed only because it
     /// bypassed the gate). If a future refactor drops the exception from a gate,
     /// this fails instead of silently regressing.
@@ -2867,12 +3118,12 @@ mod tests {
         const LIFECYCLE_SRC: &str =
             include_str!("../node/network_bridge/p2p_protoc/connection_lifecycle.rs");
         let hits = LIFECYCLE_SRC
-            .matches("admits_lattice_edge_over_cap(loc)")
+            .matches("admits_lattice_edge_over_cap(loc, Some(peer_addr))")
             .count();
         assert!(
             hits >= 2,
-            "both lifecycle promotion cap-gates must apply admits_lattice_edge_over_cap(loc); \
-             found {hits} call site(s)"
+            "both lifecycle promotion cap-gates must apply \
+             admits_lattice_edge_over_cap(loc, Some(peer_addr)); found {hits} call site(s)"
         );
     }
 

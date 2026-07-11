@@ -321,7 +321,7 @@ impl P2pConnManager {
                 // connection_manager.rs::{admits_lattice_edge_over_cap, LATTICE_OVERMAX_SLACK}.
                 let current = connection_manager.connection_count();
                 if current >= connection_manager.max_connections
-                    && !connection_manager.admits_lattice_edge_over_cap(loc)
+                    && !connection_manager.admits_lattice_edge_over_cap(loc, Some(peer_addr))
                 {
                     tracing::warn!(
                         tx = %tx,
@@ -1183,7 +1183,7 @@ impl P2pConnManager {
                 // connection_manager.rs::{admits_lattice_edge_over_cap, LATTICE_OVERMAX_SLACK}.
                 let current = connection_manager.connection_count();
                 if current >= connection_manager.max_connections
-                    && !connection_manager.admits_lattice_edge_over_cap(loc)
+                    && !connection_manager.admits_lattice_edge_over_cap(loc, Some(peer_addr))
                 {
                     tracing::warn!(
                         %peer_addr,

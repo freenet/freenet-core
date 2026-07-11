@@ -44,6 +44,26 @@ WHEN accepting a new connection (should_accept):
      add_connection, AND in BOTH connection-lifecycle promotion gates
      (p2p_protoc/connection_lifecycle.rs) so the exception is live on the
      real CONNECT path, not just should_accept. See connection_manager.rs.
+     MINIMUM-DEGREE FLOOR: the whole lattice feature (this exception, the
+     per-side acceptance clause, the route-to-self discovery probe, and the
+     topology.rs retention exemption) is GATED OFF when this peer's CONFIGURED
+     max_connections is below NN_LATTICE_MIN_MAX_CONNECTIONS (= 25 =
+     DEFAULT_MIN_CONNECTIONS). Two-tier routing needs enough long links left
+     after the 2-slot base-lattice reserve; below the network's own
+     minimum-degree target a node can't sustain the structure. The gate reads
+     CONFIGURED max (200 in production), NOT the live connection count, so
+     production peers are always active and the floor's real job is to keep the
+     sparse simulation suite (configs top out at max=16) at its pre-lattice
+     baseline — only the production-scale max=200 sim tests exercise the lattice.
+     The single activation gate is nn_lattice_active_for(max_connections) /
+     ConnectionManager::nn_lattice_active(); the test-only override that flips
+     the stock/fix validation arm also force-activates below the floor (so the
+     dedicated benefit tests exercise the ON path at max=5).
+     RESERVATION-AWARE over-cap admission: admits_lattice_edge_over_cap also
+     refuses to force-accept a fill when another in-flight pending reservation
+     already targets the same empty side, bounding concurrent over-cap fills to
+     ONE per side (otherwise a full node force-accepts EVERY concurrent
+     candidate on an empty side).
   3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
      → Map all connection distances to log-space (1/d = uniform in log)
      → Score = min distance to nearest neighbor in log-space

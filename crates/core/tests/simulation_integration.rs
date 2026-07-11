@@ -14766,7 +14766,13 @@ struct NnLatticeTestGuard;
 impl Drop for NnLatticeTestGuard {
     fn drop(&mut self) {
         freenet::dev_tool::set_scatter_disabled(false);
+        // Restore the TRUE production default on this thread: flag ON but the
+        // minimum-degree floor RE-ARMED. `set_nn_lattice_enabled(true)` also
+        // force-activates (bypasses the floor), so clear that afterward — otherwise
+        // a later test reusing this thread (under plain `cargo test`; nextest is
+        // process-isolated) would see the lattice forced ON below the floor.
         freenet::dev_tool::set_nn_lattice_enabled(true);
+        freenet::dev_tool::set_nn_lattice_force_active(false);
     }
 }
 
