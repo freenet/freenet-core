@@ -4556,25 +4556,38 @@ impl Ring {
 
         // --- Nearest-neighbor lattice discovery (route-to-self probe) ---
         //
-        // Mechanism 2: to seek/tighten the guaranteed successor+predecessor edges,
-        // periodically route a self-targeted CONNECT toward own_location (reusing
-        // acquire_new + the existing CONNECT path — no wire change). Every
-        // self-initiated CONNECT already pre-populates the visited bloom with all
-        // currently-connected peers (`start_client_connect`), so the probe routes
-        // PAST everything already held and terminates at the nearest UNCONNECTED
-        // peer to own_location; successive probes fill outward on BOTH ring sides
-        // as each newly-connected peer is excluded from the next probe. The
-        // terminus installs the edge via the per-side clause in `should_accept`.
-        // Runs CONCURRENTLY with long-link targeting; long links are never gated
-        // on lattice completion (they supply the weak connectivity that lets
-        // route-to-self converge from a cold start).
+        // Mechanism 2: to fill each peer's empty successor+predecessor lattice
+        // slots, periodically route a self-targeted CONNECT toward own_location
+        // (reusing acquire_new + the existing CONNECT path — no wire change).
+        // Every self-initiated CONNECT already pre-populates the visited bloom
+        // with all currently-connected peers (`start_client_connect`), so the
+        // probe routes PAST everything already held and terminates at the nearest
+        // UNCONNECTED peer to own_location; successive probes fill outward on BOTH
+        // ring sides as each newly-connected peer is excluded from the next probe.
+        // The terminus installs the edge via the per-side clause in
+        // `should_accept`. Runs CONCURRENTLY with long-link targeting; long links
+        // are never gated on lattice completion (they supply the weak connectivity
+        // that lets route-to-self converge from a cold start).
         //
-        // EXPONENTIAL BACKOFF: stay at tau0 while the lattice is incomplete (a
-        // side unfilled) or a probe improved it (side filled / edge tightened);
-        // once both sides are held and tight, double the interval up to tau_max;
-        // reset to tau0 and probe now when an edge is lost/regresses. tau_max is
-        // the Chord half-life floor — it must comfortably exceed the churn
-        // interval so a dropped edge is re-formed well within a node's lifetime.
+        // STOP CONDITION — filled, not exact-tight (a deliberate, measured
+        // choice): probe only while a lattice side is UNFILLED and STOP once both
+        // sides hold a neighbor. A filled edge may still be LOOSE (holding a
+        // farther neighbor while the exact nearest is an unconnected peer between
+        // two adjacent peers), so this leaves a residual exact-nearest gap
+        // (~0.53 exact coverage at max_connections=5 in the control-vs-fix sim).
+        // Continued probing to TIGHTEN a filled-but-loose edge was TRIED and
+        // MEASURED to regress distant GET find-rate at low connection budgets:
+        // tightening competes for the scarce slots the long-range links need, and
+        // the extra route-to-self CONNECTs disrupt in-flight routing (findability,
+        // the PR's primary goal, matters more than the exact-nearest proxy). So we
+        // accept the residual looseness rather than chase it. A strictly-closer
+        // peer that appears later is still adopted PASSIVELY when its own discovery
+        // reaches this node (the per-side acceptance clause). EXPONENTIAL BACKOFF
+        // bounds the cost of an unfillable side: a fill resets to tau0; an
+        // unproductive probe grows the interval toward tau_max; a lost edge resets
+        // to tau0 and probes now. tau_max is the Chord half-life floor — it must
+        // comfortably exceed the churn interval so a dropped edge is re-formed
+        // well within a node's lifetime.
         #[cfg(not(test))]
         const LATTICE_PROBE_TAU0: Duration = Duration::from_secs(5);
         #[cfg(test)]
@@ -4595,19 +4608,28 @@ impl Ring {
         // deterministic simulation support.
         let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
 
+        // Shared exponential-backoff delay calculator for the lattice probe
+        // (code-style: use crate::util::backoff, don't hand-roll doubling). The
+        // interval is `delay(backoff_attempt) = tau0 * 2^attempt`, capped at
+        // tau_max.
+        let lattice_probe_backoff = crate::util::backoff::ExponentialBackoff::new(
+            LATTICE_PROBE_TAU0,
+            LATTICE_PROBE_TAU_MAX,
+        );
+
         // Nearest-neighbor lattice discovery state (mechanism 2). Tracks the next
-        // route-to-self probe time, the current backoff interval, and the number
-        // of lattice sides held at the previous tick — used to detect a side
-        // filling (improvement → stay aggressive) vs a side lost (regression →
-        // probe now). Seeded to fire on the first eligible tick.
+        // route-to-self probe time, the current backoff attempt (0 = aggressive
+        // tau0; grows on an unproductive probe, resets on a side fill or a
+        // regression), and the number of lattice sides held at the previous tick
+        // (side fill/loss detection). Seeded to fire on the first eligible tick.
         struct LatticeProbeState {
             next_at: Instant,
-            interval: Duration,
+            backoff_attempt: u32,
             last_sides_held: Option<u8>,
         }
         let mut lattice_probe = LatticeProbeState {
             next_at: self.time_source.now(),
-            interval: LATTICE_PROBE_TAU0,
+            backoff_attempt: 0,
             last_sides_held: None,
         };
         let mut zero_connections_since: Option<Instant> = None;
@@ -5283,12 +5305,24 @@ impl Ring {
 
             // Nearest-neighbor lattice discovery (mechanism 2): inject a
             // route-to-self probe target (own_location), gated by exponential
-            // backoff, to seek/tighten the guaranteed successor and predecessor
-            // edges. Queued into pending_conn_adds so it is acquired next tick
+            // backoff, to FILL each peer's empty successor/predecessor lattice
+            // slots. Queued into pending_conn_adds so it is acquired next tick
             // alongside long-link targets. No wire change: the probe is a plain
             // CONNECT toward own_location whose bloom already excludes held peers,
-            // so it lands on the nearest unconnected peer and the terminus
+            // so it lands on the nearest UNCONNECTED peer and the terminus
             // installs the edge via the per-side clause in should_accept.
+            //
+            // We probe only while a lattice side is UNFILLED and STOP once both
+            // sides hold a neighbor (`lattice_should_probe`). Continued probing to
+            // TIGHTEN a filled-but-loose edge toward the exact nearest was TRIED
+            // and MEASURED to churn connections and regress distant GET find-rate
+            // at low connection budgets (control-vs-fix sim): tightening competes
+            // for the scarce slots the long-range links need, and the extra
+            // route-to-self CONNECTs disrupt in-flight routing. So a filled edge
+            // may remain LOOSE (filled != exact-tight) and the residual gap is
+            // accepted; a strictly-closer peer that appears later is adopted
+            // PASSIVELY when its own discovery reaches this node, and a lost edge
+            // re-triggers probing immediately.
             if crate::ring::nn_lattice_enabled() {
                 if let Some(me) = self.connection_manager.get_stored_location() {
                     let probe_now = self.time_source.now();
@@ -5296,62 +5330,57 @@ impl Ring {
                     let pred = self.connection_manager.nearest_lattice_neighbor_dist(false);
                     let sides_held = u8::from(succ.is_some()) + u8::from(pred.is_some());
 
-                    // Only probe while a lattice side is UNFILLED. Once both edges
-                    // are held we stop: a route-to-self probe at that point would
-                    // land on a farther, non-lattice nearby peer (its terminus,
-                    // when under max_connections, accepts it as an ordinary
-                    // connection), skewing the connection set toward short links
-                    // and pruning long links. TIGHTENING to a strictly-closer peer
-                    // that appears later is handled PASSIVELY by the per-side
-                    // acceptance clause in should_accept — when that closer peer's
-                    // own discovery reaches this node, it is force-accepted as the
-                    // new nearest and the superseded edge demotes. So this probe
-                    // only ever fills an empty side (where the nearest unconnected
-                    // peer IS the exact nearest), never manufactures extra links.
-                    let need_probe = sides_held < 2;
+                    let need_probe = lattice_should_probe(sides_held);
 
-                    // Regression (a side was lost) → reset the backoff and probe
+                    // Improvement = a side newly FILLED since the previous tick.
+                    let improved = match lattice_probe.last_sides_held {
+                        Some(prev) => sides_held > prev,
+                        None => sides_held > 0,
+                    };
+                    if improved {
+                        self.connection_manager.record_lattice_probe_improvement();
+                    }
+
+                    // Regression (a side was lost) -> reset the backoff and probe
                     // now to re-fill the empty slot immediately.
                     if let Some(prev_sides) = lattice_probe.last_sides_held {
                         if sides_held < prev_sides {
-                            lattice_probe.interval = LATTICE_PROBE_TAU0;
+                            lattice_probe.backoff_attempt = 0;
                             lattice_probe.next_at = probe_now;
                         }
                     }
 
                     if need_probe && probe_now >= lattice_probe.next_at {
-                        // Did a side fill since the last tick (improvement)? If so
-                        // stay aggressive; otherwise back off (a side we cannot
-                        // currently reach a peer on).
-                        let improved = match lattice_probe.last_sides_held {
-                            Some(prev_sides) => sides_held > prev_sides,
-                            None => true,
-                        };
-                        lattice_probe.interval = if improved {
-                            LATTICE_PROBE_TAU0
+                        // Stay aggressive (tau0) while probes keep filling sides;
+                        // back off toward tau_max for a side we currently cannot
+                        // reach any peer to fill.
+                        lattice_probe.backoff_attempt = if improved {
+                            0
                         } else {
-                            (lattice_probe.interval * 2).min(LATTICE_PROBE_TAU_MAX)
+                            lattice_probe.backoff_attempt.saturating_add(1)
                         };
-                        self.connection_manager.record_lattice_probe(improved);
+                        self.connection_manager.record_lattice_probe_issued();
 
                         pending_conn_adds.insert(me);
 
-                        // ±20% jitter to avoid synchronized probe bursts across
+                        // +/-20% jitter to avoid synchronized probe bursts across
                         // peers that bootstrapped together.
                         let jitter = crate::config::GlobalRng::random_range(0.8..=1.2);
-                        lattice_probe.next_at = probe_now + lattice_probe.interval.mul_f64(jitter);
+                        let interval = lattice_probe_backoff.delay(lattice_probe.backoff_attempt);
+                        lattice_probe.next_at = probe_now + interval.mul_f64(jitter);
 
                         tracing::debug!(
                             sides_held,
                             succ_dist = ?succ,
                             pred_dist = ?pred,
-                            interval_secs = lattice_probe.interval.as_secs(),
+                            backoff_attempt = lattice_probe.backoff_attempt,
+                            interval_secs = interval.as_secs(),
                             "lattice discovery: queued route-to-self probe"
                         );
                     }
-                    // Record the observed state each tick (whether or not we
-                    // probed) so regression detection and the improvement check
-                    // compare against the latest reality.
+                    // Record the observed side count each tick (whether or not we
+                    // probed) so the regression and improvement checks compare
+                    // against the latest reality on the next tick.
                     lattice_probe.last_sides_held = Some(sides_held);
                 }
             }
@@ -7966,6 +7995,65 @@ mod deferred_swap_drop_tests {
 ///
 /// If you add a new production time read, route it through
 /// `self.time_source.now()` rather than bumping this count.
+/// Whether the lattice discovery probe should fire this tick (subject to the
+/// caller's `now >= next_at` timing gate). Probe ONLY while a lattice side is
+/// UNFILLED, and STOP once both sides hold a neighbor. This is a deliberate
+/// choice: continued probing to TIGHTEN a filled-but-loose edge toward the exact
+/// nearest was measured to churn connections and regress distant GET find-rate at
+/// low connection budgets (see the maintenance-loop comment), so a filled edge is
+/// allowed to remain loose (filled != exact-tight). Extracted for deterministic
+/// CI coverage of the probe gating.
+pub(crate) fn lattice_should_probe(sides_held: u8) -> bool {
+    sides_held < 2
+}
+
+#[cfg(test)]
+mod lattice_probe_state_machine_tests {
+    use super::lattice_should_probe;
+    use crate::util::backoff::ExponentialBackoff;
+    use std::time::Duration;
+
+    #[test]
+    fn should_probe_gating_stops_when_both_sides_filled() {
+        // An unfilled side probes.
+        assert!(lattice_should_probe(0));
+        assert!(lattice_should_probe(1));
+        // Both sides held: STOP (we do not chase exact-tightness — it regressed
+        // findability, see the maintenance loop).
+        assert!(!lattice_should_probe(2));
+    }
+
+    /// The probe backoff uses the shared `ExponentialBackoff` (code-style: no
+    /// hand-rolled doubling). While a side stays unfillable, unproductive probes
+    /// grow the interval from tau0 toward the tau_max cap; a fill resets it to
+    /// tau0. This mirrors the maintenance-loop update rule.
+    #[test]
+    fn backoff_grows_to_tau_max_then_resets_on_fill() {
+        let tau0 = Duration::from_secs(5);
+        let tau_max = Duration::from_secs(300);
+        let backoff = ExponentialBackoff::new(tau0, tau_max);
+        assert_eq!(backoff.delay(0), tau0, "attempt 0 probes at tau0");
+
+        // A chain of unproductive probes for an unfillable side (still probing,
+        // sides_held < 2) grows the attempt until the interval saturates at
+        // tau_max. Bounded, monotonic, capped.
+        let mut attempt: u32 = 0;
+        let mut last = Duration::ZERO;
+        for _ in 0..20 {
+            let d = backoff.delay(attempt);
+            assert!(d >= last, "interval is monotonic non-decreasing");
+            assert!(d <= tau_max, "interval never exceeds tau_max");
+            last = d;
+            attempt = attempt.saturating_add(1);
+        }
+        assert_eq!(last, tau_max, "the backoff saturates at tau_max");
+
+        // A fill resets the attempt to tau0 (aggressive re-probe of the other
+        // still-empty side).
+        assert_eq!(backoff.delay(0), tau0);
+    }
+}
+
 #[cfg(test)]
 mod instant_now_pin_test {
     /// Number of bare `Instant::now()` call sites expected in this file, all

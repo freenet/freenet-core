@@ -2633,6 +2633,174 @@ mod tests {
         crate::ring::set_nn_lattice_enabled(true);
     }
 
+    /// The score-based topology SWAP (`maybe_swap_connection`) never selects a
+    /// per-side nearest lattice edge as the drop victim, even when that edge is
+    /// the least-valuable candidate (zero routing) and would otherwise be the
+    /// natural drop. Covers the swap-path exemption (the fallback-drop path is
+    /// covered by `score_fallback_never_drops_lattice_edge`).
+    #[test_log::test]
+    fn maybe_swap_connection_never_swaps_lattice_edge() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x5A1D_C0DE);
+        crate::ring::set_nn_lattice_enabled(true);
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(100000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut tm = TopologyManager::new(limits);
+        let my_location = Location::new(0.5);
+
+        // Per-side NEAREST edges (protected), each with ZERO routing so they are
+        // the least-valuable and would be the natural swap victims absent the
+        // exemption.
+        let succ_near = Location::new(0.502);
+        let pred_near = Location::new(0.498);
+        let succ_near_peer = PeerKeyLocation::random();
+        let pred_near_peer = PeerKeyLocation::random();
+        let mut nb: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
+        nb.insert(succ_near, vec![Connection::new(succ_near_peer.clone())]);
+        nb.insert(pred_near, vec![Connection::new(pred_near_peer.clone())]);
+        // Non-protected clustered peers with high routing (kept), plus one
+        // non-protected redundant low-routing peer that is the intended victim.
+        for off in [0.010_f64, 0.012, 0.014, -0.010, -0.012] {
+            let loc = Location::new_rounded(my_location.as_f64() + off);
+            let peer = PeerKeyLocation::random();
+            for _ in 0..50 {
+                tm.outbound_request_counter.record_request(peer.clone());
+            }
+            nb.entry(loc).or_default().push(Connection::new(peer));
+        }
+        let redundant = Location::new_rounded(my_location.as_f64() + 0.0141);
+        nb.entry(redundant)
+            .or_default()
+            .push(Connection::new(PeerKeyLocation::random()));
+
+        let protected = protected_nearest_neighbors(&Some(my_location), &nb);
+        assert!(
+            protected.contains(&succ_near) && protected.contains(&pred_near),
+            "the per-side nearest edges must be protected: {protected:?}"
+        );
+
+        let n = nb.values().map(|v| v.len()).sum::<usize>();
+        let mut saw_swap = false;
+        for _ in 0..400 {
+            if let TopologyAdjustment::SwapConnection { remove, .. } =
+                tm.maybe_swap_connection(&Some(my_location), &nb, n)
+            {
+                saw_swap = true;
+                assert_ne!(
+                    remove, succ_near_peer,
+                    "swap must NOT drop the protected nearest successor"
+                );
+                assert_ne!(
+                    remove, pred_near_peer,
+                    "swap must NOT drop the protected nearest predecessor"
+                );
+            }
+        }
+        assert!(
+            saw_swap,
+            "expected the clustered topology to trigger a swap"
+        );
+    }
+
+    /// The resource-pressure removal path (`select_connections_to_remove`) never
+    /// selects a per-side nearest lattice edge, even when that edge is the
+    /// least-valuable candidate. Covers the third exemption site (the swap path
+    /// and the fallback-drop path are covered by the two tests above).
+    #[test_log::test]
+    fn select_connections_to_remove_never_drops_lattice_edge() {
+        crate::ring::set_nn_lattice_enabled(true);
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(100000.0),
+            max_downstream_bandwidth: Rate::new_per_second(100000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut tm = TopologyManager::new(limits);
+        let my_location = Location::new(0.5);
+
+        // Build peers at chosen key locations; the nearest per-side edges are the
+        // protected lattice edges. Give the protected edges the LOWEST routing
+        // usage so, absent the exemption, they would be the removal victims.
+        let succ_near = Location::new(0.502);
+        let pred_near = Location::new(0.498);
+        let succ_near_peer = PeerKeyLocation::random();
+        let pred_near_peer = PeerKeyLocation::random();
+        // Non-protected farther peers (high usage → kept).
+        let far_a = (Location::new(0.520), PeerKeyLocation::random());
+        let far_b = (Location::new(0.480), PeerKeyLocation::random());
+        let far_c = (Location::new(0.540), PeerKeyLocation::random());
+
+        let mut nb: BTreeMap<Location, Vec<Connection>> = BTreeMap::new();
+        for (loc, peer) in [
+            (succ_near, succ_near_peer.clone()),
+            (pred_near, pred_near_peer.clone()),
+            far_a.clone(),
+            far_b.clone(),
+            far_c.clone(),
+        ] {
+            nb.entry(loc).or_default().push(Connection::new(peer));
+        }
+
+        let protected = protected_nearest_neighbors(&Some(my_location), &nb);
+        assert!(
+            protected.contains(&succ_near) && protected.contains(&pred_near),
+            "per-side nearest edges must be protected: {protected:?}"
+        );
+
+        // Report inbound-bandwidth usage: protected edges get tiny usage (most
+        // prunable by routing_value), the farther peers get large usage.
+        let at_time = Instant::now();
+        let report_time = at_time - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        for (peer, amount) in [
+            (&succ_near_peer, 1.0_f64),
+            (&pred_near_peer, 1.0),
+            (&far_a.1, 5000.0),
+            (&far_b.1, 5000.0),
+            (&far_c.1, 5000.0),
+        ] {
+            let src = AttributionSource::Peer(peer.clone());
+            for seconds in 1..600u64 {
+                let t = report_time - Duration::from_secs(600 - seconds);
+                tm.meter
+                    .report(&src, ResourceType::InboundBandwidthBytes, amount, t);
+            }
+            // Backdate the source creation time out of the ramp-up window.
+            tm.source_creation_times.insert(src, report_time);
+        }
+        // Give the protected peers essentially no routing usefulness and the
+        // far peers plenty, so the composite score ranks the protected edges as
+        // least valuable (they'd be dropped absent the exemption).
+        tm.outbound_request_counter
+            .record_request(succ_near_peer.clone());
+        for peer in [&far_a.1, &far_b.1, &far_c.1] {
+            for _ in 0..100 {
+                tm.outbound_request_counter.record_request(peer.clone());
+            }
+        }
+
+        let adj = tm.select_connections_to_remove(
+            &ResourceType::InboundBandwidthBytes,
+            at_time,
+            &Some(my_location),
+            &nb,
+        );
+        if let TopologyAdjustment::RemoveConnections(peers) = adj {
+            for p in &peers {
+                assert_ne!(
+                    *p, succ_near_peer,
+                    "removal must NOT drop the protected nearest successor"
+                );
+                assert_ne!(
+                    *p, pred_near_peer,
+                    "removal must NOT drop the protected nearest predecessor"
+                );
+            }
+        }
+    }
+
     /// Regression test for #3630: low bandwidth should not trigger connection
     /// growth when the peer already has enough connections. In a low-activity
     /// network, bandwidth is always below 50% regardless of connection count,

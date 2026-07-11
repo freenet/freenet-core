@@ -14587,9 +14587,11 @@ fn test_summary_first_put_reverse_delta_converges_originator() {
 // =============================================================================
 // NEAREST-NEIGHBOR RING LATTICE — validation + regression (feat(topology)).
 //
-// The lattice guarantees each peer its closest connected SUCCESSOR (higher
-// location, wrapping) AND PREDECESSOR (lower location) so greedy routing
-// reliably reaches the peer closest to any key. These tests measure the fix
+// The lattice SEEKS AND TIGHTENS each peer's closest connected SUCCESSOR (higher
+// location, wrapping) AND PREDECESSOR (lower location) so greedy routing more
+// reliably reaches the peer closest to any key (a strictly-closer neighbor is
+// force-accepted and probed toward; residual looseness remains where the true
+// nearest is currently unreachable). These tests measure the fix
 // (lattice ON — the production default) against stock main (lattice OFF via the
 // test-only `set_nn_lattice_enabled(false)` override) on identical seeds, and
 // hard-assert the regression-critical properties (both-sides cycle formation,
@@ -14698,7 +14700,7 @@ fn nn_classify_edges(own: f64, nbrs: &[f64]) -> NodeEdges {
 }
 
 /// True nearest successor and predecessor of `own_idx` among ALL peer locations
-/// (the exact lattice edges the fix guarantees). `None` on a side only in the
+/// (the exact lattice edges the fix TARGETS). `None` on a side only in the
 /// degenerate all-neighbors-on-one-side case.
 fn nn_exact_nearest(own_idx: usize, locs: &[f64]) -> (Option<f64>, Option<f64>) {
     let own = locs[own_idx];
@@ -14756,6 +14758,18 @@ struct NnTopologyRun {
 /// Lone-holder topology run: seed ONE copy on the rank-0 node (scatter+consult
 /// OFF so it stays singular), issue distant read-only GETs, and read back the
 /// end-of-run topology + GET outcomes. `nn_enabled` selects fix vs stock.
+/// Restores the per-thread lattice/scatter overrides to production defaults on
+/// drop, so a panic mid-helper (e.g. a failed sim assertion) cannot leak the
+/// override to the next test running on the same thread (the overrides are
+/// otherwise reset only on the happy path).
+struct NnLatticeTestGuard;
+impl Drop for NnLatticeTestGuard {
+    fn drop(&mut self) {
+        freenet::dev_tool::set_scatter_disabled(false);
+        freenet::dev_tool::set_nn_lattice_enabled(true);
+    }
+}
+
 fn nn_run_topology(
     seed: u64,
     nn_enabled: bool,
@@ -14770,6 +14784,8 @@ fn nn_run_topology(
     freenet::dev_tool::set_scatter_disabled(true);
     freenet::dev_tool::set_nn_lattice_enabled(nn_enabled);
     freenet::dev_tool::clear_op_traces();
+    // Panic-safe restore of the per-thread overrides on any early return/panic.
+    let _nn_guard = NnLatticeTestGuard;
 
     let arm = if nn_enabled { "fix" } else { "stock" };
     let network = format!("nn-topo-{arm}-{seed:x}-g{gateways}-n{num_nodes}");
@@ -14839,9 +14855,7 @@ fn nn_run_topology(
     );
     let logs = rt.block_on(async { logs_handle.lock().await.clone() });
     let traces = freenet::dev_tool::take_op_traces();
-    // Restore production defaults for the next test on this thread.
-    freenet::dev_tool::set_scatter_disabled(false);
-    freenet::dev_tool::set_nn_lattice_enabled(true);
+    // Overrides restored on drop by `_nn_guard` (panic-safe).
 
     let metrics =
         compute_piece_e_metrics(&result, &logs, &contract_key, &holder, &get_requesters, &[]);
@@ -14946,6 +14960,8 @@ fn nn_run_put_reach(
     freenet::dev_tool::set_scatter_disabled(true);
     freenet::dev_tool::set_nn_lattice_enabled(nn_enabled);
     freenet::dev_tool::clear_op_traces();
+    // Panic-safe restore of the per-thread overrides on any early return/panic.
+    let _nn_guard = NnLatticeTestGuard;
 
     let arm = if nn_enabled { "fix" } else { "stock" };
     let network = format!("nn-put-{arm}-{seed:x}-n{num_nodes}");
@@ -14997,8 +15013,7 @@ fn nn_run_put_reach(
         "seed={seed:x} nn={nn_enabled}: PUT-reach sim failed: {:?}",
         result.turmoil_result.err()
     );
-    freenet::dev_tool::set_scatter_disabled(false);
-    freenet::dev_tool::set_nn_lattice_enabled(true);
+    // Overrides restored on drop by `_nn_guard` (panic-safe).
 
     // Exactly one holder expected (scatter off).
     let mut total_holders = 0usize;
@@ -15025,7 +15040,7 @@ fn nn_run_put_reach(
 /// REGRESSION (metric 3, the both-sides property — the whole point). The
 /// discriminating measure is EXACT-nearest coverage: the fraction of peers that
 /// hold their TRUE nearest successor AND predecessor. "Any edge per side" is
-/// saturated for stock (~0.8) and does not capture what the lattice guarantees;
+/// saturated for stock (~0.8) and does not capture what the lattice TARGETS;
 /// exact-nearest is what greedy-to-closest actually needs. With the lattice ON,
 /// far more peers hold both exact edges, and it strictly beats stock. (Any-edge
 /// coverage + connection counts are logged for contrast.)
@@ -15123,7 +15138,7 @@ fn test_nn_lattice_findability_and_topology_control_vs_fix() {
     // Hard findability assertion: a scatter-free PUT from the farthest node must
     // land its single copy on the peer CLOSEST to the key (rank 0) at least as
     // often with the fix as without — this is the exact-nearest routing outcome
-    // the lattice exists to guarantee. (In practice the fix lands rank 0 on every
+    // the lattice exists to IMPROVE. (In practice the fix lands rank 0 on every
     // valid seed where stock misses on several.)
     assert!(
         put0_fix >= put0_stock,
@@ -15238,10 +15253,13 @@ fn test_nn_lattice_larger_ring_report() {
 }
 
 // Note: the mechanism-4 liveness-boundedness invariant (a lattice edge is exempt
-// from the SCORE-BASED swap but STILL subject to liveness eviction, and its slot
-// is re-discovered on loss) is asserted by deterministic unit tests in
-// `topology.rs` (`protected_nearest_neighbors_*`, `score_swap_never_drops_lattice_edge`)
-// and `connection_manager.rs` (`prune_connection_evicts_lattice_edge`), which are
-// reliable where a mid-run sim crash's timing is not. Re-discovery-on-loss is
+// from the SCORE-BASED swap/removal but STILL subject to liveness eviction, and
+// its slot is re-discovered on loss) is asserted by deterministic unit tests in
+// `topology.rs` (`protected_nearest_neighbors_returns_per_side_nearest`,
+// `score_fallback_never_drops_lattice_edge`,
+// `maybe_swap_connection_never_swaps_lattice_edge`,
+// `select_connections_to_remove_never_drops_lattice_edge`) and
+// `connection_manager.rs` (`prune_evicts_lattice_edge_liveness_not_gated`), which
+// are reliable where a mid-run sim crash's timing is not. Re-discovery-on-loss is
 // exercised behaviorally by the cycle-completeness sim above (edges that fail to
 // form on the first probe are re-probed until the cycle completes).

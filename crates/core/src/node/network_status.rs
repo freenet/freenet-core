@@ -82,19 +82,31 @@ pub struct RingStatsSnapshot {
     pub updates_capacity_dropped: u64,
     /// Nearest-neighbor ring lattice completeness (the "is greedy routing's base
     /// lattice present" signal). `lattice_has_successor` / `_predecessor` are
-    /// whether this peer currently holds its closest-higher / closest-lower ring
-    /// neighbor; a peer with BOTH `true` has a complete both-sides lattice, and
-    /// the collector aggregates the fraction of such peers. The `_distance`
-    /// fields are the ring distance to each edge (None when unheld). Read from
-    /// the live connection set — no mirrored counter to rot.
+    /// whether this peer currently HOLDS (a side is FILLED with) its
+    /// closest-higher / closest-lower connected ring neighbor; a peer with BOTH
+    /// `true` has a complete both-sides lattice, and the collector aggregates the
+    /// fraction of such peers.
+    ///
+    /// CAVEAT — filled != tight: a held edge may still be LOOSE (the exact
+    /// nearest is an unconnected peer between two adjacent peers), so the
+    /// both-sides-filled fraction OVERSTATES exact-nearest coverage. A peer
+    /// cannot locally determine tightness (that is what the route-to-self probe
+    /// discovers), so it is not reported as a boolean; compare the `_distance`
+    /// fields across peers to gauge looseness. The `_distance` fields are the
+    /// ring distance to each held edge (None when unheld). Read from the live
+    /// connection set — no mirrored counter to rot.
     pub lattice_has_successor: bool,
     pub lattice_has_predecessor: bool,
     pub lattice_successor_distance: Option<f64>,
     pub lattice_predecessor_distance: Option<f64>,
     /// Discovery health (route-to-self probe). `lattice_probes_issued` counts
-    /// probes fired since startup; `lattice_probe_improvements` counts those that
-    /// found a strictly-closer peer (filled or tightened an edge). A healthy peer
-    /// converges to both-sides-held and the improvement rate falls toward zero.
+    /// probes FIRED since startup; `lattice_probe_improvements` counts observed
+    /// lattice IMPROVEMENTS (a side filled or an edge tightened toward the true
+    /// nearest). The two are counted INDEPENDENTLY (an improvement lands a few
+    /// maintenance ticks after the probe that caused it, as the CONNECT completes
+    /// asynchronously), so the ratio is a convergence-health gauge, not a strict
+    /// per-probe success rate. A healthy peer converges to a tight both-sides
+    /// lattice and the improvement rate falls toward zero.
     pub lattice_probes_issued: u64,
     pub lattice_probe_improvements: u64,
 }

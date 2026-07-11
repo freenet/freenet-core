@@ -33,6 +33,17 @@ WHEN accepting a new connection (should_accept):
       (default 8, separate from TTL). Each uphill hop decrements budget by 1.
       See PR #3621, which replaced the TTL halving from PR #3582.
   2. CHECK: Are we at max_connections (open + pending)? → REJECT
+     EXCEPTION (nearest-neighbor lattice, mechanism 3): a candidate that
+     would become this peer's new per-side NEAREST ring neighbor (its
+     successor or predecessor lattice edge) is force-accepted even at/over
+     max, up to a HARD over-max ceiling (max_connections +
+     LATTICE_OVERMAX_SLACK). It displaces a farther non-lattice long link,
+     which the topology maintenance loop's over-max prune sheds next tick
+     (protected lattice edges are never the prune victim). Applied via the
+     shared predicate admits_lattice_edge_over_cap() in should_accept, in
+     add_connection, AND in BOTH connection-lifecycle promotion gates
+     (p2p_protoc/connection_lifecycle.rs) so the exception is live on the
+     real CONNECT path, not just should_accept. See connection_manager.rs.
   3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
      → Map all connection distances to log-space (1/d = uniform in log)
      → Score = min distance to nearest neighbor in log-space
