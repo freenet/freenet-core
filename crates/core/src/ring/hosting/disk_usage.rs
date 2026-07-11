@@ -1,12 +1,22 @@
 //! Aggregate on-disk usage accounting for demand-driven hosting (#4683).
 //!
 //! The demand-driven hosting budget (#4642) sizes itself from **memory** only.
-//! For a disk-constrained host, disk — not RAM — is the scarcest resource, yet
-//! nothing bounds disk in aggregate today. [`DiskUsageTracker`] is the shared
-//! source of truth that the future disk budget (eviction floor `min(ram, disk)`
-//! in PR 2, admission gate in PR 3) reads. This PR wires only the accounting +
-//! telemetry: the tracker is populated and observable but does not yet change
-//! any admission or eviction decision (zero behavior change).
+//! For a disk-constrained host, disk — not RAM — is the scarcest resource, so a
+//! separate disk budget bounds aggregate on-disk usage. [`DiskUsageTracker`] is
+//! the shared source of truth that this disk budget reads, and it now feeds two
+//! live decisions, both wired in #4702:
+//!
+//! - **Eviction floor:** [`super::HostingManager::recompute_effective_budget`]
+//!   installs `effective_budget = min(ram_budget, disk_budget)` on the ~60s
+//!   sweep, so under disk pressure eviction sheds (subscriber-primary order)
+//!   against the disk-constrained budget.
+//! - **Pre-write PUT admission gate:** [`DiskUsageTracker::admit_state_write`]
+//!   rejects a new state write that would push aggregate on-disk usage past the
+//!   disk budget.
+//!
+//! The disk budget is `clamp(0.5 * (used + available), 128 MiB, 32 GiB)`, tunable
+//! via `--hosting-disk-pct` / `--max-hosting-disk`. This module owns the
+//! accounting + telemetry those two decisions read.
 //!
 //! # What is counted
 //!
@@ -31,7 +41,7 @@
 //!
 //! [`DiskUsageTracker::seed`] mirrors the #4561 secrets `seeded_user_total`
 //! discipline: it walks the real on-disk state ONCE and is **fail-loud** on I/O
-//! error. A silently-too-low seed would defeat the future admission gate (it
+//! error. A silently-too-low seed would defeat the admission gate (it
 //! would admit writes that actually overflow disk), so a seed that cannot read
 //! the truth must surface the error rather than start from an under-count.
 
@@ -43,7 +53,8 @@ use freenet_stdlib::prelude::ContractKey;
 use parking_lot::Mutex;
 
 /// A pre-write admission check rejected a state/code write because it would
-/// push aggregate on-disk usage past the disk budget (#4683, PR 3).
+/// push aggregate on-disk usage past the disk budget (#4683, admission gate live
+/// since #4702).
 ///
 /// Carries the numbers that made the decision so the caller can surface a
 /// human-readable cause on the client `Err` and (for PUT) the `PutMsg::Error`
@@ -73,7 +84,7 @@ impl std::fmt::Display for DiskBudgetExceeded {
 ///
 /// Aggregate scalars only, emitted on the existing `RouterSnapshot` cadence
 /// alongside the RAM-budget gauges so the disk-budget feature is observable in
-/// production before any enforcement ships.
+/// production alongside the eviction floor and admission gate it feeds (#4702).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct DiskUsageStats {
     /// Persisted contract-state bytes (delta-tracked, seeded from redb rows).
@@ -82,7 +93,7 @@ pub(crate) struct DiskUsageStats {
     pub wasm_bytes: u64,
     /// Wasmtime compile-cache bytes (`du` of the relocated cache dir).
     pub compile_cache_bytes: u64,
-    /// Sum of the three above — the aggregate the disk budget will bound.
+    /// Sum of the three above — the aggregate the disk budget bounds.
     pub total_bytes: u64,
 }
 
@@ -112,7 +123,7 @@ pub(crate) struct DiskUsageTracker {
     /// which is exactly what closes the seed/write TOCTOU documented on
     /// [`Self::seed`] and [`Self::record_state_write`]. Per-shard locking would
     /// reopen that race and turn the counter into a load-bearing under-count
-    /// once the admission gate (PR 3) reads it.
+    /// now that the admission gate reads it (#4702).
     state_sizes: Mutex<HashMap<ContractKey, u64>>,
     /// Directory holding `*.wasm` code blobs (mode-resolved `contracts_dir`).
     contracts_dir: PathBuf,
@@ -143,9 +154,10 @@ impl DiskUsageTracker {
     /// Aggregate on-disk bytes = state + wasm + compile-cache. The value the
     /// disk budget bounds. Cheap (three atomic loads).
     ///
-    /// The eviction floor (PR 2) and admission gate (PR 3) are the first
-    /// runtime readers; in this accounting-only PR it is exercised by tests and
-    /// the telemetry snapshot path.
+    /// Read live by the eviction floor
+    /// ([`super::HostingManager::recompute_effective_budget`]) and the pre-write
+    /// admission gate ([`Self::admit_state_write`]), both wired in #4702, plus the
+    /// telemetry snapshot path.
     pub(crate) fn total_bytes(&self) -> u64 {
         self.state_bytes
             .load(Ordering::Relaxed)
@@ -177,7 +189,7 @@ impl DiskUsageTracker {
     /// no-op so a racing second sweep tick cannot double-count.
     ///
     /// Fail-loud contract: the caller MUST pass the true on-disk state total. A
-    /// silently-too-low seed would let the future admission gate admit
+    /// silently-too-low seed would let the admission gate admit
     /// overflowing writes — the exact failure the #4561 secrets seed discipline
     /// guards against.
     ///
@@ -193,8 +205,9 @@ impl DiskUsageTracker {
     /// `state_bytes` is recomputed from the merged map under the same lock that
     /// serializes writes, so every write is counted exactly once regardless of
     /// whether its redb row made it into the snapshot. This is the lock-based
-    /// close of the window flagged in the PR-1 review (would otherwise become a
-    /// load-bearing under-count once PR 3 turns the counter into a gate input).
+    /// close of the window flagged in the tracker-only PR's review (would
+    /// otherwise be a load-bearing under-count now that the counter is a live
+    /// gate input, #4702).
     pub(crate) fn seed<I>(&self, state_rows: I)
     where
         I: IntoIterator<Item = (ContractKey, u64)>,
@@ -389,7 +402,7 @@ impl DiskUsageTracker {
         }
     }
 
-    /// Pre-write admission check for a state write (#4683, PR 3). Computes the
+    /// Pre-write admission check for a state write (#4683, live since #4702). Computes the
     /// aggregate on-disk bytes that WOULD result from replacing `key`'s current
     /// tracked state size with `new_size`
     /// (`projected = total − old_for_key + new_size`) and rejects if that
@@ -435,7 +448,7 @@ impl DiskUsageTracker {
     }
 
     /// Pre-write admission check for a state **UPDATE** to an already-hosted
-    /// contract (#4683, PR 4 growth-only rule). Unlike [`Self::admit_state_write`]
+    /// contract (#4683 growth-only rule, live since #4702). Unlike [`Self::admit_state_write`]
     /// (used for a fresh PUT), an UPDATE is a mutation of an *existing*
     /// footprint, not a new admission. A CRDT merge frequently shrinks or holds
     /// the state size (`delta <= 0`); rejecting such a write would stall
@@ -478,7 +491,7 @@ impl DiskUsageTracker {
         }
     }
 
-    /// Pre-write admission check for a WASM code-blob write (#4683, PR 3).
+    /// Pre-write admission check for a WASM code-blob write (#4683, live since #4702).
     /// Charges `blob_len` on top of current aggregate usage
     /// (`projected = total + blob_len`) and rejects if it exceeds
     /// `budget_bytes`. Used only for a NEWLY-stored (deduped) code blob — a
@@ -832,7 +845,7 @@ mod tests {
         }
     }
 
-    // --- Admission gate boundary (#4683, PR 3) --------------------------------
+    // --- Admission gate boundary (#4683, live since #4702) --------------------
 
     #[test]
     fn admit_state_write_boundary_projected_equals_budget_admits() {
