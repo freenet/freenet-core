@@ -164,12 +164,26 @@ fn walkdir(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 fn generate_version() -> anyhow::Result<u32> {
-    // Use unix timestamp / 60 as version (minutes since epoch), matching River's convention
+    // Use unix timestamp (seconds since epoch) as the version.
+    //
+    // Second granularity — not minute granularity — is required (#4064): the
+    // website contract's update_state rejects any state whose version is not
+    // strictly greater than the current one. With minute granularity
+    // (unix_secs / 60), two republishes within the same wall-clock minute tie,
+    // and subscribed peers reject the broadcast with
+    // "New state version X must be higher than current version X", staying
+    // pinned to the old build. Seconds give each republish (>= 1s apart) a
+    // strictly higher version.
+    //
+    // This is backward-compatible with sites already published at minute
+    // granularity: seconds-since-epoch (~1.78e9) is strictly greater than any
+    // minute-granularity value (~2.96e7), so the first seconds-based republish
+    // always supersedes the old state. u32 holds seconds-since-epoch until 2106.
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("System clock is before Unix epoch")?
         .as_secs();
-    Ok((secs / 60) as u32)
+    Ok(secs as u32)
 }
 
 fn sign_webapp(
@@ -499,6 +513,55 @@ mod tests {
         assert!(
             ensure_state_within_limit(1024, dir).is_ok(),
             "small state must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_generate_version_is_seconds_since_epoch() {
+        // Regression for #4064: generate_version() must use second granularity,
+        // not minute granularity. Minute-granularity versions (unix_secs / 60)
+        // tie whenever a publisher republishes within the same wall-clock minute,
+        // and the website contract's strictly-increasing version check rejects
+        // the tied broadcast on every subscribed peer, pinning them to the old
+        // build. Second granularity gives each republish (>=1s apart) a strictly
+        // higher version.
+        let version = generate_version().unwrap();
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Version is seconds-since-epoch: within a few seconds of now, and well
+        // above any plausible minute-granularity value (unix_secs / 60 ~= 2.96e7).
+        assert!(
+            version as u64 >= now_secs.saturating_sub(5) && (version as u64) <= now_secs + 5,
+            "version {version} should be seconds-since-epoch (~{now_secs}), \
+             not minutes-since-epoch"
+        );
+        assert!(
+            version > 1_700_000_000,
+            "version {version} should be seconds-since-epoch (> 1.7e9), \
+             a minute-granularity value would be ~2.96e7"
+        );
+    }
+
+    #[test]
+    fn test_generate_version_exceeds_minute_granularity() {
+        // Backward-compatibility guard for #4064: sites already published with a
+        // minute-granularity version must still be superseded by the first
+        // seconds-based republish. Seconds-since-epoch (~1.78e9) is strictly
+        // greater than the minute-granularity version derived from the same
+        // instant (~2.96e7), so monotonicity holds across the granularity change.
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let minute_version = (secs / 60) as u32;
+        let seconds_version = generate_version().unwrap();
+        assert!(
+            seconds_version > minute_version,
+            "seconds version {seconds_version} must exceed the minute-granularity \
+             version {minute_version} for the same instant"
         );
     }
 
