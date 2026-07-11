@@ -2625,6 +2625,46 @@ mod tests {
         );
     }
 
+    /// Over-max last-resort SAFETY (rule-review Info): when EVERY remaining
+    /// connection is a protected per-side nearest lattice edge, the fallback drop
+    /// must still return a victim (the unfiltered `.or_else` branch) rather than
+    /// None — otherwise a node could sit permanently over max. Degenerate
+    /// tiny-config case, reachable in practice only via the test-only force-active
+    /// override (production gates the lattice at `max_connections >= 25`, so being
+    /// over max with <= 2 total connections cannot happen there), but it guards a
+    /// real safety property. Without the `.or_else(|| pick_least_important(false))`
+    /// fallback this returns None and the caller cannot shed down to max.
+    #[test_log::test]
+    fn fallback_drop_returns_victim_when_all_connections_are_protected() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        crate::ring::set_nn_lattice_enabled(true);
+        let my_loc = Location::new(0.5);
+        // Exactly one connection per side, each the per-side nearest, so BOTH are
+        // protected lattice edges and the protected-excluding filter yields nothing.
+        let succ = Location::new(0.52);
+        let pred = Location::new(0.48);
+        let succ_peer = PeerKeyLocation::random();
+        let pred_peer = PeerKeyLocation::random();
+        let mut nb = BTreeMap::new();
+        nb.insert(succ, vec![Connection::new(succ_peer.clone())]);
+        nb.insert(pred, vec![Connection::new(pred_peer.clone())]);
+
+        // Precondition: both edges are protected, so `pick_least_important(true)`
+        // (exclude-protected) has no candidate and must fall through.
+        let protected = protected_nearest_neighbors(true, &Some(my_loc), &nb);
+        assert_eq!(protected.len(), 2, "both edges protected: {protected:?}");
+        assert!(protected.contains(&succ) && protected.contains(&pred));
+
+        // The safety fallback must still yield a victim (never None) so the node
+        // does not stay permanently over max.
+        let dropped = select_fallback_peer_to_drop(true, &nb, &Some(my_loc))
+            .expect("all-protected fallback must still return a victim, not None");
+        assert!(
+            dropped == succ_peer || dropped == pred_peer,
+            "the fallback victim must be one of the (only) connections: {dropped:?}"
+        );
+    }
+
     /// The exemption is gated by the lattice flag: disabled → the activation gate
     /// (`nn_lattice_active_for`) is false → nothing protected (stock behavior).
     /// `_nn_guard` restores the thread to the production default on drop.

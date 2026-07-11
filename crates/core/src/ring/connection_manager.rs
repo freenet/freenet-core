@@ -3351,6 +3351,67 @@ mod tests {
         );
     }
 
+    /// Regression for the `add_connection` atomicity refactor's cap-bypass
+    /// semantics (rule-review coverage-gap warning): a STALE `location_for_peer`
+    /// entry with NO matching established `connections_by_location` entry (a
+    /// `record_pending_location` that never became a ring connection) must NOT
+    /// exempt a peer from the `max_connections` cap. Before the refactor ANY
+    /// `previous_location.is_some()` skipped the cap (treating it as a net-zero
+    /// relocation); now the cap is skipped only when an established entry is
+    /// actually removed (`removed_established`), so a stale pending entry is a
+    /// genuine net-add the cap must gate. Without the fix this add overshoots the
+    /// cap to `max + 1`.
+    #[test]
+    fn add_connection_stale_previous_location_still_enforces_cap() {
+        // Deliberately NO NnLatticeOverrideGuard: at max=3 (below the lattice
+        // floor) the lattice is inactive, AND the candidate below is a FAR
+        // successor (dist 0.40 >> nearest 0.10), so it is not a strictly-closer
+        // lattice edge and the over-cap exception cannot admit it regardless of
+        // the lattice flag state. This isolates pure cap enforcement.
+        let max = 3usize;
+        let own = make_addr(8600);
+        let cm = make_connection_manager(Some(own), 2, max, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        // Fill the successor side to the cap; nearest established successor 0.60.
+        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(8610 + i as u16),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert_eq!(cm.connection_count(), max, "at the cap");
+
+        // Register a STALE pending location for a peer that never establishes a
+        // ring connection: location_for_peer gets an entry, connections_by_location
+        // does not. This is the `record_pending_location`-without-establish case.
+        let stale_addr = make_addr(8620);
+        cm.record_pending_location(stale_addr, Location::new(0.62));
+        assert_eq!(
+            cm.connection_count(),
+            max,
+            "record_pending_location does not create an established connection"
+        );
+
+        // add_connection for that addr at capacity, to a FAR successor (0.90). Its
+        // stale previous_location (0.62) has no established entry to remove, so
+        // removed_established stays false and this is a genuine net-add the cap
+        // must reject — NOT a cap-exempt relocation.
+        let admitted =
+            cm.add_connection(Location::new(0.90), stale_addr, kp.public().clone(), false);
+        assert!(
+            !admitted,
+            "a stale previous_location must not exempt a net-add from the cap"
+        );
+        assert_eq!(
+            cm.connection_count(),
+            max,
+            "cap enforced: count did not overshoot via the stale-previous-location path"
+        );
+    }
+
     /// Source-scrape pin (B1 regression guard): BOTH connection-lifecycle
     /// promotion gates must apply the shared `admits_lattice_edge_over_cap`
     /// exception to their `>= max_connections` reject. Without this a lattice edge
