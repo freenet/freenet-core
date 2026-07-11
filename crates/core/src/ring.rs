@@ -4572,25 +4572,24 @@ impl Ring {
         // are never gated on lattice completion (they supply the weak connectivity
         // that lets route-to-self converge from a cold start).
         //
-        // STOP CONDITION — filled, not exact-tight (a deliberate, measured
-        // choice): probe only while a lattice side is UNFILLED and STOP once both
-        // sides hold a neighbor. A filled edge may still be LOOSE (holding a
-        // farther neighbor while the exact nearest is an unconnected peer between
-        // two adjacent peers), so this leaves a residual exact-nearest gap
-        // (~0.53 exact coverage at max_connections=5 in the control-vs-fix sim).
-        // Continued probing to TIGHTEN a filled-but-loose edge was TRIED and
-        // MEASURED to regress distant GET find-rate at low connection budgets:
-        // tightening competes for the scarce slots the long-range links need, and
-        // the extra route-to-self CONNECTs disrupt in-flight routing (findability,
-        // the PR's primary goal, matters more than the exact-nearest proxy). So we
-        // accept the residual looseness rather than chase it. A strictly-closer
-        // peer that appears later is still adopted PASSIVELY when its own discovery
-        // reaches this node (the per-side acceptance clause). EXPONENTIAL BACKOFF
-        // bounds the cost of an unfillable side: a fill resets to tau0; an
-        // unproductive probe grows the interval toward tau_max; a lost edge resets
-        // to tau0 and probes now. tau_max is the Chord half-life floor — it must
-        // comfortably exceed the churn interval so a dropped edge is re-formed
-        // well within a node's lifetime.
+        // CONTINUOUS, DECAYING DISCOVERY — the probe NEVER stops. It keeps
+        // route-to-self probing even when both sides are filled, so a filled-but-
+        // LOOSE edge (holding a farther neighbor while the exact nearest is an
+        // unconnected peer) keeps tightening toward this peer's TRUE nearest ring
+        // neighbor. But the EFFORT DECAYS: the probability of finding a strictly-
+        // closer neighbor drops as the peer converges, so an unproductive probe
+        // (found nothing closer) backs the interval off exponentially toward
+        // tau_max, while any IMPROVEMENT (a side filled OR an edge tightened) or a
+        // LOST edge resets it to the aggressive tau0 and probes promptly. The
+        // interval floors at tau_max (a churn-tied maximum), so a fully-converged
+        // peer still re-checks periodically — decayed, but never silent. This
+        // replaces the earlier fill-only STOP-when-filled probe: relying on the
+        // passive per-side acceptance clause alone left ~half the ring's last-mile
+        // edges loose at the exact-nearest layer, so the tightening lattice is what
+        // pulls each peer onto its true ring neighbors. tau_max is the Chord
+        // half-life floor — it must comfortably exceed the churn interval so a
+        // dropped edge is re-formed well within a node's lifetime. The steady-state
+        // cost is one route-to-self CONNECT per peer roughly every tau_max.
         #[cfg(not(test))]
         const LATTICE_PROBE_TAU0: Duration = Duration::from_secs(5);
         #[cfg(test)]
@@ -4622,18 +4621,20 @@ impl Ring {
 
         // Nearest-neighbor lattice discovery state (mechanism 2). Tracks the next
         // route-to-self probe time, the current backoff attempt (0 = aggressive
-        // tau0; grows on an unproductive probe, resets on a side fill or a
-        // regression), and the number of lattice sides held at the previous tick
-        // (side fill/loss detection). Seeded to fire on the first eligible tick.
+        // tau0; grows one step per fire, resets to 0 on an improvement or a lost
+        // edge), and the per-side nearest-neighbor DISTANCES observed at the
+        // previous tick — used to detect a fill OR a tighten (a distance that
+        // strictly decreased) as an improvement. Seeded to fire on the first
+        // eligible tick.
         struct LatticeProbeState {
             next_at: Instant,
             backoff_attempt: u32,
-            last_sides_held: Option<u8>,
+            last_sides: Option<LatticeSides>,
         }
         let mut lattice_probe = LatticeProbeState {
             next_at: self.time_source.now(),
             backoff_attempt: 0,
-            last_sides_held: None,
+            last_sides: None,
         };
         let mut zero_connections_since: Option<Instant> = None;
         // Track whether we've ever had ring connections. Before the first
@@ -5315,53 +5316,48 @@ impl Ring {
             // so it lands on the nearest UNCONNECTED peer and the terminus
             // installs the edge via the per-side clause in should_accept.
             //
-            // We probe only while a lattice side is UNFILLED and STOP once both
-            // sides hold a neighbor (`lattice_should_probe`). Continued probing to
-            // TIGHTEN a filled-but-loose edge toward the exact nearest was TRIED
-            // and MEASURED to churn connections and regress distant GET find-rate
-            // at low connection budgets (control-vs-fix sim): tightening competes
-            // for the scarce slots the long-range links need, and the extra
-            // route-to-self CONNECTs disrupt in-flight routing. So a filled edge
-            // may remain LOOSE (filled != exact-tight) and the residual gap is
-            // accepted; a strictly-closer peer that appears later is adopted
-            // PASSIVELY when its own discovery reaches this node, and a lost edge
-            // re-triggers probing immediately.
+            // CONTINUOUS, DECAYING discovery: the probe keeps firing even when both
+            // sides are filled, so a filled-but-loose edge tightens toward the TRUE
+            // nearest. `lattice_probe_progress` classifies the change since the last
+            // tick — an improvement (a side filled OR an edge tightened) or a
+            // regression (a side lost) resets the cadence to the aggressive tau0 and
+            // probes promptly, while a plateau (nothing closer found) lets the
+            // interval grow geometrically toward tau_max. The probe never goes
+            // silent; the effort decays as the peer converges (see the module-level
+            // discovery comment above).
             if self.connection_manager.nn_lattice_active() {
                 if let Some(me) = self.connection_manager.get_stored_location() {
                     let probe_now = self.time_source.now();
                     let succ = self.connection_manager.nearest_lattice_neighbor_dist(true);
                     let pred = self.connection_manager.nearest_lattice_neighbor_dist(false);
+                    let curr = LatticeSides { succ, pred };
                     let sides_held = u8::from(succ.is_some()) + u8::from(pred.is_some());
 
-                    let need_probe = lattice_should_probe(sides_held);
-
-                    // Improvement = a side newly FILLED since the previous tick.
-                    let improved = match lattice_probe.last_sides_held {
-                        Some(prev) => sides_held > prev,
-                        None => sides_held > 0,
-                    };
-                    if improved {
+                    // Classify the change since the previous tick: an IMPROVEMENT is
+                    // a side newly filled OR an already-held side whose nearest got
+                    // strictly closer (a successful tighten); a REGRESSION is a side
+                    // that was lost.
+                    let progress = lattice_probe_progress(lattice_probe.last_sides, curr);
+                    if progress.improved {
                         self.connection_manager.record_lattice_probe_improvement();
                     }
 
-                    // Regression (a side was lost) -> reset the backoff and probe
-                    // now to re-fill the empty slot immediately.
-                    if let Some(prev_sides) = lattice_probe.last_sides_held {
-                        if sides_held < prev_sides {
-                            lattice_probe.backoff_attempt = 0;
-                            lattice_probe.next_at = probe_now;
-                        }
+                    // An improvement or a lost edge resets the cadence to the
+                    // aggressive tau0 and probes promptly: a lost edge is a routing
+                    // dead-end to re-fill NOW, and an improvement means progress is
+                    // being made, so keep tightening aggressively (there may be an
+                    // even-closer neighbor still to find). A plateau leaves the
+                    // growing backoff untouched (see the fire site below).
+                    if progress.improved || progress.regressed {
+                        lattice_probe.backoff_attempt = 0;
+                        lattice_probe.next_at = probe_now;
                     }
 
-                    if need_probe && probe_now >= lattice_probe.next_at {
-                        // Stay aggressive (tau0) while probes keep filling sides;
-                        // back off toward tau_max for a side we currently cannot
-                        // reach any peer to fill.
-                        lattice_probe.backoff_attempt = if improved {
-                            0
-                        } else {
-                            lattice_probe.backoff_attempt.saturating_add(1)
-                        };
+                    // CONTINUOUS discovery: no sides-based stop condition — the only
+                    // gate is timing. The probe keeps firing (decayed toward tau_max
+                    // on a plateau) so a converged peer still re-checks and a
+                    // filled-but-loose edge keeps tightening toward the true nearest.
+                    if probe_now >= lattice_probe.next_at {
                         self.connection_manager.record_lattice_probe_issued();
 
                         pending_conn_adds.insert(me);
@@ -5371,6 +5367,10 @@ impl Ring {
                         let jitter = crate::config::GlobalRng::random_range(0.8..=1.2);
                         let interval = lattice_probe_backoff.delay(lattice_probe.backoff_attempt);
                         lattice_probe.next_at = probe_now + interval.mul_f64(jitter);
+                        // Grow the interval one step for the NEXT fire; an
+                        // improvement or a regression resets it back to 0 above.
+                        lattice_probe.backoff_attempt =
+                            lattice_probe.backoff_attempt.saturating_add(1);
 
                         tracing::debug!(
                             sides_held,
@@ -5381,10 +5381,10 @@ impl Ring {
                             "lattice discovery: queued route-to-self probe"
                         );
                     }
-                    // Record the observed side count each tick (whether or not we
-                    // probed) so the regression and improvement checks compare
-                    // against the latest reality on the next tick.
-                    lattice_probe.last_sides_held = Some(sides_held);
+                    // Record the observed per-side distances each tick (whether or
+                    // not we probed) so the next tick's progress check compares
+                    // against the latest reality.
+                    lattice_probe.last_sides = Some(curr);
                 }
             }
 
@@ -7998,61 +7998,196 @@ mod deferred_swap_drop_tests {
 ///
 /// If you add a new production time read, route it through
 /// `self.time_source.now()` rather than bumping this count.
-/// Whether the lattice discovery probe should fire this tick (subject to the
-/// caller's `now >= next_at` timing gate). Probe ONLY while a lattice side is
-/// UNFILLED, and STOP once both sides hold a neighbor. This is a deliberate
-/// choice: continued probing to TIGHTEN a filled-but-loose edge toward the exact
-/// nearest was measured to churn connections and regress distant GET find-rate at
-/// low connection budgets (see the maintenance-loop comment), so a filled edge is
-/// allowed to remain loose (filled != exact-tight). Extracted for deterministic
-/// CI coverage of the probe gating.
-pub(crate) fn lattice_should_probe(sides_held: u8) -> bool {
-    sides_held < 2
+/// Per-side nearest-neighbor lattice distances observed at a maintenance tick:
+/// the unsigned ring distance to the nearest connected successor / predecessor,
+/// or `None` when that side has no connected neighbor. Used by
+/// [`lattice_probe_progress`] to detect a fill OR a tighten between ticks.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LatticeSides {
+    pub succ: Option<f64>,
+    pub pred: Option<f64>,
+}
+
+/// Classification of the lattice change between two consecutive maintenance
+/// ticks, for the CONTINUOUS discovery backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LatticeProbeProgress {
+    /// A side was newly FILLED, or an already-held side's nearest neighbor got
+    /// strictly CLOSER (a successful tighten). Resets the probe backoff to tau0.
+    pub improved: bool,
+    /// A side was LOST (a held neighbor dropped, leaving the side empty). Resets
+    /// the backoff to tau0 and re-probes promptly to re-fill the dead-end.
+    pub regressed: bool,
+}
+
+/// Classify the lattice change between the previous tick's per-side nearest
+/// distances (`prev`, `None` on the first observation) and this tick's (`curr`),
+/// for CONTINUOUS discovery. An IMPROVEMENT — a side newly filled OR an
+/// already-held side whose nearest got strictly closer — keeps the probe
+/// aggressive; a REGRESSION — a side lost — re-probes promptly; a plateau
+/// (neither) lets the backoff decay toward tau_max. This is the tighten-aware
+/// replacement for the old fill-only STOP-when-filled gate: a filled side is no
+/// longer a stop condition, only a plateau input, so the probe keeps tightening
+/// a loose edge toward the peer's TRUE nearest ring neighbor.
+pub(crate) fn lattice_probe_progress(
+    prev: Option<LatticeSides>,
+    curr: LatticeSides,
+) -> LatticeProbeProgress {
+    let Some(prev) = prev else {
+        // First observation: any held side is a fill from the cold-start baseline.
+        return LatticeProbeProgress {
+            improved: curr.succ.is_some() || curr.pred.is_some(),
+            regressed: false,
+        };
+    };
+    // A side improved if it went empty -> held (a fill) or held -> strictly closer
+    // (a tighten). Distances are derived from fixed peer locations, so a side's
+    // nearest only changes when the connection set changes; a strict `<` is a real
+    // tighten, not float jitter.
+    let side_improved = |p: Option<f64>, c: Option<f64>| match (p, c) {
+        (None, Some(_)) => true,
+        (Some(pd), Some(cd)) => cd < pd,
+        _ => false,
+    };
+    let side_regressed = |p: Option<f64>, c: Option<f64>| matches!((p, c), (Some(_), None));
+    LatticeProbeProgress {
+        improved: side_improved(prev.succ, curr.succ) || side_improved(prev.pred, curr.pred),
+        regressed: side_regressed(prev.succ, curr.succ) || side_regressed(prev.pred, curr.pred),
+    }
 }
 
 #[cfg(test)]
 mod lattice_probe_state_machine_tests {
-    use super::lattice_should_probe;
+    use super::{LatticeSides, lattice_probe_progress};
     use crate::util::backoff::ExponentialBackoff;
     use std::time::Duration;
 
+    /// CONTINUOUS discovery has NO sides-based stop condition. A tick where both
+    /// sides are filled and UNCHANGED is a plateau (neither improved nor
+    /// regressed) — the backoff grows, but the probe still fires on timing, so
+    /// discovery never goes silent when both sides are filled. This is the
+    /// behavioral reversal of the old fill-only stop-when-filled gate.
     #[test]
-    fn should_probe_gating_stops_when_both_sides_filled() {
-        // An unfilled side probes.
-        assert!(lattice_should_probe(0));
-        assert!(lattice_should_probe(1));
-        // Both sides held: STOP (we do not chase exact-tightness — it regressed
-        // findability, see the maintenance loop).
-        assert!(!lattice_should_probe(2));
+    fn both_sides_filled_and_unchanged_is_a_plateau_not_a_stop() {
+        let both = LatticeSides {
+            succ: Some(0.05),
+            pred: Some(0.05),
+        };
+        let p = lattice_probe_progress(Some(both), both);
+        assert!(
+            !p.improved && !p.regressed,
+            "a steady filled state is a plateau, not a stop"
+        );
     }
 
-    /// The probe backoff uses the shared `ExponentialBackoff` (code-style: no
-    /// hand-rolled doubling). While a side stays unfillable, unproductive probes
-    /// grow the interval from tau0 toward the tau_max cap; a fill resets it to
-    /// tau0. This mirrors the maintenance-loop update rule.
+    /// A newly-filled side (empty -> held) is an improvement.
     #[test]
-    fn backoff_grows_to_tau_max_then_resets_on_fill() {
+    fn fill_is_an_improvement() {
+        let prev = LatticeSides {
+            succ: None,
+            pred: Some(0.1),
+        };
+        let curr = LatticeSides {
+            succ: Some(0.2),
+            pred: Some(0.1),
+        };
+        let p = lattice_probe_progress(Some(prev), curr);
+        assert!(p.improved && !p.regressed);
+    }
+
+    /// A TIGHTEN — an already-held side whose nearest gets strictly closer — is an
+    /// improvement. This is exactly the signal the fill-only probe ignored.
+    #[test]
+    fn tighten_of_a_filled_side_is_an_improvement() {
+        let prev = LatticeSides {
+            succ: Some(0.20),
+            pred: Some(0.10),
+        };
+        let curr = LatticeSides {
+            succ: Some(0.08),
+            pred: Some(0.10),
+        };
+        let p = lattice_probe_progress(Some(prev), curr);
+        assert!(
+            p.improved,
+            "a strictly-closer nearest on a filled side is an improvement"
+        );
+        assert!(!p.regressed);
+    }
+
+    /// A lost side (held -> empty) is a regression; re-widening a held side (a
+    /// farther nearest, e.g. the closest dropped and a farther one remains) is NOT
+    /// an improvement.
+    #[test]
+    fn lost_side_is_a_regression_and_widening_is_not_improvement() {
+        let prev = LatticeSides {
+            succ: Some(0.05),
+            pred: Some(0.05),
+        };
+        let lost = LatticeSides {
+            succ: None,
+            pred: Some(0.05),
+        };
+        let p = lattice_probe_progress(Some(prev), lost);
+        assert!(p.regressed && !p.improved);
+
+        let widened = LatticeSides {
+            succ: Some(0.30),
+            pred: Some(0.05),
+        };
+        let p2 = lattice_probe_progress(Some(prev), widened);
+        assert!(
+            !p2.improved && !p2.regressed,
+            "a farther nearest on a still-held side is a plateau, not an improvement"
+        );
+    }
+
+    /// First observation: any held side counts as a fill from the cold baseline;
+    /// nothing held is a plateau.
+    #[test]
+    fn first_observation_classification() {
+        let held = LatticeSides {
+            succ: Some(0.3),
+            pred: None,
+        };
+        let p = lattice_probe_progress(None, held);
+        assert!(p.improved && !p.regressed);
+
+        let empty = LatticeSides {
+            succ: None,
+            pred: None,
+        };
+        let p0 = lattice_probe_progress(None, empty);
+        assert!(!p0.improved && !p0.regressed);
+    }
+
+    /// The probe backoff uses the shared `ExponentialBackoff` and DECAYS toward
+    /// tau_max on a plateau, never stopping. The maintenance loop grows the attempt
+    /// one step per fire and resets it to 0 on an improvement/regression; mirror
+    /// that rule here and assert the interval is always finite (the probe keeps
+    /// firing — continuous, never silent), monotonic, and floored at tau_max.
+    #[test]
+    fn backoff_decays_to_tau_max_and_never_stops() {
         let tau0 = Duration::from_secs(5);
         let tau_max = Duration::from_secs(300);
         let backoff = ExponentialBackoff::new(tau0, tau_max);
         assert_eq!(backoff.delay(0), tau0, "attempt 0 probes at tau0");
 
-        // A chain of unproductive probes for an unfillable side (still probing,
-        // sides_held < 2) grows the attempt until the interval saturates at
-        // tau_max. Bounded, monotonic, capped.
         let mut attempt: u32 = 0;
         let mut last = Duration::ZERO;
         for _ in 0..20 {
             let d = backoff.delay(attempt);
             assert!(d >= last, "interval is monotonic non-decreasing");
-            assert!(d <= tau_max, "interval never exceeds tau_max");
+            assert!(d <= tau_max, "interval floors at tau_max, never longer");
             last = d;
             attempt = attempt.saturating_add(1);
         }
-        assert_eq!(last, tau_max, "the backoff saturates at tau_max");
+        assert_eq!(
+            last, tau_max,
+            "the backoff saturates at (floors at) tau_max"
+        );
 
-        // A fill resets the attempt to tau0 (aggressive re-probe of the other
-        // still-empty side).
+        // An improvement or a lost edge resets the attempt to 0 -> aggressive tau0.
         assert_eq!(backoff.delay(0), tau0);
     }
 }

@@ -803,18 +803,17 @@ impl ConnectionManager {
         // are required for the closed undirected cycle greedy-to-closest needs.
         //
         // Under `max_connections` this fires for a fill OR a tighten (bypassing
-        // Kleinberg, no displacement). AT/OVER max it is restricted to FILLING an
-        // empty side (a genuine routing dead-end), up to the bounded ceiling
+        // Kleinberg, no displacement). AT/OVER max a strictly-closer per-side
+        // nearest (tighten OR fill) is admitted up to the bounded ceiling
         // `max_connections + LATTICE_OVERMAX_SLACK` — see
-        // `admits_lattice_edge_over_cap`. A fill over max displaces one long link
-        // (the over-max prune in topology.rs then drops a farther, non-lattice
-        // connection — never a protected lattice edge). A mere TIGHTEN is NOT
-        // force-accepted over max: displacing a long link for a marginal locality
-        // gain measurably regresses distant GET routing at low budgets, so a
-        // tighten waits for an under-max slot. Self-bounding on each side: it
-        // fires only for a candidate closer than every current connection on that
-        // side, a strictly decreasing sequence, so it cannot admit an unbounded
-        // stream.
+        // `admits_lattice_edge_over_cap`. Admitting over max displaces one long
+        // link (the over-max prune in topology.rs then drops a farther,
+        // non-lattice connection — never a protected lattice edge). TIGHTENING at
+        // capacity is deliberate: the lattice continuously pulls each peer toward
+        // its TRUE nearest ring neighbors, not just filling empty sides.
+        // Self-bounding on each side: it fires only for a candidate closer than
+        // every current connection on that side, a strictly decreasing sequence,
+        // so it cannot admit an unbounded stream.
         //
         // SECURITY (eclipse) — DISCLOSED and ACCEPTED tradeoff: this makes
         // per-side nearest admission DETERMINISTIC (pre-lattice a very-close peer
@@ -969,16 +968,15 @@ impl ConnectionManager {
         // Nearest-neighbor lattice force-accept (mechanism 3). A new per-side
         // nearest neighbor is admitted regardless of the Kleinberg verdict. UNDER
         // max this admits a fill OR a tighten (no displacement, just bypassing
-        // Kleinberg). AT/OVER max, force-accept is restricted to FILLING an empty
-        // side (a genuine dead-end) within the ceiling — a mere tighten waits for
-        // an under-max slot rather than displacing a long link (see
+        // Kleinberg). AT/OVER max, a strictly-closer per-side nearest (tighten OR
+        // fill) is admitted within the over-cap ceiling, displacing a non-lattice
+        // long link on the next over-max prune tick (see
         // `admits_lattice_edge_over_cap`).
         let accepted = accepted
             || (nn_override && total_conn < self.max_connections)
-            // Exclude THIS candidate's just-inserted reservation (added above) so
-            // the reservation-aware per-side concurrency bound counts only OTHER
-            // in-flight fills (F1).
-            || self.admits_lattice_edge_over_cap(location, Some(addr));
+            // At/over max, admit a strictly-closer per-side nearest (tighten OR
+            // fill) within the over-cap ceiling.
+            || self.admits_lattice_edge_over_cap(location);
         tracing::debug!(
             addr = %addr,
             peer_location = %location,
@@ -1103,26 +1101,22 @@ impl ConnectionManager {
         nn_lattice_active_for(self.max_connections)
     }
 
-    /// Whether a candidate at `loc` would FILL an EMPTY per-side lattice slot: it
-    /// is on a ring side (successor if higher location wrapping, predecessor if
-    /// lower) that currently has NO connected neighbor at all. This is the strict
-    /// subset of "new per-side nearest" that closes a genuine routing dead-end
-    /// (no connected neighbor closer to the key on that side), as opposed to
-    /// merely TIGHTENING an already-held side. Only a fill justifies displacing a
-    /// long link over the `max_connections` cap; see
-    /// [`Self::admits_lattice_edge_over_cap`].
-    // Production now runs the fill check under a held write guard via
-    // `would_fill_empty_lattice_side_in` (see `admits_lattice_edge_over_cap_in`),
-    // so this fresh-read-lock wrapper is exercised only by unit tests. Kept for
-    // the test API and for symmetry with `nearest_lattice_neighbor_dist`.
-    #[allow(dead_code)]
-    pub(crate) fn would_fill_empty_lattice_side(&self, loc: Location) -> bool {
-        self.would_fill_empty_lattice_side_in(&self.connections_by_location.read(), loc)
-    }
-
-    /// [`Self::would_fill_empty_lattice_side`] against an ALREADY-HELD
-    /// `connections_by_location` map (see [`Self::nearest_lattice_neighbor_dist_in`]).
-    fn would_fill_empty_lattice_side_in(
+    /// Whether a candidate at `loc` would become this peer's new NEAREST connected
+    /// neighbor on its own ring side — strictly closer to own location than the
+    /// current per-side nearest. An EMPTY side is the degenerate case (current
+    /// nearest = +inf), so this test also covers the FILL case: a fill is just the
+    /// tighten where there was nothing to tighten against.
+    ///
+    /// This is the "tighten OR fill" predicate that TIGHTENING-AT-CAPACITY needs
+    /// (see [`Self::admits_lattice_edge_over_cap`]): the lattice must continuously
+    /// pull each peer toward its TRUE nearest ring neighbors, not merely fill empty
+    /// sides. The former-nearest is demoted automatically — the reserved slot is
+    /// derived on demand from the live connection set
+    /// ([`Self::nearest_lattice_neighbor_dist_in`]), so once the strictly-closer
+    /// candidate connects it IS the new per-side nearest and the superseded peer
+    /// falls back into the ordinary long-link pool (the topology retention
+    /// exemption then protects the new nearest, not the old one).
+    fn is_strictly_closer_lattice_edge_in(
         &self,
         connections: &BTreeMap<Location, Vec<Connection>>,
         loc: Location,
@@ -1135,28 +1129,32 @@ impl ConnectionManager {
         };
         let sd = me.signed_distance(loc);
         if sd == 0.0 {
+            // A candidate exactly at own location is on neither side.
             return false;
         }
         let successor_side = sd > 0.0;
-        // The side currently holds NO connected neighbor (an empty lattice slot).
-        self.nearest_lattice_neighbor_dist_in(connections, successor_side)
-            .is_none()
+        let current_nearest = self
+            .nearest_lattice_neighbor_dist_in(connections, successor_side)
+            .unwrap_or(f64::INFINITY);
+        sd.abs() < current_nearest
     }
 
     /// Whether a candidate at `loc` may be admitted even though the node is at or
-    /// over `max_connections`. Over-cap admission is restricted to FILLING an
-    /// EMPTY per-side lattice slot ([`Self::would_fill_empty_lattice_side`]) —
-    /// closing a genuine routing dead-end — within the absolute over-max ceiling
-    /// (`max_connections + LATTICE_OVERMAX_SLACK`).
+    /// over `max_connections`. Over-cap admission fires for any candidate that
+    /// would become this peer's new per-side NEAREST ring neighbor — a TIGHTEN of
+    /// an already-held side OR a FILL of an empty one
+    /// ([`Self::is_strictly_closer_lattice_edge_in`]) — within the absolute
+    /// over-max ceiling (`max_connections + LATTICE_OVERMAX_SLACK`).
     ///
-    /// A mere TIGHTEN of an already-filled side is deliberately NOT admitted over
-    /// the cap: it would displace a long-range link for only a marginal locality
-    /// gain, and stripping long links measurably regresses distant GET routing at
-    /// low connection budgets (validated in the control-vs-fix sim — activating an
-    /// unconditional over-cap displacement dropped mean GET find-rate at
-    /// max_connections=5). Tightening therefore waits for a slot UNDER max;
-    /// over-max displacement is reserved for the dead-end case that motivated
-    /// mechanism 3 (invariant 5, findability).
+    /// TIGHTENING-AT-CAPACITY (the mechanism this predicate exists for): the
+    /// lattice must CONTINUOUSLY pull each peer toward its TRUE nearest ring
+    /// neighbors, not merely fill empty sides. A strictly-closer arrival at
+    /// capacity is admitted over the cap; it becomes the new per-side nearest (the
+    /// reserved slot is derived on demand, so the superseded former-nearest
+    /// demotes into the long-link pool automatically), and the topology
+    /// maintenance loop's over-max prune sheds the least-valuable NON-lattice long
+    /// link next tick (`topology.rs`; protected lattice edges are never the prune
+    /// victim), bringing the node back to `max_connections`.
     ///
     /// This is the SINGLE over-cap admission predicate shared by every gate that
     /// can add a ring connection: `should_accept`, the two connection-lifecycle
@@ -1164,32 +1162,24 @@ impl ConnectionManager {
     /// [`Self::add_connection`]. Keeping the decision in one place is deliberate —
     /// before it was wired through the lifecycle gates, mechanism 3's over-cap
     /// displacement was inert on the real CONNECT path (the gates rejected at
-    /// `>= max_connections` first). The ceiling bounds the over-max excess (see
-    /// [`LATTICE_OVERMAX_SLACK`]); with fill-only admission the excess is at most
-    /// the number of empty sides (<= 2), so the ceiling is a defensive transient
-    /// bound rather than a frequently-binding limit.
+    /// `>= max_connections` first).
     ///
-    /// RESERVATION-AWARE (F1): the fill decision reads the ESTABLISHED connection
-    /// set only (`would_fill_empty_lattice_side`), so without this it would
-    /// re-fire for EVERY concurrent candidate on the same empty side — a full node
-    /// with an empty side would force-accept + reserve + NAT-complete all of them,
-    /// piling several over-cap fills onto one side. We therefore also require that
-    /// no OTHER in-flight pending reservation already targets that side
-    /// ([`Self::pending_reservation_on_side`]), bounding concurrent over-cap fills
-    /// to ONE per side. `exclude_addr` is the candidate under evaluation, whose own
-    /// reservation `should_accept`/`add_connection` may have already inserted;
-    /// pass `Some(addr)` so it is not counted against itself (`None` when there is
-    /// no such self-reservation to exclude).
-    pub(crate) fn admits_lattice_edge_over_cap(
-        &self,
-        loc: Location,
-        exclude_addr: Option<SocketAddr>,
-    ) -> bool {
-        self.admits_lattice_edge_over_cap_in(
-            &self.connections_by_location.read(),
-            loc,
-            exclude_addr,
-        )
+    /// SELF-BOUNDING (why no reservation-aware clause is needed): each accepted
+    /// over-cap candidate ADVANCES the per-side current-nearest, so a following
+    /// candidate must be strictly closer STILL to be admitted — the admitted
+    /// sequence on one side is strictly decreasing in distance (a short records
+    /// chain, O(log) expected), and the absolute ceiling
+    /// ([`LATTICE_OVERMAX_SLACK`]) hard-bounds the ESTABLISHED set regardless. The
+    /// earlier F1 reservation-aware clause (bounding concurrent over-cap fills to
+    /// one per empty side) was DROPPED: its concern was a concurrent fill flood on
+    /// an EMPTY side of a FULL node — a near-non-case (a node at 200 connections
+    /// essentially always has both ring sides populated) — and the ceiling already
+    /// hard-bounds the established set. Any residual reservation/NAT pile-up
+    /// degrades to the generic connection-flood case (bounded by
+    /// `PENDING_RESERVATION_TTL` and per-target connection backoff), not an
+    /// unbounded lattice-specific path.
+    pub(crate) fn admits_lattice_edge_over_cap(&self, loc: Location) -> bool {
+        self.admits_lattice_edge_over_cap_in(&self.connections_by_location.read(), loc)
     }
 
     /// [`Self::admits_lattice_edge_over_cap`] evaluated against an ALREADY-HELD
@@ -1197,53 +1187,16 @@ impl ConnectionManager {
     /// count-check under the SAME write guard that performs the insert. This is
     /// what makes the over-cap ceiling (`max_connections + LATTICE_OVERMAX_SLACK`)
     /// a HARD invariant under concurrent adds rather than a racy check-then-insert
-    /// (F4). `connections` is the held map; the fill check and the count both read
-    /// it directly. `pending_reservation_on_side` takes its own `pending_reservations`
-    /// read lock, which is lock #3 — acquired AFTER `connections_by_location` (#2),
-    /// consistent with the documented lock ordering, so holding the write guard
-    /// across this call cannot deadlock.
+    /// (F4). `connections` is the held map; the strict-closer check and the count
+    /// both read it directly, no re-locking.
     fn admits_lattice_edge_over_cap_in(
         &self,
         connections: &BTreeMap<Location, Vec<Connection>>,
         loc: Location,
-        exclude_addr: Option<SocketAddr>,
     ) -> bool {
         let count: usize = connections.values().map(|conns| conns.len()).sum();
-        self.would_fill_empty_lattice_side_in(connections, loc)
+        self.is_strictly_closer_lattice_edge_in(connections, loc)
             && count < self.max_connections + LATTICE_OVERMAX_SLACK
-            && !self.pending_reservation_on_side(loc, exclude_addr)
-    }
-
-    /// Whether any OTHER TTL-valid pending reservation already targets the same
-    /// ring side as `loc` (successor vs predecessor, relative to own location),
-    /// ignoring `exclude_addr` (the candidate currently under evaluation, whose
-    /// own reservation the caller has already inserted). Used by
-    /// [`Self::admits_lattice_edge_over_cap`] to bound concurrent over-cap lattice
-    /// fills to one per side (F1). Returns `false` (nothing blocks) when own
-    /// location is unknown or `loc` sits exactly on own location.
-    fn pending_reservation_on_side(&self, loc: Location, exclude_addr: Option<SocketAddr>) -> bool {
-        let Some(me) = self.get_stored_location() else {
-            return false;
-        };
-        let sd = me.signed_distance(loc);
-        if sd == 0.0 {
-            return false;
-        }
-        let successor_side = sd > 0.0;
-        let now = Instant::now();
-        self.pending_reservations
-            .read()
-            .iter()
-            .any(|(resv_addr, (resv_loc, created))| {
-                if Some(*resv_addr) == exclude_addr {
-                    return false;
-                }
-                if now.duration_since(*created) > PENDING_RESERVATION_TTL {
-                    return false;
-                }
-                let rsd = me.signed_distance(*resv_loc);
-                rsd != 0.0 && (rsd > 0.0) == successor_side
-            })
     }
 
     /// Record the advertised location for a peer that we have decided to accept.
@@ -1744,9 +1697,9 @@ impl ConnectionManager {
         // event-loop task so the race never fired, but holding the guard across
         // the whole decision makes the bound hold regardless. Lock ordering is
         // preserved: `location_for_peer` (lock #1) is inserted above and rolled
-        // back below OUTSIDE this guard (never acquired while it is held), and
-        // `pending_reservation_on_side` acquires `pending_reservations` (#3) AFTER
-        // `connections_by_location` (#2).
+        // back below OUTSIDE this guard (never acquired while it is held); the
+        // over-cap admission check reads only the already-held
+        // `connections_by_location` map (#2), taking no further lock.
         let count_after = {
             let mut cbl = self.connections_by_location.write();
 
@@ -1787,10 +1740,12 @@ impl ConnectionManager {
             // true relocation (net-zero) does not change the count and is exempt.
             let current: usize = cbl.values().map(|conns| conns.len()).sum();
             if !removed_established && current >= self.max_connections {
-                // Exclude this candidate's own reservation (still present here — it
-                // is pruned only in the reject branch below) from the
-                // reservation-aware per-side concurrency bound (F1).
-                if self.admits_lattice_edge_over_cap_in(&cbl, loc, Some(addr)) {
+                // Admit a strictly-closer per-side nearest (tighten OR fill) within
+                // the over-cap ceiling; the over-max prune sheds a non-lattice long
+                // link next tick and the superseded former-nearest demotes into the
+                // long-link pool automatically (the reserved slot is derived on
+                // demand from the live connection set).
+                if self.admits_lattice_edge_over_cap_in(&cbl, loc) {
                     tracing::debug!(
                         addr = %addr,
                         peer_location = %loc,
@@ -2996,20 +2951,25 @@ mod tests {
         );
     }
 
-    /// Mechanism 3 over-cap admission is FILL-ONLY: a candidate that FILLS an
-    /// empty per-side lattice slot (a genuine routing dead-end) is admitted over
-    /// max (displacing a long link), but a mere TIGHTEN of an already-filled side
-    /// is NOT — it waits for an under-max slot rather than stripping a long link.
-    /// The absolute ceiling still bounds the (fill-only) over-max excess.
+    /// Mechanism 3, TIGHTENING-AT-CAPACITY (the core guard): a peer AT capacity
+    /// ACQUIRES a strictly-closer per-side nearest by admitting it over the cap.
+    /// The former nearest is demoted automatically (the reserved slot is derived
+    /// on demand, so `nearest_lattice_neighbor_dist` immediately reports the closer
+    /// arrival and the superseded peer becomes an ordinary long link — pruned by
+    /// the over-max prune in topology.rs, tested there). The absolute ceiling
+    /// (`max_connections + LATTICE_OVERMAX_SLACK`) hard-bounds the transient
+    /// excess even against an ever-closer stream. Reverses the earlier fill-only
+    /// restriction: the lattice must continuously pull toward the TRUE nearest.
     #[test]
-    fn add_connection_admits_lattice_fill_over_max_not_tighten() {
+    fn add_connection_admits_lattice_tighten_over_max_bounded_by_ceiling() {
         set_nn_lattice_enabled(true);
         let max = 3usize;
         let cm = make_connection_manager(None, 2, max, false);
         cm.update_location(Some(Location::new(0.5)));
         assert_eq!(cm.get_stored_location(), Some(Location::new(0.5)));
         let kp = TransportKeypair::new();
-        // Fill the SUCCESSOR side to max; the PREDECESSOR side stays empty.
+        let approx = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+        // Fill the SUCCESSOR side to max (nearest successor is 0.60, dist 0.10).
         for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
             cm.add_connection(
                 Location::new(l),
@@ -3023,8 +2983,12 @@ mod tests {
             max,
             "filled to max on the successor side"
         );
-        // A strictly-closer SUCCESSOR is a TIGHTEN of an already-filled side ->
-        // NOT admitted over max (would strip a long link for marginal gain).
+        assert!(
+            approx(cm.nearest_lattice_neighbor_dist(true), 0.10),
+            "nearest successor starts at dist 0.10 (loc 0.60)"
+        );
+        // A strictly-closer SUCCESSOR (0.55, dist 0.05) is a TIGHTEN of an
+        // already-filled side -> now ACQUIRED over max (was rejected as fill-only).
         let tighten = cm.add_connection(
             Location::new(0.55),
             make_addr(8220),
@@ -3032,55 +2996,77 @@ mod tests {
             false,
         );
         assert!(
-            !tighten,
-            "a tighten of a filled side must be rejected over max"
-        );
-        assert_eq!(cm.connection_count(), max);
-        // A PREDECESSOR candidate FILLS the empty predecessor side (a dead-end) ->
-        // admitted over max, displacing a long link.
-        let fill = cm.add_connection(
-            Location::new(0.45),
-            make_addr(8230),
-            kp.public().clone(),
-            false,
-        );
-        assert!(
-            fill,
-            "filling an empty lattice side must be admitted over max"
+            tighten,
+            "a strictly-closer tighten must be acquired over max"
         );
         assert_eq!(
             cm.connection_count(),
             max + 1,
             "over max by 1 until the over-max prune tick restores it"
         );
-        // Both sides are now filled: a farther non-lattice peer AND a further
-        // tighten of the predecessor side are both rejected over max, so the count
-        // stays bounded (no further fills are possible — only two sides exist).
-        let farther = cm.add_connection(
-            Location::new(0.85),
-            make_addr(8240),
-            kp.public().clone(),
-            false,
+        assert!(
+            approx(cm.nearest_lattice_neighbor_dist(true), 0.05),
+            "the closer 0.55 is now the nearest successor (former 0.60 demoted, still connected)"
         );
-        assert!(!farther, "a farther non-lattice peer is rejected over max");
-        let tighten_pred = cm.add_connection(
-            Location::new(0.48),
-            make_addr(8250),
+        // An even-closer successor (0.53, dist 0.03) tightens again -> reaches the
+        // over-max ceiling (max + LATTICE_OVERMAX_SLACK).
+        let tighten2 = cm.add_connection(
+            Location::new(0.53),
+            make_addr(8221),
             kp.public().clone(),
             false,
         );
         assert!(
-            !tighten_pred,
-            "a tighten of the now-filled predecessor side is rejected over max"
+            tighten2,
+            "a second strictly-closer tighten is acquired within the slack"
         );
-        assert_eq!(cm.connection_count(), max + 1, "count stays bounded");
+        assert_eq!(
+            cm.connection_count(),
+            max + LATTICE_OVERMAX_SLACK,
+            "at the over-max ceiling"
+        );
+        assert!(
+            approx(cm.nearest_lattice_neighbor_dist(true), 0.03),
+            "0.53 is now the nearest successor"
+        );
+        // The ceiling HARD-bounds further admits: an even-closer 0.52 is strictly
+        // closer STILL but REFUSED because the count is already at the ceiling.
+        let over_ceiling = cm.add_connection(
+            Location::new(0.52),
+            make_addr(8222),
+            kp.public().clone(),
+            false,
+        );
+        assert!(
+            !over_ceiling,
+            "an admit past the ceiling is refused even if strictly closer"
+        );
+        assert_eq!(
+            cm.connection_count(),
+            max + LATTICE_OVERMAX_SLACK,
+            "ceiling held: count never exceeds max + LATTICE_OVERMAX_SLACK"
+        );
+        // A FILL of the still-empty predecessor side is only refused here because
+        // the ceiling is saturated — subsumption of fill by strict-closer is
+        // covered by `admits_lattice_edge_over_cap_predicate`.
+        let pred_fill = cm.add_connection(
+            Location::new(0.45),
+            make_addr(8223),
+            kp.public().clone(),
+            false,
+        );
+        assert!(
+            !pred_fill,
+            "even a fill is refused once the ceiling is saturated"
+        );
     }
 
-    /// The SINGLE over-cap admission predicate `admits_lattice_edge_over_cap` is
-    /// FILL-ONLY and is the exact decision both connection-lifecycle promotion
+    /// The SINGLE over-cap admission predicate `admits_lattice_edge_over_cap`
+    /// admits any strictly-closer per-side nearest — a TIGHTEN of a filled side OR
+    /// a FILL of an empty one — within the over-max ceiling. A candidate no closer
+    /// than the current per-side nearest (a farther non-lattice peer) is never
+    /// admissible. It is the exact decision both connection-lifecycle promotion
     /// gates apply on the real CONNECT path (see the source-scrape pin below).
-    /// Filling an empty side is admissible over cap; a tighten of a filled side
-    /// and a farther non-lattice peer are not.
     #[test]
     fn admits_lattice_edge_over_cap_predicate() {
         set_nn_lattice_enabled(true);
@@ -3088,7 +3074,8 @@ mod tests {
         let cm = make_connection_manager(None, 2, max, false);
         cm.update_location(Some(Location::new(0.5)));
         let kp = TransportKeypair::new();
-        // Successor side filled to the cap; predecessor side empty.
+        // Successor side filled to the cap; predecessor side empty. Nearest
+        // successor is 0.60 (dist 0.10).
         for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
             cm.add_connection(
                 Location::new(l),
@@ -3098,116 +3085,54 @@ mod tests {
             );
         }
         assert_eq!(cm.connection_count(), max, "at the cap");
-        // Filling the EMPTY predecessor side is admissible over the cap. No
-        // competing reservation (`None`), so the reservation-aware bound is a
-        // no-op here.
+        // FILLING the EMPTY predecessor side is admissible over the cap (the
+        // degenerate strict-closer case: current nearest = +inf).
         assert!(
-            cm.admits_lattice_edge_over_cap(Location::new(0.45), None),
+            cm.admits_lattice_edge_over_cap(Location::new(0.45)),
             "filling an empty lattice side is admissible over the cap"
         );
+        // TIGHTENING the already-filled successor side (0.55, dist 0.05, strictly
+        // closer than the current nearest 0.60/dist 0.10) is NOW admissible over
+        // the cap — the lattice continuously pulls toward the true nearest.
         assert!(
-            cm.would_fill_empty_lattice_side(Location::new(0.45)),
-            "the predecessor side is empty"
+            cm.admits_lattice_edge_over_cap(Location::new(0.55)),
+            "a strictly-closer tighten of a filled side is admissible over the cap"
         );
-        // A TIGHTEN of the already-filled successor side is NOT admissible over
-        // the cap (it waits for an under-max slot).
+        // A successor NO closer than the current nearest is a farther non-lattice
+        // peer — never admissible over the cap.
         assert!(
-            !cm.admits_lattice_edge_over_cap(Location::new(0.55), None),
-            "a tighten of a filled side is not admissible over the cap"
+            !cm.admits_lattice_edge_over_cap(Location::new(0.65)),
+            "a successor farther than the current nearest (0.60) is not admissible"
         );
         assert!(
-            !cm.would_fill_empty_lattice_side(Location::new(0.55)),
-            "the successor side is not empty"
-        );
-        // A farther non-lattice peer is not admissible over the cap.
-        assert!(
-            !cm.admits_lattice_edge_over_cap(Location::new(0.95), None),
-            "a farther non-lattice peer is not admissible over the cap"
+            !cm.admits_lattice_edge_over_cap(Location::new(0.95)),
+            "a far non-lattice peer is not admissible over the cap"
         );
         // Disabling the lattice makes the predicate a no-op.
         set_nn_lattice_enabled(false);
-        assert!(!cm.admits_lattice_edge_over_cap(Location::new(0.45), None));
-        set_nn_lattice_enabled(true);
-    }
-
-    /// F1 regression: the over-cap lattice admission is RESERVATION-AWARE, so a
-    /// full node with an empty lattice side cannot force-accept EVERY concurrent
-    /// candidate on that side — a pending reservation already targeting the side
-    /// blocks a second concurrent over-cap fill (bounding concurrent fills to one
-    /// per side). `exclude_addr` skips the candidate's own reservation.
-    #[test]
-    fn admits_lattice_over_cap_is_reservation_aware() {
-        set_nn_lattice_enabled(true);
-        let max = 3usize;
-        let cm = make_connection_manager(None, 2, max, false);
-        cm.update_location(Some(Location::new(0.5)));
-        let kp = TransportKeypair::new();
-        // Successor side filled to the cap; predecessor side empty.
-        for (i, l) in [0.60_f64, 0.70, 0.80].into_iter().enumerate() {
-            cm.add_connection(
-                Location::new(l),
-                make_addr(8410 + i as u16),
-                kp.public().clone(),
-                false,
-            );
-        }
-        assert_eq!(cm.connection_count(), max, "at the cap");
-        let pred = Location::new(0.45);
-        // With no competing reservation, filling the empty predecessor side is
-        // admissible over the cap.
-        assert!(
-            cm.admits_lattice_edge_over_cap(pred, None),
-            "a fill with no competing reservation is admissible"
-        );
-        // A concurrent pending reservation ALREADY targeting the predecessor side
-        // blocks a second over-cap fill on that side.
-        let other = make_addr(8420);
-        cm.pending_reservations
-            .write()
-            .insert(other, (Location::new(0.47), Instant::now()));
-        assert!(
-            !cm.admits_lattice_edge_over_cap(pred, None),
-            "a competing predecessor-side reservation blocks a concurrent fill"
-        );
-        // Excluding that reservation (as when it IS the candidate itself)
-        // re-admits — self must not block itself.
-        assert!(
-            cm.admits_lattice_edge_over_cap(pred, Some(other)),
-            "excluding the candidate's own reservation re-admits the fill"
-        );
-        // A reservation on the OTHER (successor) side does not block a predecessor
-        // fill — the bound is strictly per-side.
-        cm.pending_reservations.write().clear();
-        cm.pending_reservations
-            .write()
-            .insert(make_addr(8430), (Location::new(0.65), Instant::now()));
-        assert!(
-            cm.admits_lattice_edge_over_cap(pred, None),
-            "a reservation on the opposite side does not block a predecessor fill"
-        );
+        assert!(!cm.admits_lattice_edge_over_cap(Location::new(0.45)));
         set_nn_lattice_enabled(true);
     }
 
     /// Source-scrape pin (B1 regression guard): BOTH connection-lifecycle
     /// promotion gates must apply the shared `admits_lattice_edge_over_cap`
-    /// exception (reservation-aware, so they pass the candidate's `peer_addr` to
-    /// exclude its own reservation) to their `>= max_connections` reject. Without
-    /// this a lattice edge is silently dropped at the cap on the real CONNECT path
-    /// and mechanism 3's at-capacity displacement is inert — the exact defect the
-    /// external review caught (the over-max unit test passed only because it
-    /// bypassed the gate). If a future refactor drops the exception from a gate,
-    /// this fails instead of silently regressing.
+    /// exception to their `>= max_connections` reject. Without this a lattice edge
+    /// is silently dropped at the cap on the real CONNECT path and mechanism 3's
+    /// at-capacity displacement is inert — the exact defect the external review
+    /// caught (the over-max unit test passed only because it bypassed the gate).
+    /// If a future refactor drops the exception from a gate, this fails instead of
+    /// silently regressing.
     #[test]
     fn lifecycle_gates_apply_lattice_over_cap_predicate() {
         const LIFECYCLE_SRC: &str =
             include_str!("../node/network_bridge/p2p_protoc/connection_lifecycle.rs");
         let hits = LIFECYCLE_SRC
-            .matches("admits_lattice_edge_over_cap(loc, Some(peer_addr))")
+            .matches("admits_lattice_edge_over_cap(loc)")
             .count();
         assert!(
             hits >= 2,
             "both lifecycle promotion cap-gates must apply \
-             admits_lattice_edge_over_cap(loc, Some(peer_addr)); found {hits} call site(s)"
+             admits_lattice_edge_over_cap(loc); found {hits} call site(s)"
         );
     }
 

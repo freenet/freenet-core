@@ -34,10 +34,11 @@ WHEN accepting a new connection (should_accept):
       See PR #3621, which replaced the TTL halving from PR #3582.
   2. CHECK: Are we at max_connections (open + pending)? → REJECT
      EXCEPTION (nearest-neighbor lattice, mechanism 3): a candidate that
-     would become this peer's new per-side NEAREST ring neighbor (its
-     successor or predecessor lattice edge) is force-accepted even at/over
-     max, up to a HARD over-max ceiling (max_connections +
-     LATTICE_OVERMAX_SLACK). It displaces a farther non-lattice long link,
+     would become this peer's new per-side NEAREST ring neighbor — a TIGHTEN
+     of an already-held side OR a FILL of an empty one (any strictly-closer
+     successor or predecessor) — is force-accepted even at/over max, up to a
+     HARD over-max ceiling (max_connections + LATTICE_OVERMAX_SLACK). It
+     displaces a farther non-lattice long link,
      which the topology maintenance loop's over-max prune sheds next tick
      (protected lattice edges are never the prune victim). Applied via the
      shared predicate admits_lattice_edge_over_cap() in should_accept, in
@@ -59,11 +60,21 @@ WHEN accepting a new connection (should_accept):
      ConnectionManager::nn_lattice_active(); the test-only override that flips
      the stock/fix validation arm also force-activates below the floor (so the
      dedicated benefit tests exercise the ON path at max=5).
-     RESERVATION-AWARE over-cap admission: admits_lattice_edge_over_cap also
-     refuses to force-accept a fill when another in-flight pending reservation
-     already targets the same empty side, bounding concurrent over-cap fills to
-     ONE per side (otherwise a full node force-accepts EVERY concurrent
-     candidate on an empty side).
+     TIGHTENING-AT-CAPACITY: over-cap admission fires for any strictly-closer
+     per-side nearest — a TIGHTEN of an already-held side OR a FILL of an empty
+     one — so the lattice CONTINUOUSLY pulls each peer toward its true nearest
+     ring neighbors, not merely filling empty sides. The superseded
+     former-nearest demotes into the long-link pool automatically (the reserved
+     slot is derived on demand from the live connection set). No reservation-aware
+     clause: each admitted candidate ADVANCES the per-side current-nearest, so the
+     admitted sequence is strictly decreasing (a short records chain) and the
+     absolute ceiling already hard-bounds the ESTABLISHED set; the earlier F1
+     one-fill-per-side clause was DROPPED (its concern was a concurrent fill flood
+     on an EMPTY side of a FULL node — a near-non-case, since a node at max almost
+     always has both ring sides populated). The route-to-self discovery probe
+     likewise runs CONTINUOUSLY (decaying toward tau_max, never stopping when both
+     sides are filled) so a filled-but-loose edge keeps tightening. See
+     connection_manager.rs and ring.rs.
   3. Compute Kleinberg gap score (small_world_rand::kleinberg_score):
      → Map all connection distances to log-space (1/d = uniform in log)
      → Score = min distance to nearest neighbor in log-space
