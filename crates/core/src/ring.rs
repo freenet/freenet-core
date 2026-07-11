@@ -85,6 +85,14 @@ mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
 pub(crate) use connection_manager::ConnectionManager;
+// Nearest-neighbor ring lattice (successor+predecessor base edges). The
+// predicate is `pub(crate)` for the acceptance clause, the discovery probe, and
+// the retention path (`crate::topology`). The setter is `pub` so `dev_tool` can
+// flip the stock/fix arm from the findability validation harness; it is a
+// no-op-in-production, test-only override (see the module docs).
+pub(crate) use connection_manager::nn_lattice_enabled;
+#[cfg(any(test, feature = "testing"))]
+pub use connection_manager::set_nn_lattice_enabled;
 mod connection;
 mod hosting;
 pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
@@ -4546,6 +4554,36 @@ impl Ring {
         /// Max time to hold a deferred swap drop before abandoning it.
         const DEFERRED_SWAP_DROP_TTL: Duration = Duration::from_secs(120);
 
+        // --- Nearest-neighbor lattice discovery (route-to-self probe) ---
+        //
+        // Mechanism 2: to seek/tighten the guaranteed successor+predecessor edges,
+        // periodically route a self-targeted CONNECT toward own_location (reusing
+        // acquire_new + the existing CONNECT path — no wire change). Every
+        // self-initiated CONNECT already pre-populates the visited bloom with all
+        // currently-connected peers (`start_client_connect`), so the probe routes
+        // PAST everything already held and terminates at the nearest UNCONNECTED
+        // peer to own_location; successive probes fill outward on BOTH ring sides
+        // as each newly-connected peer is excluded from the next probe. The
+        // terminus installs the edge via the per-side clause in `should_accept`.
+        // Runs CONCURRENTLY with long-link targeting; long links are never gated
+        // on lattice completion (they supply the weak connectivity that lets
+        // route-to-self converge from a cold start).
+        //
+        // EXPONENTIAL BACKOFF: stay at tau0 while the lattice is incomplete (a
+        // side unfilled) or a probe improved it (side filled / edge tightened);
+        // once both sides are held and tight, double the interval up to tau_max;
+        // reset to tau0 and probe now when an edge is lost/regresses. tau_max is
+        // the Chord half-life floor — it must comfortably exceed the churn
+        // interval so a dropped edge is re-formed well within a node's lifetime.
+        #[cfg(not(test))]
+        const LATTICE_PROBE_TAU0: Duration = Duration::from_secs(5);
+        #[cfg(test)]
+        const LATTICE_PROBE_TAU0: Duration = Duration::from_secs(1);
+        #[cfg(not(test))]
+        const LATTICE_PROBE_TAU_MAX: Duration = Duration::from_secs(300);
+        #[cfg(test)]
+        const LATTICE_PROBE_TAU_MAX: Duration = Duration::from_secs(8);
+
         /// How often to probe a gateway for version discovery (#3677).
         #[cfg(not(test))]
         const GATEWAY_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(4 * 3600);
@@ -4556,6 +4594,22 @@ impl Ring {
         // Deferred swap drops: (addr, queued_at) using time_source for
         // deterministic simulation support.
         let mut deferred_swap_drops: Vec<(SocketAddr, tokio::time::Instant)> = Vec::new();
+
+        // Nearest-neighbor lattice discovery state (mechanism 2). Tracks the next
+        // route-to-self probe time, the current backoff interval, and the number
+        // of lattice sides held at the previous tick — used to detect a side
+        // filling (improvement → stay aggressive) vs a side lost (regression →
+        // probe now). Seeded to fire on the first eligible tick.
+        struct LatticeProbeState {
+            next_at: Instant,
+            interval: Duration,
+            last_sides_held: Option<u8>,
+        }
+        let mut lattice_probe = LatticeProbeState {
+            next_at: self.time_source.now(),
+            interval: LATTICE_PROBE_TAU0,
+            last_sides_held: None,
+        };
         let mut zero_connections_since: Option<Instant> = None;
         // Track whether we've ever had ring connections. Before the first
         // successful connection, use a shorter isolation escalation threshold
@@ -5225,6 +5279,81 @@ impl Ring {
                     }
                 }
                 TopologyAdjustment::NoChange => {}
+            }
+
+            // Nearest-neighbor lattice discovery (mechanism 2): inject a
+            // route-to-self probe target (own_location), gated by exponential
+            // backoff, to seek/tighten the guaranteed successor and predecessor
+            // edges. Queued into pending_conn_adds so it is acquired next tick
+            // alongside long-link targets. No wire change: the probe is a plain
+            // CONNECT toward own_location whose bloom already excludes held peers,
+            // so it lands on the nearest unconnected peer and the terminus
+            // installs the edge via the per-side clause in should_accept.
+            if crate::ring::nn_lattice_enabled() {
+                if let Some(me) = self.connection_manager.get_stored_location() {
+                    let probe_now = self.time_source.now();
+                    let succ = self.connection_manager.nearest_lattice_neighbor_dist(true);
+                    let pred = self.connection_manager.nearest_lattice_neighbor_dist(false);
+                    let sides_held = u8::from(succ.is_some()) + u8::from(pred.is_some());
+
+                    // Only probe while a lattice side is UNFILLED. Once both edges
+                    // are held we stop: a route-to-self probe at that point would
+                    // land on a farther, non-lattice nearby peer (its terminus,
+                    // when under max_connections, accepts it as an ordinary
+                    // connection), skewing the connection set toward short links
+                    // and pruning long links. TIGHTENING to a strictly-closer peer
+                    // that appears later is handled PASSIVELY by the per-side
+                    // acceptance clause in should_accept — when that closer peer's
+                    // own discovery reaches this node, it is force-accepted as the
+                    // new nearest and the superseded edge demotes. So this probe
+                    // only ever fills an empty side (where the nearest unconnected
+                    // peer IS the exact nearest), never manufactures extra links.
+                    let need_probe = sides_held < 2;
+
+                    // Regression (a side was lost) → reset the backoff and probe
+                    // now to re-fill the empty slot immediately.
+                    if let Some(prev_sides) = lattice_probe.last_sides_held {
+                        if sides_held < prev_sides {
+                            lattice_probe.interval = LATTICE_PROBE_TAU0;
+                            lattice_probe.next_at = probe_now;
+                        }
+                    }
+
+                    if need_probe && probe_now >= lattice_probe.next_at {
+                        // Did a side fill since the last tick (improvement)? If so
+                        // stay aggressive; otherwise back off (a side we cannot
+                        // currently reach a peer on).
+                        let improved = match lattice_probe.last_sides_held {
+                            Some(prev_sides) => sides_held > prev_sides,
+                            None => true,
+                        };
+                        lattice_probe.interval = if improved {
+                            LATTICE_PROBE_TAU0
+                        } else {
+                            (lattice_probe.interval * 2).min(LATTICE_PROBE_TAU_MAX)
+                        };
+                        self.connection_manager.record_lattice_probe(improved);
+
+                        pending_conn_adds.insert(me);
+
+                        // ±20% jitter to avoid synchronized probe bursts across
+                        // peers that bootstrapped together.
+                        let jitter = crate::config::GlobalRng::random_range(0.8..=1.2);
+                        lattice_probe.next_at = probe_now + lattice_probe.interval.mul_f64(jitter);
+
+                        tracing::debug!(
+                            sides_held,
+                            succ_dist = ?succ,
+                            pred_dist = ?pred,
+                            interval_secs = lattice_probe.interval.as_secs(),
+                            "lattice discovery: queued route-to-self probe"
+                        );
+                    }
+                    // Record the observed state each tick (whether or not we
+                    // probed) so regression detection and the improvement check
+                    // compare against the latest reality.
+                    lattice_probe.last_sides_held = Some(sides_held);
+                }
             }
 
             // Execute deferred swap drops: only drop as many peers as we

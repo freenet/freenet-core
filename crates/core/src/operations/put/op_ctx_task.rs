@@ -615,6 +615,14 @@ async fn try_summary_first_put(
     target: &PeerKeyLocation,
     target_addr: SocketAddr,
 ) -> SummaryFirstOutcome {
+    // EXPERIMENT-ONLY (findability_probe): force the full-state driver so the
+    // PUT-reach measurement exercises the plain greedy-routing terminus path
+    // (summary-first would store at the originator then probe, muddying the
+    // single-copy placement). NOT for ship.
+    #[cfg(any(test, feature = "testing"))]
+    if crate::operations::findability_probe::scatter_disabled() {
+        return SummaryFirstOutcome::FallThrough;
+    }
     // (a) Store locally first — the same local-store path a relay hop uses
     // (`relay_put_store_locally`: put_contract + host_contract +
     // register_local_hosting + announce_contract_hosted) — so the
@@ -1692,6 +1700,31 @@ where
                     .await;
                 }
                 let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                // EXPERIMENT-ONLY (findability_probe): record the PUT terminus
+                // (#4363 guard) + store the single copy here. NOT for ship.
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    let skip = new_skip_list.clone();
+                    crate::operations::findability_probe::record_terminus(
+                        &op_manager.ring,
+                        crate::operations::findability_probe::ProbeOpKind::Put,
+                        &incoming_tx,
+                        target,
+                        htl,
+                        hop_count,
+                        crate::operations::findability_probe::ProbeStopReason::TerminusGuard,
+                        move |addr| skip.contains(&addr),
+                    );
+                    relay_put_finalize_scatter_disabled_store(
+                        op_manager,
+                        incoming_tx,
+                        key,
+                        merged_value.clone(),
+                        &contract,
+                        related_contracts.clone(),
+                    )
+                    .await;
+                }
                 return relay_put_finalize_local(
                     op_manager,
                     incoming_tx,
@@ -1714,6 +1747,36 @@ where
                     // No next hop — act as final destination.
                     // This node IS the storer; hop_count = max_htl - htl_we_received.
                     let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                    // EXPERIMENT-ONLY (findability_probe). NOT for ship.
+                    #[cfg(any(test, feature = "testing"))]
+                    {
+                        let skip = new_skip_list.clone();
+                        let target = crate::ring::Location::from(&key);
+                        let reason = if htl == 0 {
+                            crate::operations::findability_probe::ProbeStopReason::HtlZero
+                        } else {
+                            crate::operations::findability_probe::ProbeStopReason::NoNextHop
+                        };
+                        crate::operations::findability_probe::record_terminus(
+                            &op_manager.ring,
+                            crate::operations::findability_probe::ProbeOpKind::Put,
+                            &incoming_tx,
+                            target,
+                            htl,
+                            hop_count,
+                            reason,
+                            move |addr| skip.contains(&addr),
+                        );
+                        relay_put_finalize_scatter_disabled_store(
+                            op_manager,
+                            incoming_tx,
+                            key,
+                            merged_value.clone(),
+                            &contract,
+                            related_contracts.clone(),
+                        )
+                        .await;
+                    }
                     return relay_put_finalize_local(
                         op_manager,
                         incoming_tx,
@@ -1778,6 +1841,36 @@ where
                     );
                     // Same arm as above: this node IS the storer.
                     let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                    // EXPERIMENT-ONLY (findability_probe). NOT for ship.
+                    #[cfg(any(test, feature = "testing"))]
+                    {
+                        let skip = new_skip_list.clone();
+                        let target = crate::ring::Location::from(&key);
+                        let reason = if htl == 0 {
+                            crate::operations::findability_probe::ProbeStopReason::HtlZero
+                        } else {
+                            crate::operations::findability_probe::ProbeStopReason::NoNextHop
+                        };
+                        crate::operations::findability_probe::record_terminus(
+                            &op_manager.ring,
+                            crate::operations::findability_probe::ProbeOpKind::Put,
+                            &incoming_tx,
+                            target,
+                            htl,
+                            hop_count,
+                            reason,
+                            move |addr| skip.contains(&addr),
+                        );
+                        relay_put_finalize_scatter_disabled_store(
+                            op_manager,
+                            incoming_tx,
+                            key,
+                            merged_value.clone(),
+                            &contract,
+                            related_contracts.clone(),
+                        )
+                        .await;
+                    }
                     return relay_put_finalize_local(
                         op_manager,
                         incoming_tx,
@@ -2274,6 +2367,15 @@ async fn relay_put_store_locally(
     htl: usize,
     priority: crate::contract::Priority,
 ) -> Result<WrappedState, OpError> {
+    // EXPERIMENT-ONLY (findability_probe): suppress the every-hop PUT store so
+    // the copy lands ONLY at the routing terminus (stored there explicitly by
+    // `relay_put_finalize_scatter_disabled_store`). Return the value unmerged —
+    // with a single copy in flight there is no existing state to merge against.
+    // NOT for ship. See operations::findability_probe.
+    #[cfg(any(test, feature = "testing"))]
+    if crate::operations::findability_probe::scatter_disabled() {
+        return Ok(value);
+    }
     let was_hosting = op_manager.ring.is_hosting_contract(&key);
     let (merged_value, _state_changed) = match super::put_contract(
         op_manager,
@@ -2433,6 +2535,12 @@ async fn relay_put_replicate_forward(
     htl: usize,
     skip_list: HashSet<SocketAddr>,
 ) {
+    // EXPERIMENT-ONLY (findability_probe): suppress the one-hop-past terminus
+    // replication so the PUT copy stays SINGULAR. NOT for ship.
+    #[cfg(any(test, feature = "testing"))]
+    if crate::operations::findability_probe::scatter_disabled() {
+        return;
+    }
     // The replication copy is sent as a single `PutMsg::Request`. For a
     // payload that would need streaming we skip the replication forward rather
     // than re-implement the piped-stream upgrade here: the local store already
@@ -2489,6 +2597,51 @@ async fn relay_put_replicate_forward(
             phase = "relay_put_terminus_replicate",
             "PUT relay: finalized locally but forwarded replication copy onward (#4509)"
         );
+    }
+}
+
+/// EXPERIMENT-ONLY (findability_probe): when scatter is disabled the every-hop
+/// store was a no-op, so the PUT terminus must persist its single copy here so
+/// exactly one holder lands (the PUT-reach measurement point). NOT for ship.
+#[cfg(any(test, feature = "testing"))]
+async fn relay_put_finalize_scatter_disabled_store(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    value: WrappedState,
+    contract: &ContractContainer,
+    related_contracts: RelatedContracts<'static>,
+) {
+    if !crate::operations::findability_probe::scatter_disabled() {
+        return;
+    }
+    match super::put_contract(
+        op_manager,
+        key,
+        value.clone(),
+        related_contracts,
+        contract,
+        crate::contract::Priority::NetworkRelay,
+    )
+    .await
+    {
+        Ok((merged, _)) => {
+            if !op_manager.ring.is_hosting_contract(&key) {
+                op_manager.ring.host_contract(
+                    key,
+                    merged.size() as u64,
+                    crate::ring::AccessType::Put,
+                );
+            }
+        }
+        Err(err) => {
+            tracing::error!(
+                tx = %incoming_tx,
+                contract = %key,
+                error = %err,
+                "EXPERIMENT findability_probe: PUT terminus store failed"
+            );
+        }
     }
 }
 

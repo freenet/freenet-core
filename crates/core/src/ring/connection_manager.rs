@@ -23,7 +23,7 @@ use dashmap::{DashMap, DashSet};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -53,6 +53,61 @@ const PENDING_RESERVATION_TTL: Duration = Duration::from_secs(60);
 /// avoid blocking initial bootstrap. With fewer than 3 connections the gap
 /// score is too noisy to be useful.
 const KLEINBERG_FILTER_MIN_CONNECTIONS: usize = 3;
+
+// ---------------------------------------------------------------------------
+// Nearest-neighbor ring lattice (successor + predecessor base edges)
+// ---------------------------------------------------------------------------
+//
+// Kleinberg gap-fill (the k-2 long links) gives O(log^2 n) routing *iff* the
+// short-range base lattice — each peer's immediate ring neighbors — is also
+// present. Freenet builds the long links but never guaranteed the base lattice:
+// the gap-fill objective scores the *nearest* candidate LOWEST (an ordinal
+// "who is my immediate neighbor" property cannot emerge from a log-distance
+// metric), so greedy routing dead-ends at local minima with no connected
+// neighbor closer to the key. This module adds the two-tier structure Chord and
+// Symphony ship: guarantee an edge to the nearest connected SUCCESSOR (closest
+// higher location, wrapping) AND the nearest connected PREDECESSOR (closest
+// lower location), leaving the remaining slots to the untouched Kleinberg
+// machinery. Two guaranteed edges per peer is all Kleinberg needs (Theta(1)
+// lattice edges); routing stays O(log^2 n).
+//
+// The behavior is UNCONDITIONALLY ON in production (`nn_lattice_enabled()`
+// folds to `const true` and the branch optimizes away). Under `test`/`testing`
+// a thread-local override lets a validation harness run the stock (lattice-off)
+// arm against the fix (lattice-on) arm on identical seeds. The override is
+// THREAD-LOCAL because the simulation harness runs every node on the test's own
+// current-thread runtime and relies on thread-local globals (`GlobalRng`,
+// simulation time) to stay parallel-test-safe; a process-global flag would
+// bleed across concurrently-running sim tests on other threads. It is NOT a
+// production config knob.
+#[cfg(any(test, feature = "testing"))]
+thread_local! {
+    static NN_LATTICE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Enable/disable the nearest-neighbor ring lattice for the CURRENT THREAD
+/// (test/validation only — production is always enabled). The control arm of the
+/// findability validation calls `set_nn_lattice_enabled(false)` to reproduce
+/// stock (v0.2.95) topology behavior on the same seed as the treatment arm.
+#[cfg(any(test, feature = "testing"))]
+pub fn set_nn_lattice_enabled(enabled: bool) {
+    NN_LATTICE_ENABLED.with(|c| c.set(enabled));
+}
+
+/// Whether the nearest-neighbor ring lattice is active. Always `true` in
+/// production; overridable per-thread in test/testing builds (see
+/// [`set_nn_lattice_enabled`]).
+#[inline]
+pub(crate) fn nn_lattice_enabled() -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        NN_LATTICE_ENABLED.with(|c| c.get())
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        true
+    }
+}
 
 /// Maximum number of concurrent CONNECT operations a gateway will route simultaneously.
 /// This prevents thundering-herd scenarios where many joiners hit the same gateway at once.
@@ -366,6 +421,13 @@ pub(crate) struct ConnectionManager {
     /// Key: peer socket address
     /// Value: AcceptorStats (successes, attempts, last_updated)
     acceptor_reliability: Arc<parking_lot::RwLock<BTreeMap<SocketAddr, AcceptorStats>>>,
+    /// Nearest-neighbor lattice discovery health counters (telemetry only).
+    /// `lattice_probes_issued`: route-to-self probes fired since startup;
+    /// `lattice_probe_improvements`: probes that found a strictly-closer peer
+    /// (filled or tightened an edge). Incremented from the maintenance loop,
+    /// surfaced via the dashboard ring-stats provider.
+    lattice_probes_issued: Arc<AtomicU64>,
+    lattice_probe_improvements: Arc<AtomicU64>,
 }
 
 impl ConnectionManager {
@@ -499,6 +561,8 @@ impl ConnectionManager {
             peer_health: Arc::new(Mutex::new(PeerHealthTracker::new())),
             connect_jitter_failures: Arc::new(parking_lot::Mutex::new((0, None))),
             acceptor_reliability: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+            lattice_probes_issued: Arc::new(AtomicU64::new(0)),
+            lattice_probe_improvements: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -616,6 +680,56 @@ impl ConnectionManager {
             return true;
         }
 
+        // Nearest-neighbor lattice clause (mechanism 3). BEFORE the Kleinberg
+        // score paths: unconditionally accept a candidate that would become this
+        // peer's new nearest ring-neighbor ON ITS OWN SIDE — its successor side
+        // (higher location, signed_distance > 0) or its predecessor side (lower
+        // location, signed_distance < 0). The test is STRICTLY PER-SIDE: a
+        // candidate on the successor side is compared only to the current nearest
+        // successor, never to the predecessor. A global "closer than any current
+        // connection" test would only ever tighten ONE edge and let the other
+        // side go quiet, which dead-ends ~half of last-mile lookups; both edges
+        // are required for the closed undirected cycle greedy-to-closest needs.
+        //
+        // Fires even at/over `max_connections`: the newcomer is a strictly-closer
+        // nearest neighbor, so it displaces a long link rather than being
+        // rejected. The over-max prune path (topology.rs) brings the node back
+        // under max by dropping a farther, non-lattice connection — never one of
+        // the two protected lattice edges. Self-bounding on each side: it fires
+        // only for a candidate closer than every current connection on that side,
+        // a strictly decreasing sequence, so it cannot admit an unbounded stream.
+        let nn_override = if nn_lattice_enabled() {
+            if let Some(me) = self.get_stored_location() {
+                let cand_signed = me.signed_distance(location);
+                let cand_dist = cand_signed.abs();
+                if cand_dist == 0.0 {
+                    // A candidate exactly at own location is on neither side.
+                    false
+                } else {
+                    let successor_side = cand_signed > 0.0;
+                    let current_nearest = self
+                        .nearest_lattice_neighbor_dist(successor_side)
+                        .unwrap_or(f64::INFINITY);
+                    let fires = cand_dist < current_nearest;
+                    if fires {
+                        tracing::debug!(
+                            addr = %addr,
+                            peer_location = %location,
+                            cand_dist,
+                            current_nearest,
+                            side = if successor_side { "successor" } else { "predecessor" },
+                            "should_accept: nearest-neighbor lattice force-accept (new nearest on its side)"
+                        );
+                    }
+                    fires
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Use actual open connections (not inflated total_conn) for the
         // min_connections threshold. Pending reservations are speculative —
         // many fail to complete — so counting them pushes nodes into the
@@ -708,6 +822,11 @@ impl ConnectionManager {
             );
             accepted
         };
+        // Nearest-neighbor lattice force-accept (mechanism 3). A new per-side
+        // nearest neighbor is admitted regardless of the Kleinberg verdict and
+        // regardless of max_connections; the over-max prune path then sheds a
+        // farther, non-lattice connection.
+        let accepted = accepted || nn_override;
         tracing::debug!(
             addr = %addr,
             peer_location = %location,
@@ -750,6 +869,82 @@ impl ConnectionManager {
                 std::iter::repeat_n(my_location.distance(*loc).as_f64(), conns.len())
             }),
         )
+    }
+
+    /// Unsigned ring distance to this peer's nearest connected neighbor on the
+    /// given side (`successor_side = true` → closest higher location wrapping;
+    /// `false` → closest lower location). `None` when own location is unknown or
+    /// there is no connected neighbor on that side.
+    ///
+    /// This is the "who holds my reserved lattice slot on this side" query used
+    /// by the per-side acceptance clause and by the route-to-self discovery
+    /// probe. The reserved slot is derived on demand from the live connection set
+    /// rather than tracked as separate state, so a strictly-closer arrival
+    /// automatically becomes the new slot holder and the superseded former
+    /// nearest demotes back into the ordinary long-link pool with no bookkeeping.
+    pub(crate) fn nearest_lattice_neighbor_dist(&self, successor_side: bool) -> Option<f64> {
+        let me = self.get_stored_location()?;
+        self.connections_by_location
+            .read()
+            .keys()
+            .filter_map(|loc| {
+                let sd = me.signed_distance(*loc);
+                // A neighbor exactly at own location (sd == 0.0) belongs to
+                // neither side; exclude it.
+                if sd != 0.0 && (sd > 0.0) == successor_side {
+                    Some(sd.abs())
+                } else {
+                    None
+                }
+            })
+            .fold(None, |acc, d| Some(acc.map_or(d, |a: f64| a.min(d))))
+    }
+
+    /// Record that a route-to-self lattice discovery probe was issued, and
+    /// whether it improved the lattice (filled or tightened an edge). Telemetry
+    /// only — surfaced via the dashboard ring-stats provider.
+    pub(crate) fn record_lattice_probe(&self, improved: bool) {
+        self.lattice_probes_issued.fetch_add(1, Ordering::Relaxed);
+        if improved {
+            self.lattice_probe_improvements
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Discovery-health counters: (probes issued, probes that found a strictly
+    /// closer peer) since startup.
+    pub(crate) fn lattice_probe_stats(&self) -> (u64, u64) {
+        (
+            self.lattice_probes_issued.load(Ordering::Relaxed),
+            self.lattice_probe_improvements.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Whether a candidate at `loc` would become this peer's new nearest
+    /// neighbor on its own ring side (i.e. a lattice edge). Mirrors the per-side
+    /// clause in [`should_accept`]; used by [`add_connection`] to admit a lattice
+    /// edge over the `max_connections` cap so mechanism 3's displacement can land
+    /// (the over-max topology prune then sheds a farther, non-lattice link, which
+    /// is why this never grows the connection set unboundedly). Evaluated against
+    /// the pre-add connection set, so `cand_dist < current` means strictly closer
+    /// than whatever currently holds the slot on that side.
+    pub(crate) fn would_be_new_lattice_edge(&self, loc: Location) -> bool {
+        if !nn_lattice_enabled() {
+            return false;
+        }
+        let Some(me) = self.get_stored_location() else {
+            return false;
+        };
+        let sd = me.signed_distance(loc);
+        if sd == 0.0 {
+            return false;
+        }
+        let cand_dist = sd.abs();
+        let successor_side = sd > 0.0;
+        let current = self
+            .nearest_lattice_neighbor_dist(successor_side)
+            .unwrap_or(f64::INFINITY);
+        cand_dist < current
     }
 
     /// Record the advertised location for a peer that we have decided to accept.
@@ -1227,19 +1422,34 @@ impl ConnectionManager {
         drop(lop);
 
         // Enforce the global cap when adding a new peer (relocations reuse the existing slot).
+        // EXCEPTION (mechanism 3): admit a nearest-neighbor lattice edge even at
+        // capacity — it displaces a farther long link rather than being rejected.
+        // The over-max topology prune sheds a non-lattice connection on the next
+        // maintenance tick (lattice edges are protected there), bringing the node
+        // back to max. Without this the cap would silently drop the guaranteed
+        // successor/predecessor edge the acceptance clause just admitted.
         if previous_location.is_none() && self.connection_count() >= self.max_connections {
-            tracing::warn!(
-                addr = %addr,
-                peer_location = %loc,
-                max = self.max_connections,
-                "add_connection: rejecting new connection to enforce cap"
-            );
-            // Roll back bookkeeping since we're refusing the connection.
-            self.location_for_peer.write().remove(&addr);
-            if was_reserved {
-                self.pending_reservations.write().remove(&addr);
+            if self.would_be_new_lattice_edge(loc) {
+                tracing::debug!(
+                    addr = %addr,
+                    peer_location = %loc,
+                    max = self.max_connections,
+                    "add_connection: admitting nearest-neighbor lattice edge over cap (a long link will be pruned)"
+                );
+            } else {
+                tracing::warn!(
+                    addr = %addr,
+                    peer_location = %loc,
+                    max = self.max_connections,
+                    "add_connection: rejecting new connection to enforce cap"
+                );
+                // Roll back bookkeeping since we're refusing the connection.
+                self.location_for_peer.write().remove(&addr);
+                if was_reserved {
+                    self.pending_reservations.write().remove(&addr);
+                }
+                return false;
             }
-            return false;
         }
 
         if let Some(prev_loc) = previous_location {
@@ -2385,6 +2595,88 @@ mod tests {
         let pruned_loc = cm.prune_alive_connection(addr);
         assert_eq!(pruned_loc, Some(loc));
         assert_eq!(cm.connection_count(), 0);
+    }
+
+    /// Mechanism 4 liveness bound: the retention exemption lives ONLY in the
+    /// score-based topology paths (topology.rs). The liveness prune STILL evicts
+    /// a lattice edge — the exemption is never a permanent pin to a dead neighbor.
+    #[test]
+    fn prune_evicts_lattice_edge_liveness_not_gated() {
+        set_nn_lattice_enabled(true);
+        // own_addr None so the location starts unset; update_location then pins
+        // it to 0.5 (update_location is a no-op once a location is already set).
+        let cm = make_connection_manager(None, 2, 10, false);
+        cm.update_location(Some(Location::new(0.5)));
+        assert_eq!(cm.get_stored_location(), Some(Location::new(0.5)));
+        let keypair = TransportKeypair::new();
+        let addr = make_addr(8101);
+        // A nearest-successor lattice edge.
+        cm.add_connection(Location::new(0.52), addr, keypair.public().clone(), false);
+        assert!(
+            cm.nearest_lattice_neighbor_dist(true).is_some(),
+            "the added edge is the current nearest successor (a lattice edge)"
+        );
+        // Liveness prune removes it despite being a lattice edge.
+        let pruned = cm.prune_alive_connection(addr);
+        assert!(
+            pruned.is_some(),
+            "liveness prune must evict even a lattice edge"
+        );
+        assert_eq!(cm.connection_count(), 0);
+        assert!(
+            cm.nearest_lattice_neighbor_dist(true).is_none(),
+            "the successor slot is now empty (re-discovery will re-fill it)"
+        );
+    }
+
+    /// Mechanism 3 displacement: a new nearest-neighbor edge is admitted OVER the
+    /// max cap (a farther long link is pruned on the next maintenance tick); a
+    /// farther non-lattice peer at/over max is still rejected.
+    #[test]
+    fn add_connection_admits_lattice_edge_over_max() {
+        set_nn_lattice_enabled(true);
+        let cm = make_connection_manager(None, 2, 3, false);
+        cm.update_location(Some(Location::new(0.5)));
+        assert_eq!(cm.get_stored_location(), Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        // Fill to max=3 with far successor-side long links.
+        for (i, l) in [0.70_f64, 0.80, 0.90].into_iter().enumerate() {
+            cm.add_connection(
+                Location::new(l),
+                make_addr(8210 + i as u16),
+                kp.public().clone(),
+                false,
+            );
+        }
+        assert_eq!(cm.connection_count(), 3, "filled to max");
+        // A strictly-closer successor is a new lattice edge → admitted over max.
+        let admitted = cm.add_connection(
+            Location::new(0.51),
+            make_addr(8220),
+            kp.public().clone(),
+            false,
+        );
+        assert!(
+            admitted,
+            "nearest-neighbor lattice edge must be admitted over the max cap"
+        );
+        assert_eq!(
+            cm.connection_count(),
+            4,
+            "over max by 1 until the over-max prune tick restores it"
+        );
+        // A farther non-lattice peer at over-max is still rejected.
+        let rejected = cm.add_connection(
+            Location::new(0.85),
+            make_addr(8230),
+            kp.public().clone(),
+            false,
+        );
+        assert!(
+            !rejected,
+            "a farther non-lattice peer must be rejected at/over max"
+        );
+        assert_eq!(cm.connection_count(), 4);
     }
 
     #[test]

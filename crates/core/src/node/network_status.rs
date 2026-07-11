@@ -80,6 +80,23 @@ pub struct RingStatsSnapshot {
     /// was at capacity (`MAX_TRACKED_PAIRS`). A non-zero value suggests
     /// identity churn / admission pressure, distinct from per-pair rate.
     pub updates_capacity_dropped: u64,
+    /// Nearest-neighbor ring lattice completeness (the "is greedy routing's base
+    /// lattice present" signal). `lattice_has_successor` / `_predecessor` are
+    /// whether this peer currently holds its closest-higher / closest-lower ring
+    /// neighbor; a peer with BOTH `true` has a complete both-sides lattice, and
+    /// the collector aggregates the fraction of such peers. The `_distance`
+    /// fields are the ring distance to each edge (None when unheld). Read from
+    /// the live connection set — no mirrored counter to rot.
+    pub lattice_has_successor: bool,
+    pub lattice_has_predecessor: bool,
+    pub lattice_successor_distance: Option<f64>,
+    pub lattice_predecessor_distance: Option<f64>,
+    /// Discovery health (route-to-self probe). `lattice_probes_issued` counts
+    /// probes fired since startup; `lattice_probe_improvements` counts those that
+    /// found a strictly-closer peer (filled or tightened an edge). A healthy peer
+    /// converges to both-sides-held and the improvement rate falls toward zero.
+    pub lattice_probes_issued: u64,
+    pub lattice_probe_improvements: u64,
 }
 
 static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
@@ -2219,6 +2236,7 @@ mod tests {
             updates_accepted: 1000,
             updates_rate_limited: 13,
             updates_capacity_dropped: 2,
+            ..Default::default()
         }));
         let snap = get_snapshot().unwrap();
         assert_eq!(snap.ring_stats.connection_count, 42);

@@ -1184,6 +1184,16 @@ async fn cache_contract_locally(
     contract: Option<ContractContainer>,
     is_client_requester: bool,
 ) {
+    // EXPERIMENT-ONLY (findability_probe): suppress RELAY-path GET-return caching
+    // so the seeded copy cannot self-scatter along successful GET return paths
+    // (the confound that invalidated an earlier lone-holder run). The client
+    // requester's own final store (is_client_requester=true) is KEPT so find-rate
+    // stays measurable — it lands at the requester (a GET origin, never on another
+    // requester's key-ward path) so it cannot confound routing. NOT for ship.
+    #[cfg(any(test, feature = "testing"))]
+    if !is_client_requester && crate::operations::findability_probe::scatter_disabled() {
+        return;
+    }
     let state_size = state.size() as u64;
 
     // (1) Idempotency short-circuit: re-query the local store FIRST.
@@ -2630,6 +2640,22 @@ where
         // meaning the request traversed the full max_htl forward hops to get
         // here. hop_count = max_htl - 0 = max_htl.
         let hop_count = op_manager.ring.max_hops_to_live;
+        // EXPERIMENT-ONLY (findability_probe): record the HTL-exhaustion GET
+        // terminus. NOT for ship.
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let visited = visited.clone();
+            crate::operations::findability_probe::record_terminus(
+                &op_manager.ring,
+                crate::operations::findability_probe::ProbeOpKind::Get,
+                &incoming_tx,
+                crate::ring::Location::from(&instance_id),
+                htl,
+                hop_count,
+                crate::operations::findability_probe::ProbeStopReason::HtlZero,
+                move |addr| visited.probably_visited(addr),
+            );
+        }
         relay_send_not_found(
             op_manager,
             incoming_tx,
@@ -2660,6 +2686,25 @@ where
             phase = "complete",
             "GET relay: contract found locally (active interest) — sending Found upstream"
         );
+
+        // EXPERIMENT-ONLY (findability_probe): record that greedy routing REACHED
+        // a live local copy at this peer (for the single-seeded-copy experiment
+        // this is the rank-0 holder). NOT for ship.
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let visited = new_visited.clone();
+            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+            crate::operations::findability_probe::record_terminus(
+                &op_manager.ring,
+                crate::operations::findability_probe::ProbeOpKind::Get,
+                &incoming_tx,
+                crate::ring::Location::from(&instance_id),
+                htl,
+                hop_count,
+                crate::operations::findability_probe::ProbeStopReason::Found,
+                move |addr| visited.probably_visited(addr),
+            );
+        }
 
         // Register interest for the requester (mirrors get.rs:1447-1476).
         if subscribe {
@@ -2876,7 +2921,16 @@ where
                 // (`did_forward`) — a no-candidate terminus consult is a no-op
                 // (parity with SUBSCRIBE). Either way, skip the consult and
                 // report NotFound — the same outcome as before the consult.
-                let consult_candidate = if last_forward_failed || !did_forward {
+                // EXPERIMENT-ONLY (findability_probe): when scatter is disabled,
+                // also suppress the piece-C advertisement consult so the GET-reach
+                // measurement isolates PURE greedy routing (the consult is a
+                // separate advertisement-based findability layer). NOT for ship.
+                #[cfg(any(test, feature = "testing"))]
+                let consult_suppressed = crate::operations::findability_probe::scatter_disabled();
+                #[cfg(not(any(test, feature = "testing")))]
+                let consult_suppressed = false;
+                let consult_candidate = if last_forward_failed || !did_forward || consult_suppressed
+                {
                     None
                 } else {
                     let targets = consult_targets.get_or_insert_with(|| {
@@ -2928,6 +2982,27 @@ where
                     // exhaustion of downstream candidates. hop_count is its
                     // forward depth (max_htl - htl).
                     let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                    // EXPERIMENT-ONLY (findability_probe): the pure-routing
+                    // GET-reach terminus — greedy routing (+ consult) could not
+                    // reach the copy from here. The closer-neighbor field splits
+                    // connectivity-gap from routing-give-up. NOT for ship.
+                    #[cfg(any(test, feature = "testing"))]
+                    {
+                        let visited = new_visited.clone();
+                        let tried_snapshot = tried.clone();
+                        crate::operations::findability_probe::record_terminus(
+                            &op_manager.ring,
+                            crate::operations::findability_probe::ProbeOpKind::Get,
+                            &incoming_tx,
+                            crate::ring::Location::from(&instance_id),
+                            htl,
+                            hop_count,
+                            crate::operations::findability_probe::ProbeStopReason::RoutingExhausted,
+                            move |addr| {
+                                tried_snapshot.contains(&addr) || visited.probably_visited(addr)
+                            },
+                        );
+                    }
                     if let Some(event) = crate::tracing::NetEventLog::get_not_found(
                         &incoming_tx,
                         &op_manager.ring,

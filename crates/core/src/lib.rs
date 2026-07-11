@@ -103,6 +103,24 @@ pub mod dev_tool {
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
 
+    // Nearest-neighbor ring lattice (successor+predecessor base edges). Always
+    // ON in production; this setter is the test-only per-thread override the
+    // findability validation harness flips to run the stock (lattice-off) arm
+    // against the fix (lattice-on) arm on identical seeds. No-op in production
+    // builds (compiled out).
+    #[cfg(any(test, feature = "testing"))]
+    pub use ring::set_nn_lattice_enabled;
+
+    // Test-only findability measurement harness (NOT for ship): scatter/cache
+    // disable hook (guarantees a single copy) + per-op terminus tracing (rank /
+    // HTL / hop / stop-reason / connectivity-gap-vs-give-up). See
+    // operations::findability_probe. Compiled out in production.
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::findability_probe::{
+        OpTraceRecord, ProbeOpKind, ProbeStopReason, clear_op_traces, scatter_disabled,
+        set_scatter_disabled, take_op_traces,
+    };
+
     // Test hooks: per-op driver call counters. Tests assert these
     // increment to confirm wire variants dispatch through their
     // driver (not a local-cache shortcut or legacy path).

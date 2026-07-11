@@ -603,6 +603,26 @@ impl ControlledSimulationResult {
             .unwrap_or(0)
     }
 
+    /// Ring locations (as `f64`) of `label`'s connected neighbors at the end of
+    /// the run, read from the captured live `Ring`'s connection manager. Empty
+    /// if the node never published its Ring. Used by the nearest-neighbor
+    /// findability experiment to premise-check that the guaranteed
+    /// successor/predecessor edges actually formed. Only present under
+    /// `cfg(test)`/`testing`.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn node_neighbor_locations(&self, label: &NodeLabel) -> Vec<f64> {
+        self.node_rings
+            .get(label)
+            .map(|ring| {
+                ring.connection_manager
+                    .get_connections_by_location()
+                    .keys()
+                    .map(|loc| loc.as_f64())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Whether `label`'s node was actively receiving updates for `key` (has a
     /// live network/client subscription keeping the copy fresh) at the end of the
     /// run. Returns `false` if the node never published its Ring. The serve-DURING

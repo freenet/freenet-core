@@ -15,6 +15,10 @@ use crate::{
 
 pub(crate) mod bootstrap;
 pub(crate) mod connect;
+// EXPERIMENT-ONLY findability instrumentation (NOT for ship). See the module
+// docs; gated to test/testing builds so it never links into production.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) mod findability_probe;
 pub(crate) mod get;
 pub(crate) mod op_ctx;
 pub(crate) mod orphan_streams;

@@ -124,6 +124,49 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         String::new()
     };
 
+    // Nearest-neighbor ring lattice completeness. A peer with BOTH a successor
+    // (closest-higher) and predecessor (closest-lower) ring edge has the base
+    // lattice greedy routing needs. Shown once the node has any connections.
+    let lattice_html = if snap.open_connections > 0 {
+        let mark = |held: bool, dist: Option<f64>| -> String {
+            match (held, dist) {
+                (true, Some(d)) => format!("yes ({d:.4})"),
+                (true, None) => "yes".to_string(),
+                (false, _) => "no".to_string(),
+            }
+        };
+        let (probes, improvements) = (
+            snap.ring_stats.lattice_probes_issued,
+            snap.ring_stats.lattice_probe_improvements,
+        );
+        format!(
+            r#"<div class="metrics-row">
+            <div class="metric-tile">
+                <span class="metric-value">{succ}</span>
+                <span class="metric-label">Lattice successor</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{pred}</span>
+                <span class="metric-label">Lattice predecessor</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{improvements}/{probes}</span>
+                <span class="metric-label">Discovery hits/probes</span>
+            </div>
+        </div>"#,
+            succ = mark(
+                snap.ring_stats.lattice_has_successor,
+                snap.ring_stats.lattice_successor_distance
+            ),
+            pred = mark(
+                snap.ring_stats.lattice_has_predecessor,
+                snap.ring_stats.lattice_predecessor_distance
+            ),
+        )
+    } else {
+        String::new()
+    };
+
     let spinner = if snap.open_connections == 0 {
         r#"<div class="spinner"></div>"#
     } else {
@@ -239,6 +282,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             <h2>Connection Status</h2>
             {health_banner}
             {ring_stats_html}
+            {lattice_html}
             {rate_limit_html}
             {external_addr_html}
             {spinner}
@@ -248,6 +292,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         </div>"#,
         health_banner = health_banner,
         ring_stats_html = ring_stats_html,
+        lattice_html = lattice_html,
         rate_limit_html = rate_limit_html,
         external_addr_html = external_addr_html,
         spinner = spinner,
