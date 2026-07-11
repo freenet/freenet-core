@@ -16,11 +16,69 @@ use crate::config::{BaseConfig, GetConfig, PutConfig, SubscribeConfig, UpdateCon
 
 mod v1;
 
-/// Timeout for waiting for server responses.
+/// Default timeout for waiting for server responses.
 /// Contract operations (especially updates with large state) may take time to process
 /// and propagate through the network. Network publish operations may require forwarding
 /// through multiple hops, so we use a generous timeout.
-pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Environment variable that overrides the default response timeout (in seconds).
+/// A `--timeout` CLI flag, when present, takes precedence over this variable.
+/// See issue #4102.
+pub(crate) const RESPONSE_TIMEOUT_ENV: &str = "FDEV_RESPONSE_TIMEOUT";
+
+/// Error returned when the node did not deliver a response within the configured
+/// timeout window. The operation may still have succeeded on the node/network —
+/// see issue #4102. `fdev` maps this to a distinct process exit code (3) so that
+/// release automation can verify out-of-band before treating it as a hard failure.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Timeout waiting for server response for {target} after {} seconds.\n\
+     The operation may have succeeded on the network - verify out-of-band \
+     (e.g. fetch the contract over the HTTP API) before treating this as a \
+     failure. Increase the wait with --timeout <seconds> or the \
+     FDEV_RESPONSE_TIMEOUT env var. See issue #4102.",
+    .timeout.as_secs()
+)]
+pub(crate) struct ResponseTimeout {
+    /// Human-readable description of what was awaited, e.g. "contract <key>".
+    pub(crate) target: String,
+    /// The timeout window that elapsed.
+    pub(crate) timeout: Duration,
+}
+
+/// Resolve the response timeout with precedence: explicit `--timeout` flag >
+/// `FDEV_RESPONSE_TIMEOUT` env var > [`DEFAULT_RESPONSE_TIMEOUT`].
+///
+/// A zero or non-numeric value — from either the flag or the env var — is
+/// ignored (falls back to the default) so neither a malformed environment nor
+/// an explicit `--timeout 0` ever silently disables the wait (which would
+/// produce an immediate timeout without the request ever being awaited).
+/// See issue #4102.
+pub(crate) fn resolve_response_timeout(cli: Option<u64>) -> Duration {
+    resolve_response_timeout_from(cli, std::env::var(RESPONSE_TIMEOUT_ENV).ok())
+}
+
+/// Pure inner form of [`resolve_response_timeout`], parameterized on the env
+/// value so it can be unit-tested without mutating the process environment.
+fn resolve_response_timeout_from(cli: Option<u64>, env: Option<String>) -> Duration {
+    // `--timeout 0` is treated the same as `FDEV_RESPONSE_TIMEOUT=0`: ignored,
+    // so a zero never disables the wait and produces a spurious "may have
+    // succeeded" timeout before anything is awaited. See issue #4102.
+    if let Some(secs) = cli {
+        if secs > 0 {
+            return Duration::from_secs(secs);
+        }
+    }
+    if let Some(raw) = env {
+        if let Ok(secs) = raw.trim().parse::<u64>() {
+            if secs > 0 {
+                return Duration::from_secs(secs);
+            }
+        }
+    }
+    DEFAULT_RESPONSE_TIMEOUT
+}
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub(crate) enum PutType {
@@ -215,13 +273,14 @@ async fn put_contract(
     execute_command(request, &mut client).await?;
 
     // Wait for server response before closing connection (with timeout)
+    let timeout = resolve_response_timeout(config.timeout);
     tracing::info!(
         %key,
         "Request submitted, waiting for network response (timeout: {}s)...",
-        RESPONSE_TIMEOUT.as_secs()
+        timeout.as_secs()
     );
 
-    let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+    let result = match tokio::time::timeout(timeout, client.recv()).await {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse {
             key: response_key,
         }))) => {
@@ -241,14 +300,11 @@ async fn put_contract(
         }
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
-        Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for server response for contract {key} after {} seconds.\n\
-             The operation may have succeeded on the network - check server logs.\n\
-             If this timeout is consistently too short, consider:\n\
-             - Network latency between you and the gateway\n\
-             - Contract size and propagation time through the network",
-            RESPONSE_TIMEOUT.as_secs()
-        )),
+        Err(_) => Err(ResponseTimeout {
+            target: format!("contract {key}"),
+            timeout,
+        }
+        .into()),
     };
 
     // Always gracefully close the WebSocket connection, even on timeout/error
@@ -304,28 +360,25 @@ async fn put_delegate(
     execute_command(request, &mut client).await?;
 
     // Wait for server response before closing connection (with timeout)
+    let timeout = resolve_response_timeout(config.timeout);
     tracing::info!(
         delegate = %delegate_key.encode(),
         "Request submitted, waiting for network response (timeout: {}s)...",
-        RESPONSE_TIMEOUT.as_secs()
+        timeout.as_secs()
     );
 
-    let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+    let result = match tokio::time::timeout(timeout, client.recv()).await {
         Ok(Ok(HostResponse::DelegateResponse { key, values })) => {
             tracing::info!(%key, response_count = values.len(), "Delegate registered successfully");
             Ok(())
         }
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
-        Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for server response for delegate {} after {} seconds.\n\
-             The operation may have succeeded on the network - check server logs.\n\
-             If this timeout is consistently too short, consider:\n\
-             - Network latency between you and the gateway\n\
-             - Delegate size and propagation time through the network",
-            delegate_key.encode(),
-            RESPONSE_TIMEOUT.as_secs()
-        )),
+        Err(_) => Err(ResponseTimeout {
+            target: format!("delegate {}", delegate_key.encode()),
+            timeout,
+        }
+        .into()),
     };
 
     // Always gracefully close the WebSocket connection, even on timeout/error
@@ -377,13 +430,14 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
     execute_command(request, &mut client).await?;
 
     // Wait for server response before closing connection (with timeout)
+    let timeout = resolve_response_timeout(config.timeout);
     tracing::info!(
         %key,
         "Request submitted, waiting for network response (timeout: {}s)...",
-        RESPONSE_TIMEOUT.as_secs()
+        timeout.as_secs()
     );
 
-    let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+    let result = match tokio::time::timeout(timeout, client.recv()).await {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
             key: response_key,
             summary,
@@ -396,14 +450,11 @@ pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<(
         }
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
-        Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for server response for contract {key} after {} seconds.\n\
-             The operation may have succeeded on the network - check server logs.\n\
-             If this timeout is consistently too short, consider:\n\
-             - Network latency between you and the gateway\n\
-             - State delta size and propagation time through the network",
-            RESPONSE_TIMEOUT.as_secs()
-        )),
+        Err(_) => Err(ResponseTimeout {
+            target: format!("contract {key}"),
+            timeout,
+        }
+        .into()),
     };
 
     // Always gracefully close the WebSocket connection, even on timeout/error
@@ -427,7 +478,8 @@ pub async fn get(config: GetConfig, other: BaseConfig) -> anyhow::Result<()> {
     let mut client = start_api_client(other).await?;
     execute_command(request, &mut client).await?;
 
-    let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+    let timeout = resolve_response_timeout(config.timeout);
+    let result = match tokio::time::timeout(timeout, client.recv()).await {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
             key: response_key,
             state,
@@ -453,10 +505,11 @@ pub async fn get(config: GetConfig, other: BaseConfig) -> anyhow::Result<()> {
         }
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response type: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
-        Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for get response for contract {key} after {} seconds",
-            RESPONSE_TIMEOUT.as_secs()
-        )),
+        Err(_) => Err(ResponseTimeout {
+            target: format!("contract {key}"),
+            timeout,
+        }
+        .into()),
     };
 
     close_api_client(&mut client).await;
@@ -477,7 +530,8 @@ pub async fn subscribe(config: SubscribeConfig, other: BaseConfig) -> anyhow::Re
     execute_command(request, &mut client).await?;
 
     // Wait for initial subscribe confirmation
-    match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+    let timeout = resolve_response_timeout(config.timeout);
+    match tokio::time::timeout(timeout, client.recv()).await {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
             key: response_key,
             subscribed: true,
@@ -507,10 +561,11 @@ pub async fn subscribe(config: SubscribeConfig, other: BaseConfig) -> anyhow::Re
         }
         Err(_) => {
             close_api_client(&mut client).await;
-            return Err(anyhow::anyhow!(
-                "Timeout waiting for subscribe response after {} seconds",
-                RESPONSE_TIMEOUT.as_secs()
-            ));
+            return Err(ResponseTimeout {
+                target: format!("contract {key} (subscribe)"),
+                timeout,
+            }
+            .into());
         }
     }
 
@@ -777,5 +832,104 @@ mod tests {
         assert!(matches!(wrapped, UpdateData::Delta(_)));
         assert_eq!(extract_update_bytes(&wrapped), bytes.as_slice());
         assert_eq!(describe_update_variant(&wrapped), "delta");
+    }
+
+    // ---------------------------------------------------------------
+    // #4102: configurable response timeout + distinguishable timeout
+    // error. These reference `resolve_response_timeout_from` and
+    // `ResponseTimeout`, which do not exist on pre-fix code.
+    // ---------------------------------------------------------------
+
+    /// Explicit `--timeout` flag wins over env var and default.
+    #[test]
+    fn timeout_flag_takes_precedence() {
+        let d = resolve_response_timeout_from(Some(600), Some("90".to_string()));
+        assert_eq!(d, Duration::from_secs(600));
+        // Even a garbage env value is irrelevant when the flag is set.
+        let d = resolve_response_timeout_from(Some(600), Some("not-a-number".to_string()));
+        assert_eq!(d, Duration::from_secs(600));
+    }
+
+    /// #4102: `--timeout 0` is rejected the same way `FDEV_RESPONSE_TIMEOUT=0`
+    /// is — it must NOT be honored as an immediate timeout (which would emit a
+    /// spurious "may have succeeded" before the request is ever awaited).
+    /// A zero flag falls back to the env var, and to the default when the env
+    /// is also unset/zero.
+    #[test]
+    fn timeout_flag_zero_falls_back() {
+        // Zero flag, no env → default.
+        assert_eq!(
+            resolve_response_timeout_from(Some(0), None),
+            DEFAULT_RESPONSE_TIMEOUT
+        );
+        // Zero flag, zero env → still the default (never disabled).
+        assert_eq!(
+            resolve_response_timeout_from(Some(0), Some("0".to_string())),
+            DEFAULT_RESPONSE_TIMEOUT
+        );
+        // Zero flag defers to a valid env value rather than short-circuiting.
+        assert_eq!(
+            resolve_response_timeout_from(Some(0), Some("90".to_string())),
+            Duration::from_secs(90)
+        );
+    }
+
+    /// Env var is used when no flag is given.
+    #[test]
+    fn timeout_env_used_when_no_flag() {
+        let d = resolve_response_timeout_from(None, Some("90".to_string()));
+        assert_eq!(d, Duration::from_secs(90));
+        // Surrounding whitespace is tolerated.
+        let d = resolve_response_timeout_from(None, Some("  120 ".to_string()));
+        assert_eq!(d, Duration::from_secs(120));
+    }
+
+    /// Neither flag nor env → the 300s default.
+    #[test]
+    fn timeout_defaults_when_absent() {
+        let d = resolve_response_timeout_from(None, None);
+        assert_eq!(d, DEFAULT_RESPONSE_TIMEOUT);
+        assert_eq!(d, Duration::from_secs(300));
+    }
+
+    /// A zero or non-numeric env value is rejected and falls back to the
+    /// default rather than silently disabling the wait.
+    #[test]
+    fn timeout_env_zero_or_garbage_falls_back_to_default() {
+        assert_eq!(
+            resolve_response_timeout_from(None, Some("0".to_string())),
+            DEFAULT_RESPONSE_TIMEOUT
+        );
+        assert_eq!(
+            resolve_response_timeout_from(None, Some("not-a-number".to_string())),
+            DEFAULT_RESPONSE_TIMEOUT
+        );
+        assert_eq!(
+            resolve_response_timeout_from(None, Some(String::new())),
+            DEFAULT_RESPONSE_TIMEOUT
+        );
+    }
+
+    /// The timeout error survives conversion into `anyhow::Error` and can be
+    /// downcast back to `ResponseTimeout`, so `main` can map it to a distinct
+    /// exit code. The "may have succeeded" wording is preserved for humans.
+    #[test]
+    fn response_timeout_downcasts_through_anyhow() {
+        let err: anyhow::Error = ResponseTimeout {
+            target: "contract ABC".to_string(),
+            timeout: Duration::from_secs(300),
+        }
+        .into();
+        let downcast = err.downcast_ref::<ResponseTimeout>();
+        assert!(
+            downcast.is_some(),
+            "timeout error must remain downcastable to ResponseTimeout"
+        );
+        assert_eq!(downcast.unwrap().timeout, Duration::from_secs(300));
+        assert!(err.to_string().contains("may have succeeded"));
+
+        // A different error type must NOT downcast to ResponseTimeout.
+        let other: anyhow::Error = anyhow::anyhow!("some other failure");
+        assert!(other.downcast_ref::<ResponseTimeout>().is_none());
     }
 }

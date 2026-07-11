@@ -15,7 +15,9 @@ use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use xz2::write::XzEncoder;
 
-use crate::commands::{RESPONSE_TIMEOUT, close_api_client, execute_command, start_api_client};
+use crate::commands::{
+    ResponseTimeout, close_api_client, execute_command, resolve_response_timeout, start_api_client,
+};
 use crate::config::BaseConfig;
 
 /// Pre-compiled website container contract WASM, embedded at build time.
@@ -56,6 +58,11 @@ pub enum WebsiteCommand {
         /// Path to a custom contract WASM file (uses built-in contract by default)
         #[arg(long)]
         contract_wasm: Option<PathBuf>,
+        /// Maximum seconds to wait for the node's response before giving up.
+        /// Takes precedence over the `FDEV_RESPONSE_TIMEOUT` env var; when
+        /// neither is set the default of 300s applies. See issue #4102.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Update an existing website with new content (publishes with a higher version)
     Update {
@@ -67,6 +74,11 @@ pub enum WebsiteCommand {
         /// Path to a custom contract WASM file (uses built-in contract by default)
         #[arg(long)]
         contract_wasm: Option<PathBuf>,
+        /// Maximum seconds to wait for the node's response before giving up.
+        /// Takes precedence over the `FDEV_RESPONSE_TIMEOUT` env var; when
+        /// neither is set the default of 300s applies. See issue #4102.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// List all website signing keys
     List,
@@ -333,6 +345,7 @@ pub async fn publish(
     directory: PathBuf,
     key_name: String,
     contract_wasm: Option<PathBuf>,
+    timeout_secs: Option<u64>,
     base_config: BaseConfig,
 ) -> anyhow::Result<()> {
     let signing_key = read_signing_key(&key_name)?;
@@ -383,7 +396,8 @@ pub async fn publish(
     let mut client = start_api_client(base_config).await?;
     execute_command(request, &mut client).await?;
 
-    let result = match tokio::time::timeout(RESPONSE_TIMEOUT, client.recv()).await {
+    let timeout = resolve_response_timeout(timeout_secs);
+    let result = match tokio::time::timeout(timeout, client.recv()).await {
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse {
             key: response_key,
         }))) => {
@@ -401,10 +415,11 @@ pub async fn publish(
         }
         Ok(Ok(other)) => Err(anyhow::anyhow!("Unexpected response: {:?}", other)),
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to receive response: {e}")),
-        Err(_) => Err(anyhow::anyhow!(
-            "Timeout waiting for response after {} seconds. The operation may have succeeded.",
-            RESPONSE_TIMEOUT.as_secs()
-        )),
+        Err(_) => Err(ResponseTimeout {
+            target: format!("website contract {key}"),
+            timeout,
+        }
+        .into()),
     };
 
     close_api_client(&mut client).await;
@@ -415,12 +430,20 @@ pub async fn update(
     directory: PathBuf,
     key_name: String,
     contract_wasm: Option<PathBuf>,
+    timeout_secs: Option<u64>,
     base_config: BaseConfig,
 ) -> anyhow::Result<()> {
     // Update is the same as publish -- the node handles PUT vs UPDATE based on
     // whether the contract already exists. The contract's update_state validates
     // that the version is strictly increasing.
-    publish(directory, key_name, contract_wasm, base_config).await
+    publish(
+        directory,
+        key_name,
+        contract_wasm,
+        timeout_secs,
+        base_config,
+    )
+    .await
 }
 
 #[cfg(test)]
