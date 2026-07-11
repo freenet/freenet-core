@@ -37,6 +37,30 @@ enum Error {
     CommandFailed(&'static str),
 }
 
+/// Process exit code for a response timeout (see [`commands::ResponseTimeout`]
+/// and issue #4102). Distinct from the generic failure code (1) so release
+/// automation can treat a timeout as "verify out-of-band before failing"
+/// rather than a hard failure.
+///
+/// Deliberately NOT `2`: clap emits exit code `2` for CLI usage errors
+/// (unknown flag, missing argument, etc.) from `Config::parse()` before any
+/// of our code runs. Reusing `2` would let a usage error — where nothing was
+/// ever sent to the node — masquerade as "submitted, may have succeeded",
+/// which is exactly the misclassification this distinct code exists to
+/// prevent. `3` is the first free code above clap's reserved range.
+const EXIT_RESPONSE_TIMEOUT: i32 = 3;
+
+/// Map a top-level error to the process exit code. A [`commands::ResponseTimeout`]
+/// (possibly wrapped by `anyhow`) maps to [`EXIT_RESPONSE_TIMEOUT`]; everything
+/// else maps to the generic failure code `1`.
+fn exit_code_for_error(err: &anyhow::Error) -> i32 {
+    if err.downcast_ref::<commands::ResponseTimeout>().is_some() {
+        EXIT_RESPONSE_TIMEOUT
+    } else {
+        1
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let config = Config::parse();
     if !config.sub_command.is_child() {
@@ -54,7 +78,7 @@ fn main() -> anyhow::Result<()> {
     let tokio_rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    tokio_rt.block_on(async move {
+    let result = tokio_rt.block_on(async move {
         let cwd = std::env::current_dir()?;
         let r = match config.sub_command {
             SubCommand::WasmRuntime(local_node_config) => {
@@ -107,16 +131,82 @@ fn main() -> anyhow::Result<()> {
                     directory,
                     key,
                     contract_wasm,
-                } => website::publish(directory, key, contract_wasm, config.additional).await,
+                    timeout,
+                } => {
+                    website::publish(directory, key, contract_wasm, timeout, config.additional)
+                        .await
+                }
                 website::WebsiteCommand::Update {
                     directory,
                     key,
                     contract_wasm,
-                } => website::update(directory, key, contract_wasm, config.additional).await,
+                    timeout,
+                } => {
+                    website::update(directory, key, contract_wasm, timeout, config.additional).await
+                }
                 website::WebsiteCommand::List => website::list(),
             },
         };
         // todo: make all commands return concrete `thiserror` compatible errors so we can use anyhow
-        r.map_err(|e| anyhow::format_err!(e))
-    })
+        // Preserve the concrete `ResponseTimeout` type so main() can map it to a
+        // distinct exit code (#4102); re-wrap every other error as before.
+        r.map_err(|e| {
+            if e.downcast_ref::<commands::ResponseTimeout>().is_some() {
+                e
+            } else {
+                anyhow::format_err!(e)
+            }
+        })
+    });
+
+    // A response timeout exits with a distinct code (#4102) so release scripts
+    // can distinguish "timed out, may have succeeded" from a hard failure.
+    if let Err(err) = &result {
+        let code = exit_code_for_error(err);
+        if code != 1 {
+            eprintln!("Error: {err:#}");
+            std::process::exit(code);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EXIT_RESPONSE_TIMEOUT, exit_code_for_error};
+    use crate::commands::ResponseTimeout;
+    use std::time::Duration;
+
+    /// #4102: a response timeout maps to a distinct exit code so release
+    /// automation can verify out-of-band before treating it as a hard failure.
+    #[test]
+    fn response_timeout_maps_to_distinct_exit_code() {
+        let err: anyhow::Error = ResponseTimeout {
+            target: "contract ABC".to_string(),
+            timeout: Duration::from_secs(300),
+        }
+        .into();
+        assert_eq!(exit_code_for_error(&err), EXIT_RESPONSE_TIMEOUT);
+        assert_eq!(EXIT_RESPONSE_TIMEOUT, 3);
+    }
+
+    /// #4102: the timeout exit code must NOT collide with clap's usage-error
+    /// code (2). A release script treating exit 2 as "submitted, may have
+    /// succeeded" would otherwise misclassify a CLI usage error (unknown flag,
+    /// e.g. passing `--timeout` to an older fdev) where nothing was ever sent.
+    #[test]
+    fn timeout_exit_code_does_not_collide_with_clap_usage_error() {
+        const CLAP_USAGE_ERROR: i32 = 2;
+        assert_ne!(
+            EXIT_RESPONSE_TIMEOUT, CLAP_USAGE_ERROR,
+            "response-timeout exit code must not reuse clap's usage-error code"
+        );
+    }
+
+    /// Any other error keeps the generic failure code (1).
+    #[test]
+    fn other_errors_map_to_generic_failure_code() {
+        let err = anyhow::anyhow!("boom");
+        assert_eq!(exit_code_for_error(&err), 1);
+    }
 }

@@ -121,6 +121,11 @@ pub struct GetConfig {
     /// Write the state to a file instead of stdout.
     #[arg(short, long)]
     pub(crate) output: Option<PathBuf>,
+    /// Maximum seconds to wait for the node's response before giving up.
+    /// Takes precedence over the `FDEV_RESPONSE_TIMEOUT` env var; when neither
+    /// is set the default of 300s applies. See issue #4102.
+    #[arg(long)]
+    pub(crate) timeout: Option<u64>,
 }
 
 /// Subscribes to a contract and streams update notifications until interrupted.
@@ -131,6 +136,11 @@ pub struct SubscribeConfig {
     /// Write each update to a file (overwritten on each update) instead of stdout.
     #[arg(short, long)]
     pub(crate) output: Option<PathBuf>,
+    /// Maximum seconds to wait for the node's initial subscribe confirmation
+    /// before giving up. Takes precedence over the `FDEV_RESPONSE_TIMEOUT` env
+    /// var; when neither is set the default of 300s applies. See issue #4102.
+    #[arg(long)]
+    pub(crate) timeout: Option<u64>,
 }
 
 /// Updates a contract in the network.
@@ -151,6 +161,11 @@ pub struct UpdateConfig {
     /// contract's `update_state` only accepts full-state replacements.
     #[arg(long)]
     pub(crate) as_state: bool,
+    /// Maximum seconds to wait for the node's response before giving up.
+    /// Takes precedence over the `FDEV_RESPONSE_TIMEOUT` env var; when neither
+    /// is set the default of 300s applies. See issue #4102.
+    #[arg(long)]
+    pub(crate) timeout: Option<u64>,
 }
 
 /// Publishes a new contract or delegate to the network.
@@ -173,6 +188,12 @@ pub struct PutConfig {
     /// Flag that indicates if the node should subscribe to the contract.
     #[arg(long)]
     pub(crate) subscribe: bool,
+
+    /// Maximum seconds to wait for the node's response before giving up.
+    /// Takes precedence over the `FDEV_RESPONSE_TIMEOUT` env var; when neither
+    /// is set the default of 300s applies. See issue #4102.
+    #[arg(long)]
+    pub(crate) timeout: Option<u64>,
 }
 
 /// Builds and packages a contract or delegate.
@@ -328,5 +349,175 @@ mod tests {
             result.is_err(),
             "fdev execute update with a third positional arg should fail after #4088 removal"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #4102: `--timeout <seconds>` on publish / execute {put,get,update}.
+    // These parse assertions fail to COMPILE on pre-fix code because the
+    // `timeout` field does not exist on the config structs yet.
+    // -----------------------------------------------------------------
+
+    use super::{NodeCommand, SubCommand};
+    use crate::commands::PutType;
+
+    #[test]
+    fn publish_accepts_timeout_flag() {
+        let config = Config::try_parse_from([
+            "fdev",
+            "publish",
+            "--code",
+            "contract.wasm",
+            "--timeout",
+            "600",
+            "contract",
+        ])
+        .expect("publish --timeout 600 should parse");
+        match config.sub_command {
+            SubCommand::Publish(put) => {
+                assert_eq!(put.timeout, Some(600));
+                assert!(matches!(put.package_type, PutType::Contract(_)));
+            }
+            _ => panic!("expected Publish subcommand"),
+        }
+    }
+
+    #[test]
+    fn publish_timeout_defaults_to_none_when_omitted() {
+        let config =
+            Config::try_parse_from(["fdev", "publish", "--code", "contract.wasm", "contract"])
+                .expect("publish without --timeout should parse");
+        match config.sub_command {
+            SubCommand::Publish(put) => assert_eq!(put.timeout, None),
+            _ => panic!("expected Publish subcommand"),
+        }
+    }
+
+    #[test]
+    fn execute_put_accepts_timeout_flag() {
+        let config = Config::try_parse_from([
+            "fdev",
+            "execute",
+            "put",
+            "--code",
+            "contract.wasm",
+            "--timeout",
+            "45",
+            "contract",
+        ])
+        .expect("execute put --timeout 45 should parse");
+        match config.sub_command {
+            SubCommand::Execute(run) => match run.command {
+                NodeCommand::Put(put) => assert_eq!(put.timeout, Some(45)),
+                _ => panic!("expected Put command"),
+            },
+            _ => panic!("expected Execute subcommand"),
+        }
+    }
+
+    #[test]
+    fn execute_get_accepts_timeout_flag() {
+        let config = Config::try_parse_from([
+            "fdev",
+            "execute",
+            "get",
+            "SomeBase58ContractKey",
+            "--timeout",
+            "42",
+        ])
+        .expect("execute get --timeout 42 should parse");
+        match config.sub_command {
+            SubCommand::Execute(run) => match run.command {
+                NodeCommand::Get(get) => assert_eq!(get.timeout, Some(42)),
+                _ => panic!("expected Get command"),
+            },
+            _ => panic!("expected Execute subcommand"),
+        }
+    }
+
+    #[test]
+    fn execute_update_accepts_timeout_flag() {
+        let config = Config::try_parse_from([
+            "fdev",
+            "execute",
+            "update",
+            "SomeBase58ContractKey",
+            "/tmp/delta.bin",
+            "--timeout",
+            "42",
+        ])
+        .expect("execute update --timeout 42 should parse");
+        match config.sub_command {
+            SubCommand::Execute(run) => match run.command {
+                NodeCommand::Update(update) => assert_eq!(update.timeout, Some(42)),
+                _ => panic!("expected Update command"),
+            },
+            _ => panic!("expected Execute subcommand"),
+        }
+    }
+
+    #[test]
+    fn execute_subscribe_accepts_timeout_flag() {
+        let config = Config::try_parse_from([
+            "fdev",
+            "execute",
+            "subscribe",
+            "SomeBase58ContractKey",
+            "--timeout",
+            "42",
+        ])
+        .expect("execute subscribe --timeout 42 should parse");
+        match config.sub_command {
+            SubCommand::Execute(run) => match run.command {
+                NodeCommand::Subscribe(subscribe) => assert_eq!(subscribe.timeout, Some(42)),
+                _ => panic!("expected Subscribe command"),
+            },
+            _ => panic!("expected Execute subcommand"),
+        }
+    }
+
+    #[test]
+    fn website_publish_accepts_timeout_flag() {
+        use crate::website::WebsiteCommand;
+        let config = Config::try_parse_from([
+            "fdev",
+            "website",
+            "publish",
+            "/tmp/site",
+            "--key",
+            "my-site",
+            "--timeout",
+            "120",
+        ])
+        .expect("website publish --timeout 120 should parse");
+        match config.sub_command {
+            SubCommand::Website { command } => match command {
+                WebsiteCommand::Publish { timeout, .. } => assert_eq!(timeout, Some(120)),
+                _ => panic!("expected Publish website command"),
+            },
+            _ => panic!("expected Website subcommand"),
+        }
+    }
+
+    #[test]
+    fn website_update_accepts_timeout_flag() {
+        use crate::website::WebsiteCommand;
+        let config = Config::try_parse_from([
+            "fdev",
+            "website",
+            "update",
+            "/tmp/site",
+            "--key",
+            "my-site",
+            "--timeout",
+            "120",
+        ])
+        .expect("website update --timeout 120 should parse");
+        match config.sub_command {
+            SubCommand::Website { command } => match command {
+                WebsiteCommand::Update { timeout, .. } => assert_eq!(timeout, Some(120)),
+                _ => panic!("expected Update website command"),
+            },
+            _ => panic!("expected Website subcommand"),
+        }
     }
 }
