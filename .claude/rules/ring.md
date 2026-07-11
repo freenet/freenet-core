@@ -237,6 +237,18 @@ WHEN summarizing contracts in the InterestSync heartbeat handlers
     state store so an evicted-but-on-disk contract (state present, not in the
     hosting cache, still in_use) keeps summarizing — keying on is_hosting_contract
     there would wrongly drop it.
+  → #4612 (root fix for the phantoms the #4610 gate only filters): the 30s
+    recovery loop reconciles the downstream-driven in-use set against the
+    state store (HostingManager::reconcile_phantom_in_use). A contract in_use
+    via downstream subscribers with NO stored state gets a bounded one-shot
+    repair fetch (sub-op GET; ≤ MAX_PHANTOM_REPAIRS_PER_INTERVAL per tick,
+    one per contract per OPERATION_TTL cooldown); after
+    MAX_PHANTOM_REPAIR_ATTEMPTS failures its downstream registration is
+    DROPPED (drop_phantom_downstream + symmetric interest decrement +
+    reconcile_wants_collapse), never kept as a persistent stateless "host".
+    Do NOT instead skip register_downstream_subscriber on a stateless relay:
+    the downstream map is load-bearing for UPDATE forwarding through relay
+    chains — the fix is repair-or-drop, not never-register.
 ```
 
 ### Cleanup Exemptions Must Be Time-Bounded
