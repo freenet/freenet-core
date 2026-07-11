@@ -17,6 +17,12 @@ pub struct ContractStore {
     key_to_code_part: Arc<DashMap<ContractInstanceId, CodeHash>>,
     /// ReDb storage for persistent index
     db: Storage,
+    /// Test-only hook invoked inside `store_contract` AFTER the `.wasm` blob is
+    /// written and synced but BEFORE the ReDb index entry is committed. Lets the
+    /// issue #4216 regression test drive a concurrent `remove_contract` into
+    /// exactly that window. `None` in every non-test build.
+    #[cfg(test)]
+    after_blob_write_hook: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 // Eviction-driven reclamation of unused contracts now exists: the hosting
 // cache evicts least-valuable contracts past its budget and the resulting
@@ -87,7 +93,15 @@ impl ContractStore {
             contracts_dir,
             key_to_code_part,
             db,
+            #[cfg(test)]
+            after_blob_write_hook: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Install the test-only post-blob-write hook (issue #4216 regression test).
+    #[cfg(test)]
+    fn set_after_blob_write_hook(&self, hook: Box<dyn FnMut() + Send>) {
+        *self.after_blob_write_hook.lock().unwrap() = Some(hook);
     }
 
     /// Returns a copy of the contract bytes if available, none otherwise.
@@ -143,6 +157,20 @@ impl ContractStore {
 
     /// Store a copy of the contract in the local store, in case it hasn't been stored previously.
     pub fn store_contract(&mut self, contract: ContractContainer) -> RuntimeResult<()> {
+        // Serialize against concurrent store/remove on the SAME shared code
+        // hash across sibling-executor `ContractStore`s (issue #4216). Without
+        // this, a `remove_contract` on another executor can run its
+        // `load_all_contract_index()` scan in the window after we write the
+        // `.wasm` blob but before we commit our index entry, see no remaining
+        // reference to the code hash, and delete the blob we just wrote —
+        // leaving this instance indexed but blobless. Holding the shared lock
+        // from before the cache/disk checks through the index commit closes
+        // that window. All sections below are synchronous (no `.await`), so
+        // holding a std `Mutex` across the ReDb + filesystem ops is
+        // deadlock-safe.
+        let blob_lock = self.db.contract_blob_lock();
+        let _blob_guard = blob_lock.lock().unwrap_or_else(|e| e.into_inner());
+
         let (key, code) = match contract.clone() {
             ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
                 (*contract_v1.key(), contract_v1.code().clone())
@@ -165,13 +193,16 @@ impl ContractStore {
             // below restores the blob in that case so the new instance is
             // durably stored. See issue #4218 for the underlying per-executor
             // map divergence and Codex's round-4 finding.
-            self.ensure_key_indexed(&key)?;
+            //
+            // Use the `_locked` helper: we already hold `blob_lock` and std
+            // `Mutex` is not reentrant.
+            self.ensure_key_indexed_locked(&key)?;
             return Ok(());
         }
         if let Ok((code, _ver)) = ContractCode::load_versioned_from_path(&key_path) {
             // WASM file exists on disk. Add to cache AND ensure the index is updated.
             // See issue #2344 for why this is critical after crash recovery.
-            self.ensure_key_indexed(&key)?;
+            self.ensure_key_indexed_locked(&key)?;
             self.contract_cache.insert(*code_hash, Arc::new(code));
             return Ok(());
         }
@@ -187,6 +218,13 @@ impl ContractStore {
         let mut file = File::create(&key_path)?;
         file.write_all(output.as_slice())?;
         file.sync_all()?; // Ensure durability before updating index
+
+        // Test-only injection point for the issue #4216 race: the blob is now
+        // observable on disk but the index entry below is not yet committed.
+        #[cfg(test)]
+        if let Some(hook) = self.after_blob_write_hook.lock().unwrap().as_mut() {
+            hook();
+        }
 
         // Step 2: Update index in ReDb (persistent, crash-safe)
         self.db
@@ -232,6 +270,18 @@ impl ContractStore {
     /// index is the single shared source of truth across all executors.
     pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let contract_hash = *key.code_hash();
+
+        // Serialize against concurrent `store_contract` on the SAME shared code
+        // hash across sibling-executor `ContractStore`s (issue #4216). Holding
+        // the shared lock from before the ReDb index removal through the blob
+        // delete guarantees our "is this code still referenced?" scan observes
+        // any concurrent store's committed index entry (that store commits its
+        // entry while holding this same lock), so we never delete a blob a
+        // sibling executor just wrote for a new instance of the same code. All
+        // sections below are synchronous (no `.await`), so holding a std
+        // `Mutex` across the ReDb + filesystem ops is deadlock-safe.
+        let blob_lock = self.db.contract_blob_lock();
+        let _blob_guard = blob_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         // Remove this instance's index entries first. The ReDb removal must
         // happen before the `load_all_contract_index()` scan below so this
@@ -311,6 +361,21 @@ impl ContractStore {
     /// use the same code (different parameters = different rooms).
     /// See issue #2380.
     pub fn ensure_key_indexed(&mut self, key: &ContractKey) -> RuntimeResult<()> {
+        // Public entry point: take the shared store/remove lock (issue #4216)
+        // so an external caller indexing a new instance is serialized against a
+        // concurrent `remove_contract` on the same code hash, just like
+        // `store_contract`. Callers already holding the lock (i.e.
+        // `store_contract`) must use `ensure_key_indexed_locked` instead — std
+        // `Mutex` is not reentrant.
+        let blob_lock = self.db.contract_blob_lock();
+        let _blob_guard = blob_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_key_indexed_locked(key)
+    }
+
+    /// Unlocked body of [`ensure_key_indexed`]. The caller MUST hold the shared
+    /// `contract_blob_lock` (issue #4216). Called by `store_contract`, which
+    /// already holds the lock.
+    fn ensure_key_indexed_locked(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let code_hash = key.code_hash();
         if !self.key_to_code_part.contains_key(key.id()) {
             // Store in ReDb
@@ -1003,6 +1068,122 @@ mod test {
         assert!(
             store.fetch_contract(&x2_key, &params).is_some(),
             "new instance must be fetchable after rewrite"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for issue #4216: a concurrent `store_contract` and
+    /// `remove_contract` on the SAME shared code hash, running on two
+    /// sibling-executor `ContractStore`s over one shared ReDb, must not delete
+    /// the freshly-written `.wasm` blob.
+    ///
+    /// The race: executor B stores a new instance X2 (writes the `.wasm` blob,
+    /// then commits its index entry). Executor A removes instance X1, which
+    /// scans the shared ReDb index to decide whether the blob is still
+    /// referenced. If A's scan runs after B wrote the blob but before B
+    /// committed X2's index entry, A sees no remaining reference and deletes
+    /// the blob B just wrote — corrupting X2 on the next cache miss / restart.
+    ///
+    /// This test drives A's `remove_contract` into exactly that window via the
+    /// test-only `after_blob_write_hook`, which fires inside B's
+    /// `store_contract` after the blob write/sync but before the index commit.
+    /// Pre-fix, A's remove completes inside the window and deletes the blob;
+    /// post-fix, the shared blob lock makes A block until B's index commit
+    /// lands, so A's scan sees X2 and keeps the blob.
+    #[tokio::test]
+    async fn test_concurrent_store_remove_keeps_freshly_written_wasm()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+
+        // Two ContractStores (two runtime-pool executors) sharing ONE db.
+        let mut store_a = ContractStore::new(contract_dir.path().into(), 10_000, db.clone())?;
+        let mut store_b = ContractStore::new(contract_dir.path().into(), 10_000, db.clone())?;
+
+        // Same code, different params -> same code_hash, different instances.
+        let shared_code = vec![11, 22, 33, 44, 55];
+        let params1 = Parameters::from(vec![1, 1, 1]);
+        let params2 = Parameters::from(vec![2, 2, 2]);
+        let contract1 = WrappedContract::new(
+            Arc::new(ContractCode::from(shared_code.clone())),
+            params1.clone(),
+        );
+        let contract2 = WrappedContract::new(
+            Arc::new(ContractCode::from(shared_code.clone())),
+            params2.clone(),
+        );
+        let key1 = *contract1.key();
+        let key2 = *contract2.key();
+        assert_eq!(key1.code_hash(), key2.code_hash());
+
+        // Store X1 (blob + index) via executor A.
+        store_a.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract1,
+        )))?;
+
+        let wasm_path = contract_dir
+            .path()
+            .join(key1.code_hash().encode())
+            .with_extension("wasm");
+        assert!(
+            wasm_path.exists(),
+            "WASM file should exist after first store"
+        );
+
+        // Remove the on-disk blob so B is forced down the blob-WRITE path
+        // (otherwise B would take the "blob already on disk" fast path and
+        // never reach the write->commit window this race lives in). X1's index
+        // entry is intentionally left in place, exactly as it would be during a
+        // concurrent eviction of X1.
+        std::fs::remove_file(&wasm_path)?;
+
+        // When B writes X2's blob (before committing X2's index), spawn A's
+        // remove_contract(X1) on another thread and hold the window open long
+        // enough for it to reach — and, pre-fix, complete — its delete
+        // decision. We do NOT join inside the hook: post-fix the remove blocks
+        // on the shared lock B still holds, so joining here would deadlock.
+        let join_slot = Arc::new(std::sync::Mutex::new(None));
+        let join_slot_hook = Arc::clone(&join_slot);
+        let mut store_a_opt = Some(store_a);
+        store_b.set_after_blob_write_hook(Box::new(move || {
+            let mut store_a = store_a_opt.take().expect("hook is invoked exactly once");
+            let handle = std::thread::spawn(move || {
+                let _ = store_a.remove_contract(&key1);
+            });
+            // Real wall-clock sleep: this is a genuine cross-thread race test,
+            // so a deterministic TimeSource cannot model the interleaving.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            *join_slot_hook.lock().unwrap() = Some(handle);
+        }));
+
+        // Store X2 via executor B. The hook fires mid-store, after the blob is
+        // on disk and before X2's index is committed.
+        store_b.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract2,
+        )))?;
+
+        // B released the lock on return; let A's remove finish.
+        let handle = join_slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("hook must have spawned the remove thread");
+        handle.join().expect("remove thread panicked");
+
+        // Post-fix: A's scan observed X2's committed reference and kept the blob.
+        assert!(
+            wasm_path.exists(),
+            "shared WASM blob must survive a concurrent store/remove race (#4216)"
+        );
+
+        // And X2 is fetchable from a FRESH cold-cache store over the same db,
+        // forcing the disk read that pre-fix corruption breaks.
+        let fresh = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+        assert!(
+            fresh.fetch_contract(&key2, &params2).is_some(),
+            "newly stored instance must be fetchable from disk after the race (#4216)"
         );
 
         Ok(())
