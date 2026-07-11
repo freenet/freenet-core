@@ -1294,6 +1294,24 @@ mod tests {
     use crate::ring::Distance;
     use std::time::Duration;
 
+    /// Restores the per-thread nearest-neighbor lattice overrides to their
+    /// production defaults (flag ON, floor-bypass OFF) on drop — even on panic —
+    /// so a lattice test that calls `set_nn_lattice_enabled` cannot leak the
+    /// floor-bypass to a later test on the SAME thread under plain `cargo test`
+    /// (nextest is process-isolated, but `cargo test` reuses threads).
+    /// `set_nn_lattice_enabled(true)` also force-activates (bypasses the
+    /// minimum-degree floor), so the guard clears that explicitly rather than
+    /// relying on a bare `set_nn_lattice_enabled(true)` cleanup that would itself
+    /// leak force-active ON. Mirrors `NnLatticeTestGuard` in
+    /// `tests/simulation_integration.rs`.
+    struct NnLatticeOverrideGuard;
+    impl Drop for NnLatticeOverrideGuard {
+        fn drop(&mut self) {
+            crate::ring::set_nn_lattice_enabled(true);
+            crate::ring::set_nn_lattice_force_active(false);
+        }
+    }
+
     #[test_log::test]
     fn test_resource_manager_report() {
         // Create a TopologyManager with arbitrary limits
@@ -2580,6 +2598,7 @@ mod tests {
     /// (successor + predecessor), never the farther neighbors on either side.
     #[test_log::test]
     fn protected_nearest_neighbors_returns_per_side_nearest() {
+        let _nn_guard = NnLatticeOverrideGuard;
         crate::ring::set_nn_lattice_enabled(true);
         let my_loc = Location::new(0.5);
         let succ_near = Location::new(0.52);
@@ -2608,10 +2627,10 @@ mod tests {
 
     /// The exemption is gated by the lattice flag: disabled → the activation gate
     /// (`nn_lattice_active_for`) is false → nothing protected (stock behavior).
-    /// Restores the flag so the thread stays at the production default for
-    /// subsequent tests.
+    /// `_nn_guard` restores the thread to the production default on drop.
     #[test_log::test]
     fn protected_nearest_neighbors_empty_when_lattice_disabled() {
+        let _nn_guard = NnLatticeOverrideGuard;
         crate::ring::set_nn_lattice_enabled(false);
         let my_loc = Location::new(0.5);
         let mut nb = BTreeMap::new();
@@ -2622,7 +2641,6 @@ mod tests {
         // Production-scale budget, so the gate tracks the flag: disabled → false.
         let nn_active = crate::ring::nn_lattice_active_for(200);
         assert!(protected_nearest_neighbors(nn_active, &Some(my_loc), &nb).is_empty());
-        crate::ring::set_nn_lattice_enabled(true);
     }
 
     /// The score-based fallback drop never selects a per-side nearest lattice
@@ -2633,6 +2651,7 @@ mod tests {
     /// edges) — this pair of checks shows the exemption is what spares them.
     #[test_log::test]
     fn score_fallback_never_drops_lattice_edge() {
+        let _nn_guard = NnLatticeOverrideGuard;
         let my_loc = Location::new(0.5);
         // Nearest edge on each side is redundant (has a near-duplicate), so its
         // removal makes a tiny gap — a prime least-important drop candidate.
@@ -2682,7 +2701,7 @@ mod tests {
             .is_empty(),
             "lattice OFF must protect nothing"
         );
-        crate::ring::set_nn_lattice_enabled(true);
+        // `_nn_guard` restores the production default on drop (even on panic).
     }
 
     /// The score-based topology SWAP (`maybe_swap_connection`) never selects a
@@ -2693,6 +2712,7 @@ mod tests {
     #[test_log::test]
     fn maybe_swap_connection_never_swaps_lattice_edge() {
         let _guard = crate::config::GlobalRng::seed_guard(0x5A1D_C0DE);
+        let _nn_guard = NnLatticeOverrideGuard;
         crate::ring::set_nn_lattice_enabled(true);
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(100000.0),
@@ -2763,6 +2783,7 @@ mod tests {
     /// and the fallback-drop path are covered by the two tests above).
     #[test_log::test]
     fn select_connections_to_remove_never_drops_lattice_edge() {
+        let _nn_guard = NnLatticeOverrideGuard;
         crate::ring::set_nn_lattice_enabled(true);
         let limits = Limits {
             max_upstream_bandwidth: Rate::new_per_second(100000.0),
@@ -2839,17 +2860,29 @@ mod tests {
             &Some(my_location),
             &nb,
         );
-        if let TopologyAdjustment::RemoveConnections(peers) = adj {
-            for p in &peers {
-                assert_ne!(
-                    *p, succ_near_peer,
-                    "removal must NOT drop the protected nearest successor"
-                );
-                assert_ne!(
-                    *p, pred_near_peer,
-                    "removal must NOT drop the protected nearest predecessor"
-                );
-            }
+        // Assert the outcome IS a removal (not `NoChange`): under this resource
+        // pressure the method must shed load, and pinning the variant is what
+        // stops the test from passing vacuously if a future refactor makes it
+        // return `NoChange` (the protected-edge check would then never run).
+        let TopologyAdjustment::RemoveConnections(peers) = adj else {
+            panic!(
+                "expected RemoveConnections under resource pressure, got {adj:?}; \
+                 a NoChange here would make the protected-edge assertions vacuous"
+            );
+        };
+        assert!(
+            !peers.is_empty(),
+            "resource pressure must remove at least one peer"
+        );
+        for p in &peers {
+            assert_ne!(
+                *p, succ_near_peer,
+                "removal must NOT drop the protected nearest successor"
+            );
+            assert_ne!(
+                *p, pred_near_peer,
+                "removal must NOT drop the protected nearest predecessor"
+            );
         }
     }
 

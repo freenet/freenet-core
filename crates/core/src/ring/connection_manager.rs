@@ -1164,20 +1164,34 @@ impl ConnectionManager {
     /// displacement was inert on the real CONNECT path (the gates rejected at
     /// `>= max_connections` first).
     ///
-    /// SELF-BOUNDING (why no reservation-aware clause is needed): each accepted
-    /// over-cap candidate ADVANCES the per-side current-nearest, so a following
-    /// candidate must be strictly closer STILL to be admitted — the admitted
-    /// sequence on one side is strictly decreasing in distance (a short records
-    /// chain, O(log) expected), and the absolute ceiling
-    /// ([`LATTICE_OVERMAX_SLACK`]) hard-bounds the ESTABLISHED set regardless. The
+    /// SELF-BOUNDING for the ESTABLISHED set (why no reservation-aware clause is
+    /// needed): each over-cap candidate that actually ESTABLISHES advances the
+    /// per-side current-nearest, so a following establisher must be strictly closer
+    /// STILL — the established sequence on one side is strictly decreasing in
+    /// distance (a short records chain, O(log) expected), and the absolute ceiling
+    /// ([`LATTICE_OVERMAX_SLACK`]) hard-bounds the ESTABLISHED count regardless. The
     /// earlier F1 reservation-aware clause (bounding concurrent over-cap fills to
     /// one per empty side) was DROPPED: its concern was a concurrent fill flood on
     /// an EMPTY side of a FULL node — a near-non-case (a node at 200 connections
     /// essentially always has both ring sides populated) — and the ceiling already
-    /// hard-bounds the established set. Any residual reservation/NAT pile-up
-    /// degrades to the generic connection-flood case (bounded by
-    /// `PENDING_RESERVATION_TTL` and per-target connection backoff), not an
-    /// unbounded lattice-specific path.
+    /// hard-bounds the established set.
+    ///
+    /// RESIDUAL (honestly disclosed, NOT closed here): this predicate checks the
+    /// ESTABLISHED count, and a pending reservation from `should_accept` does NOT
+    /// advance the established per-side nearest. So a FULL node (established count
+    /// at `max_connections`) fed a stream of strictly-closer FRESH-ADDRESS requests
+    /// re-fires the over-cap accept on EVERY request — recording pending state and
+    /// emitting an accept + NAT-traversal per request — because none of them
+    /// establishes and so none advances the nearest the next candidate must beat.
+    /// Per-target connection backoff does NOT bound this: each request straddles the
+    /// victim from a different fresh IPv6 `Location`/address, so no single target
+    /// repeats. It is instead TTL-bounded (each pending reservation expires at
+    /// [`PENDING_RESERVATION_TTL`]) and falls squarely within the cheap-IPv6 eclipse
+    /// / NAT-amplification tradeoff the project lead has already accepted (see the
+    /// `should_accept` SECURITY note, F3) — it is not a NEW unbounded lattice
+    /// path. Counting non-stale reservations toward the ceiling would close the
+    /// residual, but that is a DEFERRED decision (it would resurrect a
+    /// reservation-aware bound like the dropped F1 clause), not done here.
     pub(crate) fn admits_lattice_edge_over_cap(&self, loc: Location) -> bool {
         self.admits_lattice_edge_over_cap_in(&self.connections_by_location.read(), loc)
     }
@@ -2533,6 +2547,25 @@ mod tests {
         }
     }
 
+    /// Restores the per-thread nearest-neighbor lattice overrides to their
+    /// production defaults (flag ON, floor-bypass OFF) on drop — even on panic —
+    /// so a test that toggles them via `set_nn_lattice_enabled` cannot leak the
+    /// floor-bypass to a later test on the SAME thread under plain `cargo test`
+    /// (nextest is process-isolated, but `cargo test` reuses threads, and a sparse
+    /// test running after a leaked force-active sees the lattice forced ON below
+    /// the minimum-degree floor — an order-dependent failure).
+    /// `set_nn_lattice_enabled(true)` also force-activates (bypasses the floor),
+    /// so a naive `set_nn_lattice_enabled(true)` cleanup would itself leak
+    /// force-active ON; the guard clears it explicitly. Mirrors `NnLatticeTestGuard`
+    /// in `tests/simulation_integration.rs`.
+    struct NnLatticeOverrideGuard;
+    impl Drop for NnLatticeOverrideGuard {
+        fn drop(&mut self) {
+            set_nn_lattice_enabled(true);
+            set_nn_lattice_force_active(false);
+        }
+    }
+
     // ============ summary-first PUT version-gate tests (#4642 step 3-bis) ============
 
     /// `record_remote_version` / `remote_version` round-trip: an address
@@ -2843,6 +2876,7 @@ mod tests {
         // exercised by add_connection_admits_lattice_edge_over_max,
         // admits_lattice_edge_over_cap_predicate, and
         // lifecycle_gates_apply_lattice_over_cap_predicate.
+        let _nn_guard = NnLatticeOverrideGuard;
         set_nn_lattice_enabled(false);
         let cm = make_connection_manager(Some(make_addr(8000)), 1, 4, false);
         let keypair = TransportKeypair::new();
@@ -2869,7 +2903,9 @@ mod tests {
         let addr4 = make_addr(8004);
         let loc4 = Location::new(0.4);
         assert!(!cm.should_accept(loc4, addr4));
-        set_nn_lattice_enabled(true);
+        // `_nn_guard` restores the production default (flag ON, floor RE-ARMED) on
+        // drop — even on panic — so this test's `set_nn_lattice_enabled(false)`
+        // cannot leak to a later same-thread test.
     }
 
     #[test]
@@ -2924,6 +2960,7 @@ mod tests {
     /// a lattice edge — the exemption is never a permanent pin to a dead neighbor.
     #[test]
     fn prune_evicts_lattice_edge_liveness_not_gated() {
+        let _nn_guard = NnLatticeOverrideGuard;
         set_nn_lattice_enabled(true);
         // own_addr None so the location starts unset; update_location then pins
         // it to 0.5 (update_location is a no-op once a location is already set).
@@ -2962,6 +2999,7 @@ mod tests {
     /// restriction: the lattice must continuously pull toward the TRUE nearest.
     #[test]
     fn add_connection_admits_lattice_tighten_over_max_bounded_by_ceiling() {
+        let _nn_guard = NnLatticeOverrideGuard;
         set_nn_lattice_enabled(true);
         let max = 3usize;
         let cm = make_connection_manager(None, 2, max, false);
@@ -3069,6 +3107,7 @@ mod tests {
     /// gates apply on the real CONNECT path (see the source-scrape pin below).
     #[test]
     fn admits_lattice_edge_over_cap_predicate() {
+        let _nn_guard = NnLatticeOverrideGuard;
         set_nn_lattice_enabled(true);
         let max = 3usize;
         let cm = make_connection_manager(None, 2, max, false);
@@ -3111,7 +3150,9 @@ mod tests {
         // Disabling the lattice makes the predicate a no-op.
         set_nn_lattice_enabled(false);
         assert!(!cm.admits_lattice_edge_over_cap(Location::new(0.45)));
-        set_nn_lattice_enabled(true);
+        // `_nn_guard` restores the production default (flag ON, floor RE-ARMED) on
+        // drop — even on panic — instead of a bare `set_nn_lattice_enabled(true)`
+        // that would leak force-active ON to a later same-thread test.
     }
 
     /// Source-scrape pin (B1 regression guard): BOTH connection-lifecycle
@@ -4665,6 +4706,107 @@ mod tests {
         for (i, r) in results.into_iter().enumerate() {
             r.unwrap_or_else(|e| panic!("task {i} panicked: {e}"));
         }
+    }
+
+    /// F4 regression (targeted): the over-cap lattice ceiling
+    /// (`max_connections + LATTICE_OVERMAX_SLACK`) holds atomically under
+    /// CONCURRENT `add_connection` calls. Before f214dab the over-cap admission
+    /// did a non-atomic check-then-insert (read `connection_count()` under one
+    /// lock, insert under a fresh write lock), so many concurrent adders each read
+    /// the same stale count and all inserted past the ceiling (the broad stress
+    /// tests breached it to 60-73 vs a ceiling of 52). The fix holds the
+    /// `connections_by_location` write guard across the whole count-check +
+    /// admission-check + insert, making the ceiling a HARD bound.
+    ///
+    /// This is a FOCUSED complement to the broad lifecycle/prune stress tests: it
+    /// pre-fills a node to exactly `max` on one ring side, then races many tasks
+    /// that each attempt a strictly-closer successor edge (each admissible over
+    /// cap the instant it checks). The asserted invariant is a BOUND, so it never
+    /// flakes on interleaving; a non-atomic regression breaches the ceiling
+    /// (tripping the F4 `debug_assert` inside `add_connection` in debug/test
+    /// builds, and this post-condition assert regardless). Uses `max >= 25` so the
+    /// lattice is active via the real minimum-degree floor on every worker thread
+    /// (the per-thread force-active override does not propagate across
+    /// `tokio::spawn`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_over_cap_lattice_adds_never_breach_ceiling() {
+        use std::sync::Arc;
+
+        // `_nn_guard` defensively restores this thread's lattice overrides on drop.
+        // The test relies on the REAL floor (max >= NN_LATTICE_MIN_MAX_CONNECTIONS),
+        // not a force override, so the lattice is active on the spawned worker
+        // threads too (a thread-local force-active would not propagate there).
+        let _nn_guard = NnLatticeOverrideGuard;
+        const MAX: usize = 30;
+        const NUM_TASKS: usize = 48;
+        // Compile-time: `MAX` must clear the minimum-degree floor so the lattice is
+        // active via the real gate on every worker thread (a per-thread
+        // force-active override does not propagate across `tokio::spawn`).
+        const _: () = assert!(MAX >= NN_LATTICE_MIN_MAX_CONNECTIONS);
+
+        let cm = Arc::new(make_connection_manager(None, 5, MAX, false));
+        cm.update_location(Some(Location::new(0.5)));
+        assert_eq!(cm.get_stored_location(), Some(Location::new(0.5)));
+
+        // Pre-fill EXACTLY `max` established connections, all on the successor side
+        // at distance >= 0.10 (nearest successor ends at 0.60, dist 0.10). Each add
+        // is under the cap, so it inserts unconditionally. The predecessor side is
+        // left empty.
+        let kp = TransportKeypair::new();
+        for i in 0..MAX {
+            let loc = Location::new(0.60 + i as f64 * 0.002);
+            cm.add_connection(loc, make_addr(19000 + i as u16), kp.public().clone(), false);
+        }
+        assert_eq!(cm.connection_count(), MAX, "pre-filled to exactly max");
+
+        // Race many tasks, each adding a DISTINCT successor location strictly
+        // closer than the pre-filled nearest (0.10) — every one is admissible over
+        // the cap at the moment it checks, so a non-atomic check-then-insert lets
+        // several slip in past the ceiling simultaneously.
+        let barrier = Arc::new(tokio::sync::Barrier::new(NUM_TASKS));
+        let mut handles = Vec::with_capacity(NUM_TASKS);
+        for task_id in 0..NUM_TASKS {
+            let cm = Arc::clone(&cm);
+            let barrier = Arc::clone(&barrier);
+            let kp = kp.clone();
+            handles.push(tokio::spawn(async move {
+                // 0.589 .. 0.542: all in (0.5, 0.6), dist (0.042, 0.089) < 0.10,
+                // all distinct, all strictly-closer successor tightens.
+                let loc = Location::new(0.589 - task_id as f64 * 0.001);
+                barrier.wait().await;
+                cm.add_connection(
+                    loc,
+                    make_addr(20000 + task_id as u16),
+                    kp.public().clone(),
+                    false,
+                );
+            }));
+        }
+        let result =
+            tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(handles)).await;
+        for (i, r) in result
+            .expect(
+                "DEADLOCK DETECTED: concurrent over-cap adds did not complete within 30 seconds",
+            )
+            .into_iter()
+            .enumerate()
+        {
+            r.unwrap_or_else(|e| panic!("task {i} panicked: {e}"));
+        }
+
+        let final_count = cm.connection_count();
+        assert!(
+            final_count <= MAX + LATTICE_OVERMAX_SLACK,
+            "over-cap ceiling breached under concurrent adds: {final_count} > \
+             {MAX} + {LATTICE_OVERMAX_SLACK} (the atomic check-then-insert guard was defeated)"
+        );
+        // At count == max the first admissible racing add always succeeds, so at
+        // least one over-cap admit MUST have happened — otherwise the test is
+        // vacuous (it never exercised the over-cap path).
+        assert!(
+            final_count > MAX,
+            "expected at least one over-cap lattice admit; got {final_count} (over-cap path not exercised)"
+        );
     }
 
     /// Stress test: concurrent admission control under gateway limits.
