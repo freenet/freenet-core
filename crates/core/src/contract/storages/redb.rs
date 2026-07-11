@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use freenet_stdlib::prelude::*;
 use redb::{
@@ -196,7 +196,37 @@ static POISON_RECOVERY_TRIGGERED: std::sync::atomic::AtomicUsize =
 /// redb supports MVCC (multiple concurrent readers, single writer) internally,
 /// so multiple clones of ReDb can safely access the same database.
 #[derive(Clone)]
-pub struct ReDb(Arc<Database>);
+pub struct ReDb {
+    db: Arc<Database>,
+    /// Cross-`ContractStore` mutual-exclusion lock for the shared-WASM
+    /// store/remove race (issue #4216).
+    ///
+    /// Each runtime-pool executor owns a *separate* `ContractStore` but they
+    /// all share one `ReDb` handle (cloned into each store). redb's MVCC gives
+    /// no cross-transaction locking, so without this lock a
+    /// `store_contract(X2)` on one executor and a `remove_contract(X1)` on
+    /// another — where X1 and X2 share a code hash — can interleave: the
+    /// remover's `load_all_contract_index()` scan runs after the storer wrote
+    /// the `.wasm` blob but before it committed the index entry, sees no
+    /// remaining reference, and deletes the blob the storer just wrote. The
+    /// storer then commits an index entry pointing at a deleted blob.
+    ///
+    /// This lock serializes those two critical sections. It travels with the
+    /// database handle (cloned with every `ReDb::clone`), so all
+    /// `ContractStore`s built over the same database share it automatically
+    /// with no constructor plumbing, while stores over *different* databases
+    /// (per-test isolation) get independent locks.
+    contract_blob_lock: Arc<Mutex<()>>,
+}
+
+impl ReDb {
+    /// Clone the shared cross-`ContractStore` blob lock (issue #4216). The
+    /// `ContractStore` store/remove paths lock this clone for the duration of
+    /// their blob-vs-index critical section; see the field docs above.
+    pub fn contract_blob_lock(&self) -> Arc<Mutex<()>> {
+        self.contract_blob_lock.clone()
+    }
+}
 
 impl ReDb {
     /// Begin a write transaction, routing a *poisoned*-database error to the #4604
@@ -210,7 +240,7 @@ impl ReDb {
     /// metadata on essentially every contract access, a poisoned database is detected
     /// here within one write — whatever the original error was a read or a write.
     fn begin_write(&self) -> Result<WriteTransaction, TransactionError> {
-        self.0.begin_write().map_err(Self::route_txn_error)
+        self.db.begin_write().map_err(Self::route_txn_error)
     }
 
     /// Begin a read transaction with the same poison-recovery routing as
@@ -220,7 +250,7 @@ impl ReDb {
     /// poisoned read that reaches the backend fails later inside the transaction.
     /// Either way the next `begin_write` (above) catches the poison promptly.
     fn begin_read(&self) -> Result<ReadTransaction, TransactionError> {
-        self.0.begin_read().map_err(Self::route_txn_error)
+        self.db.begin_read().map_err(Self::route_txn_error)
     }
 
     /// If `e` indicates a poisoned database, trigger the #4604 recovery path
@@ -330,8 +360,11 @@ impl ReDb {
     }
 
     fn initialize_database(db: Database) -> Result<Self, redb::Error> {
-        let db = Self(Arc::new(db));
-        let txn = db.0.begin_write()?;
+        let db = Self {
+            db: Arc::new(db),
+            contract_blob_lock: Arc::new(Mutex::new(())),
+        };
+        let txn = db.db.begin_write()?;
         {
             txn.open_table(STATE_TABLE).map_err(|e| {
                 tracing::error!(
