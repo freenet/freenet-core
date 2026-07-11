@@ -190,9 +190,9 @@ pub const DEFAULT_MAX_HOSTING_DISK_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// point conversion saturates rather than wrapping, so a huge `used + available`
 /// cannot overflow into a small budget.
 ///
-// Default-bound convenience entry: the recompute path uses
+// Default-bound convenience entry: the live recompute path (#4702) uses
 // `disk_budget_for_clamped` with the operator cap, so this constant-bound form
-// is exercised by tests and reserved for the PR 3 admission gate.
+// stays test-only.
 #[allow(dead_code)]
 pub fn disk_budget_for(freenet_used: u64, available: u64, pct: f64) -> u64 {
     disk_budget_for_clamped(

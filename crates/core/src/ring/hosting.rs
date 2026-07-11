@@ -367,9 +367,10 @@ pub(crate) struct HostingManager {
     /// Aggregate on-disk usage accounting (#4683): hosted state + WASM blobs +
     /// wasmtime compile cache. `None` until [`Self::configure_disk_tracker`]
     /// installs it with the node's real paths (done once at startup alongside
-    /// `set_storage`, since `with_time_source` has no path access). Populated
-    /// and observable in this PR but does not yet drive admission or eviction —
-    /// that is PR 2 (eviction floor) and PR 3 (admission gate). Behind an
+    /// `set_storage`, since `with_time_source` has no path access). Now drives
+    /// both the eviction floor (`min(ram, disk)`, via
+    /// [`Self::recompute_effective_budget`]) and the pre-write admission gate
+    /// ([`Self::admit_state_write`]), wired in #4702. Behind an
     /// `RwLock` for the same late-binding reason as `storage`.
     disk_tracker: RwLock<Option<DiskUsageTracker>>,
 
@@ -393,7 +394,7 @@ pub(crate) struct HostingManager {
     max_hosting_disk_bytes: AtomicU64,
 
     /// Last aggregate disk budget computed by [`Self::recompute_effective_budget`]
-    /// (#4683, PR 3 admission gate). This is the *aggregate* bound the pre-write
+    /// (#4683, admission gate live since #4702). This is the *aggregate* bound the pre-write
     /// gate checks projected disk against — distinct from the effective eviction
     /// floor `min(ram, disk)` that governs the state cache. Initialised to
     /// `u64::MAX` so the gate admits everything until the first 60s recompute
@@ -576,7 +577,7 @@ impl HostingManager {
         Some(effective)
     }
 
-    /// Pre-write admission gate for a state write (#4683, PR 3): reject the write
+    /// Pre-write admission gate for a state write (#4683, live since #4702): reject the write
     /// if replacing `key`'s tracked state size with `new_size` would push
     /// aggregate on-disk usage past the current disk budget. Read-only; the
     /// `+delta` is applied later by [`Self::record_state_write`] on the post-write
@@ -602,7 +603,7 @@ impl HostingManager {
     }
 
     /// Pre-write admission gate for a state **UPDATE** to an already-hosted
-    /// contract (#4683, PR 4 growth-only rule). Unlike [`Self::admit_state_write`]
+    /// contract (#4683 growth-only rule, live since #4702). Unlike [`Self::admit_state_write`]
     /// (fresh PUT), a shrinking or size-holding UPDATE (`new_size <= old`) is
     /// admitted unconditionally — even when the aggregate is over budget —
     /// because an UPDATE mutates an already-counted footprint and rejecting it
@@ -626,7 +627,7 @@ impl HostingManager {
     }
 
     /// Pre-write admission gate for a newly-stored (deduped) WASM code blob
-    /// (#4683, PR 3): reject if charging `blob_len` on top of current aggregate
+    /// (#4683, live since #4702): reject if charging `blob_len` on top of current aggregate
     /// usage would exceed the disk budget. Caller invokes this ONLY for a blob
     /// that is not already on disk (a re-PUT of existing code adds nothing).
     /// No-op admit when the tracker is absent or unseeded, same as
@@ -661,7 +662,7 @@ impl HostingManager {
     /// write lock (the caller — the 60s sweep — invokes it off the hot path).
     ///
     /// The state seed is intentionally fail-loud on I/O error (a too-low seed
-    /// would defeat the future admission gate): a read failure leaves the
+    /// would defeat the admission gate): a read failure leaves the
     /// tracker UNSEEDED so the next tick retries, rather than committing an
     /// under-count.
     #[cfg(feature = "redb")]
@@ -6128,7 +6129,7 @@ mod tests {
         assert!(b <= 4 * GIB, "effective budget never exceeds the RAM floor");
     }
 
-    // --- Admission gate: HostingManager level (#4683, PR 3) -------------------
+    // --- Admission gate: HostingManager level (#4683, live since #4702) --------
 
     /// Before the first recompute the aggregate disk budget is `u64::MAX` and the
     /// tracker may be unseeded, so the gate admits everything — early-startup
