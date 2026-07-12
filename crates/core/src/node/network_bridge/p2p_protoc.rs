@@ -5054,9 +5054,13 @@ mod tests {
 
     /// #4359 trigger-completeness pin (MUST-FIX 1). The deferred broadcast only
     /// drains when a viable target appears, signalled by
-    /// `flush_pending_broadcast_on_interest`. The interest-manager (Source 2)
-    /// path makes a peer a target via `register_peer_interest`; EVERY such call
-    /// site that can be the first viable target for a never-seen id must flush.
+    /// `flush_pending_broadcast_on_interest`. Since #4642 step 9 an interest-only
+    /// peer is no longer itself a broadcast target (the Source-2 live fan-out arm
+    /// was removed), but interest registration typically coincides with the
+    /// peer's advertisement, so every `register_peer_interest` call site keeps
+    /// flushing as the eager wakeup for the Source-1 target that lands alongside
+    /// it. EVERY such call site that can be the first viable target for a
+    /// never-seen id must flush.
     ///
     /// Rather than trusting a static allow-list of files (the brittle shape the
     /// re-review flagged — a NEW production `register_peer_interest` added in

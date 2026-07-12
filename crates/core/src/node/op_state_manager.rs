@@ -2939,11 +2939,12 @@ mod tests {
     ///    advertisement) case; under the old two-source model it WOULD be a
     ///    target via Source 2, and after step 9 it must not be.
     /// 2. An advertised co-host (Source 1) is still INCLUDED.
-    /// 3. The anti-entropy heal restores the lagged peer: once its advertisement
-    ///    arrives — exactly what the periodic InterestSync
-    ///    `HostingStateRequest`/`HostingStateResponse` reconciliation delivers,
-    ///    a `HostingAnnounce { is_response: true }` (`ring.rs::interest_heartbeat`,
-    ///    #4722) — it becomes a broadcast target.
+    /// 3. The advertisement-reconciliation heal restores the lagged peer: once
+    ///    our view of it includes the contract it becomes a broadcast target. The
+    ///    periodic interest heartbeat sends each neighbor a `HostingStateRequest`;
+    ///    the neighbor replies with a `HostingStateResponse` snapshot of its
+    ///    hosted set, which we full-replace into our Source-1 view
+    ///    (`ring.rs::interest_heartbeat`, #4722).
     ///
     /// This is the unit-level counterpart of the lagged-advertisement
     /// convergence simulation: removing Source-2 is safe precisely because a
@@ -3034,16 +3035,16 @@ mod tests {
             "interest_found is vestigial after Source-2 removal and must report 0"
         );
 
-        // THE HEAL: B's advertisement arrives. This mirrors the periodic
-        // InterestSync anti-entropy `HostingStateResponse` reconciliation
-        // (`ring.rs::interest_heartbeat`, #4722), which re-pulls a neighbor's
-        // hosted set as a `HostingAnnounce { is_response: true }`.
+        // THE HEAL: the periodic interest heartbeat re-pulls B's hosted set. We
+        // send B a `HostingStateRequest`; B replies with a `HostingStateResponse`
+        // snapshot of what it hosts, which we full-replace into our view of B
+        // (`ring.rs::interest_heartbeat`, #4722). That is what moves B into
+        // Source-1. (An advertised co-host may also announce proactively via
+        // `HostingAnnounce`; either path lands B in the proximity cache.)
         op_manager.neighbor_hosting.handle_message(
             kp_b.public(),
-            crate::message::NeighborHostingMessage::HostingAnnounce {
-                added: vec![cid],
-                removed: vec![],
-                is_response: true,
+            crate::message::NeighborHostingMessage::HostingStateResponse {
+                contracts: vec![cid],
             },
         );
 
