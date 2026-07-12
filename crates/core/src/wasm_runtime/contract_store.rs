@@ -8,13 +8,26 @@ use crate::contract::storages::Storage;
 
 use super::RuntimeResult;
 
+/// Shared in-memory contract instance index: `ContractInstanceId -> CodeHash`.
+///
+/// One `Arc` is owned by `RuntimePool` and cloned into every pool executor's
+/// [`ContractStore`], so an instance stored / indexed / removed via one
+/// executor is immediately visible to all the others. Before #4218 each
+/// `ContractStore::new` built its OWN `Arc<DashMap>` and loaded it once from
+/// ReDb, so pool executors diverged: `code_hash_from_id` / `fetch_contract`
+/// on executor B could miss an instance stored via executor A, and a
+/// removal on A left a "ghost" instance live on B until B was rebuilt.
+pub type SharedContractIndex = Arc<DashMap<ContractInstanceId, CodeHash>>;
+
 /// Handle contract blob storage on the file system.
 pub struct ContractStore {
     contracts_dir: PathBuf,
     contract_cache: MokaCache<CodeHash, Arc<ContractCode<'static>>>,
-    /// In-memory index: ContractInstanceId -> CodeHash
-    /// This is populated from ReDb on startup and kept in sync
-    key_to_code_part: Arc<DashMap<ContractInstanceId, CodeHash>>,
+    /// In-memory index: ContractInstanceId -> CodeHash.
+    /// Shared across all pool executors (see [`SharedContractIndex`]); loaded
+    /// from ReDb once on first construction and kept in sync by every
+    /// `store_contract` / `ensure_key_indexed` / `remove_contract`.
+    key_to_code_part: SharedContractIndex,
     /// ReDb storage for persistent index
     db: Storage,
     /// Test-only hook invoked inside `store_contract` AFTER the `.wasm` blob is
@@ -34,39 +47,65 @@ impl ContractStore {
     /// - contracts_dir: directory where contract WASM files are stored
     /// - max_size: max size in bytes of the contracts being cached
     /// - db: ReDb storage for persistent index
+    ///
+    /// Builds a store with its OWN fresh (unshared) instance index. Use this
+    /// for standalone / single-executor stores and tests. Pool executors that
+    /// must share one live index across the pool use
+    /// [`ContractStore::new_with_shared_index`] (#4218).
     pub fn new(contracts_dir: PathBuf, max_size: u64, db: Storage) -> RuntimeResult<Self> {
+        Self::new_with_shared_index(contracts_dir, max_size, db, Arc::new(DashMap::new()))
+    }
+
+    /// Like [`ContractStore::new`] but wires in a caller-owned
+    /// [`SharedContractIndex`] so every pool executor sees the same live
+    /// `ContractInstanceId -> CodeHash` map (#4218).
+    ///
+    /// The ReDb index is loaded into the shared map only on FIRST construction
+    /// (when the map is still empty). Subsequent pool executors and
+    /// replacements pass the SAME already-populated `Arc`, so they inherit the
+    /// live map (including instances stored since startup) instead of paying a
+    /// redundant ReDb scan and racing the on-disk state.
+    pub fn new_with_shared_index(
+        contracts_dir: PathBuf,
+        max_size: u64,
+        db: Storage,
+        key_to_code_part: SharedContractIndex,
+    ) -> RuntimeResult<Self> {
         std::fs::create_dir_all(&contracts_dir).map_err(|err| {
             tracing::error!("error creating contract dir: {err}");
             err
         })?;
 
-        // Load index from ReDb
-        let key_to_code_part = Arc::new(DashMap::new());
-        match db.load_all_contract_index() {
-            Ok(entries) => {
-                for (instance_id, code_hash) in entries {
-                    key_to_code_part.insert(instance_id, code_hash);
+        // Load the index from ReDb only if this shared map hasn't been
+        // populated yet (first executor in the pool). Later executors share the
+        // same live `Arc` and must not clobber / re-scan it.
+        if key_to_code_part.is_empty() {
+            match db.load_all_contract_index() {
+                Ok(entries) => {
+                    for (instance_id, code_hash) in entries {
+                        key_to_code_part.insert(instance_id, code_hash);
+                    }
+                    tracing::debug!(
+                        "Loaded {} contract index entries from ReDb",
+                        key_to_code_part.len()
+                    );
                 }
-                tracing::debug!(
-                    "Loaded {} contract index entries from ReDb",
-                    key_to_code_part.len()
+                Err(e) => {
+                    tracing::warn!("Failed to load contract index from ReDb: {e}");
+                }
+            }
+
+            // Migrate any contract WASM files written under the legacy lowercased
+            // Base58 name to the canonical mixed-case name (issue #4214) so the
+            // fetch paths below, which use `code_hash.encode()`, still find code
+            // persisted before the stdlib CodeHash::encode case-fix.
+            for entry in key_to_code_part.iter() {
+                super::migrate_legacy_lowercased_code_file(
+                    &contracts_dir,
+                    &entry.value().encode(),
+                    "wasm",
                 );
             }
-            Err(e) => {
-                tracing::warn!("Failed to load contract index from ReDb: {e}");
-            }
-        }
-
-        // Migrate any contract WASM files written under the legacy lowercased
-        // Base58 name to the canonical mixed-case name (issue #4214) so the
-        // fetch paths below, which use `code_hash.encode()`, still find code
-        // persisted before the stdlib CodeHash::encode case-fix.
-        for entry in key_to_code_part.iter() {
-            super::migrate_legacy_lowercased_code_file(
-                &contracts_dir,
-                &entry.value().encode(),
-                "wasm",
-            );
         }
 
         Ok(Self {
@@ -107,24 +146,31 @@ impl ContractStore {
     /// Returns a copy of the contract bytes if available, none otherwise.
     // todo: instead return Result<Option<_>, _> to handle IO errors upstream
     //
-    // Known limitation: `key_to_code_part` is a per-`ContractStore` index
-    // (a fresh `Arc<DashMap>` per `ContractStore::new`), so when the
-    // executor pool holds multiple `ContractStore` instances each carries
-    // its own copy of the index. A contract stored via executor A may
-    // therefore be reported as "missing" by `fetch_contract` on executor
-    // B even though both share the same on-disk `.wasm` and the same
-    // process-wide `contract_cache`. The cache-hit fast path below
-    // masks this for shared-code reads when the code hash happens to be
-    // warm in the cache, which is the only reason cross-executor
-    // fetches currently work in production. This divergence is tracked
-    // as #4218; a proper fix would either share the index across
-    // pool members or rebuild it from the on-disk state at startup
-    // per executor.
+    // The `key_to_code_part` index is now SHARED across every pool executor
+    // (see [`SharedContractIndex`] / #4218), so a contract stored via executor
+    // A is visible to `fetch_contract` on executor B. That fixes the old
+    // "stored on A, missing on B" divergence.
+    //
+    // The lookup is GATED on the shared index: the per-executor `contract_cache`
+    // fast path is served ONLY when this instance id is still present in the
+    // shared index. Without this gate, after a sibling executor's
+    // `remove_contract` cleared the shared index entry, THIS executor's
+    // still-warm `contract_cache` (keyed by the shared code hash) would keep
+    // serving the removed instance as a "ghost". Consulting the shared index
+    // first makes a removal on any executor immediately authoritative on all of
+    // them (#4218 problem 2).
     pub fn fetch_contract(
         &self,
         key: &ContractKey,
         params: &Parameters<'_>,
     ) -> Option<ContractContainer> {
+        // Gate on the shared index: an instance that is no longer indexed
+        // (e.g. removed via a sibling executor) must not be served from a stale
+        // per-executor cache entry.
+        if !self.key_to_code_part.contains_key(key.id()) {
+            return None;
+        }
+
         let code_hash = key.code_hash();
         if let Some(data) = self.contract_cache.get(code_hash) {
             return Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
@@ -257,17 +303,17 @@ impl ContractStore {
     /// only once no remaining instance references that code hash. File
     /// removal is idempotent — an already-missing `.wasm` is not an error.
     ///
-    /// The "still referenced?" decision is made against the **shared,
-    /// persistent ReDb `contract_index`**, not the per-`ContractStore`
-    /// in-memory `key_to_code_part` map. Each runtime-pool executor owns a
-    /// *separate* `ContractStore` with its own `key_to_code_part` built
-    /// fresh in [`ContractStore::new`], so an instance stored via a
-    /// different pool executor is invisible to an in-memory scan. Deciding
-    /// from the in-memory map would wrongly delete a `.wasm` blob still
-    /// referenced by an instance owned by another executor — corrupting
-    /// every surviving contract that shares the code (e.g. every River
-    /// room shares one room-contract WASM, see issue #2380). The ReDb
-    /// index is the single shared source of truth across all executors.
+    /// The "still referenced?" decision is made against the **persistent
+    /// ReDb `contract_index`**, not the in-memory `key_to_code_part` map.
+    /// Pool executors now share one in-memory index (see
+    /// [`SharedContractIndex`] / `new_with_shared_index`), but ReDb stays
+    /// the authority here: it is the durable source of truth that also
+    /// covers standalone stores built via [`ContractStore::new`] (which
+    /// get a private index), and deciding from a possibly-incomplete
+    /// in-memory view would wrongly delete a `.wasm` blob still
+    /// referenced by another instance — corrupting every surviving
+    /// contract that shares the code (e.g. every River room shares one
+    /// room-contract WASM, see issue #2380).
     pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let contract_hash = *key.code_hash();
 
@@ -343,6 +389,37 @@ impl ContractStore {
             }
         }
         Ok(())
+    }
+
+    /// Returns true if the WASM code blob for `code_hash` is already present on
+    /// the shared on-disk contract store.
+    ///
+    /// This is the disk-budget DEDUP probe (#4218 / #4683). It answers exactly
+    /// the question the budget gate and the store-vs-index routing in the
+    /// executor need: "will `store_contract` write NEW blob bytes to disk?" —
+    /// which is true iff the blob is not already on disk.
+    ///
+    /// It is keyed by CODE HASH and checks the shared filesystem (one `.wasm`
+    /// blob per code hash, shared by every instance across every pool executor),
+    /// NOT `fetch_contract`, which is keyed by INSTANCE id. A second instance of
+    /// already-stored code (same code hash, different params → a NEW instance
+    /// id) is absent from the instance index, so an instance-keyed probe would
+    /// wrongly report "not stored" and (a) charge the shared blob against the
+    /// disk budget a second time (double-count) and (b) route the PUT down the
+    /// store path instead of the ensure-indexed path. Disk existence is the
+    /// single shared source of truth for on-disk blob occupancy, is O(1), and is
+    /// consistent across executors without relying on any per-executor cache.
+    ///
+    /// The shared instance index is deliberately NOT consulted here: it can
+    /// disagree with disk (a sibling executor deleted the blob, or a crash left
+    /// an index entry without a blob), and trusting it would skip the
+    /// blob-rewrite safety in `store_contract`. Disk is authoritative for "are
+    /// the bytes on disk right now".
+    pub fn code_blob_stored(&self, code_hash: &CodeHash) -> bool {
+        self.contracts_dir
+            .join(code_hash.encode())
+            .with_extension("wasm")
+            .exists()
     }
 
     pub fn code_hash_from_key(&self, key: &ContractKey) -> Option<CodeHash> {
@@ -1184,6 +1261,215 @@ mod test {
         assert!(
             fresh.fetch_contract(&key2, &params2).is_some(),
             "newly stored instance must be fetchable from disk after the race (#4216)"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for issue #4218: pool executors must share ONE contract
+    /// instance index. A contract stored via executor A must be visible to
+    /// `code_hash_from_id` / `fetch_contract` on executor B without rebuilding
+    /// B's store.
+    ///
+    /// Two `ContractStore`s built with `new_with_shared_index` over the SAME
+    /// shared `Arc<DashMap>` (as `RuntimePool` now wires them) model executors A
+    /// and B. Pre-fix, each `ContractStore::new` built its own `Arc<DashMap>`,
+    /// so B's index never saw A's instance and both lookups returned `None`.
+    #[tokio::test]
+    async fn test_shared_index_visible_across_executors() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+
+        let shared_index: SharedContractIndex = Arc::new(DashMap::new());
+        let mut store_a = ContractStore::new_with_shared_index(
+            contract_dir.path().into(),
+            10_000,
+            db.clone(),
+            shared_index.clone(),
+        )?;
+        let store_b = ContractStore::new_with_shared_index(
+            contract_dir.path().into(),
+            10_000,
+            db,
+            shared_index,
+        )?;
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![3, 1, 4, 1, 5])),
+            [9, 9].as_ref().into(),
+        );
+        let key = *contract.key();
+        let params: Parameters = [9, 9].as_ref().into();
+
+        // Stored via executor A only.
+        store_a.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract,
+        )))?;
+
+        // Executor B must resolve the instance and fetch it via the SHARED index.
+        assert_eq!(
+            store_b.code_hash_from_id(key.id()),
+            Some(*key.code_hash()),
+            "instance stored via executor A must be resolvable on executor B \
+             through the shared index (#4218 problem 1)"
+        );
+        assert!(
+            store_b.fetch_contract(&key, &params).is_some(),
+            "contract stored via executor A must be fetchable on executor B \
+             through the shared index (#4218 problem 1)"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for issue #4218: a removal on executor A must be
+    /// immediately authoritative on executor B — B must NOT serve the removed
+    /// instance as a "ghost" from its own still-warm code cache.
+    ///
+    /// We warm B's `contract_cache` for the shared code hash (by fetching a
+    /// SECOND instance of the same code through B), then remove the first
+    /// instance via A. With the shared index + the `fetch_contract` index gate,
+    /// B's fetch of the removed instance returns `None` even though the code
+    /// hash is still cached on B (still referenced by the surviving instance).
+    #[tokio::test]
+    async fn test_shared_index_remove_closes_ghost_across_executors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+
+        let shared_index: SharedContractIndex = Arc::new(DashMap::new());
+        let mut store_a = ContractStore::new_with_shared_index(
+            contract_dir.path().into(),
+            10_000,
+            db.clone(),
+            shared_index.clone(),
+        )?;
+        let store_b = ContractStore::new_with_shared_index(
+            contract_dir.path().into(),
+            10_000,
+            db,
+            shared_index,
+        )?;
+
+        // Two instances of the SAME code (same code hash, different params).
+        let shared_code = vec![7, 7, 7, 7];
+        let params1 = Parameters::from(vec![1, 0, 0]);
+        let params2 = Parameters::from(vec![2, 0, 0]);
+        let contract1 = WrappedContract::new(
+            Arc::new(ContractCode::from(shared_code.clone())),
+            params1.clone(),
+        );
+        let contract2 = WrappedContract::new(
+            Arc::new(ContractCode::from(shared_code.clone())),
+            params2.clone(),
+        );
+        let key1 = *contract1.key();
+        let key2 = *contract2.key();
+        assert_eq!(key1.code_hash(), key2.code_hash());
+
+        store_a.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract1,
+        )))?;
+        store_a.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract2,
+        )))?;
+
+        // Warm B's per-executor code cache for the shared code hash by fetching
+        // the SURVIVING instance through B.
+        assert!(
+            store_b.fetch_contract(&key2, &params2).is_some(),
+            "surviving instance must be fetchable on B (warms B's code cache)"
+        );
+
+        // Remove instance 1 via executor A. The shared blob survives (instance 2
+        // still references the code hash), but instance 1 is gone from the index.
+        store_a.remove_contract(&key1)?;
+
+        // B must NOT serve instance 1 as a ghost even though the shared code hash
+        // is warm in B's cache.
+        assert!(
+            store_b.fetch_contract(&key1, &params1).is_none(),
+            "instance removed via executor A must not be served as a ghost by B \
+             from a stale warm cache (#4218 problem 2)"
+        );
+        // The surviving instance is unaffected.
+        assert!(
+            store_b.fetch_contract(&key2, &params2).is_some(),
+            "surviving instance must remain fetchable on B after the other is removed"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for issue #4218 (disk-budget double-count): the dedup
+    /// probe that gates the wasm disk-budget charge must be keyed by CODE HASH,
+    /// so a NEW instance of already-stored code (same code hash, different
+    /// params) is recognised as "already stored" and not charged a second time
+    /// — even on a DIFFERENT pool executor whose code cache is cold.
+    ///
+    /// This pins `code_blob_stored` (the probe used by the executor gate sites)
+    /// against the exact cross-executor scenario. The commented contrast shows
+    /// why the old instance-keyed `fetch_contract` probe double-counted: it
+    /// returns `None` here for the second instance, so the gate would charge the
+    /// shared blob twice.
+    #[tokio::test]
+    async fn test_dedup_probe_shared_code_not_double_charged_across_executors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+
+        let shared_index: SharedContractIndex = Arc::new(DashMap::new());
+        let mut store_a = ContractStore::new_with_shared_index(
+            contract_dir.path().into(),
+            10_000,
+            db.clone(),
+            shared_index.clone(),
+        )?;
+        let store_b = ContractStore::new_with_shared_index(
+            contract_dir.path().into(),
+            10_000,
+            db,
+            shared_index,
+        )?;
+
+        let shared_code = vec![5, 5, 5, 5, 5];
+        let params1 = Parameters::from(vec![1, 2, 3]);
+        let params2 = Parameters::from(vec![4, 5, 6]);
+        let contract1 =
+            WrappedContract::new(Arc::new(ContractCode::from(shared_code.clone())), params1);
+        let contract2 = WrappedContract::new(
+            Arc::new(ContractCode::from(shared_code.clone())),
+            params2.clone(),
+        );
+        let key1 = *contract1.key();
+        let key2 = *contract2.key();
+        let code_hash = *key1.code_hash();
+        assert_eq!(key1.code_hash(), key2.code_hash());
+
+        // Instance 1 stored (and blob charged) via executor A.
+        store_a.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract1,
+        )))?;
+
+        // The dedup probe on executor B (cold code cache) must report the shared
+        // blob as ALREADY stored, so PUTting instance 2 charges nothing more.
+        assert!(
+            store_b.code_blob_stored(&code_hash),
+            "the shared code blob must be recognised as stored on executor B \
+             (dedup — no double-count of the disk budget) (#4218)"
+        );
+
+        // Contrast: the OLD instance-keyed probe returns None for the never-yet-
+        // stored second instance, which is exactly what made the gate charge the
+        // shared blob twice before this fix.
+        assert!(
+            store_b.fetch_contract(&key2, &params2).is_none(),
+            "instance-keyed fetch_contract returns None for a new instance — the \
+             old dedup probe would have double-charged the shared blob"
         );
 
         Ok(())

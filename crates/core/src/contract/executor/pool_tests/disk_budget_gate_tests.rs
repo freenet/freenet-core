@@ -290,3 +290,162 @@ async fn v1_put_under_budget_admits_and_charges_wasm() {
         "admitted PUT state must be readable"
     );
 }
+
+/// Build two contract containers that share ONE code hash (same code bytes) but
+/// have DIFFERENT params — hence different `ContractInstanceId`s. This is the
+/// River "many rooms, one room-contract WASM" shape (#2380) that #4218's
+/// disk-budget dedup must not double-count.
+fn same_code_two_instances(code_bytes: &[u8]) -> (ContractContainer, ContractContainer) {
+    let code = std::sync::Arc::new(ContractCode::from(code_bytes.to_vec()));
+    let mk = |params: Vec<u8>| {
+        ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            code.clone(),
+            Parameters::from(params),
+        )))
+    };
+    (mk(vec![1, 1, 1]), mk(vec![2, 2, 2]))
+}
+
+/// Regression test for issue #4218 (disk-budget double-count via the executor
+/// gate): PUTting a SECOND instance of already-stored code (same code hash,
+/// different params) must NOT charge the shared wasm blob against the disk
+/// budget a second time. The disk-budget dedup probe is keyed by CODE HASH
+/// (`code_blob_stored`), so the second PUT is only indexed — never re-charged.
+///
+/// The budget is sized so exactly one blob plus both states fit. If the second
+/// instance re-charged the shared blob (the pre-#4218 instance-keyed probe
+/// behavior), the second PUT would exceed the budget and be REJECTED at the
+/// wasm gate; with the code-hash dedup it is admitted and the wasm total stays
+/// charged exactly once. Pins the `executor_impl.rs` gate wiring against the
+/// dedup path.
+#[tokio::test(flavor = "current_thread")]
+async fn v1_put_second_instance_same_code_not_double_charged() {
+    let (op_manager, _guards) = build_op_manager("disk-budget-dedup-second-instance").await;
+
+    // Distinct code so this test's code hash is independent of other tests.
+    let code_bytes = vec![0xABu8; 4096];
+    let (contract1, contract2) = same_code_two_instances(&code_bytes);
+    let key1 = contract1.key();
+    let key2 = contract2.key();
+    assert_eq!(
+        key1.code_hash(),
+        key2.code_hash(),
+        "the two instances must share one code hash"
+    );
+    assert_ne!(key1, key2, "the two instances must have different keys");
+
+    let blob_len = blob_len_of(&contract1);
+    let state1 = WrappedState::new(vec![1u8; 32]);
+    let state2 = WrappedState::new(vec![2u8; 32]);
+    let state1_len = state1.as_ref().len() as u64;
+    let state2_len = state2.as_ref().len() as u64;
+
+    let seed_key = test_contract(b"disk_budget_dedup_seed_key").key();
+
+    // Budget sized so ONE blob + both states fit exactly; a SECOND blob charge
+    // (the double-count bug) would overshoot and reject the second PUT.
+    let budget = MIN_DEFAULT_HOSTING_BUDGET_BYTES;
+    let state_seed = budget - blob_len - state1_len - state2_len;
+    assert!(
+        state_seed + 2 * blob_len + state1_len + state2_len > budget,
+        "test math: a second wasm charge must overshoot the budget"
+    );
+    install_tight_budget(&op_manager, seed_key, state_seed, budget);
+
+    let wasm_before = op_manager
+        .ring
+        .disk_usage_stats_for_test()
+        .expect("tracker seeded")
+        .wasm_bytes;
+
+    let mut executor =
+        Executor::new_mock_wasm("t", MockStateStorage::new(), None, Some(op_manager.clone()))
+            .await
+            .expect("build mock-wasm executor");
+
+    // PUT instance 1: admitted, charges the shared blob once.
+    executor
+        .upsert_contract_state(
+            key1,
+            Either::Left(state1.clone()),
+            RelatedContracts::default(),
+            Some(contract1.clone()),
+        )
+        .await
+        .expect("first instance PUT must be admitted");
+
+    // PUT instance 2 (same code, different params): must be admitted WITHOUT a
+    // second wasm charge. Pre-fix, the instance-keyed probe re-charged the blob,
+    // overshooting the budget and rejecting this PUT.
+    let result2 = executor
+        .upsert_contract_state(
+            key2,
+            Either::Left(state2.clone()),
+            RelatedContracts::default(),
+            Some(contract2.clone()),
+        )
+        .await
+        .expect("second instance of shared code must be admitted (no blob double-count)");
+    assert!(
+        matches!(result2, crate::contract::UpsertResult::Updated(_)),
+        "second instance PUT must return Updated, got {result2:?}"
+    );
+
+    // The shared wasm blob was charged EXACTLY ONCE across both PUTs.
+    let wasm_after = op_manager
+        .ring
+        .disk_usage_stats_for_test()
+        .expect("tracker seeded")
+        .wasm_bytes;
+    assert_eq!(
+        wasm_after,
+        wasm_before + blob_len,
+        "the shared code blob must be charged exactly once for two instances \
+         sharing it (#4218 disk-budget double-count)"
+    );
+
+    // Both instances are stored.
+    assert!(
+        matches!(executor.fetch_contract(key1, false).await, Ok((Some(_), _))),
+        "instance 1 state must be readable"
+    );
+    assert!(
+        matches!(executor.fetch_contract(key2, false).await, Ok((Some(_), _))),
+        "instance 2 state must be readable"
+    );
+}
+
+/// Call-site pin for issue #4218: the disk-budget dedup probe at the executor
+/// gate sites MUST be keyed by code hash via `code_blob_stored`, NOT by instance
+/// id via `fetch_contract` / `fetch_contract_code`. Reverting either probe back
+/// to the instance-keyed form (which double-counts a second instance of shared
+/// code across pool executors) must fail a test — the `ContractStore`-level
+/// regression tests alone would not catch a call-site revert.
+#[test]
+fn dedup_probe_call_sites_use_code_blob_stored() {
+    let executor_impl_src = include_str!("../runtime/executor_impl.rs");
+    let contract_ops_src = include_str!("../runtime/contract_ops.rs");
+
+    // executor_impl.rs bridged PUT gate must probe by code hash.
+    assert!(
+        executor_impl_src.contains("self.runtime.code_blob_stored(key.code_hash())"),
+        "executor_impl.rs disk-budget dedup gate must probe via code_blob_stored (#4218)"
+    );
+    assert!(
+        !executor_impl_src.contains("self.runtime.fetch_contract_code(&key, &params).is_none()"),
+        "executor_impl.rs must NOT gate the wasm charge on the instance-keyed \
+         fetch_contract_code probe (double-counts shared code across executors, #4218)"
+    );
+
+    // contract_ops.rs verify_and_store gate must probe by code hash. (Matched as
+    // a substring so rustfmt line-wrapping of the call chain can't break the pin.)
+    assert!(
+        contract_ops_src.contains(".code_blob_stored(key.code_hash())"),
+        "contract_ops.rs disk-budget dedup gate must probe via code_blob_stored (#4218)"
+    );
+    assert!(
+        !contract_ops_src.contains(".fetch_contract(&key, &params)"),
+        "contract_ops.rs must NOT gate the wasm charge on the instance-keyed \
+         fetch_contract probe (double-counts shared code across executors, #4218)"
+    );
+}

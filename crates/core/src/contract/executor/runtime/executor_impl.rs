@@ -202,7 +202,15 @@ where
         // length charged to the disk tracker (#4683) so every rollback site that
         // removes the just-stored contract also reverses the wasm charge.
         let (remove_if_fail, contract_was_provided, charged_wasm): (bool, bool, Option<usize>) =
-            if self.runtime.fetch_contract_code(&key, &params).is_none() {
+            // Dedup probe keyed by CODE HASH, not instance id (#4218): a new
+            // instance of already-stored code (same code hash, different params)
+            // must take the "already in store" branch below so it is only
+            // indexed — never re-stored and never charged against the disk
+            // budget a second time. The old `fetch_contract_code` probe was
+            // instance-keyed and reported such a second instance as absent,
+            // double-counting the shared blob (visible across pool executors,
+            // whose instance indexes previously diverged).
+            if !self.runtime.code_blob_stored(key.code_hash()) {
                 if let Some(ref contract_code) = code {
                     tracing::debug!(
                         contract = %key,
