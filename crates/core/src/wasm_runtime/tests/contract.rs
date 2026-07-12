@@ -37,6 +37,94 @@ async fn validate_state() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Regression test for issue #2216: `validate_state_with_contract` must
+/// compile and validate directly from the caller-supplied `ContractContainer`
+/// WITHOUT needing the contract to already be resolvable via
+/// `contract_store.fetch_contract` — i.e. it must not depend on the
+/// store→fetch round-trip `verify_and_store_contract` used to require.
+///
+/// This is proven by deliberately NOT storing the contract in `contract_store`
+/// (unlike `setup_test_contract`, which always does) before calling
+/// `validate_state_with_contract`: if the method secretly still needed
+/// `contract_store.fetch_contract` on the module-cache miss, this would fail
+/// with `ContractNotFound` instead of validating successfully.
+#[tokio::test(flavor = "multi_thread")]
+async fn validate_state_with_contract_does_not_require_prior_store()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractContainer, ContractWasmAPIVersion, WrappedContract,
+    };
+
+    use crate::contract::storages::Storage;
+    use crate::util::tests::get_temp_dir;
+
+    let temp_dir = get_temp_dir();
+    let module_bytes = crate::wasm_runtime::tests::get_test_module(TEST_CONTRACT_1)?;
+    let contract_bytes =
+        WrappedContract::new(Arc::new(ContractCode::from(module_bytes)), vec![].into());
+    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_bytes));
+    let contract_key = contract.key();
+    let params = Parameters::from([].as_ref());
+
+    let storage = Storage::new(temp_dir.path()).await?;
+    // Deliberately empty: the contract is NEVER stored here.
+    let contract_store = super::super::ContractStore::new(
+        temp_dir.path().join("contract"),
+        10_000,
+        storage.clone(),
+    )?;
+    let delegate_store = super::super::DelegateStore::new(
+        temp_dir.path().join("delegate"),
+        10_000,
+        storage.clone(),
+    )?;
+    let secrets_store = super::super::SecretsStore::new(
+        temp_dir.path().join("secrets"),
+        Default::default(),
+        storage,
+    )?;
+    let mut runtime = Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap();
+
+    // Sanity check: fetch_contract genuinely misses (proves the round-trip
+    // this test guards against would fail if it were still required).
+    assert!(
+        runtime
+            .contract_store
+            .fetch_contract(&contract_key, &params)
+            .is_none(),
+        "test setup invariant: the contract must NOT be in contract_store yet"
+    );
+
+    let is_valid = runtime.validate_state_with_contract(
+        &contract_key,
+        &params,
+        &WrappedState::new(vec![1, 2, 3, 4]),
+        &Default::default(),
+        &contract,
+    )?;
+    assert_eq!(
+        is_valid,
+        ValidateResult::Valid,
+        "validate_state_with_contract must validate directly from the \
+         supplied ContractContainer, without needing it in contract_store"
+    );
+
+    // The invalid-state branch must behave identically to `validate_state`.
+    let not_valid = runtime.validate_state_with_contract(
+        &contract_key,
+        &params,
+        &WrappedState::new(vec![1, 0, 0, 1]),
+        &Default::default(),
+        &contract,
+    )?;
+    assert!(matches!(not_valid, ValidateResult::RequestRelated(_)));
+
+    std::mem::drop(temp_dir);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn update_state() -> Result<(), Box<dyn std::error::Error>> {
     let TestSetup {

@@ -1,5 +1,6 @@
 use super::engine::{WasmEngine, WasmError};
 use super::native_api::CONTRACT_IO;
+use super::runtime::RunningInstance;
 use super::{ContractExecError, RuntimeResult};
 use freenet_stdlib::prelude::{
     CodeHash, ContractContainer, ContractInstanceId, ContractInterfaceResult, ContractKey,
@@ -104,16 +105,18 @@ impl Drop for ContractIoGuard {
     }
 }
 
-impl ContractRuntimeInterface for super::Runtime {
-    fn validate_state(
+impl super::Runtime {
+    /// Shared body of `validate_state`, parameterized over the already-running
+    /// WASM instance (obtained by the caller via either `prepare_contract_call`
+    /// or `prepare_contract_call_with_contract`). See [`Self::validate_state_with_contract`]
+    /// for why the latter exists.
+    fn run_validate_state(
         &mut self,
-        key: &ContractKey,
+        mut running: RunningInstance,
         parameters: &Parameters<'_>,
         state: &WrappedState,
         related: &RelatedContracts<'_>,
     ) -> RuntimeResult<ValidateResult> {
-        let req_bytes = parameters.size() + state.size();
-        let mut running = self.prepare_contract_call(key, parameters, req_bytes)?;
         let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<ValidateResult> {
@@ -148,6 +151,44 @@ impl ContractRuntimeInterface for super::Runtime {
 
         self.drop_running_instance(&mut running);
         result
+    }
+
+    /// Like [`ContractRuntimeInterface::validate_state`], but takes the
+    /// contract the caller already has in hand and passes it through to the
+    /// module-compile path instead of re-fetching it from `contract_store`.
+    ///
+    /// Closes the store→fetch round-trip in `verify_and_store_contract`
+    /// (issue #2216): that path calls `contract_store.store_contract(contract)`
+    /// and then immediately needed to validate the state, which — on the
+    /// (guaranteed, for a never-before-seen contract) module-cache miss —
+    /// used to re-fetch the very same bytes from `contract_store` just to
+    /// compile them.
+    pub(crate) fn validate_state_with_contract(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        state: &WrappedState,
+        related: &RelatedContracts<'_>,
+        contract: &ContractContainer,
+    ) -> RuntimeResult<ValidateResult> {
+        let req_bytes = parameters.size() + state.size();
+        let running =
+            self.prepare_contract_call_with_contract(key, parameters, req_bytes, contract)?;
+        self.run_validate_state(running, parameters, state, related)
+    }
+}
+
+impl ContractRuntimeInterface for super::Runtime {
+    fn validate_state(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        state: &WrappedState,
+        related: &RelatedContracts<'_>,
+    ) -> RuntimeResult<ValidateResult> {
+        let req_bytes = parameters.size() + state.size();
+        let running = self.prepare_contract_call(key, parameters, req_bytes)?;
+        self.run_validate_state(running, parameters, state, related)
     }
 
     fn update_state(

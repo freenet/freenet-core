@@ -643,6 +643,41 @@ impl Runtime {
         parameters: &Parameters,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
+        self.prepare_contract_call_inner(key, parameters, req_bytes, None)
+    }
+
+    /// Like [`Self::prepare_contract_call`], but lets the caller supply the
+    /// contract it already has in hand (`already_fetched`) to use on a
+    /// module-cache miss, instead of re-fetching it from `contract_store`.
+    ///
+    /// This closes the store→fetch round-trip described in issue #2216:
+    /// `verify_and_store_contract` hands a freshly-received `ContractContainer`
+    /// to `contract_store.store_contract`, then immediately needed the same
+    /// bytes again to compile the module on the (guaranteed, for a brand-new
+    /// contract) cache miss. Passing the contract through means that path
+    /// never re-reads what it just wrote.
+    ///
+    /// When `already_fetched` is `None` this is behaviorally identical to
+    /// `prepare_contract_call` (used by every call site that doesn't already
+    /// hold the contract, e.g. `update_state`/`summarize_state` on a contract
+    /// that's merely being re-validated).
+    pub(super) fn prepare_contract_call_with_contract(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters,
+        req_bytes: usize,
+        already_fetched: &ContractContainer,
+    ) -> RuntimeResult<RunningInstance> {
+        self.prepare_contract_call_inner(key, parameters, req_bytes, Some(already_fetched))
+    }
+
+    fn prepare_contract_call_inner(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters,
+        req_bytes: usize,
+        already_fetched: Option<&ContractContainer>,
+    ) -> RuntimeResult<RunningInstance> {
         // Check shared cache first. The lock is held only for the duration of
         // the lookup + Module clone (an Arc bump) and is ALWAYS dropped before
         // the compile below — never held across the blocking compile.
@@ -652,24 +687,35 @@ impl Runtime {
             module
         } else {
             tracing::info!(contract = %key, "Module cache miss — compiling");
-            // Cache miss — fetch the code and compile with the lock released so
-            // the (potentially multi-hundred-millisecond) Cranelift compile
+            // Cache miss — obtain the code and compile with the lock released
+            // so the (potentially multi-hundred-millisecond) Cranelift compile
             // never blocks other executors waiting on the shared cache. When
             // `offload_compilation` is set, `engine.compile` further offloads
             // the compile to a blocking thread so it does not pin the
             // single-threaded contract-handling loop (issue #4441).
-            let contract = self
-                .contract_store
-                .fetch_contract(key, parameters)
-                .ok_or_else(|| {
-                    tracing::error!(
-                        contract = %key,
-                        key_code_hash = ?key.code_hash(),
-                        phase = "prepare_contract_call_failed",
-                        "Contract not found in store during WASM execution"
-                    );
-                    RuntimeInnerError::ContractNotFound(*key)
-                })?;
+            //
+            // Prefer the caller-supplied contract (already in hand — no need
+            // to round-trip through `contract_store`); fall back to fetching
+            // from the store for callers that don't have it (issue #2216).
+            let owned_contract;
+            let contract = match already_fetched {
+                Some(contract) => contract,
+                None => {
+                    owned_contract = self
+                        .contract_store
+                        .fetch_contract(key, parameters)
+                        .ok_or_else(|| {
+                            tracing::error!(
+                                contract = %key,
+                                key_code_hash = ?key.code_hash(),
+                                phase = "prepare_contract_call_failed",
+                                "Contract not found in store during WASM execution"
+                            );
+                            RuntimeInnerError::ContractNotFound(*key)
+                        })?;
+                    &owned_contract
+                }
+            };
             let code = match contract {
                 ContractContainer::Wasm(ContractWasmAPIVersion::V1(contract_v1)) => {
                     contract_v1.code().data().to_vec()
