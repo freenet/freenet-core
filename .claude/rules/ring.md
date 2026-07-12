@@ -229,7 +229,7 @@ WHEN summarizing contracts in the InterestSync heartbeat handlers
     (~40/sec vs <10 real updates/hr) that wedged gateways. The ResyncRequest arm
     is exempt: it is state-gated and not heartbeat-driven.
   → #4610: the (is_hosting || in_use) gate ALONE is NOT sufficient. The inbound
-    relay-SUBSCRIBE / placement path marks a contract is_hosting/in_use WITHOUT
+    SUBSCRIBE / placement path marks a contract is_hosting/in_use WITHOUT
     its state ever being fetched/stored, so phantom (interested-but-stateless)
     contracts still passed and re-drove the storm (~70-80/sec on 0.2.84/0.2.85).
     contract_state_present (a cheap on-disk STATE-store existence check, NOT the
@@ -242,13 +242,23 @@ WHEN summarizing contracts in the InterestSync heartbeat handlers
     state store (HostingManager::reconcile_phantom_in_use). A contract in_use
     via downstream subscribers with NO stored state gets a bounded one-shot
     repair fetch (sub-op GET; ≤ MAX_PHANTOM_REPAIRS_PER_INTERVAL per tick,
-    one per contract per OPERATION_TTL cooldown); after
-    MAX_PHANTOM_REPAIR_ATTEMPTS failures its downstream registration is
-    DROPPED (drop_phantom_downstream + symmetric interest decrement +
-    reconcile_wants_collapse), never kept as a persistent stateless "host".
-    Do NOT instead skip register_downstream_subscriber on a stateless relay:
-    the downstream map is load-bearing for UPDATE forwarding through relay
-    chains — the fix is repair-or-drop, not never-register.
+    one per contract per OPERATION_TTL cooldown). After
+    MAX_PHANTOM_REPAIR_ATTEMPTS failures the sweep STOPS for that contract but
+    does NOT drop the registration — the #4770 cycling Drop arm
+    (drop_phantom_downstream) was NEUTRALIZED in SUBSCRIBE-retirement step 10
+    §1c, because a genuine phantom is now unrepresentable (see next bullet), so
+    dropping only churns (an eviction teardown re-registers → register/drop
+    cycling). The Fetch sweep survives as a rollout net for phantoms left by
+    pre-upgrade peers.
+  → step 10 §1b (register-after-state) closes the phantom at the SOURCE,
+    superseding the earlier "repair-or-drop, never skip register" guidance: a
+    peer forwarding a SUBSCRIBE (or a subscribe=true GET) now fetches the body
+    FIRST (finalize_host_subscribe / cache-then-register) and registers the
+    downstream ONLY once it holds state, becoming a real host. On fetch-fail it
+    registers NOTHING (no phantom) and the chain heals on the next renewal. The
+    downstream map is still load-bearing for UPDATE forwarding through chain
+    hops; the fix is fetch-then-register, not never-register and not
+    repair-or-drop.
 ```
 
 ### Cleanup Exemptions Must Be Time-Bounded
