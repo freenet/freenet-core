@@ -691,6 +691,61 @@ pub(crate) fn drop_subscriber_listener(
     }
 }
 
+/// Complete one in-flight subscribe=true GET/PUT for `(instance_id, client_id)`
+/// and, when it was the LAST in-flight subscribe AND no state is present, tear
+/// down the shared client subscription (ring bookkeeping AND the executor
+/// notifier). SHARED by the GET/PUT driver terminals and the start-failure sites
+/// so they cannot drift (review Fixes 5/7/8).
+///
+/// - Decrements the in-flight count first; if another subscribe for the same
+///   pair is still running (`remaining > 0`), keeps everything (Fix 5).
+/// - State-gated (Fix 3): a request whose sibling (or itself) holds current
+///   state keeps the subscription. `resolved_key` supplies the full key for a
+///   cheap sync check; `None` resolves via the store.
+/// - The final removal is ATOMIC w.r.t. begin/end (Fix 7): it goes through
+///   `remove_client_subscription_if_no_inflight`, which holds the in-flight entry
+///   lock so a NEW subscribe that raced in during the state-check `.await` is not
+///   clobbered; the notifier drop is gated on that same guard.
+///
+/// No-op when `client_sub_cleanup` is `None`.
+pub(crate) async fn finish_inflight_subscribe(
+    op_manager: &crate::node::OpManager,
+    instance_id: ContractInstanceId,
+    client_sub_cleanup: Option<crate::client_events::ClientId>,
+    resolved_key: Option<ContractKey>,
+) {
+    let Some(client_id) = client_sub_cleanup else {
+        return;
+    };
+    let remaining = op_manager
+        .ring
+        .end_inflight_subscribe(instance_id, client_id);
+    if remaining > 0 {
+        // Another subscribe=true GET/PUT for this (contract, client) is still in
+        // flight and may yet deliver state — keep the shared registration (Fix 5).
+        return;
+    }
+    let state_present = match resolved_key {
+        Some(key) => op_manager.ring.contract_state_present(&key),
+        // `has_contract` reports Ok(Some(_)) only when the store holds current
+        // state for the instance.
+        None => matches!(has_contract(op_manager, instance_id).await, Ok(Some(_))),
+    };
+    if state_present {
+        // We hold current state — legitimate host/subscription, not a phantom.
+        return;
+    }
+    // Atomic check-and-remove (Fix 7): only tear down if no subscribe raced in
+    // during the `.await` above. Gate BOTH the ring removal and the notifier drop
+    // on the guard so they stay consistent.
+    if op_manager
+        .ring
+        .remove_client_subscription_if_no_inflight(instance_id, client_id)
+    {
+        drop_subscriber_listener(op_manager, instance_id, client_id);
+    }
+}
+
 /// Determines if streaming transport should be used for a payload of the given size.
 ///
 /// Returns `true` if the payload size exceeds the streaming threshold (default: 64KB).
@@ -984,6 +1039,76 @@ mod ordering_invariant_tests {
         //
         // This test documents that the invariant exists and is intentional.
         // If refactoring this code, maintain the push-before-send ordering!
+    }
+
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..]
+            .find('{')
+            .expect("fn signature must have a body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Pin (review Fixes 5/7): the SHARED `finish_inflight_subscribe` — the single
+    /// teardown path used by both the GET/PUT driver terminals and the
+    /// start-failure sites — must:
+    ///   - decrement the in-flight count first and skip teardown while another
+    ///     subscribe for the same (contract,client) is in flight (`remaining > 0`,
+    ///     Fix 5);
+    ///   - be state-gated (Fix 3);
+    ///   - route the removal through the ATOMIC guard
+    ///     `remove_client_subscription_if_no_inflight` (Fix 7 — closes the TOCTOU
+    ///     across the state-check `.await`), NOT a bare `remove_client_subscription`;
+    ///   - drop the executor notifier gated on that guard (Fix 2).
+    #[test]
+    fn finish_inflight_subscribe_routes_removal_through_atomic_guard() {
+        let src = include_str!("operations.rs");
+        let body = extract_fn_body(src, "pub(crate) async fn finish_inflight_subscribe(");
+
+        assert!(
+            body.contains("end_inflight_subscribe(") && body.contains("remaining > 0"),
+            "finish_inflight_subscribe must decrement the in-flight count and skip \
+             teardown while another subscribe is in flight (Fix 5)"
+        );
+        assert!(
+            body.contains("contract_state_present") || body.contains("has_contract("),
+            "finish_inflight_subscribe must be state-gated (Fix 3)"
+        );
+        assert!(
+            body.contains("remove_client_subscription_if_no_inflight("),
+            "finish_inflight_subscribe must route removal through the atomic \
+             remove_client_subscription_if_no_inflight guard (Fix 7), so a subscribe \
+             that races in during the state-check .await is not clobbered"
+        );
+        assert!(
+            !body.contains(".remove_client_subscription("),
+            "finish_inflight_subscribe must NOT call the bare (non-atomic) \
+             remove_client_subscription — that reopens the Fix 7 TOCTOU"
+        );
+        assert!(
+            body.contains("drop_subscriber_listener("),
+            "finish_inflight_subscribe must drop the executor notifier (Fix 2), gated on \
+             the atomic guard"
+        );
     }
 }
 

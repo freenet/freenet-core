@@ -3817,26 +3817,6 @@ impl Ring {
             .add_client_subscription(instance_id, client_id)
     }
 
-    /// Remove a single client's subscription to `instance_id`.
-    ///
-    /// Used on the failure path of a subscribe=true GET/PUT (step 10 §1e): the
-    /// client subscription is registered up-front in `client_events` (for the
-    /// #4524 don't-miss-updates ordering), so a dead-end GET or a failed PUT
-    /// would otherwise leave it registered — `contract_in_use` true with no state
-    /// — until the client disconnects (a phantom). The driver removes it on any
-    /// terminal that delivered no state. A no-op returning `false` when the
-    /// client had no subscription to the contract, so it is safe to call
-    /// unconditionally on the failure path. Returns `true` if this was the
-    /// contract's last client subscription.
-    pub(crate) fn remove_client_subscription(
-        &self,
-        instance_id: &ContractInstanceId,
-        client_id: crate::client_events::ClientId,
-    ) -> bool {
-        self.hosting_manager
-            .remove_client_subscription(instance_id, client_id)
-    }
-
     /// Record the start of an in-flight subscribe=true GET/PUT for
     /// `(instance_id, client_id)` (review Fix 5). See
     /// `HostingManager::begin_inflight_subscribe`.
@@ -3859,6 +3839,18 @@ impl Ring {
     ) -> usize {
         self.hosting_manager
             .end_inflight_subscribe(instance_id, client_id)
+    }
+
+    /// Atomically remove a client subscription only if no subscribe is in flight
+    /// for `(instance_id, client_id)` (review Fix 7). See
+    /// `HostingManager::remove_client_subscription_if_no_inflight`.
+    pub(crate) fn remove_client_subscription_if_no_inflight(
+        &self,
+        instance_id: ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        self.hosting_manager
+            .remove_client_subscription_if_no_inflight(instance_id, client_id)
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).

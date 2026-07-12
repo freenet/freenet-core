@@ -1258,6 +1258,41 @@ impl HostingManager {
         }
     }
 
+    /// Atomically remove the client subscription for `(instance_id, client_id)`
+    /// ONLY if no subscribe=true GET/PUT is currently in flight for that pair
+    /// (review Fix 7). Returns `true` iff the subscription was removed (the caller
+    /// then drops the executor notifier), `false` when a new in-flight subscribe
+    /// raced in (that request now owns the shared registration, so nothing is
+    /// removed).
+    ///
+    /// Closes the TOCTOU window in the finish helper: after `end_inflight_subscribe`
+    /// reports 0, the helper `.await`s a state-presence check, during which a NEW
+    /// subscribe for the same pair can `begin_inflight_subscribe` + register. This
+    /// method holds the `subscribe_inflight` entry lock for the key across the
+    /// check-and-remove, so that racing `begin` is observed here (Occupied → keep)
+    /// rather than clobbered. Correctness relies on `begin_inflight_subscribe`
+    /// running BEFORE the client subscription is registered (client_events), so a
+    /// live request always has an in-flight entry by the time its registration
+    /// exists.
+    pub(crate) fn remove_client_subscription_if_no_inflight(
+        &self,
+        instance_id: ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.subscribe_inflight.entry((instance_id, client_id)) {
+            // A new in-flight subscribe raced in after our end() — it owns the
+            // shared registration now; remove nothing.
+            Entry::Occupied(_) => false,
+            // No in-flight subscribe for this pair — safe to tear down. The entry
+            // lock is held across the removal so a concurrent begin cannot slip in.
+            Entry::Vacant(_) => {
+                self.remove_client_subscription(&instance_id, client_id);
+                true
+            }
+        }
+    }
+
     /// Check if there are any client subscriptions for a contract.
     pub fn has_client_subscriptions(&self, instance_id: &ContractInstanceId) -> bool {
         self.client_subscriptions
@@ -5171,6 +5206,53 @@ mod tests {
 
         // Over-decrement is saturating (no underflow / panic) and reports 0.
         assert_eq!(manager.end_inflight_subscribe(instance, client), 0);
+    }
+
+    /// Fix 7 regression: the atomic teardown guard
+    /// `remove_client_subscription_if_no_inflight` must refuse to remove the
+    /// shared client subscription whenever an in-flight subscribe exists for the
+    /// pair — both a sibling still running, and a NEW subscribe that raced in after
+    /// `end_inflight_subscribe` reported 0 (the TOCTOU across the finish helper's
+    /// state-check `.await`). It removes (returns true) only when nothing is in
+    /// flight.
+    #[test]
+    fn remove_client_subscription_if_no_inflight_guards_concurrent_begin() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(201);
+        let instance = *key.id();
+        let client = crate::client_events::ClientId::next();
+
+        manager.add_client_subscription(&instance, client);
+
+        // A sibling is still in flight (remaining 1) → guard refuses, sub kept.
+        manager.begin_inflight_subscribe(instance, client);
+        manager.begin_inflight_subscribe(instance, client);
+        assert_eq!(manager.end_inflight_subscribe(instance, client), 1);
+        assert!(
+            !manager.remove_client_subscription_if_no_inflight(instance, client),
+            "guard must refuse to remove while a sibling subscribe is in flight"
+        );
+        assert!(manager.has_client_subscriptions(&instance));
+
+        // The last one ends (remaining 0). Simulate the Fix 7 TOCTOU: a NEW
+        // subscribe for the same pair begins during the finish helper's state
+        // check. The guard must observe it and REFUSE to remove.
+        assert_eq!(manager.end_inflight_subscribe(instance, client), 0);
+        manager.begin_inflight_subscribe(instance, client); // races in during the .await
+        assert!(
+            !manager.remove_client_subscription_if_no_inflight(instance, client),
+            "guard must refuse to remove when a subscribe raced in after end() reported \
+             0 (Fix 7 TOCTOU) — else it deletes the racing request's subscription"
+        );
+        assert!(manager.has_client_subscriptions(&instance));
+
+        // Drain the racer; with nothing in flight the guard removes and reports true.
+        assert_eq!(manager.end_inflight_subscribe(instance, client), 0);
+        assert!(
+            manager.remove_client_subscription_if_no_inflight(instance, client),
+            "with nothing in flight the guard removes and reports true"
+        );
+        assert!(!manager.has_client_subscriptions(&instance));
     }
 
     /// #4612 producer bound: `max_fetches` caps the fetches emitted per sweep

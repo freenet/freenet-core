@@ -551,25 +551,36 @@ async fn process_open_request(
                         // Some(client_id) iff we actually registered one, so the
                         // driver can tear it down when the PUT commits no state
                         // (step 10 §1e) rather than leaving a phantom until
-                        // disconnect. `begin_inflight_subscribe` records this
-                        // request so a concurrent sibling subscribe for the same
-                        // (contract, client) is not torn down by this one's failure
-                        // cleanup (Fix 5); it is balanced by exactly one
-                        // `end_inflight_subscribe` — at the driver terminal, or here
-                        // if the driver never spawns.
+                        // disconnect. `begin_inflight_subscribe` runs BEFORE
+                        // registering (Fix 7): it records this request so (a) a
+                        // concurrent sibling subscribe for the same (contract,
+                        // client) is not torn down by this one's failure cleanup
+                        // (Fix 5), and (b) the atomic teardown guard can never
+                        // clobber a registration whose intent is already recorded.
+                        // Balanced by exactly one `end_inflight_subscribe` — rolled
+                        // back here on register failure, or run at the driver
+                        // terminal / start-failure site.
                         let client_sub_cleanup = if subscribe {
                             if let Some(sl) = subscription_listener {
-                                register_subscription_listener(
+                                op_manager
+                                    .ring
+                                    .begin_inflight_subscribe(*contract_key.id(), client_id);
+                                let reg = register_subscription_listener(
                                     &op_manager,
                                     *contract_key.id(),
                                     client_id,
                                     sl,
                                     "PUT",
                                 )
-                                .await?;
-                                op_manager
-                                    .ring
-                                    .begin_inflight_subscribe(*contract_key.id(), client_id);
+                                .await;
+                                if reg.is_err() {
+                                    // Registration failed → no subscription exists;
+                                    // roll back the increment before propagating.
+                                    op_manager
+                                        .ring
+                                        .end_inflight_subscribe(*contract_key.id(), client_id);
+                                }
+                                reg?;
                                 Some(client_id)
                             } else {
                                 tracing::warn!(
@@ -596,13 +607,18 @@ async fn process_open_request(
                         )
                         .await
                         {
-                            // The driver never spawned, so no terminal will
-                            // decrement — balance the up-front increment here.
-                            if let Some(client_id) = client_sub_cleanup {
-                                op_manager
-                                    .ring
-                                    .end_inflight_subscribe(*contract_key.id(), client_id);
-                            }
+                            // The driver never spawned, so no terminal will run the
+                            // teardown — do the SAME last-request/no-state teardown
+                            // here (Fix 8), not a bare decrement, so a banned/absent-
+                            // contract PUT does not leave the registered subscription
+                            // + notifier lingering until disconnect.
+                            crate::operations::finish_inflight_subscribe(
+                                &op_manager,
+                                *contract_key.id(),
+                                client_sub_cleanup,
+                                Some(contract_key),
+                            )
+                            .await;
                             report_op_init_error(
                                 &op_manager,
                                 client_tx,
@@ -1158,22 +1174,31 @@ async fn process_open_request(
                         // Some(client_id) iff we actually registered one, so the
                         // driver can tear it down on a dead-end GET (step 10 §1e)
                         // rather than leaving a phantom until disconnect.
-                        // `begin_inflight_subscribe` records this request so a
-                        // concurrent sibling subscribe for the same (contract,
-                        // client) is not torn down by this one's dead-end cleanup
-                        // (Fix 5); balanced by exactly one `end_inflight_subscribe`
-                        // — at the driver terminal, or here if it never spawns.
+                        // `begin_inflight_subscribe` runs BEFORE registering (Fix 7):
+                        // it records this request so (a) a concurrent sibling
+                        // subscribe for the same (contract, client) is not torn down
+                        // by this one's dead-end cleanup (Fix 5), and (b) the atomic
+                        // teardown guard can never clobber a registration whose
+                        // in-flight intent is already recorded. Balanced by exactly
+                        // one `end_inflight_subscribe` — rolled back here on register
+                        // failure, or run at the driver terminal / start-failure site.
                         let client_sub_cleanup = if subscribe {
                             if let Some(sl) = subscription_listener {
-                                register_subscription_listener(
+                                op_manager.ring.begin_inflight_subscribe(key, client_id);
+                                let reg = register_subscription_listener(
                                     &op_manager,
                                     key,
                                     client_id,
                                     sl,
                                     "GET",
                                 )
-                                .await?;
-                                op_manager.ring.begin_inflight_subscribe(key, client_id);
+                                .await;
+                                if reg.is_err() {
+                                    // Registration failed → no subscription exists;
+                                    // roll back the increment before propagating.
+                                    op_manager.ring.end_inflight_subscribe(key, client_id);
+                                }
+                                reg?;
                                 Some(client_id)
                             } else {
                                 tracing::warn!(
@@ -1207,11 +1232,18 @@ async fn process_open_request(
                         )
                         .await
                         {
-                            // The driver never spawned, so no terminal will
-                            // decrement — balance the up-front increment here.
-                            if let Some(client_id) = client_sub_cleanup {
-                                op_manager.ring.end_inflight_subscribe(key, client_id);
-                            }
+                            // The driver never spawned, so no terminal will run the
+                            // teardown — do the SAME last-request/no-state teardown
+                            // here (Fix 8), not a bare decrement, so a banned/absent-
+                            // contract GET does not leave the registered subscription
+                            // + notifier lingering until disconnect.
+                            crate::operations::finish_inflight_subscribe(
+                                &op_manager,
+                                key,
+                                client_sub_cleanup,
+                                None,
+                            )
+                            .await;
                             report_op_init_error(
                                 &op_manager,
                                 client_tx,
@@ -1986,6 +2018,45 @@ mod serve_during_gate_tests {
              blocking_subscribe — that silently downgrades an explicit \
              blocking_subscribe=true GET to fire-and-forget (#4524 regression). \
              Call args: {args_only:?}"
+        );
+    }
+
+    /// Pin (review Fixes 7/8): the up-front subscribe registration must record the
+    /// in-flight intent BEFORE registering the listener (Fix 7 — so the atomic
+    /// teardown guard can never clobber a registration whose intent is not yet
+    /// recorded), and the driver-never-spawned start-failure sites must run the
+    /// FULL teardown (`finish_inflight_subscribe`), not a bare decrement (Fix 8).
+    #[test]
+    fn subscribe_registration_records_inflight_before_registering_and_tears_down_on_start_failure()
+    {
+        const SOURCE: &str = include_str!("client_events.rs");
+
+        // Fix 7: every real up-front registration site (GET + PUT) must call
+        // begin_inflight_subscribe BEFORE register_subscription_listener. The
+        // window filter (begin nearby) also excludes the fn definition/other refs.
+        let mut begin_before_register = 0;
+        let mut search_from = 0;
+        while let Some(rel) = SOURCE[search_from..].find("register_subscription_listener(") {
+            let pos = search_from + rel;
+            let window = &SOURCE[pos.saturating_sub(400)..pos];
+            if window.contains("begin_inflight_subscribe(") {
+                begin_before_register += 1;
+            }
+            search_from = pos + 1;
+        }
+        assert!(
+            begin_before_register >= 2,
+            "both the GET and PUT subscribe blocks must call begin_inflight_subscribe \
+             BEFORE register_subscription_listener (Fix 7) — found {begin_before_register}"
+        );
+
+        // Fix 8: the two start-failure sites must run the shared full teardown.
+        let teardowns = SOURCE.matches("finish_inflight_subscribe(").count();
+        assert!(
+            teardowns >= 2,
+            "the GET and PUT start-failure sites must call finish_inflight_subscribe \
+             (Fix 8 — full teardown, not a bare decrement) so a banned/absent-contract \
+             op does not leave a lingering subscription + notifier (found {teardowns})"
         );
     }
 }
