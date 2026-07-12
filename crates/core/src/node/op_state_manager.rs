@@ -3206,6 +3206,100 @@ mod tests {
         );
     }
 
+    // ===== Stale proximity-cache reap (#4756) =====
+
+    /// Regression test for #4756: a proximity-cache entry for a neighbor that
+    /// disconnected (no longer in the connection manager) MUST be reaped the
+    /// first time `get_broadcast_targets_update` fails to resolve it —
+    /// otherwise it logs at WARN and re-fires on EVERY subsequent UPDATE
+    /// forever (the unbounded log-spam failure mode reported on the 0.2.95
+    /// soak).
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_broadcast_targets_reaps_stale_proximity_neighbor() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("reap-stale-proximity").await;
+        seed_location_and_one_connection(&op_manager);
+
+        let key = reroot_contract_key(7);
+        // A hub announced it co-hosts this contract, but it is NOT in the
+        // connection manager — reproducing the post-disconnect stale state
+        // where the ring pruned the connection (keyed by addr) but the
+        // proximity entry (keyed by pub_key) leaked.
+        let hub = crate::transport::TransportKeypair::new().public().clone();
+        register_hub_cohosting(&op_manager, &hub, &[*key.id()]);
+        assert_eq!(
+            op_manager.neighbor_hosting.neighbors_with_contract(&key),
+            vec![hub.clone()],
+            "precondition: the stale proximity entry is present"
+        );
+
+        let sender: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+
+        // First lookup: the stale neighbor fails to resolve (counted once) AND
+        // is reaped so it cannot spam future UPDATEs.
+        let first = op_manager.get_broadcast_targets_update(&key, &sender);
+        assert_eq!(
+            first.proximity_resolve_failed, 1,
+            "the stale neighbor must be counted as one resolve failure"
+        );
+        assert!(
+            op_manager
+                .neighbor_hosting
+                .neighbors_with_contract(&key)
+                .is_empty(),
+            "the stale proximity entry must be reaped on the first failed resolve (#4756)"
+        );
+
+        // Second lookup: the entry is gone, so there is no repeat failure — the
+        // bug's failure mode is that this stays 1 (WARN spam) forever.
+        let second = op_manager.get_broadcast_targets_update(&key, &sender);
+        assert_eq!(
+            second.proximity_resolve_failed, 0,
+            "a reaped entry must not re-fire on the next UPDATE (no repeat spam)"
+        );
+    }
+
+    /// Companion to #4756: a proximity neighbor that IS still connected must be
+    /// resolved as a broadcast target and NOT reaped by the self-healing path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_broadcast_targets_keeps_connected_proximity_neighbor() {
+        let (op_manager, _guards) = build_reroot_test_op_manager("keep-connected-proximity").await;
+        seed_location_and_one_connection(&op_manager);
+
+        let key = reroot_contract_key(8);
+        // A connected neighbor: present in BOTH the connection manager and the
+        // proximity cache.
+        let peer_kp = crate::transport::TransportKeypair::new();
+        let peer_pub = peer_kp.public().clone();
+        let peer_addr: std::net::SocketAddr = "127.0.0.1:45678".parse().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.5),
+            peer_addr,
+            peer_pub.clone(),
+            false,
+        ));
+        register_hub_cohosting(&op_manager, &peer_pub, &[*key.id()]);
+
+        let sender: std::net::SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let result = op_manager.get_broadcast_targets_update(&key, &sender);
+
+        assert_eq!(
+            result.proximity_resolve_failed, 0,
+            "a connected neighbor must resolve, not fail"
+        );
+        assert!(
+            result
+                .targets
+                .iter()
+                .any(|t| t.socket_addr() == Some(peer_addr)),
+            "the connected neighbor must be included as a broadcast target"
+        );
+        assert_eq!(
+            op_manager.neighbor_hosting.neighbors_with_contract(&key),
+            vec![peer_pub.clone()],
+            "a connected neighbor must NOT be reaped"
+        );
+    }
+
     #[tokio::test]
     async fn notify_timeout_succeeds_when_receiver_alive() {
         let (receiver, notifier) = event_loop_notification_channel();
