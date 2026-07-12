@@ -923,6 +923,28 @@ mod tests {
     }
 
     #[test]
+    fn js_guards_against_concurrent_refresh_chains() {
+        // Rule-review finding on #4777's visibility-aware refresh: without
+        // resetting refreshTimer once its setTimeout fires, a visibilitychange
+        // racing an in-flight timer-triggered fetch would clearTimeout() an
+        // already-fired id (a no-op) and fork a second concurrent
+        // refreshDashboard().finally(scheduleRefresh) chain, breaking the
+        // documented "one fetch at a time" invariant. Pin both the in-flight
+        // guard flag and the refreshTimer = null reset.
+        assert!(
+            JS.contains("refreshInFlight"),
+            "JS must track an in-flight guard flag so refreshDashboard() \
+             is a no-op while a fetch is already running"
+        );
+        assert!(
+            JS.contains("refreshTimer = null"),
+            "JS must reset refreshTimer to null once its setTimeout fires, \
+             so a later clearTimeout(refreshTimer) can't silently no-op \
+             against an already-fired timer id"
+        );
+    }
+
+    #[test]
     fn reliability_chart_empty_is_placeholder() {
         let svg = build_reliability_chart(&[], None);
         assert!(svg.contains("collecting data"));

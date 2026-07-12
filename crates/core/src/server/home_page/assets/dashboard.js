@@ -520,12 +520,25 @@ document.addEventListener('DOMContentLoaded', function () {
   var VISIBLE_REFRESH_MS = 5000;
   var HIDDEN_REFRESH_MS = 60000;
   var refreshTimer = null;
+  /* Guards against a second concurrent refreshDashboard() chain: without
+     this, a visibilitychange->visible event racing against an in-flight
+     timer-triggered fetch would clearTimeout() an id that already fired
+     (a no-op) and then kick off a second .finally(scheduleRefresh) chain,
+     permanently forking the "one fetch at a time" poll loop. */
+  var refreshInFlight = false;
 
   function currentRefreshInterval() {
     return document.hidden ? HIDDEN_REFRESH_MS : VISIBLE_REFRESH_MS;
   }
 
   function refreshDashboard() {
+    if (refreshInFlight) {
+      /* A fetch is already running (either the timer-driven one or one
+         kicked off by a prior visibilitychange) — do nothing so we never
+         run two overlapping refresh chains. */
+      return Promise.resolve();
+    }
+    refreshInFlight = true;
     return fetch(window.location.href)
       .then(function (r) {
         return r.text();
@@ -563,22 +576,36 @@ document.addEventListener('DOMContentLoaded', function () {
       })
       .catch(function (e) {
         console.warn('Dashboard refresh failed:', e);
+      })
+      .finally(function () {
+        refreshInFlight = false;
       });
   }
 
   function scheduleRefresh() {
     if (refreshTimer !== null) clearTimeout(refreshTimer);
     refreshTimer = setTimeout(function () {
+      /* Clear before firing: once this callback runs, the timer id is
+         already spent, so leaving refreshTimer set to it would make a
+         concurrent clearTimeout(refreshTimer) elsewhere a silent no-op. */
+      refreshTimer = null;
       refreshDashboard().finally(scheduleRefresh);
     }, currentRefreshInterval());
   }
 
   /* When the tab regains visibility, refresh right away instead of waiting
      out whatever remains of the hidden-tab backoff timer, then fall back to
-     the normal cadence for the next tick. */
+     the normal cadence for the next tick. If a refresh is already in flight
+     (e.g. the hidden-tab timer fired just before visibility changed), just
+     reschedule at the normal cadence instead of starting a second fetch. */
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) return;
     if (refreshTimer !== null) clearTimeout(refreshTimer);
+    refreshTimer = null;
+    if (refreshInFlight) {
+      scheduleRefresh();
+      return;
+    }
     refreshDashboard().finally(scheduleRefresh);
   });
 
