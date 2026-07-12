@@ -61,9 +61,18 @@ impl Executor<Runtime> {
                 }
             };
 
-            // Validate before persisting (fetch related contracts from network if needed)
+            // Validate before persisting (fetch related contracts from network if needed).
+            // This is an existing-contract merge, not a fresh store — we don't
+            // have a `ContractContainer` in hand, so fall back to the
+            // fetch-from-store path (`None`).
             let validate_result = self
-                .fetch_related_for_validation_network(&key, &params, &new_state, &related_contracts)
+                .fetch_related_for_validation_network(
+                    &key,
+                    &params,
+                    &new_state,
+                    &related_contracts,
+                    None,
+                )
                 .await?;
             if validate_result != ValidateResult::Valid {
                 return Err(Self::validation_error_put(key, validate_result));
@@ -279,12 +288,15 @@ impl Executor<Runtime> {
         };
 
         // Validate before persisting or broadcasting (fetch related contracts from network if needed).
+        // This is an UPDATE on an already-hosted contract, not a fresh store —
+        // no `ContractContainer` in hand, so fall back to fetch-from-store (`None`).
         let result = self
             .fetch_related_for_validation_network(
                 &key,
                 parameters,
                 &new_state,
                 &RelatedContracts::default(),
+                None,
             )
             .await?;
 
@@ -367,6 +379,11 @@ impl Executor<Runtime> {
             }
         }
 
+        // Keep a cheap (Arc-backed) clone in hand so validation below can use
+        // it directly instead of re-fetching from `contract_store` on a
+        // module-cache miss (issue #2216: avoids the store→fetch round-trip).
+        let contract_for_validation = contract.clone();
+
         // Store contract code in runtime store
         self.runtime
             .contract_store
@@ -408,7 +425,13 @@ impl Executor<Runtime> {
         //   - Excessive fan-out (max 10 related contracts per request)
         // See MAX_RELATED_CONTRACTS_PER_REQUEST and RELATED_FETCH_TIMEOUT constants.
         let result = self
-            .fetch_related_for_validation_network(&key, &params, &state, &related_contracts)
+            .fetch_related_for_validation_network(
+                &key,
+                &params,
+                &state,
+                &related_contracts,
+                Some(&contract_for_validation),
+            )
             .await
             .inspect_err(|_| {
                 if let Err(e) = self.runtime.contract_store.remove_contract(&key) {
@@ -601,17 +624,31 @@ impl Executor<Runtime> {
     /// `local_state_or_from_network` helper directly and several PUT call
     /// sites already wire through it; collapsing the two would touch more
     /// surface area than the bug fix needs.
+    ///
+    /// `already_fetched_contract`: when the caller already holds the
+    /// `ContractContainer` being validated (e.g. `verify_and_store_contract`,
+    /// which just handed it to `contract_store.store_contract`), pass it here
+    /// so a module-cache miss compiles directly from it instead of re-fetching
+    /// the same bytes from `contract_store` (issue #2216). `None` for callers
+    /// that don't have it in hand — behaves exactly as before.
     async fn fetch_related_for_validation_network(
         &mut self,
         key: &ContractKey,
         params: &Parameters<'_>,
         state: &WrappedState,
         initial_related: &RelatedContracts<'_>,
+        already_fetched_contract: Option<&ContractContainer>,
     ) -> Result<ValidateResult, ExecutorError> {
-        let result = self
-            .runtime
-            .validate_state(key, params, state, initial_related)
-            .map_err(|e| ExecutorError::execution(e, None))?;
+        let result = match already_fetched_contract {
+            Some(contract) => self
+                .runtime
+                .validate_state_with_contract(key, params, state, initial_related, contract)
+                .map_err(|e| ExecutorError::execution(e, None))?,
+            None => self
+                .runtime
+                .validate_state(key, params, state, initial_related)
+                .map_err(|e| ExecutorError::execution(e, None))?,
+        };
 
         let requested_ids = match result {
             ValidateResult::Valid | ValidateResult::Invalid => return Ok(result),
@@ -711,10 +748,16 @@ impl Executor<Runtime> {
         }
 
         let populated_related = RelatedContracts::from(related_map);
-        let retry_result = self
-            .runtime
-            .validate_state(key, params, state, &populated_related)
-            .map_err(|e| ExecutorError::execution(e, None))?;
+        let retry_result = match already_fetched_contract {
+            Some(contract) => self
+                .runtime
+                .validate_state_with_contract(key, params, state, &populated_related, contract)
+                .map_err(|e| ExecutorError::execution(e, None))?,
+            None => self
+                .runtime
+                .validate_state(key, params, state, &populated_related)
+                .map_err(|e| ExecutorError::execution(e, None))?,
+        };
 
         if let ValidateResult::RequestRelated(_) = &retry_result {
             return Err(ExecutorError::request(StdContractError::Put {
