@@ -303,17 +303,17 @@ impl ContractStore {
     /// only once no remaining instance references that code hash. File
     /// removal is idempotent — an already-missing `.wasm` is not an error.
     ///
-    /// The "still referenced?" decision is made against the **shared,
-    /// persistent ReDb `contract_index`**, not the per-`ContractStore`
-    /// in-memory `key_to_code_part` map. Each runtime-pool executor owns a
-    /// *separate* `ContractStore` with its own `key_to_code_part` built
-    /// fresh in [`ContractStore::new`], so an instance stored via a
-    /// different pool executor is invisible to an in-memory scan. Deciding
-    /// from the in-memory map would wrongly delete a `.wasm` blob still
-    /// referenced by an instance owned by another executor — corrupting
-    /// every surviving contract that shares the code (e.g. every River
-    /// room shares one room-contract WASM, see issue #2380). The ReDb
-    /// index is the single shared source of truth across all executors.
+    /// The "still referenced?" decision is made against the **persistent
+    /// ReDb `contract_index`**, not the in-memory `key_to_code_part` map.
+    /// Pool executors now share one in-memory index (see
+    /// [`SharedContractIndex`] / `new_with_shared_index`), but ReDb stays
+    /// the authority here: it is the durable source of truth that also
+    /// covers standalone stores built via [`ContractStore::new`] (which
+    /// get a private index), and deciding from a possibly-incomplete
+    /// in-memory view would wrongly delete a `.wasm` blob still
+    /// referenced by another instance — corrupting every surviving
+    /// contract that shares the code (e.g. every River room shares one
+    /// room-contract WASM, see issue #2380).
     pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let contract_hash = *key.code_hash();
 
