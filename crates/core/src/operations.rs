@@ -655,7 +655,7 @@ pub(crate) async fn has_contract(
         | crate::contract::ContractHandlerEvent::UpdateResponse { .. }
         | crate::contract::ContractHandlerEvent::UpdateNoChange { .. }
         | crate::contract::ContractHandlerEvent::RegisterSubscriberListener { .. }
-        | crate::contract::ContractHandlerEvent::RegisterSubscriberListenerResponse
+        | crate::contract::ContractHandlerEvent::RegisterSubscriberListenerResponse { .. }
         | crate::contract::ContractHandlerEvent::QuerySubscriptions { .. }
         | crate::contract::ContractHandlerEvent::QuerySubscriptionsResponse
         | crate::contract::ContractHandlerEvent::GetSummaryQuery { .. }

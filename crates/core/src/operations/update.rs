@@ -645,7 +645,7 @@ pub(crate) async fn update_contract(
                             | ContractHandlerEvent::UpdateResponse { .. }
                             | ContractHandlerEvent::UpdateNoChange { .. }
                             | ContractHandlerEvent::RegisterSubscriberListener { .. }
-                            | ContractHandlerEvent::RegisterSubscriberListenerResponse
+                            | ContractHandlerEvent::RegisterSubscriberListenerResponse { .. }
                             | ContractHandlerEvent::QuerySubscriptions { .. }
                             | ContractHandlerEvent::QuerySubscriptionsResponse
                             | ContractHandlerEvent::GetSummaryQuery { .. }
