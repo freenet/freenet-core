@@ -13,6 +13,7 @@ use crate::wasm_runtime::delegate_api::DelegateApiVersion;
 
 use super::super::{
     ContractStore, Runtime, RuntimeResult, SecretsStore, delegate_store::DelegateStore,
+    engine::InstanceHandle,
 };
 use super::*;
 
@@ -4025,6 +4026,152 @@ async fn test_multiple_send_delegate_messages_all_attested()
             msg.sender
         );
     }
+
+    Ok(())
+}
+
+/// Build a bare `Runtime` with empty stores and no loaded delegate.
+///
+/// `process_outbound` never touches the WASM engine for the terminal-arm
+/// drain paths (its `_handle`/`_instance_id`/`_params` arguments are unused
+/// there), so these regression tests can drive it directly without compiling
+/// or instantiating a delegate module.
+async fn bare_runtime() -> (Runtime, tempfile::TempDir) {
+    use crate::contract::storages::Storage;
+    let temp_dir = get_temp_dir();
+    let db = Storage::new(temp_dir.path()).await.unwrap();
+    let contract_store =
+        ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone()).unwrap();
+    let delegate_store =
+        DelegateStore::new(temp_dir.path().join("delegates"), 10_000, db.clone()).unwrap();
+    let secret_store =
+        SecretsStore::new(temp_dir.path().join("secrets"), Default::default(), db).unwrap();
+    let runtime = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
+    (runtime, temp_dir)
+}
+
+/// Regression test for #4668: a `SendDelegateMessage` queued behind a
+/// non-`SendDelegateMessage` terminal message (here `ApplicationMessage`)
+/// must still have its `sender` re-attested to the real delegate key.
+///
+/// Before the fix, the `ApplicationMessage` terminal arm blind-drained the
+/// remaining messages, so a forged `DelegateMessage.sender` reached the
+/// target delegate unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drain_behind_application_message_reattests_sender()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::VecDeque;
+
+    let (mut runtime, _temp_dir) = bare_runtime().await;
+
+    let delegate_key = DelegateKey::new([7u8; 32], CodeHash::new([8u8; 32]));
+    // Distinct, non-zero forged sender so the assertion is unambiguous.
+    let forged = DelegateKey::new([0xEEu8; 32], CodeHash::new([0xEFu8; 32]));
+    let target = DelegateKey::new([42u8; 32], CodeHash::new([99u8; 32]));
+
+    let mut outbound: VecDeque<OutboundDelegateMsg> = VecDeque::new();
+    outbound.push_back(OutboundDelegateMsg::ApplicationMessage(
+        ApplicationMessage::new(vec![1, 2, 3]),
+    ));
+    outbound.push_back(OutboundDelegateMsg::SendDelegateMessage(
+        DelegateMessage::new(target.clone(), forged.clone(), b"forged".to_vec()),
+    ));
+
+    let handle = InstanceHandle { id: 0 };
+    let params: Parameters = vec![].into();
+    let mut context = Vec::new();
+    let mut results = Vec::new();
+    runtime.process_outbound(
+        &delegate_key,
+        &handle,
+        0,
+        &params,
+        None,
+        &mut outbound,
+        &mut context,
+        &mut results,
+    )?;
+
+    let send = results
+        .iter()
+        .find_map(|m| match m {
+            OutboundDelegateMsg::SendDelegateMessage(m) => Some(m),
+            OutboundDelegateMsg::ApplicationMessage(_)
+            | OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+        })
+        .expect("SendDelegateMessage should be drained into results");
+
+    assert_eq!(
+        send.sender, delegate_key,
+        "SendDelegateMessage drained behind an ApplicationMessage must be \
+         re-attested to the real delegate key, not the forged {forged:?}"
+    );
+
+    Ok(())
+}
+
+/// Regression test for #4668: same bypass via the `GetContractRequest`
+/// (unprocessed) terminal arm — a second non-`SendDelegateMessage` terminal
+/// arm to guard against the blind-drain pattern being reintroduced piecemeal.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drain_behind_get_contract_request_reattests_sender()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::VecDeque;
+
+    let (mut runtime, _temp_dir) = bare_runtime().await;
+
+    let delegate_key = DelegateKey::new([1u8; 32], CodeHash::new([2u8; 32]));
+    let forged = DelegateKey::new([0xAAu8; 32], CodeHash::new([0xBBu8; 32]));
+    let target = DelegateKey::new([3u8; 32], CodeHash::new([4u8; 32]));
+
+    let mut outbound: VecDeque<OutboundDelegateMsg> = VecDeque::new();
+    // Unprocessed GetContractRequest is a terminal arm (passes to executor).
+    outbound.push_back(OutboundDelegateMsg::GetContractRequest(
+        GetContractRequest::new(ContractInstanceId::new([5u8; 32])),
+    ));
+    outbound.push_back(OutboundDelegateMsg::SendDelegateMessage(
+        DelegateMessage::new(target, forged.clone(), b"forged".to_vec()),
+    ));
+
+    let handle = InstanceHandle { id: 0 };
+    let params: Parameters = vec![].into();
+    let mut context = Vec::new();
+    let mut results = Vec::new();
+    runtime.process_outbound(
+        &delegate_key,
+        &handle,
+        0,
+        &params,
+        None,
+        &mut outbound,
+        &mut context,
+        &mut results,
+    )?;
+
+    let send = results
+        .iter()
+        .find_map(|m| match m {
+            OutboundDelegateMsg::SendDelegateMessage(m) => Some(m),
+            OutboundDelegateMsg::ApplicationMessage(_)
+            | OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_) => None,
+        })
+        .expect("SendDelegateMessage should be drained into results");
+
+    assert_eq!(
+        send.sender, delegate_key,
+        "SendDelegateMessage drained behind a GetContractRequest must be \
+         re-attested to the real delegate key, not the forged {forged:?}"
+    );
 
     Ok(())
 }
