@@ -8,7 +8,7 @@
 //! - Exponential backoff on connection failures (1s → 2s → 4s → ... → 5min max)
 //! - Event batching (send every 10 seconds or when buffer reaches 100 events)
 //! - Rate limiting (max 10 events/second aggregate), with a separate shadow
-//!   sub-budget (max 4/second) so always-on low-priority shadow telemetry
+//!   sub-budget (max 6/second) so always-on low-priority shadow telemetry
 //!   cannot starve operational telemetry (#4380)
 //! - Priority-based dropping when buffer is full
 //!
@@ -177,16 +177,26 @@ const MAX_EVENTS_PER_SECOND: usize = 10;
 ///
 /// Shadow telemetry is admitted under this sub-budget, carved out of the
 /// aggregate [`MAX_EVENTS_PER_SECOND`] cap, so that always-on background
-/// emitters cannot starve operational telemetry (#4380). With the current
-/// always-on baseline of 3 shadow events/sec (`shadow_rtt_aggregate` +
-/// `shadow_rate_demand` + `shadow_outbound_class`), rising to 5/sec on a
-/// gateway that also enables reference-ping and iface-tx, a cap of 4 admits
-/// the always-on set while still reserving at least
-/// `MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND` (= 6) slots/sec for
-/// operational events even when shadow demand spikes (e.g. Phase 2 adds the
-/// shadow controller decision log). Shadow events still also count against the
-/// aggregate cap.
-const MAX_SHADOW_EVENTS_PER_SECOND: usize = 4;
+/// emitters cannot starve operational telemetry (#4380). There are five shadow
+/// streams — `shadow_rtt_aggregate`, `shadow_rate_demand`,
+/// `shadow_outbound_class` (always-on) plus `shadow_reference_ping` /
+/// `shadow_iface_tx` (opt-in on gateways). Each samples at 1 Hz but only emits
+/// one rolled-up event per
+/// `transport::shadow_stats::SHADOW_ROLLUP_WINDOW_SECS`, so the steady-state
+/// shadow rate is well below 1 event/sec.
+///
+/// The catch: all five aggregator tickers start at node startup and share the
+/// same window length, so their emit ticks ALIGN on the same second every
+/// window — five rollups contend for the sub-budget simultaneously. The cap is
+/// therefore set to 6, one slot above the five aligned rollups, so no window's
+/// rollup is ever dropped for lack of a shadow slot (at a cap of 4 the fifth
+/// aligned rollup was deterministically dropped every window). This still
+/// reserves `MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND` (= 4)
+/// slots/sec for operational telemetry, and leaves one slot of headroom for a
+/// sixth stream (e.g. Phase 2 adding a shadow controller decision log). Shadow
+/// events still also count against the aggregate cap, so under genuine
+/// operational load they continue to yield.
+const MAX_SHADOW_EVENTS_PER_SECOND: usize = 6;
 
 /// Initial backoff duration on failure
 const INITIAL_BACKOFF_MS: u64 = 1000;
@@ -708,7 +718,7 @@ impl TelemetryWorker {
     ///   [`MAX_EVENTS_PER_SECOND`] — unchanged from the pre-#4380 behavior.
     /// - `Shadow` events are admitted only while BOTH the shadow sub-budget
     ///   ([`MAX_SHADOW_EVENTS_PER_SECOND`]) AND the aggregate cap have room.
-    ///   Because the sub-budget (4) is strictly below the aggregate cap (10),
+    ///   Because the sub-budget (6) is strictly below the aggregate cap (10),
     ///   shadow events can occupy at most `MAX_SHADOW_EVENTS_PER_SECOND` of
     ///   the slots, always leaving
     ///   `MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND` for
@@ -3517,6 +3527,36 @@ mod tests {
         assert_eq!(
             admitted, MAX_SHADOW_EVENTS_PER_SECOND,
             "shadow events must be capped at the sub-budget within a window"
+        );
+    }
+
+    #[test]
+    fn test_all_aligned_shadow_rollups_are_admitted() {
+        // Regression: the five shadow streams (shadow_rtt_aggregate,
+        // shadow_rate_demand, shadow_outbound_class, shadow_reference_ping,
+        // shadow_iface_tx) each emit one rollup per SHADOW_ROLLUP_WINDOW_SECS.
+        // Their aggregator tickers all start at node startup and share the same
+        // window length, so their emit ticks align on the same second every
+        // window. The shadow sub-budget must admit all five in that one second,
+        // or a full 30 s rollup is deterministically dropped every window. A
+        // cap of 4 dropped the fifth; the cap must fit all five with headroom.
+        const SHADOW_STREAMS: usize = 5;
+        const {
+            assert!(
+                MAX_SHADOW_EVENTS_PER_SECOND > SHADOW_STREAMS,
+                "shadow sub-budget must fit all five aligned rollups with headroom"
+            );
+        }
+
+        let mut worker = rate_limit_test_worker();
+        let now = Instant::now();
+
+        // All five rollups arrive in the same aligned second (no operational
+        // load competing for the aggregate cap).
+        let admitted = admit_n(&mut worker, EventPriority::Shadow, SHADOW_STREAMS, now);
+        assert_eq!(
+            admitted, SHADOW_STREAMS,
+            "all five aligned shadow rollups must be admitted; none dropped"
         );
     }
 

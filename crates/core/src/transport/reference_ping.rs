@@ -44,6 +44,7 @@ use crate::config::GlobalRng;
 use crate::simulation::RealTime;
 use crate::transport::DefaultSocket;
 use crate::transport::rolling_rtt_stats::RollingRttStats;
+use crate::transport::shadow_stats::{SHADOW_ROLLUP_WINDOW_SECS, WindowedStat};
 
 /// Default reference target (Cloudflare public DNS over UDP).
 ///
@@ -131,6 +132,7 @@ async fn run_probe_loop(local_peer_id: String, target: SocketAddr, socket: Defau
     // align with the rest of the node clock.
     ticker.tick().await;
 
+    let mut window = RefPingWindow::default();
     loop {
         ticker.tick().await;
         let outcome = probe_once(&socket, target).await;
@@ -142,7 +144,37 @@ async fn run_probe_loop(local_peer_id: String, target: SocketAddr, socket: Defau
                 // would poison the baseline.
             }
         }
-        emit_snapshot(&local_peer_id, target, &stats);
+        // Fold a measurement into the window only when THIS tick's probe
+        // actually succeeded. A failed probe advances the window clock but
+        // contributes no sample — even though `stats.snapshot()` is still
+        // `Some` (the rolling history stays non-empty for up to the baseline
+        // window after any earlier success). Counting that stale snapshot was
+        // the finding #2 bug: a 30 s window of all-failed probes would emit
+        // `samples: 30` with stale RTT stats. Emit one OTLP rollup per
+        // SHADOW_ROLLUP_WINDOW_SECS to keep central telemetry volume down.
+        window.record(sample_for_outcome(&outcome, &stats));
+        if window.is_full() {
+            emit_reference_ping_rollup(&local_peer_id, target, &window);
+            window = RefPingWindow::default();
+        }
+    }
+}
+
+/// The window contribution for one probe tick: the current rolling snapshot
+/// when THIS tick produced a fresh RTT sample, otherwise `None`.
+///
+/// A failed probe (`NoResponse` / `SendError`) yields `None` even when
+/// `stats.snapshot()` would return `Some` from earlier successes still inside
+/// the baseline window — a stale snapshot is not a fresh measurement and must
+/// not increment `samples` or fold into the window stats (finding #2). Pulled
+/// out of the probe loop so the fresh-vs-stale gate is unit-testable.
+fn sample_for_outcome(
+    outcome: &ProbeOutcome,
+    stats: &RollingRttStats<RealTime>,
+) -> Option<RefPingSample> {
+    match outcome {
+        ProbeOutcome::Sample(_) => sample_reference_ping(stats),
+        ProbeOutcome::NoResponse | ProbeOutcome::SendError => None,
     }
 }
 
@@ -189,42 +221,126 @@ async fn probe_once(socket: &DefaultSocket, target: SocketAddr) -> ProbeOutcome 
     }
 }
 
-fn emit_snapshot(local_peer_id: &str, target: SocketAddr, stats: &RollingRttStats<RealTime>) {
-    let snapshot = stats.snapshot();
-    let (baseline_min_us, recent_median_us, inflation_us, baseline_samples, recent_samples) =
-        match snapshot {
-            Some(s) => (
-                s.baseline_min.map(|d| d.as_micros() as u64),
-                s.recent_median.map(|d| d.as_micros() as u64),
-                s.inflation.map(|d| d.as_micros() as u64),
-                s.baseline_samples as u64,
-                s.recent_samples as u64,
-            ),
-            None => (None, None, None, 0, 0),
-        };
+/// One 1 Hz sample of the reference-path rolling snapshot.
+struct RefPingSample {
+    baseline_min_us: Option<u64>,
+    recent_median_us: Option<u64>,
+    inflation_us: Option<u64>,
+    baseline_samples: u64,
+    recent_samples: u64,
+}
 
+/// Windowed rollup accumulator for the `shadow_reference_ping` stream.
+#[derive(Default)]
+struct RefPingWindow {
+    /// Total 1 Hz ticks elapsed (including warmup/failed-probe ticks that
+    /// produced no fresh measurement), used only to decide when the window
+    /// closes.
+    ticks: u32,
+    /// Ticks whose probe succeeded THIS tick (a fresh RTT measurement). This is
+    /// the honest denominator for the summary stats and the value reported as
+    /// `samples`; a window of pure warmup/failed probes has `samples == 0` and
+    /// is not emitted. It counts fresh probes, not merely ticks where the
+    /// rolling snapshot was non-empty (which stays `Some` on failed ticks after
+    /// any earlier success).
+    samples: u32,
+    baseline_min_us: WindowedStat,
+    recent_median_us: WindowedStat,
+    inflation_us: WindowedStat,
+    baseline_samples: WindowedStat,
+    recent_samples: WindowedStat,
+}
+
+impl RefPingWindow {
+    /// Count the tick toward window closing; fold a measurement only when the
+    /// caller passes `Some` (this tick's probe produced a fresh sample —
+    /// see [`sample_for_outcome`]). A `None` tick (warmup or failed probe)
+    /// advances `ticks` but not `samples`, so it never dilutes the summary
+    /// stats or inflates the reported `samples` count.
+    fn record(&mut self, sample: Option<RefPingSample>) {
+        self.ticks += 1;
+        if let Some(sample) = sample {
+            self.samples += 1;
+            self.baseline_min_us.record_opt(sample.baseline_min_us);
+            self.recent_median_us.record_opt(sample.recent_median_us);
+            self.inflation_us.record_opt(sample.inflation_us);
+            self.baseline_samples.record(sample.baseline_samples);
+            self.recent_samples.record(sample.recent_samples);
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.ticks >= SHADOW_ROLLUP_WINDOW_SECS
+    }
+}
+
+/// Read one rolling snapshot of the reference-path RTT stats. Returns `None`
+/// when the snapshot has no data (warmup before the first successful probe, or
+/// every retained sample decayed past the baseline window).
+///
+/// Called by [`sample_for_outcome`] only on a fresh-probe tick, so on the live
+/// path a returned `None` here is the warmup case; the failed-probe stale-
+/// snapshot case is filtered earlier by [`sample_for_outcome`].
+fn sample_reference_ping(stats: &RollingRttStats<RealTime>) -> Option<RefPingSample> {
+    let s = stats.snapshot()?;
+    Some(RefPingSample {
+        baseline_min_us: s.baseline_min.map(|d| d.as_micros() as u64),
+        recent_median_us: s.recent_median.map(|d| d.as_micros() as u64),
+        inflation_us: s.inflation.map(|d| d.as_micros() as u64),
+        baseline_samples: s.baseline_samples as u64,
+        recent_samples: s.recent_samples as u64,
+    })
+}
+
+/// Emit one `shadow_reference_ping` rollup. Skips emission entirely when the
+/// window had zero valid measurements (all ticks were warmup/failed probes), so
+/// the collector never sees null stats dressed up with a nonzero `samples`.
+/// Each latency field keeps the window mean under its original name;
+/// `inflation_us_p50` / `inflation_us_max` (and `recent_median_us_max`) are the
+/// additive distribution fields the #4074 reference-path analysis consumes to
+/// separate local-uplink contention from overlay queueing.
+fn emit_reference_ping_rollup(local_peer_id: &str, target: SocketAddr, window: &RefPingWindow) {
+    if window.samples == 0 {
+        return;
+    }
+    // Record the Option<u64> means directly (NOT via `?`): tracing renders a
+    // `Some(n)` as the bare number and omits the field for `None`, matching the
+    // OTLP number-or-null. `?` would emit the literal `Some(n)` and break
+    // structured local-log parsers.
     tracing::debug!(
         target: "freenet::transport::reference_ping",
         %target,
-        baseline_min_us,
-        recent_median_us,
-        inflation_us,
-        baseline_samples,
-        recent_samples,
+        baseline_min_us = window.baseline_min_us.mean(),
+        recent_median_us = window.recent_median_us.mean(),
+        inflation_us = window.inflation_us.mean(),
+        window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_reference_ping"
     );
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_reference_ping",
         local_peer_id,
-        serde_json::json!({
-            "target": target.to_string(),
-            "baseline_min_us": baseline_min_us,
-            "recent_median_us": recent_median_us,
-            "inflation_us": inflation_us,
-            "baseline_samples": baseline_samples,
-            "recent_samples": recent_samples,
-        }),
+        reference_ping_rollup_json(target, window),
     );
+}
+
+/// Build the `shadow_reference_ping` rollup JSON. Pure so the schema (compat
+/// field = window mean, additive distribution fields, and `samples` = count of
+/// VALID measurements, not elapsed ticks) is unit-testable without the
+/// telemetry sender.
+fn reference_ping_rollup_json(target: SocketAddr, window: &RefPingWindow) -> serde_json::Value {
+    serde_json::json!({
+        "target": target.to_string(),
+        "baseline_min_us": window.baseline_min_us.mean(),
+        "recent_median_us": window.recent_median_us.mean(),
+        "recent_median_us_max": window.recent_median_us.max(),
+        "inflation_us": window.inflation_us.mean(),
+        "inflation_us_p50": window.inflation_us.p50(),
+        "inflation_us_max": window.inflation_us.max(),
+        "baseline_samples": window.baseline_samples.mean(),
+        "recent_samples": window.recent_samples.mean(),
+        "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
+        "samples": window.samples,
+    })
 }
 
 /// Build a minimal DNS query packet for `name` of type A, class IN.
@@ -280,6 +396,107 @@ fn is_matching_dns_response(buf: &[u8], expected_id: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_target() -> SocketAddr {
+        "1.1.1.1:53".parse().unwrap()
+    }
+
+    fn measured_sample(inflation_us: Option<u64>) -> RefPingSample {
+        RefPingSample {
+            baseline_min_us: Some(1_000),
+            recent_median_us: inflation_us.map(|i| 1_000 + i),
+            inflation_us,
+            baseline_samples: 5,
+            recent_samples: 3,
+        }
+    }
+
+    #[test]
+    fn rollup_samples_count_valid_measurements_not_ticks() {
+        // Regression: `samples` used to report the raw tick count, so a window
+        // of warmup/failed probes (no usable snapshot) emitted null stats with
+        // samples == 30. `samples` must instead count only ticks that produced
+        // a real measurement.
+        let mut window = RefPingWindow::default();
+        // Two warmup ticks: snapshot was None, no measurement.
+        window.record(None);
+        window.record(None);
+        // One tick where inflation had not converged yet (Some sample, but the
+        // inflation field is None) — still a valid measurement.
+        window.record(Some(measured_sample(None)));
+        // One fully-measured tick.
+        window.record(Some(measured_sample(Some(200))));
+
+        assert_eq!(window.ticks, 4, "all ticks advance the window clock");
+        assert_eq!(window.samples, 2, "only measured ticks count as samples");
+
+        let json = reference_ping_rollup_json(test_target(), &window);
+        // `samples` reflects valid measurements, not the 4 elapsed ticks.
+        assert_eq!(json["samples"], 2);
+        // baseline_min was present on both measured ticks → mean over 2 samples.
+        assert_eq!(json["baseline_min_us"], 1_000);
+        // inflation was present on exactly one measured tick → stats over that
+        // one valid value only, never diluted by the None ticks.
+        assert_eq!(json["inflation_us"], 200);
+        assert_eq!(json["inflation_us_p50"], 200);
+        assert_eq!(json["inflation_us_max"], 200);
+    }
+
+    #[test]
+    fn rollup_is_skipped_when_no_valid_measurements() {
+        // A whole window of warmup/failed probes must not be emitted at all:
+        // `samples == 0` is the emit guard in `emit_reference_ping_rollup`.
+        let mut window = RefPingWindow::default();
+        for _ in 0..SHADOW_ROLLUP_WINDOW_SECS {
+            window.record(None);
+        }
+        assert_eq!(window.ticks, SHADOW_ROLLUP_WINDOW_SECS);
+        assert_eq!(
+            window.samples, 0,
+            "no measured tick means the rollup is skipped (samples == 0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_probe_after_success_does_not_count_as_sample() {
+        // Production-path regression (finding #2, second round): a failed probe
+        // that lands AFTER an earlier success leaves the rolling history
+        // non-empty, so `stats.snapshot()` (hence `sample_reference_ping`) still
+        // returns `Some(stale)`. The window must NOT count that as a sample —
+        // otherwise a 30 s window of all-failed probes emits `samples: 30` with
+        // stale RTT stats. `sample_for_outcome` is the gate: only a fresh
+        // `Sample` outcome this tick folds a measurement.
+        let stats = RollingRttStats::new(RealTime::new());
+        // An earlier successful probe leaves the rolling history non-empty.
+        stats.record(Duration::from_millis(20));
+        assert!(
+            sample_reference_ping(&stats).is_some(),
+            "precondition: the rolling snapshot is non-empty after a success, \
+             so a naive `record(sample_reference_ping(..))` would wrongly count \
+             a failed tick"
+        );
+
+        let mut window = RefPingWindow::default();
+
+        // A failed probe THIS tick — snapshot is Some(stale) but it must not
+        // count.
+        window.record(sample_for_outcome(&ProbeOutcome::NoResponse, &stats));
+        window.record(sample_for_outcome(&ProbeOutcome::SendError, &stats));
+        assert_eq!(window.ticks, 2, "failed ticks still advance the clock");
+        assert_eq!(
+            window.samples, 0,
+            "a failed probe must not increment samples even when the rolling \
+             history is non-empty from an earlier success"
+        );
+
+        // A fresh successful probe THIS tick does count.
+        window.record(sample_for_outcome(
+            &ProbeOutcome::Sample(Duration::from_millis(25)),
+            &stats,
+        ));
+        assert_eq!(window.ticks, 3);
+        assert_eq!(window.samples, 1, "a fresh successful probe counts");
+    }
 
     #[test]
     fn dns_query_header_is_well_formed() {
