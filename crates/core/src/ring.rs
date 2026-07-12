@@ -1720,6 +1720,16 @@ impl Ring {
             // as the rework ships (AtCapacity now sheds subscribed as a last
             // resort). Same periodic cadence.
             snapshot.hosting_subscribed_evictions_total = Some(hosting.subscribed_evictions_total);
+            // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
+            // current count of contracts in-use via a downstream subscriber with
+            // NO state on disk (contract_in_use && !contract_state_present). After
+            // the register-after-state fix this should read 0; a nonzero value
+            // means a hop registered demand it cannot serve (#4404/#4612 phantom).
+            // redb-scoped by construction (contract_state_present is
+            // conservative-true elsewhere). Same hand-mirror footgun as the gauges
+            // above — invisible to the collector unless added to event_kind_to_json
+            // too (pinned by router_snapshot_json_includes_phantom_in_use_gauge).
+            snapshot.phantom_in_use_contracts = Some(ring.hosting_manager.phantom_in_use_count());
             // Local-client GET hit-rate (#4642 A3): served-locally vs routed to
             // the network. Driven by the real serve/forward decision in the
             // client GET handler, so it is read from the manager counters (not
@@ -2281,6 +2291,12 @@ impl Ring {
                 && let Some(op_manager) = ring.upgrade_op_manager()
             {
                 for repair in repairs {
+                    // Single-variant match: the #4770 cycling `Drop` arm was
+                    // NEUTRALIZED in step 10 §1c (register-after-state makes a
+                    // genuine phantom unrepresentable, so dropping only churns).
+                    // Only the bounded `Fetch` rollout net survives. A re-added
+                    // Drop variant would break this match, forcing an explicit
+                    // decision.
                     match repair {
                         crate::ring::hosting::PhantomRepair::Fetch(key) => {
                             tracing::info!(
@@ -2296,33 +2312,6 @@ impl Ring {
                                 *key.id(),
                                 true,
                             );
-                        }
-                        crate::ring::hosting::PhantomRepair::Drop(key) => {
-                            let removed = ring.drop_phantom_downstream(&key);
-                            tracing::warn!(
-                                contract = %key,
-                                removed_subscribers = removed,
-                                "phantom in-use contract unrepairable: dropping \
-                                 downstream registration (peers re-root via \
-                                 their own lease renewal)"
-                            );
-                            // Mirror the stale-lease expiry handling above:
-                            // decrement interest symmetrically, then collapse
-                            // upstream if no interest remains.
-                            for _ in 0..removed {
-                                op_manager
-                                    .interest_manager
-                                    .remove_downstream_subscriber(&key);
-                            }
-                            if op_manager.reconcile_wants_collapse(
-                                &key,
-                                crate::node::network_status::ReconcileShadowSite::Collapse,
-                            ) {
-                                let op_mgr = op_manager.clone();
-                                GlobalExecutor::spawn(async move {
-                                    op_mgr.send_unsubscribe_upstream(&key).await;
-                                });
-                            }
                         }
                     }
                 }
@@ -3782,13 +3771,6 @@ impl Ring {
         self.hosting_manager.reconcile_phantom_in_use(max_fetches)
     }
 
-    /// Drop the downstream registration of an unrepairable phantom contract,
-    /// returning the number of removed subscriber entries. See
-    /// `HostingManager::drop_phantom_downstream`.
-    pub(crate) fn drop_phantom_downstream(&self, key: &ContractKey) -> usize {
-        self.hosting_manager.drop_phantom_downstream(key)
-    }
-
     pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.should_unsubscribe_upstream(contract)
     }
@@ -3833,6 +3815,26 @@ impl Ring {
         // need to gate on `is_new_for_client` for scoring purposes.
         self.hosting_manager
             .add_client_subscription(instance_id, client_id)
+    }
+
+    /// Remove a single client's subscription to `instance_id`.
+    ///
+    /// Used on the failure path of a subscribe=true GET/PUT (step 10 §1e): the
+    /// client subscription is registered up-front in `client_events` (for the
+    /// #4524 don't-miss-updates ordering), so a dead-end GET or a failed PUT
+    /// would otherwise leave it registered — `contract_in_use` true with no state
+    /// — until the client disconnects (a phantom). The driver removes it on any
+    /// terminal that delivered no state. A no-op returning `false` when the
+    /// client had no subscription to the contract, so it is safe to call
+    /// unconditionally on the failure path. Returns `true` if this was the
+    /// contract's last client subscription.
+    pub(crate) fn remove_client_subscription(
+        &self,
+        instance_id: &ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> bool {
+        self.hosting_manager
+            .remove_client_subscription(instance_id, client_id)
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).
