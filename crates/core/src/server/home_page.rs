@@ -878,6 +878,90 @@ mod tests {
     }
 
     #[test]
+    fn js_slows_refresh_when_tab_hidden() {
+        // #3353: a hidden/backgrounded tab must back off to a much longer
+        // refresh interval instead of polling every 5s while nobody is
+        // watching. Pin both constants and the document.hidden branch.
+        assert!(
+            JS.contains("document.hidden"),
+            "JS must branch the refresh interval on document.hidden"
+        );
+        assert!(
+            JS.contains("HIDDEN_REFRESH_MS"),
+            "JS must define a distinct, longer interval for hidden tabs"
+        );
+        assert!(
+            JS.contains("60000"),
+            "hidden-tab interval should be a much longer backoff (e.g. 60s)"
+        );
+    }
+
+    #[test]
+    fn js_refreshes_immediately_on_tab_visible() {
+        // #3353: returning to a hidden tab must not wait out the stale
+        // 60s hidden-tab timer — it should refresh right away so the user
+        // sees current data as soon as they look at it.
+        assert!(
+            JS.contains("visibilitychange"),
+            "JS must listen for visibilitychange to react to tab focus changes"
+        );
+        assert!(
+            JS.contains("refreshDashboard()"),
+            "JS must expose a refreshDashboard function callable outside the timer chain"
+        );
+    }
+
+    #[test]
+    fn js_auto_refresh_has_no_setinterval() {
+        // Auto-refresh must keep using setTimeout chaining (so slow responses
+        // don't overlap) even after adding the visibility-aware cadence —
+        // setInterval would let a hung fetch pile up parallel requests.
+        assert!(
+            !JS.contains("setInterval("),
+            "auto-refresh must not switch to setInterval; keep setTimeout chaining"
+        );
+    }
+
+    #[test]
+    fn js_guards_against_concurrent_refresh_chains() {
+        // Rule-review finding on #4777's visibility-aware refresh: without
+        // resetting refreshTimer once its setTimeout fires, a visibilitychange
+        // racing an in-flight timer-triggered fetch would clearTimeout() an
+        // already-fired id (a no-op) and fork a second concurrent
+        // refreshDashboard().finally(scheduleRefresh) chain, breaking the
+        // documented "one fetch at a time" invariant. Pin both the in-flight
+        // guard flag and the refreshTimer = null reset.
+        assert!(
+            JS.contains("refreshInFlight"),
+            "JS must track an in-flight guard flag so refreshDashboard() \
+             is a no-op while a fetch is already running"
+        );
+        assert!(
+            JS.contains("refreshTimer = null"),
+            "JS must reset refreshTimer to null once its setTimeout fires, \
+             so a later clearTimeout(refreshTimer) can't silently no-op \
+             against an already-fired timer id"
+        );
+        // The BEHAVIORAL coverage for this state machine lives in
+        // dashboard_refresh.test.mjs (run via `npm test` in
+        // crates/core/src/server, wired into the lint-assets CI job), which
+        // extracts createRefreshScheduler between these markers and drives it
+        // under Node with fake timers. Pin the markers here so a Rust-side
+        // refactor can't silently strip the extraction points that test
+        // depends on.
+        assert!(
+            JS.contains("refresh-scheduler:BEGIN") && JS.contains("refresh-scheduler:END"),
+            "JS must keep the refresh-scheduler:BEGIN/END markers — \
+             dashboard_refresh.test.mjs extracts the scheduler between them"
+        );
+        assert!(
+            JS.contains("function createRefreshScheduler("),
+            "JS must keep the injectable createRefreshScheduler factory \
+             that dashboard_refresh.test.mjs tests behaviorally"
+        );
+    }
+
+    #[test]
     fn reliability_chart_empty_is_placeholder() {
         let svg = build_reliability_chart(&[], None);
         assert!(svg.contains("collecting data"));

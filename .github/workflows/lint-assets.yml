@@ -12,6 +12,7 @@ on:
     paths:
       - 'crates/core/src/server/**/assets/**'
       - 'crates/core/src/server/base58_encode.test.mjs'
+      - 'crates/core/src/server/dashboard_refresh.test.mjs'
       - 'crates/core/src/server/package.json'
       - 'crates/core/src/server/package-lock.json'
       - 'crates/core/src/server/.prettierrc.json'
@@ -22,6 +23,7 @@ on:
     paths:
       - 'crates/core/src/server/**/assets/**'
       - 'crates/core/src/server/base58_encode.test.mjs'
+      - 'crates/core/src/server/dashboard_refresh.test.mjs'
       - 'crates/core/src/server/package.json'
       - 'crates/core/src/server/package-lock.json'
       - 'crates/core/src/server/.prettierrc.json'
@@ -55,6 +57,6 @@ jobs:
         working-directory: crates/core/src/server
         run: npm run lint
 
-      - name: Test (base58 access-key encoder)
+      - name: Test (Node asset unit tests)
         working-directory: crates/core/src/server
         run: npm test

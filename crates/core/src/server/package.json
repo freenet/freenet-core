@@ -2,7 +2,7 @@
   "name": "freenet-server-assets-lint",
   "version": "0.0.0",
   "private": true,
-  "description": "Prettier/ESLint tooling (issue #4017) plus a Node unit test for the inline base58 access-key encoder, for the server's extracted JS/CSS/HTML assets. The assets are served from Rust via include_str!; this package lints/formats/tests them.",
+  "description": "Prettier/ESLint tooling (issue #4017) plus Node unit tests for the inline base58 access-key encoder and the dashboard auto-refresh scheduler, for the server's extracted JS/CSS/HTML assets. The assets are served from Rust via include_str!; this package lints/formats/tests them.",
   "engines": {
     "node": ">=20"
   },
@@ -11,7 +11,7 @@
     "lint:prettier": "prettier --check \"**/assets/**/*.{js,css,html}\"",
     "lint:eslint": "eslint \"**/assets/**/*.js\"",
     "format": "prettier --write \"**/assets/**/*.{js,css,html}\"",
-    "test": "node base58_encode.test.mjs"
+    "test": "node base58_encode.test.mjs && node dashboard_refresh.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.0",

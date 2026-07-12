@@ -419,6 +419,86 @@ function runImport() {
     });
 }
 
+/* ── Auto-refresh scheduler (extracted for Node unit tests) ──
+   The scheduling state machine is deliberately self-contained: every browser
+   dependency (timers, the actual fetch/DOM-swap refresh, visibility state) is
+   injected via `deps`, so dashboard_refresh.test.mjs can extract this factory
+   verbatim (between the refresh-scheduler:BEGIN/END markers) and drive it
+   under Node with fake timers. Keep it free of direct references to
+   window/document, and keep it bracketed by those markers.
+
+   Invariants (tested behaviorally in dashboard_refresh.test.mjs):
+   - one fetch at a time: refreshDashboard() is a no-op while a refresh is
+     in flight (refreshInFlight guard);
+   - the poll chain never forks: refreshTimer is reset to null the moment its
+     setTimeout callback fires, so a concurrent clearTimeout(refreshTimer)
+     can never silently no-op against an already-spent timer id;
+   - hidden tabs poll at HIDDEN_REFRESH_MS, visible tabs at
+     VISIBLE_REFRESH_MS (#3353), and becoming visible refreshes immediately
+     unless a refresh is already running (then it just reschedules). */
+/* refresh-scheduler:BEGIN */
+function createRefreshScheduler(deps) {
+  var VISIBLE_REFRESH_MS = 5000;
+  var HIDDEN_REFRESH_MS = 60000;
+  var refreshTimer = null;
+  /* Guards against a second concurrent refreshDashboard() chain: without
+     this, a visibilitychange->visible event racing against an in-flight
+     timer-triggered fetch would clearTimeout() an id that already fired
+     (a no-op) and then kick off a second .finally(scheduleRefresh) chain,
+     breaking the "one fetch at a time" invariant. */
+  var refreshInFlight = false;
+
+  function currentRefreshInterval() {
+    return deps.isHidden() ? HIDDEN_REFRESH_MS : VISIBLE_REFRESH_MS;
+  }
+
+  function refreshDashboard() {
+    if (refreshInFlight) {
+      /* A fetch is already running (either the timer-driven one or one
+         kicked off by a prior visibilitychange) — do nothing so we never
+         run two overlapping refresh chains. */
+      return Promise.resolve();
+    }
+    refreshInFlight = true;
+    return deps.refresh().finally(function () {
+      refreshInFlight = false;
+    });
+  }
+
+  function scheduleRefresh() {
+    if (refreshTimer !== null) deps.clearTimeout(refreshTimer);
+    refreshTimer = deps.setTimeout(function () {
+      /* Clear before firing: once this callback runs, the timer id is
+         already spent, so leaving refreshTimer set to it would make a
+         concurrent clearTimeout(refreshTimer) elsewhere a silent no-op. */
+      refreshTimer = null;
+      refreshDashboard().finally(scheduleRefresh);
+    }, currentRefreshInterval());
+  }
+
+  /* When the tab regains visibility, refresh right away instead of waiting
+     out whatever remains of the hidden-tab backoff timer, then fall back to
+     the normal cadence for the next tick. If a refresh is already in flight
+     (e.g. the hidden-tab timer fired just before visibility changed), just
+     reschedule at the normal cadence instead of starting a second fetch. */
+  function onVisibilityChange() {
+    if (deps.isHidden()) return;
+    if (refreshTimer !== null) deps.clearTimeout(refreshTimer);
+    refreshTimer = null;
+    if (refreshInFlight) {
+      scheduleRefresh();
+      return;
+    }
+    refreshDashboard().finally(scheduleRefresh);
+  }
+
+  return {
+    scheduleRefresh: scheduleRefresh,
+    onVisibilityChange: onVisibilityChange,
+  };
+}
+/* refresh-scheduler:END */
+
 document.addEventListener('DOMContentLoaded', function () {
   var icon = document.getElementById('theme-icon');
   if (icon && document.documentElement.getAttribute('data-theme') === 'light') {
@@ -509,49 +589,77 @@ document.addEventListener('DOMContentLoaded', function () {
   });
 
   /* Auto-refresh: fetch the page and swap dynamic content without a full reload.
-       Uses setTimeout chaining (not setInterval) so slow responses don't overlap. */
-  function scheduleRefresh() {
-    setTimeout(function () {
-      fetch(window.location.href)
-        .then(function (r) {
-          return r.text();
-        })
-        .then(function (html) {
-          var parser = new DOMParser();
-          var doc = parser.parseFromString(html, 'text/html');
-          var newMain = doc.querySelector('main');
-          var oldMain = document.querySelector('main');
-          if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
-          /* Update header elements (outside <main>) */
-          var newUp = doc.querySelector('.uptime');
-          var oldUp = document.querySelector('.uptime');
-          if (newUp && oldUp) oldUp.textContent = newUp.textContent;
-          var newBadge = doc.querySelector('#version-badge');
-          var oldBadge = document.getElementById('version-badge');
-          if (newBadge && oldBadge) {
-            oldBadge.textContent = newBadge.textContent;
-            var nv = newBadge.getAttribute('data-version');
-            if (nv) oldBadge.setAttribute('data-version', nv);
-          }
-          var newIcon = doc.querySelector('link[rel="icon"]');
-          var oldIcon = document.querySelector('link[rel="icon"]');
-          if (newIcon && oldIcon)
-            oldIcon.setAttribute('href', newIcon.getAttribute('href'));
-          /* Restore tab selection and table sort after content swap */
-          restoreTab();
-          restoreSort();
-          /* Re-check the live runtime version so the stale-assets banner
-                   appears (or clears) if the serving process changes while the
-                   page stays open. The banner's data-asset-version stays anchored
-                   to the originally-loaded page, which is the version we're
-                   comparing against. */
-          checkVersionMismatch();
-        })
-        .catch(function (e) {
-          console.warn('Dashboard refresh failed:', e);
-        })
-        .finally(scheduleRefresh);
-    }, 5000);
+       Uses setTimeout chaining (not setInterval) so slow responses don't overlap.
+
+       Refresh cadence follows tab visibility (#3353): a hidden/backgrounded tab
+       backs off to a much longer interval since nobody is watching, and polling
+       every 5s while backgrounded only burns CPU/battery and spams the local
+       node with requests nobody reads. The moment the tab becomes visible again
+       we refresh immediately (rather than waiting out the stale timer) so the
+       user sees current data right away, then resume the fast cadence.
+
+       Scheduling policy (intervals, in-flight dedup, timer bookkeeping) lives
+       in createRefreshScheduler above; this block supplies the browser-real
+       dependencies: the fetch + DOM-swap refresh, real timers, and
+       document.hidden. */
+  function fetchAndSwapDashboard() {
+    return fetch(window.location.href)
+      .then(function (r) {
+        return r.text();
+      })
+      .then(function (html) {
+        var parser = new DOMParser();
+        var doc = parser.parseFromString(html, 'text/html');
+        var newMain = doc.querySelector('main');
+        var oldMain = document.querySelector('main');
+        if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
+        /* Update header elements (outside <main>) */
+        var newUp = doc.querySelector('.uptime');
+        var oldUp = document.querySelector('.uptime');
+        if (newUp && oldUp) oldUp.textContent = newUp.textContent;
+        var newBadge = doc.querySelector('#version-badge');
+        var oldBadge = document.getElementById('version-badge');
+        if (newBadge && oldBadge) {
+          oldBadge.textContent = newBadge.textContent;
+          var nv = newBadge.getAttribute('data-version');
+          if (nv) oldBadge.setAttribute('data-version', nv);
+        }
+        var newIcon = doc.querySelector('link[rel="icon"]');
+        var oldIcon = document.querySelector('link[rel="icon"]');
+        if (newIcon && oldIcon)
+          oldIcon.setAttribute('href', newIcon.getAttribute('href'));
+        /* Restore tab selection and table sort after content swap */
+        restoreTab();
+        restoreSort();
+        /* Re-check the live runtime version so the stale-assets banner
+                 appears (or clears) if the serving process changes while the
+                 page stays open. The banner's data-asset-version stays anchored
+                 to the originally-loaded page, which is the version we're
+                 comparing against. */
+        checkVersionMismatch();
+      })
+      .catch(function (e) {
+        console.warn('Dashboard refresh failed:', e);
+      });
   }
-  scheduleRefresh();
+
+  var refreshScheduler = createRefreshScheduler({
+    setTimeout: function (fn, ms) {
+      return setTimeout(fn, ms);
+    },
+    clearTimeout: function (id) {
+      clearTimeout(id);
+    },
+    refresh: fetchAndSwapDashboard,
+    isHidden: function () {
+      return document.hidden;
+    },
+  });
+
+  document.addEventListener(
+    'visibilitychange',
+    refreshScheduler.onVisibilityChange,
+  );
+
+  refreshScheduler.scheduleRefresh();
 });
