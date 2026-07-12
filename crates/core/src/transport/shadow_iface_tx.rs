@@ -78,18 +78,33 @@ pub(crate) fn spawn_iface_tx_monitor(local_peer_id: String, monitor: &Background
         ticker.tick().await;
         let mut prev_total = read_total_tx_bytes().await;
         let mut prev_own = TRANSPORT_METRICS.cumulative_bytes_sent();
+        // Seconds elapsed since the baseline (`prev_*`) was last taken. Ticks
+        // whose `/proc/net/dev` read fails do NOT advance the baseline, so a
+        // gap of failed reads makes the next successful interval span several
+        // seconds. Dividing the delta by this interval normalizes it back to a
+        // per-second rate, so a bridged gap is not misreported as a single
+        // one-second burst.
+        let mut secs_since_baseline: u64 = 0;
         let mut window = IfaceWindow::default();
 
         loop {
             ticker.tick().await;
+            secs_since_baseline += 1;
             let now_total = read_total_tx_bytes().await;
             let now_own = TRANSPORT_METRICS.cumulative_bytes_sent();
 
             if let (Some(prev), Some(now)) = (prev_total, now_total) {
+                // Bytes over the (possibly multi-second) interval, divided down
+                // to a per-second rate. Both counters share the same interval,
+                // so `op` stays consistent.
                 let total_delta = now.saturating_sub(prev);
                 let own_delta = now_own.saturating_sub(prev_own);
                 let op_delta = iface_op(total_delta, own_delta);
-                window.record(total_delta, own_delta, op_delta);
+                window.record(
+                    per_sec(total_delta, secs_since_baseline),
+                    per_sec(own_delta, secs_since_baseline),
+                    per_sec(op_delta, secs_since_baseline),
+                );
             }
             window.ticks += 1;
             if window.ticks >= SHADOW_ROLLUP_WINDOW_SECS {
@@ -103,6 +118,7 @@ pub(crate) fn spawn_iface_tx_monitor(local_peer_id: String, monitor: &Background
             if now_total.is_some() {
                 prev_total = now_total;
                 prev_own = now_own;
+                secs_since_baseline = 0;
             }
         }
     });
@@ -188,42 +204,66 @@ fn iface_op(total_delta: u64, own_delta: u64) -> u64 {
     total_delta.saturating_sub(own_delta)
 }
 
+/// Normalize an interval byte delta to a per-second rate.
+///
+/// A failed `/proc/net/dev` read does not advance the baseline, so after a gap
+/// of `k` consecutive failed reads the next successful interval spans `k + 1`
+/// seconds. Dividing the delta by that elapsed interval keeps the recorded
+/// value a true per-second rate: without it, a whole multi-second byte count
+/// would be folded into a single one-second sample and reported as a fake burst
+/// (inflating both the window mean and its `max`). `interval_secs` is clamped
+/// to at least 1 to avoid a divide-by-zero on the normal every-second path.
+fn per_sec(delta: u64, interval_secs: u64) -> u64 {
+    delta / interval_secs.max(1)
+}
+
 /// Emit one `shadow_iface_tx` rollup covering the closed window. Skips
 /// emission when no `/proc/net/dev` read succeeded in the whole window
 /// (mirroring the original per-tick "omit on failed read"). Each field keeps
-/// the window mean per-second rate under its original name; `*_max` (the
-/// busiest second's transmit / competing-traffic peak) is the additive
-/// distribution field the #4074 saturation-attribution analysis consumes.
+/// the window mean per-second rate under its original name; `*_p50` (robust
+/// central tendency for a bursty rate) and `*_max` (the busiest second's
+/// transmit / competing-traffic peak) are the additive distribution fields the
+/// #4074 saturation-attribution analysis consumes.
 fn emit_iface_rollup(local_peer_id: &str, window: &IfaceWindow) {
     if window.samples == 0 {
         return;
     }
-    let total_tx_bytes = window.total_tx_bytes.mean();
-    let own_tx_bytes = window.own_tx_bytes.mean();
-    let op_tx_bytes = window.op_tx_bytes.mean();
-
+    // Record the Option<u64> means directly (NOT via `?`): tracing renders a
+    // `Some(n)` as the bare number and omits the field for `None`, matching the
+    // OTLP number-or-null. `?` would emit the literal `Some(n)` and break
+    // structured local-log parsers.
     tracing::debug!(
         target: "freenet::transport::shadow_iface_tx",
-        ?total_tx_bytes,
-        ?own_tx_bytes,
-        ?op_tx_bytes,
+        total_tx_bytes = window.total_tx_bytes.mean(),
+        own_tx_bytes = window.own_tx_bytes.mean(),
+        op_tx_bytes = window.op_tx_bytes.mean(),
         window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_iface_tx"
     );
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_iface_tx",
         local_peer_id,
-        serde_json::json!({
-            "total_tx_bytes_per_sec": total_tx_bytes,
-            "total_tx_bytes_per_sec_max": window.total_tx_bytes.max(),
-            "freenet_own_tx_bytes_per_sec": own_tx_bytes,
-            "freenet_own_tx_bytes_per_sec_max": window.own_tx_bytes.max(),
-            "op_tx_bytes_per_sec": op_tx_bytes,
-            "op_tx_bytes_per_sec_max": window.op_tx_bytes.max(),
-            "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
-            "samples": window.samples,
-        }),
+        iface_rollup_json(window),
     );
+}
+
+/// Build the `shadow_iface_tx` rollup JSON. Pure so the schema (compat field =
+/// window mean per-second rate, additive `*_p50` / `*_max` distribution fields)
+/// is unit-testable without the telemetry sender.
+fn iface_rollup_json(window: &IfaceWindow) -> serde_json::Value {
+    serde_json::json!({
+        "total_tx_bytes_per_sec": window.total_tx_bytes.mean(),
+        "total_tx_bytes_per_sec_p50": window.total_tx_bytes.p50(),
+        "total_tx_bytes_per_sec_max": window.total_tx_bytes.max(),
+        "freenet_own_tx_bytes_per_sec": window.own_tx_bytes.mean(),
+        "freenet_own_tx_bytes_per_sec_p50": window.own_tx_bytes.p50(),
+        "freenet_own_tx_bytes_per_sec_max": window.own_tx_bytes.max(),
+        "op_tx_bytes_per_sec": window.op_tx_bytes.mean(),
+        "op_tx_bytes_per_sec_p50": window.op_tx_bytes.p50(),
+        "op_tx_bytes_per_sec_max": window.op_tx_bytes.max(),
+        "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
+        "samples": window.samples,
+    })
 }
 
 #[cfg(test)]
@@ -298,6 +338,60 @@ mod tests {
         // The skewed-window case the module rustdoc promises to handle:
         // own > total must clamp op to 0, never wrap.
         assert_eq!(iface_op(1_000, 4_000), 0);
+    }
+
+    #[test]
+    fn per_sec_normalizes_bridged_gap_to_a_rate() {
+        // Normal every-second path: delta is already a per-second rate.
+        assert_eq!(per_sec(9_000, 1), 9_000);
+        // A gap: 29 failed reads then one success bridges a 30 s interval, so
+        // the 30 s byte count must be divided back to a per-second rate rather
+        // than recorded as a single one-second burst.
+        assert_eq!(per_sec(300_000, 30), 10_000);
+        // Divide-by-zero guard (interval clamped to >= 1).
+        assert_eq!(per_sec(500, 0), 500);
+    }
+
+    #[test]
+    fn bridged_gap_does_not_fake_a_burst_in_the_rollup() {
+        // Regression: before the per-second normalization, a window with 29
+        // failed reads and one success recorded the whole ~30 s byte count as a
+        // single 1 s sample, so mean == max == the full multi-second burst.
+        // With normalization the single bridged sample is a true per-second
+        // rate, so no fake burst appears.
+        let mut window = IfaceWindow::default();
+        // 29 failed reads contribute no sample but count as elapsed ticks.
+        for _ in 0..29 {
+            window.ticks += 1;
+        }
+        // One success bridging a 30 s interval carrying 300_000 total bytes.
+        let interval = 30u64;
+        window.record(per_sec(300_000, interval), per_sec(60_000, interval), 0);
+        window.ticks += 1;
+
+        let json = iface_rollup_json(&window);
+        // 300_000 / 30 = 10_000 bytes/sec, NOT the raw 300_000 burst.
+        assert_eq!(json["total_tx_bytes_per_sec"], 10_000);
+        assert_eq!(json["total_tx_bytes_per_sec_max"], 10_000);
+        assert_eq!(json["freenet_own_tx_bytes_per_sec"], 2_000);
+        // Only the one successful read counts as a sample; the 29 gaps do not.
+        assert_eq!(json["samples"], 1);
+        assert_eq!(json["window_secs"], SHADOW_ROLLUP_WINDOW_SECS);
+    }
+
+    #[test]
+    fn iface_rollup_json_includes_p50_for_byte_rates() {
+        let mut window = IfaceWindow::default();
+        window.record(10_000, 4_000, 6_000);
+        window.record(30_000, 4_000, 26_000);
+        window.ticks += 2;
+        let json = iface_rollup_json(&window);
+        assert_eq!(json["total_tx_bytes_per_sec"], 20_000); // mean
+        // Upper-middle median of [10_000, 30_000] = sorted[1] = 30_000.
+        assert_eq!(json["total_tx_bytes_per_sec_p50"], 30_000);
+        assert_eq!(json["total_tx_bytes_per_sec_max"], 30_000);
+        assert_eq!(json["op_tx_bytes_per_sec_p50"], 26_000);
+        assert_eq!(json["samples"], 2);
     }
 
     /// `spawn_iface_tx_monitor` must keep its task alive across ticks even

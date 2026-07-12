@@ -377,15 +377,20 @@ pub(crate) fn spawn_demand_aggregator(local_peer_id: String, monitor: &Backgroun
 /// Each original field name carries the window **mean** in its original unit
 /// (a per-second rate stays a per-second rate — the mean of the one-second
 /// deltas is the average bytes/sec over the window), so existing consumers of
-/// the flat field keep working. `*_max` (the busiest second's demand /
-/// deepest backlog) and `window_secs` / `samples` are additive.
+/// the flat field keep working. `*_min` / `*_p50` / `*_max` (the byte-rate
+/// distribution — `p50` is a more robust central-tendency signal than `mean`
+/// for a bursty rate) and `window_secs` / `samples` are additive.
 fn emit_demand_rollup(local_peer_id: &str, window: &DemandWindow) {
     let payload = demand_rollup_json(window);
+    // Record the Option<u64> means directly (NOT via `?`): tracing renders a
+    // `Some(n)` as the bare number and omits the field for `None`, matching the
+    // OTLP number-or-null. `?` would emit the literal `Some(n)` and break
+    // structured local-log parsers.
     tracing::debug!(
         target: "freenet::transport::shadow_demand",
-        sent_bytes_per_sec = ?window.sent_bytes.mean(),
-        active_connections = ?window.active_connections.mean(),
-        broadcast_queue_depth = ?window.broadcast_queue_depth.mean(),
+        sent_bytes_per_sec = window.sent_bytes.mean(),
+        active_connections = window.active_connections.mean(),
+        broadcast_queue_depth = window.broadcast_queue_depth.mean(),
         window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_rate_demand"
     );
@@ -406,6 +411,7 @@ fn demand_rollup_json(window: &DemandWindow) -> serde_json::Value {
         // up as broadcast_queue_depth and (Phase 2) token-bucket debt.
         "sent_bytes_per_sec": window.sent_bytes.mean(),
         "sent_bytes_per_sec_min": window.sent_bytes.min(),
+        "sent_bytes_per_sec_p50": window.sent_bytes.p50(),
         "sent_bytes_per_sec_max": window.sent_bytes.max(),
         "active_connections": window.active_connections.mean(),
         "broadcast_queue_depth": window.broadcast_queue_depth.mean(),
@@ -479,15 +485,19 @@ pub(crate) fn spawn_outbound_class_aggregator(
 
 /// Emit one `shadow_outbound_class` rollup. Each original field carries the
 /// window mean per-second rate; `*_min` (the must-flow floor, i.e. the least
-/// the class ever pushed in a second) and `*_max` (the burst peak) are the
-/// additive distribution fields the #4074 floor bounds consume directly.
+/// the class ever pushed in a second), `*_p50` (robust central tendency for a
+/// bursty rate) and `*_max` (the burst peak) are the additive distribution
+/// fields the #4074 floor bounds consume directly.
 fn emit_class_rollup(local_peer_id: &str, window: &ClassWindow) {
     let payload = class_rollup_json(window);
+    // Record the Option<u64> means directly (NOT via `?`): see the
+    // `emit_demand_rollup` note — bare Option renders as the number-or-null
+    // form the OTLP path uses; `?` would emit `Some(n)` and break parsers.
     tracing::debug!(
         target: "freenet::transport::shadow_demand",
-        must_flow_bytes = ?window.must_flow_bytes.mean(),
-        short_bytes = ?window.short_bytes.mean(),
-        bulk_bytes = ?window.bulk_bytes.mean(),
+        must_flow_bytes = window.must_flow_bytes.mean(),
+        short_bytes = window.short_bytes.mean(),
+        bulk_bytes = window.bulk_bytes.mean(),
         window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_outbound_class"
     );
@@ -504,12 +514,15 @@ fn class_rollup_json(window: &ClassWindow) -> serde_json::Value {
     serde_json::json!({
         "must_flow_bytes_per_sec": window.must_flow_bytes.mean(),
         "must_flow_bytes_per_sec_min": window.must_flow_bytes.min(),
+        "must_flow_bytes_per_sec_p50": window.must_flow_bytes.p50(),
         "must_flow_bytes_per_sec_max": window.must_flow_bytes.max(),
         "short_message_bytes_per_sec": window.short_bytes.mean(),
         "short_message_bytes_per_sec_min": window.short_bytes.min(),
+        "short_message_bytes_per_sec_p50": window.short_bytes.p50(),
         "short_message_bytes_per_sec_max": window.short_bytes.max(),
         "bulk_bytes_per_sec": window.bulk_bytes.mean(),
         "bulk_bytes_per_sec_min": window.bulk_bytes.min(),
+        "bulk_bytes_per_sec_p50": window.bulk_bytes.p50(),
         "bulk_bytes_per_sec_max": window.bulk_bytes.max(),
         "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
         "samples": window.samples,
@@ -655,6 +668,8 @@ mod tests {
         assert_eq!(json["sent_bytes_per_sec"], 200);
         // Additive distribution fields.
         assert_eq!(json["sent_bytes_per_sec_min"], 100);
+        // Upper-middle median of [100,300] = sorted[len/2] = sorted[1] = 300.
+        assert_eq!(json["sent_bytes_per_sec_p50"], 300);
         assert_eq!(json["sent_bytes_per_sec_max"], 300);
         assert_eq!(json["active_connections"], 5);
         assert_eq!(json["broadcast_queue_depth"], 5);
@@ -674,10 +689,16 @@ mod tests {
         let json = class_rollup_json(&window);
         assert_eq!(json["must_flow_bytes_per_sec"], 20);
         assert_eq!(json["must_flow_bytes_per_sec_min"], 10);
+        // Upper-middle median of [10,30] = sorted[1] = 30.
+        assert_eq!(json["must_flow_bytes_per_sec_p50"], 30);
         assert_eq!(json["must_flow_bytes_per_sec_max"], 30);
         assert_eq!(json["short_message_bytes_per_sec"], 20);
+        // Both samples are 20, so every summary stat is 20.
+        assert_eq!(json["short_message_bytes_per_sec_p50"], 20);
         assert_eq!(json["bulk_bytes_per_sec"], 2000);
         assert_eq!(json["bulk_bytes_per_sec_min"], 1000);
+        // Upper-middle median of [1000,3000] = sorted[1] = 3000.
+        assert_eq!(json["bulk_bytes_per_sec_p50"], 3000);
         assert_eq!(json["bulk_bytes_per_sec_max"], 3000);
         assert_eq!(json["window_secs"], SHADOW_ROLLUP_WINDOW_SECS);
         assert_eq!(json["samples"], 2);

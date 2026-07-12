@@ -209,7 +209,14 @@ struct RefPingSample {
 /// Windowed rollup accumulator for the `shadow_reference_ping` stream.
 #[derive(Default)]
 struct RefPingWindow {
+    /// Total 1 Hz ticks elapsed (including warmup/failed-probe ticks that had
+    /// no usable snapshot), used only to decide when the window closes.
     ticks: u32,
+    /// Ticks that contributed a real measurement (the rolling snapshot had
+    /// data). This is the honest denominator for the summary stats and the
+    /// value reported as `samples`; a window of pure warmup/failed probes has
+    /// `samples == 0` and is not emitted.
+    samples: u32,
     baseline_min_us: WindowedStat,
     recent_median_us: WindowedStat,
     inflation_us: WindowedStat,
@@ -218,13 +225,20 @@ struct RefPingWindow {
 }
 
 impl RefPingWindow {
-    fn record(&mut self, sample: RefPingSample) {
+    /// Count the tick toward window closing; fold a measurement only when the
+    /// tick actually produced a snapshot (`Some`). Warmup and all-failed ticks
+    /// (`None`) advance `ticks` but not `samples`, so they never dilute the
+    /// summary stats or inflate the reported `samples` count.
+    fn record(&mut self, sample: Option<RefPingSample>) {
         self.ticks += 1;
-        self.baseline_min_us.record_opt(sample.baseline_min_us);
-        self.recent_median_us.record_opt(sample.recent_median_us);
-        self.inflation_us.record_opt(sample.inflation_us);
-        self.baseline_samples.record(sample.baseline_samples);
-        self.recent_samples.record(sample.recent_samples);
+        if let Some(sample) = sample {
+            self.samples += 1;
+            self.baseline_min_us.record_opt(sample.baseline_min_us);
+            self.recent_median_us.record_opt(sample.recent_median_us);
+            self.inflation_us.record_opt(sample.inflation_us);
+            self.baseline_samples.record(sample.baseline_samples);
+            self.recent_samples.record(sample.recent_samples);
+        }
     }
 
     fn is_full(&self) -> bool {
@@ -232,62 +246,70 @@ impl RefPingWindow {
     }
 }
 
-/// Read one rolling snapshot of the reference-path RTT stats.
-fn sample_reference_ping(stats: &RollingRttStats<RealTime>) -> RefPingSample {
-    match stats.snapshot() {
-        Some(s) => RefPingSample {
-            baseline_min_us: s.baseline_min.map(|d| d.as_micros() as u64),
-            recent_median_us: s.recent_median.map(|d| d.as_micros() as u64),
-            inflation_us: s.inflation.map(|d| d.as_micros() as u64),
-            baseline_samples: s.baseline_samples as u64,
-            recent_samples: s.recent_samples as u64,
-        },
-        None => RefPingSample {
-            baseline_min_us: None,
-            recent_median_us: None,
-            inflation_us: None,
-            baseline_samples: 0,
-            recent_samples: 0,
-        },
-    }
+/// Read one rolling snapshot of the reference-path RTT stats. Returns `None`
+/// when the snapshot has no data (warmup before the first successful probe, or
+/// every retained sample decayed past the baseline window) — that tick is not
+/// a valid measurement and must not be counted in the rollup's `samples`.
+fn sample_reference_ping(stats: &RollingRttStats<RealTime>) -> Option<RefPingSample> {
+    let s = stats.snapshot()?;
+    Some(RefPingSample {
+        baseline_min_us: s.baseline_min.map(|d| d.as_micros() as u64),
+        recent_median_us: s.recent_median.map(|d| d.as_micros() as u64),
+        inflation_us: s.inflation.map(|d| d.as_micros() as u64),
+        baseline_samples: s.baseline_samples as u64,
+        recent_samples: s.recent_samples as u64,
+    })
 }
 
-/// Emit one `shadow_reference_ping` rollup. Each latency field keeps the
-/// window mean under its original name; `inflation_us_p50` / `inflation_us_max`
-/// (and `recent_median_us_max`) are the additive distribution fields the #4074
-/// reference-path analysis consumes to separate local-uplink contention from
-/// overlay queueing.
+/// Emit one `shadow_reference_ping` rollup. Skips emission entirely when the
+/// window had zero valid measurements (all ticks were warmup/failed probes), so
+/// the collector never sees null stats dressed up with a nonzero `samples`.
+/// Each latency field keeps the window mean under its original name;
+/// `inflation_us_p50` / `inflation_us_max` (and `recent_median_us_max`) are the
+/// additive distribution fields the #4074 reference-path analysis consumes to
+/// separate local-uplink contention from overlay queueing.
 fn emit_reference_ping_rollup(local_peer_id: &str, target: SocketAddr, window: &RefPingWindow) {
-    let baseline_min_us = window.baseline_min_us.mean();
-    let recent_median_us = window.recent_median_us.mean();
-    let inflation_us = window.inflation_us.mean();
-
+    if window.samples == 0 {
+        return;
+    }
+    // Record the Option<u64> means directly (NOT via `?`): tracing renders a
+    // `Some(n)` as the bare number and omits the field for `None`, matching the
+    // OTLP number-or-null. `?` would emit the literal `Some(n)` and break
+    // structured local-log parsers.
     tracing::debug!(
         target: "freenet::transport::reference_ping",
         %target,
-        ?baseline_min_us,
-        ?recent_median_us,
-        ?inflation_us,
+        baseline_min_us = window.baseline_min_us.mean(),
+        recent_median_us = window.recent_median_us.mean(),
+        inflation_us = window.inflation_us.mean(),
         window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_reference_ping"
     );
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_reference_ping",
         local_peer_id,
-        serde_json::json!({
-            "target": target.to_string(),
-            "baseline_min_us": baseline_min_us,
-            "recent_median_us": recent_median_us,
-            "recent_median_us_max": window.recent_median_us.max(),
-            "inflation_us": inflation_us,
-            "inflation_us_p50": window.inflation_us.p50(),
-            "inflation_us_max": window.inflation_us.max(),
-            "baseline_samples": window.baseline_samples.mean(),
-            "recent_samples": window.recent_samples.mean(),
-            "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
-            "samples": window.ticks,
-        }),
+        reference_ping_rollup_json(target, window),
     );
+}
+
+/// Build the `shadow_reference_ping` rollup JSON. Pure so the schema (compat
+/// field = window mean, additive distribution fields, and `samples` = count of
+/// VALID measurements, not elapsed ticks) is unit-testable without the
+/// telemetry sender.
+fn reference_ping_rollup_json(target: SocketAddr, window: &RefPingWindow) -> serde_json::Value {
+    serde_json::json!({
+        "target": target.to_string(),
+        "baseline_min_us": window.baseline_min_us.mean(),
+        "recent_median_us": window.recent_median_us.mean(),
+        "recent_median_us_max": window.recent_median_us.max(),
+        "inflation_us": window.inflation_us.mean(),
+        "inflation_us_p50": window.inflation_us.p50(),
+        "inflation_us_max": window.inflation_us.max(),
+        "baseline_samples": window.baseline_samples.mean(),
+        "recent_samples": window.recent_samples.mean(),
+        "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
+        "samples": window.samples,
+    })
 }
 
 /// Build a minimal DNS query packet for `name` of type A, class IN.
@@ -343,6 +365,66 @@ fn is_matching_dns_response(buf: &[u8], expected_id: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_target() -> SocketAddr {
+        "1.1.1.1:53".parse().unwrap()
+    }
+
+    fn measured_sample(inflation_us: Option<u64>) -> RefPingSample {
+        RefPingSample {
+            baseline_min_us: Some(1_000),
+            recent_median_us: inflation_us.map(|i| 1_000 + i),
+            inflation_us,
+            baseline_samples: 5,
+            recent_samples: 3,
+        }
+    }
+
+    #[test]
+    fn rollup_samples_count_valid_measurements_not_ticks() {
+        // Regression: `samples` used to report the raw tick count, so a window
+        // of warmup/failed probes (no usable snapshot) emitted null stats with
+        // samples == 30. `samples` must instead count only ticks that produced
+        // a real measurement.
+        let mut window = RefPingWindow::default();
+        // Two warmup ticks: snapshot was None, no measurement.
+        window.record(None);
+        window.record(None);
+        // One tick where inflation had not converged yet (Some sample, but the
+        // inflation field is None) — still a valid measurement.
+        window.record(Some(measured_sample(None)));
+        // One fully-measured tick.
+        window.record(Some(measured_sample(Some(200))));
+
+        assert_eq!(window.ticks, 4, "all ticks advance the window clock");
+        assert_eq!(window.samples, 2, "only measured ticks count as samples");
+
+        let json = reference_ping_rollup_json(test_target(), &window);
+        // `samples` reflects valid measurements, not the 4 elapsed ticks.
+        assert_eq!(json["samples"], 2);
+        // baseline_min was present on both measured ticks → mean over 2 samples.
+        assert_eq!(json["baseline_min_us"], 1_000);
+        // inflation was present on exactly one measured tick → stats over that
+        // one valid value only, never diluted by the None ticks.
+        assert_eq!(json["inflation_us"], 200);
+        assert_eq!(json["inflation_us_p50"], 200);
+        assert_eq!(json["inflation_us_max"], 200);
+    }
+
+    #[test]
+    fn rollup_is_skipped_when_no_valid_measurements() {
+        // A whole window of warmup/failed probes must not be emitted at all:
+        // `samples == 0` is the emit guard in `emit_reference_ping_rollup`.
+        let mut window = RefPingWindow::default();
+        for _ in 0..SHADOW_ROLLUP_WINDOW_SECS {
+            window.record(None);
+        }
+        assert_eq!(window.ticks, SHADOW_ROLLUP_WINDOW_SECS);
+        assert_eq!(
+            window.samples, 0,
+            "no measured tick means the rollup is skipped (samples == 0)"
+        );
+    }
 
     #[test]
     fn dns_query_header_is_well_formed() {

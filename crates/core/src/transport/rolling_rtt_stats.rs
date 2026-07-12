@@ -424,11 +424,16 @@ fn emit_aggregate_rollup(local_peer_id: &str, window: &RttWindow) {
         return;
     }
     let payload = aggregate_rollup_json(window);
+    // Record the Option<u64> means directly (NOT via `?`): tracing's
+    // `Value for Option<T>` renders `Some(6)` as the bare number `6` and omits
+    // the field for `None`, matching the OTLP path's number-or-null. The `?`
+    // Debug sigil would instead emit the literal `Some(6)`, which breaks
+    // structured local-log parsers.
     tracing::debug!(
         target: "freenet::transport::shadow_rtt",
-        active_peers = ?window.active_peers.mean(),
-        peers_with_recent = ?window.peers_with_recent.mean(),
-        median_inflation_us = ?window.median_inflation_us.mean(),
+        active_peers = window.active_peers.mean(),
+        peers_with_recent = window.peers_with_recent.mean(),
+        median_inflation_us = window.median_inflation_us.mean(),
         window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_rtt_aggregate"
     );
@@ -448,6 +453,14 @@ fn emit_aggregate_rollup(local_peer_id: &str, window: &RttWindow) {
 /// Build the `shadow_rtt_aggregate` rollup JSON. Pure so the schema (compat
 /// field = window mean, additive `*_p50` / `*_max` distribution fields) is
 /// unit-testable without the telemetry sender.
+///
+/// Design note (#4314): the per-tick `median_inflation_us` samples are
+/// intentionally rolled up here into the window mean / p50 / max — the central
+/// collector receives one summary per window, not the raw 1 Hz series. The
+/// stubbed #4314 controller-replay would want the per-tick RTT series, but it
+/// is deferred, and when it lands it will use its own dedicated opt-in per-tick
+/// capture path rather than reviving the raw stream through this central
+/// rollup. Do NOT re-expand this into a per-tick emitter to serve #4314.
 fn aggregate_rollup_json(window: &RttWindow) -> serde_json::Value {
     serde_json::json!({
         "active_peers": window.active_peers.mean(),
@@ -822,7 +835,8 @@ mod tests {
         assert_eq!(json["active_peers"], 6);
         assert_eq!(json["peers_with_recent"], 4);
         assert_eq!(json["median_inflation_us"], 200);
-        // Additive distribution fields (lower-median of [100,300] = 300).
+        // Additive distribution fields (upper-middle median of [100,300] =
+        // sorted[len/2] = sorted[1] = 300).
         assert_eq!(json["median_inflation_us_p50"], 300);
         assert_eq!(json["median_inflation_us_max"], 300);
         assert_eq!(json["window_secs"], SHADOW_ROLLUP_WINDOW_SECS);
