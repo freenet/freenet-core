@@ -64,6 +64,12 @@ pub(crate) async fn start_client_put(
     htl: usize,
     subscribe: bool,
     blocking_subscribe: bool,
+    // `Some(client_id)` when the caller registered a client subscription up-front
+    // (subscribe=true with a listener). The driver removes it on a terminal that
+    // committed no state (so a phantom client subscription does not linger until
+    // disconnect — step 10 §1e). `None` when no client subscription was
+    // registered.
+    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> Result<Transaction, OpError> {
     // Phase 7 egress self-block (#4300): refuse to originate a PUT for
     // a contract this node has banned, BEFORE spawning the driver. The
@@ -116,6 +122,7 @@ pub(crate) async fn start_client_put(
             htl,
             subscribe,
             blocking_subscribe,
+            client_sub_cleanup,
         )
         .await;
     });
@@ -133,6 +140,7 @@ async fn run_client_put(
     htl: usize,
     subscribe: bool,
     blocking_subscribe: bool,
+    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) {
     let outcome = drive_client_put(
         op_manager.clone(),
@@ -143,6 +151,7 @@ async fn run_client_put(
         htl,
         subscribe,
         blocking_subscribe,
+        client_sub_cleanup,
     )
     .await;
     deliver_outcome(&op_manager, client_tx, outcome);
@@ -170,7 +179,11 @@ async fn drive_client_put(
     htl: usize,
     subscribe: bool,
     blocking_subscribe: bool,
+    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> DriverOutcome {
+    // Capture the key before `contract` is moved into the inner driver so the
+    // infra-error cleanup below can gate on state-presence.
+    let key = contract.key();
     match drive_client_put_inner(
         &op_manager,
         client_tx,
@@ -180,11 +193,39 @@ async fn drive_client_put(
         htl,
         subscribe,
         blocking_subscribe,
+        client_sub_cleanup,
     )
     .await
     {
         Ok(outcome) => outcome,
-        Err(err) => DriverOutcome::InfrastructureError(err),
+        Err(err) => {
+            // Infra error: no state committed here, so tear down any client
+            // subscription registered up-front IF we do not hold the state
+            // (step 10 §1e) — gated so a locally-committed PUT whose network
+            // propagation errored keeps its legitimate subscription.
+            maybe_remove_phantom_client_subscription(&op_manager, &key, client_sub_cleanup);
+            DriverOutcome::InfrastructureError(err)
+        }
+    }
+}
+
+/// Remove a client subscription that would otherwise linger as a phantom
+/// (`contract_in_use && !contract_state_present`) after a PUT terminal that did
+/// NOT commit state locally (step 10 §1e). Gated on `!contract_state_present` so
+/// a PUT that DID commit locally (e.g. network propagation exhausted but the
+/// local store succeeded) keeps its legitimate client subscription. No-op when
+/// no client subscription was registered.
+fn maybe_remove_phantom_client_subscription(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    client_sub_cleanup: Option<crate::client_events::ClientId>,
+) {
+    if let Some(client_id) = client_sub_cleanup {
+        if !op_manager.ring.contract_state_present(key) {
+            op_manager
+                .ring
+                .remove_client_subscription(key.id(), client_id);
+        }
     }
 }
 
@@ -198,6 +239,7 @@ async fn drive_client_put_inner(
     htl: usize,
     subscribe: bool,
     blocking_subscribe: bool,
+    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> Result<DriverOutcome, OpError> {
     let key = contract.key();
 
@@ -557,12 +599,21 @@ async fn drive_client_put_inner(
         // real cause once, mark the tx completed.
         RetryLoopOutcome::Done((Err(cause), _hop_count)) => {
             op_manager.completed(client_tx);
+            // Local-commit failure (PutMsg::Error): no state stored, so tear down
+            // any up-front client subscription so it does not linger as a phantom
+            // (step 10 §1e). Gated on !state-present inside the helper.
+            maybe_remove_phantom_client_subscription(op_manager, &key, client_sub_cleanup);
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into_string().into(),
             }
             .into())))
         }
         RetryLoopOutcome::Exhausted(cause) => {
+            // No remote holder took the PUT. If the local store ALSO did not
+            // commit (no state present), tear down any up-front client
+            // subscription (step 10 §1e); if the PUT committed locally the helper
+            // keeps the legitimate subscription.
+            maybe_remove_phantom_client_subscription(op_manager, &key, client_sub_cleanup);
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into(),
             }
@@ -4673,6 +4724,48 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Pin (step 10 §1e): the client-PUT driver MUST tear down an up-front client
+    /// subscription when the PUT commits no state, so it does not linger as a
+    /// phantom (`contract_in_use && !contract_state_present`) until disconnect.
+    /// Both non-committing terminals (`Done((Err(...)))` and `Exhausted`) inside
+    /// `drive_client_put_inner`, and the infra-error path in `drive_client_put`,
+    /// must call `maybe_remove_phantom_client_subscription`; and the helper must
+    /// gate on `!contract_state_present` so a locally-committed PUT keeps its
+    /// legitimate subscription.
+    #[test]
+    fn client_put_driver_removes_phantom_client_subscription_on_failure() {
+        let src = include_str!("op_ctx_task.rs");
+        let inner = extract_fn_body(src, "async fn drive_client_put_inner(");
+        assert!(
+            inner.contains("client_sub_cleanup"),
+            "drive_client_put_inner must thread client_sub_cleanup (step 10 §1e)"
+        );
+        let helper_calls = inner
+            .matches("maybe_remove_phantom_client_subscription(")
+            .count();
+        assert!(
+            helper_calls >= 2,
+            "both non-committing PUT terminals (Done(Err) and Exhausted) must call \
+             maybe_remove_phantom_client_subscription (found {helper_calls}) — else a \
+             failed subscribe=true PUT leaves a phantom client subscription (step 10 §1e)"
+        );
+
+        let wrapper = extract_fn_body(src, "async fn drive_client_put(");
+        assert!(
+            wrapper.contains("maybe_remove_phantom_client_subscription("),
+            "drive_client_put must also clean up on the infra-error terminal (step 10 §1e)"
+        );
+
+        let helper = extract_fn_body(src, "fn maybe_remove_phantom_client_subscription(");
+        assert!(
+            helper.contains("contract_state_present")
+                && helper.contains("remove_client_subscription("),
+            "the cleanup must be gated on !contract_state_present so a locally-committed \
+             PUT (network propagation exhausted but stored locally) keeps its legitimate \
+             client subscription"
+        );
     }
 
     /// Source-grep pin (#4361 / #4365): both relay PUT drivers must

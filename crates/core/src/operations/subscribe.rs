@@ -695,6 +695,95 @@ pub(crate) async fn register_downstream_subscriber(
     }
 }
 
+/// Host-formation sequence for a peer that just handled a relayed SUBSCRIBE:
+/// fetch the contract body FIRST, and only if it lands do we register the
+/// requester as a downstream subscriber, install the local subscription lease,
+/// and announce hosting. This makes the phantom (`contract_in_use &&
+/// !contract_state_present`) unrepresentable — a peer registers demand only
+/// AFTER it holds state (D-ORDER, step 10 §1b; the register-after-state fix).
+///
+/// Steps, in order (the pin `finalize_host_subscribe_fetches_before_register`
+/// enforces fetch BEFORE register BEFORE announce, and NO `add_local_client`):
+/// 1. **Fetch the body if missing** (`fetch_contract_if_missing`). Greedy fetch
+///    toward the key — the downstream that answered `Subscribed` holds the body,
+///    so a route toward the key reaches it.
+/// 2. On fetch failure (timeout `Ok(None)` / infra `Err`) register NOTHING and
+///    return: the caller forwards / answers NotFound as before, and the chain
+///    hole heals on the requester's next lease renewal. This differs from the
+///    pre-step-10 relay behavior, which registered the downstream subscriber
+///    unconditionally and so left a stateless phantom (#4404/#4612).
+/// 3. On success: register the requester as our downstream subscriber, install
+///    the local subscription lease (`ring.subscribe`) so we become a real host
+///    kept fresh in the update mesh (piece D: chain hops are real hosts), clear
+///    the pending-subscribe backoff, and announce hosting (idempotent backstop).
+///
+/// Does NOT call `add_local_client` (D-NO-LOCAL-CLIENT): a relay has no local
+/// client, and `add_local_client` is non-idempotent — copying it here would
+/// inflate `local_client_count` and wrongly make the relay evicted-last.
+///
+/// The `requester_addr` / `source_addr` / `tx` / `warn_suffix` params are
+/// forwarded verbatim to [`register_downstream_subscriber`].
+pub(super) async fn finalize_host_subscribe(
+    op_manager: &OpManager,
+    key: ContractKey,
+    requester_addr: std::net::SocketAddr,
+    source_addr: Option<std::net::SocketAddr>,
+    tx: &Transaction,
+    warn_suffix: &str,
+) {
+    // Fetch BEFORE register (D-ORDER). `None` = ordinary greedy fetch toward the
+    // key.
+    let have_body = match fetch_contract_if_missing(op_manager, *key.id(), None).await {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            tracing::debug!(
+                contract = %key,
+                timeout_ms = CONTRACT_WAIT_TIMEOUT_MS,
+                "subscribe host-formation: body did not arrive within timeout; \
+                 registering nothing (no phantom) — chain hole heals on next renewal"
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!(
+                contract = %key,
+                error = %err,
+                "subscribe host-formation: fetch_contract_if_missing infra error; \
+                 registering nothing (no phantom) — operator should investigate \
+                 (contract handler / notification channel)"
+            );
+            false
+        }
+    };
+
+    if !have_body {
+        // Register-after-state: on fetch-fail we create NO downstream
+        // registration, so `contract_in_use` stays false and no phantom exists.
+        return;
+    }
+
+    // We hold the body — become a real subscribed host and register the
+    // requester as our downstream subscriber (register-AFTER-state).
+    register_downstream_subscriber(
+        op_manager,
+        &key,
+        requester_addr,
+        None,
+        source_addr,
+        tx,
+        warn_suffix,
+    )
+    .await;
+    op_manager.ring.subscribe(key);
+    op_manager.ring.complete_subscription_request(&key, true);
+    // Announce backstop, gated on have_body. `fetch_contract_if_missing`'s own
+    // cache path already announces on a first-time store; `announce_contract_hosted`
+    // is one-shot (dedup via `neighbor_hosting.rs`'s `my_contracts` DashSet), so a
+    // duplicate is a no-op — this just guarantees the advert fires even when the
+    // body was already present locally (nothing to trigger the cache-path announce).
+    super::announce_contract_hosted(op_manager, &key).await;
+}
+
 /// Handle a fresh inbound `SubscribeMsg::Unsubscribe` from a peer.
 ///
 /// Removes the sender's downstream subscriber tracking for the contract and

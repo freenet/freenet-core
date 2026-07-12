@@ -546,7 +546,13 @@ async fn process_open_request(
                             return Ok(None);
                         }
 
-                        if subscribe {
+                        // Register the client subscription up-front (for the #4524
+                        // don't-miss-updates ordering). `client_sub_cleanup` is
+                        // Some(client_id) iff we actually registered one, so the
+                        // driver can tear it down when the PUT commits no state
+                        // (step 10 §1e) rather than leaving a phantom until
+                        // disconnect.
+                        let client_sub_cleanup = if subscribe {
                             if let Some(sl) = subscription_listener {
                                 register_subscription_listener(
                                     &op_manager,
@@ -556,14 +562,18 @@ async fn process_open_request(
                                     "PUT",
                                 )
                                 .await?;
+                                Some(client_id)
                             } else {
                                 tracing::warn!(
                                     client_id = %client_id,
                                     contract = %contract_key,
                                     "PUT with subscribe=true but no subscription_listener"
                                 );
+                                None
                             }
-                        }
+                        } else {
+                            None
+                        };
 
                         if let Err(err) = put::op_ctx_task::start_client_put(
                             op_manager.clone(),
@@ -574,6 +584,7 @@ async fn process_open_request(
                             op_manager.ring.max_hops_to_live,
                             subscribe,
                             blocking_subscribe,
+                            client_sub_cleanup,
                         )
                         .await
                         {
@@ -1127,7 +1138,12 @@ async fn process_open_request(
                                 )
                             })?;
 
-                        if subscribe {
+                        // Register the client subscription up-front (for the #4524
+                        // don't-miss-updates ordering). `client_sub_cleanup` is
+                        // Some(client_id) iff we actually registered one, so the
+                        // driver can tear it down on a dead-end GET (step 10 §1e)
+                        // rather than leaving a phantom until disconnect.
+                        let client_sub_cleanup = if subscribe {
                             if let Some(sl) = subscription_listener {
                                 register_subscription_listener(
                                     &op_manager,
@@ -1137,14 +1153,18 @@ async fn process_open_request(
                                     "GET",
                                 )
                                 .await?;
+                                Some(client_id)
                             } else {
                                 tracing::warn!(
                                     client_id = %client_id,
                                     contract = %key,
                                     "GET with subscribe=true but no subscription_listener"
                                 );
+                                None
                             }
-                        }
+                        } else {
+                            None
+                        };
 
                         // `report_op_init_error` takes a &ContractKey, so we
                         // synthesize one from the instance_id for the error
@@ -1162,6 +1182,7 @@ async fn process_open_request(
                             return_contract_code,
                             subscribe,
                             blocking_subscribe,
+                            client_sub_cleanup,
                         )
                         .await
                         {

@@ -132,6 +132,12 @@ pub(crate) async fn start_client_get(
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
+    // `Some(client_id)` when the caller registered a client subscription up-front
+    // (subscribe=true with a listener). The driver removes it on any terminal
+    // that delivered no state (dead-end NotFound / infra error) so a phantom
+    // client subscription does not linger until disconnect (step 10 §1e). `None`
+    // when no client subscription was registered.
+    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> Result<Transaction, OpError> {
     // Phase 7 egress self-block (#4300): refuse to originate a GET for
     // a contract this node has banned, BEFORE spawning the driver.
@@ -176,6 +182,7 @@ pub(crate) async fn start_client_get(
             return_contract_code,
             subscribe,
             blocking_subscribe,
+            client_sub_cleanup,
         )
         .await;
     });
@@ -190,6 +197,7 @@ async fn run_client_get(
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
+    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) {
     // RAII guard: clears the ops.get entry that the originator
     // loopback pushes via legacy process_message::GetMsg::Request
@@ -206,6 +214,7 @@ async fn run_client_get(
         return_contract_code,
         subscribe,
         blocking_subscribe,
+        client_sub_cleanup,
     )
     .await;
     deliver_outcome(&op_manager, client_tx, outcome);
@@ -242,6 +251,7 @@ async fn drive_client_get(
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
+    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> DriverOutcome {
     match drive_client_get_inner(
         &op_manager,
@@ -250,11 +260,22 @@ async fn drive_client_get(
         return_contract_code,
         subscribe,
         blocking_subscribe,
+        client_sub_cleanup,
     )
     .await
     {
         Ok(outcome) => outcome,
-        Err(err) => DriverOutcome::InfrastructureError(err),
+        Err(err) => {
+            // Infra error: the GET delivered no state, so tear down any client
+            // subscription registered up-front (step 10 §1e) before surfacing the
+            // failure — same rationale as the Exhausted arm below.
+            if let Some(client_id) = client_sub_cleanup {
+                op_manager
+                    .ring
+                    .remove_client_subscription(&instance_id, client_id);
+            }
+            DriverOutcome::InfrastructureError(err)
+        }
     }
 }
 
@@ -265,6 +286,7 @@ async fn drive_client_get_inner(
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
+    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> Result<DriverOutcome, OpError> {
     let htl = op_manager.ring.max_hops_to_live;
 
@@ -571,6 +593,15 @@ async fn drive_client_get_inner(
                 %cause,
                 "GET client: retry loop exhausted — returning NotFound to client"
             );
+            // Dead-end GET: no state was delivered, so tear down any client
+            // subscription registered up-front (step 10 §1e) — otherwise it
+            // lingers as a phantom (contract_in_use && !state) until the client
+            // disconnects. Safe no-op when nothing was registered.
+            if let Some(client_id) = client_sub_cleanup {
+                op_manager
+                    .ring
+                    .remove_client_subscription(&instance_id, client_id);
+            }
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
             ))))
@@ -1177,13 +1208,19 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 // demand signal, so the peer HOSTS the contract (WASM+state, kept fresh in the
 // update mesh) until LRU eviction. There is no cache tier. Slated to be renamed
 // hosting-* AFTER 0.2.94. See .claude/rules/hosting-invariants.md + epic #4642.
+///
+/// Returns `true` when this node holds the contract's current state after the
+/// call (`state_matches || put_persisted`) — D-CACHE-RET (step 10 §1a). Relay
+/// callers gate downstream-subscriber registration on this so a peer registers
+/// demand only after it actually holds state; registering after state makes the
+/// phantom (`contract_in_use && !contract_state_present`) unrepresentable.
 async fn cache_contract_locally(
     op_manager: &OpManager,
     key: ContractKey,
     state: WrappedState,
     contract: Option<ContractContainer>,
     is_client_requester: bool,
-) {
+) -> bool {
     // EXPERIMENT-ONLY (findability_probe): suppress RELAY-path GET-return caching
     // so the seeded copy cannot self-scatter along successful GET return paths
     // (the confound that invalidated an earlier lone-holder run). The client
@@ -1192,7 +1229,10 @@ async fn cache_contract_locally(
     // requester's key-ward path) so it cannot confound routing. NOT for ship.
     #[cfg(any(test, feature = "testing"))]
     if !is_client_requester && crate::operations::findability_probe::scatter_disabled() {
-        return;
+        // Experiment suppressed the relay-path store, so no state was cached
+        // here — report not-present so a caller gating registration on the
+        // return value does not register a downstream against uncached state.
+        return false;
     }
     let state_size = state.size() as u64;
 
@@ -1368,6 +1408,11 @@ async fn cache_contract_locally(
     } else if !removed_contracts.is_empty() {
         crate::operations::broadcast_change_interests(op_manager, vec![], removed_contracts).await;
     }
+
+    // D-CACHE-RET: current state is held locally iff it already matched or we
+    // just persisted it. Relay callers gate register_downstream_subscriber on
+    // this (register-after-state, step 10 §1a).
+    state_matches || put_persisted
 }
 
 /// Claim an orphan stream, await assembly, deserialize the payload,
@@ -2707,6 +2752,10 @@ where
         }
 
         // Register interest for the requester (mirrors get.rs:1447-1476).
+        // register-after-state (step 10 §1a): safe to register BEFORE the cache
+        // call below because this is the local-hit arm — `local_value` is
+        // `Some`, so the contract's state is already present on disk. The
+        // phantom (contract_in_use && !state) is impossible here.
         if subscribe {
             crate::operations::subscribe::register_downstream_subscriber(
                 op_manager,
@@ -3261,8 +3310,31 @@ where
                 // hosting at a relay is still broadcast (matches legacy
                 // `get.rs:2370` which announces on any first-time relay
                 // cache).
-                cache_contract_locally(op_manager, key, state, contract, false).await;
+                let state_present =
+                    cache_contract_locally(op_manager, key, state, contract, false).await;
                 send_result?;
+
+                // Register the requester as a downstream subscriber (subscribe
+                // only), gated on actually holding state after the cache
+                // (register-after-state, step 10 §1a). Registering only once we
+                // hold state makes the phantom (contract_in_use && !state)
+                // unrepresentable and closes the findability gap where a
+                // subscribe=true GET relayed a Found through this hop but never
+                // recorded the requester's demand (so updates never reached it).
+                // On cache failure (put rejected / no contract code) we register
+                // NOTHING; the chain hole heals on the requester's next renewal.
+                if subscribe && state_present {
+                    crate::operations::subscribe::register_downstream_subscriber(
+                        op_manager,
+                        &key,
+                        upstream_addr,
+                        None,
+                        None,
+                        &incoming_tx,
+                        " (relay, inline Found GET response)",
+                    )
+                    .await;
+                }
                 // Delivery succeeded (`send_result?` did not return): a
                 // consulted advertised host closed the dead-end. Record now,
                 // AFTER the fallible upstream forward, not at classify time.
@@ -3495,25 +3567,12 @@ where
                     crate::node::network_status::OpType::Get,
                 );
 
-                // ── Step 5: Subscriber-forwarding parity (subscribe only).
-                if subscribe {
-                    crate::operations::subscribe::register_downstream_subscriber(
-                        op_manager,
-                        &key,
-                        upstream_addr,
-                        None,
-                        None,
-                        &incoming_tx,
-                        " (relay, streamed GET response)",
-                    )
-                    .await;
-                }
-
                 // ── Step 6: Best-effort local cache (legacy parity — relays
                 //    cache forwarded payloads). `fork()` SHARES the buffer,
                 //    so the held `handle` can still assemble. On error, log
-                //    and continue — the pipe already succeeded.
-                match handle.assemble().await {
+                //    and continue — the pipe already succeeded. The returned
+                //    bool (state-present-after) gates Step 7's registration.
+                let state_present = match handle.assemble().await {
                     Ok(bytes) => match bincode::deserialize::<GetStreamingPayload>(&bytes) {
                         Ok(payload) => {
                             if let Some(state) = payload.value.state {
@@ -3529,13 +3588,14 @@ where
                                     contract,
                                     false,
                                 )
-                                .await;
+                                .await
                             } else {
                                 tracing::warn!(
                                     tx = %incoming_tx,
                                     %stream_id,
                                     "GET relay: streamed payload has no state; skipping local cache"
                                 );
+                                false
                             }
                         }
                         Err(e) => {
@@ -3545,6 +3605,7 @@ where
                                 error = %e,
                                 "GET relay: failed to deserialize streamed payload for local cache"
                             );
+                            false
                         }
                     },
                     Err(e) => {
@@ -3554,7 +3615,30 @@ where
                             error = %e,
                             "GET relay: stream assembly failed for local cache (pipe already sent)"
                         );
+                        false
                     }
+                };
+
+                // ── Step 7: Subscriber-forwarding parity (subscribe only).
+                //    register-after-state (step 10 §1a): moved AFTER the Step 6
+                //    cache and gated on `state_present`. Registering the
+                //    requester as a downstream subscriber only once we actually
+                //    hold state makes the phantom (contract_in_use && !state)
+                //    unrepresentable. On stream-assembly failure we register
+                //    NOTHING (was: register-before-cache, which left a phantom on
+                //    assembly failure); the chain hole heals on the requester's
+                //    next renewal — acceptable (D-CACHE-RET).
+                if subscribe && state_present {
+                    crate::operations::subscribe::register_downstream_subscriber(
+                        op_manager,
+                        &key,
+                        upstream_addr,
+                        None,
+                        None,
+                        &incoming_tx,
+                        " (relay, streamed GET response)",
+                    )
+                    .await;
                 }
 
                 return Ok(());
@@ -4140,6 +4224,36 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Pin (step 10 §1e): the client-GET driver MUST tear down an up-front client
+    /// subscription on a dead-end (NotFound) so it does not linger as a phantom
+    /// (`contract_in_use && !contract_state_present`) until the client
+    /// disconnects. The `RetryLoopOutcome::Exhausted` arm (which publishes
+    /// NotFound) must call `remove_client_subscription` BEFORE publishing, and the
+    /// driver must thread `client_sub_cleanup`.
+    #[test]
+    fn client_get_driver_removes_client_subscription_on_dead_end() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        assert!(
+            body.contains("client_sub_cleanup"),
+            "drive_client_get_inner must thread client_sub_cleanup so a dead-end GET \
+             can tear down the up-front client subscription (step 10 §1e)"
+        );
+        let exhausted = body
+            .find("RetryLoopOutcome::Exhausted(")
+            .expect("drive_client_get_inner must have an Exhausted arm");
+        let notfound = body[exhausted..]
+            .find("NotFound { instance_id }")
+            .map(|o| exhausted + o)
+            .expect("the Exhausted arm must publish NotFound");
+        assert!(
+            body[exhausted..notfound].contains("remove_client_subscription("),
+            "the Exhausted (NotFound) arm must call remove_client_subscription BEFORE \
+             publishing NotFound — else a dead-end subscribe=true GET leaves a phantom \
+             client subscription (step 10 §1e)"
+        );
     }
 
     /// Bug #3 reproduction: the legacy Response{Found} branch at

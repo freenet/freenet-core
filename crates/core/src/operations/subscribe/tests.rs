@@ -553,3 +553,65 @@ fn subscribe_hint_arm_gates_migration_on_cache_backpressure() {
          headroom (#4534)"
     );
 }
+
+/// Source-scrape pin (step 10 §1b, register-after-state): `finalize_host_subscribe`
+/// MUST fetch the contract body BEFORE registering the requester as a downstream
+/// subscriber, and BEFORE announcing hosting, and MUST early-return (register
+/// NOTHING) when the fetch does not land the body, and MUST NOT call
+/// `add_local_client`.
+///
+/// Fetch-before-register is exactly what makes the phantom
+/// (`contract_in_use && !contract_state_present`) unrepresentable — a hop
+/// registers demand only after it holds state. `add_local_client` is forbidden
+/// (D-NO-LOCAL-CLIENT): a relay has no local client, and the call is
+/// non-idempotent, so copying it here would inflate `local_client_count` and
+/// wrongly make the relay evicted-last.
+#[test]
+fn finalize_host_subscribe_fetches_before_register() {
+    const SOURCE: &str = include_str!("../subscribe.rs");
+    let fn_start = SOURCE
+        .find("pub(super) async fn finalize_host_subscribe(")
+        .expect("finalize_host_subscribe must exist in subscribe.rs");
+    let fn_end = SOURCE[fn_start..]
+        .find("/// Handle a fresh inbound `SubscribeMsg::Unsubscribe`")
+        .map(|off| fn_start + off)
+        .expect("handle_unsubscribe_inbound doc anchor must follow finalize_host_subscribe");
+    let body = &SOURCE[fn_start..fn_end];
+
+    let fetch_pos = body
+        .find("fetch_contract_if_missing(")
+        .expect("finalize_host_subscribe must fetch the body");
+    let register_pos = body
+        .find("register_downstream_subscriber(")
+        .expect("finalize_host_subscribe must register the downstream subscriber");
+    let announce_pos = body
+        .find("announce_contract_hosted(")
+        .expect("finalize_host_subscribe must announce hosting (state-gated)");
+
+    assert!(
+        fetch_pos < register_pos,
+        "fetch_contract_if_missing must come BEFORE register_downstream_subscriber \
+         (register-after-state, step 10 §1b) — else a stateless relay creates a phantom"
+    );
+    assert!(
+        register_pos < announce_pos,
+        "register_downstream_subscriber must come BEFORE announce_contract_hosted \
+         (register the demand, then advertise the host)"
+    );
+    assert!(
+        !body.contains("add_local_client"),
+        "finalize_host_subscribe must NOT call add_local_client (D-NO-LOCAL-CLIENT) — \
+         a relay has no local client; it would inflate local_client_count and wrongly \
+         make the relay evicted-last"
+    );
+    // Nothing may be registered when the fetch did not land the body: the helper
+    // must early-return on `!have_body` BEFORE the register call.
+    let guard_pos = body
+        .find("if !have_body")
+        .expect("finalize_host_subscribe must guard on !have_body");
+    assert!(
+        guard_pos < register_pos,
+        "the `if !have_body {{ return; }}` guard must precede register_downstream_subscriber \
+         so a fetch-fail registers NOTHING (no phantom)"
+    );
+}

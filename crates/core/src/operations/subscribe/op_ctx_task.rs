@@ -47,7 +47,7 @@ use crate::ring::{PeerKeyLocation, RingError};
 
 use super::{
     InitialRequest, MAX_BREADTH, MAX_RETRIES, RETRY_BASE_DELAY, SubscribeMsg, SubscribeMsgResult,
-    complete_local_subscription, prepare_initial_request, register_downstream_subscriber,
+    complete_local_subscription, prepare_initial_request,
 };
 
 /// Advertised hosts a SUBSCRIBE terminus forwards to before giving up
@@ -1664,17 +1664,20 @@ async fn drive_relay_subscribe(
     )
     .await?
     {
-        // Register the subscribing peer as a downstream subscriber.
-        // The relay driver path does not know the requester's
-        // `TransportPublicKey` (the legacy path had it because the op
-        // state carried `requester_pub_key`); `register_downstream_subscriber`
-        // falls back to addr-based lookup in that case, which is adequate
-        // for relay hops where the upstream is a direct connection.
-        register_downstream_subscriber(
+        // Register the subscribing peer as a downstream subscriber and become a
+        // real subscribed host. register-after-state (step 10 §1b): this is the
+        // local-hit arm — `wait_for_contract_with_timeout` returned Some, so the
+        // contract's state is already present. `finalize_host_subscribe` fetches
+        // (a no-op here), registers the requester as our downstream, installs our
+        // own subscription lease, and announces hosting — it can never leave a
+        // phantom. The relay driver path does not know the requester's
+        // `TransportPublicKey`; the addr-based fallback in
+        // `register_downstream_subscriber` is adequate for relay hops where the
+        // upstream is a direct connection.
+        super::finalize_host_subscribe(
             op_manager,
-            &key,
+            key,
             upstream_addr,
-            None,
             Some(upstream_addr),
             &incoming_tx,
             " (driver relay local hit)",
@@ -2053,11 +2056,22 @@ async fn relay_subscribe_forward_once(
             hop_count: downstream_hop_count,
             ..
         })) => {
-            register_downstream_subscriber(
+            // register-after-state (step 10 §1b): the downstream answered
+            // `Subscribed`, but THIS hop forwarded because it did NOT hold the
+            // contract (the local-hit fast path above missed), so registering the
+            // requester now would create a phantom (contract_in_use && !state) —
+            // the dominant #4404/#4612 generator. `finalize_host_subscribe`
+            // fetches the body FIRST and registers the downstream (plus installs
+            // our own lease + announces) only if it lands, becoming a real
+            // subscribed host; on fetch-fail it registers NOTHING and we still
+            // bubble `Subscribed` upstream, so the chain hole heals on the
+            // requester's next renewal (D-ORDER). This adds a bounded fetch wait
+            // (≤ CONTRACT_WAIT_TIMEOUT_MS) to this legacy standalone-SUBSCRIBE
+            // relay path only, which PR 2 retires.
+            super::finalize_host_subscribe(
                 op_manager,
-                &key,
+                key,
                 upstream_addr,
-                None,
                 Some(upstream_addr),
                 &incoming_tx,
                 " (driver relay registration on Response)",
@@ -2942,12 +2956,18 @@ mod tests {
         );
     }
 
-    /// Pin: relay driver MUST call `register_downstream_subscriber`
-    /// on BOTH the local-hit and downstream-Subscribed paths. Missing
-    /// this registration breaks UPDATE propagation to the original
-    /// requester (see subscribe.rs:1655–1688 for full reasoning).
+    /// Pin (REWRITTEN for step 10 §1b, register-after-state): the relay driver
+    /// MUST reach host-formation via `finalize_host_subscribe` on BOTH the
+    /// local-hit and downstream-Subscribed paths. `finalize_host_subscribe`
+    /// fetches state BEFORE registering the requester as a downstream subscriber,
+    /// so a stateless relay never creates a phantom (`contract_in_use &&
+    /// !contract_state_present`). The driver must NOT call the bare
+    /// `register_downstream_subscriber(` directly — that registered demand before
+    /// any state was held, the dominant #4404/#4612 phantom generator. Missing
+    /// the registration entirely would break UPDATE propagation to the original
+    /// requester.
     #[test]
-    fn relay_subscribe_registers_downstream_on_both_paths() {
+    fn relay_subscribe_becomes_host_via_finalize_on_both_paths() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
             .find("async fn drive_relay_subscribe(")
@@ -2957,23 +2977,43 @@ mod tests {
             .expect("driver body end not found")
             + driver_start;
         let driver_src = &src[driver_start..driver_end];
-        let hits = driver_src
-            .matches("register_downstream_subscriber(")
-            .count();
+        // Strip line comments so doc strings that mention the bare call-site as a
+        // negative constraint do not trip the substring scan.
+        let stripped: String = driver_src
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hits = stripped.matches("finalize_host_subscribe(").count();
         assert!(
             hits >= 2,
-            "driver must call register_downstream_subscriber on BOTH local-hit \
-             and downstream-Subscribed paths (found {hits})"
+            "driver must reach host-formation via finalize_host_subscribe on BOTH \
+             local-hit and downstream-Subscribed paths (found {hits})"
+        );
+        assert!(
+            !stripped.contains("register_downstream_subscriber("),
+            "relay driver must NOT call bare register_downstream_subscriber \
+             (register-before-fetch = phantom); host-formation must go through \
+             finalize_host_subscribe (fetch-then-register, step 10 §1b)"
         );
     }
 
-    /// Pin: relay driver MUST NOT call `ring.subscribe` or
-    /// `announce_contract_hosted` on behalf of the relayed Subscribed
-    /// response. A relay is not itself a subscriber; doing so would
-    /// install a lease and trigger #3763 subscription-storm feedback
-    /// loops via the renewal cycle.
+    /// Pin (REWRITTEN for step 10 §1b): the relay driver becomes a real
+    /// subscribed host, but ONLY through `finalize_host_subscribe`, which fetches
+    /// state FIRST. So the driver body must NOT install a lease, clear the
+    /// pending request, or announce hosting DIRECTLY (bare `ring.subscribe(` /
+    /// `complete_subscription_request(` / `announce_contract_hosted(`) — those
+    /// must be reached via the fetch-gated `finalize_host_subscribe` helper so
+    /// they can never run before state is held. This replaces the pre-step-10
+    /// "a relay is not itself a subscriber" guard, whose intent is superseded by
+    /// piece D (chain hops are real hosts); the register-after-state ordering
+    /// inside the helper is pinned separately by
+    /// `finalize_host_subscribe_fetches_before_register` in subscribe.rs.
     #[test]
-    fn relay_subscribe_does_not_install_lease_on_relayed_response() {
+    fn relay_subscribe_host_formation_is_fetch_gated_via_finalize() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
             .find("async fn drive_relay_subscribe(")
@@ -2995,15 +3035,18 @@ mod tests {
             .join("\n");
         assert!(
             !stripped.contains("ring.subscribe("),
-            "relay driver must NOT call ring.subscribe on relayed response"
+            "relay driver must NOT call ring.subscribe directly — go through \
+             finalize_host_subscribe (fetch-then-host)"
         );
         assert!(
             !stripped.contains("complete_subscription_request"),
-            "relay driver must NOT call complete_subscription_request on relayed response"
+            "relay driver must NOT call complete_subscription_request directly — \
+             go through finalize_host_subscribe"
         );
         assert!(
             !stripped.contains("announce_contract_hosted"),
-            "relay driver must NOT call announce_contract_hosted on relayed response"
+            "relay driver must NOT call announce_contract_hosted directly — go \
+             through finalize_host_subscribe (announce is state-gated there)"
         );
     }
 
