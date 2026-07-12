@@ -2034,6 +2034,16 @@ impl Ring {
     /// if the network can't absorb this many.
     const MAX_RECOVERY_ATTEMPTS_PER_INTERVAL: usize = 10;
 
+    /// Maximum phantom repair fetches (#4612) spawned per recovery tick.
+    ///
+    /// Bounds the producer (the #4440/#4610 lesson: never an unbounded
+    /// producer feeding the shared serial paths): at 30s intervals this is at
+    /// most 8 sub-op GETs/minute network-wide fetch pressure from phantom
+    /// repair, regardless of how many phantoms the relay path accumulated.
+    /// Per-contract pacing/giving-up lives in
+    /// `HostingManager::reconcile_phantom_in_use` (cooldown + max attempts).
+    const MAX_PHANTOM_REPAIRS_PER_INTERVAL: usize = 4;
+
     /// Skip renewal cycle when channel remaining capacity falls below this
     /// fraction of max (i.e. channel is more than 50% full).
     const RENEWAL_DEFER_CAPACITY_FRACTION: usize = 2; // channel_max / 2
@@ -2253,6 +2263,69 @@ impl Ring {
             if ring.open_connections() == 0 {
                 tracing::debug!("Skipping subscription renewal: no ring connections");
                 continue;
+            }
+
+            // Phantom in-use reconciliation (#4612): enforce `in-use ⇒
+            // has-state`. The transit-relay SUBSCRIBE path registers
+            // downstream subscribers without ever fetching the contract's
+            // state, leaving this node advertised as a "host" it cannot be
+            // (GET dead-ends #4404; summarize storm #4610 before the #4611
+            // gate). Repair each phantom with a bounded one-shot sub-op GET;
+            // after MAX_PHANTOM_REPAIR_ATTEMPTS failures drop the phantom
+            // registration instead of keeping it forever. Runs after the
+            // connection gate: the repair fetch needs peers to route through,
+            // and a disconnected node must not burn its bounded attempts on
+            // fetches that are doomed locally.
+            let repairs = ring.reconcile_phantom_in_use(Self::MAX_PHANTOM_REPAIRS_PER_INTERVAL);
+            if !repairs.is_empty()
+                && let Some(op_manager) = ring.upgrade_op_manager()
+            {
+                for repair in repairs {
+                    match repair {
+                        crate::ring::hosting::PhantomRepair::Fetch(key) => {
+                            tracing::info!(
+                                contract = %key,
+                                "phantom in-use contract (no stored state): \
+                                 starting one-shot repair fetch"
+                            );
+                            // Fire-and-forget: the side effect (contract +
+                            // state cached locally) is what restores the
+                            // invariant; the next 30s pass observes the store.
+                            let _ = crate::operations::get::op_ctx_task::start_sub_op_get(
+                                &op_manager,
+                                *key.id(),
+                                true,
+                            );
+                        }
+                        crate::ring::hosting::PhantomRepair::Drop(key) => {
+                            let removed = ring.drop_phantom_downstream(&key);
+                            tracing::warn!(
+                                contract = %key,
+                                removed_subscribers = removed,
+                                "phantom in-use contract unrepairable: dropping \
+                                 downstream registration (peers re-root via \
+                                 their own lease renewal)"
+                            );
+                            // Mirror the stale-lease expiry handling above:
+                            // decrement interest symmetrically, then collapse
+                            // upstream if no interest remains.
+                            for _ in 0..removed {
+                                op_manager
+                                    .interest_manager
+                                    .remove_downstream_subscriber(&key);
+                            }
+                            if op_manager.reconcile_wants_collapse(
+                                &key,
+                                crate::node::network_status::ReconcileShadowSite::Collapse,
+                            ) {
+                                let op_mgr = op_manager.clone();
+                                GlobalExecutor::spawn(async move {
+                                    op_mgr.send_unsubscribe_upstream(&key).await;
+                                });
+                            }
+                        }
+                    }
+                }
             }
 
             // Get contracts that need subscription renewal (have client subscriptions)
@@ -3696,6 +3769,24 @@ impl Ring {
 
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
         self.hosting_manager.expire_stale_downstream_subscribers()
+    }
+
+    /// Reconcile downstream-driven in-use contracts against the state store
+    /// (#4612): emit repair fetches for phantoms (in-use, stateless) and
+    /// drops for unrepairable ones. See
+    /// `HostingManager::reconcile_phantom_in_use`.
+    pub(crate) fn reconcile_phantom_in_use(
+        &self,
+        max_fetches: usize,
+    ) -> Vec<crate::ring::hosting::PhantomRepair> {
+        self.hosting_manager.reconcile_phantom_in_use(max_fetches)
+    }
+
+    /// Drop the downstream registration of an unrepairable phantom contract,
+    /// returning the number of removed subscriber entries. See
+    /// `HostingManager::drop_phantom_downstream`.
+    pub(crate) fn drop_phantom_downstream(&self, key: &ContractKey) -> usize {
+        self.hosting_manager.drop_phantom_downstream(key)
     }
 
     pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {
