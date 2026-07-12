@@ -551,7 +551,12 @@ async fn process_open_request(
                         // Some(client_id) iff we actually registered one, so the
                         // driver can tear it down when the PUT commits no state
                         // (step 10 §1e) rather than leaving a phantom until
-                        // disconnect.
+                        // disconnect. `begin_inflight_subscribe` records this
+                        // request so a concurrent sibling subscribe for the same
+                        // (contract, client) is not torn down by this one's failure
+                        // cleanup (Fix 5); it is balanced by exactly one
+                        // `end_inflight_subscribe` — at the driver terminal, or here
+                        // if the driver never spawns.
                         let client_sub_cleanup = if subscribe {
                             if let Some(sl) = subscription_listener {
                                 register_subscription_listener(
@@ -562,6 +567,9 @@ async fn process_open_request(
                                     "PUT",
                                 )
                                 .await?;
+                                op_manager
+                                    .ring
+                                    .begin_inflight_subscribe(*contract_key.id(), client_id);
                                 Some(client_id)
                             } else {
                                 tracing::warn!(
@@ -588,6 +596,13 @@ async fn process_open_request(
                         )
                         .await
                         {
+                            // The driver never spawned, so no terminal will
+                            // decrement — balance the up-front increment here.
+                            if let Some(client_id) = client_sub_cleanup {
+                                op_manager
+                                    .ring
+                                    .end_inflight_subscribe(*contract_key.id(), client_id);
+                            }
                             report_op_init_error(
                                 &op_manager,
                                 client_tx,
@@ -1143,6 +1158,11 @@ async fn process_open_request(
                         // Some(client_id) iff we actually registered one, so the
                         // driver can tear it down on a dead-end GET (step 10 §1e)
                         // rather than leaving a phantom until disconnect.
+                        // `begin_inflight_subscribe` records this request so a
+                        // concurrent sibling subscribe for the same (contract,
+                        // client) is not torn down by this one's dead-end cleanup
+                        // (Fix 5); balanced by exactly one `end_inflight_subscribe`
+                        // — at the driver terminal, or here if it never spawns.
                         let client_sub_cleanup = if subscribe {
                             if let Some(sl) = subscription_listener {
                                 register_subscription_listener(
@@ -1153,6 +1173,7 @@ async fn process_open_request(
                                     "GET",
                                 )
                                 .await?;
+                                op_manager.ring.begin_inflight_subscribe(key, client_id);
                                 Some(client_id)
                             } else {
                                 tracing::warn!(
@@ -1186,6 +1207,11 @@ async fn process_open_request(
                         )
                         .await
                         {
+                            // The driver never spawned, so no terminal will
+                            // decrement — balance the up-front increment here.
+                            if let Some(client_id) = client_sub_cleanup {
+                                op_manager.ring.end_inflight_subscribe(key, client_id);
+                            }
                             report_op_init_error(
                                 &op_manager,
                                 client_tx,

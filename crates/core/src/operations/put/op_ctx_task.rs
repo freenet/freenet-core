@@ -199,32 +199,40 @@ async fn drive_client_put(
     {
         Ok(outcome) => outcome,
         Err(err) => {
-            // Infra error: no state committed here, so tear down any client
-            // subscription registered up-front IF we do not hold the state
+            // Infra error (Unexpected / InfraError from the inner driver): no
+            // state committed here. Decrement the in-flight subscribe count and,
+            // if last-and-no-state, tear down the up-front client subscription
             // (step 10 §1e) — gated so a locally-committed PUT whose network
             // propagation errored keeps its legitimate subscription.
-            maybe_remove_phantom_client_subscription(&op_manager, &key, client_sub_cleanup);
+            finish_subscribe_and_maybe_cleanup(&op_manager, &key, client_sub_cleanup);
             DriverOutcome::InfrastructureError(err)
         }
     }
 }
 
-/// Remove a client subscription that would otherwise linger as a phantom
-/// (`contract_in_use && !contract_state_present`) after a PUT terminal that did
-/// NOT commit state locally (step 10 §1e). Gated on `!contract_state_present` so
-/// a PUT that DID commit locally (e.g. network propagation exhausted but the
-/// local store succeeded) keeps its legitimate client subscription. Drops BOTH
-/// the ring bookkeeping AND the executor-side update notifier (review Fix 2) so
-/// the failed subscribe does not keep consuming subscriber capacity / receiving
-/// updates until the client disconnects. No-op when no client subscription was
-/// registered.
-fn maybe_remove_phantom_client_subscription(
+/// Called at EVERY client-PUT terminal (success and failure) when a client
+/// subscription was registered up-front. Decrements this op's contribution to
+/// the per-(contract,client) in-flight subscribe count and — only when that
+/// count reaches 0 AND no state is present — tears down the client subscription
+/// (ring bookkeeping AND the executor notifier). Step 10 §1e, review Fixes
+/// 2/3/5.
+///
+/// State-gated (Fix 3): a PUT that DID commit locally (e.g. network propagation
+/// exhausted but the local store succeeded) has state present, so its
+/// subscription is kept. Refcounted (Fix 5): a PUT that fails while a SIBLING
+/// subscribe=true request for the same (contract, client) is still in flight (or
+/// already committed state) must not delete the shared registration — removal
+/// happens only when this was the last in-flight request. Drops BOTH the ring
+/// bookkeeping AND the executor notifier (Fix 2). No-op when no client
+/// subscription was registered.
+fn finish_subscribe_and_maybe_cleanup(
     op_manager: &OpManager,
     key: &ContractKey,
     client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) {
     if let Some(client_id) = client_sub_cleanup {
-        if !op_manager.ring.contract_state_present(key) {
+        let remaining = op_manager.ring.end_inflight_subscribe(*key.id(), client_id);
+        if remaining == 0 && !op_manager.ring.contract_state_present(key) {
             op_manager
                 .ring
                 .remove_client_subscription(key.id(), client_id);
@@ -593,6 +601,12 @@ async fn drive_client_put_inner(
             )
             .await;
 
+            // Success terminal: decrement this op's in-flight subscribe count
+            // (Fix 5). State is present (the PUT committed), so the helper keeps
+            // the subscription — but the decrement MUST still run so the count
+            // stays accurate for any concurrent sibling request.
+            finish_subscribe_and_maybe_cleanup(op_manager, &key, client_sub_cleanup);
+
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 ContractResponse::PutResponse { key: reply_key },
             ))))
@@ -603,21 +617,23 @@ async fn drive_client_put_inner(
         // real cause once, mark the tx completed.
         RetryLoopOutcome::Done((Err(cause), _hop_count)) => {
             op_manager.completed(client_tx);
-            // Local-commit failure (PutMsg::Error): no state stored, so tear down
-            // any up-front client subscription so it does not linger as a phantom
-            // (step 10 §1e). Gated on !state-present inside the helper.
-            maybe_remove_phantom_client_subscription(op_manager, &key, client_sub_cleanup);
+            // Local-commit failure (PutMsg::Error): no state stored. Decrement the
+            // in-flight subscribe count and, if last-and-no-state, tear down the
+            // up-front client subscription so it does not linger as a phantom
+            // (step 10 §1e). Gated inside the helper.
+            finish_subscribe_and_maybe_cleanup(op_manager, &key, client_sub_cleanup);
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into_string().into(),
             }
             .into())))
         }
         RetryLoopOutcome::Exhausted(cause) => {
-            // No remote holder took the PUT. If the local store ALSO did not
-            // commit (no state present), tear down any up-front client
-            // subscription (step 10 §1e); if the PUT committed locally the helper
-            // keeps the legitimate subscription.
-            maybe_remove_phantom_client_subscription(op_manager, &key, client_sub_cleanup);
+            // No remote holder took the PUT. Decrement the in-flight subscribe
+            // count; if the local store ALSO did not commit (no state present) and
+            // this was the last in-flight request, tear down the up-front client
+            // subscription (step 10 §1e). A PUT that committed locally keeps its
+            // legitimate subscription (state-gated inside the helper).
+            finish_subscribe_and_maybe_cleanup(op_manager, &key, client_sub_cleanup);
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into(),
             }
@@ -4730,14 +4746,14 @@ mod tests {
         panic!("unterminated fn body for {signature_prefix}");
     }
 
-    /// Pin (step 10 §1e): the client-PUT driver MUST tear down an up-front client
-    /// subscription when the PUT commits no state, so it does not linger as a
-    /// phantom (`contract_in_use && !contract_state_present`) until disconnect.
-    /// Both non-committing terminals (`Done((Err(...)))` and `Exhausted`) inside
-    /// `drive_client_put_inner`, and the infra-error path in `drive_client_put`,
-    /// must call `maybe_remove_phantom_client_subscription`; and the helper must
-    /// gate on `!contract_state_present` so a locally-committed PUT keeps its
-    /// legitimate subscription.
+    /// Pin (step 10 §1e; review Fixes 2/3/5): the client-PUT driver MUST run
+    /// `finish_subscribe_and_maybe_cleanup` at EVERY terminal so the in-flight
+    /// subscribe count is decremented, and tear down the up-front client
+    /// subscription only when it was the last in-flight subscribe AND no state is
+    /// present. All THREE inner terminals (`Done((Ok))` success, `Done((Err))`,
+    /// `Exhausted`) plus the infra-error path in `drive_client_put` must call it;
+    /// the helper must decrement the count (`end_inflight_subscribe`, Fix 5), gate
+    /// on `!contract_state_present` (Fix 3), and drop the executor notifier (Fix 2).
     #[test]
     fn client_put_driver_removes_phantom_client_subscription_on_failure() {
         let src = include_str!("op_ctx_task.rs");
@@ -4746,23 +4762,28 @@ mod tests {
             inner.contains("client_sub_cleanup"),
             "drive_client_put_inner must thread client_sub_cleanup (step 10 §1e)"
         );
-        let helper_calls = inner
-            .matches("maybe_remove_phantom_client_subscription(")
-            .count();
+        let helper_calls = inner.matches("finish_subscribe_and_maybe_cleanup(").count();
         assert!(
-            helper_calls >= 2,
-            "both non-committing PUT terminals (Done(Err) and Exhausted) must call \
-             maybe_remove_phantom_client_subscription (found {helper_calls}) — else a \
-             failed subscribe=true PUT leaves a phantom client subscription (step 10 §1e)"
+            helper_calls >= 3,
+            "all three PUT terminals (Done(Ok) success, Done(Err), Exhausted) must call \
+             finish_subscribe_and_maybe_cleanup (found {helper_calls}) — the success arm \
+             must decrement the in-flight count too (Fix 5), and the failure arms must \
+             clean up the phantom (step 10 §1e)"
         );
 
         let wrapper = extract_fn_body(src, "async fn drive_client_put(");
         assert!(
-            wrapper.contains("maybe_remove_phantom_client_subscription("),
+            wrapper.contains("finish_subscribe_and_maybe_cleanup("),
             "drive_client_put must also clean up on the infra-error terminal (step 10 §1e)"
         );
 
-        let helper = extract_fn_body(src, "fn maybe_remove_phantom_client_subscription(");
+        let helper = extract_fn_body(src, "fn finish_subscribe_and_maybe_cleanup(");
+        assert!(
+            helper.contains("end_inflight_subscribe(") && helper.contains("remaining == 0"),
+            "the PUT cleanup helper must decrement the in-flight subscribe count and tear \
+             down only when it reaches 0 (Fix 5) — else a concurrent failing PUT deletes a \
+             still-needed subscription"
+        );
         assert!(
             helper.contains("contract_state_present")
                 && helper.contains("remove_client_subscription("),

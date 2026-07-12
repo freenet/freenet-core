@@ -266,10 +266,10 @@ async fn drive_client_get(
     {
         Ok(outcome) => outcome,
         Err(err) => {
-            // Infra error: the GET delivered no state, so tear down any client
-            // subscription registered up-front (step 10 §1e) before surfacing the
-            // failure — same state-gated helper as the Done/Exhausted terminals.
-            maybe_remove_phantom_client_subscription(&op_manager, instance_id, client_sub_cleanup)
+            // Infra error: the GET delivered no state. Decrement the in-flight
+            // subscribe count and clean up if last-and-no-state (step 10 §1e) —
+            // same helper as the Done/Exhausted terminals.
+            finish_subscribe_and_maybe_cleanup(&op_manager, instance_id, client_sub_cleanup, None)
                 .await;
             DriverOutcome::InfrastructureError(err)
         }
@@ -572,23 +572,23 @@ async fn drive_client_get_inner(
             )
             .await;
 
-            // Review Fix 1 (step 10 §1e): a `Done` terminal can still deliver NO
-            // state to the client — the dominant case is a multi-fragment
-            // streaming GET whose assembly failed on every retry and was
-            // converted back to `Done(Terminal::Streaming)` (to avoid a false
-            // NotFound, #4345); `build_host_response` then finds no stored state
-            // and `host_result` is `Err`. A non-streaming InlineFound whose
-            // `cache_contract_locally` failed hits the same hole. In those cases
-            // tear down the up-front client subscription so it does not linger as
-            // a phantom. State-gated inside the helper (Fix 3).
-            if host_result.is_err() {
-                maybe_remove_phantom_client_subscription(
-                    op_manager,
-                    instance_id,
-                    client_sub_cleanup,
-                )
-                .await;
-            }
+            // Review Fixes 1/5 (step 10 §1e): decrement this op's in-flight
+            // subscribe count and, if it was the last one and no state landed,
+            // tear down the up-front client subscription. A `Done` terminal can
+            // still deliver NO state — the dominant case is a multi-fragment
+            // streaming GET whose assembly failed on every retry and was converted
+            // back to `Done(Terminal::Streaming)` (to avoid a false NotFound,
+            // #4345); `build_host_response` then finds no stored state and
+            // `host_result` is `Err`. On success, state is present (cached above),
+            // so the helper decrements and keeps. Pass `reply_key` for the cheap
+            // sync state check.
+            finish_subscribe_and_maybe_cleanup(
+                op_manager,
+                instance_id,
+                client_sub_cleanup,
+                Some(reply_key),
+            )
+            .await;
 
             Ok(DriverOutcome::Publish(host_result))
         }
@@ -608,11 +608,11 @@ async fn drive_client_get_inner(
                 %cause,
                 "GET client: retry loop exhausted — returning NotFound to client"
             );
-            // Dead-end GET: no state was delivered, so tear down any client
-            // subscription registered up-front (step 10 §1e) — otherwise it
-            // lingers as a phantom (contract_in_use && !state) until the client
-            // disconnects. State-gated + notifier-dropping inside the helper.
-            maybe_remove_phantom_client_subscription(op_manager, instance_id, client_sub_cleanup)
+            // Dead-end GET: no state delivered. Decrement the in-flight subscribe
+            // count and, if last and no state, tear down the up-front client
+            // subscription (step 10 §1e) — otherwise it lingers as a phantom.
+            // No resolved key here → the helper resolves via the store.
+            finish_subscribe_and_maybe_cleanup(op_manager, instance_id, client_sub_cleanup, None)
                 .await;
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
@@ -1534,34 +1534,51 @@ async fn lookup_stored_key(
     }
 }
 
-/// Tear down a client subscription (ring bookkeeping AND the executor-side
-/// update notifier) that would otherwise linger as a phantom
-/// (`contract_in_use && !contract_state_present`) after a GET that delivered NO
-/// state — step 10 §1e, review Fixes 1/2/3.
+/// Called at EVERY client-GET terminal (success and failure) when a client
+/// subscription was registered up-front. Decrements this op's contribution to
+/// the per-(contract,client) in-flight subscribe count, and — only when that
+/// count reaches 0 AND no state is present — tears down the client subscription
+/// (ring bookkeeping AND the executor notifier). Otherwise the shared
+/// registration is preserved. Step 10 §1e, review Fixes 1/2/3/5.
 ///
-/// Called at ALL non-state-delivering client-GET terminals: the `Done` arm when
-/// `host_result.is_err()` (e.g. a streaming assembly that failed on every retry
-/// is converted back to `Done(Streaming)` to avoid a false NotFound (#4345),
-/// then `build_host_response` finds no stored state), the `Exhausted` (NotFound)
-/// arm, and the infra-error wrapper.
+/// Why every terminal (Fix 5): a client can have several subscribe=true GETs for
+/// the SAME contract in flight; the up-front registration is idempotent (one
+/// shared ring entry + notifier), so the LAST request to finish owns the
+/// teardown decision. Decrementing at every terminal keeps the count accurate;
+/// removing only at count 0 means a request that fails while a SIBLING is still
+/// running (or already succeeded) cannot delete the shared subscription — the
+/// concurrent race the `contract_state_present` gate alone does not close.
 ///
-/// State-gated (Fix 3): if this node actually holds the contract's current state
-/// (a pre-existing legitimate subscription, or a locally-hosted copy), the
-/// subscription is NOT a phantom and is preserved. `contract_state_present`
-/// needs the full key, which we resolve from the instance id via the store; a
-/// resolve miss means no state, so we clean up. No-op when no client
-/// subscription was registered up-front.
-async fn maybe_remove_phantom_client_subscription(
+/// State-gated (Fix 3): when this is the last in-flight request, we still keep
+/// the subscription if the node holds current state (a sibling cached it, or it
+/// pre-existed). `resolved_key` lets the `Done` arm pass its `reply_key` for a
+/// cheap sync check; other terminals pass `None` and resolve via the store.
+/// No-op when no client subscription was registered up-front.
+async fn finish_subscribe_and_maybe_cleanup(
     op_manager: &OpManager,
     instance_id: ContractInstanceId,
     client_sub_cleanup: Option<crate::client_events::ClientId>,
+    resolved_key: Option<ContractKey>,
 ) {
     let Some(client_id) = client_sub_cleanup else {
         return;
     };
-    if let Some(key) = lookup_stored_key(op_manager, &instance_id).await
-        && op_manager.ring.contract_state_present(&key)
-    {
+    let remaining = op_manager
+        .ring
+        .end_inflight_subscribe(instance_id, client_id);
+    if remaining > 0 {
+        // Another subscribe=true GET/PUT for this (contract, client) is still in
+        // flight and may yet deliver state — keep the shared registration (Fix 5).
+        return;
+    }
+    let state_present = match resolved_key {
+        Some(key) => op_manager.ring.contract_state_present(&key),
+        None => match lookup_stored_key(op_manager, &instance_id).await {
+            Some(key) => op_manager.ring.contract_state_present(&key),
+            None => false,
+        },
+    };
+    if state_present {
         // We hold current state — legitimate host/subscription, not a phantom.
         return;
     }
@@ -4275,21 +4292,21 @@ mod tests {
         panic!("unterminated fn body for {signature_prefix}");
     }
 
-    /// Pin (step 10 §1e; review Fixes 1/2/3): the client-GET driver MUST tear
-    /// down an up-front client subscription at EVERY terminal that delivered no
-    /// state, so it does not linger as a phantom
-    /// (`contract_in_use && !contract_state_present`) until the client
-    /// disconnects. There are THREE such terminals, all of which must clean up:
-    ///   - the `RetryLoopOutcome::Done` arm when `host_result.is_err()` (Fix 1:
-    ///     a multi-fragment streaming GET whose assembly failed on every retry is
-    ///     converted back to `Done(Terminal::Streaming)` to avoid a false
-    ///     NotFound (#4345), then yields an `Err` host_result — this arm was the
-    ///     hole),
+    /// Pin (step 10 §1e; review Fixes 1/2/3/5): the client-GET driver MUST run
+    /// the shared `finish_subscribe_and_maybe_cleanup` at EVERY terminal (so the
+    /// in-flight subscribe count is decremented) and tear down the up-front client
+    /// subscription only when it was the last in-flight subscribe AND no state is
+    /// present. The three terminals that must call it:
+    ///   - the `RetryLoopOutcome::Done` arm (Fix 1: a multi-fragment streaming GET
+    ///     whose assembly failed on every retry is converted back to
+    ///     `Done(Terminal::Streaming)` to avoid a false NotFound (#4345), then
+    ///     yields an `Err` host_result — this arm was the hole; success also
+    ///     decrements here),
     ///   - the `Exhausted` (NotFound) arm,
     ///   - the infra-error path in `drive_client_get`.
-    /// The shared helper `maybe_remove_phantom_client_subscription` must be
-    /// state-gated (Fix 3: don't nuke a pre-existing legit sub) AND drop the
-    /// executor notifier (Fix 2), not just the ring bookkeeping.
+    /// The helper must decrement the in-flight count (`end_inflight_subscribe`,
+    /// Fix 5), be state-gated (`contract_state_present`, Fix 3), and drop BOTH the
+    /// ring bookkeeping and the executor notifier (Fix 2).
     #[test]
     fn client_get_driver_removes_client_subscription_on_dead_end() {
         let src = include_str!("op_ctx_task.rs");
@@ -4300,21 +4317,19 @@ mod tests {
              can tear down the up-front client subscription (step 10 §1e)"
         );
 
-        // (a) Done arm: cleanup gated on host_result.is_err() (Fix 1 — the hole).
+        // (a) Done arm calls the shared cleanup (Fix 1 — the hole).
         let done = inner
             .find("RetryLoopOutcome::Done(terminal)")
             .expect("drive_client_get_inner must have a Done(terminal) arm");
         let exhausted = inner
             .find("RetryLoopOutcome::Exhausted(")
             .expect("drive_client_get_inner must have an Exhausted arm");
-        let done_body = &inner[done..exhausted];
         assert!(
-            done_body.contains("host_result.is_err()")
-                && done_body.contains("maybe_remove_phantom_client_subscription("),
-            "the Done arm must call maybe_remove_phantom_client_subscription when \
-             host_result.is_err() — a streaming assembly that failed on every retry is \
-             converted back to Done(Streaming) and delivers no state (#4345), so without \
-             this the subscribe=true GET leaves a phantom client subscription (Fix 1)"
+            inner[done..exhausted].contains("finish_subscribe_and_maybe_cleanup("),
+            "the Done arm must call finish_subscribe_and_maybe_cleanup — a streaming \
+             assembly that failed on every retry is converted back to Done(Streaming) \
+             and delivers no state (#4345), so without this the subscribe=true GET \
+             leaves a phantom client subscription (Fix 1)"
         );
 
         // (b) Exhausted (NotFound) arm cleans up.
@@ -4323,7 +4338,7 @@ mod tests {
             .map(|o| exhausted + o)
             .expect("the Exhausted arm must publish NotFound");
         assert!(
-            inner[exhausted..notfound].contains("maybe_remove_phantom_client_subscription("),
+            inner[exhausted..notfound].contains("finish_subscribe_and_maybe_cleanup("),
             "the Exhausted (NotFound) arm must clean up the client subscription BEFORE \
              publishing NotFound (step 10 §1e)"
         );
@@ -4331,14 +4346,21 @@ mod tests {
         // (c) infra-error wrapper cleans up.
         let wrapper = extract_fn_body(src, "async fn drive_client_get(");
         assert!(
-            wrapper.contains("maybe_remove_phantom_client_subscription("),
+            wrapper.contains("finish_subscribe_and_maybe_cleanup("),
             "the infra-error path in drive_client_get must clean up the client \
              subscription too (step 10 §1e)"
         );
 
-        // (d) the shared helper is state-gated (Fix 3) and drops BOTH the ring
-        // bookkeeping and the executor notifier (Fix 2).
-        let helper = extract_fn_body(src, "async fn maybe_remove_phantom_client_subscription(");
+        // (d) the shared helper refcounts (Fix 5), is state-gated (Fix 3), and
+        // drops BOTH the ring bookkeeping and the executor notifier (Fix 2).
+        let helper = extract_fn_body(src, "async fn finish_subscribe_and_maybe_cleanup(");
+        assert!(
+            helper.contains("end_inflight_subscribe(") && helper.contains("remaining > 0"),
+            "the GET cleanup helper must decrement the in-flight subscribe count and \
+             skip teardown while another subscribe for the same (contract,client) is in \
+             flight (Fix 5) — else a concurrent failing request deletes a still-needed \
+             subscription"
+        );
         assert!(
             helper.contains("contract_state_present"),
             "the GET cleanup helper must be state-gated on contract_state_present so a \

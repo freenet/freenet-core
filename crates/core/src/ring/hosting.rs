@@ -291,6 +291,19 @@ pub(crate) struct HostingManager {
     /// Prevents hosting cache eviction while client subscriptions exist.
     client_subscriptions: DashMap<ContractInstanceId, HashSet<crate::client_events::ClientId>>,
 
+    /// In-flight subscribe=true GET/PUT count per (contract, client) — review
+    /// Fix 5. A client can have several subscribe requests for the SAME contract
+    /// in flight at once; the up-front client-subscription registration is
+    /// idempotent (one shared ring entry + one shared executor notifier), but the
+    /// per-request failure cleanup must NOT tear that shared registration down
+    /// while another request is still in flight (a concurrent race that the
+    /// `contract_state_present` state-gate alone does not close: request A can
+    /// fail BEFORE request B caches state). Incremented up-front where the client
+    /// subscription is registered, decremented at every driver terminal (success
+    /// and failure); cleanup removes the shared registration only when this count
+    /// reaches 0 AND no state is present.
+    subscribe_inflight: DashMap<(ContractInstanceId, crate::client_events::ClientId), usize>,
+
     /// Unified hosting cache with byte-budget demand-ordered eviction ("fuel
     /// gauge") and TTL protection. This is the single source of truth for which
     /// contracts we're hosting.
@@ -471,6 +484,7 @@ impl HostingManager {
         Self {
             active_subscriptions: DashMap::new(),
             client_subscriptions: DashMap::new(),
+            subscribe_inflight: DashMap::new(),
             hosting_cache: RwLock::new(HostingCache::new(budget_bytes, time_source.clone())),
             demand_estimator: RwLock::new(ProximityPrior::new()),
             own_location: RwLock::new(None),
@@ -1201,6 +1215,49 @@ impl HostingManager {
         no_more_subscriptions
     }
 
+    /// Record the start of an in-flight subscribe=true GET/PUT for
+    /// `(instance_id, client_id)` (review Fix 5). Paired with exactly one
+    /// [`end_inflight_subscribe`](Self::end_inflight_subscribe) at the op's
+    /// terminal (or, if the driver never spawns, at the start-failure site).
+    pub(crate) fn begin_inflight_subscribe(
+        &self,
+        instance_id: ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) {
+        *self
+            .subscribe_inflight
+            .entry((instance_id, client_id))
+            .or_insert(0) += 1;
+    }
+
+    /// Record the completion of one in-flight subscribe=true GET/PUT for
+    /// `(instance_id, client_id)` and return the number still in flight AFTER
+    /// this decrement (review Fix 5). The (contract, client)-shared subscription
+    /// registration may be torn down as a phantom only when this returns 0 (no
+    /// other subscribe request for the same pair is still running). Saturating
+    /// and self-pruning: the entry is removed at zero.
+    pub(crate) fn end_inflight_subscribe(
+        &self,
+        instance_id: ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> usize {
+        use dashmap::mapref::entry::Entry;
+        match self.subscribe_inflight.entry((instance_id, client_id)) {
+            Entry::Occupied(mut e) => {
+                let remaining = e.get().saturating_sub(1);
+                if remaining == 0 {
+                    e.remove();
+                } else {
+                    *e.get_mut() = remaining;
+                }
+                remaining
+            }
+            // No tracked in-flight request (already drained / never begun) — treat
+            // as "none in flight" so the caller's state-gate decides alone.
+            Entry::Vacant(_) => 0,
+        }
+    }
+
     /// Check if there are any client subscriptions for a contract.
     pub fn has_client_subscriptions(&self, instance_id: &ContractInstanceId) -> bool {
         self.client_subscriptions
@@ -1775,6 +1832,23 @@ impl HostingManager {
             .iter()
             .map(|entry| *entry.key())
             .collect();
+
+        // Fix 6 (step 10 §1c follow-up): prune phantom_repair tracking for keys
+        // that are no longer downstream-registered. This sweep only visits
+        // downstream_subscribers, so once an exhausted phantom's downstream
+        // subscription expires/unsubscribes the key is never revisited again —
+        // without this its phantom_repair entry would leak forever (one permanent
+        // per-node entry per exhausted phantom, violating the time-bounded
+        // cleanup-exemption rule). Pruning against the current downstream snapshot
+        // keeps the tracking existence-bounded. Uses the snapshot (not a live
+        // downstream_subscribers lock), so no cross-DashMap guard is held during
+        // the retain — a phantom_repair key is created only for a key in the
+        // snapshot, so any key absent from it is genuinely orphaned.
+        {
+            let downstream: std::collections::HashSet<ContractKey> = keys.iter().copied().collect();
+            self.phantom_repair
+                .retain(|key, _| downstream.contains(key));
+        }
 
         for key in keys {
             if self.contract_state_present(&key) {
@@ -4898,6 +4972,77 @@ mod tests {
         assert!(manager.contract_in_use(&stateful));
     }
 
+    /// Fix 6 regression: neutralizing the #4770 Drop arm means an exhausted
+    /// phantom's `phantom_repair` entry is retained after attempts run out. Since
+    /// `reconcile_phantom_in_use` only visits `downstream_subscribers`, once that
+    /// phantom's downstream subscription later expires the key would never be
+    /// revisited and its tracking entry would leak permanently. The sweep must
+    /// prune `phantom_repair` entries whose key is no longer downstream-registered.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn exhausted_phantom_repair_pruned_when_downstream_expires() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::contract::storages::ReDb::new(temp_dir.path())
+            .await
+            .unwrap();
+        manager.set_storage(storage);
+
+        let peer = make_peer_key(13);
+        let phantom = make_contract_key(90);
+        manager.add_downstream_subscriber(&phantom, peer.clone());
+
+        // Exhaust the repair attempts (leaves a phantom_repair entry at MAX).
+        assert_eq!(
+            manager.reconcile_phantom_in_use(8),
+            vec![PhantomRepair::Fetch(phantom)]
+        );
+        for attempt in 2..=MAX_PHANTOM_REPAIR_ATTEMPTS {
+            clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
+            assert_eq!(
+                manager.reconcile_phantom_in_use(8),
+                vec![PhantomRepair::Fetch(phantom)],
+                "attempt {attempt}"
+            );
+        }
+        clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
+        assert!(
+            manager.reconcile_phantom_in_use(8).is_empty(),
+            "attempts exhausted → sweep stops"
+        );
+        assert!(
+            manager.phantom_repair.get(&phantom).is_some(),
+            "precondition: the exhausted phantom_repair entry is still tracked"
+        );
+
+        // The downstream subscription expires (peer unsubscribed / lease lapsed).
+        manager.downstream_subscribers.remove(&phantom);
+        assert!(!manager.contract_in_use(&phantom));
+
+        // The next sweep must prune the now-orphaned phantom_repair entry.
+        assert!(manager.reconcile_phantom_in_use(8).is_empty());
+        assert!(
+            manager.phantom_repair.get(&phantom).is_none(),
+            "phantom_repair entry must be pruned once the downstream expired (Fix 6) — \
+             no permanent per-node leak"
+        );
+
+        // Belt-and-suspenders: a later re-registration of the SAME key starts a
+        // FRESH repair cycle (attempts=1 → Fetch), proving the exhausted entry
+        // did not leak and leave the key stuck-exhausted.
+        manager.add_downstream_subscriber(&phantom, peer);
+        clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
+        assert_eq!(
+            manager.reconcile_phantom_in_use(8),
+            vec![PhantomRepair::Fetch(phantom)],
+            "a re-registered downstream starts a fresh repair cycle, not stuck-exhausted"
+        );
+    }
+
     /// Behavioural regression for the step-10 §1d phantom falsifier gauge:
     /// `phantom_in_use_count` reports the number of contracts registered as
     /// in-use via a downstream subscriber with NO state on disk
@@ -4976,6 +5121,56 @@ mod tests {
             0,
             "client-subscription-only phantoms are out of scope for this gauge"
         );
+    }
+
+    /// Fix 5 regression: a client with TWO concurrent subscribe=true requests
+    /// for the SAME contract shares ONE idempotent client-subscription entry. If
+    /// request A fails BEFORE request B caches state, A's per-request cleanup must
+    /// NOT delete the shared registration (the `contract_state_present` state-gate
+    /// alone does not save it, since state is still absent at A's terminal). The
+    /// per-(contract,client) in-flight refcount closes this race: A sees
+    /// `remaining > 0` (B still in flight) and keeps the subscription; only B, the
+    /// last to finish, drives the count to 0.
+    #[test]
+    fn inflight_subscribe_refcount_protects_concurrent_sibling() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(200);
+        let instance = *key.id();
+        let client = crate::client_events::ClientId::next();
+
+        // Shared up-front registration + two concurrent in-flight subscribes.
+        manager.add_client_subscription(&instance, client);
+        manager.begin_inflight_subscribe(instance, client);
+        manager.begin_inflight_subscribe(instance, client);
+
+        // Request A finishes first (fails pre-cache). A sibling is still in
+        // flight, so A's terminal sees remaining > 0 and (per the driver's
+        // `remaining > 0` gate) keeps the shared subscription.
+        assert_eq!(
+            manager.end_inflight_subscribe(instance, client),
+            1,
+            "with a sibling still in flight, A's terminal must see remaining > 0"
+        );
+        assert!(
+            manager.has_client_subscriptions(&instance),
+            "the shared client subscription must SURVIVE A's failure while B is in \
+             flight (Fix 5) — the state-gate alone would have deleted it"
+        );
+
+        // Request B (the succeeding one) finishes last → count reaches 0. B backs
+        // the subscription with state, so the driver keeps it.
+        assert_eq!(
+            manager.end_inflight_subscribe(instance, client),
+            0,
+            "the last in-flight request drives the count to 0"
+        );
+        assert!(
+            manager.has_client_subscriptions(&instance),
+            "B keeps the subscription it now backs with state"
+        );
+
+        // Over-decrement is saturating (no underflow / panic) and reports 0.
+        assert_eq!(manager.end_inflight_subscribe(instance, client), 0);
     }
 
     /// #4612 producer bound: `max_fetches` caps the fetches emitted per sweep

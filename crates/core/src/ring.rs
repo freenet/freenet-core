@@ -3837,6 +3837,30 @@ impl Ring {
             .remove_client_subscription(instance_id, client_id)
     }
 
+    /// Record the start of an in-flight subscribe=true GET/PUT for
+    /// `(instance_id, client_id)` (review Fix 5). See
+    /// `HostingManager::begin_inflight_subscribe`.
+    pub(crate) fn begin_inflight_subscribe(
+        &self,
+        instance_id: ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) {
+        self.hosting_manager
+            .begin_inflight_subscribe(instance_id, client_id)
+    }
+
+    /// Record the completion of one in-flight subscribe=true GET/PUT and return
+    /// how many remain in flight for `(instance_id, client_id)` (review Fix 5).
+    /// See `HostingManager::end_inflight_subscribe`.
+    pub(crate) fn end_inflight_subscribe(
+        &self,
+        instance_id: ContractInstanceId,
+        client_id: crate::client_events::ClientId,
+    ) -> usize {
+        self.hosting_manager
+            .end_inflight_subscribe(instance_id, client_id)
+    }
+
     /// Remove a client from all its subscriptions (used when client disconnects).
     ///
     /// Returns a [`ClientDisconnectResult`] with:
