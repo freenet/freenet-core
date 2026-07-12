@@ -6,6 +6,24 @@ function freenetBridge(authToken, userToken, hostedMode) {
   var connections = new Map();
   var lastClipboard = 0;
   var lastDownload = 0;
+  // Peer-restart recovery signal: the node closes a socket whose auth token is
+  // stale (e.g. after a restart wiped its in-memory token map) with the trusted
+  // WebSocket application close code 4401 (AUTH_TOKEN_INVALID_CLOSE_CODE in
+  // client_events/websocket.rs; matched in isTrustedStaleTokenClose below). It
+  // rides the close frame of a socket the shell opened to the node, so a
+  // sandboxed contract cannot forge it. Recovery fires when the framed app
+  // reopens its WebSocket after the restart and the node rejects the now-stale
+  // token with a 4401 close (the 4401 rides that reconnect, NOT the death of
+  // the original socket, which just closes when the node goes down); the shell
+  // does not poll — it reacts to that close. The app never has to ASK for a
+  // reload (this replaces the old, spoofable message-body byte scan), but
+  // recovery does depend on the app reconnecting its socket.
+  //
+  // recoveryReloadTriggered guards against more than one recovery reload from a
+  // single document: location.replace navigates away, so any further 4401 closes
+  // in the same tick must not stack. The real CROSS-document loop bound is the
+  // URL-param cap in reloadUrlCapDecision (fail-closed, storage-independent).
+  var recoveryReloadTriggered = false;
   var notifyAffordanceShown = false;
   var notifySnoozedThisSession = false;
   // Fallback consent store for when localStorage is unavailable (private mode),
@@ -438,6 +456,89 @@ function freenetBridge(authToken, userToken, hostedMode) {
   }
   // notify-rate-limiter:END
 
+  // Fail-CLOSED, storage-independent cap on shell recovery reloads (MAJOR #2).
+  // The cap state lives in the `_freload` query param the reload itself sets, as
+  // "<windowStartMs>-<count>": location.replace carries the URL across the
+  // reload, and the TOP document's URL is NOT writable by the sandboxed contract
+  // (it can read its own referrer but cannot set the top location), so the count
+  // cannot be reset by a misbehaving iframe. Unlike sessionStorage (which is
+  // swallowed in private/no-storage mode, resetting the window every document
+  // and failing OPEN), the URL is always present — so the cap holds even with no
+  // storage. Returns { allow, url }: allow=false means the cap is hit.
+  //
+  // reload-url-cap:BEGIN — pure, extracted & unit-tested by
+  // shell_bridge_reload.test.mjs. Keep it pure (only params/locals) so the
+  // extraction works.
+  function reloadUrlCapDecision(href, now) {
+    var PARAM = '_freload';
+    var MAX = 3; // max recovery reloads per rolling window
+    var WINDOW_MS = 60000; // rolling window
+    var url;
+    try {
+      url = new URL(href);
+    } catch (e) {
+      return { allow: false, url: href };
+    }
+    var raw = url.searchParams.get(PARAM);
+    var windowStart = now;
+    var count = 0;
+    if (raw) {
+      var dash = raw.indexOf('-');
+      var ts = parseInt(dash >= 0 ? raw.slice(0, dash) : raw, 10);
+      var c = dash >= 0 ? parseInt(raw.slice(dash + 1), 10) : 0;
+      // Only continue an existing window when its start is a sane, non-future
+      // timestamp still inside the window; otherwise start a fresh window. A
+      // malformed value (only reachable by a user hand-editing the URL, never by
+      // the contract) just resets to a fresh window — the loop bound still holds
+      // because each reload re-reads and re-increments the count it wrote.
+      if (isFinite(ts) && ts <= now && now - ts < WINDOW_MS) {
+        windowStart = ts;
+        count = isFinite(c) && c > 0 ? c : 0;
+      }
+    }
+    if (count >= MAX) return { allow: false, url: url.toString() };
+    url.searchParams.set(PARAM, windowStart + '-' + (count + 1));
+    return { allow: true, url: url.toString() };
+  }
+  // reload-url-cap:END
+
+  // Whether a WebSocket close should trigger recovery: ONLY the node's trusted
+  // stale-token code (4401 = AUTH_TOKEN_INVALID_CLOSE_CODE) on a close the shell
+  // did NOT initiate itself. `clientClosed` is true for iframe-requested closes
+  // (see the close proxy), so a contract cannot forge the trigger by asking the
+  // shell to close its own socket with code 4401.
+  // close-recovery-decision:BEGIN — pure, unit-tested by shell_bridge_reload.test.mjs.
+  function isTrustedStaleTokenClose(code, clientClosed) {
+    return code === 4401 && !clientClosed;
+  }
+  // Clamp any WebSocket application-range (4000-4999) close code the iframe asks
+  // the shell to send down to a normal close, so it can never surface 4401 (or
+  // any app code) to the onclose handler — a second, independent guard on top of
+  // the `clientClosed` mark against a contract forging the recovery trigger.
+  function clampProxiedCloseCode(code) {
+    if (typeof code === 'number' && code >= 4000 && code <= 4999) return 1000;
+    return code;
+  }
+  // close-recovery-decision:END
+
+  // Re-fetch THIS shell HTML to mint a fresh auth token — the autonomous
+  // recovery a manual refresh performs, now driven by the node's trusted 4401
+  // close (see AUTH_TOKEN_INVALID_CLOSE_CODE) rather than any iframe request.
+  // Bounded fail-closed by reloadUrlCapDecision, and once-per-document by
+  // recoveryReloadTriggered. location.replace (not assign) leaves no dead
+  // history entry.
+  function triggerRecoveryReload() {
+    if (recoveryReloadTriggered) return;
+    var decision = reloadUrlCapDecision(location.href, Date.now());
+    if (!decision.allow) return;
+    recoveryReloadTriggered = true;
+    try {
+      location.replace(decision.url);
+    } catch (e) {
+      location.reload();
+    }
+  }
+
   function notifyStatusToIframe(status) {
     sendToIframe({
       __freenet_shell__: true,
@@ -648,6 +749,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
             navigator.clipboard.writeText(msg.text.slice(0, 2048));
           } catch (e) {}
         }
+        // NOTE: there is deliberately no iframe-initiated `type:'reload'` handler.
+        // Peer-restart recovery is driven autonomously by the node's trusted 4401
+        // close code (see triggerRecoveryReload / the ws.onclose handler), NOT by
+        // the sandboxed app asking — a request the app could otherwise abuse to
+        // force top-level reloads / token minting. river#400's reload message is
+        // an intentional no-op on new nodes (the two are decoupled).
       } else if (
         msg.type === 'download' &&
         typeof msg.filename === 'string' &&
@@ -1056,6 +1163,16 @@ function freenetBridge(authToken, userToken, hostedMode) {
             reason: e.reason,
           });
           connections.delete(msg.id);
+          // Trusted stale-token signal: the node closes a socket whose auth
+          // token is stale with code AUTH_TOKEN_INVALID_CLOSE_CODE (4401). Only
+          // a SERVER-initiated close carries it — the close proxy below marks
+          // iframe-requested closes with `_clientClosed` and clamps app-range
+          // codes, so a contract can't forge 4401 by asking the shell to close
+          // its own socket. On a genuine 4401 the shell re-mints its token by
+          // reloading itself (bounded, fail-closed) — no iframe request needed.
+          if (isTrustedStaleTokenClose(e.code, ws._clientClosed)) {
+            triggerRecoveryReload();
+          }
         };
         ws.onerror = function () {
           sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
@@ -1073,7 +1190,14 @@ function freenetBridge(authToken, userToken, hostedMode) {
       case 'close': {
         var ws = connections.get(msg.id);
         if (ws) {
-          ws.close(msg.code, msg.reason);
+          // Mark this as an iframe-requested close so the onclose handler above
+          // does NOT treat its code as the node's trusted 4401 stale-token
+          // signal. Also clamp any app-range (4000-4999) code the iframe asks
+          // for down to a normal close, so it can't even surface 4401 to
+          // onclose: two independent guards against the contract forging the
+          // recovery trigger by requesting a close.
+          ws._clientClosed = true;
+          ws.close(clampProxiedCloseCode(msg.code), msg.reason);
           connections.delete(msg.id);
         }
         break;

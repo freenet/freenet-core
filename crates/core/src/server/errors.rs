@@ -219,6 +219,66 @@ mod tests {
     }
 
     #[test]
+    fn connecting_page_redirects_to_root_only_at_top_level() {
+        // Regression (peer-restart breaks a framed webapp): the connecting page
+        // is served (503, EmptyRing/PeerNotJoined) while the peer rejoins the
+        // ring, and it can render INSIDE a webapp's sandboxed shell iframe as
+        // well as top-level. It must NOT unconditionally navigate to the node
+        // root `/`: doing so inside the iframe yanks the running webapp to a
+        // page that denies framing on hardened deployments ("Refused to
+        // display ... X-Frame-Options: deny" -> broken tab, exactly the River
+        // peer-restart symptom). The redirect to `/` must be conditioned on
+        // being the top document; a framed instance reloads its OWN url in
+        // place. See the head comment in connecting.html.
+        let page = connecting_page();
+        assert!(
+            page.contains("window.top === window.self"),
+            "connecting page must condition the /-redirect on being the top document"
+        );
+        assert!(
+            page.contains("window.location.reload()"),
+            "a framed connecting page must reload its own url instead of navigating to /"
+        );
+        // The only meta-refresh to `/` must be the <noscript> no-JS fallback,
+        // never an unconditional redirect that also fires in a sandboxed frame.
+        let noscript_fallback =
+            r#"<noscript><meta http-equiv="refresh" content="3;url=/" /></noscript>"#;
+        assert!(
+            page.contains(noscript_fallback),
+            "url=/ meta-refresh must be wrapped in <noscript> as the no-JS fallback"
+        );
+        assert!(
+            !page.replace(noscript_fallback, "").contains("url=/"),
+            "connecting page must not contain an unconditional top-level url=/ redirect"
+        );
+        // MAJOR #1 (PR #4781 review): a TOP-LEVEL connecting page that carries
+        // the shell's `_freload` recovery marker is a recovery reload that
+        // momentarily landed here during ring rejoin. It must NOT go to `/`
+        // (that abandons the app for the dashboard — the app-loss this recovery
+        // exists to prevent); it must retry the contract URL in place. The
+        // decision is centralised in the pure `connectingRecoveryDecision`.
+        assert!(
+            page.contains("_freload"),
+            "connecting page must recognize the shell's _freload recovery reload"
+        );
+        assert!(
+            page.contains("function connectingRecoveryDecision("),
+            "the redirect decision must be a pure, testable function of (_freload, atTop, now)"
+        );
+        // MAJOR #3 (PR #4781 review): the retry-in-place must be BOUNDED, not a
+        // 3s-forever loop. `_freload` carries a start timestamp; after the window
+        // the page stops looping (top-level -> `/`, framed -> a stop message).
+        assert!(
+            page.contains("RECOVERY_MAX_MS"),
+            "the recovery retry must be time-bounded, not an unconditional forever loop"
+        );
+        assert!(
+            page.contains("window.location.replace('/')"),
+            "top-level recovery must fall back to the dashboard once the window elapses"
+        );
+    }
+
+    #[test]
     fn peer_not_joined_returns_service_unavailable() {
         let err = WebSocketApiError::AxumError {
             error: ErrorKind::PeerNotJoined,
