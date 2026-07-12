@@ -2281,16 +2281,14 @@ where
                     }
                 }
             }
-        } else if self
+        } else if let Some(notifiers) = self
             .update_notifications
-            .get(&instance_id)
-            .is_some_and(|notifiers| !notifiers.is_empty())
+            .get_mut(&instance_id)
+            .filter(|notifiers| !notifiers.is_empty())
         {
             // #4681: only take the fan-out path when a LIVE subscriber remains.
             // A present-but-EMPTY entry (left by the channel-closed cleanup
-            // below) is routed to the `else` WARN, not silently skipped. The
-            // guard above proved the entry is non-empty, so re-borrow mutably.
-            let notifiers = self.update_notifications.get_mut(&instance_id).unwrap();
+            // below) is routed to the `else` WARN, not silently skipped.
             let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
 
             if notifiers.len() > super::FANOUT_WARNING_THRESHOLD {
