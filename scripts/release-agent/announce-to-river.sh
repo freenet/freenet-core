@@ -77,6 +77,13 @@ READ_PROBE_TIMEOUT="${READ_PROBE_TIMEOUT:-15}"
 # Overridable (e.g. VERIFY_ATTEMPTS=1 in tests for the single-shot cases).
 VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-24}"
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-5}"
+# Guard the overrides: a non-numeric or absurd value (e.g. VERIFY_INTERVAL=inf)
+# would make `sleep` hang the retry loop forever, so the budget must be
+# wall-clock-bounded, not just attempt-bounded. Require plain non-negative
+# integers; fall back to the defaults otherwise. (ATTEMPTS must be >= 1 to run at
+# least one read; INTERVAL may be 0 — tests set it so, and 0 just polls tightly.)
+[[ "$VERIFY_ATTEMPTS" =~ ^[0-9]+$ ]] && (( VERIFY_ATTEMPTS >= 1 )) || VERIFY_ATTEMPTS=24
+[[ "$VERIFY_INTERVAL" =~ ^[0-9]+$ ]] || VERIFY_INTERVAL=5
 # Target release version this announcement is for, WITHOUT a leading `v`
 # (e.g. "0.2.90"). Plumbed end-to-end from release-announce.yml's `resolve`
 # job → the nova release-agent (ANNOUNCE_TARGET_VERSION env on the sudo
