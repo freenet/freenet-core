@@ -37,6 +37,45 @@ impl Drop for DelegateEnvGuard {
     }
 }
 
+/// Drain every message remaining after a terminal arm of `process_outbound`,
+/// re-attesting the sender of each unprocessed `SendDelegateMessage` to the
+/// real `delegate_key` before pushing it into `results`.
+///
+/// This exists because a delegate can emit an unprocessed `SendDelegateMessage`
+/// queued *behind* a terminal message of any variant (e.g. an
+/// `ApplicationMessage`). Every terminal arm ends by draining the remainder of
+/// the queue, and each such drain MUST overwrite the attacker-controlled
+/// `sender` field — otherwise the target delegate observes a forged
+/// `DelegateMessage.sender` (issue #4668; the fix for the `SendDelegateMessage`
+/// arm alone was #3282). Centralizing the drain here keeps all terminal arms
+/// consistent so a future arm cannot silently reintroduce the blind-drain.
+///
+/// The match lists every `OutboundDelegateMsg` variant exhaustively (rather
+/// than a generic passthrough) so that adding a variant to the enum forces a
+/// compile-time decision here instead of silently dropping or forwarding it.
+fn drain_remaining_with_attestation(
+    delegate_key: &DelegateKey,
+    outbound_msgs: &mut VecDeque<OutboundDelegateMsg>,
+    results: &mut Vec<OutboundDelegateMsg>,
+) {
+    for remaining in outbound_msgs.drain(..) {
+        match remaining {
+            OutboundDelegateMsg::SendDelegateMessage(mut m) if !m.processed => {
+                m.sender = delegate_key.clone();
+                results.push(OutboundDelegateMsg::SendDelegateMessage(m));
+            }
+            msg @ (OutboundDelegateMsg::ApplicationMessage(_)
+            | OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::SendDelegateMessage(_)) => results.push(msg),
+        }
+    }
+}
+
 impl Runtime {
     /// Execute the delegate's `process` function with the DelegateCallEnv set up
     /// so that host functions for context and secret access are available.
@@ -331,9 +370,7 @@ impl Runtime {
                     );
                     msg.context = freenet_stdlib::prelude::DelegateContext::default();
                     results.push(OutboundDelegateMsg::ApplicationMessage(msg));
-                    for remaining in outbound_msgs.drain(..) {
-                        results.push(remaining);
-                    }
+                    drain_remaining_with_attestation(delegate_key, outbound_msgs, results);
                     break;
                 }
 
@@ -343,9 +380,7 @@ impl Runtime {
                         "Passing RequestUserInput to executor for user prompting"
                     );
                     results.push(OutboundDelegateMsg::RequestUserInput(req));
-                    for remaining in outbound_msgs.drain(..) {
-                        results.push(remaining);
-                    }
+                    drain_remaining_with_attestation(delegate_key, outbound_msgs, results);
                     break;
                 }
 
@@ -360,9 +395,7 @@ impl Runtime {
                         "Passing GetContractRequest to executor for async handling"
                     );
                     results.push(OutboundDelegateMsg::GetContractRequest(req));
-                    for remaining in outbound_msgs.drain(..) {
-                        results.push(remaining);
-                    }
+                    drain_remaining_with_attestation(delegate_key, outbound_msgs, results);
                     break;
                 }
                 OutboundDelegateMsg::GetContractRequest(GetContractRequest {
@@ -379,9 +412,7 @@ impl Runtime {
                         "Passing PutContractRequest to executor for async handling"
                     );
                     results.push(OutboundDelegateMsg::PutContractRequest(req));
-                    for remaining in outbound_msgs.drain(..) {
-                        results.push(remaining);
-                    }
+                    drain_remaining_with_attestation(delegate_key, outbound_msgs, results);
                     break;
                 }
                 OutboundDelegateMsg::PutContractRequest(PutContractRequest {
@@ -398,9 +429,7 @@ impl Runtime {
                         "Passing UpdateContractRequest to executor for async handling"
                     );
                     results.push(OutboundDelegateMsg::UpdateContractRequest(req));
-                    for remaining in outbound_msgs.drain(..) {
-                        results.push(remaining);
-                    }
+                    drain_remaining_with_attestation(delegate_key, outbound_msgs, results);
                     break;
                 }
                 OutboundDelegateMsg::UpdateContractRequest(UpdateContractRequest {
@@ -417,9 +446,7 @@ impl Runtime {
                         "Passing SubscribeContractRequest to executor for async handling"
                     );
                     results.push(OutboundDelegateMsg::SubscribeContractRequest(req));
-                    for remaining in outbound_msgs.drain(..) {
-                        results.push(remaining);
-                    }
+                    drain_remaining_with_attestation(delegate_key, outbound_msgs, results);
                     break;
                 }
                 OutboundDelegateMsg::SubscribeContractRequest(SubscribeContractRequest {
@@ -439,23 +466,8 @@ impl Runtime {
                     msg.sender = delegate_key.clone();
                     results.push(OutboundDelegateMsg::SendDelegateMessage(msg));
                     // Attest any remaining SendDelegateMessage variants to prevent
-                    // spoofing via drain bypass (see PR #3282 review).
-                    for remaining in outbound_msgs.drain(..) {
-                        match remaining {
-                            OutboundDelegateMsg::SendDelegateMessage(mut m) if !m.processed => {
-                                m.sender = delegate_key.clone();
-                                results.push(OutboundDelegateMsg::SendDelegateMessage(m));
-                            }
-                            msg @ (OutboundDelegateMsg::ApplicationMessage(_)
-                            | OutboundDelegateMsg::RequestUserInput(_)
-                            | OutboundDelegateMsg::ContextUpdated(_)
-                            | OutboundDelegateMsg::GetContractRequest(_)
-                            | OutboundDelegateMsg::PutContractRequest(_)
-                            | OutboundDelegateMsg::UpdateContractRequest(_)
-                            | OutboundDelegateMsg::SubscribeContractRequest(_)
-                            | OutboundDelegateMsg::SendDelegateMessage(_)) => results.push(msg),
-                        }
-                    }
+                    // spoofing via drain bypass (see PR #3282 review, issue #4668).
+                    drain_remaining_with_attestation(delegate_key, outbound_msgs, results);
                     break;
                 }
                 OutboundDelegateMsg::SendDelegateMessage(DelegateMessage {
