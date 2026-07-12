@@ -310,12 +310,26 @@ impl OpManager {
                 targets.insert(pkl);
             } else {
                 proximity_resolve_failed += 1;
-                tracing::warn!(
+                // Stale proximity-cache entry (#4756): the neighbor announced it
+                // seeds this contract but is no longer in the connection manager.
+                // Disconnect teardown prunes the ring connection (keyed by addr)
+                // but several paths leave this proximity entry (keyed by pub_key)
+                // behind; with no TTL it would WARN on every UPDATE forever.
+                // Self-heal at the detection point: reap the disconnected
+                // neighbor's proximity state so it fires at most once and then
+                // disappears. A reconnecting peer re-announces via the on-connect
+                // HostingStateRequest exchange and the periodic full-set
+                // re-request, so no fan-out is permanently lost. Demote the
+                // per-miss log to DEBUG (mirroring the interest arm below); the
+                // aggregate counter (proximity_resolve_failed) still feeds the
+                // summary log.
+                self.neighbor_hosting.on_peer_disconnected(&pub_key);
+                tracing::debug!(
                     contract = %format!("{:.8}", key),
                     proximity_neighbor = %pub_key,
                     is_local = is_local_update_initiator,
                     phase = "target_lookup_failed",
-                    "Proximity cache neighbor not found in connection manager"
+                    "Proximity cache neighbor not found in connection manager; reaped stale entry"
                 );
             }
         }
