@@ -1893,7 +1893,7 @@ async fn send_queue_full_response(
         | ContractHandlerEvent::UpdateResponse { .. }
         | ContractHandlerEvent::UpdateNoChange { .. }
         | ContractHandlerEvent::RegisterSubscriberListener { .. }
-        | ContractHandlerEvent::RegisterSubscriberListenerResponse
+        | ContractHandlerEvent::RegisterSubscriberListenerResponse { .. }
         | ContractHandlerEvent::QuerySubscriptions { .. }
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
@@ -2510,12 +2510,17 @@ where
             summary,
             subscriber_listener,
         } => {
-            if let Err(err) = contract_handler.executor().register_contract_notifier(
+            // #4681: surface a registration failure to the client instead of
+            // returning a success response that client_events.rs would convert
+            // into a fake successful subscribe. The error rides back on the
+            // response variant so the subscribing client sees a real failure.
+            let result = contract_handler.executor().register_contract_notifier(
                 key,
                 client_id,
                 subscriber_listener,
                 summary,
-            ) {
+            );
+            if let Err(err) = &result {
                 tracing::warn!(
                     contract = %key,
                     client = %client_id,
@@ -2525,11 +2530,13 @@ where
                 );
             }
 
-            // FIXME: if there is an error send actually an error back
             // If the caller disconnected, just log and continue.
             if let Err(error) = contract_handler
                 .channel()
-                .send_to_sender(id, ContractHandlerEvent::RegisterSubscriberListenerResponse)
+                .send_to_sender(
+                    id,
+                    ContractHandlerEvent::RegisterSubscriberListenerResponse { result },
+                )
                 .await
             {
                 tracing::debug!(
@@ -2650,7 +2657,7 @@ where
         | ContractHandlerEvent::GetResponse { .. }
         | ContractHandlerEvent::UpdateResponse { .. }
         | ContractHandlerEvent::UpdateNoChange { .. }
-        | ContractHandlerEvent::RegisterSubscriberListenerResponse
+        | ContractHandlerEvent::RegisterSubscriberListenerResponse { .. }
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
         | ContractHandlerEvent::GetDeltaResponse { .. } => {
@@ -4745,5 +4752,75 @@ mod hol_4391_tests {
             result.is_err(),
             "no op_manager must surface MissingRelated, got {result:?}"
         );
+    }
+
+    /// Regression for #4681 (partial hardening): when `register_contract_notifier`
+    /// fails (here: the per-contract subscriber limit is exhausted), the
+    /// `RegisterSubscriberListener` handler MUST return a
+    /// `RegisterSubscriberListenerResponse { result: Err(_) }` so the subscribing
+    /// client sees a real failure. Before the fix the handler always returned a
+    /// success response, which `client_events.rs` converted into a fake
+    /// successful subscribe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn register_subscriber_listener_surfaces_registration_failure() {
+        use crate::contract::executor::{ContractExecutor, MAX_SUBSCRIBERS_PER_CONTRACT};
+
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(rcv_halve, None, "reg_fail_4681").await;
+
+        let instance_id = *make_contract(b"reg_fail_4681").key().id();
+
+        // Saturate the per-contract subscriber cap directly on the executor so
+        // the next registration through the handler event path is rejected.
+        for _ in 0..MAX_SUBSCRIBERS_PER_CONTRACT {
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            handler
+                .executor()
+                .register_contract_notifier(
+                    instance_id,
+                    crate::client_events::ClientId::next(),
+                    tx,
+                    None,
+                )
+                .expect("registration within limit should succeed");
+        }
+
+        // One more registration, driven through `handle_contract_event`, must
+        // fail — and that failure must ride back on the response variant.
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let event = ContractHandlerEvent::RegisterSubscriberListener {
+            key: instance_id,
+            client_id: crate::client_events::ClientId::next(),
+            summary: None,
+            subscriber_listener: tx,
+        };
+        let send_fut = send_halve.send_to_handler(event);
+        let recv_fut = async {
+            let (id, received, _priority) = handler
+                .channel()
+                .recv_from_sender()
+                .await
+                .expect("handler channel should be open");
+            handle_contract_event(
+                &mut handler,
+                id,
+                received,
+                &user_input::AutoApprovePrompter,
+                None,
+            )
+            .await
+            .expect("dispatch must not error");
+        };
+        let (send_res, ()) = tokio::join!(send_fut, recv_fut);
+        match send_res.expect("must receive a response") {
+            ContractHandlerEvent::RegisterSubscriberListenerResponse { result } => {
+                assert!(
+                    result.is_err(),
+                    "a registration rejected by the subscriber limit must surface \
+                     an error to the client, not a fake success"
+                );
+            }
+            other => panic!("expected RegisterSubscriberListenerResponse, got {other}"),
+        }
     }
 }

@@ -270,3 +270,244 @@ async fn test_reconnection_does_not_inflate_client_count() {
         receivers.push(rx);
     }
 }
+
+// =========================================================================
+// Observability: dropped notification to a registered subscriber (#4681)
+// =========================================================================
+
+/// Install a thread-local `tracing` subscriber that records every event as a
+/// `"<LEVEL> field=value ..."` string. Returns the captured-message buffer and
+/// the default-subscriber guard (drop it to detach the capture).
+#[cfg(feature = "trace")]
+fn install_log_capture() -> (
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Default, Clone)]
+    struct Capture(Arc<Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct V(String);
+            impl tracing::field::Visit for V {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    // Writing into a String is infallible; ignore the Result.
+                    write!(self.0, " {}={value:?}", field.name()).ok();
+                }
+            }
+            let mut v = V(String::new());
+            event.record(&mut v);
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}{}", event.metadata().level(), v.0));
+        }
+    }
+
+    let capture = Capture::default();
+    let messages = capture.0.clone();
+    let subscriber = tracing_subscriber::registry().with(capture);
+    let guard = tracing::subscriber::set_default(subscriber);
+    (messages, guard)
+}
+
+/// Regression for #4681 (partial hardening): a committed state install for a
+/// contract that has NO subscriber snapshot must emit an observable WARN
+/// (carrying the contract `instance_id`) instead of returning silently. The
+/// silent early-return was the observability gap that let a cross-node
+/// subscriber miss a committed `UpdateNotification` with nothing logged.
+///
+/// The mock executor has no shared storage, so this exercises the LOCAL-storage
+/// (`else`) branch — see the `_shared_*` tests below for the shared branch.
+#[cfg(feature = "trace")]
+#[tokio::test(flavor = "current_thread")]
+async fn send_update_notification_without_subscribers_emits_warn() {
+    let mut executor = create_executor().await;
+    let contract = test_contract(b"warn_no_subscribers_4681");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    let (messages, guard) = install_log_capture();
+
+    // Fresh install of a contract with NO registered subscribers hits the
+    // missing-snapshot path in `send_update_notification`.
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![1, 2, 3])),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("store contract");
+
+    drop(guard);
+
+    let logs = messages.lock().unwrap();
+    let id_str = instance_id.to_string();
+    assert!(
+        logs.iter().any(|l| l.starts_with("WARN")
+            && l.contains("no subscriber snapshot")
+            && l.contains("local storage")
+            && l.contains(&id_str)),
+        "expected a local-storage WARN naming instance_id {id_str}; captured: {logs:?}"
+    );
+}
+
+/// Regression for #4681 (main revise item): the empty-but-present case. The
+/// channel-closed cleanup inside `send_update_notification` empties a
+/// subscriber vec in place (leaving `Some([])` in the map), so the NEXT
+/// committed update must still emit a WARN — an empty snapshot is as silent a
+/// drop as a missing one, and is the MORE diagnostic case (a subscriber was
+/// registered and lost). LOCAL-storage branch.
+#[cfg(feature = "trace")]
+#[tokio::test(flavor = "current_thread")]
+async fn send_update_notification_empty_local_snapshot_emits_warn() {
+    let mut executor = create_executor().await;
+    let contract = test_contract(b"warn_empty_local_4681");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    // Simulate the post-cleanup state: an entry that exists but whose
+    // subscriber vec has been emptied by the channel-closed `retain`. The
+    // matching (empty) `subscriber_summaries` entry mirrors the real cleanup,
+    // which retains the summaries map. (`pool_tests` is a descendant module of
+    // `executor`, so it may touch these private fields.)
+    executor
+        .update_notifications
+        .insert(instance_id, Vec::new());
+    executor
+        .subscriber_summaries
+        .insert(instance_id, std::collections::HashMap::new());
+
+    let (messages, guard) = install_log_capture();
+
+    // Fresh install still calls `send_update_notification`; it now finds a
+    // present-but-empty local snapshot.
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![9, 9, 9])),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("store contract");
+
+    drop(guard);
+
+    let logs = messages.lock().unwrap();
+    let id_str = instance_id.to_string();
+    assert!(
+        logs.iter().any(|l| l.starts_with("WARN")
+            && l.contains("no subscriber snapshot")
+            && l.contains("local storage")
+            && l.contains(&id_str)),
+        "an empty (present) local snapshot must still WARN naming instance_id \
+         {id_str}; captured: {logs:?}"
+    );
+}
+
+/// Regression for #4681: the SHARED-storage branch — the exact path the issue
+/// cites (`shared_notifications.get(&instance_id) == None`). A committed update
+/// with no shared subscriber entry must emit a shared-storage WARN.
+#[cfg(feature = "trace")]
+#[tokio::test(flavor = "current_thread")]
+async fn send_update_notification_missing_shared_snapshot_emits_warn() {
+    let mut executor = create_executor().await;
+    // Attach empty shared storage so `send_update_notification` takes the
+    // shared branch instead of the local one.
+    executor.set_shared_notifications(
+        std::sync::Arc::new(dashmap::DashMap::new()),
+        std::sync::Arc::new(dashmap::DashMap::new()),
+        std::sync::Arc::new(dashmap::DashMap::new()),
+    );
+
+    let contract = test_contract(b"warn_missing_shared_4681");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    let (messages, guard) = install_log_capture();
+
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![1, 2, 3])),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("store contract");
+
+    drop(guard);
+
+    let logs = messages.lock().unwrap();
+    let id_str = instance_id.to_string();
+    assert!(
+        logs.iter().any(|l| l.starts_with("WARN")
+            && l.contains("no subscriber snapshot")
+            && l.contains("shared storage")
+            && l.contains(&id_str)),
+        "expected a shared-storage WARN naming instance_id {id_str}; captured: {logs:?}"
+    );
+}
+
+/// Regression for #4681 (main revise item), SHARED-storage branch: a
+/// present-but-EMPTY shared subscriber vec (the state the in-place channel-
+/// closed `retain` leaves behind) must still emit a shared-storage WARN rather
+/// than snapshotting `Some([])` and returning silently.
+#[cfg(feature = "trace")]
+#[tokio::test(flavor = "current_thread")]
+async fn send_update_notification_empty_shared_snapshot_emits_warn() {
+    let mut executor = create_executor().await;
+    let shared_notifications = std::sync::Arc::new(dashmap::DashMap::new());
+    executor.set_shared_notifications(
+        shared_notifications.clone(),
+        std::sync::Arc::new(dashmap::DashMap::new()),
+        std::sync::Arc::new(dashmap::DashMap::new()),
+    );
+
+    let contract = test_contract(b"warn_empty_shared_4681");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    // Pre-seed a present-but-empty subscriber vec (post-`retain` state).
+    shared_notifications.insert(instance_id, Vec::new());
+
+    let (messages, guard) = install_log_capture();
+
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![7, 7, 7])),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("store contract");
+
+    drop(guard);
+
+    let logs = messages.lock().unwrap();
+    let id_str = instance_id.to_string();
+    assert!(
+        logs.iter().any(|l| l.starts_with("WARN")
+            && l.contains("no subscriber snapshot")
+            && l.contains("shared storage")
+            && l.contains(&id_str)),
+        "an empty (present) shared snapshot must still WARN naming instance_id \
+         {id_str}; captured: {logs:?}"
+    );
+}

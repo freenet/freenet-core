@@ -2161,10 +2161,28 @@ where
         ) {
             // Snapshot subscribers and release the DashMap read-lock before sending
             let notifiers_snapshot: Vec<(ClientId, mpsc::Sender<HostResult>)> =
-                match shared_notifications.get(&instance_id) {
-                    Some(notifiers) => notifiers.value().clone(),
-                    None => return Ok(()),
-                };
+                shared_notifications
+                    .get(&instance_id)
+                    .map_or_else(Vec::new, |notifiers| notifiers.value().clone());
+
+            // #4681: a committed update found no LIVE subscriber for this
+            // contract — either no map entry at all, OR an empty subscriber vec
+            // left behind by the channel-closed cleanup below (`retain` removes
+            // the last dead subscriber but leaves the emptied entry in the map,
+            // so the next committed update snapshots `Some([])`). Both cases are
+            // fully silent drops for a contract that may have had a registered
+            // subscriber, so surface them with a WARN (instance + total
+            // registered-contract count) instead of returning silently — a
+            // notification dropped for a registered subscriber is never invisible.
+            if notifiers_snapshot.is_empty() {
+                tracing::warn!(
+                    %instance_id,
+                    registered_contracts = shared_notifications.len(),
+                    "send_update_notification: no subscriber snapshot for contract \
+                     (shared storage); update notification not delivered"
+                );
+                return Ok(());
+            }
 
             let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> =
                 shared_summaries
@@ -2271,7 +2289,14 @@ where
                     }
                 }
             }
-        } else if let Some(notifiers) = self.update_notifications.get_mut(&instance_id) {
+        } else if let Some(notifiers) = self
+            .update_notifications
+            .get_mut(&instance_id)
+            .filter(|notifiers| !notifiers.is_empty())
+        {
+            // #4681: only take the fan-out path when a LIVE subscriber remains.
+            // A present-but-EMPTY entry (left by the channel-closed cleanup
+            // below) is routed to the `else` WARN, not silently skipped.
             let summaries = self.subscriber_summaries.get_mut(&instance_id).unwrap();
 
             if notifiers.len() > super::FANOUT_WARNING_THRESHOLD {
@@ -2356,6 +2381,18 @@ where
                     }
                 }
             }
+        } else {
+            // #4681: mirror the shared-storage observability for the local
+            // (non-pool) executor — a committed update with no LIVE subscriber
+            // for this contract (no map entry at all, OR an empty subscriber vec
+            // left behind by the channel-closed cleanup above) must not vanish
+            // silently.
+            tracing::warn!(
+                %instance_id,
+                registered_contracts = self.update_notifications.len(),
+                "send_update_notification: no subscriber snapshot for contract \
+                 (local storage); update notification not delivered"
+            );
         }
         Ok(())
     }
