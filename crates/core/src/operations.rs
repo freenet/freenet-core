@@ -663,7 +663,31 @@ pub(crate) async fn has_contract(
         | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
         | crate::contract::ContractHandlerEvent::ClientDisconnect { .. }
+        | crate::contract::ContractHandlerEvent::DropSubscriberListener { .. }
         | crate::contract::ContractHandlerEvent::EvictContract { .. } => Ok(None),
+    }
+}
+
+/// Fire-and-forget: drop the executor-side update notifier for a single
+/// (contract, client) pair after a failed subscribe=true GET/PUT (step 10
+/// §1e / review Fix 2). Best-effort; a send failure is logged, not fatal.
+pub(crate) fn drop_subscriber_listener(
+    op_manager: &crate::node::OpManager,
+    instance_id: freenet_stdlib::prelude::ContractInstanceId,
+    client_id: crate::client_events::ClientId,
+) {
+    if let Err(err) = op_manager.ch_outbound.send_to_handler_fire_and_forget(
+        crate::contract::ContractHandlerEvent::DropSubscriberListener {
+            key: instance_id,
+            client_id,
+        },
+    ) {
+        tracing::debug!(
+            contract = %instance_id,
+            %client_id,
+            error = %err,
+            "failed to notify contract handler to drop subscriber notifier"
+        );
     }
 }
 

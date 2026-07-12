@@ -826,6 +826,11 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// Default implementation is a no-op (for mock executors that don't track subscriptions).
     fn remove_client(&self, _client_id: ClientId) {}
 
+    /// Remove the update notifier for a single (contract, client) pair.
+    /// Default no-op (mock executors don't track notifiers). The real
+    /// pool implementation removes just this pair's entry.
+    fn remove_contract_notifier(&self, _key: ContractInstanceId, _client_id: ClientId) {}
+
     /// Reclaim a contract's on-disk storage (persisted state + parameters and
     /// the WASM code blob) after the contract was evicted from the hosting
     /// cache. Best-effort and idempotent: a double eviction is a no-op.

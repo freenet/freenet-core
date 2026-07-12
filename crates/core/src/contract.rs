@@ -1188,6 +1188,19 @@ where
                         contract_handler.channel().drop_waiting_response(id);
                         continue;
                     }
+                    // Process DropSubscriberListener inline for the same reasons
+                    // as ClientDisconnect: it is a lightweight cleanup that drops
+                    // just ONE (contract, client) notifier (subscribe=true GET/PUT
+                    // failure). Unlike ClientDisconnect it does NOT touch the
+                    // client-wide delegate registry.
+                    if let ContractHandlerEvent::DropSubscriberListener { key, client_id } = &event
+                    {
+                        contract_handler
+                            .executor()
+                            .remove_contract_notifier(*key, *client_id);
+                        contract_handler.channel().drop_waiting_response(id);
+                        continue;
+                    }
                     push_with_background_eviction(
                         &mut contract_handler,
                         &mut fair_queue,
@@ -1899,6 +1912,7 @@ async fn send_queue_full_response(
         | ContractHandlerEvent::GetSummaryResponse { .. }
         | ContractHandlerEvent::GetDeltaResponse { .. }
         | ContractHandlerEvent::ClientDisconnect { .. }
+        | ContractHandlerEvent::DropSubscriberListener { .. }
         | ContractHandlerEvent::EvictContract { .. } => {
             channel.drop_waiting_response(rejected.id);
             return;
@@ -2617,6 +2631,12 @@ where
         }
         ContractHandlerEvent::ClientDisconnect { client_id } => {
             contract_handler.executor().remove_client(client_id);
+            contract_handler.channel().drop_waiting_response(id);
+        }
+        ContractHandlerEvent::DropSubscriberListener { key, client_id } => {
+            contract_handler
+                .executor()
+                .remove_contract_notifier(key, client_id);
             contract_handler.channel().drop_waiting_response(id);
         }
         ContractHandlerEvent::EvictContract {

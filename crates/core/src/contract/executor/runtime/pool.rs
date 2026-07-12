@@ -1315,6 +1315,49 @@ impl ContractExecutor for RuntimePool {
         }
     }
 
+    /// Remove the update notifier for a single (contract, client) pair.
+    ///
+    /// Per-(contract, client) counterpart to [`Self::remove_client`], used
+    /// when a subscribe=true GET/PUT fails so the leaked notifier does not
+    /// linger until the client disconnects. Mirrors `remove_client` but is
+    /// scoped to ONE contract instead of every contract the client holds.
+    fn remove_contract_notifier(&self, key: ContractInstanceId, client_id: ClientId) {
+        let mut removed = false;
+        if let Some(mut channels) = self.shared_notifications.get_mut(&key) {
+            if let Ok(i) = channels.binary_search_by_key(&&client_id, |(id, _)| id) {
+                channels.remove(i);
+                removed = true;
+            }
+        }
+        // Drop the now-empty contract entry (matches remove_client's retain semantics).
+        self.shared_notifications
+            .remove_if(&key, |_, v| v.is_empty());
+
+        if let Some(mut client_summaries) = self.shared_summaries.get_mut(&key) {
+            client_summaries.remove(&client_id);
+        }
+        self.shared_summaries.remove_if(&key, |_, v| v.is_empty());
+
+        if removed {
+            // Decrement the per-client subscription counter by exactly one — the
+            // inverse of register_contract_notifier's `+= 1` for a new (contract,
+            // client) pair. remove_client resets the WHOLE client count, which is
+            // correct for a full disconnect but WRONG here: this client may still
+            // hold notifiers for OTHER contracts, so we only subtract the one we
+            // removed. Remove the entry entirely at zero to avoid a stale key.
+            if let Some(mut count) = self.shared_client_counts.get_mut(&client_id) {
+                *count = count.saturating_sub(1);
+            }
+            self.shared_client_counts
+                .remove_if(&client_id, |_, v| *v == 0);
+            tracing::debug!(
+                contract = %key,
+                %client_id,
+                "Dropped single-contract subscriber notifier"
+            );
+        }
+    }
+
     async fn summarize_contract_state(
         &mut self,
         key: ContractKey,
