@@ -4,7 +4,6 @@ use crate::node::OpManager;
 use crate::wasm_runtime::{
     InMemoryContractStore, MockStateStorage, StateStorage, UserSecretContext,
 };
-use dashmap::DashSet;
 use std::sync::Arc;
 
 // =============================================================================
@@ -23,28 +22,47 @@ use std::sync::Arc;
 // as recipient's summary, the next delta will have wrong from_version, causing
 // delta application to fail and trigger ResyncRequest.
 
-/// Global registry of contracts using CRDT emulation mode.
-/// Thread-safe for use across multiple simulation nodes.
-static CRDT_CONTRACTS: std::sync::LazyLock<DashSet<ContractInstanceId>> =
-    std::sync::LazyLock::new(DashSet::new);
+// Per-thread registry of contracts using CRDT emulation mode.
+//
+// This is thread-local (not a process-global `DashSet`) so that parallel
+// simulation tests do not interfere: every sim test's
+// `setup_deterministic_state` calls `clear_crdt_contracts()`, and several
+// tests clear on teardown. A process-global registry let one test's clear
+// wipe a concurrently-running test's registrations, deregistering a CRDT
+// contract mid-run so `get_contract_state_delta` fell through to full-state
+// sync (the intermittent `delta_sends=0` flake, #4751).
+//
+// Every simulation runner drives `MockRuntime` on the SAME thread that calls
+// `register_crdt_contract` (Turmoil is single-threaded; the direct runner and
+// the `current_thread` unit tests are driven by `block_on` on the test
+// thread), and this module never spawns work off-thread, so per-thread state
+// is both correct and visible to the executor. This mirrors the thread-local
+// pattern already used for `GlobalRng` and `GlobalTestMetrics`.
+std::thread_local! {
+    static CRDT_CONTRACTS: std::cell::RefCell<HashSet<ContractInstanceId>> =
+        std::cell::RefCell::new(HashSet::new());
+}
 
-/// Register a contract to use CRDT emulation mode.
+/// Register a contract to use CRDT emulation mode (on the current thread).
 ///
 /// CRDT mode enables version-aware delta computation and application,
 /// which can trigger ResyncRequests when summary caching is incorrect.
 pub fn register_crdt_contract(contract_id: ContractInstanceId) {
-    CRDT_CONTRACTS.insert(contract_id);
+    CRDT_CONTRACTS.with(|set| set.borrow_mut().insert(contract_id));
     tracing::debug!(contract = %contract_id, "Registered contract for CRDT emulation mode");
 }
 
-/// Check if a contract uses CRDT emulation mode.
+/// Check if a contract uses CRDT emulation mode (on the current thread).
 pub fn is_crdt_contract(contract_id: &ContractInstanceId) -> bool {
-    CRDT_CONTRACTS.contains(contract_id)
+    CRDT_CONTRACTS.with(|set| set.borrow().contains(contract_id))
 }
 
-/// Clear all CRDT contract registrations (for test cleanup).
+/// Clear this thread's CRDT contract registrations (for test cleanup).
+///
+/// Only affects the calling thread; concurrent tests on other threads keep
+/// their own registrations.
 pub fn clear_crdt_contracts() {
-    CRDT_CONTRACTS.clear();
+    CRDT_CONTRACTS.with(|set| set.borrow_mut().clear());
 }
 
 /// CRDT state encoding: [version: u64 LE][data]
@@ -1313,7 +1331,7 @@ pub(crate) mod test {
         let (version, data) = crdt_encoding::decode_state(stored.as_ref()).unwrap();
         assert_eq!(version, 2);
         assert_eq!(data, b"updated data v2");
-        // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
+        // Registry is thread-local, so parallel tests don't share it and no cleanup is needed.
     }
 
     /// Test that lower version is rejected in CRDT mode delta application
@@ -1357,7 +1375,7 @@ pub(crate) mod test {
         let (version, data) = crdt_encoding::decode_state(stored.as_ref()).unwrap();
         assert_eq!(version, 5);
         assert_eq!(data, b"version 5 data");
-        // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
+        // Registry is thread-local, so parallel tests don't share it and no cleanup is needed.
     }
 
     /// Test that equal versions use hash comparison as tiebreaker
@@ -1413,7 +1431,7 @@ pub(crate) mod test {
         let (version, data) = crdt_encoding::decode_state(stored.as_ref()).unwrap();
         assert_eq!(version, 5);
         assert_eq!(data, larger_data);
-        // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
+        // Registry is thread-local, so parallel tests don't share it and no cleanup is needed.
     }
 
     /// Test that equal version with smaller hash is rejected
@@ -1469,7 +1487,7 @@ pub(crate) mod test {
         let (version, data) = crdt_encoding::decode_state(stored.as_ref()).unwrap();
         assert_eq!(version, 5);
         assert_eq!(data, larger_data);
-        // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
+        // Registry is thread-local, so parallel tests don't share it and no cleanup is needed.
     }
 
     /// Test that CRDT emulation mode converges regardless of delta arrival order
@@ -1483,8 +1501,8 @@ pub(crate) mod test {
         let key = contract.key();
         let contract_id = *key.id();
 
-        // Register ONCE at the beginning - don't clear during test to avoid race conditions
-        // with parallel tests that share the global CRDT_CONTRACTS registry
+        // Register for CRDT mode. The registry is thread-local, so parallel
+        // tests on other threads can neither observe nor clear this registration.
         register_crdt_contract(contract_id);
 
         // Define 3 deltas representing updates v1->v2, v2->v3, and a "late" v1->v2
@@ -1690,7 +1708,63 @@ pub(crate) mod test {
         let (version, data) = crdt_encoding::decode_state(stored.as_ref()).unwrap();
         assert_eq!(version, 2);
         assert_eq!(data, b"version 2 data");
-        // Note: Don't call clear_crdt_contracts() - tests run in parallel and share the global registry
+        // Registry is thread-local, so parallel tests don't share it and no cleanup is needed.
+    }
+
+    /// Regression test for #4751: the CRDT emulation registry must be
+    /// thread-local so a concurrently-running test's `clear_crdt_contracts()`
+    /// (invoked from `setup_deterministic_state` at the start of every sim
+    /// test) cannot clobber THIS thread's registrations.
+    ///
+    /// Before this fix the registry was a process-global `DashSet`, so a
+    /// parallel test clearing it deregistered a still-running test's contract
+    /// mid-flight. That made `get_contract_state_delta` fall through to the
+    /// full-state path (`is_crdt_contract` returning false), producing the
+    /// intermittent `delta_sends=0` flake in the summary-first sim tests under
+    /// plain parallel `cargo test`.
+    #[test]
+    fn crdt_registry_is_thread_local_isolated() {
+        let contract = create_test_contract(b"crdt_thread_local_isolation");
+        let id = *contract.key().id();
+
+        // Register on THIS thread.
+        register_crdt_contract(id);
+        assert!(
+            is_crdt_contract(&id),
+            "registration must be visible on the registering thread"
+        );
+
+        // Simulate a parallel test's setup_deterministic_state() clearing the
+        // registry from its OWN thread. With a process-global registry this
+        // wipes our registration; with a thread-local one it must not.
+        std::thread::spawn(clear_crdt_contracts)
+            .join()
+            .expect("clear thread should not panic");
+
+        assert!(
+            is_crdt_contract(&id),
+            "another thread's clear_crdt_contracts() must not deregister this thread's contract"
+        );
+
+        // Inverse isolation: a registration made on another thread must not be
+        // visible here.
+        let other_contract = create_test_contract(b"crdt_thread_local_other");
+        let other_id = *other_contract.key().id();
+        let visible_on_other = std::thread::spawn(move || {
+            register_crdt_contract(other_id);
+            is_crdt_contract(&other_id)
+        })
+        .join()
+        .expect("register thread should not panic");
+
+        assert!(
+            visible_on_other,
+            "registration must be visible on the thread that made it"
+        );
+        assert!(
+            !is_crdt_contract(&other_id),
+            "another thread's registration must not be visible on this thread"
+        );
     }
 
     /// Verify that the corrupted-state recovery guard on the executor:
