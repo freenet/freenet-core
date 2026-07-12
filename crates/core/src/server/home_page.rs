@@ -942,6 +942,23 @@ mod tests {
              so a later clearTimeout(refreshTimer) can't silently no-op \
              against an already-fired timer id"
         );
+        // The BEHAVIORAL coverage for this state machine lives in
+        // dashboard_refresh.test.mjs (run via `npm test` in
+        // crates/core/src/server, wired into the lint-assets CI job), which
+        // extracts createRefreshScheduler between these markers and drives it
+        // under Node with fake timers. Pin the markers here so a Rust-side
+        // refactor can't silently strip the extraction points that test
+        // depends on.
+        assert!(
+            JS.contains("refresh-scheduler:BEGIN") && JS.contains("refresh-scheduler:END"),
+            "JS must keep the refresh-scheduler:BEGIN/END markers — \
+             dashboard_refresh.test.mjs extracts the scheduler between them"
+        );
+        assert!(
+            JS.contains("function createRefreshScheduler("),
+            "JS must keep the injectable createRefreshScheduler factory \
+             that dashboard_refresh.test.mjs tests behaviorally"
+        );
     }
 
     #[test]
