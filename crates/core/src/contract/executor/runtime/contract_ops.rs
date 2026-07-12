@@ -345,11 +345,17 @@ impl Executor<Runtime> {
         // Disk-budget admission gate for the code blob (#4683, PR 3): charge the
         // blob only if it is not already on disk (dedup — a re-PUT of existing
         // code adds nothing). Reject before storing; nothing has landed.
+        //
+        // Probe by CODE HASH (#4218), not by instance id via `fetch_contract`: a
+        // new instance of already-stored code (same code hash, different params)
+        // shares the one on-disk `.wasm` blob, so it must NOT be charged again.
+        // An instance-keyed probe reported such a second instance as absent and
+        // double-counted the shared blob — divergently across pool executors,
+        // whose instance indexes were previously per-executor.
         let code_already_stored = self
             .runtime
             .contract_store
-            .fetch_contract(&key, &params)
-            .is_some();
+            .code_blob_stored(key.code_hash());
         let blob_len = contract.data().len();
         if !code_already_stored {
             if let Some(op_manager) = &self.op_manager {

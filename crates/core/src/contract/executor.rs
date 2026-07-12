@@ -29,7 +29,8 @@ use crate::node::OpManager;
 use crate::operations::get::GetResult;
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
-    SecretsStore, StateStorage, StateStore, StateStoreError, UserSecretContext,
+    SecretsStore, SharedContractIndex, StateStorage, StateStore, StateStoreError,
+    UserSecretContext,
 };
 use crate::{
     client_events::{ClientId, HostResult},
@@ -1059,7 +1060,10 @@ where
 
         let db = Storage::new(&config.db_dir()).await?;
         let state_store = StateStore::new(db.clone(), MAX_MEM_CACHE).unwrap();
-        let (contract_store, delegate_store, secret_store) = Self::get_runtime_stores(config, db)?;
+        // Standalone executor: no pool, so its ContractStore owns a fresh
+        // (unshared) instance index.
+        let (contract_store, delegate_store, secret_store) =
+            Self::get_runtime_stores(config, db, None)?;
 
         Ok((contract_store, delegate_store, secret_store, state_store))
     }
@@ -1067,13 +1071,26 @@ where
     /// Create only the Runtime stores (contract, delegate, secrets) without StateStore.
     /// Used by RuntimePool to create executors that share a StateStore.
     /// The Storage (ReDb) is shared across all stores for index persistence.
+    ///
+    /// `shared_contract_index` is `Some` for pool executors so every executor's
+    /// `ContractStore` shares one live `ContractInstanceId -> CodeHash` map
+    /// (#4218); `None` for standalone executors, which get a fresh index.
     pub(crate) fn get_runtime_stores(
         config: &Config,
         db: Storage,
+        shared_contract_index: Option<SharedContractIndex>,
     ) -> Result<(ContractStore, DelegateStore, SecretsStore), anyhow::Error> {
         const MAX_SIZE: u64 = 10 * 1024 * 1024;
 
-        let contract_store = ContractStore::new(config.contracts_dir(), MAX_SIZE, db.clone())?;
+        let contract_store = match shared_contract_index {
+            Some(index) => ContractStore::new_with_shared_index(
+                config.contracts_dir(),
+                MAX_SIZE,
+                db.clone(),
+                index,
+            )?,
+            None => ContractStore::new(config.contracts_dir(), MAX_SIZE, db.clone())?,
+        };
         let delegate_store = DelegateStore::new(config.delegates_dir(), MAX_SIZE, db.clone())?;
         // Thread the operator-configured per-user secret quota (#4561, P5 of
         // #4381) into the store at construction. `0` = disabled (the default).

@@ -18,7 +18,7 @@ mod state_store;
 mod tests;
 
 pub(crate) use contract::{ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge};
-pub use contract_store::ContractStore;
+pub use contract_store::{ContractStore, SharedContractIndex};
 pub(crate) use delegate::DelegateRuntimeInterface;
 pub use delegate_store::DelegateStore;
 pub(crate) use engine::BackendEngine;

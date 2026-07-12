@@ -73,6 +73,11 @@ pub struct RuntimePool {
     shared_client_counts: SharedClientCounts,
     /// Shared compiled contract module cache (avoids 16x duplication across pool executors).
     shared_contract_modules: SharedModuleCache<ContractKey>,
+    /// Shared contract instance index (`ContractInstanceId -> CodeHash`) so a
+    /// contract stored / indexed / removed via any executor is visible to all
+    /// the others (#4218). Cloned into every executor's `ContractStore` at
+    /// construction and into replacements.
+    shared_contract_index: SharedContractIndex,
     /// Shared compiled delegate module cache.
     shared_delegate_modules: SharedModuleCache<DelegateKey>,
     /// Shared per-delegate `ctx.write()` cache (see `DelegateContextCache`).
@@ -381,6 +386,11 @@ impl RuntimePool {
         let shared_recovery_guard: super::CorruptedStateRecoveryGuard =
             Arc::new(std::sync::Mutex::new(HashSet::new()));
 
+        // Pool-owned contract instance index shared by every executor's
+        // `ContractStore` (#4218). The first executor loads it from ReDb; the
+        // rest inherit the same live `Arc`.
+        let shared_contract_index: SharedContractIndex = Arc::new(DashMap::new());
+
         // Create the first executor to obtain a backend engine, then share it
         // with all subsequent executors. All executors MUST share the same backend
         // engine because compiled modules store references tied to the compiling
@@ -393,6 +403,7 @@ impl RuntimePool {
             shared_delegate_modules.clone(),
             shared_delegate_contexts.clone(),
             None, // No shared backend yet — this executor creates the engine
+            shared_contract_index.clone(),
         )
         .await?;
         let shared_backend_engine = first_executor.runtime.clone_backend_engine();
@@ -414,6 +425,7 @@ impl RuntimePool {
                 shared_delegate_modules.clone(),
                 shared_delegate_contexts.clone(),
                 Some(shared_backend_engine.clone()),
+                shared_contract_index.clone(),
             )
             .await?;
 
@@ -476,6 +488,7 @@ impl RuntimePool {
             shared_summaries,
             shared_client_counts,
             shared_contract_modules,
+            shared_contract_index,
             shared_delegate_modules,
             shared_delegate_contexts,
             shared_backend_engine,
@@ -661,6 +674,7 @@ impl RuntimePool {
             self.shared_delegate_modules.clone(),
             self.shared_delegate_contexts.clone(),
             Some(self.shared_backend_engine.clone()),
+            self.shared_contract_index.clone(),
         )
         .await?;
 
