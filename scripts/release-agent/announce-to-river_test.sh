@@ -487,6 +487,31 @@ read_room_messages() { echo "[t]: unrelated chatter only, message never lands"; 
 rc=0; verify_converged_with_retry || rc=$?
 check "verify_converged_with_retry() returns nonzero when the message never converges (real drop)" "$rc" "1"
 
+# ── clamp_verify_budget() ────────────────────────────────────────────
+#
+# The env-override guard: a non-numeric or absurd VERIFY_INTERVAL/VERIFY_ATTEMPTS
+# (e.g. VERIFY_INTERVAL=inf) would hang `sleep` in the retry loop forever, so the
+# budget must be wall-clock-bounded. clamp_verify_budget rejects anything that is
+# not a plain non-negative integer (ATTEMPTS also must be >= 1) and falls back to
+# the defaults. Extracted verbatim.
+eval "$(awk '/^clamp_verify_budget\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+
+VERIFY_ATTEMPTS=abc; VERIFY_INTERVAL=5; clamp_verify_budget
+check "clamp: non-numeric VERIFY_ATTEMPTS falls back to 24" "$VERIFY_ATTEMPTS" "24"
+
+VERIFY_ATTEMPTS=0; VERIFY_INTERVAL=5; clamp_verify_budget
+check "clamp: VERIFY_ATTEMPTS=0 (below min) falls back to 24" "$VERIFY_ATTEMPTS" "24"
+
+VERIFY_ATTEMPTS=24; VERIFY_INTERVAL=inf; clamp_verify_budget
+check "clamp: non-numeric VERIFY_INTERVAL (inf) falls back to 5" "$VERIFY_INTERVAL" "5"
+
+VERIFY_ATTEMPTS=10; VERIFY_INTERVAL=3; clamp_verify_budget
+check "clamp: valid VERIFY_ATTEMPTS is left unchanged" "$VERIFY_ATTEMPTS" "10"
+check "clamp: valid VERIFY_INTERVAL is left unchanged" "$VERIFY_INTERVAL" "3"
+
+VERIFY_ATTEMPTS=5; VERIFY_INTERVAL=0; clamp_verify_budget
+check "clamp: VERIFY_INTERVAL=0 is valid (tight poll) and preserved" "$VERIFY_INTERVAL" "0"
+
 # ── send_message_checked() exit-code preservation ────────────────────
 #
 # Regression for the Codex finding: the success path originally used

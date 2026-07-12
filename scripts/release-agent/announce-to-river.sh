@@ -77,13 +77,7 @@ READ_PROBE_TIMEOUT="${READ_PROBE_TIMEOUT:-15}"
 # Overridable (e.g. VERIFY_ATTEMPTS=1 in tests for the single-shot cases).
 VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-24}"
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-5}"
-# Guard the overrides: a non-numeric or absurd value (e.g. VERIFY_INTERVAL=inf)
-# would make `sleep` hang the retry loop forever, so the budget must be
-# wall-clock-bounded, not just attempt-bounded. Require plain non-negative
-# integers; fall back to the defaults otherwise. (ATTEMPTS must be >= 1 to run at
-# least one read; INTERVAL may be 0 — tests set it so, and 0 just polls tightly.)
-[[ "$VERIFY_ATTEMPTS" =~ ^[0-9]+$ ]] && (( VERIFY_ATTEMPTS >= 1 )) || VERIFY_ATTEMPTS=24
-[[ "$VERIFY_INTERVAL" =~ ^[0-9]+$ ]] || VERIFY_INTERVAL=5
+# Overrides are sanity-clamped just before use — see clamp_verify_budget().
 # Target release version this announcement is for, WITHOUT a leading `v`
 # (e.g. "0.2.90"). Plumbed end-to-end from release-announce.yml's `resolve`
 # job → the nova release-agent (ANNOUNCE_TARGET_VERSION env on the sudo
@@ -245,6 +239,17 @@ verify_converged_with_retry() {
         fi
     done
     return 1
+}
+
+# Sanity-clamp the VERIFY_ATTEMPTS/VERIFY_INTERVAL overrides. A non-numeric or
+# absurd value (e.g. VERIFY_INTERVAL=inf) would make `sleep` hang the retry loop
+# forever, leaving the budget only attempt-bounded, not wall-clock-bounded. Require
+# plain non-negative integers, falling back to the defaults otherwise (ATTEMPTS
+# must be >= 1 to run at least one read; INTERVAL may be 0 — 0 just polls tightly).
+clamp_verify_budget() {
+    [[ "$VERIFY_ATTEMPTS" =~ ^[0-9]+$ ]] && (( VERIFY_ATTEMPTS >= 1 )) || VERIFY_ATTEMPTS=24
+    [[ "$VERIFY_INTERVAL" =~ ^[0-9]+$ ]] || VERIFY_INTERVAL=5
+    return 0
 }
 
 # Report the version of the locally running freenet node by parsing
@@ -529,6 +534,7 @@ if [[ -n "$SKIP_POST_VERIFY" ]]; then
     exit 0
 fi
 
+clamp_verify_budget
 if verify_converged_with_retry; then
     log "OK (verified message present in room state after ${VERIFY_ATTEMPT} read attempt(s))"
     exit 0
