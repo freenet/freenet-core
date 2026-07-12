@@ -471,7 +471,7 @@ fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceI
         | ContractHandlerEvent::GetResponse { .. }
         | ContractHandlerEvent::UpdateResponse { .. }
         | ContractHandlerEvent::UpdateNoChange { .. }
-        | ContractHandlerEvent::RegisterSubscriberListenerResponse
+        | ContractHandlerEvent::RegisterSubscriberListenerResponse { .. }
         | ContractHandlerEvent::QuerySubscriptions { .. }
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
@@ -1143,7 +1143,7 @@ mod tests {
             ),
             (
                 "RegisterSubscriberListenerResponse",
-                ContractHandlerEvent::RegisterSubscriberListenerResponse,
+                ContractHandlerEvent::RegisterSubscriberListenerResponse { result: Ok(()) },
             ),
             (
                 "QuerySubscriptionsResponse",

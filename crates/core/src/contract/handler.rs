@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use futures::Stream;
 
-use freenet_stdlib::client_api::DelegateRequest;
+use freenet_stdlib::client_api::{DelegateRequest, RequestError};
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -896,7 +896,13 @@ pub(crate) enum ContractHandlerEvent {
         summary: Option<StateSummary<'static>>,
         subscriber_listener: mpsc::Sender<HostResult>,
     },
-    RegisterSubscriberListenerResponse,
+    RegisterSubscriberListenerResponse {
+        /// `Ok(())` when the subscriber notifier was registered, `Err` when
+        /// registration was rejected (e.g. subscriber-limit exceeded). Carrying
+        /// the result lets the client-facing caller surface a real failure
+        /// instead of a fake successful subscribe (#4681).
+        result: Result<(), Box<RequestError>>,
+    },
     #[allow(dead_code)]
     QuerySubscriptions {
         callback: tokio::sync::mpsc::Sender<QueryResult>,
@@ -1033,9 +1039,10 @@ impl std::fmt::Display for ContractHandlerEvent {
                     "register subscriber listener {{ {key}, client_id: {client_id} }}",
                 )
             }
-            ContractHandlerEvent::RegisterSubscriberListenerResponse => {
-                write!(f, "register subscriber listener response")
-            }
+            ContractHandlerEvent::RegisterSubscriberListenerResponse { result } => match result {
+                Ok(()) => write!(f, "register subscriber listener response"),
+                Err(e) => write!(f, "register subscriber listener failed {{ {e} }}"),
+            },
             ContractHandlerEvent::QuerySubscriptions { .. } => {
                 write!(f, "query subscriptions")
             }

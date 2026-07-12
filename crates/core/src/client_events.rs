@@ -85,7 +85,7 @@ async fn register_subscription_listener(
             );
         });
     match register_listener {
-        Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
+        Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse { result: Ok(()) }) => {
             tracing::debug!(
                 client_id = %client_id,
                 contract = %instance_id,
@@ -103,6 +103,20 @@ async fn register_subscription_listener(
                 }
             }
             Ok(())
+        }
+        // #4681: registration was rejected (e.g. subscriber-limit reached).
+        // Forward the underlying RequestError so the client sees the real
+        // reason instead of a generic "unexpected op state".
+        Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse { result: Err(e) }) => {
+            tracing::error!(
+                client_id = %client_id,
+                contract = %instance_id,
+                operation = operation_type,
+                error = %e,
+                phase = "registration_failed",
+                "Subscriber listener registration rejected"
+            );
+            Err(Error::Registration(e))
         }
         _ => {
             tracing::error!(
@@ -1276,7 +1290,9 @@ async fn process_open_request(
                                 );
                             });
                         match register_listener {
-                            Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse) => {
+                            Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse {
+                                result: Ok(()),
+                            }) => {
                                 tracing::debug!(
                                     client_id = %client_id,
                                     request_id = %request_id,
@@ -1295,6 +1311,23 @@ async fn process_open_request(
                                         op_manager.ring.register_events(Either::Left(event)).await;
                                     }
                                 }
+                            }
+                            // #4681: registration rejected (e.g. subscriber-limit
+                            // reached). Forward the underlying RequestError so the
+                            // client sees the real reason instead of a generic
+                            // "unexpected op state".
+                            Ok(ContractHandlerEvent::RegisterSubscriberListenerResponse {
+                                result: Err(e),
+                            }) => {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    contract = %key,
+                                    error = %e,
+                                    phase = "registration_failed",
+                                    "Subscriber listener registration rejected"
+                                );
+                                return Err(Error::Registration(e));
                             }
                             _ => {
                                 tracing::error!(
