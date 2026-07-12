@@ -49,6 +49,7 @@
 use std::time::Duration;
 
 use crate::node::background_task_monitor::BackgroundTaskMonitor;
+use crate::simulation::{RealTime, TimeSource};
 use crate::transport::TRANSPORT_METRICS;
 use crate::transport::shadow_stats::{SHADOW_ROLLUP_WINDOW_SECS, WindowedStat};
 
@@ -76,34 +77,42 @@ pub(crate) fn spawn_iface_tx_monitor(local_peer_id: String, monitor: &Background
         // the cadence. `prev_total` and `prev_own` are sampled together so
         // their deltas cover the same window.
         ticker.tick().await;
+        // Monotonic clock (tokio-backed, so it advances with paused time in
+        // tests and reflects true wall-clock — including executor stalls — in
+        // production). The elapsed interval used to normalize a delta to a
+        // per-second rate MUST come from this clock, NOT a tick counter: under
+        // `MissedTickBehavior::Delay` a stalled executor makes one `tick()`
+        // span several wall-clock seconds, so a tick counter would divide by
+        // too few seconds and still fake a burst.
+        let time = RealTime::new();
         let mut prev_total = read_total_tx_bytes().await;
         let mut prev_own = TRANSPORT_METRICS.cumulative_bytes_sent();
-        // Seconds elapsed since the baseline (`prev_*`) was last taken. Ticks
-        // whose `/proc/net/dev` read fails do NOT advance the baseline, so a
-        // gap of failed reads makes the next successful interval span several
-        // seconds. Dividing the delta by this interval normalizes it back to a
-        // per-second rate, so a bridged gap is not misreported as a single
-        // one-second burst.
-        let mut secs_since_baseline: u64 = 0;
+        // Wall-clock nanos when the baseline (`prev_*`) was last taken. A failed
+        // `/proc/net/dev` read does NOT advance the baseline, so a gap of failed
+        // reads (or a stall) makes the next successful interval span several
+        // seconds; dividing the delta by the real elapsed interval normalizes
+        // it back to a per-second rate rather than a single one-second burst.
+        let mut baseline_at_nanos = time.now_nanos();
         let mut window = IfaceWindow::default();
 
         loop {
             ticker.tick().await;
-            secs_since_baseline += 1;
             let now_total = read_total_tx_bytes().await;
             let now_own = TRANSPORT_METRICS.cumulative_bytes_sent();
+            let now_nanos = time.now_nanos();
 
             if let (Some(prev), Some(now)) = (prev_total, now_total) {
                 // Bytes over the (possibly multi-second) interval, divided down
                 // to a per-second rate. Both counters share the same interval,
                 // so `op` stays consistent.
+                let interval_secs = elapsed_secs(baseline_at_nanos, now_nanos);
                 let total_delta = now.saturating_sub(prev);
                 let own_delta = now_own.saturating_sub(prev_own);
                 let op_delta = iface_op(total_delta, own_delta);
                 window.record(
-                    per_sec(total_delta, secs_since_baseline),
-                    per_sec(own_delta, secs_since_baseline),
-                    per_sec(op_delta, secs_since_baseline),
+                    per_sec(total_delta, interval_secs),
+                    per_sec(own_delta, interval_secs),
+                    per_sec(op_delta, interval_secs),
                 );
             }
             window.ticks += 1;
@@ -118,7 +127,7 @@ pub(crate) fn spawn_iface_tx_monitor(local_peer_id: String, monitor: &Background
             if now_total.is_some() {
                 prev_total = now_total;
                 prev_own = now_own;
-                secs_since_baseline = 0;
+                baseline_at_nanos = now_nanos;
             }
         }
     });
@@ -207,14 +216,32 @@ fn iface_op(total_delta: u64, own_delta: u64) -> u64 {
 /// Normalize an interval byte delta to a per-second rate.
 ///
 /// A failed `/proc/net/dev` read does not advance the baseline, so after a gap
-/// of `k` consecutive failed reads the next successful interval spans `k + 1`
-/// seconds. Dividing the delta by that elapsed interval keeps the recorded
-/// value a true per-second rate: without it, a whole multi-second byte count
-/// would be folded into a single one-second sample and reported as a fake burst
-/// (inflating both the window mean and its `max`). `interval_secs` is clamped
-/// to at least 1 to avoid a divide-by-zero on the normal every-second path.
+/// of failed reads (or an executor stall) the next successful interval spans
+/// several seconds. Dividing the delta by that elapsed interval keeps the
+/// recorded value a true per-second rate: without it, a whole multi-second byte
+/// count would be folded into a single one-second sample and reported as a fake
+/// burst (inflating both the window mean and its `max`). `interval_secs` is
+/// clamped to at least 1 to avoid a divide-by-zero on the normal every-second
+/// path (and when [`elapsed_secs`] rounds a sub-second interval to 0).
 fn per_sec(delta: u64, interval_secs: u64) -> u64 {
     delta / interval_secs.max(1)
+}
+
+/// Whole seconds elapsed between two monotonic-clock nanosecond readings,
+/// rounded to nearest.
+///
+/// This is the interval [`per_sec`] divides by. It is derived from the
+/// [`TimeSource`] clock, NOT the tick count, on purpose: under
+/// `MissedTickBehavior::Delay` a stalled executor can make one ticker `tick()`
+/// span several wall-clock seconds, so a tick counter would report `1` and
+/// [`per_sec`] would divide by too few seconds — still faking a burst. The
+/// monotonic clock reflects the true elapsed interval, so the stall normalizes
+/// correctly. A sub-second interval rounds to 0; `per_sec`'s `.max(1)` then
+/// treats it as one second.
+fn elapsed_secs(baseline_nanos: u64, now_nanos: u64) -> u64 {
+    let elapsed = now_nanos.saturating_sub(baseline_nanos);
+    // Round to nearest second (add half a second before the integer divide).
+    (elapsed + 500_000_000) / 1_000_000_000
 }
 
 /// Emit one `shadow_iface_tx` rollup covering the closed window. Skips
@@ -350,6 +377,30 @@ mod tests {
         assert_eq!(per_sec(300_000, 30), 10_000);
         // Divide-by-zero guard (interval clamped to >= 1).
         assert_eq!(per_sec(500, 0), 500);
+    }
+
+    #[test]
+    fn elapsed_secs_uses_wall_clock_not_tick_count() {
+        // Normal ~1 s interval.
+        assert_eq!(elapsed_secs(0, 1_000_000_000), 1);
+        // Executor stall: one tick spanning ~5 wall-clock seconds must yield 5,
+        // NOT 1 (which a tick counter would give), so per_sec divides correctly
+        // and a 5 s byte delta is not reported as a single 1 s burst.
+        assert_eq!(elapsed_secs(0, 5_000_000_000), 5);
+        let stalled_delta = 500_000u64; // ~5 s of bytes
+        assert_eq!(
+            per_sec(stalled_delta, elapsed_secs(0, 5_000_000_000)),
+            100_000,
+            "a 5 s stall normalizes to the real per-second rate, not a 5x burst"
+        );
+        // A 30 s bridged gap (baseline offset to prove it is a difference).
+        assert_eq!(elapsed_secs(1_000_000_000, 31_000_000_000), 30);
+        // Rounds to nearest second.
+        assert_eq!(elapsed_secs(0, 1_400_000_000), 1);
+        assert_eq!(elapsed_secs(0, 1_600_000_000), 2);
+        // Sub-second rounds to 0; per_sec's .max(1) then treats it as 1 s.
+        assert_eq!(elapsed_secs(0, 200_000_000), 0);
+        assert_eq!(per_sec(500, elapsed_secs(0, 200_000_000)), 500);
     }
 
     #[test]

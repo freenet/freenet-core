@@ -884,8 +884,11 @@ mod tests {
         let h = RollingRttStatsHandle::new(addr, ts.clone());
         h.record(dur_ms(50));
 
-        // Advance well past two full intervals; the first tick is
-        // skipped, the next two should emit.
+        // Advance a few 1 Hz sample intervals (the first tick is skipped).
+        // No rollup is emitted here — a rollup needs SHADOW_ROLLUP_WINDOW_SECS
+        // (30) samples; this test only exercises the sample loop and asserts
+        // the task survives across ticks. The full sample→emit→reset cycle is
+        // covered by `aggregator_survives_full_window_cycle`.
         tokio::time::advance(AGGREGATOR_INTERVAL * 3 + Duration::from_millis(100)).await;
         // Yield so the spawned task runs.
         tokio::task::yield_now().await;
@@ -903,6 +906,48 @@ mod tests {
         );
 
         drop(h);
+    }
+
+    /// Drive the aggregator through a FULL rollup window so the live
+    /// record → `is_full` → emit → reset cycle actually executes (the shorter
+    /// `aggregator_emits_periodically` stops well before the window closes).
+    /// The OTLP send is a no-op in unit tests (no `TELEMETRY_SENDER` registered),
+    /// so this asserts the cycle runs and the task survives the window boundary
+    /// + reset without panicking, rather than inspecting output. The emit-skip
+    /// branch (`emit_aggregate_rollup` returns early when `window.samples == 0`)
+    /// is pinned deterministically at the window level by the identical guard in
+    /// `reference_ping::tests::rollup_is_skipped_when_no_valid_measurements`;
+    /// this test does not register a peer, so on an unpolluted process-global
+    /// registry it also takes that skip branch, but the survival assertion holds
+    /// regardless of concurrent tests' registry state.
+    #[tokio::test(start_paused = true)]
+    async fn aggregator_survives_full_window_cycle() {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+
+        let monitor = BackgroundTaskMonitor::new();
+        spawn_aggregator("test-peer".to_string(), &monitor);
+
+        // Advance past a full window plus a few samples into the next one, so
+        // the loop hits `is_full`, emits (skipped: no samples), resets, and
+        // keeps going. Yield repeatedly so the spawned task drains every
+        // past-due tick.
+        tokio::time::advance(
+            AGGREGATOR_INTERVAL * (SHADOW_ROLLUP_WINDOW_SECS + 3) + Duration::from_millis(100),
+        )
+        .await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let exit = monitor.wait_for_any_exit();
+        tokio::pin!(exit);
+        let still_running = tokio::time::timeout(Duration::from_millis(50), &mut exit)
+            .await
+            .is_err();
+        assert!(
+            still_running,
+            "aggregator must survive a full window emit+reset cycle"
+        );
     }
 
     /// Source-level pin for the `"shadow_rtt_aggregate"` local file-log

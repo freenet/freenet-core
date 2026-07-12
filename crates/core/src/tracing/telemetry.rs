@@ -718,7 +718,7 @@ impl TelemetryWorker {
     ///   [`MAX_EVENTS_PER_SECOND`] — unchanged from the pre-#4380 behavior.
     /// - `Shadow` events are admitted only while BOTH the shadow sub-budget
     ///   ([`MAX_SHADOW_EVENTS_PER_SECOND`]) AND the aggregate cap have room.
-    ///   Because the sub-budget (4) is strictly below the aggregate cap (10),
+    ///   Because the sub-budget (6) is strictly below the aggregate cap (10),
     ///   shadow events can occupy at most `MAX_SHADOW_EVENTS_PER_SECOND` of
     ///   the slots, always leaving
     ///   `MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND` for

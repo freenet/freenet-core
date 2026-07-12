@@ -144,13 +144,37 @@ async fn run_probe_loop(local_peer_id: String, target: SocketAddr, socket: Defau
                 // would poison the baseline.
             }
         }
-        // Sample the rolling snapshot every second, but emit one OTLP rollup
-        // per SHADOW_ROLLUP_WINDOW_SECS to keep central telemetry volume down.
-        window.record(sample_reference_ping(&stats));
+        // Fold a measurement into the window only when THIS tick's probe
+        // actually succeeded. A failed probe advances the window clock but
+        // contributes no sample — even though `stats.snapshot()` is still
+        // `Some` (the rolling history stays non-empty for up to the baseline
+        // window after any earlier success). Counting that stale snapshot was
+        // the finding #2 bug: a 30 s window of all-failed probes would emit
+        // `samples: 30` with stale RTT stats. Emit one OTLP rollup per
+        // SHADOW_ROLLUP_WINDOW_SECS to keep central telemetry volume down.
+        window.record(sample_for_outcome(&outcome, &stats));
         if window.is_full() {
             emit_reference_ping_rollup(&local_peer_id, target, &window);
             window = RefPingWindow::default();
         }
+    }
+}
+
+/// The window contribution for one probe tick: the current rolling snapshot
+/// when THIS tick produced a fresh RTT sample, otherwise `None`.
+///
+/// A failed probe (`NoResponse` / `SendError`) yields `None` even when
+/// `stats.snapshot()` would return `Some` from earlier successes still inside
+/// the baseline window — a stale snapshot is not a fresh measurement and must
+/// not increment `samples` or fold into the window stats (finding #2). Pulled
+/// out of the probe loop so the fresh-vs-stale gate is unit-testable.
+fn sample_for_outcome(
+    outcome: &ProbeOutcome,
+    stats: &RollingRttStats<RealTime>,
+) -> Option<RefPingSample> {
+    match outcome {
+        ProbeOutcome::Sample(_) => sample_reference_ping(stats),
+        ProbeOutcome::NoResponse | ProbeOutcome::SendError => None,
     }
 }
 
@@ -209,13 +233,16 @@ struct RefPingSample {
 /// Windowed rollup accumulator for the `shadow_reference_ping` stream.
 #[derive(Default)]
 struct RefPingWindow {
-    /// Total 1 Hz ticks elapsed (including warmup/failed-probe ticks that had
-    /// no usable snapshot), used only to decide when the window closes.
+    /// Total 1 Hz ticks elapsed (including warmup/failed-probe ticks that
+    /// produced no fresh measurement), used only to decide when the window
+    /// closes.
     ticks: u32,
-    /// Ticks that contributed a real measurement (the rolling snapshot had
-    /// data). This is the honest denominator for the summary stats and the
-    /// value reported as `samples`; a window of pure warmup/failed probes has
-    /// `samples == 0` and is not emitted.
+    /// Ticks whose probe succeeded THIS tick (a fresh RTT measurement). This is
+    /// the honest denominator for the summary stats and the value reported as
+    /// `samples`; a window of pure warmup/failed probes has `samples == 0` and
+    /// is not emitted. It counts fresh probes, not merely ticks where the
+    /// rolling snapshot was non-empty (which stays `Some` on failed ticks after
+    /// any earlier success).
     samples: u32,
     baseline_min_us: WindowedStat,
     recent_median_us: WindowedStat,
@@ -226,9 +253,10 @@ struct RefPingWindow {
 
 impl RefPingWindow {
     /// Count the tick toward window closing; fold a measurement only when the
-    /// tick actually produced a snapshot (`Some`). Warmup and all-failed ticks
-    /// (`None`) advance `ticks` but not `samples`, so they never dilute the
-    /// summary stats or inflate the reported `samples` count.
+    /// caller passes `Some` (this tick's probe produced a fresh sample —
+    /// see [`sample_for_outcome`]). A `None` tick (warmup or failed probe)
+    /// advances `ticks` but not `samples`, so it never dilutes the summary
+    /// stats or inflates the reported `samples` count.
     fn record(&mut self, sample: Option<RefPingSample>) {
         self.ticks += 1;
         if let Some(sample) = sample {
@@ -248,8 +276,11 @@ impl RefPingWindow {
 
 /// Read one rolling snapshot of the reference-path RTT stats. Returns `None`
 /// when the snapshot has no data (warmup before the first successful probe, or
-/// every retained sample decayed past the baseline window) — that tick is not
-/// a valid measurement and must not be counted in the rollup's `samples`.
+/// every retained sample decayed past the baseline window).
+///
+/// Called by [`sample_for_outcome`] only on a fresh-probe tick, so on the live
+/// path a returned `None` here is the warmup case; the failed-probe stale-
+/// snapshot case is filtered earlier by [`sample_for_outcome`].
 fn sample_reference_ping(stats: &RollingRttStats<RealTime>) -> Option<RefPingSample> {
     let s = stats.snapshot()?;
     Some(RefPingSample {
@@ -424,6 +455,47 @@ mod tests {
             window.samples, 0,
             "no measured tick means the rollup is skipped (samples == 0)"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_probe_after_success_does_not_count_as_sample() {
+        // Production-path regression (finding #2, second round): a failed probe
+        // that lands AFTER an earlier success leaves the rolling history
+        // non-empty, so `stats.snapshot()` (hence `sample_reference_ping`) still
+        // returns `Some(stale)`. The window must NOT count that as a sample —
+        // otherwise a 30 s window of all-failed probes emits `samples: 30` with
+        // stale RTT stats. `sample_for_outcome` is the gate: only a fresh
+        // `Sample` outcome this tick folds a measurement.
+        let stats = RollingRttStats::new(RealTime::new());
+        // An earlier successful probe leaves the rolling history non-empty.
+        stats.record(Duration::from_millis(20));
+        assert!(
+            sample_reference_ping(&stats).is_some(),
+            "precondition: the rolling snapshot is non-empty after a success, \
+             so a naive `record(sample_reference_ping(..))` would wrongly count \
+             a failed tick"
+        );
+
+        let mut window = RefPingWindow::default();
+
+        // A failed probe THIS tick — snapshot is Some(stale) but it must not
+        // count.
+        window.record(sample_for_outcome(&ProbeOutcome::NoResponse, &stats));
+        window.record(sample_for_outcome(&ProbeOutcome::SendError, &stats));
+        assert_eq!(window.ticks, 2, "failed ticks still advance the clock");
+        assert_eq!(
+            window.samples, 0,
+            "a failed probe must not increment samples even when the rolling \
+             history is non-empty from an earlier success"
+        );
+
+        // A fresh successful probe THIS tick does count.
+        window.record(sample_for_outcome(
+            &ProbeOutcome::Sample(Duration::from_millis(25)),
+            &stats,
+        ));
+        assert_eq!(window.ticks, 3);
+        assert_eq!(window.samples, 1, "a fresh successful probe counts");
     }
 
     #[test]
