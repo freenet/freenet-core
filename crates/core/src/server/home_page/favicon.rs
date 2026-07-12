@@ -30,3 +30,34 @@ pub fn build_favicon_data_uri(snap: &Option<network_status::NetworkStatusSnapsho
         color = color,
     )
 }
+
+/// Build the browser tab `<title>` text, surfacing connection state at a
+/// glance (#3509) so the operator can tell the node's status from a
+/// background tab without switching to it.
+///
+/// Derived from the same snapshot fields as [`build_favicon_data_uri`] — no
+/// new state is invented at render time. Priority mirrors the favicon:
+/// 1. `(N) Dashboard` — connected (any open connections; matches the
+///    favicon's "connected wins" precedence over lingering failures/NAT
+///    issues from before the connection was established).
+/// 2. `⚠ Dashboard` — unable to connect / major error (`HealthLevel::Trouble`,
+///    or NAT traversal has failed every attempt — the favicon's dark-red
+///    case).
+/// 3. `⚠ Dashboard` — connection failures present (the favicon's red case,
+///    e.g. gateway timeouts) even without a NAT-all-failed history or
+///    `HealthLevel::Trouble`.
+/// 4. `⚡ Dashboard` — trying to connect (no snapshot yet, or still
+///    connecting/degraded with zero open connections and no failures).
+pub fn build_dashboard_title(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
+    match snap {
+        Some(s) if s.open_connections > 0 => format!("({}) Dashboard", s.open_connections),
+        Some(s)
+            if s.health == network_status::HealthLevel::Trouble
+                || (s.nat_stats.attempts > 0 && s.nat_stats.successes == 0) =>
+        {
+            "\u{26A0} Dashboard".to_string()
+        }
+        Some(s) if !s.failures.is_empty() => "\u{26A0} Dashboard".to_string(),
+        _ => "\u{26A1} Dashboard".to_string(),
+    }
+}
