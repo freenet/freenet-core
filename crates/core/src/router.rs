@@ -265,6 +265,16 @@ pub(crate) struct RouterSnapshotInfo {
     /// Populated by `Ring` on the snapshot cadence. `None` until the ring is
     /// built. Per-node aggregate scalar.
     pub hosting_subscribed_evictions_total: Option<u64>,
+    /// Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d): the count of
+    /// contracts registered as in-use via a downstream subscriber whose state is
+    /// NOT present on disk (`contract_in_use && !contract_state_present`). After
+    /// the register-after-state fix (a hop registers a downstream only once it
+    /// holds state) this should read 0; a nonzero value means a hop registered
+    /// demand it cannot serve — the #4404/#4612 phantom the step eliminates.
+    /// redb-scoped by construction (`contract_state_present` is conservative-true
+    /// elsewhere). Populated by `Ring` on the snapshot cadence; `None` until the
+    /// ring is built. Per-node aggregate scalar (current gauge, not monotonic).
+    pub phantom_in_use_contracts: Option<u64>,
     /// Terminal advertisement-consult counters (hosting redesign piece C,
     /// #4646; exported to central telemetry per #4658), populated by `Ring`
     /// from the per-node `network_status` singleton on the snapshot cadence.
@@ -1297,6 +1307,7 @@ impl Router {
             hosting_disk_total_bytes: None,
             hosting_oom_valve_evictions_total: None,
             hosting_subscribed_evictions_total: None,
+            phantom_in_use_contracts: None,
             // Terminal advertisement-consult counters (piece C, #4646),
             // populated by Ring from the network_status singleton on the
             // snapshot cadence (#4658).
