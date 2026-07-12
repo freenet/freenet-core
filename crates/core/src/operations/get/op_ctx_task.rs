@@ -132,12 +132,6 @@ pub(crate) async fn start_client_get(
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
-    // `Some(client_id)` when the caller registered a client subscription up-front
-    // (subscribe=true with a listener). The driver removes it on any terminal
-    // that delivered no state (dead-end NotFound / infra error) so a phantom
-    // client subscription does not linger until disconnect (step 10 §1e). `None`
-    // when no client subscription was registered.
-    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> Result<Transaction, OpError> {
     // Phase 7 egress self-block (#4300): refuse to originate a GET for
     // a contract this node has banned, BEFORE spawning the driver.
@@ -182,7 +176,6 @@ pub(crate) async fn start_client_get(
             return_contract_code,
             subscribe,
             blocking_subscribe,
-            client_sub_cleanup,
         )
         .await;
     });
@@ -197,7 +190,6 @@ async fn run_client_get(
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
-    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) {
     // RAII guard: clears the ops.get entry that the originator
     // loopback pushes via legacy process_message::GetMsg::Request
@@ -214,7 +206,6 @@ async fn run_client_get(
         return_contract_code,
         subscribe,
         blocking_subscribe,
-        client_sub_cleanup,
     )
     .await;
     deliver_outcome(&op_manager, client_tx, outcome);
@@ -251,7 +242,6 @@ async fn drive_client_get(
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
-    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> DriverOutcome {
     match drive_client_get_inner(
         &op_manager,
@@ -260,24 +250,11 @@ async fn drive_client_get(
         return_contract_code,
         subscribe,
         blocking_subscribe,
-        client_sub_cleanup,
     )
     .await
     {
         Ok(outcome) => outcome,
-        Err(err) => {
-            // Infra error: the GET delivered no state. Decrement the in-flight
-            // subscribe count and clean up if last-and-no-state (step 10 §1e) —
-            // same helper as the Done/Exhausted terminals.
-            crate::operations::finish_inflight_subscribe(
-                &op_manager,
-                instance_id,
-                client_sub_cleanup,
-                None,
-            )
-            .await;
-            DriverOutcome::InfrastructureError(err)
-        }
+        Err(err) => DriverOutcome::InfrastructureError(err),
     }
 }
 
@@ -288,7 +265,6 @@ async fn drive_client_get_inner(
     return_contract_code: bool,
     subscribe: bool,
     blocking_subscribe: bool,
-    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> Result<DriverOutcome, OpError> {
     let htl = op_manager.ring.max_hops_to_live;
 
@@ -577,24 +553,6 @@ async fn drive_client_get_inner(
             )
             .await;
 
-            // Review Fixes 1/5 (step 10 §1e): decrement this op's in-flight
-            // subscribe count and, if it was the last one and no state landed,
-            // tear down the up-front client subscription. A `Done` terminal can
-            // still deliver NO state — the dominant case is a multi-fragment
-            // streaming GET whose assembly failed on every retry and was converted
-            // back to `Done(Terminal::Streaming)` (to avoid a false NotFound,
-            // #4345); `build_host_response` then finds no stored state and
-            // `host_result` is `Err`. On success, state is present (cached above),
-            // so the helper decrements and keeps. Pass `reply_key` for the cheap
-            // sync state check.
-            crate::operations::finish_inflight_subscribe(
-                op_manager,
-                instance_id,
-                client_sub_cleanup,
-                Some(reply_key),
-            )
-            .await;
-
             Ok(DriverOutcome::Publish(host_result))
         }
         RetryLoopOutcome::Exhausted(cause) => {
@@ -613,17 +571,6 @@ async fn drive_client_get_inner(
                 %cause,
                 "GET client: retry loop exhausted — returning NotFound to client"
             );
-            // Dead-end GET: no state delivered. Decrement the in-flight subscribe
-            // count and, if last and no state, tear down the up-front client
-            // subscription (step 10 §1e) — otherwise it lingers as a phantom.
-            // No resolved key here → the helper resolves via the store.
-            crate::operations::finish_inflight_subscribe(
-                op_manager,
-                instance_id,
-                client_sub_cleanup,
-                None,
-            )
-            .await;
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
             ))))
@@ -4246,65 +4193,6 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
-    }
-
-    /// Pin (step 10 §1e; review Fixes 1/2/3/5/7): the client-GET driver MUST run
-    /// the shared `operations::finish_inflight_subscribe` at EVERY terminal (so the
-    /// in-flight subscribe count is decremented) and tear down the up-front client
-    /// subscription only when it was the last in-flight subscribe AND no state is
-    /// present. The three terminals that must call it:
-    ///   - the `RetryLoopOutcome::Done` arm (Fix 1: a multi-fragment streaming GET
-    ///     whose assembly failed on every retry is converted back to
-    ///     `Done(Terminal::Streaming)` to avoid a false NotFound (#4345), then
-    ///     yields an `Err` host_result — this arm was the hole; success also
-    ///     decrements here),
-    ///   - the `Exhausted` (NotFound) arm,
-    ///   - the infra-error path in `drive_client_get`.
-    /// The shared helper's internals (refcount, state-gate, atomic guard, notifier
-    /// drop) are pinned separately in `operations.rs`.
-    #[test]
-    fn client_get_driver_removes_client_subscription_on_dead_end() {
-        let src = include_str!("op_ctx_task.rs");
-        let inner = extract_fn_body(src, "async fn drive_client_get_inner(");
-        assert!(
-            inner.contains("client_sub_cleanup"),
-            "drive_client_get_inner must thread client_sub_cleanup so a dead-end GET \
-             can tear down the up-front client subscription (step 10 §1e)"
-        );
-
-        // (a) Done arm calls the shared cleanup (Fix 1 — the hole).
-        let done = inner
-            .find("RetryLoopOutcome::Done(terminal)")
-            .expect("drive_client_get_inner must have a Done(terminal) arm");
-        let exhausted = inner
-            .find("RetryLoopOutcome::Exhausted(")
-            .expect("drive_client_get_inner must have an Exhausted arm");
-        assert!(
-            inner[done..exhausted].contains("finish_inflight_subscribe("),
-            "the Done arm must call finish_inflight_subscribe — a streaming assembly \
-             that failed on every retry is converted back to Done(Streaming) and \
-             delivers no state (#4345), so without this the subscribe=true GET leaves \
-             a phantom client subscription (Fix 1)"
-        );
-
-        // (b) Exhausted (NotFound) arm cleans up.
-        let notfound = inner[exhausted..]
-            .find("NotFound { instance_id }")
-            .map(|o| exhausted + o)
-            .expect("the Exhausted arm must publish NotFound");
-        assert!(
-            inner[exhausted..notfound].contains("finish_inflight_subscribe("),
-            "the Exhausted (NotFound) arm must clean up the client subscription BEFORE \
-             publishing NotFound (step 10 §1e)"
-        );
-
-        // (c) infra-error wrapper cleans up.
-        let wrapper = extract_fn_body(src, "async fn drive_client_get(");
-        assert!(
-            wrapper.contains("finish_inflight_subscribe("),
-            "the infra-error path in drive_client_get must clean up the client \
-             subscription too (step 10 §1e)"
-        );
     }
 
     /// Bug #3 reproduction: the legacy Response{Found} branch at

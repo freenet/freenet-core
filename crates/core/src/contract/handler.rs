@@ -934,13 +934,6 @@ pub(crate) enum ContractHandlerEvent {
     ClientDisconnect {
         client_id: ClientId,
     },
-    /// Drop the executor-side update notifier for a SINGLE (contract, client)
-    /// pair — used when a subscribe=true GET/PUT fails so the leaked notifier
-    /// does not linger until ClientDisconnect. Fire-and-forget: no response.
-    DropSubscriberListener {
-        key: ContractInstanceId,
-        client_id: ClientId,
-    },
     /// Reclaim a contract's on-disk storage (state + WASM code) after it was
     /// evicted from the hosting cache. Fire-and-forget: no response is sent.
     ///
@@ -1072,12 +1065,6 @@ impl std::fmt::Display for ContractHandlerEvent {
             },
             ContractHandlerEvent::ClientDisconnect { client_id } => {
                 write!(f, "client disconnect {{ {client_id} }}")
-            }
-            ContractHandlerEvent::DropSubscriberListener { key, client_id } => {
-                write!(
-                    f,
-                    "drop subscriber listener {{ {key}, client_id: {client_id} }}"
-                )
             }
             ContractHandlerEvent::EvictContract {
                 key,

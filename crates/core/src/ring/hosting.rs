@@ -291,19 +291,6 @@ pub(crate) struct HostingManager {
     /// Prevents hosting cache eviction while client subscriptions exist.
     client_subscriptions: DashMap<ContractInstanceId, HashSet<crate::client_events::ClientId>>,
 
-    /// In-flight subscribe=true GET/PUT count per (contract, client) — review
-    /// Fix 5. A client can have several subscribe requests for the SAME contract
-    /// in flight at once; the up-front client-subscription registration is
-    /// idempotent (one shared ring entry + one shared executor notifier), but the
-    /// per-request failure cleanup must NOT tear that shared registration down
-    /// while another request is still in flight (a concurrent race that the
-    /// `contract_state_present` state-gate alone does not close: request A can
-    /// fail BEFORE request B caches state). Incremented up-front where the client
-    /// subscription is registered, decremented at every driver terminal (success
-    /// and failure); cleanup removes the shared registration only when this count
-    /// reaches 0 AND no state is present.
-    subscribe_inflight: DashMap<(ContractInstanceId, crate::client_events::ClientId), usize>,
-
     /// Unified hosting cache with byte-budget demand-ordered eviction ("fuel
     /// gauge") and TTL protection. This is the single source of truth for which
     /// contracts we're hosting.
@@ -484,7 +471,6 @@ impl HostingManager {
         Self {
             active_subscriptions: DashMap::new(),
             client_subscriptions: DashMap::new(),
-            subscribe_inflight: DashMap::new(),
             hosting_cache: RwLock::new(HostingCache::new(budget_bytes, time_source.clone())),
             demand_estimator: RwLock::new(ProximityPrior::new()),
             own_location: RwLock::new(None),
@@ -1215,84 +1201,6 @@ impl HostingManager {
         no_more_subscriptions
     }
 
-    /// Record the start of an in-flight subscribe=true GET/PUT for
-    /// `(instance_id, client_id)` (review Fix 5). Paired with exactly one
-    /// [`end_inflight_subscribe`](Self::end_inflight_subscribe) at the op's
-    /// terminal (or, if the driver never spawns, at the start-failure site).
-    pub(crate) fn begin_inflight_subscribe(
-        &self,
-        instance_id: ContractInstanceId,
-        client_id: crate::client_events::ClientId,
-    ) {
-        *self
-            .subscribe_inflight
-            .entry((instance_id, client_id))
-            .or_insert(0) += 1;
-    }
-
-    /// Record the completion of one in-flight subscribe=true GET/PUT for
-    /// `(instance_id, client_id)` and return the number still in flight AFTER
-    /// this decrement (review Fix 5). The (contract, client)-shared subscription
-    /// registration may be torn down as a phantom only when this returns 0 (no
-    /// other subscribe request for the same pair is still running). Saturating
-    /// and self-pruning: the entry is removed at zero.
-    pub(crate) fn end_inflight_subscribe(
-        &self,
-        instance_id: ContractInstanceId,
-        client_id: crate::client_events::ClientId,
-    ) -> usize {
-        use dashmap::mapref::entry::Entry;
-        match self.subscribe_inflight.entry((instance_id, client_id)) {
-            Entry::Occupied(mut e) => {
-                let remaining = e.get().saturating_sub(1);
-                if remaining == 0 {
-                    e.remove();
-                } else {
-                    *e.get_mut() = remaining;
-                }
-                remaining
-            }
-            // No tracked in-flight request (already drained / never begun) — treat
-            // as "none in flight" so the caller's state-gate decides alone.
-            Entry::Vacant(_) => 0,
-        }
-    }
-
-    /// Atomically remove the client subscription for `(instance_id, client_id)`
-    /// ONLY if no subscribe=true GET/PUT is currently in flight for that pair
-    /// (review Fix 7). Returns `true` iff the subscription was removed (the caller
-    /// then drops the executor notifier), `false` when a new in-flight subscribe
-    /// raced in (that request now owns the shared registration, so nothing is
-    /// removed).
-    ///
-    /// Closes the TOCTOU window in the finish helper: after `end_inflight_subscribe`
-    /// reports 0, the helper `.await`s a state-presence check, during which a NEW
-    /// subscribe for the same pair can `begin_inflight_subscribe` + register. This
-    /// method holds the `subscribe_inflight` entry lock for the key across the
-    /// check-and-remove, so that racing `begin` is observed here (Occupied → keep)
-    /// rather than clobbered. Correctness relies on `begin_inflight_subscribe`
-    /// running BEFORE the client subscription is registered (client_events), so a
-    /// live request always has an in-flight entry by the time its registration
-    /// exists.
-    pub(crate) fn remove_client_subscription_if_no_inflight(
-        &self,
-        instance_id: ContractInstanceId,
-        client_id: crate::client_events::ClientId,
-    ) -> bool {
-        use dashmap::mapref::entry::Entry;
-        match self.subscribe_inflight.entry((instance_id, client_id)) {
-            // A new in-flight subscribe raced in after our end() — it owns the
-            // shared registration now; remove nothing.
-            Entry::Occupied(_) => false,
-            // No in-flight subscribe for this pair — safe to tear down. The entry
-            // lock is held across the removal so a concurrent begin cannot slip in.
-            Entry::Vacant(_) => {
-                self.remove_client_subscription(&instance_id, client_id);
-                true
-            }
-        }
-    }
-
     /// Check if there are any client subscriptions for a contract.
     pub fn has_client_subscriptions(&self, instance_id: &ContractInstanceId) -> bool {
         self.client_subscriptions
@@ -1808,8 +1716,10 @@ impl HostingManager {
     /// Scans only `downstream_subscribers` (the dominant relay phantom source,
     /// gen a/d, keyed by full `ContractKey`). Client-subscription-only phantoms
     /// (gen b/c) are keyed by instance id with no full-key index and cannot be
-    /// state-checked here; they are prevented at the source by the GET/PUT
-    /// dead-end client-subscription cleanup (step 10 §1e) rather than swept.
+    /// state-checked here, so they are OUT OF SCOPE for this gauge; cleaning up a
+    /// client-subscription-only phantom left by a dead-end GET/PUT is DEFERRED to
+    /// a future PR (the up-front client subscription currently lingers until the
+    /// client disconnects).
     pub(crate) fn phantom_in_use_count(&self) -> u64 {
         self.downstream_subscribers
             .iter()
@@ -5087,8 +4997,8 @@ mod tests {
     /// A stateless downstream registration (the pre-fix relay phantom) is
     /// counted; once state lands it is not; a stateful downstream host is never
     /// counted; and a client-subscription-only stateless contract is deliberately
-    /// NOT counted (no full-key index — those phantoms are prevented at the
-    /// source by the GET/PUT dead-end cleanup, §1e).
+    /// NOT counted (no full-key index — those phantoms are OUT OF SCOPE for this
+    /// gauge; their cleanup is deferred to a future PR).
     #[cfg(feature = "redb")]
     #[tokio::test]
     async fn phantom_in_use_count_flags_stateless_downstream_only() {
@@ -5145,7 +5055,7 @@ mod tests {
 
         // A client-subscription-only stateless contract is in-use but is NOT
         // counted by this gauge (it is keyed by instance id with no full-key
-        // index; §1e prevents those at the source instead).
+        // index; those phantoms are out of scope and their cleanup is deferred).
         let client_only = make_contract_key(82);
         manager.add_client_subscription(client_only.id(), crate::client_events::ClientId::next());
         assert!(
@@ -5156,103 +5066,6 @@ mod tests {
             0,
             "client-subscription-only phantoms are out of scope for this gauge"
         );
-    }
-
-    /// Fix 5 regression: a client with TWO concurrent subscribe=true requests
-    /// for the SAME contract shares ONE idempotent client-subscription entry. If
-    /// request A fails BEFORE request B caches state, A's per-request cleanup must
-    /// NOT delete the shared registration (the `contract_state_present` state-gate
-    /// alone does not save it, since state is still absent at A's terminal). The
-    /// per-(contract,client) in-flight refcount closes this race: A sees
-    /// `remaining > 0` (B still in flight) and keeps the subscription; only B, the
-    /// last to finish, drives the count to 0.
-    #[test]
-    fn inflight_subscribe_refcount_protects_concurrent_sibling() {
-        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
-        let key = make_contract_key(200);
-        let instance = *key.id();
-        let client = crate::client_events::ClientId::next();
-
-        // Shared up-front registration + two concurrent in-flight subscribes.
-        manager.add_client_subscription(&instance, client);
-        manager.begin_inflight_subscribe(instance, client);
-        manager.begin_inflight_subscribe(instance, client);
-
-        // Request A finishes first (fails pre-cache). A sibling is still in
-        // flight, so A's terminal sees remaining > 0 and (per the driver's
-        // `remaining > 0` gate) keeps the shared subscription.
-        assert_eq!(
-            manager.end_inflight_subscribe(instance, client),
-            1,
-            "with a sibling still in flight, A's terminal must see remaining > 0"
-        );
-        assert!(
-            manager.has_client_subscriptions(&instance),
-            "the shared client subscription must SURVIVE A's failure while B is in \
-             flight (Fix 5) — the state-gate alone would have deleted it"
-        );
-
-        // Request B (the succeeding one) finishes last → count reaches 0. B backs
-        // the subscription with state, so the driver keeps it.
-        assert_eq!(
-            manager.end_inflight_subscribe(instance, client),
-            0,
-            "the last in-flight request drives the count to 0"
-        );
-        assert!(
-            manager.has_client_subscriptions(&instance),
-            "B keeps the subscription it now backs with state"
-        );
-
-        // Over-decrement is saturating (no underflow / panic) and reports 0.
-        assert_eq!(manager.end_inflight_subscribe(instance, client), 0);
-    }
-
-    /// Fix 7 regression: the atomic teardown guard
-    /// `remove_client_subscription_if_no_inflight` must refuse to remove the
-    /// shared client subscription whenever an in-flight subscribe exists for the
-    /// pair — both a sibling still running, and a NEW subscribe that raced in after
-    /// `end_inflight_subscribe` reported 0 (the TOCTOU across the finish helper's
-    /// state-check `.await`). It removes (returns true) only when nothing is in
-    /// flight.
-    #[test]
-    fn remove_client_subscription_if_no_inflight_guards_concurrent_begin() {
-        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
-        let key = make_contract_key(201);
-        let instance = *key.id();
-        let client = crate::client_events::ClientId::next();
-
-        manager.add_client_subscription(&instance, client);
-
-        // A sibling is still in flight (remaining 1) → guard refuses, sub kept.
-        manager.begin_inflight_subscribe(instance, client);
-        manager.begin_inflight_subscribe(instance, client);
-        assert_eq!(manager.end_inflight_subscribe(instance, client), 1);
-        assert!(
-            !manager.remove_client_subscription_if_no_inflight(instance, client),
-            "guard must refuse to remove while a sibling subscribe is in flight"
-        );
-        assert!(manager.has_client_subscriptions(&instance));
-
-        // The last one ends (remaining 0). Simulate the Fix 7 TOCTOU: a NEW
-        // subscribe for the same pair begins during the finish helper's state
-        // check. The guard must observe it and REFUSE to remove.
-        assert_eq!(manager.end_inflight_subscribe(instance, client), 0);
-        manager.begin_inflight_subscribe(instance, client); // races in during the .await
-        assert!(
-            !manager.remove_client_subscription_if_no_inflight(instance, client),
-            "guard must refuse to remove when a subscribe raced in after end() reported \
-             0 (Fix 7 TOCTOU) — else it deletes the racing request's subscription"
-        );
-        assert!(manager.has_client_subscriptions(&instance));
-
-        // Drain the racer; with nothing in flight the guard removes and reports true.
-        assert_eq!(manager.end_inflight_subscribe(instance, client), 0);
-        assert!(
-            manager.remove_client_subscription_if_no_inflight(instance, client),
-            "with nothing in flight the guard removes and reports true"
-        );
-        assert!(!manager.has_client_subscriptions(&instance));
     }
 
     /// #4612 producer bound: `max_fetches` caps the fetches emitted per sweep

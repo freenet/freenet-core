@@ -64,12 +64,6 @@ pub(crate) async fn start_client_put(
     htl: usize,
     subscribe: bool,
     blocking_subscribe: bool,
-    // `Some(client_id)` when the caller registered a client subscription up-front
-    // (subscribe=true with a listener). The driver removes it on a terminal that
-    // committed no state (so a phantom client subscription does not linger until
-    // disconnect — step 10 §1e). `None` when no client subscription was
-    // registered.
-    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> Result<Transaction, OpError> {
     // Phase 7 egress self-block (#4300): refuse to originate a PUT for
     // a contract this node has banned, BEFORE spawning the driver. The
@@ -122,7 +116,6 @@ pub(crate) async fn start_client_put(
             htl,
             subscribe,
             blocking_subscribe,
-            client_sub_cleanup,
         )
         .await;
     });
@@ -140,7 +133,6 @@ async fn run_client_put(
     htl: usize,
     subscribe: bool,
     blocking_subscribe: bool,
-    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) {
     let outcome = drive_client_put(
         op_manager.clone(),
@@ -151,7 +143,6 @@ async fn run_client_put(
         htl,
         subscribe,
         blocking_subscribe,
-        client_sub_cleanup,
     )
     .await;
     deliver_outcome(&op_manager, client_tx, outcome);
@@ -179,11 +170,7 @@ async fn drive_client_put(
     htl: usize,
     subscribe: bool,
     blocking_subscribe: bool,
-    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> DriverOutcome {
-    // Capture the key before `contract` is moved into the inner driver so the
-    // infra-error cleanup below can gate on state-presence.
-    let key = contract.key();
     match drive_client_put_inner(
         &op_manager,
         client_tx,
@@ -193,26 +180,11 @@ async fn drive_client_put(
         htl,
         subscribe,
         blocking_subscribe,
-        client_sub_cleanup,
     )
     .await
     {
         Ok(outcome) => outcome,
-        Err(err) => {
-            // Infra error (Unexpected / InfraError from the inner driver): no
-            // state committed here. Decrement the in-flight subscribe count and,
-            // if last-and-no-state, tear down the up-front client subscription
-            // (step 10 §1e) — gated so a locally-committed PUT whose network
-            // propagation errored keeps its legitimate subscription.
-            crate::operations::finish_inflight_subscribe(
-                &op_manager,
-                *key.id(),
-                client_sub_cleanup,
-                Some(key),
-            )
-            .await;
-            DriverOutcome::InfrastructureError(err)
-        }
+        Err(err) => DriverOutcome::InfrastructureError(err),
     }
 }
 
@@ -226,7 +198,6 @@ async fn drive_client_put_inner(
     htl: usize,
     subscribe: bool,
     blocking_subscribe: bool,
-    client_sub_cleanup: Option<crate::client_events::ClientId>,
 ) -> Result<DriverOutcome, OpError> {
     let key = contract.key();
 
@@ -576,18 +547,6 @@ async fn drive_client_put_inner(
             )
             .await;
 
-            // Success terminal: decrement this op's in-flight subscribe count
-            // (Fix 5). State is present (the PUT committed), so the helper keeps
-            // the subscription — but the decrement MUST still run so the count
-            // stays accurate for any concurrent sibling request.
-            crate::operations::finish_inflight_subscribe(
-                op_manager,
-                *key.id(),
-                client_sub_cleanup,
-                Some(key),
-            )
-            .await;
-
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 ContractResponse::PutResponse { key: reply_key },
             ))))
@@ -598,35 +557,12 @@ async fn drive_client_put_inner(
         // real cause once, mark the tx completed.
         RetryLoopOutcome::Done((Err(cause), _hop_count)) => {
             op_manager.completed(client_tx);
-            // Local-commit failure (PutMsg::Error): no state stored. Decrement the
-            // in-flight subscribe count and, if last-and-no-state, tear down the
-            // up-front client subscription so it does not linger as a phantom
-            // (step 10 §1e). Gated inside the helper.
-            crate::operations::finish_inflight_subscribe(
-                op_manager,
-                *key.id(),
-                client_sub_cleanup,
-                Some(key),
-            )
-            .await;
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into_string().into(),
             }
             .into())))
         }
         RetryLoopOutcome::Exhausted(cause) => {
-            // No remote holder took the PUT. Decrement the in-flight subscribe
-            // count; if the local store ALSO did not commit (no state present) and
-            // this was the last in-flight request, tear down the up-front client
-            // subscription (step 10 §1e). A PUT that committed locally keeps its
-            // legitimate subscription (state-gated inside the helper).
-            crate::operations::finish_inflight_subscribe(
-                op_manager,
-                *key.id(),
-                client_sub_cleanup,
-                Some(key),
-            )
-            .await;
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into(),
             }
@@ -4737,37 +4673,6 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
-    }
-
-    /// Pin (step 10 §1e; review Fixes 2/3/5): the client-PUT driver MUST run the
-    /// shared `operations::finish_inflight_subscribe` at EVERY terminal so the
-    /// in-flight subscribe count is decremented, and tear down the up-front client
-    /// subscription only when it was the last in-flight subscribe AND no state is
-    /// present. All THREE inner terminals (`Done((Ok))` success, `Done((Err))`,
-    /// `Exhausted`) plus the infra-error path in `drive_client_put` must call it.
-    /// The shared helper's internals are pinned in `operations.rs`.
-    #[test]
-    fn client_put_driver_removes_phantom_client_subscription_on_failure() {
-        let src = include_str!("op_ctx_task.rs");
-        let inner = extract_fn_body(src, "async fn drive_client_put_inner(");
-        assert!(
-            inner.contains("client_sub_cleanup"),
-            "drive_client_put_inner must thread client_sub_cleanup (step 10 §1e)"
-        );
-        let helper_calls = inner.matches("finish_inflight_subscribe(").count();
-        assert!(
-            helper_calls >= 3,
-            "all three PUT terminals (Done(Ok) success, Done(Err), Exhausted) must call \
-             finish_inflight_subscribe (found {helper_calls}) — the success arm must \
-             decrement the in-flight count too (Fix 5), and the failure arms must clean \
-             up the phantom (step 10 §1e)"
-        );
-
-        let wrapper = extract_fn_body(src, "async fn drive_client_put(");
-        assert!(
-            wrapper.contains("finish_inflight_subscribe("),
-            "drive_client_put must also clean up on the infra-error terminal (step 10 §1e)"
-        );
     }
 
     /// Source-grep pin (#4361 / #4365): both relay PUT drivers must

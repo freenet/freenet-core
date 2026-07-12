@@ -476,8 +476,7 @@ fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceI
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
         | ContractHandlerEvent::GetDeltaResponse { .. }
-        | ContractHandlerEvent::ClientDisconnect { .. }
-        | ContractHandlerEvent::DropSubscriberListener { .. } => None,
+        | ContractHandlerEvent::ClientDisconnect { .. } => None,
     }
 }
 
