@@ -61,6 +61,13 @@ pub(crate) trait ContractStoreBridge {
         params: &Parameters<'_>,
     ) -> Option<ContractContainer>;
 
+    /// Disk-budget dedup probe: is the code blob for `code_hash` already stored?
+    ///
+    /// Keyed by CODE HASH (not instance id), so a new instance of already-stored
+    /// code is correctly reported as "stored" and not double-charged against the
+    /// disk budget. See [`super::ContractStore::code_blob_stored`] (#4218).
+    fn code_blob_stored(&self, code_hash: &CodeHash) -> bool;
+
     fn store_contract(&mut self, contract: ContractContainer) -> Result<(), anyhow::Error>;
 
     fn remove_contract(&mut self, key: &ContractKey) -> Result<(), anyhow::Error>;

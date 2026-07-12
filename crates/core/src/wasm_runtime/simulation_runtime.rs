@@ -105,6 +105,14 @@ impl InMemoryContractStore {
         inner.instance_to_code.get(id).map(|(hash, _)| *hash)
     }
 
+    /// Disk-budget dedup probe: is the code blob for `code_hash` already stored?
+    /// This in-memory store is already keyed by code hash, so it simply reports
+    /// whether that code is present (see `ContractStore::code_blob_stored`).
+    pub fn code_blob_stored(&self, code_hash: &CodeHash) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.code_by_hash.contains_key(code_hash)
+    }
+
     /// Get the number of stored contracts (for testing).
     pub fn contract_count(&self) -> usize {
         let inner = self.inner.lock().unwrap();

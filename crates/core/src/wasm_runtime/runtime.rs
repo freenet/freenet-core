@@ -765,6 +765,10 @@ impl super::contract::ContractStoreBridge for Runtime {
         self.contract_store.fetch_contract(key, params)
     }
 
+    fn code_blob_stored(&self, code_hash: &CodeHash) -> bool {
+        self.contract_store.code_blob_stored(code_hash)
+    }
+
     fn store_contract(&mut self, contract: ContractContainer) -> Result<(), anyhow::Error> {
         self.contract_store.store_contract(contract)?;
         Ok(())
