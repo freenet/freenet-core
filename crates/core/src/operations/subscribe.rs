@@ -728,12 +728,20 @@ pub(super) async fn finalize_host_subscribe(
     key: ContractKey,
     requester_addr: std::net::SocketAddr,
     source_addr: Option<std::net::SocketAddr>,
+    // The peer to route the body fetch THROUGH, when known (review Fix 4). On the
+    // forwarded relay path this is the downstream that just answered `Subscribed`
+    // (`next_hop`) — it holds the body, so a directed fetch reaches it instead of
+    // greedily routing toward the key and dead-ending at a closer non-hosting
+    // peer (which would leave this hop registering nothing yet still bubbling
+    // `Subscribed` upstream — a chain hole that drops updates). `None` = ordinary
+    // greedy fetch (used by the local-hit path, where state is already present).
+    directed_holder: Option<PeerKeyLocation>,
     tx: &Transaction,
     warn_suffix: &str,
 ) {
-    // Fetch BEFORE register (D-ORDER). `None` = ordinary greedy fetch toward the
-    // key.
-    let have_body = match fetch_contract_if_missing(op_manager, *key.id(), None).await {
+    // Fetch BEFORE register (D-ORDER). `directed_holder` routes the fetch through
+    // the responding peer when known, else greedy toward the key.
+    let have_body = match fetch_contract_if_missing(op_manager, *key.id(), directed_holder).await {
         Ok(Some(_)) => true,
         Ok(None) => {
             tracing::debug!(

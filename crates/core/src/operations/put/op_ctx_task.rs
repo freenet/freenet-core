@@ -213,8 +213,11 @@ async fn drive_client_put(
 /// (`contract_in_use && !contract_state_present`) after a PUT terminal that did
 /// NOT commit state locally (step 10 §1e). Gated on `!contract_state_present` so
 /// a PUT that DID commit locally (e.g. network propagation exhausted but the
-/// local store succeeded) keeps its legitimate client subscription. No-op when
-/// no client subscription was registered.
+/// local store succeeded) keeps its legitimate client subscription. Drops BOTH
+/// the ring bookkeeping AND the executor-side update notifier (review Fix 2) so
+/// the failed subscribe does not keep consuming subscriber capacity / receiving
+/// updates until the client disconnects. No-op when no client subscription was
+/// registered.
 fn maybe_remove_phantom_client_subscription(
     op_manager: &OpManager,
     key: &ContractKey,
@@ -225,6 +228,7 @@ fn maybe_remove_phantom_client_subscription(
             op_manager
                 .ring
                 .remove_client_subscription(key.id(), client_id);
+            crate::operations::drop_subscriber_listener(op_manager, *key.id(), client_id);
         }
     }
 }
@@ -4765,6 +4769,11 @@ mod tests {
             "the cleanup must be gated on !contract_state_present so a locally-committed \
              PUT (network propagation exhausted but stored locally) keeps its legitimate \
              client subscription"
+        );
+        assert!(
+            helper.contains("drop_subscriber_listener("),
+            "the PUT cleanup helper must drop the executor-side notifier too (review \
+             Fix 2), not just the ring bookkeeping"
         );
     }
 

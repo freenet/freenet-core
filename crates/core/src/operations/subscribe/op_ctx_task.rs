@@ -1679,6 +1679,9 @@ async fn drive_relay_subscribe(
             key,
             upstream_addr,
             Some(upstream_addr),
+            // Local hit: state is already present, so the fetch is a no-op — no
+            // directed holder needed.
+            None,
             &incoming_tx,
             " (driver relay local hit)",
         )
@@ -2073,6 +2076,13 @@ async fn relay_subscribe_forward_once(
                 key,
                 upstream_addr,
                 Some(upstream_addr),
+                // Fetch the body THROUGH the downstream that just answered
+                // `Subscribed` (`next_hop`) — it holds the body, so this cannot
+                // dead-end at a closer non-hosting peer the way a greedy fetch
+                // toward the key could (review Fix 4). Without this the hop could
+                // register nothing yet still bubble `Subscribed` upstream,
+                // leaving a chain hole that drops updates.
+                Some(next_hop.clone()),
                 &incoming_tx,
                 " (driver relay registration on Response)",
             )
@@ -3047,6 +3057,42 @@ mod tests {
             !stripped.contains("announce_contract_hosted"),
             "relay driver must NOT call announce_contract_hosted directly — go \
              through finalize_host_subscribe (announce is state-gated there)"
+        );
+    }
+
+    /// Pin (review Fix 4): on the FORWARDED relay path
+    /// (`relay_subscribe_forward_once`), the `finalize_host_subscribe` call must
+    /// pass the responding downstream (`next_hop`) as the directed body-fetch
+    /// holder, NOT a greedy `None`. The downstream just answered `Subscribed`, so
+    /// it holds the body; a greedy fetch toward the key could dead-end at a
+    /// closer non-hosting peer, leaving this hop registering nothing yet still
+    /// bubbling `Subscribed` upstream — a chain hole that drops updates.
+    #[test]
+    fn relay_subscribe_forwarded_finalize_passes_directed_holder() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn relay_subscribe_forward_once(")
+            .expect("relay_subscribe_forward_once not found");
+        let end = src[start..]
+            .find("\nasync fn relay_subscribe_send_response(")
+            .map(|off| start + off)
+            .expect("relay_subscribe_send_response anchor must follow forward_once");
+        let body = &src[start..end];
+        let call = body
+            .find("finalize_host_subscribe(")
+            .expect("forwarded relay path must call finalize_host_subscribe");
+        // Scan the finalize call's argument list (up to its `.await`) for the
+        // directed holder derived from the responding next hop.
+        let call_end = body[call..]
+            .find(".await")
+            .map(|off| call + off)
+            .expect("finalize_host_subscribe call must be awaited");
+        let args = &body[call..call_end];
+        assert!(
+            args.contains("Some(next_hop"),
+            "the forwarded finalize_host_subscribe must pass Some(next_hop...) as the \
+             directed fetch holder so the body fetch reaches the peer that just answered \
+             Subscribed (review Fix 4), not a greedy None"
         );
     }
 
