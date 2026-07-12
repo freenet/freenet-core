@@ -119,6 +119,11 @@ pub(crate) struct BroadcastTargetResult {
     pub targets: Vec<PeerKeyLocation>,
     pub proximity_found: usize,
     pub proximity_resolve_failed: usize,
+    /// Interest-manager (Source-2) fan-out was removed in #4642 step 9, so
+    /// these are always 0. They are retained for telemetry-schema continuity:
+    /// the #4281 propagation-stats window (`propagation_stats.rs`) and the
+    /// #3046 broadcast-delivery event (`tracing::register`) still carry them.
+    /// See `get_broadcast_targets_update`'s rustdoc.
     pub interest_found: usize,
     pub interest_resolve_failed: usize,
     pub skipped_self: usize,
@@ -269,12 +274,50 @@ impl OpManager {
 
     /// Resolve the set of peers to broadcast a state update to.
     ///
-    /// Combines the proximity neighbor cache (peers who announced they seed
-    /// the contract) with the interest manager (peers who expressed interest
-    /// via the protocol). Skips the sender (to avoid echo) and this node
-    /// (unless we are the local originator). Returns skip-reason counters
-    /// alongside the resolved targets for broadcast delivery diagnostics
-    /// (issue #3046).
+    /// Targets are the advertised co-hosts from the proximity neighbor cache
+    /// (peers who announced, via the advertisement layer, that they host this
+    /// contract). Skips the sender (to avoid echo) and this node (unless we are
+    /// the local originator). Returns skip-reason counters alongside the
+    /// resolved targets for broadcast delivery diagnostics (issue #3046).
+    ///
+    /// ## Source-1-only live fan-out (#4642 step 9)
+    ///
+    /// This previously unioned a second source: the interest manager's
+    /// `get_interested_peers` (peers who registered interest via the protocol).
+    /// That arm was removed. Live fan-out is now advertised-co-hosts-only.
+    ///
+    /// Removing it does NOT drop a subscriber's update, because a genuine
+    /// subscriber never persists in the "interested but no local state" condition
+    /// that arm used to cover:
+    ///
+    /// 1. A subscriber seeds its own baseline state via its subscribe-GET before
+    ///    the subscription is finalized. `finalize_originator_subscribe`
+    ///    (`subscribe.rs`) awaits `fetch_contract_if_missing` (which drives a
+    ///    sub-op GET) and only returns success once current state, including any
+    ///    already-committed UPDATE, is stored locally. So no real subscriber is
+    ///    left relying on a live fan-out for its first copy of the state. Pinned
+    ///    by `subscribe_seeds_state_via_get_before_finalize` (`subscribe.rs`).
+    /// 2. Once it holds state it advertises (`announce_contract_hosted`), which
+    ///    makes it a Source-1 target for later live fan-out AND gives it a
+    ///    non-empty state summary. From then on the summary-based InterestSync
+    ///    anti-entropy (`node.rs` Summaries -> `SyncStateToPeer`) and the
+    ///    advertisement-reconciliation exchange keep it fresh if it ever misses a
+    ///    live update: the ~5-min `ring.rs::interest_heartbeat` sends each
+    ///    neighbor a `HostingStateRequest`, the neighbor replies with a
+    ///    `HostingStateResponse` snapshot of its hosted set, and we full-replace
+    ///    that into our Source-1 view (#4722).
+    ///
+    /// The summary-based anti-entropy path deliberately does NOT heal a peer with
+    /// no state: a `None` summary is skipped by the `zip` staleness gate in
+    /// `node.rs`. That is exactly why the subscribe-GET seeding in (1), not the
+    /// heartbeat, is the load-bearing safety property. See
+    /// `.claude/rules/hosting-invariants.md` invariant 1 and
+    /// `docs/design/demand-driven-hosting.md`.
+    ///
+    /// `InterestManager` itself is retained: it still drives proactive summary
+    /// notifications (`send_proactive_summary_notification`), interest-heartbeat
+    /// TTL refresh, and eviction demand-counting. Only the state fan-out arm was
+    /// removed here.
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
@@ -287,11 +330,13 @@ impl OpManager {
 
         let mut targets: HashSet<PeerKeyLocation> = HashSet::new();
         let mut proximity_resolve_failed: usize = 0;
-        let mut interest_resolve_failed: usize = 0;
         let mut skipped_self: usize = 0;
         let mut skipped_sender: usize = 0;
 
-        // Source 1: Proximity cache (peers who announced they seed this contract)
+        // Source 1 (the ONLY live fan-out source): the proximity cache of
+        // advertised co-hosts — peers who announced they host this contract via
+        // the advertisement layer. The former interest-manager arm (Source 2)
+        // was removed in #4642 step 9; see this function's rustdoc.
         let proximity_pub_keys = self.neighbor_hosting.neighbors_with_contract(key);
         let proximity_found = proximity_pub_keys.len();
 
@@ -320,43 +365,13 @@ impl OpManager {
             }
         }
 
-        // Source 2: Interest manager (peers who expressed interest via protocol)
-        let interested_peers = self.interest_manager.get_interested_peers(key);
-        let interest_found = interested_peers.len();
-
-        for (peer_key, _interest) in interested_peers {
-            if let Some(pkl) = self
-                .ring
-                .connection_manager
-                .get_peer_by_pub_key(&peer_key.0)
-            {
-                if let Some(pkl_addr) = pkl.socket_addr() {
-                    if &pkl_addr == sender && !is_local_update_initiator {
-                        skipped_sender += 1;
-                        continue;
-                    }
-                    if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
-                        skipped_self += 1;
-                        continue;
-                    }
-                }
-                targets.insert(pkl);
-            } else {
-                interest_resolve_failed += 1;
-                // Counter (interest_resolve_failed) feeds the aggregate
-                // logged below — at INFO when targets were found,
-                // promoted to WARN when ALL targets failed to resolve
-                // (worst case, NO_TARGETS branch). Per-peer-miss DEBUG
-                // avoids the hundreds-per-hour spam on hot contracts.
-                tracing::debug!(
-                    contract = %format!("{:.8}", key),
-                    interest_peer = %peer_key.0,
-                    is_local = is_local_update_initiator,
-                    phase = "target_lookup_failed",
-                    "Interest manager peer not found in connection manager"
-                );
-            }
-        }
+        // Source 2 (interest manager) REMOVED in #4642 step 9. Do NOT re-add a
+        // fan-out arm here that unions `interest_manager.get_interested_peers`.
+        // A genuine subscriber does not stay "interested but stateless": it seeds
+        // baseline state via its own subscribe-GET before finalizing
+        // (`finalize_originator_subscribe`), then advertises and becomes a
+        // Source-1 target. See this function's rustdoc and
+        // `.claude/rules/hosting-invariants.md` invariant 1.
 
         let mut result: Vec<PeerKeyLocation> = targets.into_iter().collect();
         result.sort();
@@ -373,7 +388,6 @@ impl OpManager {
                     .join(","),
                 count = result.len(),
                 proximity_sources = proximity_found,
-                interest_sources = interest_found,
                 phase = "broadcast",
                 "UPDATE_PROPAGATION"
             );
@@ -385,14 +399,13 @@ impl OpManager {
             // WARN in p2p_protoc.rs (grep for
             // "BROADCAST_NO_TARGETS: no targets found after"); the
             // per-attempt detail belongs in metrics/structured counters
-            // (interest_resolve_failed). Issue #4251 re-review M2.
+            // (proximity_resolve_failed). Issue #4251 re-review M2.
             tracing::debug!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
                 self_addr = ?self_addr.map(|a| format!("{:.8}", a)),
                 proximity_sources = proximity_found,
-                interest_sources = interest_found,
-                interest_resolve_failed,
+                proximity_resolve_failed,
                 phase = "warning",
                 "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate further"
             );
@@ -402,8 +415,10 @@ impl OpManager {
             targets: result,
             proximity_found,
             proximity_resolve_failed,
-            interest_found,
-            interest_resolve_failed,
+            // Source-2 interest fan-out removed in #4642 step 9; kept at 0 for
+            // telemetry-schema continuity (see the struct's field docs).
+            interest_found: 0,
+            interest_resolve_failed: 0,
             skipped_self,
             skipped_sender,
         }

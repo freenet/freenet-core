@@ -799,6 +799,105 @@ pub(crate) async fn handle_unsubscribe_inbound(
 #[cfg(test)]
 mod tests;
 
+/// Source-scrape pins for the subscribe-seeds-state-via-GET invariant.
+///
+/// This is the load-bearing property that makes removing the Source-2
+/// (interest-manager) live-update fan-out safe (#4642 step 9, see
+/// `operations/update.rs::get_broadcast_targets_update`). Because
+/// `finalize_originator_subscribe` awaits `fetch_contract_if_missing` (which
+/// drives a sub-op GET) BEFORE it advertises hosting or returns subscribe
+/// success, a genuine subscriber pulls current state (including any
+/// already-committed UPDATE) via its OWN GET and never persists in the
+/// "interested but no local state" condition. That is why it is safe for live
+/// UPDATE fan-out to target advertised co-hosts only: a real subscriber has
+/// state and advertises, so it is a Source-1 target and has a non-empty summary.
+///
+/// If a future change let a peer register as a subscriber WITHOUT that seeding
+/// GET, a no-state subscriber relying on live fan-out would reappear and the
+/// Source-2 removal WOULD drop its first update. These pins fail loudly if the
+/// seed-GET is dropped, made fire-and-forget, or reordered after the advertise.
+#[cfg(test)]
+mod source_pin_tests {
+    /// Extract the balanced-brace body of the named `async fn` from this file.
+    /// The needle is composed at runtime so the pin does not match itself.
+    fn extract_fn_body(fn_name: &str) -> &'static str {
+        let src = include_str!("subscribe.rs");
+        let head = ["async fn ", fn_name, "("].concat();
+        let start = src
+            .find(&head)
+            .unwrap_or_else(|| panic!("`async fn {fn_name}(` must exist in subscribe.rs"));
+        let body_open = src[start..].find('{').map(|off| start + off).unwrap();
+        let mut depth: i32 = 0;
+        let mut end = body_open;
+        for (i, ch) in src[body_open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &src[start..end]
+    }
+
+    #[test]
+    fn subscribe_seeds_state_via_get_before_finalize() {
+        let body = extract_fn_body("finalize_originator_subscribe");
+
+        // (1) The seed-GET call is present at all.
+        let fetch_idx = body.find("fetch_contract_if_missing(").expect(
+            "#4642 step 9 safety: `finalize_originator_subscribe` MUST call \
+             `fetch_contract_if_missing` to seed baseline state via GET before \
+             finalizing. Without it, a peer can become a subscriber with no local \
+             state and rely on a live UPDATE fan-out that Source-2 removal deleted.",
+        );
+
+        // Match the CALL (`announce_contract_hosted(`), not the several prose
+        // mentions of the name in comments above it.
+        let announce_idx = body.find("announce_contract_hosted(").expect(
+            "`finalize_originator_subscribe` should still advertise hosting via \
+             `announce_contract_hosted`.",
+        );
+
+        // (2) The seed-GET precedes the advertise (seed BEFORE announce): a peer
+        // must not advertise itself as a host before it has pulled state.
+        assert!(
+            fetch_idx < announce_idx,
+            "#4642 step 9 safety: `fetch_contract_if_missing` (seed state via GET) \
+             must run BEFORE `announce_contract_hosted` in \
+             `finalize_originator_subscribe`. Advertising before seeding would make \
+             the peer a Source-1 target with no state.",
+        );
+
+        // (3) It is AWAITED (not fire-and-forget): the fetch result must gate the
+        // subsequent finalize steps, so a `.await` must appear between the call
+        // and the advertise.
+        assert!(
+            body[fetch_idx..announce_idx].contains(".await"),
+            "#4642 step 9 safety: the `fetch_contract_if_missing` seed-GET must be \
+             AWAITED before finalizing. A fire-and-forget fetch would let the \
+             subscription complete before state lands, reintroducing the no-state \
+             subscriber that live fan-out no longer covers.",
+        );
+
+        // (4) The fetch genuinely drives a GET (not merely a local cache peek), so
+        // committed-but-not-yet-seen state is actually pulled in.
+        let fetch_body = extract_fn_body("fetch_contract_if_missing");
+        assert!(
+            fetch_body.contains("start_sub_op_get")
+                || fetch_body.contains("start_targeted_sub_op_get"),
+            "#4642 step 9 safety: `fetch_contract_if_missing` must drive a sub-op \
+             GET (`start_sub_op_get` / `start_targeted_sub_op_get`) so a subscriber \
+             pulls current state, including any already-committed UPDATE.",
+        );
+    }
+}
+
 /// Task-per-transaction SUBSCRIBE drivers.
 pub(crate) mod op_ctx_task;
 

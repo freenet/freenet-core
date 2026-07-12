@@ -1803,8 +1803,10 @@ where
                     // now a `neighbors_with_contract` broadcast target. If a
                     // fresh-contract PUT gave up with no targets and is stashed,
                     // flush it here — this is the proximity first-viable-target
-                    // signal, distinct from the interest-manager (Source 2)
-                    // signals. Must run BEFORE the receiving-updates/downstream
+                    // signal, distinct from the interest-registration flush sites
+                    // (`register_peer_interest`; the Source-2 live fan-out arm
+                    // itself was removed in #4642 step 9). Must run BEFORE the
+                    // receiving-updates/downstream
                     // gate below, which `continue`s for exactly the
                     // locally-hosted-only fresh-PUT case this fix targets.
                     op_manager.flush_pending_broadcast_on_interest(&key).await;

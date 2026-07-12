@@ -789,29 +789,37 @@ impl OpManager {
     ///
     /// ## Trigger completeness (issue #4359 re-review, MUST-FIX 1)
     ///
-    /// `get_broadcast_targets_update` resolves targets from two sources, so the
-    /// *first viable target* for a cold id can appear via either. This method is
-    /// invoked from every site that makes a peer a target for the first time:
+    /// Since #4642 step 9, `get_broadcast_targets_update` resolves targets from
+    /// a SINGLE source — the proximity cache of advertised co-hosts (Source 1).
+    /// The *first viable target* for a cold id therefore appears when a
+    /// connected neighbor newly announces it hosts one of our contracts:
     ///
-    /// * **Source 2 — interest manager** (`register_peer_interest` is_new):
+    /// * **Source 1 — proximity cache** (`neighbors_with_contract`):
+    ///   - `node.rs` NeighborHosting overlap path, when a neighbor newly
+    ///     announces hosting one of our contracts (the neighbor just became a
+    ///     `neighbors_with_contract` target) — live, or reconciled by the
+    ///     ~5-min InterestSync anti-entropy heartbeat
+    ///     (`ring.rs::interest_heartbeat`, #4722).
+    ///
+    /// The interest-registration flush sites remain wired even though an
+    /// interest-only peer is no longer a broadcast target (Source 2 was removed
+    /// in #4642 step 9): a flush that finds no Source-1 target simply re-stashes
+    /// or lets the entry expire — harmless and cheap, and it keeps the eager
+    /// #4359 wakeup for the case where an interest registration coincides with
+    /// the peer's advertisement. Those sites are (`register_peer_interest`
+    /// is_new):
     ///   - `subscribe::register_downstream_subscriber` (downstream subscriber)
     ///   - `subscribe::finalize_originator_subscribe` (originator upstream)
     ///   - `get::op_ctx_task` remote GET `subscribe=false` (requester interest)
     ///   - `node.rs` Interests / Summaries interest-sync handlers
-    /// * **Source 1 — proximity cache** (`neighbors_with_contract`):
-    ///   - `node.rs` NeighborHosting overlap path, when a neighbor newly
-    ///     announces hosting one of our contracts (the neighbor just became a
-    ///     `neighbors_with_contract` target).
     ///
     /// That set is the complete first-viable-target signal: a never-seen id can
-    /// only gain a broadcast target by a peer expressing interest (Source 2) or
-    /// by a connected neighbor announcing it hosts the id (Source 1), and each
-    /// such transition routes through one of the sites above. The give-up path
-    /// itself also re-checks targets immediately after stashing
-    /// (`pending_broadcast_stash_recheck`) to close the stash-after-flush race.
-    /// A grep pin test (`pending_broadcast_flush_wired_at_all_interest_sites`)
-    /// guards against a future `register_peer_interest` call site forgetting the
-    /// flush.
+    /// only gain a broadcast target by a connected neighbor announcing it hosts
+    /// the id (Source 1). The give-up path itself also re-checks targets
+    /// immediately after stashing (`pending_broadcast_stash_recheck`) to close
+    /// the stash-after-flush race. A grep pin test
+    /// (`pending_broadcast_flush_wired_at_all_interest_sites`) guards against a
+    /// future `register_peer_interest` call site forgetting the flush.
     ///
     /// Best-effort via [`Self::try_notify_node_event`]: if the channel is full
     /// the state is re-stashed for the next signal. No-op (no read, no emit)
@@ -2919,6 +2927,142 @@ mod tests {
             },
         );
         op_manager.neighbor_hosting.contracts_for_peer(hub)
+    }
+
+    /// Safety proof for #4642 step 9 (remove the Source-2 interest fan-out arm
+    /// from live UPDATE propagation). At the `get_broadcast_targets_update`
+    /// boundary this asserts the properties the removal must preserve:
+    ///
+    /// 1. An interest-only peer — registered in the interest manager but NOT
+    ///    advertising via the advertisement layer — is EXCLUDED from broadcast
+    ///    targets. This is the interest-but-not-yet-advertised (lagged
+    ///    advertisement) case; under the old two-source model it WOULD be a
+    ///    target via Source 2, and after step 9 it must not be.
+    /// 2. An advertised co-host (Source 1) is still INCLUDED.
+    /// 3. The advertisement-reconciliation heal restores the lagged peer: once
+    ///    our view of it includes the contract it becomes a broadcast target. The
+    ///    periodic interest heartbeat sends each neighbor a `HostingStateRequest`;
+    ///    the neighbor replies with a `HostingStateResponse` snapshot of its
+    ///    hosted set, which we full-replace into our Source-1 view
+    ///    (`ring.rs::interest_heartbeat`, #4722).
+    ///
+    /// This is the unit-level counterpart of the lagged-advertisement
+    /// convergence simulation: removing Source-2 is safe precisely because a
+    /// peer that is interested-but-not-yet-advertised is reached once its
+    /// advertisement lands in Source-1, live or via anti-entropy. See
+    /// `.claude/rules/hosting-invariants.md` invariant 1 and
+    /// `docs/design/demand-driven-hosting.md`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn broadcast_targets_are_advertised_cohosts_only_and_heal_via_advertisement() {
+        use crate::ring::interest::PeerKey;
+
+        let (op_manager, _guards) =
+            build_reroot_test_op_manager("broadcast-targets-source1-only").await;
+
+        // Own address. The UPDATE sender is a DIFFERENT peer, so the self/sender
+        // echo-skip never applies to A or B below.
+        let self_addr: std::net::SocketAddr = "127.0.0.1:12000".parse().unwrap();
+        op_manager.ring.connection_manager.set_own_addr(self_addr);
+        let sender_addr: std::net::SocketAddr = "127.0.0.1:20000".parse().unwrap();
+
+        let key = reroot_contract_key(0x5A);
+        let cid = *key.id();
+
+        // Peer A: a connected, ADVERTISED co-host (Source 1).
+        let kp_a = crate::transport::TransportKeypair::new();
+        let addr_a: std::net::SocketAddr = "127.0.0.1:20001".parse().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.3),
+            addr_a,
+            kp_a.public().clone(),
+            false,
+        ));
+        op_manager.neighbor_hosting.handle_message(
+            kp_a.public(),
+            crate::message::NeighborHostingMessage::HostingAnnounce {
+                added: vec![cid],
+                removed: vec![],
+                is_response: false,
+            },
+        );
+
+        // Peer B: a connected peer that has registered INTEREST but has NOT yet
+        // advertised (the lagged-advertisement case). It is a valid, resolvable
+        // connection, so its exclusion below is due to the Source-2 removal, not
+        // an unresolvable peer.
+        let kp_b = crate::transport::TransportKeypair::new();
+        let addr_b: std::net::SocketAddr = "127.0.0.1:20002".parse().unwrap();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.6),
+            addr_b,
+            kp_b.public().clone(),
+            false,
+        ));
+        assert!(
+            op_manager.interest_manager.register_peer_interest(
+                &key,
+                PeerKey(kp_b.public().clone()),
+                None,
+                false,
+            ),
+            "interest registration should succeed"
+        );
+
+        // BEFORE the heal: only the advertised co-host A is a target.
+        let before = op_manager.get_broadcast_targets_update(&key, &sender_addr);
+        let before_addrs: std::collections::HashSet<std::net::SocketAddr> = before
+            .targets
+            .iter()
+            .filter_map(|p| p.socket_addr())
+            .collect();
+        assert!(
+            before_addrs.contains(&addr_a),
+            "advertised co-host (Source 1) must be a broadcast target; got {before_addrs:?}"
+        );
+        assert!(
+            !before_addrs.contains(&addr_b),
+            "interest-only peer (former Source 2) must NOT be a broadcast target after \
+             #4642 step 9; got {before_addrs:?}"
+        );
+        assert_eq!(
+            before.targets.len(),
+            1,
+            "exactly one target (A) before heal"
+        );
+        assert_eq!(before.proximity_found, 1);
+        assert_eq!(
+            before.interest_found, 0,
+            "interest_found is vestigial after Source-2 removal and must report 0"
+        );
+
+        // THE HEAL: the periodic interest heartbeat re-pulls B's hosted set. We
+        // send B a `HostingStateRequest`; B replies with a `HostingStateResponse`
+        // snapshot of what it hosts, which we full-replace into our view of B
+        // (`ring.rs::interest_heartbeat`, #4722). That is what moves B into
+        // Source-1. (An advertised co-host may also announce proactively via
+        // `HostingAnnounce`; either path lands B in the proximity cache.)
+        op_manager.neighbor_hosting.handle_message(
+            kp_b.public(),
+            crate::message::NeighborHostingMessage::HostingStateResponse {
+                contracts: vec![cid],
+            },
+        );
+
+        // AFTER the heal: B is now an advertised co-host and IS a target.
+        let after = op_manager.get_broadcast_targets_update(&key, &sender_addr);
+        let after_addrs: std::collections::HashSet<std::net::SocketAddr> = after
+            .targets
+            .iter()
+            .filter_map(|p| p.socket_addr())
+            .collect();
+        assert!(
+            after_addrs.contains(&addr_a) && after_addrs.contains(&addr_b),
+            "after the advertisement heals, BOTH co-hosts must be broadcast targets; \
+             got {after_addrs:?}"
+        );
+        assert_eq!(after.targets.len(), 2, "both A and B after heal");
+        assert_eq!(after.proximity_found, 2);
+        assert_eq!(after.interest_found, 0);
     }
 
     /// THE re-root-storm falsifier (#4642 piece F, the load-bearing test). Drop a

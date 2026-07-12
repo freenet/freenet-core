@@ -14120,6 +14120,261 @@ fn test_piece_b_anti_entropy_heals_demandless_copy() {
     freenet::dev_tool::clear_crdt_contracts();
 }
 
+/// Safety proof for #4642 step 9: removing the Source-2 (interest-manager)
+/// fan-out arm from live UPDATE propagation is safe because Source-1 (advertised
+/// co-hosts) delivers the live update to the mesh, and the InterestSync
+/// anti-entropy heartbeat is the backstop for a subscriber that missed the live
+/// fan-out (e.g. one whose advertisement lagged, or that was briefly
+/// unreachable).
+///
+/// The interest manager (Source 2) used to be resolved as broadcast targets for
+/// exactly the peers that register interest — i.e. SUBSCRIBERS. So the on-point
+/// end-to-end demonstration is that a SUBSCRIBED mesh member still converges
+/// with Source-2 gone:
+///
+/// * **Positive control (Source-1 live fan-out, no Source-2):** the reachable
+///   mesh subscribers receive the committed UPDATE and end fresh. Their only
+///   route to the live update is Source-1 (advertised co-hosts) — Source-2 is
+///   removed — so this asserts advertised-co-host fan-out alone delivers it.
+/// * **Backstop (anti-entropy heals the missed peer):** one mesh subscriber is
+///   crash-isolated across the UPDATE (the harness has no per-message-type loss
+///   knob, so a crash across the update is the deterministic proxy for "did not
+///   receive the live fan-out"), then recovered. With no NEW update after
+///   recovery, nothing re-pushes v2 via Source-1; only the periodic InterestSync
+///   anti-entropy exchange (`ring.rs::interest_heartbeat`, #4722) can bring it
+///   current. It MUST heal to v2 within the heartbeat window.
+///
+/// This is the end-to-end counterpart of the unit test
+/// `broadcast_targets_are_advertised_cohosts_only_and_heal_via_advertisement`
+/// (op_state_manager.rs), which pins the same guarantee at the
+/// `get_broadcast_targets_update` boundary. See
+/// `.claude/rules/hosting-invariants.md` invariant 1 and
+/// `docs/design/demand-driven-hosting.md`.
+#[test_log::test]
+fn test_step9_source2_removal_subscriber_heals_via_anti_entropy() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0x4642_0009_5AFE; // step-9, "SAFE"
+    const NETWORK_NAME: &str = "step9-source2-removal-heal";
+    const NUM_NODES: usize = 8;
+
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0x59);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    // CRDT-versioned states so the higher VERSION deterministically wins the
+    // anti-entropy merge (mirrors test_piece_b's rationale): v2 wins, and a
+    // stale copy pushing v1 back is a no-op.
+    freenet::dev_tool::register_crdt_contract(contract_id);
+    let state_v1 = SimOperation::create_crdt_state(1, 0x11);
+    let state_v2 = SimOperation::create_crdt_state(2, 0x22);
+
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let node_locations: Vec<f64> = (0..NUM_NODES)
+        .map(|i| wrap(key_loc + i as f64 / NUM_NODES as f64))
+        .collect();
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,
+            NUM_NODES,
+            10,
+            7,
+            8,
+            3,
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    let host_no = ranked[0]; // nearest the key: source of truth
+    let mesh_control_nos = [ranked[1], ranked[2]]; // subscribed, stay reachable (positive control)
+    let isolated_no = ranked[3]; // subscribed, crash-isolated across the UPDATE then RECOVERED
+
+    let host = NodeLabel::node(NETWORK_NAME, host_no);
+    let mesh_control: Vec<NodeLabel> = mesh_control_nos
+        .iter()
+        .map(|n| NodeLabel::node(NETWORK_NAME, *n))
+        .collect();
+    let isolated = NodeLabel::node(NETWORK_NAME, isolated_no);
+
+    tracing::info!(
+        key_loc,
+        host = host_no,
+        mesh_control = ?mesh_control_nos,
+        isolated = isolated_no,
+        "step-9 Source-2-removal heal: roles by ring distance to key"
+    );
+
+    let mut operations = Vec::new();
+    // 0. Source of truth near the key.
+    operations.push(ScheduledOperation::new(
+        host.clone(),
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state: state_v1.clone(),
+        },
+    ));
+    // 1. Reachable mesh: GET-with-subscribe joins the update mesh (positive
+    //    control that Source-1 live fan-out delivers the UPDATE, no Source-2).
+    for m in &mesh_control {
+        operations.push(ScheduledOperation::new(
+            m.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
+        ));
+    }
+    // 2. Isolated mesh member: also GET-with-subscribe, so it is a genuine
+    //    subscriber (the exact peer class the removed Source-2 arm used to serve).
+    operations.push(ScheduledOperation::new(
+        isolated.clone(),
+        SimOperation::Get {
+            contract_id,
+            return_contract_code: true,
+            subscribe: true,
+        },
+    ));
+    // 3. Crash-isolate the ISOLATED subscriber BEFORE the UPDATE so it misses the
+    //    live fan-out — the deterministic proxy for "not reached by Source-1".
+    operations.push(ScheduledOperation::new(
+        isolated.clone(),
+        SimOperation::CrashNode,
+    ));
+    // 4. UPDATE to v2: host + reachable mesh refresh; the isolated copy misses it.
+    operations.push(ScheduledOperation::new(
+        host.clone(),
+        SimOperation::Update {
+            key: contract_key,
+            data: state_v2.clone(),
+        },
+    ));
+    // 5. RECOVER the ISOLATED subscriber: messages flow again, but there is no
+    //    NEW update, so Source-1 does not re-push v2 — only anti-entropy can
+    //    bring it current.
+    operations.push(ScheduledOperation::new(
+        isolated.clone(),
+        SimOperation::RecoverNode,
+    ));
+
+    let logs_handle = sim.event_logs_handle();
+    // Post-op wait must exceed one interest-heartbeat interval (300 s) plus the
+    // per-peer spread + push round-trip, so the periodic InterestSync exchange
+    // fires at least once after recovery. Turmoil virtual time makes this cheap.
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(720),
+        Duration::from_secs(680),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "step-9 heal sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let metrics = compute_piece_e_metrics(&result, &logs, &contract_key, &host, &[], &mesh_control);
+
+    let v1_hash = freenet::tracing::state_hash_short(&freenet_stdlib::prelude::WrappedState::new(
+        state_v1.clone(),
+    ));
+    let v2_hash = freenet::tracing::state_hash_short(&freenet_stdlib::prelude::WrappedState::new(
+        state_v2.clone(),
+    ));
+    let hash_of = |label: &NodeLabel| -> Option<String> {
+        result
+            .node_storages
+            .get(label)
+            .and_then(|s| s.get_stored_state(&contract_key))
+            .map(|ws| freenet::tracing::state_hash_short(&ws))
+    };
+    let host_current = hash_of(&host);
+    let isolated_hash = hash_of(&isolated);
+    let isolated_hosting = result.is_node_hosting(&isolated, &contract_key);
+
+    tracing::info!(target: "step9_heal",
+        "===== STEP-9 SOURCE-2-REMOVAL HEAL (seed=0x{SEED:X}) =====");
+    tracing::info!(target: "step9_heal", "  v1={v1_hash} v2={v2_hash} host_current={host_current:?}");
+    tracing::info!(target: "step9_heal",
+        "  ISOLATED subscriber: hash={isolated_hash:?} hosting={isolated_hosting} (recovered; must HEAL to v2)");
+    tracing::info!(target: "step9_heal",
+        "  mesh subscribers fresh (Source-1 live fan-out): {}/{}",
+        metrics.subscribers_fresh, metrics.subscribers_total);
+    tracing::info!(target: "step9_heal",
+        "  crash packets dropped (isolation took effect): {}", result.crash_packets_dropped());
+    tracing::info!(target: "step9_heal", "===== END =====");
+
+    // --- Assertions ---
+    // (1) The UPDATE is a real state change.
+    assert_ne!(
+        v1_hash, v2_hash,
+        "v1 and v2 must differ — the UPDATE must be a real state change"
+    );
+    // (2) The UPDATE applied at HOST (defines "current" = v2).
+    assert_eq!(
+        host_current.as_deref(),
+        Some(v2_hash.as_str()),
+        "UPDATE must apply at HOST (host_current should equal v2)"
+    );
+    // (3) POSITIVE CONTROL: the reachable mesh subscribers received the live
+    //     UPDATE and ended fresh. Their ONLY route to the live update is Source-1
+    //     (advertised co-hosts) — Source-2 was removed in step 9 — so this
+    //     asserts advertised-co-host fan-out alone delivers a committed UPDATE.
+    assert!(
+        metrics.subscribers_total >= 2,
+        "test wiring: expected >=2 reachable mesh subscribers, got {}",
+        metrics.subscribers_total
+    );
+    assert_eq!(
+        metrics.subscribers_fresh, metrics.subscribers_total,
+        "reachable mesh subscribers must all be fresh via Source-1 live fan-out \
+         ({}/{}) — a stale subscriber means advertised-co-host fan-out failed to \
+         deliver the UPDATE without Source-2",
+        metrics.subscribers_fresh, metrics.subscribers_total
+    );
+    // (4) The isolation genuinely took effect — the isolated subscriber provably
+    //     missed the live fan-out.
+    assert!(
+        result.crash_packets_dropped() > 0,
+        "crash-isolation had no effect (no packets dropped) — the subscriber did \
+         not miss the update, so the heal below would not exercise anti-entropy"
+    );
+    // (5) The isolated node is a genuine hosting subscriber.
+    assert!(
+        isolated_hosting,
+        "isolated node must host the contract (it GET-subscribed), got hosting=false"
+    );
+    // (6) PRIMARY (step 9 safety): the recovered subscriber HEALED to the current
+    //     state via the anti-entropy backstop. With Source-2 removed and no new
+    //     update after recovery, this is the ONLY mechanism that can bring a
+    //     subscriber that missed the live fan-out current. If this FAILS,
+    //     removing Source-2 dropped an update the backstop did not recover.
+    assert_eq!(
+        isolated_hash.as_deref(),
+        Some(v2_hash.as_str()),
+        "STEP-9: the recovered subscriber MUST heal to v2 via anti-entropy \
+         (isolated_hash={isolated_hash:?}, v2={v2_hash}, host_current={host_current:?})"
+    );
+    assert_eq!(
+        isolated_hash.as_deref(),
+        host_current.as_deref(),
+        "STEP-9: the recovered subscriber MUST converge with the source of truth"
+    );
+
+    // Avoid leaking the CRDT registration into other tests sharing this process.
+    freenet::dev_tool::clear_crdt_contracts();
+}
+
 // =============================================================================
 // Summary-first PUT (#4642 step 3-bis) — behavioral simulation tests
 // =============================================================================
