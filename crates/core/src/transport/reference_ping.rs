@@ -44,6 +44,7 @@ use crate::config::GlobalRng;
 use crate::simulation::RealTime;
 use crate::transport::DefaultSocket;
 use crate::transport::rolling_rtt_stats::RollingRttStats;
+use crate::transport::shadow_stats::{SHADOW_ROLLUP_WINDOW_SECS, WindowedStat};
 
 /// Default reference target (Cloudflare public DNS over UDP).
 ///
@@ -131,6 +132,7 @@ async fn run_probe_loop(local_peer_id: String, target: SocketAddr, socket: Defau
     // align with the rest of the node clock.
     ticker.tick().await;
 
+    let mut window = RefPingWindow::default();
     loop {
         ticker.tick().await;
         let outcome = probe_once(&socket, target).await;
@@ -142,7 +144,13 @@ async fn run_probe_loop(local_peer_id: String, target: SocketAddr, socket: Defau
                 // would poison the baseline.
             }
         }
-        emit_snapshot(&local_peer_id, target, &stats);
+        // Sample the rolling snapshot every second, but emit one OTLP rollup
+        // per SHADOW_ROLLUP_WINDOW_SECS to keep central telemetry volume down.
+        window.record(sample_reference_ping(&stats));
+        if window.is_full() {
+            emit_reference_ping_rollup(&local_peer_id, target, &window);
+            window = RefPingWindow::default();
+        }
     }
 }
 
@@ -189,28 +197,78 @@ async fn probe_once(socket: &DefaultSocket, target: SocketAddr) -> ProbeOutcome 
     }
 }
 
-fn emit_snapshot(local_peer_id: &str, target: SocketAddr, stats: &RollingRttStats<RealTime>) {
-    let snapshot = stats.snapshot();
-    let (baseline_min_us, recent_median_us, inflation_us, baseline_samples, recent_samples) =
-        match snapshot {
-            Some(s) => (
-                s.baseline_min.map(|d| d.as_micros() as u64),
-                s.recent_median.map(|d| d.as_micros() as u64),
-                s.inflation.map(|d| d.as_micros() as u64),
-                s.baseline_samples as u64,
-                s.recent_samples as u64,
-            ),
-            None => (None, None, None, 0, 0),
-        };
+/// One 1 Hz sample of the reference-path rolling snapshot.
+struct RefPingSample {
+    baseline_min_us: Option<u64>,
+    recent_median_us: Option<u64>,
+    inflation_us: Option<u64>,
+    baseline_samples: u64,
+    recent_samples: u64,
+}
+
+/// Windowed rollup accumulator for the `shadow_reference_ping` stream.
+#[derive(Default)]
+struct RefPingWindow {
+    ticks: u32,
+    baseline_min_us: WindowedStat,
+    recent_median_us: WindowedStat,
+    inflation_us: WindowedStat,
+    baseline_samples: WindowedStat,
+    recent_samples: WindowedStat,
+}
+
+impl RefPingWindow {
+    fn record(&mut self, sample: RefPingSample) {
+        self.ticks += 1;
+        self.baseline_min_us.record_opt(sample.baseline_min_us);
+        self.recent_median_us.record_opt(sample.recent_median_us);
+        self.inflation_us.record_opt(sample.inflation_us);
+        self.baseline_samples.record(sample.baseline_samples);
+        self.recent_samples.record(sample.recent_samples);
+    }
+
+    fn is_full(&self) -> bool {
+        self.ticks >= SHADOW_ROLLUP_WINDOW_SECS
+    }
+}
+
+/// Read one rolling snapshot of the reference-path RTT stats.
+fn sample_reference_ping(stats: &RollingRttStats<RealTime>) -> RefPingSample {
+    match stats.snapshot() {
+        Some(s) => RefPingSample {
+            baseline_min_us: s.baseline_min.map(|d| d.as_micros() as u64),
+            recent_median_us: s.recent_median.map(|d| d.as_micros() as u64),
+            inflation_us: s.inflation.map(|d| d.as_micros() as u64),
+            baseline_samples: s.baseline_samples as u64,
+            recent_samples: s.recent_samples as u64,
+        },
+        None => RefPingSample {
+            baseline_min_us: None,
+            recent_median_us: None,
+            inflation_us: None,
+            baseline_samples: 0,
+            recent_samples: 0,
+        },
+    }
+}
+
+/// Emit one `shadow_reference_ping` rollup. Each latency field keeps the
+/// window mean under its original name; `inflation_us_p50` / `inflation_us_max`
+/// (and `recent_median_us_max`) are the additive distribution fields the #4074
+/// reference-path analysis consumes to separate local-uplink contention from
+/// overlay queueing.
+fn emit_reference_ping_rollup(local_peer_id: &str, target: SocketAddr, window: &RefPingWindow) {
+    let baseline_min_us = window.baseline_min_us.mean();
+    let recent_median_us = window.recent_median_us.mean();
+    let inflation_us = window.inflation_us.mean();
 
     tracing::debug!(
         target: "freenet::transport::reference_ping",
         %target,
-        baseline_min_us,
-        recent_median_us,
-        inflation_us,
-        baseline_samples,
-        recent_samples,
+        ?baseline_min_us,
+        ?recent_median_us,
+        ?inflation_us,
+        window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_reference_ping"
     );
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
@@ -220,9 +278,14 @@ fn emit_snapshot(local_peer_id: &str, target: SocketAddr, stats: &RollingRttStat
             "target": target.to_string(),
             "baseline_min_us": baseline_min_us,
             "recent_median_us": recent_median_us,
+            "recent_median_us_max": window.recent_median_us.max(),
             "inflation_us": inflation_us,
-            "baseline_samples": baseline_samples,
-            "recent_samples": recent_samples,
+            "inflation_us_p50": window.inflation_us.p50(),
+            "inflation_us_max": window.inflation_us.max(),
+            "baseline_samples": window.baseline_samples.mean(),
+            "recent_samples": window.recent_samples.mean(),
+            "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
+            "samples": window.ticks,
         }),
     );
 }

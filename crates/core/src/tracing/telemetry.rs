@@ -177,15 +177,17 @@ const MAX_EVENTS_PER_SECOND: usize = 10;
 ///
 /// Shadow telemetry is admitted under this sub-budget, carved out of the
 /// aggregate [`MAX_EVENTS_PER_SECOND`] cap, so that always-on background
-/// emitters cannot starve operational telemetry (#4380). With the current
-/// always-on baseline of 3 shadow events/sec (`shadow_rtt_aggregate` +
-/// `shadow_rate_demand` + `shadow_outbound_class`), rising to 5/sec on a
-/// gateway that also enables reference-ping and iface-tx, a cap of 4 admits
-/// the always-on set while still reserving at least
-/// `MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND` (= 6) slots/sec for
-/// operational events even when shadow demand spikes (e.g. Phase 2 adds the
-/// shadow controller decision log). Shadow events still also count against the
-/// aggregate cap.
+/// emitters cannot starve operational telemetry (#4380). Each shadow stream
+/// (`shadow_rtt_aggregate`, `shadow_rate_demand`, `shadow_outbound_class`,
+/// plus `shadow_reference_ping` / `shadow_iface_tx` on opted-in gateways)
+/// samples at 1 Hz but only emits one rolled-up event per
+/// `transport::shadow_stats::SHADOW_ROLLUP_WINDOW_SECS`, so the steady-state
+/// shadow rate is now well below 1 event/sec. The cap is kept at 4 so a
+/// transient burst (window boundaries aligning, or Phase 2 adding a shadow
+/// controller decision log) still yields to operational telemetry, always
+/// reserving at least `MAX_EVENTS_PER_SECOND - MAX_SHADOW_EVENTS_PER_SECOND`
+/// (= 6) slots/sec for operational events. Shadow events still also count
+/// against the aggregate cap.
 const MAX_SHADOW_EVENTS_PER_SECOND: usize = 4;
 
 /// Initial backoff duration on failure

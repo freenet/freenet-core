@@ -66,14 +66,16 @@
 //!
 //! ## Telemetry budget
 //!
-//! These two always-on emitters plus the Phase 1 RTT aggregator put three
-//! 1 Hz shadow events (and, on a gateway with reference-ping and iface-tx
-//! enabled, up to five) into an OTLP pipe rate-limited at 10 events/sec
-//! with no priority ordering (`tracing/telemetry.rs`). On a busy gateway
-//! some events — shadow or operational — may be dropped within a 1 s
-//! window. Acceptable as a statistical tradeoff for shadow telemetry; a
-//! shadow-event priority / sub-budget should land before Phase 2 adds
-//! more always-on streams (tracked separately).
+//! These two always-on emitters plus the Phase 1 RTT aggregator sample at
+//! 1 Hz but emit only one rolled-up event each per
+//! [`super::shadow_stats::SHADOW_ROLLUP_WINDOW_SECS`] (see `shadow_stats.rs`);
+//! the per-window `min`/`max`/`mean` preserve the offline floor-analysis
+//! distribution while cutting the central-collector record count by that
+//! factor. Every production peer reports to the central collector by default,
+//! so the raw 1 Hz stream was ~56% of all central telemetry volume — the
+//! rollup is what reclaims it. Shadow events are also admitted under the
+//! low-priority sub-budget (#4380) so they yield to operational telemetry
+//! under load (`tracing/telemetry.rs`).
 //!
 //! ## Process-wide, single-node-per-process
 //!
@@ -90,6 +92,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use super::global_bandwidth::GlobalBandwidthManager;
+use super::shadow_stats::{SHADOW_ROLLUP_WINDOW_SECS, WindowedStat};
 use super::symmetric_message::SymmetricMessagePayload;
 use crate::node::background_task_monitor::BackgroundTaskMonitor;
 use crate::transport::TRANSPORT_METRICS;
@@ -263,19 +266,83 @@ fn active_connections() -> usize {
     super::rolling_rtt_stats::SHADOW_RTT_REGISTRY.len()
 }
 
-/// 1 Hz cadence, matching the Phase 1/1.5 aggregators so all shadow
-/// streams align at the collector.
+/// 1 Hz sampling cadence, matching the Phase 1/1.5 aggregators so all shadow
+/// streams align at the collector. The aggregator samples the cheap
+/// process-global signals at this cadence but only *emits* one OTLP rollup per
+/// [`SHADOW_ROLLUP_WINDOW_SECS`] samples (see `shadow_stats.rs`).
 const AGGREGATOR_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One 1 Hz sample of the demand signals, taken at tick time.
+struct DemandSample {
+    sent_bytes: u64,
+    active_connections: u64,
+    broadcast_queue_depth: u64,
+    global_total_limit_bytes: Option<u64>,
+    global_per_connection_rate_bytes: Option<u64>,
+    global_active_connections: Option<u64>,
+}
+
+/// Take one demand sample: the interval throughput delta plus the current
+/// gauges. Reads atomics + the (weak) bandwidth handle only — safe on any task.
+fn demand_sample(sent_bytes: u64) -> DemandSample {
+    let gbm = global_bandwidth();
+    DemandSample {
+        sent_bytes,
+        active_connections: active_connections() as u64,
+        broadcast_queue_depth: BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed) as u64,
+        global_total_limit_bytes: gbm.as_ref().map(|m| m.total_limit() as u64),
+        global_per_connection_rate_bytes: gbm
+            .as_ref()
+            .map(|m| m.current_per_connection_rate() as u64),
+        global_active_connections: gbm.as_ref().map(|m| m.connection_count() as u64),
+    }
+}
+
+/// Windowed rollup accumulator for the `shadow_rate_demand` stream. Folds up to
+/// [`SHADOW_ROLLUP_WINDOW_SECS`] one-second samples, then emits one summary
+/// event and resets.
+#[derive(Default)]
+struct DemandWindow {
+    samples: u32,
+    sent_bytes: WindowedStat,
+    active_connections: WindowedStat,
+    broadcast_queue_depth: WindowedStat,
+    global_total_limit_bytes: WindowedStat,
+    global_per_connection_rate_bytes: WindowedStat,
+    global_active_connections: WindowedStat,
+}
+
+impl DemandWindow {
+    fn record(&mut self, sample: DemandSample) {
+        self.samples += 1;
+        self.sent_bytes.record(sample.sent_bytes);
+        self.active_connections.record(sample.active_connections);
+        self.broadcast_queue_depth
+            .record(sample.broadcast_queue_depth);
+        self.global_total_limit_bytes
+            .record_opt(sample.global_total_limit_bytes);
+        self.global_per_connection_rate_bytes
+            .record_opt(sample.global_per_connection_rate_bytes);
+        self.global_active_connections
+            .record_opt(sample.global_active_connections);
+    }
+
+    fn is_full(&self) -> bool {
+        self.samples >= SHADOW_ROLLUP_WINDOW_SECS
+    }
+}
 
 /// Spawn the `shadow_rate_demand` aggregator and register it with the
 /// `BackgroundTaskMonitor`. Always-on (cheap: atomic loads + one OTLP
-/// event per second), like the RTT aggregator. Call once at node startup.
+/// rollup per [`SHADOW_ROLLUP_WINDOW_SECS`]), like the RTT aggregator. Call
+/// once at node startup.
 ///
 /// Emits achieved outbound throughput (a faithful proxy for offered
 /// demand, since the transport never drops outbound — it sleeps on the
 /// token bucket / cwnd instead, which surfaces as broadcast-queue depth),
 /// the active-connection count, the broadcast-queue depth, and the
-/// global-pool rate `R` when available.
+/// global-pool rate `R` when available — each as a per-window mean plus the
+/// distribution fields the #4074 floor analysis consumes.
 pub(crate) fn spawn_demand_aggregator(local_peer_id: String, monitor: &BackgroundTaskMonitor) {
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(AGGREGATOR_INTERVAL);
@@ -284,67 +351,107 @@ pub(crate) fn spawn_demand_aggregator(local_peer_id: String, monitor: &Backgroun
         // the loop is aligned to the cadence.
         ticker.tick().await;
         let mut prev_sent = TRANSPORT_METRICS.cumulative_bytes_sent();
+        let mut window = DemandWindow::default();
         loop {
             ticker.tick().await;
             let now_sent = TRANSPORT_METRICS.cumulative_bytes_sent();
             let sent_delta = now_sent.saturating_sub(prev_sent);
             prev_sent = now_sent;
-            emit_demand_snapshot(&local_peer_id, sent_delta);
+            window.record(demand_sample(sent_delta));
+            if window.is_full() {
+                emit_demand_rollup(&local_peer_id, &window);
+                window = DemandWindow::default();
+            }
         }
     });
     monitor.register("shadow_demand_aggregator", handle);
 }
 
-/// Emit one `shadow_rate_demand` event. See the module-level rustdoc for
+/// Emit one `shadow_rate_demand` rollup. See the module-level rustdoc for
 /// why the OTLP send is independent of the `tracing::debug!` level: the
 /// local mirror is at DEBUG (compiled out of release builds via
 /// `release_max_level_info`), while `send_standalone_shadow_event_with_peer_id`
 /// reaches the collector regardless of log level (tagged low-priority so it
 /// yields to operational telemetry under the rate-limiter sub-budget, #4380).
-fn emit_demand_snapshot(local_peer_id: &str, sent_bytes_last_interval: u64) {
-    let active_connections = active_connections();
-    let broadcast_queue_depth = BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed);
-    let gbm = global_bandwidth();
-    let global_total_limit_bytes = gbm.as_ref().map(|m| m.total_limit() as u64);
-    let global_per_connection_rate_bytes =
-        gbm.as_ref().map(|m| m.current_per_connection_rate() as u64);
-    let global_active_connections = gbm.as_ref().map(|m| m.connection_count() as u64);
-
+///
+/// Each original field name carries the window **mean** in its original unit
+/// (a per-second rate stays a per-second rate — the mean of the one-second
+/// deltas is the average bytes/sec over the window), so existing consumers of
+/// the flat field keep working. `*_max` (the busiest second's demand /
+/// deepest backlog) and `window_secs` / `samples` are additive.
+fn emit_demand_rollup(local_peer_id: &str, window: &DemandWindow) {
+    let payload = demand_rollup_json(window);
     tracing::debug!(
         target: "freenet::transport::shadow_demand",
-        sent_bytes_last_interval,
-        active_connections,
-        broadcast_queue_depth,
-        global_total_limit_bytes,
-        global_per_connection_rate_bytes,
+        sent_bytes_per_sec = ?window.sent_bytes.mean(),
+        active_connections = ?window.active_connections.mean(),
+        broadcast_queue_depth = ?window.broadcast_queue_depth.mean(),
+        window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_rate_demand"
     );
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_rate_demand",
         local_peer_id,
-        serde_json::json!({
-            // Achieved wire throughput over the last interval (~1 s). A
-            // proxy for offered demand; true offered>granted backlog shows
-            // up as broadcast_queue_depth and (Phase 2) token-bucket debt.
-            "sent_bytes_per_sec": sent_bytes_last_interval,
-            "active_connections": active_connections,
-            "broadcast_queue_depth": broadcast_queue_depth,
-            // Effective aggregate rate R — present only in global-pool
-            // mode (total_bandwidth_limit configured). Null under the
-            // default per-connection FixedRate mode, where the effective
-            // per-connection R is the FixedRate default constant.
-            "global_total_limit_bytes": global_total_limit_bytes,
-            "global_per_connection_rate_bytes": global_per_connection_rate_bytes,
-            "global_active_connections": global_active_connections,
-        }),
+        payload,
     );
+}
+
+/// Build the `shadow_rate_demand` rollup JSON. Pure so the schema (compat
+/// field = window mean, additive distribution fields) is unit-testable without
+/// the telemetry sender.
+fn demand_rollup_json(window: &DemandWindow) -> serde_json::Value {
+    serde_json::json!({
+        // Achieved wire throughput, averaged over the rollup window. A
+        // proxy for offered demand; true offered>granted backlog shows
+        // up as broadcast_queue_depth and (Phase 2) token-bucket debt.
+        "sent_bytes_per_sec": window.sent_bytes.mean(),
+        "sent_bytes_per_sec_min": window.sent_bytes.min(),
+        "sent_bytes_per_sec_max": window.sent_bytes.max(),
+        "active_connections": window.active_connections.mean(),
+        "broadcast_queue_depth": window.broadcast_queue_depth.mean(),
+        // Peak backlog in the window — the value the floor analysis cares
+        // about, since a single congested second is where demand exceeds R.
+        "broadcast_queue_depth_max": window.broadcast_queue_depth.max(),
+        // Effective aggregate rate R — present only in global-pool
+        // mode (total_bandwidth_limit configured). Null under the
+        // default per-connection FixedRate mode, where the effective
+        // per-connection R is the FixedRate default constant.
+        "global_total_limit_bytes": window.global_total_limit_bytes.mean(),
+        "global_per_connection_rate_bytes": window.global_per_connection_rate_bytes.mean(),
+        "global_active_connections": window.global_active_connections.mean(),
+        "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
+        "samples": window.samples,
+    })
+}
+
+/// Windowed rollup accumulator for the `shadow_outbound_class` stream.
+#[derive(Default)]
+struct ClassWindow {
+    samples: u32,
+    must_flow_bytes: WindowedStat,
+    short_bytes: WindowedStat,
+    bulk_bytes: WindowedStat,
+}
+
+impl ClassWindow {
+    fn record(&mut self, must_flow: u64, short: u64, bulk: u64) {
+        self.samples += 1;
+        self.must_flow_bytes.record(must_flow);
+        self.short_bytes.record(short);
+        self.bulk_bytes.record(bulk);
+    }
+
+    fn is_full(&self) -> bool {
+        self.samples >= SHADOW_ROLLUP_WINDOW_SECS
+    }
 }
 
 /// Spawn the `shadow_outbound_class` aggregator and register it with the
 /// `BackgroundTaskMonitor`. Always-on, like the demand aggregator. Reports
-/// the per-interval must-flow / short / bulk byte split that feeds both
-/// floor bounds (lower bound = must-flow rate when not bulk-transferring;
-/// upper bound combines with the OS counter).
+/// the must-flow / short / bulk byte split that feeds both floor bounds
+/// (lower bound = must-flow rate when not bulk-transferring; upper bound
+/// combines with the OS counter), sampled at 1 Hz and emitted as one rollup
+/// per [`SHADOW_ROLLUP_WINDOW_SECS`].
 pub(crate) fn spawn_outbound_class_aggregator(
     local_peer_id: String,
     monitor: &BackgroundTaskMonitor,
@@ -354,39 +461,59 @@ pub(crate) fn spawn_outbound_class_aggregator(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
         let mut prev = snapshot_outbound();
+        let mut window = ClassWindow::default();
         loop {
             ticker.tick().await;
             let now = snapshot_outbound();
             let (must_flow, short, bulk) = outbound_delta(prev, now);
             prev = now;
-            emit_class_snapshot(&local_peer_id, must_flow, short, bulk);
+            window.record(must_flow, short, bulk);
+            if window.is_full() {
+                emit_class_rollup(&local_peer_id, &window);
+                window = ClassWindow::default();
+            }
         }
     });
     monitor.register("shadow_outbound_class_aggregator", handle);
 }
 
-fn emit_class_snapshot(
-    local_peer_id: &str,
-    must_flow_bytes: u64,
-    short_bytes: u64,
-    bulk_bytes: u64,
-) {
+/// Emit one `shadow_outbound_class` rollup. Each original field carries the
+/// window mean per-second rate; `*_min` (the must-flow floor, i.e. the least
+/// the class ever pushed in a second) and `*_max` (the burst peak) are the
+/// additive distribution fields the #4074 floor bounds consume directly.
+fn emit_class_rollup(local_peer_id: &str, window: &ClassWindow) {
+    let payload = class_rollup_json(window);
     tracing::debug!(
         target: "freenet::transport::shadow_demand",
-        must_flow_bytes,
-        short_bytes,
-        bulk_bytes,
+        must_flow_bytes = ?window.must_flow_bytes.mean(),
+        short_bytes = ?window.short_bytes.mean(),
+        bulk_bytes = ?window.bulk_bytes.mean(),
+        window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_outbound_class"
     );
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_outbound_class",
         local_peer_id,
-        serde_json::json!({
-            "must_flow_bytes_per_sec": must_flow_bytes,
-            "short_message_bytes_per_sec": short_bytes,
-            "bulk_bytes_per_sec": bulk_bytes,
-        }),
+        payload,
     );
+}
+
+/// Build the `shadow_outbound_class` rollup JSON. Pure so the schema is
+/// unit-testable without the telemetry sender.
+fn class_rollup_json(window: &ClassWindow) -> serde_json::Value {
+    serde_json::json!({
+        "must_flow_bytes_per_sec": window.must_flow_bytes.mean(),
+        "must_flow_bytes_per_sec_min": window.must_flow_bytes.min(),
+        "must_flow_bytes_per_sec_max": window.must_flow_bytes.max(),
+        "short_message_bytes_per_sec": window.short_bytes.mean(),
+        "short_message_bytes_per_sec_min": window.short_bytes.min(),
+        "short_message_bytes_per_sec_max": window.short_bytes.max(),
+        "bulk_bytes_per_sec": window.bulk_bytes.mean(),
+        "bulk_bytes_per_sec_min": window.bulk_bytes.min(),
+        "bulk_bytes_per_sec_max": window.bulk_bytes.max(),
+        "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
+        "samples": window.samples,
+    })
 }
 
 #[cfg(test)]
@@ -502,6 +629,58 @@ mod tests {
         assert_eq!(BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed), 42);
         record_broadcast_queue_depth(0);
         assert_eq!(BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn demand_rollup_json_keeps_mean_under_original_names_and_adds_distribution() {
+        let mut window = DemandWindow::default();
+        window.record(DemandSample {
+            sent_bytes: 100,
+            active_connections: 4,
+            broadcast_queue_depth: 0,
+            global_total_limit_bytes: None,
+            global_per_connection_rate_bytes: None,
+            global_active_connections: None,
+        });
+        window.record(DemandSample {
+            sent_bytes: 300,
+            active_connections: 6,
+            broadcast_queue_depth: 10,
+            global_total_limit_bytes: None,
+            global_per_connection_rate_bytes: None,
+            global_active_connections: None,
+        });
+        let json = demand_rollup_json(&window);
+        // Compat: the original flat field carries the window MEAN rate.
+        assert_eq!(json["sent_bytes_per_sec"], 200);
+        // Additive distribution fields.
+        assert_eq!(json["sent_bytes_per_sec_min"], 100);
+        assert_eq!(json["sent_bytes_per_sec_max"], 300);
+        assert_eq!(json["active_connections"], 5);
+        assert_eq!(json["broadcast_queue_depth"], 5);
+        assert_eq!(json["broadcast_queue_depth_max"], 10);
+        // FixedRate mode: no global-pool R, so these stay null (unchanged).
+        assert!(json["global_total_limit_bytes"].is_null());
+        assert!(json["global_per_connection_rate_bytes"].is_null());
+        assert_eq!(json["window_secs"], SHADOW_ROLLUP_WINDOW_SECS);
+        assert_eq!(json["samples"], 2);
+    }
+
+    #[test]
+    fn class_rollup_json_keeps_mean_under_original_names_and_adds_distribution() {
+        let mut window = ClassWindow::default();
+        window.record(10, 20, 1000);
+        window.record(30, 20, 3000);
+        let json = class_rollup_json(&window);
+        assert_eq!(json["must_flow_bytes_per_sec"], 20);
+        assert_eq!(json["must_flow_bytes_per_sec_min"], 10);
+        assert_eq!(json["must_flow_bytes_per_sec_max"], 30);
+        assert_eq!(json["short_message_bytes_per_sec"], 20);
+        assert_eq!(json["bulk_bytes_per_sec"], 2000);
+        assert_eq!(json["bulk_bytes_per_sec_min"], 1000);
+        assert_eq!(json["bulk_bytes_per_sec_max"], 3000);
+        assert_eq!(json["window_secs"], SHADOW_ROLLUP_WINDOW_SECS);
+        assert_eq!(json["samples"], 2);
     }
 
     /// `spawn_demand_aggregator` must produce a task that survives across

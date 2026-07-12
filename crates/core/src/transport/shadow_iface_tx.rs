@@ -50,6 +50,7 @@ use std::time::Duration;
 
 use crate::node::background_task_monitor::BackgroundTaskMonitor;
 use crate::transport::TRANSPORT_METRICS;
+use crate::transport::shadow_stats::{SHADOW_ROLLUP_WINDOW_SECS, WindowedStat};
 
 /// 1 Hz cadence, matching the other shadow aggregators so the streams
 /// align at the collector.
@@ -77,6 +78,7 @@ pub(crate) fn spawn_iface_tx_monitor(local_peer_id: String, monitor: &Background
         ticker.tick().await;
         let mut prev_total = read_total_tx_bytes().await;
         let mut prev_own = TRANSPORT_METRICS.cumulative_bytes_sent();
+        let mut window = IfaceWindow::default();
 
         loop {
             ticker.tick().await;
@@ -87,7 +89,12 @@ pub(crate) fn spawn_iface_tx_monitor(local_peer_id: String, monitor: &Background
                 let total_delta = now.saturating_sub(prev);
                 let own_delta = now_own.saturating_sub(prev_own);
                 let op_delta = iface_op(total_delta, own_delta);
-                emit_iface_snapshot(&local_peer_id, total_delta, own_delta, op_delta);
+                window.record(total_delta, own_delta, op_delta);
+            }
+            window.ticks += 1;
+            if window.ticks >= SHADOW_ROLLUP_WINDOW_SECS {
+                emit_iface_rollup(&local_peer_id, &window);
+                window = IfaceWindow::default();
             }
             // Advance the baseline only on a successful read so that a
             // failed tick is bridged (the next success measures over the
@@ -100,6 +107,28 @@ pub(crate) fn spawn_iface_tx_monitor(local_peer_id: String, monitor: &Background
         }
     });
     monitor.register("shadow_iface_tx_monitor", handle);
+}
+
+/// Windowed rollup accumulator for the `shadow_iface_tx` stream.
+#[derive(Default)]
+struct IfaceWindow {
+    /// Total 1 Hz ticks in this window (including failed reads), used only to
+    /// close the [`SHADOW_ROLLUP_WINDOW_SECS`] window.
+    ticks: u32,
+    /// Ticks that produced a sample (a successful `/proc/net/dev` read).
+    samples: u32,
+    total_tx_bytes: WindowedStat,
+    own_tx_bytes: WindowedStat,
+    op_tx_bytes: WindowedStat,
+}
+
+impl IfaceWindow {
+    fn record(&mut self, total: u64, own: u64, op: u64) {
+        self.samples += 1;
+        self.total_tx_bytes.record(total);
+        self.own_tx_bytes.record(own);
+        self.op_tx_bytes.record(op);
+    }
 }
 
 /// Read `/proc/net/dev` and sum `tx_bytes` across non-loopback
@@ -159,17 +188,26 @@ fn iface_op(total_delta: u64, own_delta: u64) -> u64 {
     total_delta.saturating_sub(own_delta)
 }
 
-fn emit_iface_snapshot(
-    local_peer_id: &str,
-    total_tx_bytes: u64,
-    own_tx_bytes: u64,
-    op_tx_bytes: u64,
-) {
+/// Emit one `shadow_iface_tx` rollup covering the closed window. Skips
+/// emission when no `/proc/net/dev` read succeeded in the whole window
+/// (mirroring the original per-tick "omit on failed read"). Each field keeps
+/// the window mean per-second rate under its original name; `*_max` (the
+/// busiest second's transmit / competing-traffic peak) is the additive
+/// distribution field the #4074 saturation-attribution analysis consumes.
+fn emit_iface_rollup(local_peer_id: &str, window: &IfaceWindow) {
+    if window.samples == 0 {
+        return;
+    }
+    let total_tx_bytes = window.total_tx_bytes.mean();
+    let own_tx_bytes = window.own_tx_bytes.mean();
+    let op_tx_bytes = window.op_tx_bytes.mean();
+
     tracing::debug!(
         target: "freenet::transport::shadow_iface_tx",
-        total_tx_bytes,
-        own_tx_bytes,
-        op_tx_bytes,
+        ?total_tx_bytes,
+        ?own_tx_bytes,
+        ?op_tx_bytes,
+        window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_iface_tx"
     );
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
@@ -177,8 +215,13 @@ fn emit_iface_snapshot(
         local_peer_id,
         serde_json::json!({
             "total_tx_bytes_per_sec": total_tx_bytes,
+            "total_tx_bytes_per_sec_max": window.total_tx_bytes.max(),
             "freenet_own_tx_bytes_per_sec": own_tx_bytes,
+            "freenet_own_tx_bytes_per_sec_max": window.own_tx_bytes.max(),
             "op_tx_bytes_per_sec": op_tx_bytes,
+            "op_tx_bytes_per_sec_max": window.op_tx_bytes.max(),
+            "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
+            "samples": window.samples,
         }),
     );
 }

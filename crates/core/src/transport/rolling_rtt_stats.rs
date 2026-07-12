@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 
+use super::shadow_stats::{SHADOW_ROLLUP_WINDOW_SECS, WindowedStat};
 use crate::simulation::TimeSource;
 
 /// Baseline window for the rolling minimum RTT. The RFC uses 5 min as a
@@ -314,9 +315,21 @@ pub(crate) fn spawn_aggregator(
         // sample to report.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
+        let mut window = RttWindow::default();
         loop {
             ticker.tick().await;
-            emit_aggregate_snapshot(&local_peer_id);
+            // Sample the cross-connection signal at 1 Hz (also emits the
+            // local-only per-peer TRACE mirror), but only push a sample when
+            // the node actually has peers — preserving the original
+            // "no peers → no signal" semantic across the rollup window.
+            if let Some(sample) = sample_aggregate() {
+                window.record(sample);
+            }
+            window.ticks += 1;
+            if window.ticks >= SHADOW_ROLLUP_WINDOW_SECS {
+                emit_aggregate_rollup(&local_peer_id, &window);
+                window = RttWindow::default();
+            }
         }
     });
     monitor.register("shadow_rtt_aggregator", handle);
@@ -346,11 +359,45 @@ pub(crate) fn spawn_aggregator(
 /// the collector can disaggregate per reporting node. The shadow
 /// variant tags the event as low-priority so it yields to operational
 /// telemetry under the rate-limiter sub-budget (#4380).
-fn emit_aggregate_snapshot(local_peer_id: &str) {
+/// One 1 Hz sample of the cross-connection RTT aggregate.
+struct RttSample {
+    active_peers: u64,
+    peers_with_recent: u64,
+    median_inflation_us: Option<u64>,
+}
+
+/// Windowed rollup accumulator for the `shadow_rtt_aggregate` stream.
+#[derive(Default)]
+struct RttWindow {
+    /// Total 1 Hz ticks elapsed in this window (including no-peer ticks),
+    /// used only to decide when the [`SHADOW_ROLLUP_WINDOW_SECS`] window closes.
+    ticks: u32,
+    /// Ticks that actually contributed a sample (node had ≥1 peer).
+    samples: u32,
+    active_peers: WindowedStat,
+    peers_with_recent: WindowedStat,
+    median_inflation_us: WindowedStat,
+}
+
+impl RttWindow {
+    fn record(&mut self, sample: RttSample) {
+        self.samples += 1;
+        self.active_peers.record(sample.active_peers);
+        self.peers_with_recent.record(sample.peers_with_recent);
+        self.median_inflation_us
+            .record_opt(sample.median_inflation_us);
+    }
+}
+
+/// Take one 1 Hz sample of the cross-connection RTT signal, emitting the
+/// local-only per-peer TRACE mirror as a side effect. Returns `None` when the
+/// node has no peers (nothing to report), preserving the original semantic
+/// that an isolated node emits no `shadow_rtt_aggregate` telemetry.
+fn sample_aggregate() -> Option<RttSample> {
     let snap = registry_snapshot();
     let active_peers = snap.len();
     if active_peers == 0 {
-        return;
+        return None;
     }
     let peers_with_recent = snap
         .iter()
@@ -371,11 +418,33 @@ fn emit_aggregate_snapshot(local_peer_id: &str) {
             "shadow_rtt_per_peer"
         );
     }
+    Some(RttSample {
+        active_peers: active_peers as u64,
+        peers_with_recent: peers_with_recent as u64,
+        median_inflation_us,
+    })
+}
+
+/// Emit one `shadow_rtt_aggregate` rollup covering the closed window. Skips
+/// emission entirely when the node had no peers for the whole window (no
+/// samples), mirroring the original per-tick short-circuit.
+///
+/// `median_inflation_us` keeps the window mean under its original name (the
+/// value existing consumers read); `*_p50` (median of the per-second medians)
+/// and `*_max` (worst-second inflation) are the additive distribution fields
+/// the #4074 floor analysis consumes. `active_peers` / `peers_with_recent`
+/// carry the window mean.
+fn emit_aggregate_rollup(local_peer_id: &str, window: &RttWindow) {
+    if window.samples == 0 {
+        return;
+    }
+    let payload = aggregate_rollup_json(window);
     tracing::debug!(
         target: "freenet::transport::shadow_rtt",
-        active_peers,
-        peers_with_recent,
-        median_inflation_us,
+        active_peers = ?window.active_peers.mean(),
+        peers_with_recent = ?window.peers_with_recent.mean(),
+        median_inflation_us = ?window.median_inflation_us.mean(),
+        window_secs = SHADOW_ROLLUP_WINDOW_SECS,
         "shadow_rtt_aggregate"
     );
     // Mirror the aggregate to the central OTLP collector tagged with
@@ -387,12 +456,23 @@ fn emit_aggregate_snapshot(local_peer_id: &str) {
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_rtt_aggregate",
         local_peer_id,
-        serde_json::json!({
-            "active_peers": active_peers,
-            "peers_with_recent": peers_with_recent,
-            "median_inflation_us": median_inflation_us,
-        }),
+        payload,
     );
+}
+
+/// Build the `shadow_rtt_aggregate` rollup JSON. Pure so the schema (compat
+/// field = window mean, additive `*_p50` / `*_max` distribution fields) is
+/// unit-testable without the telemetry sender.
+fn aggregate_rollup_json(window: &RttWindow) -> serde_json::Value {
+    serde_json::json!({
+        "active_peers": window.active_peers.mean(),
+        "peers_with_recent": window.peers_with_recent.mean(),
+        "median_inflation_us": window.median_inflation_us.mean(),
+        "median_inflation_us_p50": window.median_inflation_us.p50(),
+        "median_inflation_us_max": window.median_inflation_us.max(),
+        "window_secs": SHADOW_ROLLUP_WINDOW_SECS,
+        "samples": window.samples,
+    })
 }
 
 #[cfg(test)]
@@ -739,13 +819,58 @@ mod tests {
         assert_eq!(snap.recent_median, Some(dur_ms(60)));
     }
 
-    /// `spawn_aggregator` must produce a task that emits the
-    /// `shadow_rtt_aggregate` event on its 1Hz cadence and survives
-    /// across multiple ticks. Uses paused tokio time so the test is
-    /// deterministic and finishes in microseconds. A regression that
-    /// (a) returns before spawning, (b) panics inside the loop, or
-    /// (c) breaks the OTLP `send_standalone_event` mirror by holding
-    /// it inside a blocking call would be caught here.
+    #[test]
+    fn aggregate_rollup_json_keeps_median_field_and_adds_distribution() {
+        let mut window = RttWindow::default();
+        window.record(RttSample {
+            active_peers: 5,
+            peers_with_recent: 3,
+            median_inflation_us: Some(100),
+        });
+        window.record(RttSample {
+            active_peers: 7,
+            peers_with_recent: 5,
+            median_inflation_us: Some(300),
+        });
+        let json = aggregate_rollup_json(&window);
+        // Compat: original fields carry the window MEAN.
+        assert_eq!(json["active_peers"], 6);
+        assert_eq!(json["peers_with_recent"], 4);
+        assert_eq!(json["median_inflation_us"], 200);
+        // Additive distribution fields (lower-median of [100,300] = 300).
+        assert_eq!(json["median_inflation_us_p50"], 300);
+        assert_eq!(json["median_inflation_us_max"], 300);
+        assert_eq!(json["window_secs"], SHADOW_ROLLUP_WINDOW_SECS);
+        assert_eq!(json["samples"], 2);
+    }
+
+    #[test]
+    fn aggregate_rollup_json_median_is_null_when_never_measured() {
+        // A window where every tick had peers but no inflation sample yet:
+        // the median field (and its distribution companions) must stay null,
+        // exactly as the pre-rollup emitter reported a null median.
+        let mut window = RttWindow::default();
+        window.record(RttSample {
+            active_peers: 2,
+            peers_with_recent: 0,
+            median_inflation_us: None,
+        });
+        let json = aggregate_rollup_json(&window);
+        assert_eq!(json["active_peers"], 2);
+        assert!(json["median_inflation_us"].is_null());
+        assert!(json["median_inflation_us_p50"].is_null());
+        assert!(json["median_inflation_us_max"].is_null());
+        assert_eq!(json["samples"], 1);
+    }
+
+    /// `spawn_aggregator` must produce a task that samples the
+    /// `shadow_rtt_aggregate` signal on its 1Hz cadence (emitting a rollup
+    /// once per `SHADOW_ROLLUP_WINDOW_SECS`) and survives across multiple
+    /// ticks. Uses paused tokio time so the test is deterministic and
+    /// finishes in microseconds. A regression that (a) returns before
+    /// spawning, (b) panics inside the loop, or (c) breaks the OTLP
+    /// `send_standalone_event` mirror by holding it inside a blocking call
+    /// would be caught here.
     #[tokio::test(start_paused = true)]
     async fn aggregator_emits_periodically() {
         use crate::node::background_task_monitor::BackgroundTaskMonitor;
@@ -753,7 +878,7 @@ mod tests {
         let monitor = BackgroundTaskMonitor::new();
         spawn_aggregator("test-peer".to_string(), &monitor);
 
-        // Register a peer so emit_aggregate_snapshot has something to
+        // Register a peer so sample_aggregate has something to
         // report (active_peers == 0 short-circuits).
         let ts = VirtualTime::new();
         let addr = unique_addr(40, 50400);
