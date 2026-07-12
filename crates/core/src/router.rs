@@ -448,6 +448,32 @@ pub(crate) struct RouterSnapshotInfo {
     /// Monotonic lifetime total; trends how much renewal traffic the
     /// root-satisfied path removes. `None` until the snapshot task populates it.
     pub renewal_terminus_satisfied: Option<u64>,
+    /// Nearest-neighbor ring-lattice completeness + probe health (#4760),
+    /// populated by `Ring` on the snapshot cadence from the same
+    /// `connection_manager` queries the home-page ring-stats provider uses. They
+    /// make the #4760 lattice fix's impact measurable NETWORK-WIDE (the home page
+    /// only shows the local peer): the fraction of peers holding BOTH immediate
+    /// ring-neighbor edges, the median held-edge distances, and the route-to-self
+    /// probe success rate, all as one-line queries over central telemetry.
+    /// `lattice_has_successor` / `_predecessor` are whether this peer currently
+    /// HOLDS its closest-higher / closest-lower connected ring neighbor (a peer
+    /// with both `true` has a complete both-sides lattice; the collector
+    /// aggregates the fraction). The `_distance` fields are the ring distance to
+    /// each held edge, `None` when that side is unheld (or own location is
+    /// unknown). `lattice_probes_issued` / `_probe_improvements` are the
+    /// route-to-self discovery-health counters (monotonic lifetime totals,
+    /// differenced by the collector); they are counted INDEPENDENTLY (an
+    /// improvement lands a few ticks after the probe), so the ratio is a
+    /// convergence-health gauge, not a strict per-probe rate. `None` until the
+    /// snapshot task populates them (i.e. always populated in production). Read
+    /// from the live connection set + probe counters — no mirrored counter to
+    /// rot. See #4642.
+    pub lattice_has_successor: Option<bool>,
+    pub lattice_has_predecessor: Option<bool>,
+    pub lattice_successor_distance: Option<f64>,
+    pub lattice_predecessor_distance: Option<f64>,
+    pub lattice_probes_issued: Option<u64>,
+    pub lattice_probe_improvements: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
     /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
@@ -1343,6 +1369,14 @@ impl Router {
             subscribe_hint_acted_succeeded: None,
             subscribe_hint_acted_failed: None,
             renewal_terminus_satisfied: None,
+            // Nearest-neighbor ring-lattice gauges populated by Ring on the
+            // snapshot cadence (#4760 / #4642).
+            lattice_has_successor: None,
+            lattice_has_predecessor: None,
+            lattice_successor_distance: None,
+            lattice_predecessor_distance: None,
+            lattice_probes_issued: None,
+            lattice_probe_improvements: None,
             // Renegade predictor diagnostics
             renegade_failure_events: self.renegade_predictor.len(),
             renegade_response_time_events: self.renegade_predictor.stage_sizes().1,

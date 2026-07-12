@@ -1641,6 +1641,26 @@ impl Ring {
             snapshot.open_fds = open_fds;
             snapshot.fd_soft_limit = fd_soft_limit;
 
+            // Nearest-neighbor ring-lattice completeness + probe health (#4760),
+            // mirrored from the home-page ring-stats provider (see
+            // `node/p2p_impl.rs`) onto the central-telemetry snapshot cadence so
+            // the lattice fix's network-wide impact — fraction of peers holding
+            // both immediate-neighbor edges, median edge distances, probe success
+            // rate — is a one-line query over central telemetry as 0.2.96 rolls
+            // out (#4642). Same calls, same `None`/`0` semantics as the home page:
+            // a distance is `None` when that side is unheld or own location is
+            // unknown; the probe counters are `0` before any probe fires.
+            let cm = &ring.connection_manager;
+            let lattice_successor = cm.nearest_lattice_neighbor_dist(true);
+            let lattice_predecessor = cm.nearest_lattice_neighbor_dist(false);
+            let (lattice_probes_issued, lattice_probe_improvements) = cm.lattice_probe_stats();
+            snapshot.lattice_has_successor = Some(lattice_successor.is_some());
+            snapshot.lattice_has_predecessor = Some(lattice_predecessor.is_some());
+            snapshot.lattice_successor_distance = lattice_successor;
+            snapshot.lattice_predecessor_distance = lattice_predecessor;
+            snapshot.lattice_probes_issued = Some(lattice_probes_issued);
+            snapshot.lattice_probe_improvements = Some(lattice_probe_improvements);
+
             // Compiled-WASM module-cache occupancy + eviction gauges (#4440),
             // read from the per-node `Arc` the caches publish into (they live
             // behind the contract-handler channel, unreachable from here; the

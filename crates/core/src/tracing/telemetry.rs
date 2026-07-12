@@ -2119,6 +2119,36 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "subscribe_hint_acted_failed".to_string(),
                     serde_json::json!(snapshot.subscribe_hint_acted_failed),
                 );
+                // Nearest-neighbor ring-lattice completeness + probe health
+                // (#4760 / #4642). Same hand-mirroring footgun as the placement
+                // gauges above — a new `RouterSnapshotInfo` field is invisible to
+                // the collector unless added here. Pinned by
+                // `router_snapshot_json_includes_placement_gauges`. `Option`
+                // fields emit `null` when unset, matching hosted_key_distance_*.
+                obj.insert(
+                    "lattice_has_successor".to_string(),
+                    serde_json::json!(snapshot.lattice_has_successor),
+                );
+                obj.insert(
+                    "lattice_has_predecessor".to_string(),
+                    serde_json::json!(snapshot.lattice_has_predecessor),
+                );
+                obj.insert(
+                    "lattice_successor_distance".to_string(),
+                    serde_json::json!(snapshot.lattice_successor_distance),
+                );
+                obj.insert(
+                    "lattice_predecessor_distance".to_string(),
+                    serde_json::json!(snapshot.lattice_predecessor_distance),
+                );
+                obj.insert(
+                    "lattice_probes_issued".to_string(),
+                    serde_json::json!(snapshot.lattice_probes_issued),
+                );
+                obj.insert(
+                    "lattice_probe_improvements".to_string(),
+                    serde_json::json!(snapshot.lattice_probe_improvements),
+                );
                 // Interest-weighted (two-tier) module-cache SHADOW gauges
                 // (#4441/#4534). Inserted here (not as inline `json!` keys) to
                 // keep the macro under its recursion limit, same as the
@@ -2905,6 +2935,14 @@ mod tests {
         info.subscribe_hint_refused_cache = Some(24);
         info.subscribe_hint_acted_succeeded = Some(25);
         info.subscribe_hint_acted_failed = Some(26);
+        // Nearest-neighbor ring-lattice gauges (#4760 / #4642): successor held,
+        // predecessor unheld, so the two boolean states are both exercised.
+        info.lattice_has_successor = Some(true);
+        info.lattice_has_predecessor = Some(false);
+        info.lattice_successor_distance = Some(0.05);
+        info.lattice_predecessor_distance = Some(0.07);
+        info.lattice_probes_issued = Some(31);
+        info.lattice_probe_improvements = Some(17);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosted_contracts_count", 5u64),
@@ -2918,6 +2956,8 @@ mod tests {
             ("subscribe_hint_refused_cache", 24),
             ("subscribe_hint_acted_succeeded", 25),
             ("subscribe_hint_acted_failed", 26),
+            ("lattice_probes_issued", 31),
+            ("lattice_probe_improvements", 17),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
@@ -2927,9 +2967,21 @@ mod tests {
             ("hosted_key_distance_min", 0.0),
             ("hosted_key_distance_mean", 0.15),
             ("hosted_key_distance_frac_within_0_1", 0.6),
+            ("lattice_successor_distance", 0.05),
+            ("lattice_predecessor_distance", 0.07),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
+        // Boolean lattice completeness flags reach the body with both states
+        // distinguishable from `null` (unpopulated).
+        assert_eq!(
+            json["lattice_has_successor"], true,
+            "lattice_has_successor must reach the OTLP body"
+        );
+        assert_eq!(
+            json["lattice_has_predecessor"], false,
+            "lattice_has_predecessor must reach the OTLP body"
+        );
     }
 
     #[test]
