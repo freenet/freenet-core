@@ -282,22 +282,42 @@ impl OpManager {
     ///
     /// ## Source-1-only live fan-out (#4642 step 9)
     ///
-    /// This previously unioned a second source — the interest manager's
+    /// This previously unioned a second source: the interest manager's
     /// `get_interested_peers` (peers who registered interest via the protocol).
-    /// That arm was removed. Under the demand-driven hosting model every co-host
-    /// advertises (so it is already a Source-1 target), and any transient gap
-    /// between "interested" and "advertised" is closed by the periodic
-    /// InterestSync anti-entropy heartbeat (~5 min), which re-pulls each
-    /// neighbor's hosted-contract set via `HostingStateRequest`
-    /// (`ring.rs::interest_heartbeat`, #4722). Live fan-out is therefore
-    /// advertised-co-hosts-only; anti-entropy is the healing backstop. See
+    /// That arm was removed. Live fan-out is now advertised-co-hosts-only.
+    ///
+    /// Removing it does NOT drop a subscriber's update, because a genuine
+    /// subscriber never persists in the "interested but no local state" condition
+    /// that arm used to cover:
+    ///
+    /// 1. A subscriber seeds its own baseline state via its subscribe-GET before
+    ///    the subscription is finalized. `finalize_originator_subscribe`
+    ///    (`subscribe.rs`) awaits `fetch_contract_if_missing` (which drives a
+    ///    sub-op GET) and only returns success once current state, including any
+    ///    already-committed UPDATE, is stored locally. So no real subscriber is
+    ///    left relying on a live fan-out for its first copy of the state. Pinned
+    ///    by `subscribe_seeds_state_via_get_before_finalize` (`subscribe.rs`).
+    /// 2. Once it holds state it advertises (`announce_contract_hosted`), which
+    ///    makes it a Source-1 target for later live fan-out AND gives it a
+    ///    non-empty state summary. From then on the summary-based InterestSync
+    ///    anti-entropy (`node.rs` Summaries -> `SyncStateToPeer`) and the
+    ///    advertisement-reconciliation exchange keep it fresh if it ever misses a
+    ///    live update: the ~5-min `ring.rs::interest_heartbeat` sends each
+    ///    neighbor a `HostingStateRequest`, the neighbor replies with a
+    ///    `HostingStateResponse` snapshot of its hosted set, and we full-replace
+    ///    that into our Source-1 view (#4722).
+    ///
+    /// The summary-based anti-entropy path deliberately does NOT heal a peer with
+    /// no state: a `None` summary is skipped by the `zip` staleness gate in
+    /// `node.rs`. That is exactly why the subscribe-GET seeding in (1), not the
+    /// heartbeat, is the load-bearing safety property. See
     /// `.claude/rules/hosting-invariants.md` invariant 1 and
     /// `docs/design/demand-driven-hosting.md`.
     ///
-    /// `InterestManager` itself is retained — it still drives proactive summary
+    /// `InterestManager` itself is retained: it still drives proactive summary
     /// notifications (`send_proactive_summary_notification`), interest-heartbeat
-    /// TTL refresh, and eviction demand-counting. Only the *state fan-out* arm
-    /// was removed here.
+    /// TTL refresh, and eviction demand-counting. Only the state fan-out arm was
+    /// removed here.
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
@@ -346,10 +366,11 @@ impl OpManager {
         }
 
         // Source 2 (interest manager) REMOVED in #4642 step 9. Do NOT re-add a
-        // fan-out arm here that unions `interest_manager.get_interested_peers`:
-        // an interest-only peer that has not yet advertised is reached by the
-        // anti-entropy heartbeat (which re-pulls its hosted set into Source-1),
-        // not by live fan-out. See this function's rustdoc and
+        // fan-out arm here that unions `interest_manager.get_interested_peers`.
+        // A genuine subscriber does not stay "interested but stateless": it seeds
+        // baseline state via its own subscribe-GET before finalizing
+        // (`finalize_originator_subscribe`), then advertises and becomes a
+        // Source-1 target. See this function's rustdoc and
         // `.claude/rules/hosting-invariants.md` invariant 1.
 
         let mut result: Vec<PeerKeyLocation> = targets.into_iter().collect();
