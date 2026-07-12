@@ -22,7 +22,7 @@ use cards::{
     build_ban_list_card, build_contracts_card, build_governance_card, build_hosting_card,
     build_ops_card, build_peers_card, build_status_card, build_transfer_card,
 };
-use favicon::build_favicon_data_uri;
+use favicon::{build_dashboard_title, build_favicon_data_uri};
 use peer_detail::peer_detail_html;
 
 /// Freenet rabbit silhouette SVG path, derived from freenet_logo.svg.
@@ -112,6 +112,7 @@ fn homepage_html() -> String {
     };
 
     let favicon = build_favicon_data_uri(&snap);
+    let title = build_dashboard_title(&snap);
 
     let status_card = build_status_card(&snap);
     let peers_card = build_peers_card(&snap);
@@ -160,6 +161,7 @@ fn homepage_html() -> String {
         CSS = CSS,
         JS = JS,
         favicon = favicon,
+        title = html_escape(&title),
         version = html_escape(version),
         // Asset version = the build that compiled THIS served page. Baked in at
         // compile time so the JS can compare it against the live runtime version
@@ -196,7 +198,7 @@ mod tests {
         build_regression_chart, build_reliability_chart, build_renegade_accuracy_panel,
         failure_chart_y_max, fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
     };
-    use super::favicon::build_favicon_data_uri;
+    use super::favicon::{build_dashboard_title, build_favicon_data_uri};
     use super::peer_detail::peer_detail_html;
     use crate::node::network_status::{
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
@@ -796,12 +798,102 @@ mod tests {
         );
     }
 
+    // ── Tab title surfaces connection state + count (#3509) ────────────────
+
     #[test]
-    fn title_is_fn_peer() {
+    fn title_shows_trying_to_connect_when_no_snapshot() {
+        // Before the first `network_status` snapshot exists (node mid-startup)
+        // the title must fall back to the "trying to connect" indicator, not
+        // crash or render a stale placeholder.
+        assert_eq!(build_dashboard_title(&None), "\u{26A1} Dashboard");
+    }
+
+    #[test]
+    fn title_shows_connection_count_when_connected() {
+        let mut snap = base_snapshot();
+        snap.open_connections = 4;
+        assert_eq!(
+            build_dashboard_title(&Some(snap)),
+            "(4) Dashboard",
+            "connected state must show the open connection count"
+        );
+    }
+
+    #[test]
+    fn title_shows_connection_count_boundary_one() {
+        // Boundary: exactly one connection still uses the count form, not a
+        // singular/plural variant — the format is purely numeric.
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        assert_eq!(build_dashboard_title(&Some(snap)), "(1) Dashboard");
+    }
+
+    #[test]
+    fn title_shows_trouble_icon_on_health_trouble() {
+        let mut snap = base_snapshot();
+        snap.health = HealthLevel::Trouble;
+        snap.open_connections = 0;
+        assert_eq!(
+            build_dashboard_title(&Some(snap)),
+            "\u{26A0} Dashboard",
+            "HealthLevel::Trouble must surface the warning icon"
+        );
+    }
+
+    #[test]
+    fn title_shows_trouble_icon_on_nat_failure() {
+        // Even without HealthLevel::Trouble, an all-failed NAT traversal
+        // history is a major connectivity error worth the same icon (mirrors
+        // the favicon's dark-red NAT-failure precedence).
+        let mut snap = base_snapshot();
+        snap.nat_stats.attempts = 5;
+        snap.nat_stats.successes = 0;
+        snap.open_connections = 0;
+        assert_eq!(build_dashboard_title(&Some(snap)), "\u{26A0} Dashboard");
+    }
+
+    #[test]
+    fn title_shows_connecting_icon_by_default() {
+        // Default base_snapshot(): HealthLevel::Connecting, zero connections,
+        // no NAT attempts yet — the "still trying" fallback.
+        let snap = base_snapshot();
+        assert_eq!(build_dashboard_title(&Some(snap)), "\u{26A1} Dashboard");
+    }
+
+    #[test]
+    fn title_connected_overrides_trouble_and_nat_failure() {
+        // Connection count takes top priority even if failures/NAT problems
+        // are still present in the snapshot (mirrors the favicon: "connected
+        // wins" over lingering failure signals from before the connection
+        // was established).
+        let mut snap = base_snapshot();
+        snap.open_connections = 2;
+        snap.health = HealthLevel::Trouble;
+        snap.nat_stats.attempts = 5;
+        snap.nat_stats.successes = 0;
+        assert_eq!(build_dashboard_title(&Some(snap)), "(2) Dashboard");
+    }
+
+    #[test]
+    fn homepage_renders_dynamic_title() {
+        // The rendered page must carry the derived title, not a static
+        // placeholder — the JS refresh path re-reads it from `doc.title`.
         let html = homepage_html();
         assert!(
-            html.contains("<title>FN Peer</title>"),
-            "dashboard title must be 'FN Peer' — do not rename without updating this test"
+            html.contains("<title>\u{26A1} Dashboard</title>"),
+            "no snapshot exists in the unit-test process, so the homepage \
+             must render the 'trying to connect' title, got: {html}"
+        );
+    }
+
+    #[test]
+    fn js_syncs_title_on_refresh() {
+        // Source-scrape guard: the auto-refresh handler must copy the
+        // fetched document's title onto the live page so a backgrounded tab
+        // reflects the current connection state without a full reload.
+        assert!(
+            JS.contains("document.title = doc.title"),
+            "JS auto-refresh must sync document.title from the refreshed page"
         );
     }
 

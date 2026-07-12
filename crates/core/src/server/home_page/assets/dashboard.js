@@ -613,6 +613,9 @@ document.addEventListener('DOMContentLoaded', function () {
         var newMain = doc.querySelector('main');
         var oldMain = document.querySelector('main');
         if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
+        /* Update the tab title (connection state + count, #3509) so a
+           backgrounded tab still surfaces the current status at a glance. */
+        if (doc.title) document.title = doc.title;
         /* Update header elements (outside <main>) */
         var newUp = doc.querySelector('.uptime');
         var oldUp = document.querySelector('.uptime');
