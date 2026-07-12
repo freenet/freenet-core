@@ -335,30 +335,6 @@ pub(crate) fn spawn_aggregator(
     monitor.register("shadow_rtt_aggregator", handle);
 }
 
-/// Emit one tracing event summarising the current cross-connection
-/// state. The local file-log mirror is at `debug`. In debug builds
-/// this is visible via `RUST_LOG=…=debug`; in release builds the
-/// `release_max_level_info` feature in `crates/core/Cargo.toml`
-/// compiles DEBUG events out entirely — `RUST_LOG` alone cannot
-/// revive them without a rebuild. This is intentional: the local
-/// mirror at INFO was the third-largest contributor to the
-/// #4251 / #4272 log-volume regression at ~3,600 lines/hour per
-/// node. Production telemetry reaches the OTLP collector via the
-/// `send_standalone_shadow_event_with_peer_id` call below, which is
-/// independent of the tracing level, so the dashboard's 1 Hz feed
-/// survives.
-///
-/// `send_standalone_shadow_event_with_peer_id` pushes a structured
-/// event through the global telemetry sender
-/// (`crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id`)
-/// so it reaches the central OTLP collector (per the `NetEventLog`
-/// path that `TelemetryReporter` consumes). Without that, the
-/// aggregate would land only in per-node file logs and the 2-4 week
-/// observation the RFC calls for would require manual log scraping.
-/// The `local_peer_id` argument is attached as an OTLP attribute so
-/// the collector can disaggregate per reporting node. The shadow
-/// variant tags the event as low-priority so it yields to operational
-/// telemetry under the rate-limiter sub-budget (#4380).
 /// One 1 Hz sample of the cross-connection RTT aggregate.
 struct RttSample {
     active_peers: u64,
@@ -434,6 +410,15 @@ fn sample_aggregate() -> Option<RttSample> {
 /// and `*_max` (worst-second inflation) are the additive distribution fields
 /// the #4074 floor analysis consumes. `active_peers` / `peers_with_recent`
 /// carry the window mean.
+///
+/// The local `tracing::debug!` mirror stays at DEBUG on purpose: at INFO it was
+/// the third-largest contributor to the #4251 / #4272 log-volume regression
+/// (~3,600 lines/hour per node), and `release_max_level_info` compiles DEBUG
+/// out of release builds entirely. The OTLP path below
+/// (`send_standalone_shadow_event_with_peer_id`) is independent of the tracing
+/// level, so the central-collector feed survives regardless; `local_peer_id`
+/// rides as an OTLP attribute so the collector can disaggregate per node, and
+/// the shadow variant tags the event low-priority (#4380).
 fn emit_aggregate_rollup(local_peer_id: &str, window: &RttWindow) {
     if window.samples == 0 {
         return;
