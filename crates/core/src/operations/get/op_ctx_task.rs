@@ -1175,7 +1175,13 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 
 /// Store the fetched contract state in the local executor and run
 /// the originator-side hosting side effects. Mirrors the legacy
-/// `process_message` Response{Found} branch at `get.rs:2218-2450`:
+/// `process_message` Response{Found} branch at `get.rs:2218-2450`.
+///
+/// Returns `true` when this node holds the contract's current state after the
+/// call (`state_matches || put_persisted`) — D-CACHE-RET (step 10 §1a). Relay
+/// callers gate downstream-subscriber registration on this so a peer registers
+/// demand only after it actually holds state; registering after state makes the
+/// phantom (`contract_in_use && !contract_state_present`) unrepresentable.
 ///
 /// 1. **Idempotency short-circuit (issue #2018)** — re-query the
 ///    local store first. If the existing bytes match the incoming
@@ -1208,12 +1214,6 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 // demand signal, so the peer HOSTS the contract (WASM+state, kept fresh in the
 // update mesh) until LRU eviction. There is no cache tier. Slated to be renamed
 // hosting-* AFTER 0.2.94. See .claude/rules/hosting-invariants.md + epic #4642.
-///
-/// Returns `true` when this node holds the contract's current state after the
-/// call (`state_matches || put_persisted`) — D-CACHE-RET (step 10 §1a). Relay
-/// callers gate downstream-subscriber registration on this so a peer registers
-/// demand only after it actually holds state; registering after state makes the
-/// phantom (`contract_in_use && !contract_state_present`) unrepresentable.
 async fn cache_contract_locally(
     op_manager: &OpManager,
     key: ContractKey,
