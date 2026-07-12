@@ -853,6 +853,25 @@ mod tests {
     }
 
     #[test]
+    fn title_shows_warning_icon_on_connection_failures() {
+        // Mirrors the favicon's red case (build_favicon_data_uri's
+        // `!s.failures.is_empty()` branch): a node can accumulate gateway
+        // connection failures (e.g. Timeout) within the first 60s while
+        // health == Connecting and nat_stats.attempts == 0 — no NAT history
+        // yet, so this must not fall through to the default "connecting"
+        // icon. Previously the title omitted this branch entirely and
+        // showed the ⚡ default here, disagreeing with the favicon's red
+        // "connection issues" icon for the same snapshot.
+        let mut snap = base_snapshot();
+        snap.open_connections = 0;
+        snap.failures.push(FailureSnapshot {
+            address: "1.2.3.4:1234".parse().unwrap(),
+            reason_html: "Timeout".to_string(),
+        });
+        assert_eq!(build_dashboard_title(&Some(snap)), "\u{26A0} Dashboard");
+    }
+
+    #[test]
     fn title_shows_connecting_icon_by_default() {
         // Default base_snapshot(): HealthLevel::Connecting, zero connections,
         // no NAT attempts yet — the "still trying" fallback.
@@ -872,6 +891,22 @@ mod tests {
         snap.nat_stats.attempts = 5;
         snap.nat_stats.successes = 0;
         assert_eq!(build_dashboard_title(&Some(snap)), "(2) Dashboard");
+    }
+
+    #[test]
+    fn title_connected_overrides_failures() {
+        // Same "connected wins" precedence as
+        // title_connected_overrides_trouble_and_nat_failure, but exercised
+        // against a bare `failures` signal with no Trouble/NAT-failure
+        // present — connected must still win (mirrors
+        // favicon_connected_overrides_failures).
+        let mut snap = base_snapshot();
+        snap.open_connections = 3;
+        snap.failures.push(FailureSnapshot {
+            address: "1.2.3.4:1234".parse().unwrap(),
+            reason_html: "Timeout".to_string(),
+        });
+        assert_eq!(build_dashboard_title(&Some(snap)), "(3) Dashboard");
     }
 
     #[test]
