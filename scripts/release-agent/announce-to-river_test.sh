@@ -442,6 +442,51 @@ rc=0
 verify_converged || rc=$?
 check "verify_converged() matches messages with regex/dash metacharacters literally" "$rc" "0"
 
+# ── verify_converged_with_retry() ────────────────────────────────────
+#
+# The post-send verify must POLL, not read once: cross-node UPDATE convergence
+# is ~6-7s and a concurrent gateway restart can delay the first readable read
+# further, so a single immediate read false-negatives a message that DID land
+# (the v0.2.96 "silent drop" that was actually converged). This wrapper re-reads
+# up to VERIFY_ATTEMPTS times and only declares a drop after the budget.
+#
+# Extracted verbatim (depends on verify_converged, extracted above). The stubs
+# key on the loop's VERIFY_ATTEMPT global — read-only in the command-substitution
+# subshell, so no counter file needed. VERIFY_INTERVAL=0 keeps the tests instant.
+# shellcheck disable=SC2317  # stubs are called indirectly via eval'd functions
+eval "$(awk '/^verify_converged_with_retry\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+VERIFY_INTERVAL=0
+
+MESSAGE="Freenet v0.2.96 released: https://example/v0.2.96"
+
+# Present immediately: succeeds on attempt 1.
+VERIFY_ATTEMPTS=5
+read_room_messages() { echo "[t - Room Owner]: $MESSAGE"; }
+rc=0; verify_converged_with_retry || rc=$?
+check "verify_converged_with_retry() returns 0 when present on the first read" "$rc" "0"
+check "verify_converged_with_retry() records attempt 1 when present immediately" "$VERIFY_ATTEMPT" "1"
+
+# THE FIX: still propagating on the first two reads, converges on attempt 3 —
+# a single-shot verify would have wrongly reported a silent drop here.
+VERIFY_ATTEMPTS=5
+read_room_messages() {
+    if ((VERIFY_ATTEMPT >= 3)); then
+        echo "[t - Room Owner]: $MESSAGE"
+    else
+        echo "[t]: still propagating, message not converged yet"
+    fi
+}
+rc=0; verify_converged_with_retry || rc=$?
+check "verify_converged_with_retry() converges after transient misses (no false silent-drop)" "$rc" "0"
+check "verify_converged_with_retry() succeeds on the attempt the message first appears" "$VERIFY_ATTEMPT" "3"
+
+# Genuine silent drop: never converges within the budget → still fails, so a
+# real drop is not masked by the retry.
+VERIFY_ATTEMPTS=4
+read_room_messages() { echo "[t]: unrelated chatter only, message never lands"; }
+rc=0; verify_converged_with_retry || rc=$?
+check "verify_converged_with_retry() returns nonzero when the message never converges (real drop)" "$rc" "1"
+
 # ── send_message_checked() exit-code preservation ────────────────────
 #
 # Regression for the Codex finding: the success path originally used

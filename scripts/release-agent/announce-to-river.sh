@@ -64,6 +64,19 @@ NODE_WAIT_INTERVAL="${NODE_WAIT_INTERVAL:-5}"
 # Bounds the legacy-generation walk a failing GET performs during the
 # down-window; the happy-path read is far faster. Overridable in tests.
 READ_PROBE_TIMEOUT="${READ_PROBE_TIMEOUT:-15}"
+# Post-send convergence verify budget. Cross-node UPDATE convergence is NOT
+# instant (measured ~6-7s on a healthy 0.2.96 network) and can be delayed
+# further when the announce runs concurrently with a gateway self-update that
+# briefly restarts the node. A SINGLE immediate re-read therefore false-negatives
+# a message that is still propagating — observed on the v0.2.96 release, where the
+# message DID land but the one-shot verify reported a "silent drop". So the verify
+# POLLS: re-read every VERIFY_INTERVAL up to VERIFY_ATTEMPTS times, succeeding on
+# the first match, declaring a drop only after the whole budget is exhausted. The
+# common case succeeds in the first 1-3 attempts (~seconds); the drop case waits
+# the full budget before reporting (harmless — the announce is fire-and-forget).
+# Overridable (e.g. VERIFY_ATTEMPTS=1 in tests for the single-shot cases).
+VERIFY_ATTEMPTS="${VERIFY_ATTEMPTS:-24}"
+VERIFY_INTERVAL="${VERIFY_INTERVAL:-5}"
 # Target release version this announcement is for, WITHOUT a leading `v`
 # (e.g. "0.2.90"). Plumbed end-to-end from release-announce.yml's `resolve`
 # job → the nova release-agent (ANNOUNCE_TARGET_VERSION env on the sudo
@@ -206,6 +219,25 @@ verify_converged() {
     local listing
     listing="$(read_room_messages)"
     grep -qF -- "$MESSAGE" <<<"$listing"
+}
+
+# Poll verify_converged until it succeeds or the VERIFY_ATTEMPTS budget is
+# exhausted, sleeping VERIFY_INTERVAL between reads. A single read false-negatives
+# a message that is still propagating (convergence is ~6-7s, and a concurrent
+# gateway restart can delay the first readable read further — see VERIFY_ATTEMPTS),
+# so the "silent drop" verdict must survive the whole budget, not one read.
+# Returns 0 as soon as the message is observed (leaving the winning attempt count
+# in the global VERIFY_ATTEMPT for the caller's log), 1 if it never converges.
+verify_converged_with_retry() {
+    for ((VERIFY_ATTEMPT = 1; VERIFY_ATTEMPT <= VERIFY_ATTEMPTS; VERIFY_ATTEMPT++)); do
+        if verify_converged; then
+            return 0
+        fi
+        if ((VERIFY_ATTEMPT < VERIFY_ATTEMPTS)); then
+            sleep "$VERIFY_INTERVAL"
+        fi
+    done
+    return 1
 }
 
 # Report the version of the locally running freenet node by parsing
@@ -490,10 +522,10 @@ if [[ -n "$SKIP_POST_VERIFY" ]]; then
     exit 0
 fi
 
-if verify_converged; then
-    log "OK (verified message present in room state)"
+if verify_converged_with_retry; then
+    log "OK (verified message present in room state after ${VERIFY_ATTEMPT} read attempt(s))"
     exit 0
 else
-    log "ERROR: riverctl reported success but the message did NOT converge into room state (silent drop)"
+    log "ERROR: riverctl reported success but the message did NOT converge into room state after ${VERIFY_ATTEMPTS} attempts over ~$((VERIFY_ATTEMPTS * VERIFY_INTERVAL))s of polling (silent drop)"
     exit 1
 fi
