@@ -509,49 +509,78 @@ document.addEventListener('DOMContentLoaded', function () {
   });
 
   /* Auto-refresh: fetch the page and swap dynamic content without a full reload.
-       Uses setTimeout chaining (not setInterval) so slow responses don't overlap. */
-  function scheduleRefresh() {
-    setTimeout(function () {
-      fetch(window.location.href)
-        .then(function (r) {
-          return r.text();
-        })
-        .then(function (html) {
-          var parser = new DOMParser();
-          var doc = parser.parseFromString(html, 'text/html');
-          var newMain = doc.querySelector('main');
-          var oldMain = document.querySelector('main');
-          if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
-          /* Update header elements (outside <main>) */
-          var newUp = doc.querySelector('.uptime');
-          var oldUp = document.querySelector('.uptime');
-          if (newUp && oldUp) oldUp.textContent = newUp.textContent;
-          var newBadge = doc.querySelector('#version-badge');
-          var oldBadge = document.getElementById('version-badge');
-          if (newBadge && oldBadge) {
-            oldBadge.textContent = newBadge.textContent;
-            var nv = newBadge.getAttribute('data-version');
-            if (nv) oldBadge.setAttribute('data-version', nv);
-          }
-          var newIcon = doc.querySelector('link[rel="icon"]');
-          var oldIcon = document.querySelector('link[rel="icon"]');
-          if (newIcon && oldIcon)
-            oldIcon.setAttribute('href', newIcon.getAttribute('href'));
-          /* Restore tab selection and table sort after content swap */
-          restoreTab();
-          restoreSort();
-          /* Re-check the live runtime version so the stale-assets banner
-                   appears (or clears) if the serving process changes while the
-                   page stays open. The banner's data-asset-version stays anchored
-                   to the originally-loaded page, which is the version we're
-                   comparing against. */
-          checkVersionMismatch();
-        })
-        .catch(function (e) {
-          console.warn('Dashboard refresh failed:', e);
-        })
-        .finally(scheduleRefresh);
-    }, 5000);
+       Uses setTimeout chaining (not setInterval) so slow responses don't overlap.
+
+       Refresh cadence follows tab visibility (#3353): a hidden/backgrounded tab
+       backs off to a much longer interval since nobody is watching, and polling
+       every 5s while backgrounded only burns CPU/battery and spams the local
+       node with requests nobody reads. The moment the tab becomes visible again
+       we refresh immediately (rather than waiting out the stale timer) so the
+       user sees current data right away, then resume the fast cadence. */
+  var VISIBLE_REFRESH_MS = 5000;
+  var HIDDEN_REFRESH_MS = 60000;
+  var refreshTimer = null;
+
+  function currentRefreshInterval() {
+    return document.hidden ? HIDDEN_REFRESH_MS : VISIBLE_REFRESH_MS;
   }
+
+  function refreshDashboard() {
+    return fetch(window.location.href)
+      .then(function (r) {
+        return r.text();
+      })
+      .then(function (html) {
+        var parser = new DOMParser();
+        var doc = parser.parseFromString(html, 'text/html');
+        var newMain = doc.querySelector('main');
+        var oldMain = document.querySelector('main');
+        if (newMain && oldMain) oldMain.innerHTML = newMain.innerHTML;
+        /* Update header elements (outside <main>) */
+        var newUp = doc.querySelector('.uptime');
+        var oldUp = document.querySelector('.uptime');
+        if (newUp && oldUp) oldUp.textContent = newUp.textContent;
+        var newBadge = doc.querySelector('#version-badge');
+        var oldBadge = document.getElementById('version-badge');
+        if (newBadge && oldBadge) {
+          oldBadge.textContent = newBadge.textContent;
+          var nv = newBadge.getAttribute('data-version');
+          if (nv) oldBadge.setAttribute('data-version', nv);
+        }
+        var newIcon = doc.querySelector('link[rel="icon"]');
+        var oldIcon = document.querySelector('link[rel="icon"]');
+        if (newIcon && oldIcon)
+          oldIcon.setAttribute('href', newIcon.getAttribute('href'));
+        /* Restore tab selection and table sort after content swap */
+        restoreTab();
+        restoreSort();
+        /* Re-check the live runtime version so the stale-assets banner
+                 appears (or clears) if the serving process changes while the
+                 page stays open. The banner's data-asset-version stays anchored
+                 to the originally-loaded page, which is the version we're
+                 comparing against. */
+        checkVersionMismatch();
+      })
+      .catch(function (e) {
+        console.warn('Dashboard refresh failed:', e);
+      });
+  }
+
+  function scheduleRefresh() {
+    if (refreshTimer !== null) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(function () {
+      refreshDashboard().finally(scheduleRefresh);
+    }, currentRefreshInterval());
+  }
+
+  /* When the tab regains visibility, refresh right away instead of waiting
+     out whatever remains of the hidden-tab backoff timer, then fall back to
+     the normal cadence for the next tick. */
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) return;
+    if (refreshTimer !== null) clearTimeout(refreshTimer);
+    refreshDashboard().finally(scheduleRefresh);
+  });
+
   scheduleRefresh();
 });
