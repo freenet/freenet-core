@@ -172,7 +172,12 @@ async fn register_subscription_listener(
 /// (`OpManager::rehydrate_local_hosting_interest`, #4780), which registers the
 /// copy into anti-entropy so `has_local_interest` (term 3) is a true
 /// fresh-in-mesh signal — NOT to widen this gate.
-fn should_serve_local_copy(
+// `pub(crate)` so the restart-rehydration regression test
+// (`node::op_state_manager::tests`) can assert the ACTUAL serve decision for a
+// restored contract, not just the `has_local_interest` input — guarding against
+// a future refactor that decouples the gate from `has_local_interest`. Pure fn,
+// no state, safe to expose in-crate.
+pub(crate) fn should_serve_local_copy(
     local_satisfies_request: bool,
     connection_count: usize,
     is_subscribed: bool,

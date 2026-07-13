@@ -581,10 +581,28 @@ impl OpManager {
     ///
     /// Register-after-state (#4782): a restored key whose state is NOT on disk
     /// is skipped, so we never create a phantom interested-but-stateless entry
-    /// (#4440). `Ring::contract_state_present` conservatively returns `true`
-    /// when the storage handle is unset, matching the summarize gate; at the
-    /// production call site (`contract::handler::build`) the handle is already
-    /// set, so this is a real state-store existence check.
+    /// (#4440).
+    ///
+    /// **Backend scope of the state gate.** `Ring::contract_state_present` is a
+    /// REAL state-store existence check only on the **redb** backend (the
+    /// production default): it does a cheap synchronous point lookup on the
+    /// state table. On the **sqlite** backend, and whenever the storage handle
+    /// is unset, it conservatively returns `true` — the same conservative shape
+    /// as the #4610 summarize gate and #4782 register-after-state. So on sqlite
+    /// a restored *metadata-only* key with no on-disk state WOULD be registered
+    /// here. That is:
+    /// - **pre-existing and shared** with the summarize gate, not introduced by
+    ///   this method;
+    /// - **moot in production**, which runs redb and sets the storage handle
+    ///   (`set_hosting_storage`) before this call, so the check is real; and
+    /// - **never a mis-serve**: the client-GET serve gate still requires
+    ///   `local_satisfies_request` (valid state actually present), so a
+    ///   stateless-but-interested entry can enroll in anti-entropy but can
+    ///   never cause a read to be answered from absent state.
+    ///
+    /// Tightening the shared `contract_state_present` gate to a real check on
+    /// sqlite is a whole-system change out of scope here (tracked separately);
+    /// do NOT special-case it in this method.
     ///
     /// Returns the number of contracts for which interest was (re-)registered.
     pub(crate) fn rehydrate_local_hosting_interest(&self) -> usize {
@@ -4904,11 +4922,12 @@ mod tests {
     /// entry, #4440).
     ///
     /// Red-without / green-with: neutering `rehydrate_local_hosting_interest` to
-    /// a no-op flips the post-restart `has_local_interest` / lookup_by_hash
-    /// assertions from true to false.
+    /// a no-op flips the post-restart real-serve-gate (`should_serve_local_copy`),
+    /// `has_local_interest`, and `lookup_by_hash` assertions from true to false.
     #[cfg(feature = "redb")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restart_rehydrates_local_hosting_interest_so_cached_get_serves_locally() {
+        use crate::client_events::should_serve_local_copy;
         use crate::contract::storages::{HostingMetadata, ReDb};
         use crate::ring::interest::contract_hash;
         use freenet_stdlib::prelude::WrappedState;
@@ -4976,15 +4995,37 @@ mod tests {
             "absent key must have NO on-disk state (register-after-state control)",
         );
 
+        // The ACTUAL serve decision for a client GET of the present key, using
+        // the real production gate with the real inputs a restored contract
+        // presents: valid local state (`local_satisfies_request = true`),
+        // connections re-established, NOT subscribed, and whatever local
+        // interest the InterestManager currently holds. Asserting the real gate
+        // (not just the `has_local_interest` input) guards against a future
+        // refactor that decouples the serve decision from `has_local_interest`.
+        let serves_locally = |key: &ContractKey| {
+            should_serve_local_copy(
+                /* local_satisfies_request */ true,
+                op_manager.ring.open_connections(),
+                /* is_subscribed */ op_manager.ring.is_receiving_updates(key),
+                /* has_local_interest */
+                op_manager.interest_manager.has_local_interest(key),
+            )
+        };
+
         // --- Pre-fix state (the #4780 bug): restore did NOT touch the
-        // InterestManager, so the serve gate would route to the network ---
+        // InterestManager, so the serve gate routes to the network ---
         assert!(
             !op_manager.interest_manager.has_local_interest(&present_key),
-            "BUG REPRO: restored hosted contract has no local interest after restore, \
-             so the serve gate (has_local_interest term) routes the GET to the network",
+            "BUG REPRO: restored hosted contract has no local interest after restore",
         );
         // Not subscribed (no live update stream) — the other serve-gate term.
         assert!(!op_manager.ring.is_receiving_updates(&present_key));
+        assert!(
+            !serves_locally(&present_key),
+            "BUG REPRO: the real serve gate returns FALSE for the restored contract \
+             (connections up, not subscribed, no local interest) → the GET is routed \
+             to the network instead of served from the fresh local copy",
+        );
         assert!(
             op_manager
                 .interest_manager
@@ -5004,8 +5045,13 @@ mod tests {
         // --- Post-fix: serve LOCALLY + re-enrolled in anti-entropy ---
         assert!(
             op_manager.interest_manager.has_local_interest(&present_key),
-            "FIX: restored hosted contract now has local interest → serve gate \
-             answers the GET from the local copy instead of routing to the network",
+            "FIX: restored hosted contract now has local interest",
+        );
+        assert!(
+            serves_locally(&present_key),
+            "FIX: the real serve gate now returns TRUE for the restored contract → \
+             the GET is answered from the fresh local copy instead of routing to the \
+             network (serve-DURING)",
         );
         assert!(
             op_manager
