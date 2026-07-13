@@ -115,8 +115,74 @@ Current wire-gated floors:
   incident-scale fan-out, and the broadcast-assembly-failure telemetry (#4498)
   was deployed to record a baseline and watch the rollout.
 
+- `SUMMARY_FIRST_PUT_MIN_VERSION` in `crates/core/src/node/network_bridge/p2p_protoc.rs`
+  (summary-first PUT probe, `PutMsg::ProbeRequest`/`ProbeResponse`).
+
+  Set to **`(0, 2, 95)`** and FROZEN (0.2.95 was the first release to ship the
+  probe variants + their handler). Follows the standard freeze rule. **DO NOT
+  bump on later releases.**
+
+- `PUT_SUBSCRIBE_MIN_VERSION` in `crates/core/src/node/network_bridge/p2p_protoc.rs`
+  (step-10 §2a `PutMsg::RequestSubscribe`, the version-gated PUT-carries-subscribe
+  variant, #4642 R4 step 10).
+
+  **PLACEHOLDER `(0, 2, 99)` — NOT yet frozen.** This is the one wire-gated floor
+  in flight. **Release-cutting checklist item (do NOT skip):** before cutting the
+  release that first EMITS `PutMsg::RequestSubscribe`, set this constant to
+  **exactly that shipping release version** (matching the `TODO(release)` marker
+  on the constant), then freeze it — same rule as the floors above. A floor below
+  the shipping version reintroduces the old-peer decode-failure connection-drop
+  hazard; a floor above it silently disables PUT-carried-subscribe against
+  fully-capable peers. The fail-closed unit tests
+  (`version_supports_put_subscribe` in `p2p_protoc.rs::tests`) already exist.
+
+  Note (step-10 §2f): the GET side of step 10 needs NO floor.
+  `GetMsg::Request.subscribe` is a long-existing wire field (not a new variant),
+  so a non-blocking GET-with-subscribe is wire-unchanged and safe against every
+  released peer — do NOT add a GET version gate.
+
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
+
+### Step 10 (standalone SUBSCRIBE retirement) rollout safety
+
+Step 10 (#4642 R4) makes subscribe demand ride the GET/PUT route instead of a
+separate SUBSCRIBE op. §2a/§2b retire the standalone `SubscribeMsg` child for the
+**non-blocking** GET/PUT-with-subscribe case (the demand rides the route via
+`GetMsg::Request.subscribe` / the version-gated `PutMsg::RequestSubscribe`, and
+the originator establishes its own local subscription inline via
+`establish_local_client_subscription`). The blocking-subscribe child is kept
+(ordering requirement). Two rollout properties are load-bearing:
+
+- **Bounded mixed-version transient (update-latency only, no correctness loss, no
+  wire break).** A non-blocking GET/PUT-with-subscribe forms its downstream
+  subscriber chain hop-by-hop via carried register-after-state (each relay
+  registers the upstream peer as a downstream subscriber after it has cached the
+  state). During a mixed-version fleet the chain can have a per-hop gap: a
+  small-state GET routed through a relay that predates the register-after-cache
+  handler, or a PUT hop that degrades `RequestSubscribe` to a plain `Request` at a
+  pre-`PUT_SUBSCRIBE_MIN_VERSION` boundary, will not register that one hop. This
+  only delays UPDATE delivery to the newly-subscribed originator; it never drops
+  state, corrupts anything, or breaks the wire. The gap self-heals within one
+  renewal cycle (≤ ~2 min): see the fallback invariant below.
+
+- **LOAD-BEARING: renewal MUST stay a standalone routed `SubscribeMsg::Request`,
+  and directed `Renew` (§2c) MUST NOT ship in the same release that retires the
+  initial-subscribe child.** Renewal (`run_renewal_subscribe` →
+  `drive_client_subscribe_inner(is_renewal = true)` → `SubscribeMsg::Request { is_renewal, .. }`)
+  is the rollout fallback: it is a routed `SubscribeMsg::Request` that every
+  released peer handles on the legacy path, and it re-forms any mixed-version chain
+  gap on the next ~2-minute cycle (the inline-subscribed contracts are exactly the
+  ones that get renewed). §2c would replace routed renewal with a **directed**
+  `SubscribeMsg::Renew` sent only to `computed_upstream`. Enabling §2c in the same
+  release that retires the standalone initial-subscribe child would DELETE this
+  fallback — a directed Renew to a stale/absent upstream cannot re-route around a
+  chain gap, so gaps would persist instead of self-healing. Directed `Renew` is a
+  SEPARATE, LATER release, and even then must keep the routed-`Request` frontier
+  path (design §5c). Pinned by
+  `renewal_still_emits_standalone_subscribe_as_rollout_fallback`
+  (`subscribe/op_ctx_task.rs`): it fails the build if renewal stops emitting the
+  standalone routed `SubscribeMsg::Request` or switches to directed `Renew`.
 
 ## What fires when
 

@@ -567,6 +567,20 @@ async fn drive_client_get_inner(
             //     (ordering requirement; see the `blocking_subscribe` invariant
             //     in `client_events.rs`). `emit_get_subscribe` is false here, so
             //     the GET went out as subscribe=false and built no chain.
+            //
+            // Single-establish guarantee (`add_local_client` inside
+            // `establish_local_client_subscription` is NON-idempotent — it
+            // increments `local_client_count`, so a double-call inflates local
+            // interest and wrongly biases the contract toward evicted-last). This
+            // `Done` arm runs EXACTLY ONCE per client GET: `drive_client_get_inner`
+            // is called once per GET (run_client_get → drive_client_get →
+            // drive_client_get_inner), and the #4345 assembly-retry lives ENTIRELY
+            // inside `drive_get_with_assembly_retry`, which loops internally but
+            // returns a SINGLE terminal via `break` — every retry (including the
+            // terminal-then-re-enter path) completes BEFORE this `match loop_result`
+            // runs. So establish fires once, never per attempt. Do NOT move this
+            // establish into the assembly-retry loop. Pinned by
+            // `establish_local_client_subscription_fires_once_outside_assembly_retry`.
             if driver.emit_get_subscribe {
                 crate::operations::subscribe::establish_local_client_subscription(
                     op_manager, reply_key,
@@ -4515,6 +4529,47 @@ mod tests {
             client_body.contains("maybe_subscribe_child("),
             "the else branch must keep maybe_subscribe_child for the blocking \
              subscribe (ordering requirement) and no-subscribe cases."
+        );
+    }
+
+    /// Step 10 §2b risk pin: `establish_local_client_subscription` (which calls
+    /// the NON-idempotent `add_local_client` — it increments `local_client_count`)
+    /// must fire EXACTLY ONCE per client GET, or a retried GET-with-subscribe would
+    /// double-count local interest and wrongly bias the contract toward
+    /// evicted-last. The establish call lives in `drive_client_get_inner`'s terminal
+    /// `Done` arm, which runs AFTER `drive_get_with_assembly_retry` returns a single
+    /// terminal; the #4345 assembly-retry loop must never contain the establish call
+    /// (moving it inside would re-run it per assembly attempt). This pins the
+    /// structural single-fire so a refactor of the assembly-retry loop can't
+    /// silently reintroduce a double-establish.
+    #[test]
+    fn establish_local_client_subscription_fires_once_outside_assembly_retry() {
+        let src = production_source();
+        // Exactly one establish CALL (immediate `(`) in the client driver — the
+        // Done arm's non-blocking branch. (Doc-comment mentions in the body are
+        // written `establish_local_client_subscription` + backtick, so they do not
+        // match the `(`-suffixed call form counted here.)
+        let client_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        assert_eq!(
+            client_body
+                .matches("establish_local_client_subscription(")
+                .count(),
+            1,
+            "establish_local_client_subscription must appear exactly once in \
+             drive_client_get_inner (the Done arm's non-blocking branch). \
+             add_local_client is non-idempotent, so a second call inflates \
+             local_client_count and biases the contract toward evicted-last."
+        );
+        // The #4345 outer retry loop must NOT contain the establish call —
+        // otherwise a per-attempt re-entry would double-establish.
+        let wrapper_body = extract_fn_body(src, "async fn drive_get_with_assembly_retry(");
+        assert!(
+            !wrapper_body.contains("establish_local_client_subscription"),
+            "drive_get_with_assembly_retry (the #4345 outer retry loop) must NOT \
+             call establish_local_client_subscription — it loops per assembly \
+             attempt, so establishing there would fire the non-idempotent \
+             add_local_client multiple times for one client GET. Keep it in the \
+             terminal Done arm of drive_client_get_inner."
         );
     }
 

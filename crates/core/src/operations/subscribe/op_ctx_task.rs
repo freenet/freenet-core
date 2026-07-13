@@ -438,6 +438,19 @@ pub(crate) async fn run_renewal_subscribe(
         crate::ring::topology_registry::record_renewal_wire_attempt(addr);
     }
 
+    // ROLLOUT-FALLBACK INVARIANT (step 10 §2f — do NOT break without reading
+    // docs/RELEASING.md "Step 10 rollout safety"). This drives renewal as a
+    // routed, standalone `SubscribeMsg::Request { is_renewal, .. }` (built in
+    // `drive_client_subscribe_inner`, `first_hop = None` → routed toward the key).
+    // That routed request is the fallback that heals any mixed-version chain gap
+    // left by a non-blocking GET/PUT-with-subscribe (§2a/§2b retired the standalone
+    // *initial-subscribe* child, but renewal re-forms the downstream chain within
+    // one ~2-min cycle). §2c would switch this to a DIRECTED `SubscribeMsg::Renew`
+    // to `computed_upstream`; doing so in the same release that retired the
+    // initial-subscribe child would delete this fallback (a directed Renew to a
+    // stale/absent upstream can't re-route around a gap). Directed Renew is a
+    // separate, later release. Pinned by
+    // `renewal_still_emits_standalone_subscribe_as_rollout_fallback`.
     let result = drive_client_subscribe_inner(
         &op_manager,
         instance_id,
@@ -3614,6 +3627,110 @@ mod tests {
             !executor_body.contains("record_op_result"),
             "run_executor_subscribe must NOT call record_op_result. \
              Issue #4010."
+        );
+    }
+
+    /// Step 10 §2f rollout-fallback pin. Renewal MUST keep emitting a standalone,
+    /// ROUTED `SubscribeMsg::Request { is_renewal, .. }` — the fallback that heals
+    /// any mixed-version downstream-chain gap left by a non-blocking
+    /// GET/PUT-with-subscribe. §2a/§2b retired the standalone *initial-subscribe*
+    /// child, so during rollout renewal is the only thing re-forming the chain
+    /// through peers that predate the carried-subscribe handlers, and it does so
+    /// within one ~2-min cycle because it routes toward the key on the legacy path
+    /// every released peer handles.
+    ///
+    /// This fails the build if renewal stops emitting that routed request or
+    /// switches to a DIRECTED `SubscribeMsg::Renew` (the §2c variant sent only to
+    /// `computed_upstream`). Shipping directed Renew in the SAME release that
+    /// retired the initial-subscribe child would DELETE this fallback: a directed
+    /// Renew to a stale/absent upstream cannot re-route around a chain gap, so gaps
+    /// would persist instead of self-healing. Directed Renew is a separate, LATER
+    /// release that must still keep the routed-`Request` frontier path (design
+    /// §5c). When it lands, update this pin deliberately, only after confirming
+    /// both the routed frontier fallback and the release-separation invariant
+    /// (docs/RELEASING.md "Step 10 (standalone SUBSCRIBE retirement) rollout
+    /// safety").
+    #[test]
+    fn renewal_still_emits_standalone_subscribe_as_rollout_fallback() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+
+        // The tripwire matches the CONSTRUCTION form (`SubscribeMsg::Renew {` /
+        // `SubscribeMsg::Renew(`), not the bare path, so a prose mention of the
+        // type name in a doc/rationale comment does not false-trip — only code that
+        // actually builds/dispatches the directed variant does. rustfmt guarantees
+        // the space in the struct-literal form.
+        let builds_directed_renew = |body: &str| {
+            body.contains("SubscribeMsg::Renew {") || body.contains("SubscribeMsg::Renew(")
+        };
+
+        // 1. Renewal drives through the shared client-subscribe driver with
+        //    is_renewal = true (NOT a bespoke directed-renewal path), and never
+        //    dispatches a directed Renew itself.
+        let renewal_body = extract_fn_body(prod, "pub(crate) async fn run_renewal_subscribe(");
+        assert!(
+            renewal_body.contains("drive_client_subscribe_inner(")
+                && renewal_body.contains("/* is_renewal */ true"),
+            "run_renewal_subscribe must drive renewal via \
+             drive_client_subscribe_inner(is_renewal = true) — the routed standalone \
+             SubscribeMsg::Request is the step 10 §2f rollout fallback."
+        );
+        assert!(
+            !builds_directed_renew(renewal_body),
+            "run_renewal_subscribe must NOT dispatch a directed SubscribeMsg::Renew \
+             — that deletes the routed-Request rollout fallback (step 10 §2f). \
+             Directed Renew is a separate, later release; see docs/RELEASING.md."
+        );
+
+        // 2. The shared driver constructs the routed standalone
+        //    SubscribeMsg::Request carrying the is_renewal flag, and builds no
+        //    directed SubscribeMsg::Renew.
+        let driver_body = extract_fn_body(prod, "async fn drive_client_subscribe_inner(");
+        let request_at = driver_body.find("SubscribeMsg::Request {").expect(
+            "drive_client_subscribe_inner must construct a routed \
+             SubscribeMsg::Request (the renewal / initial-subscribe wire request)",
+        );
+        // Slice to the struct literal's closing `};` (both bytes ASCII, so no
+        // char-boundary panic risk) and assert is_renewal is one of its fields.
+        let after = &driver_body[request_at..];
+        let close = after
+            .find("};")
+            .expect("SubscribeMsg::Request literal must close with `};`");
+        assert!(
+            after[..close].contains("is_renewal"),
+            "the SubscribeMsg::Request built by drive_client_subscribe_inner must \
+             carry the is_renewal flag so renewal rides the routed legacy path every \
+             released peer handles (step 10 §2f rollout fallback)."
+        );
+        assert!(
+            !builds_directed_renew(driver_body),
+            "drive_client_subscribe_inner must NOT construct a directed \
+             SubscribeMsg::Renew: renewal is the routed rollout fallback. When §2c \
+             adds directed Renew (a separate, later release), update this pin only \
+             after confirming the routed-Request frontier path survives and that \
+             directed Renew is NOT shipping in the child-retirement release \
+             (docs/RELEASING.md 'Step 10 rollout safety')."
+        );
+
+        // Matcher self-test (mirrors the rule_lint `--self-test` convention). This
+        // is what proves the tripwire "guards the right thing": it fires on a real
+        // directed-Renew CONSTRUCTION/dispatch — the change that would delete the
+        // routed rollout fallback — but NOT on a rationale comment that merely
+        // names the variant. So the pin above fails exactly when renewal is
+        // switched to a directed Renew, not when a comment mentions it.
+        assert!(
+            builds_directed_renew("let m = NetMessage::from(SubscribeMsg::Renew { id: tx });"),
+            "self-test: must flag a real directed-Renew struct construction"
+        );
+        assert!(
+            builds_directed_renew("dispatch(SubscribeMsg::Renew(renew))"),
+            "self-test: must flag the tuple-construction form too"
+        );
+        assert!(
+            !builds_directed_renew(
+                "// §2c would switch this to a directed `SubscribeMsg::Renew` variant"
+            ),
+            "self-test: must NOT fire on a prose mention of the type name"
         );
     }
 
