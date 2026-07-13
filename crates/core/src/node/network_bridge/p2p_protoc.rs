@@ -956,6 +956,46 @@ pub(crate) fn version_supports_summary_first_put(
     remote.is_some_and(|v| v >= floor)
 }
 
+/// Minimum peer protocol version that understands the version-gated
+/// `PutMsg::RequestSubscribe` variant (#4642, step 10 §2a).
+///
+/// `RequestSubscribe` is an appended `PutMsg` variant (new bincode tag 9).
+/// A peer on an older release has no such tag in its `PutMsg` enum and would
+/// fail to deserialize it, dropping the connection — the same decode-failure
+/// connection-drop rollout hazard the summary-first floor guards against. The
+/// floor therefore must equal the first release that carries this variant AND
+/// its handler.
+///
+/// RELEASE-TIME CHECK (do NOT skip): this constant MUST equal the actual
+/// shipping version. `(0, 2, 99)` is a PLACEHOLDER for the next release; if
+/// the release that first emits `RequestSubscribe` ends up being something
+/// other than 0.2.99 (a slipped or renumbered release), update this constant
+/// to match that version before cutting the release, then freeze it. A floor
+/// lower than the shipping version reintroduces the decode-failure
+/// connection-drop rollout bug; a floor higher silently disables the feature
+/// against fully-capable peers.
+///
+/// TODO(release): set to the actual first-emitting release before cutting the
+/// release. The floor MUST equal the release that first ships this variant.
+pub(crate) const PUT_SUBSCRIBE_MIN_VERSION: (u8, u8, u16) = (0, 2, 99);
+
+/// Pure version-gate for the `PutMsg::RequestSubscribe` variant, mirroring
+/// [`version_supports_summary_first_put`]: returns `true` iff `remote` is
+/// known (`Some`) AND at least `floor`.
+///
+/// An unknown remote version is treated as unsupported (fail-closed): an older
+/// peer that cannot deserialize the appended `RequestSubscribe` wire tag would
+/// drop the connection, so when in doubt we do NOT emit — the forwarding hop
+/// degrades to a plain `PutMsg::Request` instead. Factored out (with an
+/// explicit `floor` param) so the gate is unit-testable independent of the
+/// production [`PUT_SUBSCRIBE_MIN_VERSION`].
+pub(crate) fn version_supports_put_subscribe(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
 /// Upper bound on the number of hosted contracts examined per new-peer
 /// migration trigger. Each examined contract may emit a best-effort
 /// non-blocking `try_send` (the SubscribeHint nudge), so an unbounded scan
@@ -3518,8 +3558,9 @@ mod tests {
 
     mod version_gate {
         use super::super::{
-            SUBSCRIBE_HINT_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
-            version_supports_subscribe_hint, version_supports_summary_first_put,
+            PUT_SUBSCRIBE_MIN_VERSION, SUBSCRIBE_HINT_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
+            version_supports_put_subscribe, version_supports_subscribe_hint,
+            version_supports_summary_first_put,
         };
 
         const FLOOR: (u8, u8, u16) = (0, 2, 73);
@@ -3650,6 +3691,63 @@ mod tests {
             assert!(version_supports_summary_first_put(
                 Some(SUMMARY_FIRST_PUT_MIN_VERSION),
                 SUMMARY_FIRST_PUT_MIN_VERSION
+            ));
+        }
+
+        // ---- PUT RequestSubscribe gate (#4642, step 10 §2a) ----
+        // Same fail-closed semantics as the summary-first / SubscribeHint
+        // gates. This is the emission gate a forwarding hop consults before
+        // sending `PutMsg::RequestSubscribe` to a next hop; below the floor it
+        // degrades to a plain `PutMsg::Request`.
+
+        /// Placeholder floor mirroring the production `PUT_SUBSCRIBE_MIN_VERSION`
+        /// (`(0, 2, 99)` — the next release, per the TODO on the constant).
+        const PS_FLOOR: (u8, u8, u16) = (0, 2, 99);
+
+        /// An UNKNOWN remote version fails closed: a RequestSubscribe-capable
+        /// node never emits the variant to a peer whose version it hasn't
+        /// captured (it would fail to deserialize the appended tag and drop the
+        /// connection).
+        #[test]
+        fn put_subscribe_unknown_remote_version_fails_closed() {
+            assert!(!version_supports_put_subscribe(None, PS_FLOOR));
+        }
+
+        /// A pre-floor peer (older than the release that first carries
+        /// RequestSubscribe) is never sent the variant — it could not decode
+        /// it. `(0, 2, 98)` is the highest already-released version and does
+        /// NOT carry the variant, so it must be rejected like any other
+        /// pre-floor peer.
+        #[test]
+        fn put_subscribe_older_remote_version_is_rejected() {
+            assert!(!version_supports_put_subscribe(Some((0, 2, 98)), PS_FLOOR));
+            assert!(!version_supports_put_subscribe(Some((0, 2, 95)), PS_FLOOR));
+            assert!(!version_supports_put_subscribe(Some((0, 1, 40)), PS_FLOOR));
+        }
+
+        /// A peer at or above the floor understands the appended variant and
+        /// may receive RequestSubscribe. Both-sides-capable is the activation
+        /// condition (ramps with fleet upgrade).
+        #[test]
+        fn put_subscribe_equal_or_newer_remote_version_is_accepted() {
+            assert!(version_supports_put_subscribe(Some((0, 2, 99)), PS_FLOOR));
+            assert!(version_supports_put_subscribe(Some((0, 3, 0)), PS_FLOOR));
+            assert!(version_supports_put_subscribe(Some((1, 0, 0)), PS_FLOOR));
+        }
+
+        /// The production floor const is wired to the same fail-closed
+        /// predicate (guards against a future refactor that swaps the predicate
+        /// for one that admits `None`).
+        #[test]
+        fn put_subscribe_production_floor_fails_closed_on_unknown() {
+            assert!(!version_supports_put_subscribe(
+                None,
+                PUT_SUBSCRIBE_MIN_VERSION
+            ));
+            // A peer exactly at the production floor qualifies.
+            assert!(version_supports_put_subscribe(
+                Some(PUT_SUBSCRIBE_MIN_VERSION),
+                PUT_SUBSCRIBE_MIN_VERSION
             ));
         }
 

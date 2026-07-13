@@ -404,6 +404,42 @@ async fn complete_local_subscription(
     Ok(())
 }
 
+/// Establish the ORIGINATOR's own local-client subscription for a contract it
+/// already holds (e.g. right after its own PUT), WITHOUT emitting any wire
+/// `SubscribeMsg`.
+///
+/// Used by the PUT client driver's non-blocking `RequestSubscribe` emission
+/// path (step 10 §2a). The downstream subscription CHAIN toward the key is
+/// built hop-by-hop by the `PutMsg::RequestSubscribe` relays
+/// (`register_downstream_subscriber` after each store), so the originator only
+/// needs its own local-subscription STATE:
+///
+/// - `ring.subscribe` installs the local `active_subscriptions` lease so the
+///   contract stays in the renewal set (`contracts_needing_renewal`) and is
+///   retained (renewal — still standalone SUBSCRIBE until step 10 §2c — keeps
+///   the downstream chain fresh and heals any gap the version-gate degrade left).
+/// - `add_local_client` records local-client interest so the contract is
+///   evicted LAST (subscriber-primary eviction, invariant 3) and joins
+///   InterestSync anti-entropy.
+///
+/// This is the subset of `finalize_originator_subscribe` that does NOT require
+/// a wire round-trip: no upstream-peer registration (there is no responder — the
+/// chain is built by the RequestSubscribe forwards; the first renewal's
+/// `finalize_originator_subscribe` registers the upstream), no body fetch (the
+/// originator just PUT the state), and no `LocalSubscribeComplete` client event
+/// (the WS listener was registered at request time in `client_events.rs`).
+///
+/// `add_local_client` is NOT idempotent (it increments `local_client_count` on
+/// every call), so this MUST be called exactly once per successful PUT — never
+/// on a per-attempt / per-retry path.
+pub(crate) async fn establish_local_client_subscription(op_manager: &OpManager, key: ContractKey) {
+    op_manager.ring.subscribe(key);
+    let became_interested = op_manager.interest_manager.add_local_client(&key);
+    if became_interested {
+        super::broadcast_change_interests(op_manager, vec![key], vec![]).await;
+    }
+}
+
 /// Fetch the contract body locally if we do not already have it.
 ///
 /// Fire-and-forget GET sub-op + bounded wait for the contract to land in

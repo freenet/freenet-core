@@ -1385,6 +1385,22 @@ impl ConnectionManager {
         crate::node::version_supports_summary_first_put(remote, floor)
     }
 
+    /// Whether the peer at `addr` reports a negotiated protocol version new
+    /// enough to understand the version-gated `PutMsg::RequestSubscribe`
+    /// variant (#4642, step 10 §2a).
+    ///
+    /// Driver-reachable mirror of `supports_summary_first_put`: op drivers
+    /// (`operations::put::op_ctx_task`) only reach `op_manager.ring`, not the
+    /// network-bridge layer, so this reads the `remote_version` mirror above.
+    /// `None` (unknown version) is treated as unsupported (fail-closed): an
+    /// older peer that cannot deserialize the appended `RequestSubscribe` wire
+    /// tag would drop the connection, so a forwarding hop that fails this gate
+    /// degrades to a plain `PutMsg::Request` instead of emitting the variant.
+    pub(crate) fn supports_put_subscribe(&self, addr: SocketAddr) -> bool {
+        let remote = self.remote_version(addr);
+        crate::node::version_supports_put_subscribe(remote, crate::node::PUT_SUBSCRIBE_MIN_VERSION)
+    }
+
     /// Reserve the next `window`-sized slice of the hosting set for a migration
     /// scan and advance the rotating cursor by `window`. Returns the start
     /// offset (callers should take it modulo the current hosting-set size). Over
@@ -2687,6 +2703,31 @@ mod tests {
         let at_floor_addr = make_addr(9004);
         cm.record_remote_version(at_floor_addr, crate::node::SUMMARY_FIRST_PUT_MIN_VERSION);
         assert!(cm.supports_summary_first_put(at_floor_addr));
+    }
+
+    /// PUT RequestSubscribe emission gate (#4642 step 10 §2a): unknown peer
+    /// fails closed; a pre-floor peer is rejected; a peer at/above the
+    /// production floor is accepted. This is the decision a forwarding hop
+    /// consults before emitting `PutMsg::RequestSubscribe` — a pre-floor peer
+    /// must never receive one (it cannot bincode-deserialize the appended
+    /// tag), and the hop degrades to a plain `PutMsg::Request` instead.
+    #[test]
+    fn supports_put_subscribe_respects_recorded_version_against_production_floor() {
+        let cm = make_connection_manager(Some(make_addr(9100)), 1, 10, false);
+
+        // Unknown version: fail closed.
+        let unknown_addr = make_addr(9101);
+        assert!(!cm.supports_put_subscribe(unknown_addr));
+
+        // Pre-floor peer: rejected (would fail to decode the appended tag).
+        let pre_floor_addr = make_addr(9102);
+        cm.record_remote_version(pre_floor_addr, (0, 2, 98));
+        assert!(!cm.supports_put_subscribe(pre_floor_addr));
+
+        // A peer at the production floor is accepted.
+        let at_floor_addr = make_addr(9103);
+        cm.record_remote_version(at_floor_addr, crate::node::PUT_SUBSCRIBE_MIN_VERSION);
+        assert!(cm.supports_put_subscribe(at_floor_addr));
     }
 
     // ============ cleanup_expired_transients tests ============

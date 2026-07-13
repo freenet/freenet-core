@@ -343,6 +343,16 @@ async fn drive_client_put_inner(
         /// `attempt_timeout`. `None` for non-streaming PUTs (fixed deadline,
         /// behaviour unchanged).
         stream_progress: Option<crate::operations::stream_progress::StreamProgress>,
+        /// Emit `PutMsg::RequestSubscribe` instead of `PutMsg::Request` (step
+        /// 10 §2a). Set only for a NON-BLOCKING `subscribe=true` PUT: the
+        /// carried subscribe intent makes each relay register the upstream peer
+        /// as a downstream subscriber (register-after-state), retiring the
+        /// standalone `SubscribeMsg` child for this case. The first hop is the
+        /// originator loopback (own node), which always understands the variant,
+        /// so no version gate is needed here — the per-neighbour degrade happens
+        /// at each relay's forward (`build_put_forward`). A blocking subscribe
+        /// keeps `Request` + the blocking child (ordering requirement).
+        emit_request_subscribe: bool,
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
@@ -357,23 +367,38 @@ async fn drive_client_put_inner(
         }
 
         fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {
-            NetMessage::from(PutMsg::Request {
-                id: attempt_tx,
-                contract: self.contract.clone(),
-                related_contracts: self.related.clone(),
-                value: self.value.clone(),
-                htl: self.htl,
-                // Only include own_addr in skip_list (matching legacy request_put).
-                // `tried` contains driver-side routing state (peers the driver
-                // selected); process_message makes its own forwarding decisions.
-                skip_list: self
-                    .op_manager
-                    .ring
-                    .connection_manager
-                    .get_own_addr()
-                    .into_iter()
-                    .collect::<HashSet<_>>(),
-            })
+            // Only include own_addr in skip_list (matching legacy request_put).
+            // `tried` contains driver-side routing state (peers the driver
+            // selected); process_message makes its own forwarding decisions.
+            let skip_list = self
+                .op_manager
+                .ring
+                .connection_manager
+                .get_own_addr()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            if self.emit_request_subscribe {
+                // Non-blocking subscribe=true: carry the subscribe intent on the
+                // PUT route (step 10 §2a). Sent to the originator loopback first,
+                // which always understands the variant.
+                NetMessage::from(PutMsg::RequestSubscribe {
+                    id: attempt_tx,
+                    contract: self.contract.clone(),
+                    related_contracts: self.related.clone(),
+                    value: self.value.clone(),
+                    htl: self.htl,
+                    skip_list,
+                })
+            } else {
+                NetMessage::from(PutMsg::Request {
+                    id: attempt_tx,
+                    contract: self.contract.clone(),
+                    related_contracts: self.related.clone(),
+                    value: self.value.clone(),
+                    htl: self.htl,
+                    skip_list,
+                })
+            }
         }
 
         fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Self::Terminal> {
@@ -463,6 +488,11 @@ async fn drive_client_put_inner(
         None
     };
 
+    // Non-blocking subscribe=true rides the PUT route as `RequestSubscribe`
+    // (step 10 §2a) instead of a standalone `SubscribeMsg` child. A blocking
+    // subscribe keeps `Request` + the blocking child (ordering requirement).
+    let emit_request_subscribe = subscribe && !blocking_subscribe;
+
     let mut driver = PutRetryDriver {
         op_manager,
         key,
@@ -476,6 +506,7 @@ async fn drive_client_put_inner(
         attempt_timeout,
         max_advancements,
         stream_progress,
+        emit_request_subscribe,
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
@@ -538,14 +569,33 @@ async fn drive_client_put_inner(
             )
             .await;
 
-            maybe_subscribe_child(
-                op_manager,
-                client_tx,
-                reply_key,
-                subscribe,
-                blocking_subscribe,
-            )
-            .await;
+            // Establish the client-visible subscription (step 10 §2a).
+            //   * Non-blocking subscribe=true: the demand already rode the PUT
+            //     route as `RequestSubscribe` (relays registered the downstream
+            //     chain toward the key), so the originator only needs its own
+            //     local-subscription STATE — established here WITHOUT a standalone
+            //     wire SUBSCRIBE. This retires standalone-SUBSCRIBE emission for
+            //     this case. No double-subscribe: we do NOT also spawn the child.
+            //   * Blocking subscribe (or a no-subscribe PUT): unchanged — keep
+            //     the blocking `SubscribeMsg` child (ordering requirement: the
+            //     client must not see the PutResponse before its subscriber chain
+            //     exists). `emit_request_subscribe` is false here, so the PUT went
+            //     out as a plain `Request` and did NOT build a chain.
+            if driver.emit_request_subscribe {
+                crate::operations::subscribe::establish_local_client_subscription(
+                    op_manager, reply_key,
+                )
+                .await;
+            } else {
+                maybe_subscribe_child(
+                    op_manager,
+                    client_tx,
+                    reply_key,
+                    subscribe,
+                    blocking_subscribe,
+                )
+                .await;
+            }
 
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 ContractResponse::PutResponse { key: reply_key },
@@ -1233,6 +1283,11 @@ pub(crate) async fn start_relay_put<CB>(
     value: WrappedState,
     htl: usize,
     skip_list: HashSet<SocketAddr>,
+    // `true` when the inbound message was `PutMsg::RequestSubscribe` (step 10
+    // §2a): after the store confirms state is present the driver registers the
+    // upstream peer as a downstream subscriber, and forwards `RequestSubscribe`
+    // (version-gated) rather than plain `Request`.
+    subscribe: bool,
     upstream_addr: SocketAddr,
 ) -> Result<(), OpError>
 where
@@ -1285,6 +1340,7 @@ where
         value,
         htl,
         skip_list,
+        subscribe,
         upstream_addr,
     ));
     Ok(())
@@ -1319,6 +1375,7 @@ async fn run_relay_put<CB>(
     value: WrappedState,
     htl: usize,
     skip_list: HashSet<SocketAddr>,
+    subscribe: bool,
     upstream_addr: SocketAddr,
 ) where
     CB: NetworkBridge + Clone + Send + 'static,
@@ -1334,6 +1391,7 @@ async fn run_relay_put<CB>(
         value,
         htl,
         skip_list,
+        subscribe,
         upstream_addr,
     )
     .await;
@@ -1579,6 +1637,58 @@ fn put_routing_should_terminate(
 // standalone SUBSCRIBE hop, being retired (subscribe folds into GET/PUT). Slated for
 // removal/rename by piece D (chain peers become real hosts). Do not name new code
 // "relay". See .claude/rules/hosting-invariants.md terminology + epic #4642.
+/// Forward-degrade decision for the PUT RequestSubscribe route (step 10 §2a).
+///
+/// A hop forwarding a subscribe-carrying PUT toward the key emits
+/// `PutMsg::RequestSubscribe` ONLY when the next hop passes the per-neighbour
+/// version gate (`ConnectionManager::supports_put_subscribe`). Otherwise it
+/// degrades to a plain `PutMsg::Request`, dropping the subscribe intent at that
+/// boundary — a pre-floor next hop cannot decode the appended tag and would
+/// drop the connection. Pure so the degrade decision is unit-testable without a
+/// running driver.
+fn should_forward_request_subscribe(subscribe: bool, next_hop_supports: bool) -> bool {
+    subscribe && next_hop_supports
+}
+
+/// Build the non-streaming PUT forward message toward the next hop, applying
+/// the RequestSubscribe forward-degrade (see [`should_forward_request_subscribe`]).
+#[allow(clippy::too_many_arguments)]
+fn build_put_forward(
+    op_manager: &OpManager,
+    subscribe: bool,
+    next_addr: SocketAddr,
+    id: Transaction,
+    contract: ContractContainer,
+    related_contracts: RelatedContracts<'static>,
+    value: WrappedState,
+    htl: usize,
+    skip_list: HashSet<SocketAddr>,
+) -> NetMessage {
+    let next_supports = op_manager
+        .ring
+        .connection_manager
+        .supports_put_subscribe(next_addr);
+    if should_forward_request_subscribe(subscribe, next_supports) {
+        NetMessage::from(PutMsg::RequestSubscribe {
+            id,
+            contract,
+            related_contracts,
+            value,
+            htl,
+            skip_list,
+        })
+    } else {
+        NetMessage::from(PutMsg::Request {
+            id,
+            contract,
+            related_contracts,
+            value,
+            htl,
+            skip_list,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_relay_put<CB>(
     op_manager: &Arc<OpManager>,
@@ -1589,6 +1699,7 @@ async fn drive_relay_put<CB>(
     value: WrappedState,
     htl: usize,
     skip_list: HashSet<SocketAddr>,
+    subscribe: bool,
     upstream_addr: SocketAddr,
 ) -> Result<(), OpError>
 where
@@ -1625,6 +1736,37 @@ where
         store_priority,
     )
     .await?;
+
+    // ── Step 1b: RequestSubscribe demand registration (step 10 §2a) ─────────
+    // register-AFTER-state: the `?` above means the store succeeded, so state
+    // IS present on this node. Only now do we register the upstream peer as our
+    // downstream subscriber, which makes the phantom
+    // (`contract_in_use && !contract_state_present`) unrepresentable — mirrors
+    // GET's relay register-after-cache. (PUT stores at Step 1 before forwarding
+    // by necessity — it forwards the merged value — so unlike GET's response
+    // path there is no forward-before-cache to honour on the request leg; the
+    // load-bearing invariant here is register-AFTER-state.)
+    //
+    // Skipped on the originator loopback (`upstream_addr == own_addr`): the
+    // upstream IS us, so there is no downstream peer to register, and the
+    // originator's own local-client subscription is established exactly once by
+    // the client driver (`add_local_client` is NOT idempotent, so it must not
+    // run on this per-relay/per-retry path). NO `add_local_client` here either
+    // (a relay has no local client — D-NO-LOCAL-CLIENT).
+    let register_subscribe_downstream =
+        subscribe && Some(upstream_addr) != op_manager.ring.connection_manager.get_own_addr();
+    if register_subscribe_downstream {
+        crate::operations::subscribe::register_downstream_subscriber(
+            op_manager,
+            &key,
+            upstream_addr,
+            None,
+            None,
+            &incoming_tx,
+            " (relay, PUT RequestSubscribe)",
+        )
+        .await;
+    }
 
     // ── Step 2: Build skip list + select next hop ──────────────────────────
     let mut new_skip_list = skip_list;
@@ -1980,7 +2122,15 @@ where
                 total_size: payload_size as u64,
                 htl: new_htl,
                 skip_list: new_skip_list.clone(),
-                subscribe: false,
+                // Carry subscribe intent across a streaming upgrade (step 10
+                // §2a). `RequestStreaming` is a pre-existing variant with this
+                // field, so no version gate is needed. NOTE: the streaming
+                // relay does not yet register downstream demand from this flag
+                // (it only forwards it) — the subscribe chain forms at
+                // non-streaming hops; a large streaming PUT still relies on the
+                // originator's local subscription + renewal. Streaming-relay
+                // register-after-store is a follow-up, out of §2a scope.
+                subscribe,
             });
             if let Err(err) = ctx.send_fire_and_forget(next_addr, metadata_msg).await {
                 tracing::warn!(
@@ -2042,14 +2192,17 @@ where
                 .await;
             }
         } else {
-            let forward = NetMessage::from(PutMsg::Request {
-                id: incoming_tx,
+            let forward = build_put_forward(
+                op_manager,
+                subscribe,
+                next_addr,
+                incoming_tx,
                 contract,
                 related_contracts,
-                value: merged_value.clone(),
-                htl: new_htl,
-                skip_list: new_skip_list,
-            });
+                merged_value.clone(),
+                new_htl,
+                new_skip_list,
+            );
             if let Err(err) = ctx.send_fire_and_forget(next_addr, forward).await {
                 tracing::warn!(
                     tx = %incoming_tx,
@@ -2096,10 +2249,11 @@ where
             total_size: payload_size as u64,
             htl: new_htl,
             skip_list: new_skip_list.clone(),
-            // Relay path never carries client subscribe intent; only the
-            // originator's `start_client_put` triggers post-PUT
-            // subscription.
-            subscribe: false,
+            // Carry subscribe intent across a streaming upgrade (step 10 §2a).
+            // See the loopback streaming-upgrade site above for the caveat:
+            // the streaming relay forwards this flag but does not yet register
+            // downstream demand from it.
+            subscribe,
         });
 
         // Install the reply waiter BEFORE dispatching stream fragments.
@@ -2156,14 +2310,17 @@ where
         })
         .await
     } else {
-        let forward = NetMessage::from(PutMsg::Request {
-            id: incoming_tx,
+        let forward = build_put_forward(
+            op_manager,
+            subscribe,
+            next_addr,
+            incoming_tx,
             contract,
             related_contracts,
-            value: merged_value,
-            htl: new_htl,
-            skip_list: new_skip_list,
-        });
+            merged_value,
+            new_htl,
+            new_skip_list,
+        );
         tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(next_addr, forward)).await
     };
 
@@ -5732,25 +5889,51 @@ mod tests {
         let driver_start = src
             .find("async fn drive_relay_put<CB>(")
             .expect("drive_relay_put not found");
+        // Use the immediately-following `relay_put_store_locally` as the end
+        // anchor to capture ONLY the drive_relay_put body — the wider
+        // `relay_put_finalize_local` anchor would also swallow the
+        // `relay_put_replicate_forward` helper, which legitimately mints its
+        // own replication tx.
         let driver_end = src[driver_start..]
-            .find("\nasync fn relay_put_finalize_local(")
+            .find("\nasync fn relay_put_store_locally(")
             .expect("driver body end not found")
             + driver_start;
         let driver_src = &src[driver_start..driver_end];
-        // The PutMsg::Request forward must carry id: incoming_tx (not a
-        // freshly-minted Transaction::new::<PutMsg>()).
-        let forward_pos = driver_src
-            .find("PutMsg::Request {")
-            .expect("forward PutMsg::Request not found in driver");
-        let forward_window = &driver_src[forward_pos..forward_pos + 400];
+        // The non-streaming forward now goes through `build_put_forward(...)`
+        // (step 10 §2a, so the RequestSubscribe forward-degrade lives in one
+        // place). Every such call must pass `incoming_tx` as the forward id
+        // (not a freshly-minted Transaction::new::<PutMsg>()).
         assert!(
-            forward_window.contains("id: incoming_tx"),
-            "relay forward must reuse incoming_tx; minting a fresh tx per hop \
-             breaks the downstream `active_relay_put_txs` dedup gate"
+            driver_src.contains("build_put_forward("),
+            "drive_relay_put must build the non-streaming forward via \
+             build_put_forward (RequestSubscribe forward-degrade lives there)"
         );
+        for (idx, _) in driver_src.match_indices("build_put_forward(") {
+            let window = &driver_src[idx..(idx + 300).min(driver_src.len())];
+            assert!(
+                window.contains("incoming_tx"),
+                "build_put_forward call must pass incoming_tx as the forward id; \
+                 minting a fresh tx per hop breaks the downstream \
+                 `active_relay_put_txs` dedup gate"
+            );
+        }
         assert!(
-            !forward_window.contains("Transaction::new::<PutMsg>()"),
+            !driver_src.contains("Transaction::new::<PutMsg>()"),
             "relay forward must NOT mint a fresh Transaction"
+        );
+        // build_put_forward itself must construct the forward with the passed
+        // `id`, never a fresh Transaction.
+        let bpf_start = src
+            .find("fn build_put_forward(")
+            .expect("build_put_forward not found");
+        let bpf_end = src[bpf_start..]
+            .find("\nasync fn drive_relay_put<CB>(")
+            .expect("build_put_forward end not found")
+            + bpf_start;
+        let bpf_src = &src[bpf_start..bpf_end];
+        assert!(
+            !bpf_src.contains("Transaction::new::<PutMsg>()"),
+            "build_put_forward must reuse the passed id, never mint a fresh tx"
         );
     }
 
@@ -5864,6 +6047,91 @@ mod tests {
             helper_src.contains("remove_evicted_in_use"),
             "helper MUST call interest_manager.remove_evicted_in_use to sync the \
              InterestManager after a subscribed eviction"
+        );
+    }
+
+    /// Degrade decision (step 10 §2a): a hop forwards `RequestSubscribe` ONLY
+    /// when both the op carries subscribe intent AND the next hop passes the
+    /// per-neighbour version gate; otherwise it degrades to plain `Request`.
+    #[test]
+    fn should_forward_request_subscribe_requires_intent_and_support() {
+        // (subscribe intent, next-hop supports the variant, expected: forward
+        // RequestSubscribe rather than degrade to plain Request). Driven from a
+        // table so the predicate is exercised with runtime values, not literals.
+        let cases = [
+            (true, true, true),   // intent + capable next hop → RequestSubscribe
+            (true, false, false), // intent but sub-floor/unknown → degrade to Request
+            (false, true, false), // no intent → plain Request even to a capable peer
+            (false, false, false),
+        ];
+        for (subscribe, next_hop_supports, expected) in cases {
+            assert_eq!(
+                should_forward_request_subscribe(subscribe, next_hop_supports),
+                expected,
+                "subscribe={subscribe} next_hop_supports={next_hop_supports}"
+            );
+        }
+    }
+
+    /// Source-scrape pin (step 10 §2a, register-AFTER-state): the PUT relay
+    /// driver registers the upstream peer as a downstream subscriber ONLY after
+    /// `relay_put_store_locally` has stored the state (the `?` on that call
+    /// means state is present), and ONLY when the op carries subscribe intent.
+    /// Registering before the store, or unconditionally, would recreate the
+    /// phantom `contract_in_use && !contract_state_present`. It must also NOT
+    /// call `add_local_client` (a relay has no local client; the originator's
+    /// own local-client subscription is established once by the client driver).
+    #[test]
+    fn drive_relay_put_registers_downstream_after_store_for_subscribe() {
+        let src = include_str!("op_ctx_task.rs");
+        let driver_start = src
+            .find("async fn drive_relay_put<CB>(")
+            .expect("drive_relay_put not found");
+        // Capture ONLY the drive_relay_put body (see the reuses-incoming-tx pin
+        // for why the wider anchor over-captures helpers).
+        let driver_end = src[driver_start..]
+            .find("\nasync fn relay_put_store_locally(")
+            .expect("driver body end not found")
+            + driver_start;
+        let driver_src = &src[driver_start..driver_end];
+
+        let store_pos = driver_src
+            .find("relay_put_store_locally(")
+            .expect("relay_put_store_locally call missing in driver");
+        let register_pos = driver_src
+            .find("register_downstream_subscriber(")
+            .expect("RequestSubscribe relay must register the downstream subscriber");
+        assert!(
+            store_pos < register_pos,
+            "downstream registration MUST run AFTER the local store (register-\
+             after-state); registering first recreates the phantom \
+             contract_in_use && !contract_state_present"
+        );
+
+        // The registration must be gated on the subscribe flag (and skipped on
+        // the originator loopback).
+        let gate_pos = driver_src
+            .find("let register_subscribe_downstream =")
+            .expect("downstream registration must be gated on register_subscribe_downstream");
+        assert!(
+            driver_src[gate_pos..register_pos].contains("subscribe &&"),
+            "the RequestSubscribe downstream gate must require the subscribe flag"
+        );
+        assert!(
+            gate_pos < register_pos && register_pos - gate_pos < 800,
+            "register_downstream_subscriber must sit inside the \
+             register_subscribe_downstream gate"
+        );
+
+        // A relay must NEVER call add_local_client (D-NO-LOCAL-CLIENT): a relay
+        // has no local client, and add_local_client is not idempotent. Match the
+        // CALL form (`add_local_client(`) so the explanatory comment in the
+        // driver that names the method does not trip the pin.
+        assert!(
+            !driver_src.contains("add_local_client("),
+            "drive_relay_put MUST NOT call add_local_client — a relay has no \
+             local client (D-NO-LOCAL-CLIENT); the originator's own local-client \
+             subscription is established once by the client driver"
         );
     }
 

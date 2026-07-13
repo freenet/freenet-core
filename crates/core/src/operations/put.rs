@@ -601,6 +601,44 @@ mod messages {
             /// Addresses to skip when selecting next hop (loop prevention).
             skip_list: HashSet<std::net::SocketAddr>,
         },
+
+        /// **PUT that also carries subscribe intent (#4642, step 10 §2a).**
+        ///
+        /// Identical payload to [`Request`](Self::Request) — the variant
+        /// identity IS the subscribe flag, so there is deliberately no `bool`
+        /// field (a positional bool on `Request` would EOF a pre-floor peer
+        /// and drop the connection; a new appended variant does not, because
+        /// old peers never receive a tag they can't decode).
+        ///
+        /// Brings the non-streaming PUT route to GET-with-subscribe parity: a
+        /// relay handling this variant stores the contract and then, once the
+        /// store confirms state is present, registers its UPSTREAM peer as a
+        /// downstream subscriber (register-AFTER-state, so the phantom
+        /// `contract_in_use && !contract_state_present` is unrepresentable —
+        /// mirrors GET's relay register-after-cache). This is the net-new
+        /// relay downstream-registration on the PUT path; plain
+        /// [`Request`](Self::Request) never registered demand at relays.
+        ///
+        /// Emitted only after the sender confirms the target passes
+        /// [`ConnectionManager::supports_put_subscribe`](crate::ring::connection_manager::ConnectionManager::supports_put_subscribe)
+        /// (per-neighbour `remote_version` gate,
+        /// [`PUT_SUBSCRIBE_MIN_VERSION`](crate::node::PUT_SUBSCRIBE_MIN_VERSION)),
+        /// exactly like the summary-first [`ProbeRequest`](Self::ProbeRequest).
+        /// A hop forwarding toward the key to a next hop that does NOT pass the
+        /// gate degrades to a plain [`Request`](Self::Request), dropping the
+        /// subscribe intent at that boundary — the originator's own local
+        /// subscription plus renewal are the safety net.
+        RequestSubscribe {
+            id: Transaction,
+            contract: ContractContainer,
+            #[serde(deserialize_with = "RelatedContracts::deser_related_contracts")]
+            related_contracts: RelatedContracts<'static>,
+            value: WrappedState,
+            /// Hops to live - decremented at each hop, request fails if reaches 0
+            htl: usize,
+            /// Addresses to skip when selecting next hop (prevents loops)
+            skip_list: HashSet<std::net::SocketAddr>,
+        },
     }
 
     impl InnerMessage for PutMsg {
@@ -614,7 +652,8 @@ mod messages {
                 | Self::Error { id, .. }
                 | Self::ProbeRequest { id, .. }
                 | Self::ProbeResponse { id, .. }
-                | Self::ProbeReconcile { id, .. } => id,
+                | Self::ProbeReconcile { id, .. }
+                | Self::RequestSubscribe { id, .. } => id,
             }
         }
 
@@ -634,6 +673,7 @@ mod messages {
                 Self::ProbeRequest { contract_key, .. } => Some(Location::from(contract_key.id())),
                 Self::ProbeResponse { key, .. } => Some(Location::from(key.id())),
                 Self::ProbeReconcile { key, .. } => Some(Location::from(key.id())),
+                Self::RequestSubscribe { contract, .. } => Some(Location::from(contract.id())),
             }
         }
     }
@@ -735,6 +775,17 @@ mod messages {
                         id,
                         key,
                         delta.size(),
+                        htl
+                    )
+                }
+                Self::RequestSubscribe {
+                    id, contract, htl, ..
+                } => {
+                    write!(
+                        f,
+                        "PutRequestSubscribe(id: {}, key: {}, htl: {})",
+                        id,
+                        contract.key(),
                         htl
                     )
                 }
@@ -852,7 +903,7 @@ mod tests {
         let tx = Transaction::new::<PutMsg>();
         let key = make_contract_key(0);
         // One minimal instance per variant, in declaration order.
-        let samples: [(u32, PutMsg); 9] = [
+        let samples: [(u32, PutMsg); 10] = [
             (
                 0,
                 PutMsg::Request {
@@ -940,6 +991,21 @@ mod tests {
                     id: tx,
                     key,
                     delta: StateDelta::from(Vec::new()),
+                    htl: 0,
+                    skip_list: Default::default(),
+                },
+            ),
+            // Tag 9: RequestSubscribe (step 10 §2a). Appended AFTER every
+            // existing variant so tags 0-8 stay byte-identical. Emission is
+            // version-gated (never sent to a pre-floor peer), so this tag
+            // never reaches a node that can't decode it.
+            (
+                9,
+                PutMsg::RequestSubscribe {
+                    id: tx,
+                    contract: crate::operations::test_utils::make_test_contract(&[]),
+                    related_contracts: RelatedContracts::default(),
+                    value: WrappedState::new(vec![]),
                     htl: 0,
                     skip_list: Default::default(),
                 },
@@ -1132,6 +1198,47 @@ mod tests {
                 assert_eq!(decoded_skip, skip_list);
             }
             other => panic!("expected ProbeReconcile, got {other}"),
+        }
+    }
+
+    /// `PutMsg::RequestSubscribe` (step 10 §2a): the full Request payload
+    /// (contract, related contracts, value, htl, skip_list) round-trips
+    /// through bincode via the `deser_related_contracts` owned-deserialize
+    /// path — a borrowed `RelatedContracts<'de>` is not `DeserializeOwned`
+    /// and cannot cross the bincode boundary as a plain field. Mirrors
+    /// `get::tests::test_get_msg_subscribe_roundtrip`; the wire is what a
+    /// version-gated emit will send once the floor is reached.
+    #[test]
+    fn test_put_msg_request_subscribe_roundtrip() {
+        let tx = Transaction::new::<PutMsg>();
+        let mut skip_list = std::collections::HashSet::new();
+        skip_list.insert(std::net::SocketAddr::from(([127, 0, 0, 1], 8080)));
+        let value = WrappedState::new(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let msg = PutMsg::RequestSubscribe {
+            id: tx,
+            contract: crate::operations::test_utils::make_test_contract(&[0x01, 0x02, 0x03]),
+            related_contracts: RelatedContracts::default(),
+            value: value.clone(),
+            htl: 9,
+            skip_list: skip_list.clone(),
+        };
+
+        let bytes = bincode::serialize(&msg).expect("serialize");
+        let decoded: PutMsg = bincode::deserialize(&bytes).expect("deserialize");
+        match decoded {
+            PutMsg::RequestSubscribe {
+                id,
+                value: decoded_value,
+                htl,
+                skip_list: decoded_skip,
+                ..
+            } => {
+                assert_eq!(id, tx);
+                assert_eq!(decoded_value.as_ref(), value.as_ref());
+                assert_eq!(htl, 9);
+                assert_eq!(decoded_skip, skip_list);
+            }
+            other => panic!("expected RequestSubscribe, got {other}"),
         }
     }
 

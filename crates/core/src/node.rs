@@ -64,7 +64,8 @@ pub(crate) use network_bridge::broadcast_queue::BROADCAST_STREAM_METRICS;
 // re-export rather than a path through `network_bridge` directly. Mirrors
 // `BROADCAST_STREAM_METRICS` above.
 pub(crate) use network_bridge::p2p_protoc::{
-    SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_summary_first_put,
+    PUT_SUBSCRIBE_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_put_subscribe,
+    version_supports_summary_first_put,
 };
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
@@ -1170,6 +1171,7 @@ where
             #[allow(clippy::wildcard_enum_match_arm)]
             let banned_key = match op {
                 put::PutMsg::Request { contract, .. } => Some(contract.key()),
+                put::PutMsg::RequestSubscribe { contract, .. } => Some(contract.key()),
                 put::PutMsg::RequestStreaming { contract_key, .. } => Some(*contract_key),
                 put::PutMsg::ProbeRequest { contract_key, .. } => Some(*contract_key),
                 put::PutMsg::ProbeReconcile { key, .. } => Some(*key),
@@ -1221,6 +1223,8 @@ where
                             value.clone(),
                             *htl,
                             skip_list.clone(),
+                            // Plain Request carries no subscribe intent.
+                            false,
                             upstream_addr,
                         )
                         .await
@@ -1230,6 +1234,41 @@ where
                                 contract = %contract.key(),
                                 error = %err,
                                 "PUT relay dispatch: start_relay_put failed"
+                            );
+                        }
+                    }
+                    // RequestSubscribe (step 10 §2a): same relay driver as
+                    // Request, with `subscribe=true` so the driver registers the
+                    // upstream peer as a downstream subscriber AFTER the store
+                    // confirms state is present (register-after-state). This is
+                    // the net-new relay downstream-registration on the PUT path.
+                    put::PutMsg::RequestSubscribe {
+                        id,
+                        contract,
+                        related_contracts,
+                        value,
+                        htl,
+                        skip_list,
+                    } => {
+                        if let Err(err) = put::op_ctx_task::start_relay_put(
+                            op_manager.clone(),
+                            conn_manager.clone(),
+                            *id,
+                            contract.clone(),
+                            related_contracts.clone(),
+                            value.clone(),
+                            *htl,
+                            skip_list.clone(),
+                            true,
+                            upstream_addr,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                contract = %contract.key(),
+                                error = %err,
+                                "PUT relay dispatch: start_relay_put (subscribe) failed"
                             );
                         }
                     }
