@@ -739,6 +739,16 @@ pub(super) async fn finalize_host_subscribe(
     tx: &Transaction,
     warn_suffix: &str,
 ) {
+    // Capture the responder's interest key BEFORE the fetch consumes
+    // `directed_holder` (review Fix D). On the forwarded relay path the
+    // `directed_holder` is the peer that answered `Subscribed` — this hop's
+    // UPSTREAM toward the key. We register it as an upstream interest below so an
+    // early unsubscribe can propagate to it. `None` on the local-hit path (this
+    // node already holds the state; its upstream is established via renewal).
+    let upstream_peer = directed_holder
+        .as_ref()
+        .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key.clone()));
+
     // Fetch BEFORE register (D-ORDER). `directed_holder` routes the fetch through
     // the responding peer when known, else greedy toward the key.
     let have_body = match fetch_contract_if_missing(op_manager, *key.id(), directed_holder).await {
@@ -783,6 +793,23 @@ pub(super) async fn finalize_host_subscribe(
     )
     .await;
     op_manager.ring.subscribe(key);
+    // Register the RESPONDER as our UPSTREAM interest (review Fix D), mirroring
+    // `finalize_originator_subscribe`'s step 1. Without this the relay is an
+    // incomplete host: `send_unsubscribe_upstream` would find no upstream peer if
+    // the requester unsubscribes before this relay's first renewal, so it would
+    // only drop the local lease — leaving the responder with a stale downstream
+    // registration for us, fanning updates to a collapsing relay until its ~8-min
+    // lease expires. Recording the upstream lets an early unsubscribe propagate
+    // promptly. `is_new` marks a freshly-viable broadcast target → flush any
+    // deferred fresh-contract broadcast (#4359), same as the originator.
+    if let Some(peer_key) = upstream_peer {
+        let is_new = op_manager
+            .interest_manager
+            .register_peer_interest(&key, peer_key, None, true);
+        if is_new {
+            op_manager.flush_pending_broadcast_on_interest(&key).await;
+        }
+    }
     // NOTE (review Fix B): do NOT call `complete_subscription_request` here. That
     // clears the node-wide per-contract pending-subscription dedup slot and
     // records backoff success — but a RELAY never CLAIMED that slot

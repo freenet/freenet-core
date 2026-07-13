@@ -628,4 +628,35 @@ fn finalize_host_subscribe_fetches_before_register() {
         "the `if !have_body {{ return; }}` guard must precede register_downstream_subscriber \
          so a fetch-fail registers NOTHING (no phantom)"
     );
+
+    // Review Fix D: the relay must register the directed holder (the responder /
+    // its upstream toward the key) as an UPSTREAM interest (is_upstream = true),
+    // mirroring finalize_originator_subscribe, so an early unsubscribe can
+    // propagate upstream instead of leaving the responder fanning updates to a
+    // collapsing relay until the ~8-min lease expires. The upstream is derived
+    // from the captured directed holder (`upstream_peer`), NOT the downstream
+    // requester, and a newly-viable upstream flushes deferred broadcasts (#4359).
+    let upstream_reg = body
+        .find("register_peer_interest(")
+        .expect("finalize_host_subscribe must register the responder as upstream interest (Fix D)");
+    let upstream_call_end = body[upstream_reg..]
+        .find(')')
+        .map(|o| upstream_reg + o)
+        .expect("register_peer_interest call must close");
+    let upstream_args = &body[upstream_reg..upstream_call_end];
+    assert!(
+        upstream_args.contains("true"),
+        "finalize_host_subscribe's register_peer_interest must pass is_upstream = true — the \
+         responder is our upstream toward the key (review Fix D)"
+    );
+    assert!(
+        body.contains("upstream_peer"),
+        "the upstream interest must be the captured directed holder (upstream_peer), not the \
+         downstream requester (review Fix D)"
+    );
+    assert!(
+        body.contains("flush_pending_broadcast_on_interest"),
+        "finalize_host_subscribe must flush deferred broadcasts on a newly-viable upstream \
+         (#4359), mirroring finalize_originator_subscribe (review Fix D)"
+    );
 }
