@@ -174,6 +174,23 @@ impl ContractHandler for NetworkContractHandler {
             .neighbor_hosting
             .initialize_from_hosting_cache(hosted_ids);
 
+        // #4780: also rehydrate InterestManager local-hosting for every restored
+        // hosted contract, so a client GET for a cached contract serves LOCALLY
+        // (serve-DURING gate) instead of routing to the network, and the copy
+        // re-joins InterestSync anti-entropy. The two restore steps above rebuild
+        // the hosting cache and the advertised-host set but NOT the
+        // InterestManager, which both the serve gate and the interest-sync
+        // heartbeat key on. State-gated inside the helper (register-after-state,
+        // #4782) so no phantom interested-but-stateless entry is created — the
+        // hosting storage handle is set above (`set_hosting_storage`), so the
+        // state-presence check is real here.
+        //
+        // Do NOT "fix" this instead by re-adding is_hosting_contract to the serve
+        // gate (`client_events::should_serve_local_copy`) — that would serve
+        // copies with no freshening path and re-introduce the #3698 stale-serve
+        // bug. See .claude/rules/hosting-invariants.md (invariant 1).
+        op_manager.rehydrate_local_hosting_interest();
+
         Ok(Self { executor, channel })
     }
 

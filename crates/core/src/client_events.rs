@@ -161,6 +161,17 @@ async fn register_subscription_listener(
 /// near-miss floor. `local_satisfies_request` already guarantees valid state is
 /// present, so a phantom (interested-but-stateless, #4440) copy is excluded even
 /// though it can register interest via a downstream subscriber.
+///
+/// Do NOT re-add `is_hosting_contract` (the in-memory hosting-cache membership)
+/// as a serve term — see .claude/rules/hosting-invariants.md (invariant 1). A
+/// hosting-cache copy is NOT necessarily in the update mesh: on restart the
+/// cache is restored but the InterestManager is not, so `is_hosting_contract`
+/// can be true while the copy has no freshening path. Serving on it would
+/// re-introduce the #3698 stale-serve bug. The correct fix for restored copies
+/// is to rehydrate `has_local_interest` at startup
+/// (`OpManager::rehydrate_local_hosting_interest`, #4780), which registers the
+/// copy into anti-entropy so `has_local_interest` (term 3) is a true
+/// fresh-in-mesh signal — NOT to widen this gate.
 fn should_serve_local_copy(
     local_satisfies_request: bool,
     connection_count: usize,

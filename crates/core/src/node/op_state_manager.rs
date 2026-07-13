@@ -552,6 +552,58 @@ impl OpManager {
         })
     }
 
+    /// Re-register local-hosting interest for every restored hosted contract
+    /// on restart (#4780).
+    ///
+    /// Startup restore repopulates the hosting cache
+    /// ([`Ring::load_hosting_cache`]) and the advertised-host set
+    /// ([`NeighborHostingManager::initialize_from_hosting_cache`]), but NOT the
+    /// [`InterestManager`](crate::ring::interest::InterestManager). Both the
+    /// client-GET serve gate (`client_events::should_serve_local_copy`, which
+    /// keys on `InterestManager::has_local_interest`) AND the InterestSync
+    /// anti-entropy heartbeat (`node::handle_interest_sync_message`, which keys
+    /// on `has_local_interest` / `get_matching_contracts` — i.e. the interest
+    /// hash index) read the InterestManager. So without this call a restored,
+    /// still-hosted contract silently fell out of BOTH local serving and
+    /// anti-entropy: after a restart with connections re-established (so the
+    /// serve gate's `connection_count == 0` escape hatch no longer applies) and
+    /// no live subscription, every subsequent client GET routed the whole
+    /// request through the network (slow), and the copy never re-joined the
+    /// update mesh. serve-DURING (`hosting-invariants.md` invariant 1) requires
+    /// the reverse: serve the local copy immediately and re-link it in the
+    /// background.
+    ///
+    /// Registering `hosting = true` (the same reason the GET/PUT host-formation
+    /// paths register on first cache) is exactly what restores both: the serve
+    /// gate answers locally, and the contract re-enters the interest index so
+    /// the ~5-min InterestSync heartbeat heals it and neighbors learn we
+    /// co-host it (live fan-out).
+    ///
+    /// Register-after-state (#4782): a restored key whose state is NOT on disk
+    /// is skipped, so we never create a phantom interested-but-stateless entry
+    /// (#4440). `Ring::contract_state_present` conservatively returns `true`
+    /// when the storage handle is unset, matching the summarize gate; at the
+    /// production call site (`contract::handler::build`) the handle is already
+    /// set, so this is a real state-store existence check.
+    ///
+    /// Returns the number of contracts for which interest was (re-)registered.
+    pub(crate) fn rehydrate_local_hosting_interest(&self) -> usize {
+        let mut rehydrated = 0usize;
+        for key in self.ring.hosting_contract_keys() {
+            if self.ring.contract_state_present(&key) {
+                self.interest_manager.register_local_hosting(&key);
+                rehydrated += 1;
+            }
+        }
+        if rehydrated > 0 {
+            tracing::info!(
+                rehydrated,
+                "Rehydrated local-hosting interest for restored contracts on restart (#4780)"
+            );
+        }
+        rehydrated
+    }
+
     /// Cloneable handle to the shutting-down flag. Used by
     /// `ShutdownHandle` to flip the gate before starting the drain
     /// wait. Callers checking the flag should use
@@ -4815,5 +4867,179 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         drop(g);
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    // ===== Restart serve-rehydration (#4780) =====
+
+    /// Build a contract key whose 32-byte instance id and code hash are both
+    /// derived from `seed`, so a `HostingMetadata { code_hash }` we persist under
+    /// `key.as_bytes()` reconstructs to the SAME key after restore.
+    #[cfg(feature = "redb")]
+    fn rehydrate_key(seed: u8) -> ContractKey {
+        ContractKey::from_id_and_code(
+            ContractInstanceId::new([seed; 32]),
+            freenet_stdlib::prelude::CodeHash::new([seed.wrapping_add(0x40); 32]),
+        )
+    }
+
+    /// #4780 regression: after a restart that restores the hosting cache and
+    /// re-establishes connections (so the serve gate's `connection_count == 0`
+    /// escape hatch does NOT apply) with no live subscription, a restored hosted
+    /// contract whose state is on disk must be SERVED LOCALLY and re-enrolled in
+    /// InterestSync anti-entropy — not routed through the network.
+    ///
+    /// Root cause: startup restore (`Ring::load_hosting_cache` +
+    /// `NeighborHostingManager::initialize_from_hosting_cache`) rebuilt the
+    /// hosting cache and the advertised-host set but NOT the `InterestManager`.
+    /// The serve gate (`client_events::should_serve_local_copy`) and the
+    /// interest-sync heartbeat (`node::handle_interest_sync_message`) both key on
+    /// `InterestManager::has_local_interest` / the interest hash index, so the
+    /// restored copy silently fell out of both. The fix rehydrates local-hosting
+    /// interest on restart (`OpManager::rehydrate_local_hosting_interest`).
+    ///
+    /// This drives the REAL restore path (`load_hosting_cache` against a real
+    /// redb store), then the REAL fix method. It also pins the
+    /// register-after-state gate (#4782): a restored metadata-only key with no
+    /// state on disk must NOT be registered (no phantom interested-but-stateless
+    /// entry, #4440).
+    ///
+    /// Red-without / green-with: neutering `rehydrate_local_hosting_interest` to
+    /// a no-op flips the post-restart `has_local_interest` / lookup_by_hash
+    /// assertions from true to false.
+    #[cfg(feature = "redb")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_rehydrates_local_hosting_interest_so_cached_get_serves_locally() {
+        use crate::contract::storages::{HostingMetadata, ReDb};
+        use crate::ring::interest::contract_hash;
+        use freenet_stdlib::prelude::WrappedState;
+
+        let (op_manager, _guards) =
+            build_reroot_test_op_manager("restart-serve-rehydration-4780").await;
+        // Re-establish connectivity: connection_count > 0 means the serve gate's
+        // isolated-node escape hatch does NOT fire, so serving depends on
+        // has_local_interest — exactly the #4780 scenario.
+        seed_location_and_one_connection(&op_manager);
+        assert!(op_manager.ring.open_connections() > 0);
+
+        // A restored hosted contract WITH state on disk (must be re-served + re-
+        // enrolled), and a restored metadata-only contract with NO state (must be
+        // skipped by the register-after-state gate).
+        let present_key = rehydrate_key(0x11);
+        let absent_key = rehydrate_key(0x22);
+        let state = WrappedState::new(b"restored contract state".to_vec());
+
+        // --- Simulate the pre-restart on-disk store ---
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage: ReDb = ReDb::new(dir.path()).await.expect("open redb");
+        storage
+            .store_state_sync(&present_key, state.clone())
+            .expect("store state for present key");
+        let now_ms = 1_000u64;
+        storage
+            .store_hosting_metadata(
+                &present_key,
+                HostingMetadata::new(
+                    now_ms,
+                    0,
+                    state.as_ref().len() as u64,
+                    **present_key.code_hash(),
+                    true,
+                ),
+            )
+            .expect("store hosting metadata for present key");
+        // absent_key: hosting metadata only, NO state row on disk.
+        storage
+            .store_hosting_metadata(
+                &absent_key,
+                HostingMetadata::new(now_ms, 0, 0, **absent_key.code_hash(), false),
+            )
+            .expect("store hosting metadata for absent key");
+
+        // --- Restart restore path (mirrors contract::handler::build) ---
+        op_manager.ring.set_hosting_storage(storage.clone());
+        let restored = op_manager
+            .ring
+            .load_hosting_cache(&storage, |_id| None)
+            .expect("load_hosting_cache");
+        assert_eq!(
+            restored, 2,
+            "both metadata entries restore into the hosting cache"
+        );
+        assert!(op_manager.ring.is_hosting_contract(&present_key));
+        assert!(op_manager.ring.is_hosting_contract(&absent_key));
+        assert!(
+            op_manager.ring.contract_state_present(&present_key),
+            "present key must have on-disk state after restore",
+        );
+        assert!(
+            !op_manager.ring.contract_state_present(&absent_key),
+            "absent key must have NO on-disk state (register-after-state control)",
+        );
+
+        // --- Pre-fix state (the #4780 bug): restore did NOT touch the
+        // InterestManager, so the serve gate would route to the network ---
+        assert!(
+            !op_manager.interest_manager.has_local_interest(&present_key),
+            "BUG REPRO: restored hosted contract has no local interest after restore, \
+             so the serve gate (has_local_interest term) routes the GET to the network",
+        );
+        // Not subscribed (no live update stream) — the other serve-gate term.
+        assert!(!op_manager.ring.is_receiving_updates(&present_key));
+        assert!(
+            op_manager
+                .interest_manager
+                .lookup_by_hash(contract_hash(&present_key))
+                .is_empty(),
+            "BUG REPRO: restored contract is absent from the interest hash index, \
+             so it does not participate in InterestSync anti-entropy",
+        );
+
+        // --- Apply the fix ---
+        let rehydrated = op_manager.rehydrate_local_hosting_interest();
+        assert_eq!(
+            rehydrated, 1,
+            "only the state-present contract is re-registered; the stateless one is skipped",
+        );
+
+        // --- Post-fix: serve LOCALLY + re-enrolled in anti-entropy ---
+        assert!(
+            op_manager.interest_manager.has_local_interest(&present_key),
+            "FIX: restored hosted contract now has local interest → serve gate \
+             answers the GET from the local copy instead of routing to the network",
+        );
+        assert!(
+            op_manager
+                .interest_manager
+                .lookup_by_hash(contract_hash(&present_key))
+                .contains(&present_key),
+            "FIX: restored contract is back in the interest hash index → it re-joins \
+             the InterestSync anti-entropy heartbeat (node::handle_interest_sync_message)",
+        );
+
+        // Register-after-state gate: the stateless restored copy must NOT be
+        // registered (no phantom interested-but-stateless entry, #4440 / #4782).
+        assert!(
+            !op_manager.interest_manager.has_local_interest(&absent_key),
+            "register-after-state: a restored metadata-only copy with no on-disk \
+             state must NOT be registered as interested",
+        );
+    }
+
+    /// Wiring pin (#4780): `contract::handler::NetworkContractHandler::build`
+    /// MUST call `rehydrate_local_hosting_interest` after restoring the hosting
+    /// cache, or restored contracts silently stop serving locally / rejoining
+    /// anti-entropy. The behavioral test above proves the method WORKS; this pin
+    /// proves it is actually invoked at startup (the first `async fn build(` in
+    /// handler.rs is `NetworkContractHandler::build`).
+    #[test]
+    fn handler_build_rehydrates_local_hosting_interest_on_restart() {
+        let handler_src = include_str!("../contract/handler.rs");
+        let build_body = braced_block_after(handler_src, "async fn build(");
+        assert!(
+            build_body.contains("rehydrate_local_hosting_interest"),
+            "NetworkContractHandler::build must call rehydrate_local_hosting_interest \
+             after load_hosting_cache so restored hosted contracts serve locally and \
+             rejoin anti-entropy (#4780)",
+        );
     }
 }
