@@ -1183,8 +1183,8 @@ where
         // populate the detector against a state a concurrent write has changed.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
             if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
-                if *cached_hash == detector_hash {
-                    return Ok(cached_summary.clone());
+                if cached_hash == detector_hash {
+                    return Ok(cached_summary);
                 }
             }
         }
@@ -1209,11 +1209,11 @@ where
         self.state_store.cache_state_hash(key, state_hash);
 
         // The summary may already be cached under this exact hash even when the
-        // detector was cold (the summary cache is per-executor; the detector is
-        // shared). Reuse it to skip the WASM call.
+        // detector was cold (e.g. after a restart or a detector eviction). Reuse it
+        // to skip the WASM call.
         if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
-            if *cached_hash == state_hash {
-                return Ok(cached_summary.clone());
+            if cached_hash == state_hash {
+                return Ok(cached_summary);
             }
         }
 
@@ -1234,7 +1234,8 @@ where
             .summarize_state(&key, &params, &state)
             .map_err(|e| ExecutorError::execution(e, None))?;
 
-        self.summary_cache.put(key, (state_hash, summary.clone()));
+        self.summary_cache
+            .insert(key, (state_hash, summary.clone()));
         Ok(summary)
     }
 
@@ -1270,7 +1271,7 @@ where
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
             let cache_key = (key, detector_hash, summary_hash);
             if let Some(cached_delta) = self.delta_cache.get(&cache_key) {
-                return Ok(cached_delta.clone());
+                return Ok(cached_delta);
             }
         }
 
@@ -1294,7 +1295,7 @@ where
 
         let cache_key = (key, state_hash, summary_hash);
         if let Some(cached_delta) = self.delta_cache.get(&cache_key) {
-            return Ok(cached_delta.clone());
+            return Ok(cached_delta);
         }
 
         let params = self
@@ -1314,7 +1315,7 @@ where
             .get_state_delta(&key, &params, &state, &their_summary)
             .map_err(|e| ExecutorError::execution(e, None))?;
 
-        self.delta_cache.put(cache_key, delta.clone());
+        self.delta_cache.insert(cache_key, delta.clone());
         Ok(delta)
     }
 

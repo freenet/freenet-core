@@ -287,6 +287,20 @@ impl RuntimePool {
         let shared_summaries: SharedSummaries = Arc::new(DashMap::new());
         let shared_client_counts: SharedClientCounts = Arc::new(DashMap::new());
 
+        // Shared summarize/delta fast-path caches, sized ONCE from the hosting
+        // byte budget (`Config::max_hosting_storage`) so the ~5-min InterestSync
+        // anti-entropy re-summarize of the whole hosted set hits the fast path
+        // (skips the WASM `summarize_state` + a possible module recompile) instead
+        // of thrashing a fixed 1024-entry cache once the hosted set exceeds it
+        // (the 0.2.98 every-hop-hosting re-summarization storm). Every executor
+        // gets a clone of the SAME moka cache (moka is internally `Arc`), so one
+        // copy of each summary is held for the whole pool — NOT one per executor,
+        // and the "first available" checkout can no longer fragment the hit rate
+        // across executors. See `Executor::set_summarize_caches`.
+        let summarize_cache_capacity = super::summarize_cache_capacity(config.max_hosting_storage);
+        let shared_summary_cache = super::build_summary_cache(summarize_cache_capacity);
+        let shared_delta_cache = super::build_delta_cache(summarize_cache_capacity);
+
         // Create delegate notification channel for subscription delivery
         let (delegate_notification_tx, delegate_notification_rx) =
             tokio::sync::mpsc::channel(super::DELEGATE_NOTIFICATION_CHANNEL_SIZE);
@@ -412,6 +426,8 @@ impl RuntimePool {
             shared_summaries.clone(),
             shared_client_counts.clone(),
         );
+        first_executor
+            .set_summarize_caches(shared_summary_cache.clone(), shared_delta_cache.clone());
         first_executor.set_recovery_guard(shared_recovery_guard.clone());
         first_executor.set_delegate_notification_tx(delegate_notification_tx.clone());
         runtimes.push(Some(first_executor));
@@ -435,6 +451,7 @@ impl RuntimePool {
                 shared_summaries.clone(),
                 shared_client_counts.clone(),
             );
+            executor.set_summarize_caches(shared_summary_cache.clone(), shared_delta_cache.clone());
             executor.set_recovery_guard(shared_recovery_guard.clone());
             executor.set_delegate_notification_tx(delegate_notification_tx.clone());
 

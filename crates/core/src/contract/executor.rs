@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::future::Future;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +18,7 @@ use freenet_stdlib::client_api::{
     RequestError,
 };
 use freenet_stdlib::prelude::*;
-use lru::LruCache;
+use moka::sync::Cache as MokaCache;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -916,6 +915,78 @@ type SharedSummaries =
 // Per-client subscription counts for O(1) limit enforcement (used by RuntimePool).
 type SharedClientCounts = Arc<dashmap::DashMap<ClientId, usize>>;
 
+/// Value cached per contract for the `summarize_contract_state` fast path: the
+/// state-hash the summary was computed against, plus the summary itself. moka is
+/// internally `Arc`, so cloning the cache (into every pool executor) shares one
+/// backing store — the summaries are held once, not once per executor. See
+/// [`summarize_cache_capacity`] and [`Executor::set_summarize_caches`].
+pub(crate) type SummaryCache = MokaCache<ContractKey, (u64, StateSummary<'static>)>;
+
+/// Value cached per `(contract, state-hash, peer-summary-hash)` for the
+/// `get_contract_state_delta` fast path. Shared across pool executors like
+/// [`SummaryCache`].
+pub(crate) type DeltaCache = MokaCache<(ContractKey, u64, u64), StateDelta<'static>>;
+
+/// Conservative per-contract on-disk state floor used to size the summarize/delta
+/// fast-path caches from the node's hosting byte budget.
+///
+/// Chosen well BELOW the ~400 KiB average contract-state size observed on
+/// production gateways (a 1 GiB hosting budget held ~2616 contracts) so the
+/// derived entry count comfortably EXCEEDS the real hosted set (headroom for a
+/// larger-than-average hosted set and for smaller-than-average contracts), while
+/// still reducing to the historical fixed 1024-entry cap at the 128 MiB minimum
+/// hosting budget so small hosts see no behavior change (128 MiB / 128 KiB =
+/// 1024). A smaller floor would only add cheap headroom (summaries are tiny — the
+/// website/UI-container summary is a serialized version number, a River room
+/// summary a small digest — so an entry costs ~1 KiB, not the ~1.4 MiB of a
+/// compiled module), but 128 KiB already gives ~3x headroom over the observed set
+/// at the 1 GiB budget.
+const SUMMARIZE_CACHE_STATE_FLOOR_BYTES: u64 = 128 * 1024;
+
+/// Floor for the derived summarize/delta cache size: the historical fixed cap
+/// (1024). A host at the 128 MiB minimum hosting budget lands exactly here, so
+/// the change is a pure "larger budgets get a proportionally larger cache" —
+/// small/standalone hosts are unaffected.
+const SUMMARIZE_CACHE_MIN_CAPACITY: u64 = 1024;
+
+/// Sanity ceiling for the derived summarize/delta cache size.
+///
+/// Mirrors `StateStore::STATE_HASH_CACHE_CAPACITY` (100_000): the cheap
+/// change-detector that ALSO gates the fast path caps at 100k entries, so a
+/// larger summary/delta cache could never raise the hit rate (a summary miss on
+/// the detector's evicted key falls to the slow path regardless). Also bounds
+/// worst-case cache RAM if an operator sets an extreme `max-hosting-storage`.
+const SUMMARIZE_CACHE_MAX_CAPACITY: u64 = 100_000;
+
+/// Derive the summarize/delta fast-path cache entry-count from the node's hosting
+/// byte budget (`Config::max_hosting_storage`), so the ~5-min InterestSync
+/// anti-entropy re-summarize of the WHOLE hosted set hits the fast path (reuses
+/// the cached summary, skipping the WASM `summarize_state` and its possible module
+/// recompile) instead of thrashing a fixed 1024-entry cache the moment the hosted
+/// set exceeds it. Under 0.2.98 every-hop hosting a gateway hosts thousands of
+/// contracts, so the fixed 1024 cap turned the heartbeat into a re-summarization
+/// storm (~250x the summarize rate, tens of module recompiles/sec).
+///
+/// `count = clamp(hosting_budget_bytes / SUMMARIZE_CACHE_STATE_FLOOR_BYTES,
+///                SUMMARIZE_CACHE_MIN_CAPACITY, SUMMARIZE_CACHE_MAX_CAPACITY)`.
+///
+/// At the default RAM-scaled hosting budgets (`clamp(total_ram/8, 128 MiB, 1 GiB)`):
+/// 128 MiB budget → 1024 entries, 1 GiB budget → 8192 entries.
+pub(crate) fn summarize_cache_capacity(hosting_budget_bytes: u64) -> u64 {
+    (hosting_budget_bytes / SUMMARIZE_CACHE_STATE_FLOOR_BYTES)
+        .clamp(SUMMARIZE_CACHE_MIN_CAPACITY, SUMMARIZE_CACHE_MAX_CAPACITY)
+}
+
+/// Build a [`SummaryCache`] bounded to `capacity` entries.
+pub(crate) fn build_summary_cache(capacity: u64) -> SummaryCache {
+    MokaCache::builder().max_capacity(capacity).build()
+}
+
+/// Build a [`DeltaCache`] bounded to `capacity` entries.
+pub(crate) fn build_delta_cache(capacity: u64) -> DeltaCache {
+    MokaCache::builder().max_capacity(capacity).build()
+}
+
 /// Consumers of the executor are required to poll for new changes in order to be notified
 /// of changes or can alternatively use the notification channel.
 ///
@@ -957,14 +1028,21 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     pub(crate) recovery_guard: CorruptedStateRecoveryGuard,
 
     /// Cache of contract summaries keyed by ContractKey, storing (state_hash, summary).
-    /// Avoids redundant WASM instantiations during the 5-minute interest heartbeat
+    /// Avoids redundant WASM instantiations during the ~5-minute interest heartbeat
     /// which calls summarize_state() for every matching contract.
-    /// LRU-bounded to prevent unbounded growth on gateways that see many contracts over time.
-    summary_cache: LruCache<ContractKey, (u64, StateSummary<'static>)>,
+    ///
+    /// Bounded to cover the hosted set (see [`summarize_cache_capacity`]) so that
+    /// heartbeat re-summarize hits the fast path at every-hop-hosting scale
+    /// instead of thrashing. In a pool this is a clone of ONE shared moka cache
+    /// (injected via [`Self::set_summarize_caches`]), so the summaries are held
+    /// once for the whole pool rather than once per executor; standalone executors
+    /// get a private min-sized cache.
+    summary_cache: SummaryCache,
 
     /// Cache of delta results keyed by (ContractKey, state_hash, their_summary_hash).
-    /// Avoids redundant WASM instantiations for get_state_delta() calls.
-    delta_cache: LruCache<(ContractKey, u64, u64), StateDelta<'static>>,
+    /// Avoids redundant WASM instantiations for get_state_delta() calls. Shared and
+    /// bounded like [`Self::summary_cache`].
+    delta_cache: DeltaCache,
 
     /// Channel to send delegate notifications when subscribed contracts change state.
     /// Set when running in a pool via `set_delegate_notification_tx()`.
@@ -1001,8 +1079,12 @@ where
             shared_summaries: None,
             shared_client_counts: None,
             recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            summary_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
-            delta_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
+            // Standalone executors get a private, minimum-sized cache. The pool
+            // replaces these with clones of one hosting-budget-sized shared cache
+            // via `set_summarize_caches`, so pool executors don't each hold a full
+            // copy of the hosted set's summaries.
+            summary_cache: build_summary_cache(SUMMARIZE_CACHE_MIN_CAPACITY),
+            delta_cache: build_delta_cache(SUMMARIZE_CACHE_MIN_CAPACITY),
             delegate_notification_tx: None,
         })
     }
@@ -1029,6 +1111,26 @@ where
         self.shared_notifications = Some(notifications);
         self.shared_summaries = Some(summaries);
         self.shared_client_counts = Some(client_counts);
+    }
+
+    /// Replace this executor's private summarize/delta fast-path caches with
+    /// pool-shared, hosting-budget-sized caches.
+    ///
+    /// Called by `RuntimePool::new` for every executor with clones of ONE moka
+    /// cache pair sized via [`summarize_cache_capacity`]. Because the
+    /// "first available" checkout scatters summarize/delta calls across executors,
+    /// per-executor caches fragment the hit rate AND duplicate the hosted set's
+    /// summaries N times in RAM; one shared cache sized to the hosted set fixes
+    /// both, so the ~5-min anti-entropy re-summarize hits the fast path (skips the
+    /// WASM summarize and its possible module recompile) across the whole pool.
+    /// moka is internally `Arc`, so the clones share one backing store.
+    pub(crate) fn set_summarize_caches(
+        &mut self,
+        summary_cache: SummaryCache,
+        delta_cache: DeltaCache,
+    ) {
+        self.summary_cache = summary_cache;
+        self.delta_cache = delta_cache;
     }
 
     /// Set a shared recovery guard for pool-based operation.
@@ -1160,6 +1262,64 @@ pub(crate) mod test_fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hosting-budget → summarize/delta cache-size derivation. Pure and
+    /// deterministic (no machine RAM), so these pin the exact sizing the pool
+    /// applies at every-hop-hosting scale (the 0.2.98 re-summarization storm fix).
+    mod summarize_cache_sizing_tests {
+        use super::*;
+
+        #[test]
+        fn reduces_to_old_cap_at_min_budget() {
+            // 128 MiB minimum hosting budget → exactly the historical fixed 1024
+            // cap, so small / standalone hosts see no behavior change.
+            assert_eq!(summarize_cache_capacity(128 * 1024 * 1024), 1024);
+        }
+
+        #[test]
+        fn covers_hosted_set_at_default_gateway_budget() {
+            // 1 GiB budget (the gateway default) → 8192, comfortably above the
+            // ~2616 contracts a production gateway hosted when the storm appeared.
+            assert_eq!(summarize_cache_capacity(1024 * 1024 * 1024), 8192);
+        }
+
+        #[test]
+        fn clamps_to_floor_for_degenerate_budget() {
+            assert_eq!(summarize_cache_capacity(0), SUMMARIZE_CACHE_MIN_CAPACITY);
+            assert_eq!(summarize_cache_capacity(1), SUMMARIZE_CACHE_MIN_CAPACITY);
+        }
+
+        #[test]
+        fn clamps_to_ceiling_for_extreme_budget() {
+            // An extreme operator `max-hosting-storage` is bounded by the sanity
+            // ceiling so cache RAM stays bounded (and never exceeds the detector
+            // cap that also gates the fast path).
+            assert_eq!(
+                summarize_cache_capacity(u64::MAX),
+                SUMMARIZE_CACHE_MAX_CAPACITY
+            );
+            // The first budget that reaches the ceiling: MAX * floor bytes.
+            assert_eq!(
+                summarize_cache_capacity(
+                    SUMMARIZE_CACHE_MAX_CAPACITY * SUMMARIZE_CACHE_STATE_FLOOR_BYTES
+                ),
+                SUMMARIZE_CACHE_MAX_CAPACITY
+            );
+        }
+
+        #[test]
+        fn is_monotonic_nondecreasing_in_budget() {
+            let mut prev = 0;
+            for gib in [0u64, 1, 2, 4, 8, 16, 64] {
+                let cap = summarize_cache_capacity(gib * 1024 * 1024 * 1024);
+                assert!(
+                    cap >= prev,
+                    "capacity must not decrease as the budget grows"
+                );
+                prev = cap;
+            }
+        }
+    }
 
     mod executor_error_tests {
         use super::*;

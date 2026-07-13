@@ -314,6 +314,87 @@ async fn delta_unchanged_skips_state_load() {
 }
 
 // =========================================================================
+// SCALE (the 0.2.98 fix: cover the hosted set, not a fixed 1024)
+// =========================================================================
+
+/// At an every-hop-hosting hosted set LARGER than the historical fixed
+/// 1024-entry cap, re-summarizing an UNCHANGED contract must still hit the fast
+/// path (no state reload → no WASM `summarize_state` → no module recompile).
+///
+/// This is the regression guard for the 0.2.98 anti-entropy re-summarization
+/// storm. With the old fixed `LruCache::new(1024)`, warming > 1024 distinct
+/// contracts evicted the earliest summaries, so the ~5-min InterestSync
+/// heartbeat re-summarize of those contracts fell to the slow path (reload +
+/// WASM summarize + a possible module recompile) EVERY cycle. The cache is now
+/// sized from the hosting byte budget (`summarize_cache_capacity`), so the whole
+/// hosted set stays cached. `get_count` is the fast/slow-path discriminator: the
+/// slow path ALWAYS loads the state before it runs WASM, so "no additional load"
+/// proves "no WASM summarize" (uses an uncached `StateStore` so every load is
+/// observable).
+#[tokio::test(flavor = "current_thread")]
+async fn summarize_unchanged_hits_fast_path_beyond_old_1024_cap() {
+    use crate::contract::executor::{
+        build_delta_cache, build_summary_cache, summarize_cache_capacity,
+    };
+
+    let storage = MockStateStorage::new();
+    let mut exec = Executor::new_mock_wasm_uncached("summarize_scale", storage.clone())
+        .await
+        .expect("create uncached executor");
+
+    // Size the caches from a 1 GiB hosting budget (the gateway default), which
+    // derives to 8192 entries — far above both the old 1024 cap and the warm set
+    // below. Injected via the SAME setter the pool uses in production.
+    let capacity = summarize_cache_capacity(1024 * 1024 * 1024);
+    assert!(
+        capacity > 1024,
+        "the gateway-default hosting budget must derive a cache larger than the old fixed cap"
+    );
+    exec.set_summarize_caches(build_summary_cache(capacity), build_delta_cache(capacity));
+
+    // Warm WELL past the old 1024 cap (but under the derived capacity, so nothing
+    // is evicted). Each contract is PUT then summarized once (cold → slow path,
+    // populating both the detector and the summary cache).
+    const WARM: usize = 1500;
+    let mut keys = Vec::with_capacity(WARM);
+    for i in 0..WARM {
+        let seed = format!("summarize-scale-{i}");
+        let contract = test_contract(seed.as_bytes());
+        let key = contract.key();
+        keys.push(key);
+        let state = WrappedState::new(vec![(i & 0xff) as u8, (i >> 8) as u8, 7, 7]);
+        exec.upsert_contract_state(
+            key,
+            Either::Left(state),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("warm PUT");
+        let _ = exec
+            .summarize_contract_state(key)
+            .await
+            .expect("warm summarize");
+    }
+
+    // Re-summarize the FIRST (oldest) contract on unchanged state. With the old
+    // fixed 1024-entry cache this key's summary would have been evicted by the
+    // 1500 warm inserts, forcing a reload; with the hosting-budget-sized cache it
+    // is still cached, so no reload (and no WASM summarize) happens.
+    let gets_before = storage.get_count();
+    let _ = exec
+        .summarize_contract_state(keys[0])
+        .await
+        .expect("re-summarize oldest");
+    assert_eq!(
+        storage.get_count(),
+        gets_before,
+        "re-summarizing the oldest of {WARM} hosted contracts (> old 1024 cap) must hit the \
+         fast path (no reload, no WASM summarize) with the budget-sized cache"
+    );
+}
+
+// =========================================================================
 // EDGE CASES
 // =========================================================================
 
