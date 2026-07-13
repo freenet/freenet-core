@@ -1522,7 +1522,6 @@ async fn test_get_with_subscribe_flag(ctx: &mut TestContext) -> TestResult {
     Ok(())
 }
 
-// FIXME Update notification is not received
 #[freenet_test(
     health_check_readiness = true,
     nodes = ["gateway", "node-a"],
