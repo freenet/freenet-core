@@ -125,6 +125,19 @@ const MAX_PHANTOM_REPAIR_ATTEMPTS: u32 = 3;
 /// fire-and-forget fetch could still be in flight.
 const PHANTOM_REPAIR_COOLDOWN: Duration = crate::config::OPERATION_TTL;
 
+/// Absolute-age bound for the exhausted-phantom exemption (review Fix C /
+/// ring.md "Cleanup Exemptions Must Be Time-Bounded"). A phantom whose
+/// downstream keeps renewing (so the Fix-6 downstream-expiry prune never fires)
+/// but whose state stays unfetchable past this age is dropped, so it cannot be a
+/// permanent GC blind spot + advertised dead-end. Four subscription leases (~32
+/// min) is well past the 8-min lease — several renewal cycles of genuine
+/// repair-fetch attempts must fail first. This drop is SAFE and NON-CYCLING
+/// (unlike the original #4770 Drop): a re-registration goes through
+/// `finalize_host_subscribe` (fetch-first), so if the state is still unfetchable
+/// it registers NOTHING and the phantom cannot re-form.
+const PHANTOM_ABSOLUTE_MAX_AGE: Duration =
+    Duration::from_secs(SUBSCRIPTION_LEASE_DURATION.as_secs() * 4); // ~32 minutes
+
 // =============================================================================
 // Result Types
 // =============================================================================
@@ -135,19 +148,34 @@ const PHANTOM_REPAIR_COOLDOWN: Duration = crate::config::OPERATION_TTL;
 struct PhantomRepairEntry {
     attempts: u32,
     last_attempt: Instant,
+    /// When this phantom was first observed (TimeSource). Drives the
+    /// absolute-age drop (`PHANTOM_ABSOLUTE_MAX_AGE`, review Fix C) — an
+    /// exhausted phantom whose downstream keeps renewing is dropped once its age
+    /// exceeds the bound, so the exemption is time-bounded (ring.md).
+    first_seen: Instant,
 }
 
 /// Action emitted by [`HostingManager::reconcile_phantom_in_use`] for one
 /// phantom (in-use, stateless) contract. The driver in
 /// `Ring::recover_orphaned_subscriptions` applies it: `Fetch` spawns a
 /// fire-and-forget sub-op GET (`start_sub_op_get`); `Drop` removes the
-/// phantom registration via [`HostingManager::drop_phantom_downstream`] and
-/// decrements the interest manager.
+/// downstream registration (via [`HostingManager::drop_phantom_downstream`]) and
+/// collapses upstream.
+///
+/// The `Drop` variant here is NOT the #4770 cycling drop (that was neutralized in
+/// step 10 §1c). It is the review-Fix-C absolute-age-bounded drop: it fires ONLY
+/// after `PHANTOM_ABSOLUTE_MAX_AGE`, and it is non-cycling because a
+/// re-registration must go through `finalize_host_subscribe` (fetch-first), which
+/// registers NOTHING while the state stays unfetchable — so the phantom cannot
+/// re-form. It re-satisfies the ring.md time-bounded-exemption rule that the
+/// pure Fix-6 downstream-expiry prune leaves open when the downstream keeps
+/// renewing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhantomRepair {
     /// Launch a one-shot state repair fetch for the contract.
     Fetch(ContractKey),
-    /// Repair attempts exhausted — drop the phantom downstream registration.
+    /// Repair attempts exhausted AND the phantom is older than
+    /// `PHANTOM_ABSOLUTE_MAX_AGE` — drop the stale downstream registration.
     Drop(ContractKey),
 }
 
@@ -1698,6 +1726,32 @@ impl HostingManager {
         !self.has_downstream_subscribers(contract)
     }
 
+    /// Count of phantom in-use contracts: contracts registered as in-use via a
+    /// downstream subscriber whose state is NOT present on disk
+    /// (`contract_in_use && !contract_state_present`). This is the step-10 §1d
+    /// falsifier — after the register-after-state fix (a hop registers a
+    /// downstream only once it holds state) it should read 0. A nonzero value
+    /// means a hop registered demand it cannot serve (the #4404/#4612 phantom).
+    ///
+    /// redb-scoped by construction: `contract_state_present` is
+    /// conservative-true on sqlite, before the storage handle is set, and on
+    /// store errors, so this reads 0 on those backends regardless (matching the
+    /// #4610/#4612 gate's own scoping).
+    ///
+    /// Scans only `downstream_subscribers` (the dominant relay phantom source,
+    /// gen a/d, keyed by full `ContractKey`). Client-subscription-only phantoms
+    /// (gen b/c) are keyed by instance id with no full-key index and cannot be
+    /// state-checked here, so they are OUT OF SCOPE for this gauge; cleaning up a
+    /// client-subscription-only phantom left by a dead-end GET/PUT is DEFERRED to
+    /// a future PR (the up-front client subscription currently lingers until the
+    /// client disconnects).
+    pub(crate) fn phantom_in_use_count(&self) -> u64 {
+        self.downstream_subscribers
+            .iter()
+            .filter(|entry| !self.contract_state_present(entry.key()))
+            .count() as u64
+    }
+
     /// Reconcile the downstream-driven in-use set against the state store
     /// (#4612 root fix, option b): enforce `in-use ⇒ has-state` as a repaired
     /// invariant rather than a persistent violation.
@@ -1716,11 +1770,19 @@ impl HostingManager {
     ///   attempts per contract (never overlapping an in-flight fetch), and
     ///   [`MAX_PHANTOM_REPAIR_ATTEMPTS`] total (bound the producer — the
     ///   #4440/#4610 storms both came from unbounded producers).
-    /// - [`PhantomRepair::Drop`]: attempts exhausted and state still absent —
-    ///   the contract is unretrievable from here; drop the downstream
-    ///   registration (via [`Self::drop_phantom_downstream`]) so the phantom
-    ///   does not persist. The downstream peers' own lease renewal re-roots
-    ///   them through a path that can actually serve the contract.
+    ///
+    /// Once `MAX_PHANTOM_REPAIR_ATTEMPTS` fetches fail, the sweep STOPS fetching
+    /// for that contract. The #4770 *cycling* Drop stays NEUTRALIZED (step 10
+    /// §1c): with the register-after-state fix a genuine phantom is
+    /// unrepresentable, so an immediate drop would only churn. But the exemption
+    /// is time-bounded (ring.md): a phantom whose downstream keeps RENEWING never
+    /// hits the Fix-6 downstream-expiry prune, so once it is older than
+    /// [`PHANTOM_ABSOLUTE_MAX_AGE`] the sweep emits a [`PhantomRepair::Drop`]
+    /// (review Fix C). That drop is safe and non-cycling because a
+    /// re-registration must go through `finalize_host_subscribe` (fetch-first),
+    /// which registers NOTHING while the state stays unfetchable. Below the age
+    /// bound the sweep survives as a rollout net for phantoms left by pre-upgrade
+    /// peers; the downstream peer's own lease expiry / renewal may re-root it.
     ///
     /// Decisions are level-triggered against the state store: a contract
     /// whose state appears (this sweep's fetch, an inbound UPDATE auto-fetch,
@@ -1746,6 +1808,23 @@ impl HostingManager {
             .map(|entry| *entry.key())
             .collect();
 
+        // Fix 6 (step 10 §1c follow-up): prune phantom_repair tracking for keys
+        // that are no longer downstream-registered. This sweep only visits
+        // downstream_subscribers, so once an exhausted phantom's downstream
+        // subscription expires/unsubscribes the key is never revisited again —
+        // without this its phantom_repair entry would leak forever (one permanent
+        // per-node entry per exhausted phantom, violating the time-bounded
+        // cleanup-exemption rule). Pruning against the current downstream snapshot
+        // keeps the tracking existence-bounded. Uses the snapshot (not a live
+        // downstream_subscribers lock), so no cross-DashMap guard is held during
+        // the retain — a phantom_repair key is created only for a key in the
+        // snapshot, so any key absent from it is genuinely orphaned.
+        {
+            let downstream: std::collections::HashSet<ContractKey> = keys.iter().copied().collect();
+            self.phantom_repair
+                .retain(|key, _| downstream.contains(key));
+        }
+
         for key in keys {
             if self.contract_state_present(&key) {
                 // Invariant holds (or repair succeeded) — clear any tracking.
@@ -1759,14 +1838,33 @@ impl HostingManager {
             use dashmap::mapref::entry::Entry;
             match self.phantom_repair.entry(key) {
                 Entry::Occupied(mut e) => {
+                    if e.get().attempts >= MAX_PHANTOM_REPAIR_ATTEMPTS {
+                        // Repair attempts exhausted. The #4770 cycling Drop stays
+                        // NEUTRALIZED for the common case (step 10 §1c): with the
+                        // register-after-state fix a genuine phantom is
+                        // unrepresentable, so an immediate drop would only churn.
+                        // BUT the exemption must be time-bounded (ring.md): a
+                        // phantom whose downstream keeps RENEWING never hits the
+                        // Fix-6 downstream-expiry prune, so once it is older than
+                        // PHANTOM_ABSOLUTE_MAX_AGE we DROP it (review Fix C). This
+                        // is safe and non-cycling because a re-registration goes
+                        // through finalize_host_subscribe (fetch-first) — while the
+                        // state stays unfetchable it registers NOTHING, so the
+                        // phantom cannot re-form.
+                        if now.duration_since(e.get().first_seen) >= PHANTOM_ABSOLUTE_MAX_AGE {
+                            e.remove();
+                            actions.push(PhantomRepair::Drop(key));
+                        }
+                        // Under the absolute-age bound: STOP fetching, do not drop
+                        // (the downstream's own lease expiry / renewal may re-root
+                        // it, or a later fetch could still succeed).
+                        continue;
+                    }
                     let entry = e.get_mut();
                     if now.duration_since(entry.last_attempt) < PHANTOM_REPAIR_COOLDOWN {
                         continue;
                     }
-                    if entry.attempts >= MAX_PHANTOM_REPAIR_ATTEMPTS {
-                        e.remove();
-                        actions.push(PhantomRepair::Drop(key));
-                    } else if fetches < max_fetches {
+                    if fetches < max_fetches {
                         entry.attempts += 1;
                         entry.last_attempt = now;
                         fetches += 1;
@@ -1778,6 +1876,7 @@ impl HostingManager {
                         slot.insert(PhantomRepairEntry {
                             attempts: 1,
                             last_attempt: now,
+                            first_seen: now,
                         });
                         fetches += 1;
                         actions.push(PhantomRepair::Fetch(key));
@@ -1789,13 +1888,14 @@ impl HostingManager {
         actions
     }
 
-    /// Drop the downstream-subscriber registration for an unrepairable
-    /// phantom contract (state fetch failed [`MAX_PHANTOM_REPAIR_ATTEMPTS`]
-    /// times). Returns the number of removed subscriber entries so the caller
+    /// Drop the downstream-subscriber registration for an
+    /// absolute-age-exhausted phantom contract (review Fix C — the state stayed
+    /// unfetchable past `PHANTOM_ABSOLUTE_MAX_AGE` while the downstream kept
+    /// renewing). Returns the number of removed subscriber entries so the caller
     /// can decrement the interest manager symmetrically (one
-    /// `remove_downstream_subscriber` per entry, mirroring the
-    /// `expire_stale_downstream_subscribers` handling in
-    /// `recover_orphaned_subscriptions`).
+    /// `remove_downstream_subscriber` per entry), then collapse upstream.
+    /// Non-cycling: a re-registration must go through `finalize_host_subscribe`
+    /// (fetch-first), which registers nothing while state is unfetchable.
     pub(crate) fn drop_phantom_downstream(&self, key: &ContractKey) -> usize {
         let removed = self
             .downstream_subscribers
@@ -1804,8 +1904,8 @@ impl HostingManager {
             .unwrap_or(0);
         if removed > 0 {
             // Same as lease expiry: the contract may have just transitioned to
-            // no-longer-in-use — reset recency so the next over-budget sweep
-            // does not shed it for an old last-read.
+            // no-longer-in-use — reset recency so the next over-budget sweep does
+            // not shed it for an old last-read.
             self.maybe_record_abandonment(key);
         }
         self.phantom_repair.remove(key);
@@ -4758,24 +4858,26 @@ mod tests {
     // pre-existing errors, e.g. missing `get_user_secrets_index`) and there is
     // no sqlite CI lane, so such a test would be unverifiable dead code.
 
-    /// Behavioural regression for #4612 (phantom-hosting root cause): the
-    /// reconcile sweep must enforce `in-use ⇒ has-state` as a REPAIRED
-    /// invariant — a downstream-registered contract with no stored state gets
-    /// a bounded one-shot fetch per cooldown window, and after
-    /// `MAX_PHANTOM_REPAIR_ATTEMPTS` failures a `Drop` so the phantom does
-    /// not persist. Covers all four transitions through a real redb store and
+    /// Behavioural regression for #4612 (phantom-hosting root cause) as
+    /// AMENDED by step 10 §1c (#4770 Drop arm neutralized): the reconcile sweep
+    /// enforces `in-use ⇒ has-state` by REPAIR-fetching a downstream-registered
+    /// contract with no stored state (bounded one-shot per cooldown window), and
+    /// after `MAX_PHANTOM_REPAIR_ATTEMPTS` failures it STOPS — it does NOT drop
+    /// the registration (that cycling Drop arm was removed because
+    /// register-after-state makes a genuine phantom unrepresentable, so dropping
+    /// would only churn). Covers all transitions through a real redb store and
     /// the injected clock:
     ///   - phantom (downstream, stateless) → `Fetch`, exactly once per
     ///     cooldown window (a retry never overlaps the in-flight fetch);
-    ///   - attempts exhausted → `Drop`, and applying it via
-    ///     `drop_phantom_downstream` clears `contract_in_use`;
+    ///   - attempts exhausted → NO action, and the downstream registration is
+    ///     retained (`contract_in_use` stays true — never dropped);
     ///   - repair success (state appears between passes, whatever wrote it)
     ///     → tracking cleared, no further fetches, contract keeps its
     ///     downstream subscribers;
     ///   - a stateful in-use contract is never flagged.
     #[cfg(feature = "redb")]
     #[tokio::test]
-    async fn phantom_in_use_reconcile_fetch_then_drop_4612() {
+    async fn phantom_in_use_reconcile_fetches_then_stops_no_drop_4612() {
         use freenet_stdlib::prelude::WrappedState;
 
         let clock = crate::util::time_source::SharedMockTimeSource::new();
@@ -4833,21 +4935,23 @@ mod tests {
             );
         }
 
-        // Attempts exhausted → Drop; applying it removes the phantom's
-        // downstream registration and with it `contract_in_use`.
+        // Attempts exhausted → the sweep STOPS (no Drop — step 10 §1c). The
+        // downstream registration is RETAINED, so `contract_in_use` stays true;
+        // the sweep never churns a registration it can't repair.
         clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
-        assert_eq!(
-            manager.reconcile_phantom_in_use(8),
-            vec![PhantomRepair::Drop(phantom)],
-            "after MAX_PHANTOM_REPAIR_ATTEMPTS failed fetches the phantom is dropped, \
-             not kept as a persistent stateless host"
-        );
-        assert_eq!(manager.drop_phantom_downstream(&phantom), 1);
         assert!(
-            !manager.contract_in_use(&phantom),
-            "dropping the phantom clears contract_in_use — the #4612 invariant"
+            manager.reconcile_phantom_in_use(8).is_empty(),
+            "after MAX_PHANTOM_REPAIR_ATTEMPTS failed fetches the sweep emits \
+             nothing — the #4770 cycling Drop arm is neutralized"
         );
-        assert!(manager.reconcile_phantom_in_use(8).is_empty());
+        assert!(
+            manager.contract_in_use(&phantom),
+            "the downstream registration is retained (never dropped) — step 10 §1c"
+        );
+        assert!(
+            manager.reconcile_phantom_in_use(8).is_empty(),
+            "still nothing on the next pass — exhausted, but not dropped"
+        );
 
         // Repair-success path: state appears (here via a direct store write,
         // in production via the sub-op GET / an UPDATE auto-fetch / a PUT)
@@ -4874,6 +4978,222 @@ mod tests {
 
         // The stateful contract was never touched throughout.
         assert!(manager.contract_in_use(&stateful));
+    }
+
+    /// Fix 6 regression: neutralizing the #4770 Drop arm means an exhausted
+    /// phantom's `phantom_repair` entry is retained after attempts run out. Since
+    /// `reconcile_phantom_in_use` only visits `downstream_subscribers`, once that
+    /// phantom's downstream subscription later expires the key would never be
+    /// revisited and its tracking entry would leak permanently. The sweep must
+    /// prune `phantom_repair` entries whose key is no longer downstream-registered.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn exhausted_phantom_repair_pruned_when_downstream_expires() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::contract::storages::ReDb::new(temp_dir.path())
+            .await
+            .unwrap();
+        manager.set_storage(storage);
+
+        let peer = make_peer_key(13);
+        let phantom = make_contract_key(90);
+        manager.add_downstream_subscriber(&phantom, peer.clone());
+
+        // Exhaust the repair attempts (leaves a phantom_repair entry at MAX).
+        assert_eq!(
+            manager.reconcile_phantom_in_use(8),
+            vec![PhantomRepair::Fetch(phantom)]
+        );
+        for attempt in 2..=MAX_PHANTOM_REPAIR_ATTEMPTS {
+            clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
+            assert_eq!(
+                manager.reconcile_phantom_in_use(8),
+                vec![PhantomRepair::Fetch(phantom)],
+                "attempt {attempt}"
+            );
+        }
+        clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
+        assert!(
+            manager.reconcile_phantom_in_use(8).is_empty(),
+            "attempts exhausted → sweep stops"
+        );
+        assert!(
+            manager.phantom_repair.get(&phantom).is_some(),
+            "precondition: the exhausted phantom_repair entry is still tracked"
+        );
+
+        // The downstream subscription expires (peer unsubscribed / lease lapsed).
+        manager.downstream_subscribers.remove(&phantom);
+        assert!(!manager.contract_in_use(&phantom));
+
+        // The next sweep must prune the now-orphaned phantom_repair entry.
+        assert!(manager.reconcile_phantom_in_use(8).is_empty());
+        assert!(
+            manager.phantom_repair.get(&phantom).is_none(),
+            "phantom_repair entry must be pruned once the downstream expired (Fix 6) — \
+             no permanent per-node leak"
+        );
+
+        // Belt-and-suspenders: a later re-registration of the SAME key starts a
+        // FRESH repair cycle (attempts=1 → Fetch), proving the exhausted entry
+        // did not leak and leave the key stuck-exhausted.
+        manager.add_downstream_subscriber(&phantom, peer);
+        clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
+        assert_eq!(
+            manager.reconcile_phantom_in_use(8),
+            vec![PhantomRepair::Fetch(phantom)],
+            "a re-registered downstream starts a fresh repair cycle, not stuck-exhausted"
+        );
+    }
+
+    /// Fix C regression: the Fix-6 prune only fires when the downstream EXPIRES.
+    /// A phantom whose downstream keeps RENEWING (lease refreshable) would
+    /// otherwise be a permanent GC blind spot + advertised dead-end. The
+    /// exhausted-phantom exemption is now absolute-age-bounded: once the phantom
+    /// exceeds `PHANTOM_ABSOLUTE_MAX_AGE` the sweep DROPS it, even though its
+    /// downstream is still registered. Non-cycling because a re-registration goes
+    /// through `finalize_host_subscribe` (fetch-first).
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn exhausted_phantom_dropped_after_absolute_age_bound() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::contract::storages::ReDb::new(temp_dir.path())
+            .await
+            .unwrap();
+        manager.set_storage(storage);
+
+        let peer = make_peer_key(14);
+        let phantom = make_contract_key(91);
+        manager.add_downstream_subscriber(&phantom, peer.clone());
+
+        // Exhaust the repair attempts (~4 × 60s, well under the 32-min bound).
+        assert_eq!(
+            manager.reconcile_phantom_in_use(8),
+            vec![PhantomRepair::Fetch(phantom)]
+        );
+        for _ in 2..=MAX_PHANTOM_REPAIR_ATTEMPTS {
+            clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
+            assert_eq!(
+                manager.reconcile_phantom_in_use(8),
+                vec![PhantomRepair::Fetch(phantom)]
+            );
+        }
+        clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
+        // Exhausted but still YOUNG: NOT dropped (the downstream keeps renewing so
+        // the Fix-6 downstream-expiry prune never fires).
+        assert!(
+            manager.reconcile_phantom_in_use(8).is_empty(),
+            "a young exhausted phantom is not dropped (only fetching stops)"
+        );
+        assert!(manager.contract_in_use(&phantom));
+
+        // The downstream keeps renewing (refresh its lease) so it never expires.
+        manager.add_downstream_subscriber(&phantom, peer);
+        // Age crosses the absolute bound.
+        clock.advance_time(PHANTOM_ABSOLUTE_MAX_AGE + Duration::from_secs(1));
+        assert_eq!(
+            manager.reconcile_phantom_in_use(8),
+            vec![PhantomRepair::Drop(phantom)],
+            "an exhausted phantom older than PHANTOM_ABSOLUTE_MAX_AGE is dropped even while \
+             its downstream keeps renewing (review Fix C — the exemption is time-bounded)"
+        );
+        // Applying the drop clears contract_in_use and removes the tracking.
+        assert_eq!(manager.drop_phantom_downstream(&phantom), 1);
+        assert!(
+            !manager.contract_in_use(&phantom),
+            "dropping the aged phantom clears contract_in_use"
+        );
+        assert!(manager.phantom_repair.get(&phantom).is_none());
+    }
+
+    /// Behavioural regression for the step-10 §1d phantom falsifier gauge:
+    /// `phantom_in_use_count` reports the number of contracts registered as
+    /// in-use via a downstream subscriber with NO state on disk
+    /// (`contract_in_use && !contract_state_present`). This is the counter that
+    /// should read 0 in production after the register-after-state fix.
+    ///
+    /// A stateless downstream registration (the pre-fix relay phantom) is
+    /// counted; once state lands it is not; a stateful downstream host is never
+    /// counted; and a client-subscription-only stateless contract is deliberately
+    /// NOT counted (no full-key index — those phantoms are OUT OF SCOPE for this
+    /// gauge; their cleanup is deferred to a future PR).
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn phantom_in_use_count_flags_stateless_downstream_only() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::contract::storages::ReDb::new(temp_dir.path())
+            .await
+            .unwrap();
+        let store_handle = storage.clone();
+        manager.set_storage(storage);
+
+        let peer = make_peer_key(11);
+
+        assert_eq!(
+            manager.phantom_in_use_count(),
+            0,
+            "no registrations → no phantoms"
+        );
+
+        // Stateless downstream registration = the pre-fix relay phantom.
+        let phantom = make_contract_key(80);
+        manager.add_downstream_subscriber(&phantom, peer.clone());
+        assert!(manager.contract_in_use(&phantom) && !manager.contract_state_present(&phantom));
+        assert_eq!(
+            manager.phantom_in_use_count(),
+            1,
+            "a downstream registration with no state on disk is a phantom"
+        );
+
+        // Stateful downstream host is never a phantom.
+        let stateful = make_contract_key(81);
+        store_handle
+            .store_state_sync(&stateful, WrappedState::new(vec![1, 2, 3]))
+            .unwrap();
+        manager.add_downstream_subscriber(&stateful, peer.clone());
+        assert_eq!(
+            manager.phantom_in_use_count(),
+            1,
+            "a stateful downstream host is not counted; only the stateless one is"
+        );
+
+        // Once state lands for the phantom (repair fetch / UPDATE / PUT), the
+        // falsifier drops back to 0 — this is what the fix must achieve in prod.
+        store_handle
+            .store_state_sync(&phantom, WrappedState::new(vec![4, 5]))
+            .unwrap();
+        assert_eq!(
+            manager.phantom_in_use_count(),
+            0,
+            "once state is present the contract is no longer a phantom"
+        );
+
+        // A client-subscription-only stateless contract is in-use but is NOT
+        // counted by this gauge (it is keyed by instance id with no full-key
+        // index; those phantoms are out of scope and their cleanup is deferred).
+        let client_only = make_contract_key(82);
+        manager.add_client_subscription(client_only.id(), crate::client_events::ClientId::next());
+        assert!(
+            manager.contract_in_use(&client_only) && !manager.contract_state_present(&client_only)
+        );
+        assert_eq!(
+            manager.phantom_in_use_count(),
+            0,
+            "client-subscription-only phantoms are out of scope for this gauge"
+        );
     }
 
     /// #4612 producer bound: `max_fetches` caps the fetches emitted per sweep

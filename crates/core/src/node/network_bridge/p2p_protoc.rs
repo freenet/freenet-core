@@ -5112,6 +5112,16 @@ mod tests {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
+            // Test-only files are not production call sites: a
+            // `register_peer_interest` reference in a test assertion (e.g. a
+            // source-scrape pin in `operations/subscribe/tests.rs` asserting
+            // that `finalize_host_subscribe` registers upstream interest) is
+            // not a broadcast target. `strip_cfg_test_regions` only removes
+            // inline `#[cfg(test)]` blocks, not a whole test file gated by its
+            // parent's `#[cfg(test)] mod tests;`, so skip test files here.
+            if rel.ends_with("/tests.rs") || rel == "tests.rs" || rel.contains("/tests/") {
+                continue;
+            }
             let src = match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(_) => continue,

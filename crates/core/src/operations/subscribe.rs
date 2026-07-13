@@ -695,6 +695,137 @@ pub(crate) async fn register_downstream_subscriber(
     }
 }
 
+/// Host-formation sequence for a peer that just handled a relayed SUBSCRIBE:
+/// fetch the contract body FIRST, and only if it lands do we register the
+/// requester as a downstream subscriber, install the local subscription lease,
+/// and announce hosting. This makes the phantom (`contract_in_use &&
+/// !contract_state_present`) unrepresentable — a peer registers demand only
+/// AFTER it holds state (D-ORDER, step 10 §1b; the register-after-state fix).
+///
+/// Steps, in order (the pin `finalize_host_subscribe_fetches_before_register`
+/// enforces fetch BEFORE register BEFORE announce, and NO `add_local_client`):
+/// 1. **Fetch the body if missing** (`fetch_contract_if_missing`). Greedy fetch
+///    toward the key — the downstream that answered `Subscribed` holds the body,
+///    so a route toward the key reaches it.
+/// 2. On fetch failure (timeout `Ok(None)` / infra `Err`) register NOTHING and
+///    return: the caller forwards / answers NotFound as before, and the chain
+///    hole heals on the requester's next lease renewal. This differs from the
+///    pre-step-10 relay behavior, which registered the downstream subscriber
+///    unconditionally and so left a stateless phantom (#4404/#4612).
+/// 3. On success: register the requester as our downstream subscriber, install
+///    the local subscription lease (`ring.subscribe`) so we become a real host
+///    kept fresh in the update mesh (piece D: chain hops are real hosts), clear
+///    the pending-subscribe backoff, and announce hosting (idempotent backstop).
+///
+/// Does NOT call `add_local_client` (D-NO-LOCAL-CLIENT): a relay has no local
+/// client, and `add_local_client` is non-idempotent — copying it here would
+/// inflate `local_client_count` and wrongly make the relay evicted-last.
+///
+/// The `requester_addr` / `source_addr` / `tx` / `warn_suffix` params are
+/// forwarded verbatim to [`register_downstream_subscriber`].
+pub(super) async fn finalize_host_subscribe(
+    op_manager: &OpManager,
+    key: ContractKey,
+    requester_addr: std::net::SocketAddr,
+    source_addr: Option<std::net::SocketAddr>,
+    // The peer to route the body fetch THROUGH, when known (review Fix 4). On the
+    // forwarded relay path this is the downstream that just answered `Subscribed`
+    // (`next_hop`) — it holds the body, so a directed fetch reaches it instead of
+    // greedily routing toward the key and dead-ending at a closer non-hosting
+    // peer (which would leave this hop registering nothing yet still bubbling
+    // `Subscribed` upstream — a chain hole that drops updates). `None` = ordinary
+    // greedy fetch (used by the local-hit path, where state is already present).
+    directed_holder: Option<PeerKeyLocation>,
+    tx: &Transaction,
+    warn_suffix: &str,
+) {
+    // Capture the responder's interest key BEFORE the fetch consumes
+    // `directed_holder` (review Fix D). On the forwarded relay path the
+    // `directed_holder` is the peer that answered `Subscribed` — this hop's
+    // UPSTREAM toward the key. We register it as an upstream interest below so an
+    // early unsubscribe can propagate to it. `None` on the local-hit path (this
+    // node already holds the state; its upstream is established via renewal).
+    let upstream_peer = directed_holder
+        .as_ref()
+        .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key.clone()));
+
+    // Fetch BEFORE register (D-ORDER). `directed_holder` routes the fetch through
+    // the responding peer when known, else greedy toward the key.
+    let have_body = match fetch_contract_if_missing(op_manager, *key.id(), directed_holder).await {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            tracing::debug!(
+                contract = %key,
+                timeout_ms = CONTRACT_WAIT_TIMEOUT_MS,
+                "subscribe host-formation: body did not arrive within timeout; \
+                 registering nothing (no phantom) — chain hole heals on next renewal"
+            );
+            false
+        }
+        Err(err) => {
+            tracing::warn!(
+                contract = %key,
+                error = %err,
+                "subscribe host-formation: fetch_contract_if_missing infra error; \
+                 registering nothing (no phantom) — operator should investigate \
+                 (contract handler / notification channel)"
+            );
+            false
+        }
+    };
+
+    if !have_body {
+        // Register-after-state: on fetch-fail we create NO downstream
+        // registration, so `contract_in_use` stays false and no phantom exists.
+        return;
+    }
+
+    // We hold the body — become a real subscribed host and register the
+    // requester as our downstream subscriber (register-AFTER-state).
+    register_downstream_subscriber(
+        op_manager,
+        &key,
+        requester_addr,
+        None,
+        source_addr,
+        tx,
+        warn_suffix,
+    )
+    .await;
+    op_manager.ring.subscribe(key);
+    // Register the RESPONDER as our UPSTREAM interest (review Fix D), mirroring
+    // `finalize_originator_subscribe`'s step 1. Without this the relay is an
+    // incomplete host: `send_unsubscribe_upstream` would find no upstream peer if
+    // the requester unsubscribes before this relay's first renewal, so it would
+    // only drop the local lease — leaving the responder with a stale downstream
+    // registration for us, fanning updates to a collapsing relay until its ~8-min
+    // lease expires. Recording the upstream lets an early unsubscribe propagate
+    // promptly. `is_new` marks a freshly-viable broadcast target → flush any
+    // deferred fresh-contract broadcast (#4359), same as the originator.
+    if let Some(peer_key) = upstream_peer {
+        let is_new = op_manager
+            .interest_manager
+            .register_peer_interest(&key, peer_key, None, true);
+        if is_new {
+            op_manager.flush_pending_broadcast_on_interest(&key).await;
+        }
+    }
+    // NOTE (review Fix B): do NOT call `complete_subscription_request` here. That
+    // clears the node-wide per-contract pending-subscription dedup slot and
+    // records backoff success — but a RELAY never CLAIMED that slot
+    // (`mark_subscription_pending` is called only by the client-subscribe /
+    // renewal / re-root drivers, not the relay path). Releasing it here would
+    // free a concurrent LOCAL renewal/re-root's dedup slot early and overwrite
+    // its retry state → duplicate renewals / masked failures. It is correct only
+    // in `finalize_originator_subscribe`, where the originator DID claim the slot.
+    // Announce backstop, gated on have_body. `fetch_contract_if_missing`'s own
+    // cache path already announces on a first-time store; `announce_contract_hosted`
+    // is one-shot (dedup via `neighbor_hosting.rs`'s `my_contracts` DashSet), so a
+    // duplicate is a no-op — this just guarantees the advert fires even when the
+    // body was already present locally (nothing to trigger the cache-path announce).
+    super::announce_contract_hosted(op_manager, &key).await;
+}
+
 /// Handle a fresh inbound `SubscribeMsg::Unsubscribe` from a peer.
 ///
 /// Removes the sender's downstream subscriber tracking for the contract and

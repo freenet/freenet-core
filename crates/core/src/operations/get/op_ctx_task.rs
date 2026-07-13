@@ -1144,7 +1144,13 @@ fn synthetic_key(instance_id: &ContractInstanceId) -> ContractKey {
 
 /// Store the fetched contract state in the local executor and run
 /// the originator-side hosting side effects. Mirrors the legacy
-/// `process_message` Response{Found} branch at `get.rs:2218-2450`:
+/// `process_message` Response{Found} branch at `get.rs:2218-2450`.
+///
+/// Returns `true` when this node holds the contract's current state after the
+/// call (`state_matches || put_persisted`) — D-CACHE-RET (step 10 §1a). Relay
+/// callers gate downstream-subscriber registration on this so a peer registers
+/// demand only after it actually holds state; registering after state makes the
+/// phantom (`contract_in_use && !contract_state_present`) unrepresentable.
 ///
 /// 1. **Idempotency short-circuit (issue #2018)** — re-query the
 ///    local store first. If the existing bytes match the incoming
@@ -1183,7 +1189,7 @@ async fn cache_contract_locally(
     state: WrappedState,
     contract: Option<ContractContainer>,
     is_client_requester: bool,
-) {
+) -> bool {
     // EXPERIMENT-ONLY (findability_probe): suppress RELAY-path GET-return caching
     // so the seeded copy cannot self-scatter along successful GET return paths
     // (the confound that invalidated an earlier lone-holder run). The client
@@ -1192,7 +1198,10 @@ async fn cache_contract_locally(
     // requester's key-ward path) so it cannot confound routing. NOT for ship.
     #[cfg(any(test, feature = "testing"))]
     if !is_client_requester && crate::operations::findability_probe::scatter_disabled() {
-        return;
+        // Experiment suppressed the relay-path store, so no state was cached
+        // here — report not-present so a caller gating registration on the
+        // return value does not register a downstream against uncached state.
+        return false;
     }
     let state_size = state.size() as u64;
 
@@ -1368,6 +1377,11 @@ async fn cache_contract_locally(
     } else if !removed_contracts.is_empty() {
         crate::operations::broadcast_change_interests(op_manager, vec![], removed_contracts).await;
     }
+
+    // D-CACHE-RET: current state is held locally iff it already matched or we
+    // just persisted it. Relay callers gate register_downstream_subscriber on
+    // this (register-after-state, step 10 §1a).
+    state_matches || put_persisted
 }
 
 /// Claim an orphan stream, await assembly, deserialize the payload,
@@ -2707,6 +2721,10 @@ where
         }
 
         // Register interest for the requester (mirrors get.rs:1447-1476).
+        // register-after-state (step 10 §1a): safe to register BEFORE the cache
+        // call below because this is the local-hit arm — `local_value` is
+        // `Some`, so the contract's state is already present on disk. The
+        // phantom (contract_in_use && !state) is impossible here.
         if subscribe {
             crate::operations::subscribe::register_downstream_subscriber(
                 op_manager,
@@ -3261,8 +3279,31 @@ where
                 // hosting at a relay is still broadcast (matches legacy
                 // `get.rs:2370` which announces on any first-time relay
                 // cache).
-                cache_contract_locally(op_manager, key, state, contract, false).await;
+                let state_present =
+                    cache_contract_locally(op_manager, key, state, contract, false).await;
                 send_result?;
+
+                // Register the requester as a downstream subscriber (subscribe
+                // only), gated on actually holding state after the cache
+                // (register-after-state, step 10 §1a). Registering only once we
+                // hold state makes the phantom (contract_in_use && !state)
+                // unrepresentable and closes the findability gap where a
+                // subscribe=true GET relayed a Found through this hop but never
+                // recorded the requester's demand (so updates never reached it).
+                // On cache failure (put rejected / no contract code) we register
+                // NOTHING; the chain hole heals on the requester's next renewal.
+                if subscribe && state_present {
+                    crate::operations::subscribe::register_downstream_subscriber(
+                        op_manager,
+                        &key,
+                        upstream_addr,
+                        None,
+                        None,
+                        &incoming_tx,
+                        " (relay, inline Found GET response)",
+                    )
+                    .await;
+                }
                 // Delivery succeeded (`send_result?` did not return): a
                 // consulted advertised host closed the dead-end. Record now,
                 // AFTER the fallible upstream forward, not at classify time.
@@ -3495,25 +3536,12 @@ where
                     crate::node::network_status::OpType::Get,
                 );
 
-                // ── Step 5: Subscriber-forwarding parity (subscribe only).
-                if subscribe {
-                    crate::operations::subscribe::register_downstream_subscriber(
-                        op_manager,
-                        &key,
-                        upstream_addr,
-                        None,
-                        None,
-                        &incoming_tx,
-                        " (relay, streamed GET response)",
-                    )
-                    .await;
-                }
-
                 // ── Step 6: Best-effort local cache (legacy parity — relays
                 //    cache forwarded payloads). `fork()` SHARES the buffer,
                 //    so the held `handle` can still assemble. On error, log
-                //    and continue — the pipe already succeeded.
-                match handle.assemble().await {
+                //    and continue — the pipe already succeeded. The returned
+                //    bool (state-present-after) gates Step 7's registration.
+                let state_present = match handle.assemble().await {
                     Ok(bytes) => match bincode::deserialize::<GetStreamingPayload>(&bytes) {
                         Ok(payload) => {
                             if let Some(state) = payload.value.state {
@@ -3529,13 +3557,14 @@ where
                                     contract,
                                     false,
                                 )
-                                .await;
+                                .await
                             } else {
                                 tracing::warn!(
                                     tx = %incoming_tx,
                                     %stream_id,
                                     "GET relay: streamed payload has no state; skipping local cache"
                                 );
+                                false
                             }
                         }
                         Err(e) => {
@@ -3545,6 +3574,7 @@ where
                                 error = %e,
                                 "GET relay: failed to deserialize streamed payload for local cache"
                             );
+                            false
                         }
                     },
                     Err(e) => {
@@ -3554,7 +3584,30 @@ where
                             error = %e,
                             "GET relay: stream assembly failed for local cache (pipe already sent)"
                         );
+                        false
                     }
+                };
+
+                // ── Step 7: Subscriber-forwarding parity (subscribe only).
+                //    register-after-state (step 10 §1a): moved AFTER the Step 6
+                //    cache and gated on `state_present`. Registering the
+                //    requester as a downstream subscriber only once we actually
+                //    hold state makes the phantom (contract_in_use && !state)
+                //    unrepresentable. On stream-assembly failure we register
+                //    NOTHING (was: register-before-cache, which left a phantom on
+                //    assembly failure); the chain hole heals on the requester's
+                //    next renewal — acceptable (D-CACHE-RET).
+                if subscribe && state_present {
+                    crate::operations::subscribe::register_downstream_subscriber(
+                        op_manager,
+                        &key,
+                        upstream_addr,
+                        None,
+                        None,
+                        &incoming_tx,
+                        " (relay, streamed GET response)",
+                    )
+                    .await;
                 }
 
                 return Ok(());

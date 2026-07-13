@@ -2282,6 +2282,16 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_subscribed_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_subscribed_evictions_total),
                 );
+                // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
+                // current count of contracts in-use via a downstream subscriber
+                // with NO state on disk. Should read 0 after register-after-state.
+                // Same hand-mirrored footgun — invisible to the collector unless
+                // added here. Pinned by
+                // `router_snapshot_json_includes_phantom_in_use_gauge`.
+                obj.insert(
+                    "phantom_in_use_contracts".to_string(),
+                    serde_json::json!(snapshot.phantom_in_use_contracts),
+                );
                 // Terminal advertisement-consult counters (hosting redesign
                 // piece C, #4646; exported per #4658). Same hand-mirrored
                 // footgun as the gauges above: a new `RouterSnapshotInfo` field
@@ -2735,6 +2745,26 @@ mod tests {
         assert_eq!(
             json["hosting_subscribed_evictions_total"], 287,
             "hosting_subscribed_evictions_total must reach the OTLP body"
+        );
+    }
+
+    /// Pin: the phantom-hosting falsifier gauge (SUBSCRIBE-retirement step 10
+    /// §1d) must reach the hand-mirrored OTLP body. It counts contracts in-use
+    /// via a downstream subscriber with NO state on disk
+    /// (`contract_in_use && !contract_state_present`) and should read 0 after the
+    /// register-after-state fix; a silent drop would blind central telemetry to a
+    /// regression that re-introduces the phantom (#4404/#4612).
+    #[test]
+    fn router_snapshot_json_includes_phantom_in_use_gauge() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.phantom_in_use_contracts = Some(7);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(
+            json["phantom_in_use_contracts"], 7,
+            "phantom_in_use_contracts must reach the OTLP body"
         );
     }
 

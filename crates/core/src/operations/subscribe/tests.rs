@@ -553,3 +553,110 @@ fn subscribe_hint_arm_gates_migration_on_cache_backpressure() {
          headroom (#4534)"
     );
 }
+
+/// Source-scrape pin (step 10 §1b, register-after-state): `finalize_host_subscribe`
+/// MUST fetch the contract body BEFORE registering the requester as a downstream
+/// subscriber, and BEFORE announcing hosting, and MUST early-return (register
+/// NOTHING) when the fetch does not land the body, and MUST NOT call
+/// `add_local_client`.
+///
+/// Fetch-before-register is exactly what makes the phantom
+/// (`contract_in_use && !contract_state_present`) unrepresentable — a hop
+/// registers demand only after it holds state. `add_local_client` is forbidden
+/// (D-NO-LOCAL-CLIENT): a relay has no local client, and the call is
+/// non-idempotent, so copying it here would inflate `local_client_count` and
+/// wrongly make the relay evicted-last.
+#[test]
+fn finalize_host_subscribe_fetches_before_register() {
+    const SOURCE: &str = include_str!("../subscribe.rs");
+    let fn_start = SOURCE
+        .find("pub(super) async fn finalize_host_subscribe(")
+        .expect("finalize_host_subscribe must exist in subscribe.rs");
+    let fn_end = SOURCE[fn_start..]
+        .find("/// Handle a fresh inbound `SubscribeMsg::Unsubscribe`")
+        .map(|off| fn_start + off)
+        .expect("handle_unsubscribe_inbound doc anchor must follow finalize_host_subscribe");
+    let body = &SOURCE[fn_start..fn_end];
+
+    let fetch_pos = body
+        .find("fetch_contract_if_missing(")
+        .expect("finalize_host_subscribe must fetch the body");
+    let register_pos = body
+        .find("register_downstream_subscriber(")
+        .expect("finalize_host_subscribe must register the downstream subscriber");
+    let announce_pos = body
+        .find("announce_contract_hosted(")
+        .expect("finalize_host_subscribe must announce hosting (state-gated)");
+
+    assert!(
+        fetch_pos < register_pos,
+        "fetch_contract_if_missing must come BEFORE register_downstream_subscriber \
+         (register-after-state, step 10 §1b) — else a stateless relay creates a phantom"
+    );
+    assert!(
+        register_pos < announce_pos,
+        "register_downstream_subscriber must come BEFORE announce_contract_hosted \
+         (register the demand, then advertise the host)"
+    );
+    assert!(
+        !body.contains("add_local_client"),
+        "finalize_host_subscribe must NOT call add_local_client (D-NO-LOCAL-CLIENT) — \
+         a relay has no local client; it would inflate local_client_count and wrongly \
+         make the relay evicted-last"
+    );
+    // Review Fix B: finalize_host_subscribe must NOT call complete_subscription_request.
+    // That clears the node-wide per-contract pending-subscription dedup slot + records
+    // backoff success, but a RELAY never CLAIMED that slot (mark_subscription_pending is
+    // called only by the client-subscribe / renewal / re-root drivers). Releasing it here
+    // would free a concurrent local renewal/re-root's slot early and overwrite its retry
+    // state. It is correct only in finalize_originator_subscribe (which DID claim the slot).
+    // Match the method-CALL form (`.complete_subscription_request(`) so the NOTE
+    // comment that names the function in prose does not trip the scan.
+    assert!(
+        !body.contains(".complete_subscription_request("),
+        "finalize_host_subscribe must NOT call complete_subscription_request (review Fix B) — \
+         a relay never claimed the pending-subscription slot; releasing it corrupts a \
+         concurrent local renewal/re-root's dedup + retry state"
+    );
+    // Nothing may be registered when the fetch did not land the body: the helper
+    // must early-return on `!have_body` BEFORE the register call.
+    let guard_pos = body
+        .find("if !have_body")
+        .expect("finalize_host_subscribe must guard on !have_body");
+    assert!(
+        guard_pos < register_pos,
+        "the `if !have_body {{ return; }}` guard must precede register_downstream_subscriber \
+         so a fetch-fail registers NOTHING (no phantom)"
+    );
+
+    // Review Fix D: the relay must register the directed holder (the responder /
+    // its upstream toward the key) as an UPSTREAM interest (is_upstream = true),
+    // mirroring finalize_originator_subscribe, so an early unsubscribe can
+    // propagate upstream instead of leaving the responder fanning updates to a
+    // collapsing relay until the ~8-min lease expires. The upstream is derived
+    // from the captured directed holder (`upstream_peer`), NOT the downstream
+    // requester, and a newly-viable upstream flushes deferred broadcasts (#4359).
+    let upstream_reg = body
+        .find("register_peer_interest(")
+        .expect("finalize_host_subscribe must register the responder as upstream interest (Fix D)");
+    let upstream_call_end = body[upstream_reg..]
+        .find(')')
+        .map(|o| upstream_reg + o)
+        .expect("register_peer_interest call must close");
+    let upstream_args = &body[upstream_reg..upstream_call_end];
+    assert!(
+        upstream_args.contains("true"),
+        "finalize_host_subscribe's register_peer_interest must pass is_upstream = true — the \
+         responder is our upstream toward the key (review Fix D)"
+    );
+    assert!(
+        body.contains("upstream_peer"),
+        "the upstream interest must be the captured directed holder (upstream_peer), not the \
+         downstream requester (review Fix D)"
+    );
+    assert!(
+        body.contains("flush_pending_broadcast_on_interest"),
+        "finalize_host_subscribe must flush deferred broadcasts on a newly-viable upstream \
+         (#4359), mirroring finalize_originator_subscribe (review Fix D)"
+    );
+}

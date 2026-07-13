@@ -1720,6 +1720,16 @@ impl Ring {
             // as the rework ships (AtCapacity now sheds subscribed as a last
             // resort). Same periodic cadence.
             snapshot.hosting_subscribed_evictions_total = Some(hosting.subscribed_evictions_total);
+            // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
+            // current count of contracts in-use via a downstream subscriber with
+            // NO state on disk (contract_in_use && !contract_state_present). After
+            // the register-after-state fix this should read 0; a nonzero value
+            // means a hop registered demand it cannot serve (#4404/#4612 phantom).
+            // redb-scoped by construction (contract_state_present is
+            // conservative-true elsewhere). Same hand-mirror footgun as the gauges
+            // above — invisible to the collector unless added to event_kind_to_json
+            // too (pinned by router_snapshot_json_includes_phantom_in_use_gauge).
+            snapshot.phantom_in_use_contracts = Some(ring.hosting_manager.phantom_in_use_count());
             // Local-client GET hit-rate (#4642 A3): served-locally vs routed to
             // the network. Driven by the real serve/forward decision in the
             // client GET handler, so it is read from the manager counters (not
@@ -2281,6 +2291,11 @@ impl Ring {
                 && let Some(op_manager) = ring.upgrade_op_manager()
             {
                 for repair in repairs {
+                    // The #4770 CYCLING Drop stays neutralized (step 10 §1c);
+                    // `Drop` here is the review-Fix-C ABSOLUTE-AGE-bounded drop —
+                    // it fires only after PHANTOM_ABSOLUTE_MAX_AGE and is
+                    // non-cycling (a re-registration goes through
+                    // finalize_host_subscribe / fetch-first).
                     match repair {
                         crate::ring::hosting::PhantomRepair::Fetch(key) => {
                             tracing::info!(
@@ -2302,12 +2317,11 @@ impl Ring {
                             tracing::warn!(
                                 contract = %key,
                                 removed_subscribers = removed,
-                                "phantom in-use contract unrepairable: dropping \
-                                 downstream registration (peers re-root via \
-                                 their own lease renewal)"
+                                "phantom in-use contract unrepairable past absolute-age bound: \
+                                 dropping stale downstream registration (review Fix C — the \
+                                 downstream kept renewing but state stayed unfetchable)"
                             );
-                            // Mirror the stale-lease expiry handling above:
-                            // decrement interest symmetrically, then collapse
+                            // Decrement interest symmetrically, then collapse
                             // upstream if no interest remains.
                             for _ in 0..removed {
                                 op_manager
@@ -3782,9 +3796,9 @@ impl Ring {
         self.hosting_manager.reconcile_phantom_in_use(max_fetches)
     }
 
-    /// Drop the downstream registration of an unrepairable phantom contract,
-    /// returning the number of removed subscriber entries. See
-    /// `HostingManager::drop_phantom_downstream`.
+    /// Drop the downstream registration of an absolute-age-exhausted phantom
+    /// contract (review Fix C), returning the number of removed subscriber
+    /// entries. See `HostingManager::drop_phantom_downstream`.
     pub(crate) fn drop_phantom_downstream(&self, key: &ContractKey) -> usize {
         self.hosting_manager.drop_phantom_downstream(key)
     }
