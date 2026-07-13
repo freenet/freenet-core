@@ -1180,7 +1180,10 @@ where
         // write can land between the slow path's state load and its detector
         // populate. Any off-loop work that holds an executor (e.g. the hosted
         // secret export) MUST stay read-only w.r.t. contract state, or it could
-        // populate the detector against a state a concurrent write has changed.
+        // populate the detector against a state a concurrent write has changed —
+        // and because the caches + detector are pool-SHARED, that poisons the fast
+        // path for the WHOLE pool, not just one executor. Guarded by the pin
+        // `off_loop_export_does_not_touch_summarize_delta_cache_surface`.
         if let Some(detector_hash) = self.state_store.cached_state_hash(&key) {
             if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
                 if cached_hash == detector_hash {
@@ -1209,8 +1212,10 @@ where
         self.state_store.cache_state_hash(key, state_hash);
 
         // The summary may already be cached under this exact hash even when the
-        // detector was cold (e.g. after a restart or a detector eviction). Reuse it
-        // to skip the WASM call.
+        // detector was cold. The detector (`state_hash_cache`) and the summary
+        // cache are SEPARATE moka instances with independent eviction, so the
+        // detector can evict a key whose summary is still cached — reuse it to skip
+        // the WASM call. (A process restart clears BOTH, so it is not this case.)
         if let Some((cached_hash, cached_summary)) = self.summary_cache.get(&key) {
             if cached_hash == state_hash {
                 return Ok(cached_summary);
@@ -1228,6 +1233,15 @@ where
                     cause: "contract parameters not found".into(),
                 })
             })?;
+
+        // Slow-path detectability (telemetry): we are about to run the WASM
+        // `summarize_state`, the expensive path the hosting-budget-sized summary
+        // cache exists to avoid. Count it so a sustained-high slow-path rate — the
+        // re-summarization storm's fingerprint, and the under-coverage signal on a
+        // small-contract node — is visible in central telemetry (router_snapshot)
+        // instead of silent. No-op until the network_status singleton is inited
+        // (mock/unit tests), and only on the slow path so no fast-path contention.
+        crate::node::network_status::record_summarize_slow_path();
 
         let summary = self
             .runtime

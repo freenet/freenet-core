@@ -239,6 +239,17 @@ pub struct NetworkStatus {
     pub reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats,
     pub reconcile_shadow_connection_drop: ReconcileShadowStats,
     pub reconcile_shadow_host_formation: ReconcileShadowStats,
+    /// Monotonic count of summarize SLOW-PATH runs: a `summarize_contract_state`
+    /// call that missed the fast-path summary cache and actually ran the WASM
+    /// `summarize_state` (the expensive path the hosting-budget-sized summary
+    /// cache exists to avoid). The collector differences this across the snapshot
+    /// cadence to derive the slow-path RATE; a sustained-high rate is the
+    /// re-summarization storm's fingerprint (#4565 / 0.2.98) and, on a
+    /// small-contract node, the DETECTABLE signal that the byte-budget-derived
+    /// summary cache is under-covering the real hosted count (see
+    /// `contract::executor::summarize_cache_capacity`). Recorded only on the slow
+    /// path (already expensive), so it adds no hot fast-path lock contention.
+    pub summarize_slow_path_total: u64,
 }
 
 /// Per-node counters measuring how often the demand-driven-hosting **computed
@@ -557,6 +568,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         reconcile_shadow_inbound_unsubscribe: ReconcileShadowStats::default(),
         reconcile_shadow_connection_drop: ReconcileShadowStats::default(),
         reconcile_shadow_host_formation: ReconcileShadowStats::default(),
+        summarize_slow_path_total: 0,
     };
     match NETWORK_STATUS.get() {
         // Already initialized: overwrite the existing tracker in place so
@@ -786,6 +798,30 @@ pub fn terminal_consult_counts() -> Option<(u64, u64, u64, u64)> {
     let s = status.read().ok()?;
     let c = &s.terminal_consult_stats;
     Some((c.attempts, c.hits, c.resolved_found, c.still_not_found))
+}
+
+/// Record one summarize SLOW-PATH run: a `summarize_contract_state` call that
+/// missed the fast-path summary cache and actually ran the WASM `summarize_state`
+/// (see `NetworkStatus::summarize_slow_path_total`). Called ONLY on the slow path
+/// (already expensive), so the process-global write lock adds no hot fast-path
+/// contention.
+pub fn record_summarize_slow_path() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.summarize_slow_path_total = s.summarize_slow_path_total.saturating_add(1);
+        }
+    }
+}
+
+/// Read the monotonic summarize slow-path counter for export to the
+/// `router_snapshot` telemetry event, or `None` before the `NETWORK_STATUS`
+/// singleton is initialized. `Ring` polls this on the snapshot cadence so the
+/// slow-path rate (the re-summarization-storm / cache-under-coverage signal) is
+/// legible in central telemetry, not just internally.
+pub fn summarize_slow_path_count() -> Option<u64> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    Some(s.summarize_slow_path_total)
 }
 
 /// Record one computed-upstream vs. stored-`is_upstream`-flag comparison

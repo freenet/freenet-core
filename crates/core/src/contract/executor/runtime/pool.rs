@@ -91,6 +91,19 @@ pub struct RuntimePool {
     shared_backend_engine: BackendEngine,
     /// Shared recovery guard for corrupted-state self-healing across all pool executors.
     shared_recovery_guard: super::CorruptedStateRecoveryGuard,
+    /// Pool-shared summarize fast-path cache (moka, internally `Arc`), sized ONCE
+    /// from the hosting byte budget in [`RuntimePool::new`]. Held as a field so
+    /// [`RuntimePool::create_replacement_executor`] injects the SAME shared cache
+    /// into every replacement (built on WASM-panic / unhealthy executor) — a
+    /// replacement that fell back to the private min-sized cache would reintroduce
+    /// the 0.2.98 re-summarization storm and never self-heal. See
+    /// `Executor::set_summarize_caches`.
+    shared_summary_cache: super::SummaryCache,
+    /// Pool-shared delta fast-path cache, sized from the hosting byte budget
+    /// (byte-bounded, see `contract::executor::delta_cache_capacity_bytes`).
+    /// Injected into every executor AND every replacement alongside
+    /// [`Self::shared_summary_cache`].
+    shared_delta_cache: super::DeltaCache,
     /// Sender for delegate notifications (cloned into each executor and replacements).
     delegate_notification_tx: super::DelegateNotificationSender,
     /// Receiver for delegate notifications (taken once by `contract_handling()`).
@@ -296,10 +309,17 @@ impl RuntimePool {
         // gets a clone of the SAME moka cache (moka is internally `Arc`), so one
         // copy of each summary is held for the whole pool — NOT one per executor,
         // and the "first available" checkout can no longer fragment the hit rate
-        // across executors. See `Executor::set_summarize_caches`.
-        let summarize_cache_capacity = super::summarize_cache_capacity(config.max_hosting_storage);
-        let shared_summary_cache = super::build_summary_cache(summarize_cache_capacity);
-        let shared_delta_cache = super::build_delta_cache(summarize_cache_capacity);
+        // across executors. The summary cache is entry-count sized (summaries are
+        // tiny); the delta cache is BYTE-bounded (deltas are variable and can be
+        // large — an entry-count cap could pin multi-GB, the #4565 OOM class). Both
+        // handles are STORED on the pool (below) so `create_replacement_executor`
+        // injects the SAME shared caches into replacements — a replacement that
+        // fell back to the private min cache would reintroduce the storm and never
+        // self-heal. See `Executor::set_summarize_caches`.
+        let summary_cache_capacity = super::summarize_cache_capacity(config.max_hosting_storage);
+        let shared_summary_cache = super::build_summary_cache(summary_cache_capacity);
+        let delta_cache_bytes = super::delta_cache_capacity_bytes(config.max_hosting_storage);
+        let shared_delta_cache = super::build_delta_cache(delta_cache_bytes);
 
         // Create delegate notification channel for subscription delivery
         let (delegate_notification_tx, delegate_notification_rx) =
@@ -510,6 +530,8 @@ impl RuntimePool {
             shared_delegate_contexts,
             shared_backend_engine,
             shared_recovery_guard,
+            shared_summary_cache,
+            shared_delta_cache,
             delegate_notification_tx,
             delegate_notification_rx: Some(delegate_notification_rx),
             in_flight_contracts: HashMap::new(),
@@ -700,6 +722,16 @@ impl RuntimePool {
             self.shared_notifications.clone(),
             self.shared_summaries.clone(),
             self.shared_client_counts.clone(),
+        );
+        // Inject the pool-shared summarize/delta fast-path caches (hosting-budget
+        // sized in `RuntimePool::new`) so a replacement — built on a WASM-panic /
+        // unhealthy executor — shares the SAME caches as the rest of the pool. A
+        // replacement left with the private min-sized cache from `Executor::new`
+        // would miss the fast path for the whole hosted set, reintroducing the
+        // 0.2.98 re-summarization storm on that executor and never self-healing.
+        executor.set_summarize_caches(
+            self.shared_summary_cache.clone(),
+            self.shared_delta_cache.clone(),
         );
         executor.set_recovery_guard(self.shared_recovery_guard.clone());
         executor.set_delegate_notification_tx(self.delegate_notification_tx.clone());

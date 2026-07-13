@@ -2316,6 +2316,15 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "terminal_consult_still_not_found".to_string(),
                     serde_json::json!(snapshot.terminal_consult_still_not_found),
                 );
+                // Summarize slow-path counter (cache-thrash detectability, #4565 /
+                // 0.2.98) — same hand-mirror footgun: a new `RouterSnapshotInfo`
+                // field is invisible to the collector unless added here. This is
+                // the storm / cache-under-coverage rate signal. Pinned by
+                // `router_snapshot_json_includes_summarize_slow_path_counter`.
+                obj.insert(
+                    "summarize_slow_path_total".to_string(),
+                    serde_json::json!(snapshot.summarize_slow_path_total),
+                );
                 // Computed-upstream vs. stored-flag divergence counters (piece D,
                 // #4642 / #4671) — same hand-mirror footgun: a new
                 // `RouterSnapshotInfo` field is invisible to the collector unless
@@ -2795,6 +2804,25 @@ mod tests {
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
+    }
+
+    /// Pin: the summarize slow-path counter (cache-thrash detectability, #4565 /
+    /// 0.2.98) must also reach the hand-mirrored OTLP body — same footgun as the
+    /// terminal-consult counters above. This is the storm / cache-under-coverage
+    /// rate signal; a silent drop would re-blind central telemetry to whether the
+    /// hosting-budget-sized summary cache is actually covering the hosted set.
+    #[test]
+    fn router_snapshot_json_includes_summarize_slow_path_counter() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.summarize_slow_path_total = Some(353);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(
+            json["summarize_slow_path_total"], 353,
+            "summarize_slow_path_total must reach the OTLP body"
+        );
     }
 
     /// Pin: the computed-upstream vs. stored-flag divergence counters (piece D,

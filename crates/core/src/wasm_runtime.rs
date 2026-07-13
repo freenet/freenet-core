@@ -63,7 +63,9 @@ pub use state_store::StateStore;
 // `MAX_STATE_SIZE` is `pub` (not `pub(crate)`) so it can be re-exported from the
 // crate root as `dev_tool::MAX_CONTRACT_STATE_SIZE` for fdev's client-side check.
 pub use state_store::MAX_STATE_SIZE;
-pub(crate) use state_store::{StateStorage, StateStoreError, state_hash};
+pub(crate) use state_store::{
+    STATE_HASH_CACHE_CAPACITY, StateStorage, StateStoreError, state_hash,
+};
 
 /// Rename a code-hash-named WASM file from the legacy all-lowercase Base58
 /// name to the canonical mixed-case name (issue #4214).

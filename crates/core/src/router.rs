@@ -297,6 +297,15 @@ pub(crate) struct RouterSnapshotInfo {
     pub terminal_consult_hits: Option<u64>,
     pub terminal_consult_resolved_found: Option<u64>,
     pub terminal_consult_still_not_found: Option<u64>,
+    /// Monotonic count of summarize SLOW-PATH runs (a `summarize_contract_state`
+    /// that missed the fast-path summary cache and ran the WASM `summarize_state`).
+    /// Populated by `Ring` from the `network_status` singleton on the snapshot
+    /// cadence; the collector differences it to a rate. A sustained-high rate is
+    /// the re-summarization-storm fingerprint (#4565 / 0.2.98) and, on a
+    /// small-contract node, the DETECTABLE signal that the budget-derived summary
+    /// cache is under-covering the hosted set. `None` until the ring's snapshot
+    /// task populates it.
+    pub summarize_slow_path_total: Option<u64>,
     /// Computed-upstream vs. stored-`is_upstream`-flag divergence counters
     /// (hosting redesign piece D, #4642 / #4671). `comparisons` is the
     /// denominator (one per `send_unsubscribe_upstream`), `divergences` the times
@@ -1315,6 +1324,9 @@ impl Router {
             terminal_consult_hits: None,
             terminal_consult_resolved_found: None,
             terminal_consult_still_not_found: None,
+            // Summarize slow-path counter (cache-thrash detectability), populated
+            // by Ring from the network_status singleton on the snapshot cadence.
+            summarize_slow_path_total: None,
             // Computed-upstream vs. stored-flag divergence counters (piece D,
             // #4642 / #4671), populated by Ring from the network_status
             // singleton on the snapshot cadence.

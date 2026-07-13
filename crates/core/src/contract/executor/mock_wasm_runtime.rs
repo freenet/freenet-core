@@ -407,6 +407,24 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
         Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await
     }
 
+    /// Like [`new_mock_wasm_uncached`](Self::new_mock_wasm_uncached) but takes a
+    /// PRE-BUILT `StateStore` so two executors can SHARE one (its change-detector
+    /// `state_hash_cache` and the backing storage clone together, moka is
+    /// internally `Arc`) — the way the production pool shares one cloned
+    /// `StateStore` across executors. Used by the cross-executor shared-cache test
+    /// to prove a summary computed on executor A is served fast-path on executor B.
+    #[cfg(test)]
+    pub async fn new_mock_wasm_uncached_with_state_store(
+        state_store: crate::wasm_runtime::StateStore<MockStateStorage>,
+    ) -> anyhow::Result<Self> {
+        let runtime = MockWasmRuntime {
+            contract_store: InMemoryContractStore::default(),
+            validate_overrides: HashMap::new(),
+            update_overrides: HashMap::new(),
+        };
+        Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await
+    }
+
     /// Mutable access to the inner `MockWasmRuntime` so tests can install
     /// per-contract `validate_overrides` / `update_overrides` after the
     /// executor is wrapped in a handler. The `runtime` field is private to

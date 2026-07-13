@@ -1767,6 +1767,17 @@ impl Ring {
                 snapshot.terminal_consult_still_not_found = Some(still_not_found);
             }
 
+            // Summarize slow-path counter (cache-thrash detectability, #4565 /
+            // 0.2.98). Read from the per-node network_status singleton where the
+            // executor slow path records it; the collector differences it to a
+            // rate so the re-summarization storm / cache under-coverage is legible
+            // in central telemetry, not just internally. Same hand-mirror footgun
+            // as the counters above — invisible to the collector unless added to
+            // `event_kind_to_json` too (pinned by
+            // `router_snapshot_json_includes_summarize_slow_path_counter`).
+            snapshot.summarize_slow_path_total =
+                crate::node::network_status::summarize_slow_path_count();
+
             // Computed-upstream vs. stored-`is_upstream`-flag divergence counters
             // (#4642 piece D / #4671). Recorded at `send_unsubscribe_upstream`
             // where the stored flag is still consulted; exported here so the

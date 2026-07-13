@@ -48,7 +48,12 @@ pub const MAX_STATE_SIZE: usize = 50 * 1024 * 1024; // 50 MiB
 /// only ~40 bytes (key + `u64`), so this ceiling is well under 5 MiB. A miss
 /// simply falls back to loading and hashing the state, so the cap only trades a
 /// little extra work for a hard memory ceiling — never correctness.
-const STATE_HASH_CACHE_CAPACITY: u64 = 100_000;
+///
+/// `pub(crate)` so the summarize/delta fast-path caches in `contract::executor`
+/// can pin their sanity ceiling to THIS value instead of duplicating the literal
+/// (a larger summary cache than the detector cannot raise the hit rate, since the
+/// detector gates the fast path). See `contract::executor::SUMMARIZE_CACHE_MAX_CAPACITY`.
+pub(crate) const STATE_HASH_CACHE_CAPACITY: u64 = 100_000;
 
 /// Hash a contract state's bytes into the `u64` change-detector key shared by
 /// the summarize and delta caches.

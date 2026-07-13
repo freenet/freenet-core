@@ -1358,6 +1358,92 @@ mod executor_pin_tests {
         );
     }
 
+    /// Pin (bug-prevention: migration-wiring): the SUMMARIZE/DELTA fast-path caches
+    /// are shared ACROSS the pool — the actual fix for the 0.2.98 re-summarization
+    /// storm. `RuntimePool::new` must size them from the hosting budget and inject
+    /// them into every executor, AND `create_replacement_executor` must inject the
+    /// SAME shared caches into replacements — a replacement (built on a WASM-panic /
+    /// unhealthy executor) that fell back to the private min-sized cache would
+    /// reintroduce the storm on that executor and never self-heal. The headline
+    /// sizing test injects into a single executor, so it proves sizing but NOT this
+    /// shared-injection wiring; dropping either injection would not fail that test.
+    /// This source-scrape closes that gap.
+    #[test]
+    fn runtime_pool_injects_shared_summarize_caches_into_new_and_replacements() {
+        let src = include_str!("runtime/pool.rs");
+
+        let new_body = src
+            .split("pub async fn new(")
+            .nth(1)
+            .expect("RuntimePool::new must exist")
+            .split("\n    /// Get the current health status of the pool.")
+            .next()
+            .expect("end of RuntimePool::new");
+        assert!(
+            new_body.contains("summarize_cache_capacity(config.max_hosting_storage)"),
+            "RuntimePool::new must size the shared SUMMARY cache from the hosting budget"
+        );
+        assert!(
+            new_body.contains("delta_cache_capacity_bytes(config.max_hosting_storage)"),
+            "RuntimePool::new must BYTE-size the shared DELTA cache from the hosting budget"
+        );
+        assert!(
+            new_body.matches("set_summarize_caches(").count() >= 2,
+            "RuntimePool::new must inject the shared caches into BOTH the first executor \
+             and each subsequent pool executor"
+        );
+
+        let replacement_body = src
+            .split("async fn create_replacement_executor(")
+            .nth(1)
+            .expect("create_replacement_executor must exist")
+            .split("\n    /// Return an executor to the pool")
+            .next()
+            .expect("end of create_replacement_executor");
+        assert!(
+            replacement_body.contains("set_summarize_caches("),
+            "create_replacement_executor must inject the pool-shared summarize/delta caches \
+             into replacements, or a WASM-panic replacement reintroduces the 0.2.98 \
+             re-summarization storm and never self-heals"
+        );
+    }
+
+    /// Pin (hosting-cache-thrash / serialization invariant): the pool-SHARED
+    /// summarize/delta caches + the `state_hash_cache` change-detector are correct
+    /// ONLY because every summarize/delta read and every `cache_state_hash`
+    /// populate runs on the serialized contract loop (no write can interleave
+    /// between a slow-path load and its detector populate). The one thing that
+    /// holds a pool executor OFF that loop is the hosted-secret export
+    /// (`ExportJob::run` → `export_user_secrets`), so it MUST stay read-only w.r.t.
+    /// contract state: it must NOT call summarize / delta / `cache_state_hash`, or
+    /// an off-loop populate could certify the detector against a state a concurrent
+    /// on-loop write has changed — poisoning the fast path for the WHOLE pool. This
+    /// guards a future off-loop path from silently re-coupling to the cache
+    /// surface. Mirrors `export_job_run_offloads_blocking_work`; see the
+    /// SERIALIZATION INVARIANT comment in runtime/executor_impl.rs.
+    #[test]
+    fn off_loop_export_does_not_touch_summarize_delta_cache_surface() {
+        let src = include_str!("runtime/delegates.rs");
+        let body = src
+            .split("pub fn export_user_secrets(")
+            .nth(1)
+            .expect("export_user_secrets must exist")
+            .split("\n    /// Import delegate secrets")
+            .next()
+            .expect("end of export_user_secrets");
+        for forbidden in [
+            "summarize_contract_state",
+            "get_contract_state_delta",
+            "cache_state_hash",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "off-loop export_user_secrets must not call {forbidden}: off-loop \
+                 cache/detector mutation would poison the pool-shared summarize/delta fast path"
+            );
+        }
+    }
+
     /// Pin (#2257): the `ContractRequest::Put` arm of `contract_requests`
     /// MUST reject debug-compiled WASM (`contains_debug_sections`) BEFORE
     /// delegating to `perform_contract_put`. This is the only debug-WASM

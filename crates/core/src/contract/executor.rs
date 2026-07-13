@@ -925,10 +925,19 @@ pub(crate) type SummaryCache = MokaCache<ContractKey, (u64, StateSummary<'static
 /// Value cached per `(contract, state-hash, peer-summary-hash)` for the
 /// `get_contract_state_delta` fast path. Shared across pool executors like
 /// [`SummaryCache`].
+///
+/// Unlike [`SummaryCache`] this is BYTE-bounded, not entry-bounded: a
+/// `StateDelta` is variable and can be large (up to `MAX_STATE_SIZE` = 50 MiB —
+/// a contract may legitimately return its full state as a delta), and the key's
+/// cardinality (one entry per distinct peer-summary per contract) exceeds the
+/// contract count, so an entry-count cap reused from the tiny-summary cache could
+/// pin multi-GB of RAM (the #4565 OOM class). See [`build_delta_cache`] /
+/// [`delta_cache_capacity_bytes`].
 pub(crate) type DeltaCache = MokaCache<(ContractKey, u64, u64), StateDelta<'static>>;
 
-/// Conservative per-contract on-disk state floor used to size the summarize/delta
-/// fast-path caches from the node's hosting byte budget.
+/// Conservative per-contract on-disk state floor used to size the SUMMARY
+/// fast-path cache (entry-count) from the node's hosting byte budget. The delta
+/// cache is byte-bounded separately (see [`delta_cache_capacity_bytes`]).
 ///
 /// Chosen well BELOW the ~400 KiB average contract-state size observed on
 /// production gateways (a 1 GiB hosting budget held ~2616 contracts) so the
@@ -943,22 +952,23 @@ pub(crate) type DeltaCache = MokaCache<(ContractKey, u64, u64), StateDelta<'stat
 /// at the 1 GiB budget.
 const SUMMARIZE_CACHE_STATE_FLOOR_BYTES: u64 = 128 * 1024;
 
-/// Floor for the derived summarize/delta cache size: the historical fixed cap
+/// Floor for the derived SUMMARY cache entry-count: the historical fixed cap
 /// (1024). A host at the 128 MiB minimum hosting budget lands exactly here, so
 /// the change is a pure "larger budgets get a proportionally larger cache" —
 /// small/standalone hosts are unaffected.
 const SUMMARIZE_CACHE_MIN_CAPACITY: u64 = 1024;
 
-/// Sanity ceiling for the derived summarize/delta cache size.
+/// Sanity ceiling for the derived SUMMARY cache entry-count.
 ///
-/// Mirrors `StateStore::STATE_HASH_CACHE_CAPACITY` (100_000): the cheap
-/// change-detector that ALSO gates the fast path caps at 100k entries, so a
-/// larger summary/delta cache could never raise the hit rate (a summary miss on
-/// the detector's evicted key falls to the slow path regardless). Also bounds
-/// worst-case cache RAM if an operator sets an extreme `max-hosting-storage`.
-const SUMMARIZE_CACHE_MAX_CAPACITY: u64 = 100_000;
+/// Pinned to `STATE_HASH_CACHE_CAPACITY` (100_000) rather than a duplicated
+/// literal (the "manually-mirrored value that rots" pattern): the cheap
+/// change-detector that ALSO gates the fast path caps at that many entries, so a
+/// larger summary cache could never raise the hit rate (a summary miss on the
+/// detector's evicted key falls to the slow path regardless). Also bounds
+/// worst-case summary-cache RAM if an operator sets an extreme `max-hosting-storage`.
+const SUMMARIZE_CACHE_MAX_CAPACITY: u64 = crate::wasm_runtime::STATE_HASH_CACHE_CAPACITY;
 
-/// Derive the summarize/delta fast-path cache entry-count from the node's hosting
+/// Derive the SUMMARY fast-path cache entry-count from the node's hosting
 /// byte budget (`Config::max_hosting_storage`), so the ~5-min InterestSync
 /// anti-entropy re-summarize of the WHOLE hosted set hits the fast path (reuses
 /// the cached summary, skipping the WASM `summarize_state` and its possible module
@@ -972,19 +982,81 @@ const SUMMARIZE_CACHE_MAX_CAPACITY: u64 = 100_000;
 ///
 /// At the default RAM-scaled hosting budgets (`clamp(total_ram/8, 128 MiB, 1 GiB)`):
 /// 128 MiB budget → 1024 entries, 1 GiB budget → 8192 entries.
+///
+/// FUTURE: this sizes from the byte budget as a proxy for the hosted-set size. A
+/// more direct sizing would read the live hosted-contract count and size the
+/// cache from it, which would self-correct under-coverage on small-contract
+/// nodes (where `budget / SUMMARIZE_CACHE_STATE_FLOOR_BYTES` under-covers the real
+/// hosted count). Not done here — the summarize slow-path telemetry counter
+/// (`network_status::record_summarize_slow_path`) is the pragmatic detector for
+/// that under-coverage; size-from-count is the follow-up if it shows up.
 pub(crate) fn summarize_cache_capacity(hosting_budget_bytes: u64) -> u64 {
     (hosting_budget_bytes / SUMMARIZE_CACHE_STATE_FLOOR_BYTES)
         .clamp(SUMMARIZE_CACHE_MIN_CAPACITY, SUMMARIZE_CACHE_MAX_CAPACITY)
 }
 
-/// Build a [`SummaryCache`] bounded to `capacity` entries.
+/// Build a [`SummaryCache`] bounded to `capacity` ENTRIES. Summaries are tiny (a
+/// version number or small digest, ~1 KiB each), so entry-count sizing is an
+/// adequate RAM proxy here; the delta cache is byte-bounded instead
+/// ([`build_delta_cache`]).
 pub(crate) fn build_summary_cache(capacity: u64) -> SummaryCache {
     MokaCache::builder().max_capacity(capacity).build()
 }
 
-/// Build a [`DeltaCache`] bounded to `capacity` entries.
-pub(crate) fn build_delta_cache(capacity: u64) -> DeltaCache {
-    MokaCache::builder().max_capacity(capacity).build()
+/// Divisor applied to the hosting byte budget to derive the delta cache's BYTE
+/// budget: the delta cache gets `Config::max_hosting_storage / this` bytes.
+///
+/// The delta cache is a pure performance cache (a miss recomputes the delta via
+/// WASM — never a correctness issue), so it deserves only a modest slice of RAM.
+/// Its working set is bounded by live fan-out (per-subscriber delta computation),
+/// NOT by the whole hosted set, so it does not need to scale with the ~5-min
+/// anti-entropy re-summarize the way the summary cache does.
+const DELTA_CACHE_BUDGET_DIVISOR: u64 = 16;
+
+/// Floor for the delta cache byte budget (8 MiB). A host at the 128 MiB minimum
+/// hosting budget lands here (128 MiB / 16 = 8 MiB). At the observed ~400 KiB
+/// average delta this holds ~20 deltas — enough for a small node's fan-out.
+const DELTA_CACHE_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Ceiling for the delta cache byte budget (64 MiB) — the HARD worst-case RAM for
+/// this cache regardless of operator `max-hosting-storage`, since moka evicts by
+/// the per-entry byte weight (below) to keep total weight under this cap. A
+/// gateway at the 1 GiB default hosting budget lands here (1 GiB / 16 = 64 MiB).
+const DELTA_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Derive the delta fast-path cache's BYTE budget from the node's hosting byte
+/// budget: `clamp(hosting_budget / DELTA_CACHE_BUDGET_DIVISOR,
+/// DELTA_CACHE_MIN_BYTES, DELTA_CACHE_MAX_BYTES)`.
+///
+/// Byte-bounded (not entry-counted) because a `StateDelta` is variable and can be
+/// large (up to `MAX_STATE_SIZE` = 50 MiB), and the delta key's cardinality
+/// exceeds the contract count, so an entry-count cap could pin multi-GB of RAM
+/// (#4565 OOM class). At the default budgets: 128 MiB hosting budget → 8 MiB delta
+/// cache, 1 GiB → 64 MiB. Worst-case delta-cache RAM is `DELTA_CACHE_MAX_BYTES`
+/// (64 MiB). NOTE: an individual delta whose byte length exceeds the derived
+/// budget (e.g. a >8 MiB delta on a small 128 MiB-budget node) simply is not
+/// cached and falls to the slow path — correctness is unaffected.
+pub(crate) fn delta_cache_capacity_bytes(hosting_budget_bytes: u64) -> u64 {
+    (hosting_budget_bytes / DELTA_CACHE_BUDGET_DIVISOR)
+        .clamp(DELTA_CACHE_MIN_BYTES, DELTA_CACHE_MAX_BYTES)
+}
+
+/// Build a [`DeltaCache`] bounded to `capacity_bytes` BYTES (NOT entries).
+///
+/// The weigher is the delta's byte length, so moka's size-aware eviction keeps
+/// the cache's total held bytes under `capacity_bytes` — the hard RAM bound that
+/// entry-count sizing could not provide for a variable-size, high-cardinality
+/// value (see [`delta_cache_capacity_bytes`]). Saturates the weight to `u32::MAX`
+/// on the (impossible, `MAX_STATE_SIZE` = 50 MiB) overflow, as moka recommends.
+pub(crate) fn build_delta_cache(capacity_bytes: u64) -> DeltaCache {
+    MokaCache::builder()
+        .max_capacity(capacity_bytes)
+        .weigher(
+            |_key: &(ContractKey, u64, u64), delta: &StateDelta<'static>| -> u32 {
+                u32::try_from(delta.as_ref().len()).unwrap_or(u32::MAX)
+            },
+        )
+        .build()
 }
 
 /// Consumers of the executor are required to poll for new changes in order to be notified
@@ -1084,7 +1156,7 @@ where
             // via `set_summarize_caches`, so pool executors don't each hold a full
             // copy of the hosted set's summaries.
             summary_cache: build_summary_cache(SUMMARIZE_CACHE_MIN_CAPACITY),
-            delta_cache: build_delta_cache(SUMMARIZE_CACHE_MIN_CAPACITY),
+            delta_cache: build_delta_cache(DELTA_CACHE_MIN_BYTES),
             delegate_notification_tx: None,
         })
     }
