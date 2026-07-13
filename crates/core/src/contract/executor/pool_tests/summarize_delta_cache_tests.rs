@@ -592,6 +592,63 @@ async fn delta_unchanged_hits_fast_path_beyond_old_1024_cap() {
     );
 }
 
+/// REGRESSION (#4794 review): the byte weigher must FLOOR each entry's weight so
+/// empty/tiny deltas still count toward eviction. moka evicts only when total
+/// WEIGHT exceeds the byte budget, and a raw byte-length weigher reports 0 for the
+/// EMPTY deltas some contracts return (the website / UI-container contract). A
+/// stream of distinct empty-delta keys — one per UPDATE, since every UPDATE mints a
+/// fresh `(key, state_hash, summary_hash)` — would then NEVER be evicted and the
+/// entry count would grow unbounded, re-opening the #4565 OOM class this cache
+/// closes.
+///
+/// This inserts FAR more distinct EMPTY-delta keys than `budget / floor` and
+/// asserts the entry count stays bounded by that ratio. Without the floor every
+/// entry weighs 0, nothing is ever evicted, and `entry_count` equals the number
+/// inserted (here 2000, ~62x the bound) — so this test would fail.
+#[tokio::test(flavor = "current_thread")]
+async fn delta_cache_empty_deltas_stay_entry_bounded() {
+    use crate::contract::executor::{DELTA_ENTRY_OVERHEAD_FLOOR_BYTES, build_delta_cache};
+
+    // A deliberately tiny byte budget so the derived max entry count is small and
+    // easy to exceed: 32 * floor => at most 32 floored entries fit.
+    let floor = u64::from(DELTA_ENTRY_OVERHEAD_FLOOR_BYTES);
+    let max_entries = 32u64;
+    let capacity_bytes = max_entries * floor;
+    let cache = build_delta_cache(capacity_bytes);
+
+    // Insert MANY distinct keys, each with an EMPTY delta (byte length 0). Distinct
+    // ContractKeys model the per-UPDATE churn of `(key, state_hash, summary_hash)`
+    // cache keys the website contract produces with empty deltas.
+    const INSERTS: usize = 2000;
+    for i in 0..INSERTS {
+        let seed = format!("delta-floor-{i}");
+        let key = test_contract(seed.as_bytes()).key();
+        cache.insert((key, 0u64, 0u64), StateDelta::from(Vec::<u8>::new()));
+    }
+
+    // Force moka's pending eviction/housekeeping so the counts are settled.
+    cache.run_pending_tasks();
+
+    let entries = cache.entry_count();
+    let weighted = cache.weighted_size();
+    assert!(
+        entries <= max_entries,
+        "delta cache must stay entry-bounded: inserted {INSERTS} distinct EMPTY deltas into a \
+         {capacity_bytes}-byte cache (floor {floor} => max {max_entries} entries) but holds \
+         {entries} (weighted_size {weighted}). Without the per-entry weight floor every empty \
+         delta weighs 0, nothing is evicted, and this would equal {INSERTS} (#4565 OOM class)."
+    );
+    assert!(
+        weighted <= capacity_bytes,
+        "floored weighted_size ({weighted}) must stay within the byte budget ({capacity_bytes})"
+    );
+    // Sanity: the bound is FAR below the insert count (not merely equal to it).
+    assert!(
+        entries < INSERTS as u64,
+        "entry count ({entries}) must not grow with the {INSERTS} inserts"
+    );
+}
+
 // =========================================================================
 // EDGE CASES
 // =========================================================================

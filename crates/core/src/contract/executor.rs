@@ -1018,11 +1018,39 @@ const DELTA_CACHE_BUDGET_DIVISOR: u64 = 16;
 /// average delta this holds ~20 deltas — enough for a small node's fan-out.
 const DELTA_CACHE_MIN_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Ceiling for the delta cache byte budget (64 MiB) — the HARD worst-case RAM for
-/// this cache regardless of operator `max-hosting-storage`, since moka evicts by
-/// the per-entry byte weight (below) to keep total weight under this cap. A
-/// gateway at the 1 GiB default hosting budget lands here (1 GiB / 16 = 64 MiB).
+/// Ceiling for the delta cache byte budget (64 MiB) — the HARD ceiling on the
+/// cache's total byte WEIGHT regardless of operator `max-hosting-storage`, since
+/// moka evicts by the per-entry byte weight (below) to keep total weight under
+/// this cap. A gateway at the 1 GiB default hosting budget lands here
+/// (1 GiB / 16 = 64 MiB). Resident RAM is a small multiple of this weight cap:
+/// small/empty deltas are floored to [`DELTA_ENTRY_OVERHEAD_FLOOR_BYTES`] so the
+/// entry count (and its uncounted per-entry structural overhead) is also bounded,
+/// giving a worst case of <= ~1.5x this cap (<= ~96 MiB).
 const DELTA_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Per-entry weight FLOOR for the delta cache (512 bytes).
+///
+/// moka evicts only when the cache's total WEIGHT exceeds its byte budget, and the
+/// raw weigher (a delta's byte length) reports ~0 for the empty/tiny deltas some
+/// contracts legitimately return — the website / UI-container contract returns an
+/// EMPTY delta once a peer is already current. A zero-weight entry can never raise
+/// the weighted size, so WITHOUT a floor such entries are NEVER evicted: every
+/// UPDATE mints a fresh `(key, state_hash, summary_hash)` cache key, and the entry
+/// count — plus its uncounted per-entry structural overhead (the key tuple, moka's
+/// `ValueEntry`, deque node and map slot, ~100-250 B each) — grows without bound.
+/// That reintroduces the #4565 OOM class this cache exists to close (the delta
+/// cache is byte-bounded precisely so a high-cardinality value can't pin RAM).
+///
+/// Flooring every entry's weight at 512 B (a) is >= the real per-entry structural
+/// overhead, so the counted weight is a true upper bound on held RAM (RAM ~=
+/// weight, not weight + uncounted overhead), and (b) caps the entry COUNT at
+/// `byte_budget / 512`: 16_384 entries at the 8 MiB minimum budget, 131_072 at the
+/// 64 MiB maximum — comparable in scale to the summary cache's 100_000-entry
+/// ceiling. Worst-case delta-cache RAM is then the byte budget (real delta bytes,
+/// since `weighted_size <= budget`) PLUS `entry_count * overhead` (<= the budget
+/// again when overhead <= floor) — i.e. <= ~1.5x the byte budget, NOT the naive
+/// "budget only" the un-floored weigher implied.
+pub(crate) const DELTA_ENTRY_OVERHEAD_FLOOR_BYTES: u32 = 512;
 
 /// Derive the delta fast-path cache's BYTE budget from the node's hosting byte
 /// budget: `clamp(hosting_budget / DELTA_CACHE_BUDGET_DIVISOR,
@@ -1032,10 +1060,13 @@ const DELTA_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// large (up to `MAX_STATE_SIZE` = 50 MiB), and the delta key's cardinality
 /// exceeds the contract count, so an entry-count cap could pin multi-GB of RAM
 /// (#4565 OOM class). At the default budgets: 128 MiB hosting budget → 8 MiB delta
-/// cache, 1 GiB → 64 MiB. Worst-case delta-cache RAM is `DELTA_CACHE_MAX_BYTES`
-/// (64 MiB). NOTE: an individual delta whose byte length exceeds the derived
-/// budget (e.g. a >8 MiB delta on a small 128 MiB-budget node) simply is not
-/// cached and falls to the slow path — correctness is unaffected.
+/// cache, 1 GiB → 64 MiB. Worst-case delta-cache RAM is the byte budget PLUS the
+/// floored entry-count overhead — <= ~1.5x `DELTA_CACHE_MAX_BYTES` (<= ~96 MiB) —
+/// see [`DELTA_ENTRY_OVERHEAD_FLOOR_BYTES`]; the floor is what bounds the entry
+/// count for the empty/tiny deltas the raw byte weigher would leave uncapped.
+/// NOTE: an individual delta whose byte length exceeds the derived budget (e.g.
+/// an 8-plus-MiB delta on a small 128 MiB-budget node) simply is not cached and
+/// falls to the slow path — correctness is unaffected.
 pub(crate) fn delta_cache_capacity_bytes(hosting_budget_bytes: u64) -> u64 {
     (hosting_budget_bytes / DELTA_CACHE_BUDGET_DIVISOR)
         .clamp(DELTA_CACHE_MIN_BYTES, DELTA_CACHE_MAX_BYTES)
@@ -1043,17 +1074,30 @@ pub(crate) fn delta_cache_capacity_bytes(hosting_budget_bytes: u64) -> u64 {
 
 /// Build a [`DeltaCache`] bounded to `capacity_bytes` BYTES (NOT entries).
 ///
-/// The weigher is the delta's byte length, so moka's size-aware eviction keeps
-/// the cache's total held bytes under `capacity_bytes` — the hard RAM bound that
+/// The weigher is the delta's byte length FLOORED at
+/// [`DELTA_ENTRY_OVERHEAD_FLOOR_BYTES`], so moka's size-aware eviction keeps the
+/// cache's total held bytes under `capacity_bytes` — the hard RAM bound that
 /// entry-count sizing could not provide for a variable-size, high-cardinality
-/// value (see [`delta_cache_capacity_bytes`]). Saturates the weight to `u32::MAX`
-/// on the (impossible, `MAX_STATE_SIZE` = 50 MiB) overflow, as moka recommends.
+/// value (see [`delta_cache_capacity_bytes`]). The floor is load-bearing: an
+/// UNfloored byte weigher reports ~0 for the empty/tiny deltas some contracts
+/// return (the website / UI-container contract returns an EMPTY delta once a peer
+/// is current), and a zero-weight entry is never evicted, so the entry count would
+/// grow without bound (re-opening the #4565 OOM class). Flooring caps the entry
+/// count at `capacity_bytes / DELTA_ENTRY_OVERHEAD_FLOOR_BYTES`. Saturates the
+/// weight to `u32::MAX` on the (impossible, `MAX_STATE_SIZE` = 50 MiB) overflow, as
+/// moka recommends, before applying the floor.
 pub(crate) fn build_delta_cache(capacity_bytes: u64) -> DeltaCache {
     MokaCache::builder()
         .max_capacity(capacity_bytes)
         .weigher(
             |_key: &(ContractKey, u64, u64), delta: &StateDelta<'static>| -> u32 {
-                u32::try_from(delta.as_ref().len()).unwrap_or(u32::MAX)
+                // Floor every entry's weight so empty/tiny deltas still count
+                // toward eviction — without this an unbounded stream of distinct
+                // empty-delta keys is never evicted (#4565 OOM class). See
+                // DELTA_ENTRY_OVERHEAD_FLOOR_BYTES.
+                u32::try_from(delta.as_ref().len())
+                    .unwrap_or(u32::MAX)
+                    .max(DELTA_ENTRY_OVERHEAD_FLOOR_BYTES)
             },
         )
         .build()
