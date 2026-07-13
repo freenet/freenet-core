@@ -1053,28 +1053,35 @@ async fn process_open_request(
 
                                 // serve-DURING (#4642 R3 piece C): a subscribe=true GET
                                 // served from a LOCAL copy did NOT route through the
-                                // network, which is where the subscribe normally rides
-                                // (`maybe_subscribe_child`, the sole GET subscribe
-                                // path). If we were not already receiving updates (a
-                                // demandless every-hop copy), establish the upstream
-                                // subscription so the client gets ongoing updates. The
-                                // state itself was already served from the LOCAL copy
-                                // above (serve-DURING) regardless of the flag — only the
-                                // subscribe-registration wait differs here.
+                                // network, which is where the subscribe normally rides —
+                                // the network GET path carries the demand on the route and
+                                // finalizes the originator's subscription itself (step 10
+                                // §2b). A local hit bypasses that route, so route the
+                                // subscribe explicitly here via `maybe_subscribe_child`. If
+                                // we were not already receiving updates (a demandless
+                                // every-hop copy), establish the upstream subscription so
+                                // the client gets ongoing updates. The state itself was
+                                // already served from the LOCAL copy above (serve-DURING)
+                                // regardless of the flag — only the subscribe-registration
+                                // wait differs here.
                                 //
                                 // `blocking_subscribe` is the client's real wire-API flag
-                                // and is LOAD-BEARING (#4524): when `true`, the served read
-                                // is held until the upstream subscription is registered, so
-                                // the client cannot see the `GetResponse` before its
-                                // downstream-subscriber chain exists (else an UPDATE sent
-                                // immediately after the response would race registration and
-                                // be missed — the exact bug #4524 fixed). Hardcoding `false`
-                                // here would silently downgrade an explicit
-                                // `blocking_subscribe=true` GET to fire-and-forget the moment
-                                // serve-DURING fires — a regression vs the network path,
-                                // which passes the real flag. When `false`, the subscribe is
-                                // spawned in the background and the served read returns
-                                // immediately.
+                                // and is LOAD-BEARING: when `true`, the served read is held
+                                // until the upstream subscription is registered, so the
+                                // client cannot observe the `GetResponse` before its
+                                // downstream-subscriber chain exists. Otherwise an UPDATE
+                                // sent immediately after the response would race registration
+                                // and be missed. This register-before-observe ordering is the
+                                // reason a blocking subscribe keeps the standalone
+                                // `SubscribeMsg` child rather than the inline
+                                // `establish_local_client_subscription` path (step 10 §2b);
+                                // it is inherent to the ordering, not tied to a specific
+                                // issue. Hardcoding `false` here would silently downgrade an
+                                // explicit `blocking_subscribe=true` GET to fire-and-forget
+                                // the moment serve-DURING fires — a regression vs the network
+                                // path, which passes the real flag. When `false`, the
+                                // subscribe is spawned in the background and the served read
+                                // returns immediately.
                                 //
                                 // A subscribe=FALSE read establishes NOTHING: no durable
                                 // demand is created, the demandless copy stays fresh via
@@ -1094,7 +1101,7 @@ async fn process_open_request(
                                         crate::message::Transaction::new::<get::GetMsg>(),
                                         full_key,
                                         true,               // subscribe
-                                        blocking_subscribe, // honor the client's #4524 flag
+                                        blocking_subscribe, // honor the client's ordering flag
                                     )
                                     .await;
                                 }

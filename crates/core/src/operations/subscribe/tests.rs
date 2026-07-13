@@ -660,3 +660,100 @@ fn finalize_host_subscribe_fetches_before_register() {
          (#4359), mirroring finalize_originator_subscribe (review Fix D)"
     );
 }
+
+// ===== Behavioral test: establish_local_client_subscription (step 10 §2a/§2b) =====
+
+/// Build a minimal real `OpManager` (Local mode) for behavioral tests, mirroring
+/// the executor `pool_tests` / `op_state_manager` re-root builders. Returns the
+/// op_manager plus a boxed guard bundle that keeps the channel receivers + task
+/// monitor alive for the test scope (dropping them mid-run tears down the
+/// OpManager's channels).
+async fn build_test_op_manager(id: &str) -> (std::sync::Arc<OpManager>, Box<dyn std::any::Any>) {
+    let config_args = crate::config::ConfigArgs {
+        id: Some(id.to_string()),
+        mode: Some(crate::contract::OperationMode::Local),
+        ..Default::default()
+    };
+    let node_config =
+        crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+    let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+    let (ops_ch_channel, ch_channel, wait_for_event) = crate::contract::contract_handler_channel();
+    let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+    let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+    let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+    let op_manager = std::sync::Arc::new(
+        OpManager::new(
+            notification_tx,
+            ops_ch_channel,
+            &node_config,
+            crate::tracing::DynamicRegister::new(vec![]),
+            connection_manager,
+            result_router_tx,
+            &task_monitor,
+        )
+        .expect("build OpManager"),
+    );
+    op_manager.ring.attach_op_manager(&op_manager);
+    let guards: Box<dyn std::any::Any> = Box::new((
+        notification_rx,
+        ch_channel,
+        wait_for_event,
+        result_router_rx,
+        task_monitor,
+    ));
+    (op_manager, guards)
+}
+
+/// Behavioral pin for step 10 §2b (and §2a): after a non-blocking
+/// subscribe=true GET (or PUT) completes, the originator establishes its own
+/// local-client subscription via `establish_local_client_subscription` INSTEAD
+/// of the standalone `SubscribeMsg` child. For the client to keep receiving
+/// updates, that helper must leave the ring/interest state such that the
+/// contract is (a) in the local active-subscription set — so it stays in the
+/// renewal set and is retained — and (b) marked as a LOCAL-CLIENT interest — so
+/// it joins InterestSync anti-entropy, is evicted LAST, and is a live UPDATE
+/// fan-out target. This is the deterministic proof that the new inline path is
+/// functionally equivalent to the standalone child on the originator side; the
+/// downstream chain toward the key is built separately by the relays that
+/// carried the subscribe flag (covered by the relay register-after-cache pins).
+#[tokio::test]
+async fn establish_local_client_subscription_marks_subscribed_and_interested() {
+    let (op_manager, _guards) = build_test_op_manager("establish-local-sub").await;
+
+    let key =
+        ContractKey::from_id_and_code(ContractInstanceId::new([7u8; 32]), CodeHash::new([0u8; 32]));
+
+    // Precondition: a contract the originator has never subscribed to is neither
+    // subscribed nor a local interest.
+    assert!(
+        !op_manager.ring.is_subscribed(&key),
+        "precondition: contract must not be subscribed before establish"
+    );
+    assert!(
+        !op_manager.interest_manager.has_local_interest(&key),
+        "precondition: contract must not be a local interest before establish"
+    );
+
+    // The exact call the GET/PUT client driver makes on the non-blocking
+    // subscribe=true completion path.
+    super::establish_local_client_subscription(&op_manager, key).await;
+
+    // (a) Local subscription lease installed → renewal set + retention.
+    assert!(
+        op_manager.ring.is_subscribed(&key),
+        "establish_local_client_subscription must install the active-subscription \
+         lease (ring.subscribe) so the contract stays in contracts_needing_renewal \
+         and is retained — without it the client's subscription is not durable"
+    );
+
+    // (b) Local-client interest recorded → anti-entropy + evicted-last +
+    //     UPDATE fan-out target.
+    assert!(
+        op_manager.interest_manager.has_local_interest(&key),
+        "establish_local_client_subscription must record local-client interest \
+         (add_local_client) so the contract joins InterestSync anti-entropy, is \
+         evicted LAST (subscriber-primary eviction), and receives UPDATE fan-out"
+    );
+}

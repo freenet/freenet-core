@@ -311,6 +311,13 @@ async fn drive_client_get_inner(
         },
     };
 
+    // Non-blocking subscribe=true rides the GET route (build_request carries
+    // subscribe=true, relays register the downstream chain), and the completion
+    // arm establishes the originator's own local subscription via
+    // `establish_local_client_subscription` (step 10 §2b). A blocking subscribe
+    // keeps the standalone `SubscribeMsg` child (ordering requirement).
+    let emit_get_subscribe = subscribe && !blocking_subscribe;
+
     let mut driver = GetRetryDriver {
         op_manager,
         instance_id,
@@ -321,6 +328,7 @@ async fn drive_client_get_inner(
         attempt_visited: VisitedPeers::new(&client_tx),
         request_sent_at: None,
         response_received_at: None,
+        emit_get_subscribe,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -536,22 +544,44 @@ async fn drive_client_get_inner(
                 host_result.is_ok(),
             );
 
-            // Explicit-subscribe hand-off. Mirrors PUT 3a's
-            // `maybe_subscribe_child` — subscribe is never handled in
-            // the terminal-result construction to avoid double-subscribe
-            // (commit 494a3c69). This only runs when the client set
-            // `subscribe=true`; it is now the ONLY subscribe path on GET
-            // (piece E removed the AUTO_SUBSCRIBE_ON_GET fallback above —
-            // a subscribe=false GET hosts under the demand gauge but does
-            // not subscribe).
-            maybe_subscribe_child(
-                op_manager,
-                client_tx,
-                reply_key,
-                subscribe,
-                blocking_subscribe,
-            )
-            .await;
+            // Explicit-subscribe hand-off (step 10 §2b). Mirrors PUT §2a's
+            // completion-arm branch. Subscribe is never handled in the
+            // terminal-result construction, to avoid double-subscribe (commit
+            // 494a3c69). This only runs when the client set `subscribe=true`
+            // (piece E removed the AUTO_SUBSCRIBE_ON_GET fallback above — a
+            // subscribe=false GET hosts under the demand gauge but does not
+            // subscribe). The branch is mutually exclusive: exactly one of the
+            // two subscribe paths fires.
+            //   * Non-blocking subscribe=true (`emit_get_subscribe`): the demand
+            //     already rode the GET route (`build_request` carried
+            //     subscribe=true, so each relay registered the downstream chain
+            //     toward the key after caching), and the originator just
+            //     GET-fetched the state (`cache_contract_locally` above), so it
+            //     only needs its own local-client subscription STATE —
+            //     established here WITHOUT a standalone wire `SubscribeMsg`. This
+            //     retires standalone-SUBSCRIBE emission for this case. No
+            //     double-subscribe: we do NOT also spawn the child.
+            //   * Blocking subscribe (or a no-subscribe GET): unchanged — keep
+            //     the blocking `SubscribeMsg` child. The blocking client must not
+            //     observe the `GetResponse` before its subscriber chain exists
+            //     (ordering requirement; see the `blocking_subscribe` invariant
+            //     in `client_events.rs`). `emit_get_subscribe` is false here, so
+            //     the GET went out as subscribe=false and built no chain.
+            if driver.emit_get_subscribe {
+                crate::operations::subscribe::establish_local_client_subscription(
+                    op_manager, reply_key,
+                )
+                .await;
+            } else {
+                maybe_subscribe_child(
+                    op_manager,
+                    client_tx,
+                    reply_key,
+                    subscribe,
+                    blocking_subscribe,
+                )
+                .await;
+            }
 
             Ok(DriverOutcome::Publish(host_result))
         }
@@ -603,6 +633,24 @@ struct GetRetryDriver<'a> {
     /// outcomes (Retry / Unexpected) leave it untouched and the next
     /// `build_request` overwrites `request_sent_at`.
     response_received_at: Option<tokio::time::Instant>,
+    /// Carry `subscribe=true` on the originator's own GET request (step 10
+    /// §2b) so the subscribe demand rides the GET route: each relay, after it
+    /// caches the returned state, registers the upstream peer as a downstream
+    /// subscriber (register-after-cache, PR 1 §1a), building the subscription
+    /// CHAIN toward the key hop-by-hop. Mirrors PUT's `emit_request_subscribe`
+    /// (§2a). GET needs no new wire variant or version gate: `GetMsg::Request`
+    /// already carries the `subscribe` bool.
+    ///
+    /// Set only for a NON-BLOCKING `subscribe=true` client GET. The completion
+    /// arm then establishes the originator's own local-client subscription via
+    /// `establish_local_client_subscription` (ring.subscribe + add_local_client,
+    /// once) instead of spawning the standalone `SubscribeMsg` child — retiring
+    /// standalone-SUBSCRIBE emission for this case. A blocking subscribe leaves
+    /// this `false` and keeps the blocking child (ordering requirement — the
+    /// client must not observe the `GetResponse` before its subscriber chain
+    /// exists; see the `blocking_subscribe` invariant in `client_events.rs`).
+    /// The sub-op GET driver always sets it `false` (sub-ops never subscribe).
+    emit_get_subscribe: bool,
 }
 
 /// Terminal value for the GET driver.
@@ -765,7 +813,11 @@ impl RetryDriver for GetRetryDriver<'_> {
             fetch_contract: true,
             htl: self.htl,
             visited: self.attempt_visited.clone(),
-            subscribe: false,
+            // Non-blocking subscribe=true carries the demand on the GET route
+            // (step 10 §2b); relays register the downstream chain after caching.
+            // `false` for a no-subscribe GET, a blocking subscribe (keeps the
+            // standalone child), and every sub-op GET.
+            subscribe: self.emit_get_subscribe,
         })
     }
 
@@ -1865,6 +1917,10 @@ async fn drive_sub_op_get(
         attempt_visited: VisitedPeers::new(&tx),
         request_sent_at: None,
         response_received_at: None,
+        // Sub-op GETs (auto-fetch, related-contract fetch,
+        // fetch_contract_if_missing) never subscribe — the sub-op caller owns
+        // subscribe semantics (see the caller-owns-subscribe comments below).
+        emit_get_subscribe: false,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -4290,10 +4346,13 @@ mod tests {
     /// A successful GET with `subscribe=false` must NOT install a durable
     /// subscription — that is the "GET-auto-subscribe" anti-pattern
     /// (hosting-invariants, invariants 1 & 2). The driver must therefore
-    /// never call `auto_subscribe_on_get_response`; the only subscribe path
-    /// left is the explicit-`subscribe=true` `maybe_subscribe_child`. This
-    /// pairs with `test_driver_inline_get_does_not_auto_subscribe`
-    /// (integration), which asserts the requesting node does NOT subscribe.
+    /// never call `auto_subscribe_on_get_response`. The only subscribe paths
+    /// left are the EXPLICIT `subscribe=true` ones: the non-blocking inline
+    /// `establish_local_client_subscription` (step 10 §2b — lives in
+    /// subscribe.rs) and the blocking `maybe_subscribe_child` child, both gated
+    /// on subscribe=true. This pairs with
+    /// `test_driver_inline_get_does_not_auto_subscribe` (integration), which
+    /// asserts the requesting node does NOT subscribe on a subscribe=false GET.
     #[test]
     fn driver_does_not_auto_subscribe_on_get_response() {
         let src = production_source();
@@ -4306,22 +4365,31 @@ mod tests {
              — see hosting-invariants."
         );
         // Belt-and-braces: catch a re-subscribe reintroduced via a DIFFERENT
-        // mechanism than the removed helper. The GET driver installs durable
-        // subscriptions ONLY through `maybe_subscribe_child` (a subscribe sub-op
-        // spawned on the explicit subscribe=true path); it must never call
-        // `ring.subscribe(` directly, which would re-open the GET-auto-subscribe
-        // anti-pattern regardless of the helper name.
+        // mechanism than the removed helper. The durable subscribe primitive
+        // (`ring.subscribe(`) lives behind `establish_local_client_subscription`
+        // (subscribe.rs, the non-blocking §2b path) and `maybe_subscribe_child`
+        // (the blocking child), both gated on an explicit subscribe=true. THIS
+        // driver's own source must never call `ring.subscribe(` directly, which
+        // would re-open the GET-auto-subscribe anti-pattern regardless of the
+        // helper name.
         assert!(
             !src.contains("ring.subscribe("),
-            "GET driver must NOT call ring.subscribe( directly — the only durable \
-             subscribe path is maybe_subscribe_child (explicit subscribe=true). A \
-             direct ring.subscribe( in this driver re-introduces GET-auto-subscribe \
-             under a new name — see hosting-invariants (invariants 1 & 2)."
+            "GET driver must NOT call ring.subscribe( directly — the durable \
+             subscribe paths are establish_local_client_subscription (non-blocking) \
+             and maybe_subscribe_child (blocking), both explicit subscribe=true and \
+             both external to this driver. A direct ring.subscribe( here re-introduces \
+             GET-auto-subscribe under a new name — see hosting-invariants (1 & 2)."
         );
-        // The explicit subscribe path must still be wired in.
+        // The explicit subscribe paths must still be wired in: the blocking child
+        // and the non-blocking inline establisher.
         assert!(
             src.contains("maybe_subscribe_child"),
-            "the explicit subscribe=true path (maybe_subscribe_child) must remain"
+            "the blocking explicit subscribe=true path (maybe_subscribe_child) must remain"
+        );
+        assert!(
+            src.contains("establish_local_client_subscription"),
+            "the non-blocking explicit subscribe=true path \
+             (establish_local_client_subscription, step 10 §2b) must remain"
         );
     }
 
@@ -4381,6 +4449,72 @@ mod tests {
              the node needs WASM for local validation/hosting regardless of \
              the client's return_contract_code preference (issue #3757 / \
              get.rs:52-55)."
+        );
+    }
+
+    /// Step 10 §2b: a non-blocking `subscribe=true` client GET carries the
+    /// subscribe demand on its OWN route (so relays build the downstream chain
+    /// after caching), then establishes the originator's own local-client
+    /// subscription inline via `establish_local_client_subscription` — retiring
+    /// the standalone `SubscribeMsg` child for this case. This pins the
+    /// three-part wiring so a refactor can't silently regress it to the pre-§2b
+    /// standalone-child-only behaviour (which would rebuild the phantom-prone
+    /// separate SUBSCRIBE op the epic is retiring).
+    #[test]
+    fn non_blocking_get_subscribe_rides_route_and_establishes_inline() {
+        let src = production_source();
+
+        // 1. build_request must carry the driver's emit_get_subscribe flag on
+        //    the wire, NOT a hard-coded `false`. A hard-coded false stops the
+        //    demand riding the GET route, so no relay registers the downstream
+        //    chain and updates never reach the originator via the chain.
+        let build_body = extract_fn_body(
+            src,
+            "fn build_request(&mut self, attempt_tx: Transaction) -> NetMessage {",
+        );
+        assert!(
+            build_body.contains("subscribe: self.emit_get_subscribe,"),
+            "GetMsg::Request.subscribe must be the driver's emit_get_subscribe \
+             flag so a non-blocking subscribe=true GET carries the demand on its \
+             route (relays register the downstream chain after caching, §2b)."
+        );
+        assert!(
+            !build_body.contains("subscribe: false,"),
+            "GetMsg::Request.subscribe must not be hard-coded false in \
+             build_request — that regresses §2b to the standalone-child path."
+        );
+
+        // 2. The client driver computes the predicate as subscribe &&
+        //    !blocking_subscribe (mirrors PUT §2a): a blocking subscribe keeps
+        //    the standalone child (ordering requirement — the client must not
+        //    observe the GetResponse before its subscriber chain exists; see the
+        //    blocking_subscribe invariant in client_events.rs).
+        let client_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        assert!(
+            client_body.contains("let emit_get_subscribe = subscribe && !blocking_subscribe;"),
+            "the non-blocking-subscribe predicate must be `subscribe && \
+             !blocking_subscribe`: a blocking subscribe keeps the standalone \
+             child (ordering requirement)."
+        );
+
+        // 3. The Done arm branches on `driver.emit_get_subscribe`: the
+        //    non-blocking path establishes the local-client subscription inline
+        //    (no wire SUBSCRIBE); the else path keeps maybe_subscribe_child
+        //    (blocking subscribe / no subscribe). Mutually exclusive — never a
+        //    double-subscribe.
+        assert!(
+            client_body.contains("if driver.emit_get_subscribe {"),
+            "the Done arm must branch on driver.emit_get_subscribe (§2b)."
+        );
+        assert!(
+            client_body.contains("establish_local_client_subscription("),
+            "the non-blocking branch must call establish_local_client_subscription \
+             (inline local subscription, no standalone SubscribeMsg child)."
+        );
+        assert!(
+            client_body.contains("maybe_subscribe_child("),
+            "the else branch must keep maybe_subscribe_child for the blocking \
+             subscribe (ordering requirement) and no-subscribe cases."
         );
     }
 
