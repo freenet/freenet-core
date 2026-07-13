@@ -149,7 +149,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -160,7 +160,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1590,7 +1590,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1800,7 +1800,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1866,7 +1866,7 @@ dependencies = [
  "ed25519-dalek",
  "either",
  "freenet",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.3",
  "futures 0.3.32",
  "glob",
  "hex",
@@ -2061,7 +2061,7 @@ dependencies = [
  "flatbuffers 25.12.19",
  "flate2",
  "freenet-macros 0.1.0",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.3",
  "freenet-test-network",
  "futures 0.3.32",
  "headers",
@@ -2179,7 +2179,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.3",
  "freenet-test-network",
  "futures 0.3.32",
  "rand 0.9.4",
@@ -2199,7 +2199,7 @@ name = "freenet-ping-contract"
 version = "0.1.11"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.3",
  "serde_json",
 ]
 
@@ -2209,7 +2209,7 @@ version = "0.1.11"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.3",
  "humantime",
  "humantime-serde",
  "serde",
@@ -2269,9 +2269,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.8.2"
+version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6014c3b45cbd33a81a779d4c9b8b8e676716bf302ccf9589d10ba8371aeaa63"
+checksum = "2ce69f7b87ca5fedb784da0194e26a3315bc23b11e346f7a8413c48abdcac73f"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -2333,7 +2333,7 @@ dependencies = [
  "byteorder",
  "ciborium",
  "ed25519-dalek",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.3",
  "rand 0.9.4",
  "serde",
 ]
@@ -3503,7 +3503,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4065,7 +4065,7 @@ dependencies = [
  "once_cell",
  "png",
  "thiserror 2.0.18",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4197,7 +4197,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5761,7 +5761,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6265,7 +6265,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6667,7 +6667,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6704,7 +6704,7 @@ dependencies = [
 name = "test-contract-integration"
 version = "0.1.11"
 dependencies = [
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.3",
  "serde",
  "serde_json",
 ]
@@ -6714,14 +6714,14 @@ name = "test-contract-mock-aligned"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.3",
 ]
 
 [[package]]
 name = "test-contract-update-nochange"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.8.2",
+ "freenet-stdlib 0.8.3",
  "serde",
  "serde_json",
 ]
@@ -7420,7 +7420,7 @@ dependencies = [
  "once_cell",
  "png",
  "thiserror 2.0.18",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8299,7 +8299,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8725,7 +8725,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
