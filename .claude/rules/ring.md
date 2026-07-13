@@ -243,13 +243,20 @@ WHEN summarizing contracts in the InterestSync heartbeat handlers
     via downstream subscribers with NO stored state gets a bounded one-shot
     repair fetch (sub-op GET; ≤ MAX_PHANTOM_REPAIRS_PER_INTERVAL per tick,
     one per contract per OPERATION_TTL cooldown). After
-    MAX_PHANTOM_REPAIR_ATTEMPTS failures the sweep STOPS for that contract but
-    does NOT drop the registration — the #4770 cycling Drop arm
-    (drop_phantom_downstream) was NEUTRALIZED in SUBSCRIBE-retirement step 10
-    §1c, because a genuine phantom is now unrepresentable (see next bullet), so
-    dropping only churns (an eviction teardown re-registers → register/drop
-    cycling). The Fetch sweep survives as a rollout net for phantoms left by
-    pre-upgrade peers.
+    MAX_PHANTOM_REPAIR_ATTEMPTS failures the sweep STOPS FETCHING for that
+    contract. The #4770 CYCLING Drop stays neutralized (SUBSCRIBE-retirement step
+    10 §1c) — with register-after-state a genuine phantom is unrepresentable, so
+    an immediate drop would only churn (an eviction teardown re-registers →
+    register/drop cycling). BUT the exemption is time-bounded (see "Cleanup
+    Exemptions Must Be Time-Bounded" below): a phantom whose downstream keeps
+    RENEWING never hits the Fix-6 downstream-expiry prune, so once it is older
+    than PHANTOM_ABSOLUTE_MAX_AGE (4 × SUBSCRIPTION_LEASE_DURATION ≈ 32 min) the
+    sweep emits PhantomRepair::Drop (drop_phantom_downstream + interest decrement
+    + collapse). That absolute-age drop is SAFE and NON-CYCLING (review Fix C):
+    unlike the original #4770 Drop, a re-registration must go through
+    finalize_host_subscribe (fetch-first), which registers NOTHING while the state
+    stays unfetchable, so the phantom cannot re-form. Below the age bound the
+    Fetch sweep survives as a rollout net for phantoms left by pre-upgrade peers.
   → step 10 §1b (register-after-state) closes the phantom at the SOURCE,
     superseding the earlier "repair-or-drop, never skip register" guidance: a
     peer forwarding a SUBSCRIBE (or a subscribe=true GET) now fetches the body

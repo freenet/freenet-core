@@ -604,6 +604,20 @@ fn finalize_host_subscribe_fetches_before_register() {
          a relay has no local client; it would inflate local_client_count and wrongly \
          make the relay evicted-last"
     );
+    // Review Fix B: finalize_host_subscribe must NOT call complete_subscription_request.
+    // That clears the node-wide per-contract pending-subscription dedup slot + records
+    // backoff success, but a RELAY never CLAIMED that slot (mark_subscription_pending is
+    // called only by the client-subscribe / renewal / re-root drivers). Releasing it here
+    // would free a concurrent local renewal/re-root's slot early and overwrite its retry
+    // state. It is correct only in finalize_originator_subscribe (which DID claim the slot).
+    // Match the method-CALL form (`.complete_subscription_request(`) so the NOTE
+    // comment that names the function in prose does not trip the scan.
+    assert!(
+        !body.contains(".complete_subscription_request("),
+        "finalize_host_subscribe must NOT call complete_subscription_request (review Fix B) — \
+         a relay never claimed the pending-subscription slot; releasing it corrupts a \
+         concurrent local renewal/re-root's dedup + retry state"
+    );
     // Nothing may be registered when the fetch did not land the body: the helper
     // must early-return on `!have_body` BEFORE the register call.
     let guard_pos = body

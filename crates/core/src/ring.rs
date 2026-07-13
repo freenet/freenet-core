@@ -2291,12 +2291,11 @@ impl Ring {
                 && let Some(op_manager) = ring.upgrade_op_manager()
             {
                 for repair in repairs {
-                    // Single-variant match: the #4770 cycling `Drop` arm was
-                    // NEUTRALIZED in step 10 §1c (register-after-state makes a
-                    // genuine phantom unrepresentable, so dropping only churns).
-                    // Only the bounded `Fetch` rollout net survives. A re-added
-                    // Drop variant would break this match, forcing an explicit
-                    // decision.
+                    // The #4770 CYCLING Drop stays neutralized (step 10 §1c);
+                    // `Drop` here is the review-Fix-C ABSOLUTE-AGE-bounded drop —
+                    // it fires only after PHANTOM_ABSOLUTE_MAX_AGE and is
+                    // non-cycling (a re-registration goes through
+                    // finalize_host_subscribe / fetch-first).
                     match repair {
                         crate::ring::hosting::PhantomRepair::Fetch(key) => {
                             tracing::info!(
@@ -2312,6 +2311,32 @@ impl Ring {
                                 *key.id(),
                                 true,
                             );
+                        }
+                        crate::ring::hosting::PhantomRepair::Drop(key) => {
+                            let removed = ring.drop_phantom_downstream(&key);
+                            tracing::warn!(
+                                contract = %key,
+                                removed_subscribers = removed,
+                                "phantom in-use contract unrepairable past absolute-age bound: \
+                                 dropping stale downstream registration (review Fix C — the \
+                                 downstream kept renewing but state stayed unfetchable)"
+                            );
+                            // Decrement interest symmetrically, then collapse
+                            // upstream if no interest remains.
+                            for _ in 0..removed {
+                                op_manager
+                                    .interest_manager
+                                    .remove_downstream_subscriber(&key);
+                            }
+                            if op_manager.reconcile_wants_collapse(
+                                &key,
+                                crate::node::network_status::ReconcileShadowSite::Collapse,
+                            ) {
+                                let op_mgr = op_manager.clone();
+                                GlobalExecutor::spawn(async move {
+                                    op_mgr.send_unsubscribe_upstream(&key).await;
+                                });
+                            }
                         }
                     }
                 }
@@ -3769,6 +3794,13 @@ impl Ring {
         max_fetches: usize,
     ) -> Vec<crate::ring::hosting::PhantomRepair> {
         self.hosting_manager.reconcile_phantom_in_use(max_fetches)
+    }
+
+    /// Drop the downstream registration of an absolute-age-exhausted phantom
+    /// contract (review Fix C), returning the number of removed subscriber
+    /// entries. See `HostingManager::drop_phantom_downstream`.
+    pub(crate) fn drop_phantom_downstream(&self, key: &ContractKey) -> usize {
+        self.hosting_manager.drop_phantom_downstream(key)
     }
 
     pub fn should_unsubscribe_upstream(&self, contract: &ContractKey) -> bool {

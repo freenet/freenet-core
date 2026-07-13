@@ -125,6 +125,19 @@ const MAX_PHANTOM_REPAIR_ATTEMPTS: u32 = 3;
 /// fire-and-forget fetch could still be in flight.
 const PHANTOM_REPAIR_COOLDOWN: Duration = crate::config::OPERATION_TTL;
 
+/// Absolute-age bound for the exhausted-phantom exemption (review Fix C /
+/// ring.md "Cleanup Exemptions Must Be Time-Bounded"). A phantom whose
+/// downstream keeps renewing (so the Fix-6 downstream-expiry prune never fires)
+/// but whose state stays unfetchable past this age is dropped, so it cannot be a
+/// permanent GC blind spot + advertised dead-end. Four subscription leases (~32
+/// min) is well past the 8-min lease — several renewal cycles of genuine
+/// repair-fetch attempts must fail first. This drop is SAFE and NON-CYCLING
+/// (unlike the original #4770 Drop): a re-registration goes through
+/// `finalize_host_subscribe` (fetch-first), so if the state is still unfetchable
+/// it registers NOTHING and the phantom cannot re-form.
+const PHANTOM_ABSOLUTE_MAX_AGE: Duration =
+    Duration::from_secs(SUBSCRIPTION_LEASE_DURATION.as_secs() * 4); // ~32 minutes
+
 // =============================================================================
 // Result Types
 // =============================================================================
@@ -135,23 +148,35 @@ const PHANTOM_REPAIR_COOLDOWN: Duration = crate::config::OPERATION_TTL;
 struct PhantomRepairEntry {
     attempts: u32,
     last_attempt: Instant,
+    /// When this phantom was first observed (TimeSource). Drives the
+    /// absolute-age drop (`PHANTOM_ABSOLUTE_MAX_AGE`, review Fix C) — an
+    /// exhausted phantom whose downstream keeps renewing is dropped once its age
+    /// exceeds the bound, so the exemption is time-bounded (ring.md).
+    first_seen: Instant,
 }
 
 /// Action emitted by [`HostingManager::reconcile_phantom_in_use`] for one
 /// phantom (in-use, stateless) contract. The driver in
 /// `Ring::recover_orphaned_subscriptions` applies it: `Fetch` spawns a
-/// fire-and-forget sub-op GET (`start_sub_op_get`).
+/// fire-and-forget sub-op GET (`start_sub_op_get`); `Drop` removes the
+/// downstream registration (via [`HostingManager::drop_phantom_downstream`]) and
+/// collapses upstream.
 ///
-/// The `Drop` variant (drop the downstream registration once repair attempts
-/// were exhausted) was NEUTRALIZED in step 10 §1c: with the register-after-state
-/// fix a genuine phantom is unrepresentable, so dropping a registration would
-/// only churn (see `reconcile_phantom_in_use`). A future bounded drop, if
-/// wanted, must be gated behind a persistent tombstone with backoff past
-/// `SUBSCRIPTION_LEASE_DURATION`.
+/// The `Drop` variant here is NOT the #4770 cycling drop (that was neutralized in
+/// step 10 §1c). It is the review-Fix-C absolute-age-bounded drop: it fires ONLY
+/// after `PHANTOM_ABSOLUTE_MAX_AGE`, and it is non-cycling because a
+/// re-registration must go through `finalize_host_subscribe` (fetch-first), which
+/// registers NOTHING while the state stays unfetchable — so the phantom cannot
+/// re-form. It re-satisfies the ring.md time-bounded-exemption rule that the
+/// pure Fix-6 downstream-expiry prune leaves open when the downstream keeps
+/// renewing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhantomRepair {
     /// Launch a one-shot state repair fetch for the contract.
     Fetch(ContractKey),
+    /// Repair attempts exhausted AND the phantom is older than
+    /// `PHANTOM_ABSOLUTE_MAX_AGE` — drop the stale downstream registration.
+    Drop(ContractKey),
 }
 
 /// Result of adding a client subscription.
@@ -1746,13 +1771,18 @@ impl HostingManager {
     ///   [`MAX_PHANTOM_REPAIR_ATTEMPTS`] total (bound the producer — the
     ///   #4440/#4610 storms both came from unbounded producers).
     ///
-    /// Once `MAX_PHANTOM_REPAIR_ATTEMPTS` fetches fail, the sweep STOPS (emits
-    /// nothing) for that contract but does NOT drop the registration — the #4770
-    /// cycling Drop arm was NEUTRALIZED in step 10 §1c, because with the
-    /// register-after-state fix a genuine phantom is unrepresentable and dropping
-    /// would only churn. This sweep survives as a rollout net for phantoms left
-    /// by pre-upgrade peers; the downstream peer's own lease expiry / renewal
-    /// re-roots it.
+    /// Once `MAX_PHANTOM_REPAIR_ATTEMPTS` fetches fail, the sweep STOPS fetching
+    /// for that contract. The #4770 *cycling* Drop stays NEUTRALIZED (step 10
+    /// §1c): with the register-after-state fix a genuine phantom is
+    /// unrepresentable, so an immediate drop would only churn. But the exemption
+    /// is time-bounded (ring.md): a phantom whose downstream keeps RENEWING never
+    /// hits the Fix-6 downstream-expiry prune, so once it is older than
+    /// [`PHANTOM_ABSOLUTE_MAX_AGE`] the sweep emits a [`PhantomRepair::Drop`]
+    /// (review Fix C). That drop is safe and non-cycling because a
+    /// re-registration must go through `finalize_host_subscribe` (fetch-first),
+    /// which registers NOTHING while the state stays unfetchable. Below the age
+    /// bound the sweep survives as a rollout net for phantoms left by pre-upgrade
+    /// peers; the downstream peer's own lease expiry / renewal may re-root it.
     ///
     /// Decisions are level-triggered against the state store: a contract
     /// whose state appears (this sweep's fetch, an inbound UPDATE auto-fetch,
@@ -1808,25 +1838,33 @@ impl HostingManager {
             use dashmap::mapref::entry::Entry;
             match self.phantom_repair.entry(key) {
                 Entry::Occupied(mut e) => {
+                    if e.get().attempts >= MAX_PHANTOM_REPAIR_ATTEMPTS {
+                        // Repair attempts exhausted. The #4770 cycling Drop stays
+                        // NEUTRALIZED for the common case (step 10 §1c): with the
+                        // register-after-state fix a genuine phantom is
+                        // unrepresentable, so an immediate drop would only churn.
+                        // BUT the exemption must be time-bounded (ring.md): a
+                        // phantom whose downstream keeps RENEWING never hits the
+                        // Fix-6 downstream-expiry prune, so once it is older than
+                        // PHANTOM_ABSOLUTE_MAX_AGE we DROP it (review Fix C). This
+                        // is safe and non-cycling because a re-registration goes
+                        // through finalize_host_subscribe (fetch-first) — while the
+                        // state stays unfetchable it registers NOTHING, so the
+                        // phantom cannot re-form.
+                        if now.duration_since(e.get().first_seen) >= PHANTOM_ABSOLUTE_MAX_AGE {
+                            e.remove();
+                            actions.push(PhantomRepair::Drop(key));
+                        }
+                        // Under the absolute-age bound: STOP fetching, do not drop
+                        // (the downstream's own lease expiry / renewal may re-root
+                        // it, or a later fetch could still succeed).
+                        continue;
+                    }
                     let entry = e.get_mut();
                     if now.duration_since(entry.last_attempt) < PHANTOM_REPAIR_COOLDOWN {
                         continue;
                     }
-                    if entry.attempts >= MAX_PHANTOM_REPAIR_ATTEMPTS {
-                        // #4770 Drop arm NEUTRALIZED (step 10 §1c). After the
-                        // register-after-state fix (a downstream registration
-                        // only exists once state was actually held), a genuine
-                        // phantom is unrepresentable, so dropping the registration
-                        // would only churn (gen-d eviction teardown re-registers →
-                        // register/drop cycling). Keep only the bounded Fetch
-                        // sweep as a rollout net for phantoms left by pre-upgrade
-                        // peers; once attempts are exhausted we STOP fetching but
-                        // never drop — the downstream peer's own lease expiry /
-                        // renewal re-roots it. A future bounded drop, if wanted,
-                        // must be gated behind a persistent tombstone with backoff
-                        // past SUBSCRIPTION_LEASE_DURATION.
-                        continue;
-                    } else if fetches < max_fetches {
+                    if fetches < max_fetches {
                         entry.attempts += 1;
                         entry.last_attempt = now;
                         fetches += 1;
@@ -1838,6 +1876,7 @@ impl HostingManager {
                         slot.insert(PhantomRepairEntry {
                             attempts: 1,
                             last_attempt: now,
+                            first_seen: now,
                         });
                         fetches += 1;
                         actions.push(PhantomRepair::Fetch(key));
@@ -1847,6 +1886,30 @@ impl HostingManager {
         }
 
         actions
+    }
+
+    /// Drop the downstream-subscriber registration for an
+    /// absolute-age-exhausted phantom contract (review Fix C — the state stayed
+    /// unfetchable past `PHANTOM_ABSOLUTE_MAX_AGE` while the downstream kept
+    /// renewing). Returns the number of removed subscriber entries so the caller
+    /// can decrement the interest manager symmetrically (one
+    /// `remove_downstream_subscriber` per entry), then collapse upstream.
+    /// Non-cycling: a re-registration must go through `finalize_host_subscribe`
+    /// (fetch-first), which registers nothing while state is unfetchable.
+    pub(crate) fn drop_phantom_downstream(&self, key: &ContractKey) -> usize {
+        let removed = self
+            .downstream_subscribers
+            .remove(key)
+            .map(|(_, peers)| peers.len())
+            .unwrap_or(0);
+        if removed > 0 {
+            // Same as lease expiry: the contract may have just transitioned to
+            // no-longer-in-use — reset recency so the next over-budget sweep does
+            // not shed it for an old last-read.
+            self.maybe_record_abandonment(key);
+        }
+        self.phantom_repair.remove(key);
+        removed
     }
 
     // =========================================================================
@@ -4986,6 +5049,71 @@ mod tests {
             vec![PhantomRepair::Fetch(phantom)],
             "a re-registered downstream starts a fresh repair cycle, not stuck-exhausted"
         );
+    }
+
+    /// Fix C regression: the Fix-6 prune only fires when the downstream EXPIRES.
+    /// A phantom whose downstream keeps RENEWING (lease refreshable) would
+    /// otherwise be a permanent GC blind spot + advertised dead-end. The
+    /// exhausted-phantom exemption is now absolute-age-bounded: once the phantom
+    /// exceeds `PHANTOM_ABSOLUTE_MAX_AGE` the sweep DROPS it, even though its
+    /// downstream is still registered. Non-cycling because a re-registration goes
+    /// through `finalize_host_subscribe` (fetch-first).
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn exhausted_phantom_dropped_after_absolute_age_bound() {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::contract::storages::ReDb::new(temp_dir.path())
+            .await
+            .unwrap();
+        manager.set_storage(storage);
+
+        let peer = make_peer_key(14);
+        let phantom = make_contract_key(91);
+        manager.add_downstream_subscriber(&phantom, peer.clone());
+
+        // Exhaust the repair attempts (~4 × 60s, well under the 32-min bound).
+        assert_eq!(
+            manager.reconcile_phantom_in_use(8),
+            vec![PhantomRepair::Fetch(phantom)]
+        );
+        for _ in 2..=MAX_PHANTOM_REPAIR_ATTEMPTS {
+            clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
+            assert_eq!(
+                manager.reconcile_phantom_in_use(8),
+                vec![PhantomRepair::Fetch(phantom)]
+            );
+        }
+        clock.advance_time(PHANTOM_REPAIR_COOLDOWN + Duration::from_secs(1));
+        // Exhausted but still YOUNG: NOT dropped (the downstream keeps renewing so
+        // the Fix-6 downstream-expiry prune never fires).
+        assert!(
+            manager.reconcile_phantom_in_use(8).is_empty(),
+            "a young exhausted phantom is not dropped (only fetching stops)"
+        );
+        assert!(manager.contract_in_use(&phantom));
+
+        // The downstream keeps renewing (refresh its lease) so it never expires.
+        manager.add_downstream_subscriber(&phantom, peer);
+        // Age crosses the absolute bound.
+        clock.advance_time(PHANTOM_ABSOLUTE_MAX_AGE + Duration::from_secs(1));
+        assert_eq!(
+            manager.reconcile_phantom_in_use(8),
+            vec![PhantomRepair::Drop(phantom)],
+            "an exhausted phantom older than PHANTOM_ABSOLUTE_MAX_AGE is dropped even while \
+             its downstream keeps renewing (review Fix C — the exemption is time-bounded)"
+        );
+        // Applying the drop clears contract_in_use and removes the tracking.
+        assert_eq!(manager.drop_phantom_downstream(&phantom), 1);
+        assert!(
+            !manager.contract_in_use(&phantom),
+            "dropping the aged phantom clears contract_in_use"
+        );
+        assert!(manager.phantom_repair.get(&phantom).is_none());
     }
 
     /// Behavioural regression for the step-10 §1d phantom falsifier gauge:

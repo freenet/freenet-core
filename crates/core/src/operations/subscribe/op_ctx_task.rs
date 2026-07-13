@@ -1664,16 +1664,36 @@ async fn drive_relay_subscribe(
     )
     .await?
     {
-        // Register the subscribing peer as a downstream subscriber and become a
-        // real subscribed host. register-after-state (step 10 §1b): this is the
-        // local-hit arm — `wait_for_contract_with_timeout` returned Some, so the
-        // contract's state is already present. `finalize_host_subscribe` fetches
-        // (a no-op here), registers the requester as our downstream, installs our
-        // own subscription lease, and announces hosting — it can never leave a
-        // phantom. The relay driver path does not know the requester's
-        // `TransportPublicKey`; the addr-based fallback in
-        // `register_downstream_subscriber` is adequate for relay hops where the
-        // upstream is a direct connection.
+        tracing::info!(
+            tx = %incoming_tx,
+            contract = %key,
+            is_renewal,
+            phase = "relay_subscribe_local_hit",
+            "SUBSCRIBE relay: fulfilled locally, sending Response"
+        );
+        // Local-hit storer arm: this node hosts the contract.
+        // hop_count = max_htl - htl_we_received.
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+        // Forward-Upstream-Before-Contract-Handling-Work (Fix A / operations.md):
+        // send the Subscribed ACK upstream FIRST, THEN become a real subscribed
+        // host. `finalize_host_subscribe` registers the requester as our downstream,
+        // installs our own subscription lease, and announces hosting (register-
+        // after-state — it fetches first, a no-op here since state is present, so
+        // it can never leave a phantom). Deferring it past the send keeps any
+        // contract-handling work off the upstream critical path (uniform with the
+        // forwarded path, where the fetch can take up to CONTRACT_WAIT_TIMEOUT_MS
+        // and must not stack across a multi-hop chain). The relay driver path does
+        // not know the requester's `TransportPublicKey`; the addr-based fallback in
+        // `register_downstream_subscriber` is adequate for relay hops.
+        let send_result = relay_subscribe_send_response(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            SubscribeMsgResult::Subscribed { key },
+            upstream_addr,
+            hop_count,
+        )
+        .await;
         super::finalize_host_subscribe(
             op_manager,
             key,
@@ -1686,26 +1706,7 @@ async fn drive_relay_subscribe(
             " (driver relay local hit)",
         )
         .await;
-
-        tracing::info!(
-            tx = %incoming_tx,
-            contract = %key,
-            is_renewal,
-            phase = "relay_subscribe_local_hit",
-            "SUBSCRIBE relay: fulfilled locally, sending Response"
-        );
-        // Local-hit storer arm: this node hosts the contract.
-        // hop_count = max_htl - htl_we_received.
-        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
-        return relay_subscribe_send_response(
-            op_manager,
-            incoming_tx,
-            instance_id,
-            SubscribeMsgResult::Subscribed { key },
-            upstream_addr,
-            hop_count,
-        )
-        .await;
+        return send_result;
     }
 
     // ── Step 2: HTL / candidate selection ────────────────────────────────
@@ -1821,7 +1822,6 @@ async fn drive_relay_subscribe(
         is_renewal,
         next_hop,
         next_addr,
-        upstream_addr,
     )
     .await;
 
@@ -1843,68 +1843,87 @@ async fn drive_relay_subscribe(
     // succeeds (below), never here — a consult that subscribed but whose
     // fire-and-forget reply then fails leaves the requester to time out, so it
     // did NOT close the dead-end (Codex P2 — record after delivery).
-    let (result, bubble_hop_count, consult_outcome): (SubscribeMsgResult, usize, Option<bool>) =
-        match outcome {
-            SubscribeForwardOutcome::Subscribed { key, hop_count } => {
-                (SubscribeMsgResult::Subscribed { key }, hop_count, None)
-            }
-            SubscribeForwardOutcome::NotFound { hop_count } => {
-                let visited_snapshot = new_visited.clone();
-                let consult = crate::operations::consult_advertised_hosts(
-                    op_manager,
-                    &instance_id,
-                    TERMINAL_CONSULT_HOSTS,
-                    move |addr| visited_snapshot.probably_visited(addr),
-                );
-                match consult.into_iter().next() {
-                    Some((consult_hop, consult_addr)) => {
-                        new_visited.mark_visited(consult_addr);
-                        tracing::debug!(
-                            tx = %incoming_tx,
-                            %instance_id,
-                            target = %consult_addr,
-                            "SUBSCRIBE relay: consulting advertised host off routing path after \
-                             downstream NotFound"
-                        );
-                        let consult_outcome = relay_subscribe_forward_once(
-                            op_manager,
-                            incoming_tx,
-                            instance_id,
-                            htl,
-                            &new_visited,
-                            is_renewal,
-                            consult_hop,
-                            consult_addr,
-                            upstream_addr,
-                        )
-                        .await;
-                        match consult_outcome {
-                            SubscribeForwardOutcome::Subscribed { key, hop_count } => (
-                                SubscribeMsgResult::Subscribed { key },
-                                hop_count,
-                                Some(true),
-                            ),
-                            SubscribeForwardOutcome::NotFound { hop_count }
-                            | SubscribeForwardOutcome::Failed { hop_count } => {
-                                (SubscribeMsgResult::NotFound, hop_count, Some(false))
-                            }
+    // `finalize_info` (Fix A): the `(key, responder)` to run host-formation with
+    // AFTER the Subscribed ACK is bubbled upstream. `None` when the outcome was
+    // not Subscribed (nothing to become a host of).
+    #[allow(clippy::type_complexity)]
+    let (result, bubble_hop_count, consult_outcome, finalize_info): (
+        SubscribeMsgResult,
+        usize,
+        Option<bool>,
+        Option<(freenet_stdlib::prelude::ContractKey, PeerKeyLocation)>,
+    ) = match outcome {
+        SubscribeForwardOutcome::Subscribed {
+            key,
+            hop_count,
+            responder,
+        } => (
+            SubscribeMsgResult::Subscribed { key },
+            hop_count,
+            None,
+            Some((key, responder)),
+        ),
+        SubscribeForwardOutcome::NotFound { hop_count } => {
+            let visited_snapshot = new_visited.clone();
+            let consult = crate::operations::consult_advertised_hosts(
+                op_manager,
+                &instance_id,
+                TERMINAL_CONSULT_HOSTS,
+                move |addr| visited_snapshot.probably_visited(addr),
+            );
+            match consult.into_iter().next() {
+                Some((consult_hop, consult_addr)) => {
+                    new_visited.mark_visited(consult_addr);
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        %instance_id,
+                        target = %consult_addr,
+                        "SUBSCRIBE relay: consulting advertised host off routing path after \
+                         downstream NotFound"
+                    );
+                    let consult_outcome = relay_subscribe_forward_once(
+                        op_manager,
+                        incoming_tx,
+                        instance_id,
+                        htl,
+                        &new_visited,
+                        is_renewal,
+                        consult_hop,
+                        consult_addr,
+                    )
+                    .await;
+                    match consult_outcome {
+                        SubscribeForwardOutcome::Subscribed {
+                            key,
+                            hop_count,
+                            responder,
+                        } => (
+                            SubscribeMsgResult::Subscribed { key },
+                            hop_count,
+                            Some(true),
+                            Some((key, responder)),
+                        ),
+                        SubscribeForwardOutcome::NotFound { hop_count }
+                        | SubscribeForwardOutcome::Failed { hop_count } => {
+                            (SubscribeMsgResult::NotFound, hop_count, Some(false), None)
                         }
                     }
-                    None => {
-                        // No advertised host to try: the downstream NotFound stands.
-                        (SubscribeMsgResult::NotFound, hop_count, Some(false))
-                    }
+                }
+                None => {
+                    // No advertised host to try: the downstream NotFound stands.
+                    (SubscribeMsgResult::NotFound, hop_count, Some(false), None)
                 }
             }
-            SubscribeForwardOutcome::Failed { hop_count } => {
-                // The greedy routing forward received NO reply (timeout / send
-                // failure / unexpected variant). Consulting would install a new
-                // waiter on the reused tx that a late reply from the timed-out
-                // peer could satisfy (Codex P2), so bubble NotFound WITHOUT
-                // consulting — the same outcome as before the consult existed.
-                (SubscribeMsgResult::NotFound, hop_count, None)
-            }
-        };
+        }
+        SubscribeForwardOutcome::Failed { hop_count } => {
+            // The greedy routing forward received NO reply (timeout / send
+            // failure / unexpected variant). Consulting would install a new
+            // waiter on the reused tx that a late reply from the timed-out
+            // peer could satisfy (Codex P2), so bubble NotFound WITHOUT
+            // consulting — the same outcome as before the consult existed.
+            (SubscribeMsgResult::NotFound, hop_count, None, None)
+        }
+    };
 
     let send_result = relay_subscribe_send_response(
         op_manager,
@@ -1915,6 +1934,27 @@ async fn drive_relay_subscribe(
         bubble_hop_count,
     )
     .await;
+
+    // Forward-Upstream-Before-Contract-Handling-Work (Fix A / operations.md):
+    // become a real subscribed host ONLY AFTER the Subscribed ACK is on the wire.
+    // `finalize_host_subscribe` fetches the body via the `responder` directed
+    // target (register-after-state), registers the requester as our downstream,
+    // installs our lease, and announces — on fetch-fail it registers NOTHING (no
+    // phantom). Deferring it past the send keeps the ≤ CONTRACT_WAIT_TIMEOUT_MS
+    // fetch off the upstream critical path so multi-hop chains don't stack
+    // timeouts.
+    if let Some((key, responder)) = finalize_info {
+        super::finalize_host_subscribe(
+            op_manager,
+            key,
+            upstream_addr,
+            Some(upstream_addr),
+            Some(responder),
+            &incoming_tx,
+            " (driver relay registration on Response)",
+        )
+        .await;
+    }
 
     // Record the terminal-consult outcome only AFTER the upstream response
     // send: a consult that subscribed but whose reply failed to send did NOT
@@ -1931,11 +1971,17 @@ async fn drive_relay_subscribe(
 /// decide whether to fall back to the terminal advertisement consult
 /// (hosting redesign piece C).
 enum SubscribeForwardOutcome {
-    /// Downstream (or a consulted host) subscribed us; the requester was
-    /// already registered as a downstream subscriber.
+    /// Downstream (or a consulted host) subscribed us. Host-formation
+    /// (`finalize_host_subscribe`: fetch → register the requester as our
+    /// downstream → announce) is DEFERRED to the caller and runs AFTER the
+    /// Subscribed ACK is bubbled upstream (Fix A), so the fetch never stalls the
+    /// upstream forward. `responder` is the peer that answered Subscribed (it
+    /// holds the body) — the directed fetch target passed to
+    /// `finalize_host_subscribe`.
     Subscribed {
         key: freenet_stdlib::prelude::ContractKey,
         hop_count: usize,
+        responder: PeerKeyLocation,
     },
     /// Downstream cleanly answered NotFound (a reply WAS received). Safe to
     /// fall back to the terminal advertisement consult on the reused tx.
@@ -1947,13 +1993,14 @@ enum SubscribeForwardOutcome {
 }
 
 /// Forward a `SubscribeMsg::Request` to a single target, await the reply, and
-/// classify it into [`SubscribeForwardOutcome`]. Registers the requester as a
-/// downstream subscriber on a Subscribed reply (mirroring legacy
-/// `subscribe.rs:1690`; does NOT call `ring.subscribe` /
-/// `announce_contract_hosted` — a relay is not itself a subscriber, which
-/// prevents the #3763 storm) and feeds the router the observed outcome. Does
-/// NOT bubble upstream — the caller owns that and may retry via the consult
-/// on a NotFound.
+/// classify it into [`SubscribeForwardOutcome`]. On a Subscribed reply it
+/// carries the responding `next_hop` out as `SubscribeForwardOutcome::Subscribed
+/// { responder }` so the CALLER can run host-formation (`finalize_host_subscribe`)
+/// AFTER bubbling the ACK upstream (Fix A) — this function does NOT itself
+/// register, subscribe, or announce (avoiding the #3763 storm and keeping the
+/// ≤2s body fetch off the upstream critical path). Feeds the router the observed
+/// outcome. Does NOT bubble upstream — the caller owns that and may retry via the
+/// consult on a NotFound.
 #[allow(clippy::too_many_arguments)]
 async fn relay_subscribe_forward_once(
     op_manager: &Arc<OpManager>,
@@ -1964,7 +2011,6 @@ async fn relay_subscribe_forward_once(
     is_renewal: bool,
     next_hop: PeerKeyLocation,
     next_addr: std::net::SocketAddr,
-    upstream_addr: std::net::SocketAddr,
 ) -> SubscribeForwardOutcome {
     let new_htl = htl.saturating_sub(1);
     // Forward-failure / unexpected-variant depth for THIS relay.
@@ -2059,35 +2105,16 @@ async fn relay_subscribe_forward_once(
             hop_count: downstream_hop_count,
             ..
         })) => {
-            // register-after-state (step 10 §1b): the downstream answered
-            // `Subscribed`, but THIS hop forwarded because it did NOT hold the
-            // contract (the local-hit fast path above missed), so registering the
-            // requester now would create a phantom (contract_in_use && !state) —
-            // the dominant #4404/#4612 generator. `finalize_host_subscribe`
-            // fetches the body FIRST and registers the downstream (plus installs
-            // our own lease + announces) only if it lands, becoming a real
-            // subscribed host; on fetch-fail it registers NOTHING and we still
-            // bubble `Subscribed` upstream, so the chain hole heals on the
-            // requester's next renewal (D-ORDER). This adds a bounded fetch wait
-            // (≤ CONTRACT_WAIT_TIMEOUT_MS) to this legacy standalone-SUBSCRIBE
-            // relay path only, which PR 2 retires.
-            super::finalize_host_subscribe(
-                op_manager,
-                key,
-                upstream_addr,
-                Some(upstream_addr),
-                // Fetch the body THROUGH the downstream that just answered
-                // `Subscribed` (`next_hop`) — it holds the body, so this cannot
-                // dead-end at a closer non-hosting peer the way a greedy fetch
-                // toward the key could (review Fix 4). Without this the hop could
-                // register nothing yet still bubble `Subscribed` upstream,
-                // leaving a chain hole that drops updates.
-                Some(next_hop.clone()),
-                &incoming_tx,
-                " (driver relay registration on Response)",
-            )
-            .await;
-
+            // Host-formation is DEFERRED to the caller (Fix A): it bubbles this
+            // `Subscribed` upstream FIRST, THEN calls `finalize_host_subscribe`
+            // (fetch the body via the `responder` directed target → register the
+            // requester as our downstream → announce; register-after-state, on
+            // fetch-fail registers NOTHING so no phantom). Running the ≤2s fetch
+            // here — before the upstream forward — would stall the ACK and stack
+            // ~20s across a 10-hop chain (operations.md forward-before-contract-
+            // handling invariant). THIS hop forwarded because it did NOT hold the
+            // contract, so it becomes a real host only after fetching from the
+            // responder that just proved it holds the body.
             tracing::info!(
                 tx = %incoming_tx,
                 contract = %key,
@@ -2096,7 +2123,7 @@ async fn relay_subscribe_forward_once(
             );
             crate::operations::record_relay_route_event(
                 op_manager,
-                next_hop,
+                next_hop.clone(),
                 crate::ring::Location::from(&key),
                 crate::router::RouteOutcome::SuccessUntimed,
                 crate::node::network_status::OpType::Subscribe,
@@ -2104,6 +2131,7 @@ async fn relay_subscribe_forward_once(
             SubscribeForwardOutcome::Subscribed {
                 key,
                 hop_count: downstream_hop_count,
+                responder: next_hop,
             }
         }
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
@@ -3070,29 +3098,89 @@ mod tests {
     #[test]
     fn relay_subscribe_forwarded_finalize_passes_directed_holder() {
         let src = include_str!("op_ctx_task.rs");
+        // Fix A moved the forwarded-path finalize OUT of relay_subscribe_forward_once
+        // and INTO drive_relay_subscribe, AFTER the upstream send. It runs on the
+        // `finalize_info = Some((key, responder))` captured from the outcome, and
+        // passes that `responder` as the directed fetch holder.
         let start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let end = src[start..]
+            .find("\nasync fn relay_subscribe_forward_once(")
+            .map(|off| start + off)
+            .expect("relay_subscribe_forward_once anchor must follow drive_relay_subscribe");
+        let body = &src[start..end];
+        // The forwarded finalize (guarded by `if let Some((key, responder))`) must
+        // pass `Some(responder)` as the directed holder, NOT a greedy `None`.
+        assert!(
+            body.contains("Some(responder)"),
+            "the forwarded finalize_host_subscribe (post-send, in drive_relay_subscribe) must \
+             pass Some(responder) — the peer that just answered Subscribed — as the directed \
+             fetch holder (review Fix 4), not a greedy None"
+        );
+        // The responder is carried out of the forward via the Subscribed outcome.
+        let fwd_start = src
             .find("async fn relay_subscribe_forward_once(")
             .expect("relay_subscribe_forward_once not found");
-        let end = src[start..]
+        let fwd_end = src[fwd_start..]
             .find("\nasync fn relay_subscribe_send_response(")
-            .map(|off| start + off)
+            .map(|off| fwd_start + off)
             .expect("relay_subscribe_send_response anchor must follow forward_once");
-        let body = &src[start..end];
-        let call = body
-            .find("finalize_host_subscribe(")
-            .expect("forwarded relay path must call finalize_host_subscribe");
-        // Scan the finalize call's argument list (up to its `.await`) for the
-        // directed holder derived from the responding next hop.
-        let call_end = body[call..]
-            .find(".await")
-            .map(|off| call + off)
-            .expect("finalize_host_subscribe call must be awaited");
-        let args = &body[call..call_end];
+        let fwd = &src[fwd_start..fwd_end];
         assert!(
-            args.contains("Some(next_hop"),
-            "the forwarded finalize_host_subscribe must pass Some(next_hop...) as the \
-             directed fetch holder so the body fetch reaches the peer that just answered \
-             Subscribed (review Fix 4), not a greedy None"
+            fwd.contains("responder: next_hop"),
+            "relay_subscribe_forward_once must carry the responding `next_hop` out in the \
+             Subscribed outcome so the deferred finalize can direct its fetch through it"
+        );
+    }
+
+    /// Pin (review Fix A / operations.md "Forward Upstream Before Contract-Handling
+    /// Work on Relay Paths"): both SUBSCRIBE relay arms (local-hit and forwarded)
+    /// must send the `Subscribed` ACK upstream BEFORE calling
+    /// `finalize_host_subscribe`. `finalize_host_subscribe`'s body fetch can take
+    /// up to `CONTRACT_WAIT_TIMEOUT_MS`; running it before the upstream forward
+    /// would stall the ACK and stack ~20s across a 10-hop chain. Analogous to
+    /// GET's `relay_driver_forwards_upstream_before_caching_on_found_response`.
+    #[test]
+    fn relay_subscribe_forwards_response_before_finalize_host_subscribe() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_subscribe(")
+            .expect("drive_relay_subscribe not found");
+        let end = src[start..]
+            .find("\nasync fn relay_subscribe_forward_once(")
+            .map(|off| start + off)
+            .expect("relay_subscribe_forward_once anchor must follow drive_relay_subscribe");
+        let body = &src[start..end];
+        let sends: Vec<usize> = body
+            .match_indices("relay_subscribe_send_response(")
+            .map(|(i, _)| i)
+            .collect();
+        let finals: Vec<usize> = body
+            .match_indices("finalize_host_subscribe(")
+            .map(|(i, _)| i)
+            .collect();
+        // Both finalizes live in drive_relay_subscribe (the forwarded one is
+        // post-send here, NOT inside relay_subscribe_forward_once). Reverting the
+        // forwarded arm to finalize-inside-forward_once drops this to 1.
+        assert_eq!(
+            finals.len(),
+            2,
+            "drive_relay_subscribe must finalize on exactly the local-hit and forwarded arms, \
+             both AFTER the send (found {}) — a forward-arm regression moves it back into \
+             relay_subscribe_forward_once",
+            finals.len()
+        );
+        // Local-hit: the first send precedes the first finalize.
+        assert!(
+            sends[0] < finals[0],
+            "the local-hit arm must send the Subscribed ACK before finalize_host_subscribe (Fix A)"
+        );
+        // Forwarded: a send occurs between the two finalizes (the forward-path send
+        // precedes the forward-path finalize).
+        assert!(
+            sends.iter().any(|&s| s > finals[0] && s < finals[1]),
+            "the forwarded arm must send the Subscribed ACK before finalize_host_subscribe (Fix A)"
         );
     }
 

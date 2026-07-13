@@ -783,7 +783,14 @@ pub(super) async fn finalize_host_subscribe(
     )
     .await;
     op_manager.ring.subscribe(key);
-    op_manager.ring.complete_subscription_request(&key, true);
+    // NOTE (review Fix B): do NOT call `complete_subscription_request` here. That
+    // clears the node-wide per-contract pending-subscription dedup slot and
+    // records backoff success — but a RELAY never CLAIMED that slot
+    // (`mark_subscription_pending` is called only by the client-subscribe /
+    // renewal / re-root drivers, not the relay path). Releasing it here would
+    // free a concurrent LOCAL renewal/re-root's dedup slot early and overwrite
+    // its retry state → duplicate renewals / masked failures. It is correct only
+    // in `finalize_originator_subscribe`, where the originator DID claim the slot.
     // Announce backstop, gated on have_body. `fetch_contract_if_missing`'s own
     // cache path already announces on a first-time store; `announce_contract_hosted`
     // is one-shot (dedup via `neighbor_hosting.rs`'s `my_contracts` DashSet), so a
