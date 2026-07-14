@@ -117,11 +117,21 @@
 
   // "Move to my peer" — the zero-friction magic-link migration (#4592). Mints a
   // one-time pull token on this hosted node (authorized by the shell-only user
-  // token) and builds a link the user opens on their OWN peer, which then pulls
-  // the data over HTTPS and imports it. The durable access key never leaves this
-  // browser: the bundle is sealed under a fresh ephemeral key held server-side.
+  // token) and sends the user to the import confirmation page on their OWN peer,
+  // which then pulls the data over HTTPS and imports it. The durable access key
+  // never leaves this browser: the bundle is sealed under a fresh ephemeral key
+  // held server-side.
+  //
+  // The DEFAULT is one click: we navigate straight to the peer's import page
+  // (top-level navigation to the loopback peer is exempt from mixed-content and
+  // CORS, and that page still requires an explicit "Import" click, so there is
+  // no drive-by risk). Copy-the-URL stays as a SECONDARY option for a peer on a
+  // different computer/browser/profile. Not everyone's peer is on this machine,
+  // but making the common case one click is the whole point — "why create
+  // friction for a behavior we want the user to do?".
   var migrateOut = document.getElementById('fnmigrateout');
   var migrateLink = document.getElementById('fnmigratelink');
+  var migrateOpen = document.getElementById('fnmigrateopen');
   var migrateMsg = document.getElementById('fnmigratemsg');
   // Default local-peer web/ws-api port (the freenet config default, see
   // config.rs default_ws_api_port). Overriding a non-default local port is a
@@ -132,12 +142,36 @@
     if (migrateMsg) migrateMsg.textContent = m || '';
   }
 
+  function buildMigrateLink(pt) {
+    return (
+      'http://127.0.0.1:' +
+      LOCAL_PEER_PORT +
+      '/hosted/import?source=' +
+      encodeURIComponent(window.location.origin) +
+      '&pt=' +
+      encodeURIComponent(pt)
+    );
+  }
+
   document.getElementById('fnmigrate').addEventListener('click', function () {
     var t =
       typeof __freenet_user_token !== 'undefined' ? __freenet_user_token : null;
     if (!t) {
       setOk('No key on this connection');
       return;
+    }
+    // Open the destination tab SYNCHRONOUSLY inside the click gesture so the
+    // popup isn't blocked, then point it at the link once minted. (window.open
+    // after the async mint resolves would be treated as programmatic and
+    // blocked.) If the browser still blocks it, peerWin is null and the
+    // revealed "Open on my peer" link is a direct one-click fallback.
+    var peerWin = null;
+    try {
+      peerWin = window.open('', '_blank');
+      // sever reverse-tabnabbing back-ref; persists across the later navigation
+      if (peerWin) peerWin.opener = null;
+    } catch (e) {
+      peerWin = null;
     }
     setMigrateMsg('Preparing your one-time migration link...');
     fetch('/v1/hosted/migrate/mint', {
@@ -155,18 +189,26 @@
         if (!pt) {
           throw new Error('no token');
         }
-        var link =
-          'http://127.0.0.1:' +
-          LOCAL_PEER_PORT +
-          '/hosted/import?source=' +
-          encodeURIComponent(window.location.origin) +
-          '&pt=' +
-          encodeURIComponent(pt);
+        var link = buildMigrateLink(pt);
         if (migrateLink) migrateLink.value = link;
+        if (migrateOpen) migrateOpen.href = link;
         if (migrateOut) migrateOut.hidden = false;
-        setMigrateMsg('One-time link ready. It expires in a few minutes.');
+        if (peerWin && !peerWin.closed) {
+          // One click: send the tab we opened to the peer's import page.
+          peerWin.location = link;
+          setMigrateMsg(
+            "Opening the import page on your peer. Didn't open? Use " +
+              '"Open on my peer" below.',
+          );
+        } else {
+          setMigrateMsg('One-time link ready. Click "Open on my peer".');
+        }
       })
       .catch(function (e) {
+        // Don't strand a blank tab if minting failed.
+        if (peerWin && !peerWin.closed) {
+          peerWin.close();
+        }
         setMigrateMsg('Could not prepare a link (' + e.message + ')');
       });
   });
