@@ -55,6 +55,7 @@ use crate::operations::VisitedPeers;
 use crate::operations::bootstrap::bootstrap_gateway_target;
 use crate::ring::{Location, PeerKeyLocation};
 use crate::router::{RouteEvent, RouteOutcome};
+use crate::tracing::GetTerminalOutcome;
 use crate::transport::peer_connection::StreamId;
 
 use super::{GetMsg, GetMsgResult, GetStreamingPayload};
@@ -235,6 +236,73 @@ enum DriverOutcome {
     InfrastructureError(OpError),
 }
 
+/// Map a GET that reached a terminal reply to its client-visible outcome.
+///
+/// `host_ok` is whether state was actually delivered to the client. A
+/// terminal header that then failed local assembly / store re-query (e.g.
+/// streaming assembly exhausting its retry budget, #4345) delivered
+/// nothing, so it is reported as `TimeoutExhausted` — the `streamed` flag
+/// on the emitted event distinguishes a streaming-delivery exhaustion from
+/// a routing timeout.
+fn done_terminal_outcome(host_ok: bool) -> GetTerminalOutcome {
+    if host_ok {
+        GetTerminalOutcome::Success
+    } else {
+        GetTerminalOutcome::TimeoutExhausted
+    }
+}
+
+/// Map a GET whose retry loop exhausted (no terminal reply reached) to its
+/// client-visible outcome: a definitive NotFound from at least one
+/// reachable peer is `NotFound`; otherwise the budget was burned by
+/// timeouts / unroutable attempts (`TimeoutExhausted`).
+fn exhausted_terminal_outcome(saw_not_found: bool) -> GetTerminalOutcome {
+    if saw_not_found {
+        GetTerminalOutcome::NotFound
+    } else {
+        GetTerminalOutcome::TimeoutExhausted
+    }
+}
+
+/// Emit the authoritative client-visible GET terminal telemetry event
+/// (exactly one per client GET op, one per sub-op GET) via the same
+/// `register_events` path the driver already uses for `RouteEvent`.
+///
+/// `is_sub_op` is passed EXPLICITLY by the caller rather than derived from
+/// `tx.is_sub_operation()`: the sub-op GET drivers construct their tx via
+/// `Transaction::new` (not `new_child_of`), so `is_sub_operation()` alone
+/// under-reports them. Callers OR-in `tx.is_sub_operation()` so a client tx
+/// that is itself a child is still flagged.
+#[allow(clippy::too_many_arguments)]
+async fn emit_get_terminal_event(
+    op_manager: &OpManager,
+    tx: Transaction,
+    instance_id: ContractInstanceId,
+    key: Option<ContractKey>,
+    outcome: GetTerminalOutcome,
+    streamed: bool,
+    is_sub_op: bool,
+    attempts: usize,
+    hop_count: Option<usize>,
+) {
+    if let Some(log_event) = crate::tracing::NetEventLog::get_terminal(
+        &tx,
+        &op_manager.ring,
+        instance_id,
+        key,
+        outcome,
+        streamed,
+        is_sub_op,
+        attempts,
+        hop_count,
+    ) {
+        op_manager
+            .ring
+            .register_events(either::Either::Left(log_event))
+            .await;
+    }
+}
+
 async fn drive_client_get(
     op_manager: Arc<OpManager>,
     client_tx: Transaction,
@@ -321,6 +389,7 @@ async fn drive_client_get_inner(
         attempt_visited: VisitedPeers::new(&client_tx),
         request_sent_at: None,
         response_received_at: None,
+        saw_not_found: false,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -536,6 +605,29 @@ async fn drive_client_get_inner(
                 host_result.is_ok(),
             );
 
+            // Authoritative client-visible terminal event (issue: streaming
+            // GETs emit no `get_success`). Captures streaming (> 64 KB)
+            // successes the inline `register.rs` path misses because they
+            // arrive as `ResponseStreaming`. `streamed` is true only for the
+            // streaming terminal; `hop_count` is carried only by InlineFound.
+            let streamed = matches!(terminal, Terminal::Streaming { .. });
+            let hop_count = match &terminal {
+                Terminal::InlineFound { hop_count, .. } => Some(*hop_count),
+                Terminal::Streaming { .. } | Terminal::LocalCompletion => None,
+            };
+            emit_get_terminal_event(
+                op_manager,
+                client_tx,
+                instance_id,
+                Some(reply_key),
+                done_terminal_outcome(host_result.is_ok()),
+                streamed,
+                client_tx.is_sub_operation(),
+                driver.retries + 1,
+                hop_count,
+            )
+            .await;
+
             // Explicit-subscribe hand-off. Mirrors PUT 3a's
             // `maybe_subscribe_child` — subscribe is never handled in
             // the terminal-result construction to avoid double-subscribe
@@ -571,6 +663,22 @@ async fn drive_client_get_inner(
                 %cause,
                 "GET client: retry loop exhausted — returning NotFound to client"
             );
+            // Terminal event for the previously-silent exhaustion path
+            // (only a `tracing::info!` fired before). `not_found` vs
+            // `timeout_exhausted` is distinguished by whether any reachable
+            // peer answered NotFound (`driver.saw_not_found`).
+            emit_get_terminal_event(
+                op_manager,
+                client_tx,
+                instance_id,
+                None,
+                exhausted_terminal_outcome(driver.saw_not_found),
+                false,
+                client_tx.is_sub_operation(),
+                driver.retries + 1,
+                None,
+            )
+            .await;
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
             ))))
@@ -603,6 +711,14 @@ struct GetRetryDriver<'a> {
     /// outcomes (Retry / Unexpected) leave it untouched and the next
     /// `build_request` overwrites `request_sent_at`.
     response_received_at: Option<tokio::time::Instant>,
+    /// Set once any attempt classified a reply as a definitive
+    /// `GetMsg::Response{NotFound}`. Used by the terminal-telemetry event
+    /// to distinguish a genuine `not_found` (a reachable peer answered
+    /// NotFound) from a `timeout_exhausted` (the budget was burned by
+    /// timeouts / unroutable attempts) when the retry loop exhausts —
+    /// the `RetryLoopOutcome::Exhausted` string does not carry that
+    /// structural distinction.
+    saw_not_found: bool,
 }
 
 /// Terminal value for the GET driver.
@@ -775,6 +891,15 @@ impl RetryDriver for GetRetryDriver<'_> {
             // Only capture on Terminal so non-terminal Retry/Unexpected
             // outcomes leave the field as None until a terminal arrives.
             self.response_received_at = Some(tokio::time::Instant::now());
+        }
+        // GET's ONLY source of `AttemptOutcome::Retry` is a
+        // `GetMsg::Response{NotFound}` (see the free `classify` fn — the
+        // NotFound arm is the sole `Retry` producer). Record it so the
+        // terminal-telemetry event can report `not_found` vs
+        // `timeout_exhausted` on exhaustion. If a future non-NotFound Retry
+        // source is added to `classify`, this must be narrowed accordingly.
+        if matches!(outcome, AttemptOutcome::Retry) {
+            self.saw_not_found = true;
         }
         outcome
     }
@@ -1865,6 +1990,7 @@ async fn drive_sub_op_get(
         attempt_visited: VisitedPeers::new(&tx),
         request_sent_at: None,
         response_received_at: None,
+        saw_not_found: false,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -1909,6 +2035,18 @@ async fn drive_sub_op_get(
                 Terminal::LocalCompletion => {}
             }
 
+            // Capture telemetry fields from the terminal before the store
+            // re-query consumes ownership below.
+            let terminal_key = match &terminal {
+                Terminal::InlineFound { key, .. } | Terminal::Streaming { key, .. } => Some(*key),
+                Terminal::LocalCompletion => None,
+            };
+            let streamed = matches!(terminal, Terminal::Streaming { .. });
+            let hop_count = match &terminal {
+                Terminal::InlineFound { hop_count, .. } => Some(*hop_count),
+                Terminal::Streaming { .. } | Terminal::LocalCompletion => None,
+            };
+
             // Resolve a GetResult by re-querying the local store. Mirrors
             // `build_host_response` but returns the raw `GetResult` shape
             // instead of a HostResponse.
@@ -1918,7 +2056,7 @@ async fn drive_sub_op_get(
                     return_contract_code,
                 })
                 .await;
-            match lookup {
+            let result = match lookup {
                 Ok(ContractHandlerEvent::GetResponse {
                     key: Some(_),
                     response:
@@ -1937,9 +2075,39 @@ async fn drive_sub_op_get(
                     &instance_id,
                     streaming_assembly.error.as_deref(),
                 )),
-            }
+            };
+            // Sub-op GET terminal event: `is_sub_op = true` so analysts can
+            // exclude repair / renewal / related fetches from
+            // client-findability metrics.
+            emit_get_terminal_event(
+                op_manager,
+                tx,
+                instance_id,
+                terminal_key,
+                done_terminal_outcome(matches!(result, SubOpGetOutcome::Found(_))),
+                streamed,
+                true,
+                driver.retries + 1,
+                hop_count,
+            )
+            .await;
+            result
         }
-        RetryLoopOutcome::Exhausted(cause) => SubOpGetOutcome::NotFound(cause),
+        RetryLoopOutcome::Exhausted(cause) => {
+            emit_get_terminal_event(
+                op_manager,
+                tx,
+                instance_id,
+                None,
+                exhausted_terminal_outcome(driver.saw_not_found),
+                false,
+                true,
+                driver.retries + 1,
+                None,
+            )
+            .await;
+            SubOpGetOutcome::NotFound(cause)
+        }
         RetryLoopOutcome::Unexpected => SubOpGetOutcome::Infra(OpError::UnexpectedOpState),
         RetryLoopOutcome::InfraError(err) => SubOpGetOutcome::Infra(err),
     }
@@ -4131,6 +4299,106 @@ mod tests {
             !arm_body.contains("routing_finished("),
             "Exhausted arm must NOT call routing_finished — no wire success \
              attribution is appropriate for a peer set that returned NotFound."
+        );
+    }
+
+    /// The pure outcome-mapping functions the terminal arms use.
+    #[test]
+    fn get_terminal_outcome_mappings() {
+        // Done arm: state delivered => Success. A located-but-undelivered
+        // terminal (e.g. streaming assembly exhausted its retry budget,
+        // #4345) delivered nothing => TimeoutExhausted (the `streamed` flag
+        // on the event distinguishes it from a routing timeout).
+        assert_eq!(done_terminal_outcome(true), GetTerminalOutcome::Success);
+        assert_eq!(
+            done_terminal_outcome(false),
+            GetTerminalOutcome::TimeoutExhausted
+        );
+        // Exhausted arm: a reachable peer answered NotFound => NotFound;
+        // otherwise the budget was burned by timeouts / unroutable attempts.
+        assert_eq!(
+            exhausted_terminal_outcome(true),
+            GetTerminalOutcome::NotFound
+        );
+        assert_eq!(
+            exhausted_terminal_outcome(false),
+            GetTerminalOutcome::TimeoutExhausted
+        );
+        // Stable OTLP `outcome` strings.
+        assert_eq!(GetTerminalOutcome::Success.as_str(), "success");
+        assert_eq!(GetTerminalOutcome::NotFound.as_str(), "not_found");
+        assert_eq!(
+            GetTerminalOutcome::TimeoutExhausted.as_str(),
+            "timeout_exhausted"
+        );
+    }
+
+    /// The client GET driver must emit exactly ONE terminal telemetry event
+    /// on EACH terminal arm (Done + Exhausted), tag `is_sub_op` from the tx
+    /// (never a hardcoded true on the client path), and map the outcome via
+    /// the pure helpers. Source-scrape pin.
+    #[test]
+    fn client_get_emits_terminal_event_on_both_arms() {
+        let src = production_source();
+        let inner_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        let emits = inner_body.matches("emit_get_terminal_event(").count();
+        assert_eq!(
+            emits, 2,
+            "drive_client_get_inner must emit exactly one terminal event on \
+             each of the Done and Exhausted arms (found {emits})"
+        );
+        assert!(
+            inner_body.contains("done_terminal_outcome(host_result.is_ok())"),
+            "Done arm must map its outcome via done_terminal_outcome(host_result.is_ok())"
+        );
+        assert!(
+            inner_body.contains("exhausted_terminal_outcome(driver.saw_not_found)"),
+            "Exhausted arm must map its outcome via \
+             exhausted_terminal_outcome(driver.saw_not_found)"
+        );
+        assert!(
+            inner_body.contains("client_tx.is_sub_operation()"),
+            "client GET terminal events must tag is_sub_op from \
+             client_tx.is_sub_operation(), not a hardcoded value"
+        );
+    }
+
+    /// Core-bug regression guard: a streaming (> 64 KB) GET success must be
+    /// tagged `streamed=true`. The Done arm derives `streamed` from whether
+    /// the terminal was `Terminal::Streaming` (delivered as
+    /// `ResponseStreaming`, the class of success the inline `GetSuccess`
+    /// path could not observe).
+    #[test]
+    fn client_get_terminal_marks_streaming_success() {
+        let src = production_source();
+        let inner_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        assert!(
+            inner_body.contains("let streamed = matches!(terminal, Terminal::Streaming { .. });"),
+            "Done arm must set `streamed` true for the Streaming terminal so \
+             streaming (>64KB) successes are measurable."
+        );
+    }
+
+    /// Sub-op GETs (phantom-repair, renewal, related-fetch) construct their
+    /// tx via `Transaction::new` (parent = None), so `is_sub_operation()`
+    /// under-reports them. The sub-op driver must emit a terminal event on
+    /// both arms and tag `is_sub_op` EXPLICITLY (not derive it from the tx),
+    /// so client-findability metrics can exclude these. Source-scrape pin.
+    #[test]
+    fn sub_op_get_tags_terminal_event_explicitly() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_sub_op_get(");
+        let emits = body.matches("emit_get_terminal_event(").count();
+        assert_eq!(
+            emits, 2,
+            "drive_sub_op_get must emit a terminal event on each of the Done \
+             and Exhausted arms (found {emits})"
+        );
+        assert!(
+            !body.contains("is_sub_operation()"),
+            "sub-op terminal events must pass is_sub_op=true explicitly, not \
+             derive it from tx.is_sub_operation() — the sub-op tx has no \
+             parent, so is_sub_operation() would wrongly report false."
         );
     }
 

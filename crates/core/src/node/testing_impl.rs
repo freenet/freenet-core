@@ -3858,10 +3858,16 @@ impl SimNetwork {
                         GetEvent::Request { .. } => summary.get.requested += 1,
                         GetEvent::GetSuccess { .. } => summary.get.succeeded += 1,
                         GetEvent::GetFailure { .. } => summary.get.failed += 1,
+                        // ClientTerminal is emitted IN ADDITION to
+                        // GetSuccess / GetNotFound (once per client op from
+                        // the driver), so counting it here would double-count
+                        // the sim summary; the GetSuccess arm above already
+                        // tallies succeeded.
                         GetEvent::GetNotFound { .. }
                         | GetEvent::ResponseSent { .. }
                         | GetEvent::ForwardingAckSent { .. }
-                        | GetEvent::ForwardingAckReceived { .. } => {}
+                        | GetEvent::ForwardingAckReceived { .. }
+                        | GetEvent::ClientTerminal { .. } => {}
                     }
                 }
                 // Subscribe operations

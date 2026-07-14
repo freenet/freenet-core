@@ -95,7 +95,9 @@ pub(crate) use register::{
 // (used by external crates, e.g. crates/core/tests), so they must stay `pub`.
 pub use register::{EventFlushHandle, NetLogMessage};
 // NEW_RECORDS_TS is needed by metrics_client's opentelemetry_tracer
-pub(crate) use event_kind::{ConnectEvent, GetEvent, PutEvent, SubscribeEvent, UpdateEvent};
+pub(crate) use event_kind::{
+    ConnectEvent, GetEvent, GetTerminalOutcome, PutEvent, SubscribeEvent, UpdateEvent,
+};
 pub use event_kind::{
     ConnectionType, DisconnectReason, EventKind, HostingStoppedReason, InterestSyncEvent,
     OperationFailure, PeerLifecycleEvent, TransferDirection, TransferEvent,

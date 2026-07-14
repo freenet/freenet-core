@@ -524,6 +524,44 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create the authoritative client-visible GET terminal event (see
+    /// [`GetEvent::ClientTerminal`]). Emitted once per client GET op (and
+    /// once per sub-op GET, tagged) from the driver so streaming (> 64 KB)
+    /// successes — invisible to the inline `GetSuccess` path — are
+    /// measurable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_terminal(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        key: Option<ContractKey>,
+        outcome: GetTerminalOutcome,
+        streamed: bool,
+        is_sub_op: bool,
+        attempts: usize,
+        hop_count: Option<usize>,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Get(GetEvent::ClientTerminal {
+                id: *tx,
+                requester: own_loc,
+                instance_id,
+                key,
+                outcome,
+                streamed,
+                is_sub_op,
+                attempts,
+                hop_count,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
     /// Create a ForwardingAck sent event.
     pub fn get_forwarding_ack_sent(
         tx: &'a Transaction,
