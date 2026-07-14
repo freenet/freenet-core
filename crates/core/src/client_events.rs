@@ -879,6 +879,16 @@ async fn process_open_request(
                                             phase = "local_cache_pre_join",
                                             "Serving locally cached contract state before network join"
                                         );
+                                        // Local-cache hit bypasses start_client_get, so
+                                        // emit the client-terminal event here (attempts=0
+                                        // marks a local hit) to keep the findability
+                                        // metric covering ALL client GET successes.
+                                        get::op_ctx_task::emit_local_get_terminal_event(
+                                            &op_manager,
+                                            key,
+                                            full_key,
+                                        )
+                                        .await;
                                         return Ok(Some(Either::Left(QueryResult::GetResult {
                                             key: full_key,
                                             state,
@@ -1100,6 +1110,16 @@ async fn process_open_request(
                                 }
                             }
 
+                            // Local-cache hit (serve-DURING / subscribed) bypasses
+                            // start_client_get, so emit the client-terminal event
+                            // here (attempts=0 marks a local hit) to keep the
+                            // findability metric covering ALL client GET successes.
+                            get::op_ctx_task::emit_local_get_terminal_event(
+                                &op_manager,
+                                key,
+                                full_key,
+                            )
+                            .await;
                             return Ok(Some(Either::Left(QueryResult::GetResult {
                                 key: full_key,
                                 state,

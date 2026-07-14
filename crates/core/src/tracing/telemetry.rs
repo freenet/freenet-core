@@ -937,6 +937,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 GetEvent::ResponseSent { .. } => "get_response_sent".to_string(),
                 GetEvent::ForwardingAckSent { .. } => "get_forwarding_ack_sent".to_string(),
                 GetEvent::ForwardingAckReceived { .. } => "get_forwarding_ack_received".to_string(),
+                GetEvent::ClientTerminal { .. } => "get_terminal".to_string(),
             }
         }
         EventKind::Subscribe(subscribe_event) => {
@@ -1414,6 +1415,37 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
+                }
+                GetEvent::ClientTerminal {
+                    id,
+                    requester,
+                    instance_id,
+                    key,
+                    outcome,
+                    streamed,
+                    is_sub_op,
+                    attempts,
+                    hop_count,
+                    elapsed_ms,
+                    timestamp,
+                } => {
+                    let mut json = serde_json::json!({
+                        "type": "get_terminal",
+                        "id": id.to_string(),
+                        "requester": requester.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "outcome": outcome.as_str(),
+                        "streamed": streamed,
+                        "is_sub_op": is_sub_op,
+                        "attempts": attempts,
+                        "hop_count": hop_count,
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": timestamp,
+                    });
+                    if let Some(k) = key {
+                        json["key"] = serde_json::Value::String(k.to_string());
+                    }
+                    json
                 }
             }
         }
@@ -3505,6 +3537,136 @@ mod tests {
         assert_eq!(json["reason"], "htl_exhausted");
         assert_eq!(json["elapsed_ms"], 1234);
         assert_eq!(json["timestamp"], 99999);
+    }
+
+    /// Core-bug regression guard: a streaming (> 64 KB) GET success must
+    /// reach the OTLP body as `get_terminal` with `outcome=success` and
+    /// `streamed=true`. This is the exact event the inline `get_success`
+    /// path drops (streaming replies arrive as `ResponseStreaming`, which
+    /// `register.rs` maps to `Ignored`), so without this the findability of
+    /// River rooms / UI-container contracts (all > 64 KB) is unmeasurable.
+    #[test]
+    fn test_event_kind_to_json_get_terminal_streaming_success() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::{GetEvent, GetTerminalOutcome};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let requester = PeerKeyLocation::random();
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([1u8; 32]),
+            CodeHash::new([2u8; 32]),
+        );
+        let instance_id = ContractInstanceId::new([9u8; 32]);
+
+        let event = EventKind::Get(GetEvent::ClientTerminal {
+            id: tx,
+            requester: requester.clone(),
+            instance_id,
+            key: Some(key),
+            outcome: GetTerminalOutcome::Success,
+            streamed: true,
+            is_sub_op: false,
+            attempts: 2,
+            hop_count: Some(3),
+            elapsed_ms: 1234,
+            timestamp: 99999,
+        });
+
+        // Metric name the central collector segments on.
+        assert_eq!(event_kind_to_string(&event), "get_terminal");
+
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["type"], "get_terminal");
+        assert_eq!(json["id"], tx.to_string());
+        assert_eq!(json["requester"], requester.to_string());
+        assert_eq!(json["instance_id"], instance_id.to_string());
+        assert_eq!(json["outcome"], "success");
+        assert_eq!(json["streamed"], true);
+        assert_eq!(json["is_sub_op"], false);
+        assert_eq!(json["attempts"], 2);
+        assert_eq!(json["hop_count"], 3);
+        assert_eq!(json["elapsed_ms"], 1234);
+        assert_eq!(json["timestamp"], 99999);
+        assert!(json["key"].is_string());
+    }
+
+    /// A timeout-exhausted client GET now emits a `get_terminal` event with
+    /// `outcome=timeout_exhausted` (previously this path returned NotFound
+    /// to the client with NO telemetry event at all). No key on this path.
+    #[test]
+    fn test_event_kind_to_json_get_terminal_timeout_exhausted() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::{GetEvent, GetTerminalOutcome};
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let requester = PeerKeyLocation::random();
+        let instance_id = ContractInstanceId::new([7u8; 32]);
+
+        let event = EventKind::Get(GetEvent::ClientTerminal {
+            id: tx,
+            requester,
+            instance_id,
+            key: None,
+            outcome: GetTerminalOutcome::TimeoutExhausted,
+            streamed: false,
+            is_sub_op: false,
+            attempts: 3,
+            hop_count: None,
+            elapsed_ms: 60000,
+            timestamp: 1,
+        });
+
+        assert_eq!(event_kind_to_string(&event), "get_terminal");
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["outcome"], "timeout_exhausted");
+        assert_eq!(json["streamed"], false);
+        // No key and no hop_count on the timeout path — both serialize null.
+        assert!(json["key"].is_null());
+        assert!(json["hop_count"].is_null());
+    }
+
+    /// A local-cache-hit client GET emits a `ClientTerminal` with
+    /// `attempts=0` (the local-hit convention) so the findability metric
+    /// covers ALL client GET successes — gateways serve many local hits,
+    /// which would otherwise bias the number toward network misses.
+    #[test]
+    fn test_event_kind_to_json_get_terminal_local_hit() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::{GetEvent, GetTerminalOutcome};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([1u8; 32]),
+            CodeHash::new([2u8; 32]),
+        );
+
+        let event = EventKind::Get(GetEvent::ClientTerminal {
+            id: tx,
+            requester: PeerKeyLocation::random(),
+            instance_id: ContractInstanceId::new([1u8; 32]),
+            key: Some(key),
+            outcome: GetTerminalOutcome::Success,
+            streamed: false,
+            is_sub_op: false,
+            attempts: 0,
+            hop_count: None,
+            elapsed_ms: 1,
+            timestamp: 1,
+        });
+
+        assert_eq!(event_kind_to_string(&event), "get_terminal");
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["outcome"], "success");
+        assert_eq!(json["attempts"], 0);
+        assert_eq!(json["streamed"], false);
+        assert_eq!(json["is_sub_op"], false);
+        assert!(json["key"].is_string());
     }
 
     // ----- #4380: shadow sub-budget rate limiting -----

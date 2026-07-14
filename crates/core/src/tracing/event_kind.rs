@@ -1091,6 +1091,33 @@ impl UpdateEvent {
     }
 }
 
+/// Client-visible outcome of a completed GET operation, carried by
+/// [`GetEvent::ClientTerminal`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) enum GetTerminalOutcome {
+    /// State was delivered to the client.
+    Success,
+    /// At least one reachable peer returned a definitive NotFound — the
+    /// contract was not located in the network.
+    NotFound,
+    /// The retry budget was exhausted by timeouts / unroutable attempts
+    /// without a definitive NotFound. Previously this returned NotFound to
+    /// the client with NO telemetry event at all.
+    TimeoutExhausted,
+}
+
+impl GetTerminalOutcome {
+    /// Stable string form used in the OTLP `outcome` field.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            GetTerminalOutcome::Success => "success",
+            GetTerminalOutcome::NotFound => "not_found",
+            GetTerminalOutcome::TimeoutExhausted => "timeout_exhausted",
+        }
+    }
+}
+
 /// GET operation events for tracking the lifecycle of contract retrieval.
 ///
 /// Similar to `PutEvent`, this enum captures the full sequence of a Get operation:
@@ -1203,15 +1230,59 @@ pub(crate) enum GetEvent {
         elapsed_ms: u64,
         timestamp: u64,
     },
+    /// Authoritative client-visible terminal outcome of a GET operation,
+    /// emitted exactly ONCE per client GET op (and once per sub-op GET,
+    /// tagged `is_sub_op`) from the originator / sub-op driver at completion.
+    ///
+    /// Unlike [`GetEvent::GetSuccess`] — which `register.rs` synthesizes
+    /// inline from a `GetMsg::Response{Found}` header and therefore MISSES
+    /// every streaming (> 64 KB `streaming_threshold`) success delivered as
+    /// `GetMsg::ResponseStreaming` (which falls through to `_ => Ignored`) —
+    /// this fires from the driver's terminal arm, so it captures ALL
+    /// client-visible outcomes including streaming successes. It is the
+    /// authoritative findability signal; `is_sub_op = true` marks
+    /// repair / renewal / related sub-op GETs so analysts can exclude them
+    /// from client-findability metrics.
+    ClientTerminal {
+        id: Transaction,
+        requester: PeerKeyLocation,
+        instance_id: ContractInstanceId,
+        /// Full contract key on the success path; `None` for
+        /// not-found / timeout-exhausted (the key is only known once a
+        /// terminal Found / streaming reply arrives).
+        key: Option<ContractKey>,
+        outcome: GetTerminalOutcome,
+        /// Payload delivered via `ResponseStreaming` (> 64 KB) rather than
+        /// inline — the class of success the inline `GetSuccess` path
+        /// could not observe.
+        streamed: bool,
+        /// Sub-operation GET (phantom-repair, renewal, related-fetch);
+        /// excluded from client-findability metrics.
+        is_sub_op: bool,
+        /// GET requests actually SENT before this terminal outcome. `1` means
+        /// the first peer answered; `0` is the convention for a LOCAL-cache
+        /// hit that never routed to the network (see
+        /// `emit_local_get_terminal_event`), letting analysts split "all
+        /// client GET successes" (`attempts >= 0`) from "network GET
+        /// findability" (`attempts >= 1`).
+        attempts: usize,
+        /// Forward-path hop count when carried by the terminal reply.
+        hop_count: Option<usize>,
+        /// Time elapsed since operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
 }
 
 impl GetEvent {
     /// Returns the contract key for this event if available.
-    /// Only GetSuccess and ResponseSent may have the full key; other variants have instance_id.
+    /// Only GetSuccess, ResponseSent, and ClientTerminal may have the full
+    /// key; other variants have instance_id.
     fn contract_key(&self) -> Option<ContractKey> {
         match self {
             GetEvent::GetSuccess { key, .. } => Some(*key),
             GetEvent::ResponseSent { key, .. } => *key,
+            GetEvent::ClientTerminal { key, .. } => *key,
             GetEvent::Request { .. }
             | GetEvent::GetNotFound { .. }
             | GetEvent::GetFailure { .. }

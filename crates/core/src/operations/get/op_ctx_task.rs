@@ -55,6 +55,7 @@ use crate::operations::VisitedPeers;
 use crate::operations::bootstrap::bootstrap_gateway_target;
 use crate::ring::{Location, PeerKeyLocation};
 use crate::router::{RouteEvent, RouteOutcome};
+use crate::tracing::GetTerminalOutcome;
 use crate::transport::peer_connection::StreamId;
 
 use super::{GetMsg, GetMsgResult, GetStreamingPayload};
@@ -235,6 +236,104 @@ enum DriverOutcome {
     InfrastructureError(OpError),
 }
 
+/// Map a GET that reached a terminal reply to its client-visible outcome.
+///
+/// `host_ok` is whether state was actually delivered to the client. A
+/// terminal header that then failed local assembly / store re-query (e.g.
+/// streaming assembly exhausting its retry budget, #4345) delivered
+/// nothing, so it is reported as `TimeoutExhausted` — the `streamed` flag
+/// on the emitted event distinguishes a streaming-delivery exhaustion from
+/// a routing timeout.
+fn done_terminal_outcome(host_ok: bool) -> GetTerminalOutcome {
+    if host_ok {
+        GetTerminalOutcome::Success
+    } else {
+        GetTerminalOutcome::TimeoutExhausted
+    }
+}
+
+/// Map a GET whose retry loop exhausted (no terminal reply reached) to its
+/// client-visible outcome: a definitive NotFound from at least one
+/// reachable peer is `NotFound`; otherwise the budget was burned by
+/// timeouts / unroutable attempts (`TimeoutExhausted`).
+fn exhausted_terminal_outcome(saw_not_found: bool) -> GetTerminalOutcome {
+    if saw_not_found {
+        GetTerminalOutcome::NotFound
+    } else {
+        GetTerminalOutcome::TimeoutExhausted
+    }
+}
+
+/// Emit the authoritative client-visible GET terminal telemetry event
+/// (exactly one per client GET op, one per sub-op GET) via the same
+/// `register_events` path the driver already uses for `RouteEvent`.
+///
+/// `is_sub_op` is passed EXPLICITLY by the caller rather than derived from
+/// `tx.is_sub_operation()`: the sub-op GET drivers construct their tx via
+/// `Transaction::new` (not `new_child_of`), so `is_sub_operation()` alone
+/// under-reports them. Callers OR-in `tx.is_sub_operation()` so a client tx
+/// that is itself a child is still flagged.
+#[allow(clippy::too_many_arguments)]
+async fn emit_get_terminal_event(
+    op_manager: &OpManager,
+    tx: Transaction,
+    instance_id: ContractInstanceId,
+    key: Option<ContractKey>,
+    outcome: GetTerminalOutcome,
+    streamed: bool,
+    is_sub_op: bool,
+    attempts: usize,
+    hop_count: Option<usize>,
+) {
+    if let Some(log_event) = crate::tracing::NetEventLog::get_terminal(
+        &tx,
+        &op_manager.ring,
+        instance_id,
+        key,
+        outcome,
+        streamed,
+        is_sub_op,
+        attempts,
+        hop_count,
+    ) {
+        op_manager
+            .ring
+            .register_events(either::Either::Left(log_event))
+            .await;
+    }
+}
+
+/// Emit a `ClientTerminal` event for a client GET satisfied from a LOCAL
+/// copy (the pre-join cache return, or a serve-DURING / subscribed
+/// local-cache hit in `client_events.rs`) without routing through the
+/// network — those paths never call [`start_client_get`], so the driver's
+/// terminal event never fires for them.
+///
+/// `attempts = 0` is the convention marking a local hit (a networked GET
+/// always sends >= 1 request, so `attempts >= 1`), letting analysts split
+/// "all client GET successes" from "network GET findability" without a new
+/// field. Keeps the client-visible findability metric covering ALL client
+/// GET successes — gateways serve many local hits, which would otherwise
+/// bias the number toward network misses.
+pub(crate) async fn emit_local_get_terminal_event(
+    op_manager: &OpManager,
+    instance_id: ContractInstanceId,
+    key: ContractKey,
+) {
+    emit_get_terminal_event(
+        op_manager,
+        Transaction::new::<GetMsg>(),
+        instance_id,
+        Some(key),
+        GetTerminalOutcome::Success,
+        false, // not streamed
+        false, // a real client GET, not a sub-op
+        0,     // local hit: no network request was sent
+        None,  // no hop count for a local hit
+    )
+    .await;
+}
+
 async fn drive_client_get(
     op_manager: Arc<OpManager>,
     client_tx: Transaction,
@@ -321,6 +420,8 @@ async fn drive_client_get_inner(
         attempt_visited: VisitedPeers::new(&client_tx),
         request_sent_at: None,
         response_received_at: None,
+        saw_not_found: false,
+        requests_sent: 0,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -536,6 +637,45 @@ async fn drive_client_get_inner(
                 host_result.is_ok(),
             );
 
+            // Authoritative client-visible terminal event (issue: streaming
+            // GETs emit no `get_success`). Captures streaming (> 64 KB)
+            // successes the inline `register.rs` path misses because they
+            // arrive as `ResponseStreaming`. `streamed` is true only for the
+            // streaming terminal; `hop_count` is carried only by InlineFound.
+            let streamed = matches!(terminal, Terminal::Streaming { .. });
+            let hop_count = match &terminal {
+                Terminal::InlineFound { hop_count, .. } => Some(*hop_count),
+                Terminal::Streaming { .. } | Terminal::LocalCompletion => None,
+            };
+            let outcome = done_terminal_outcome(host_result.is_ok());
+            let is_sub_op = client_tx.is_sub_operation();
+            let attempts = driver.requests_sent;
+
+            // For a BLOCKING subscribe hand-off the client result is not
+            // delivered until `maybe_subscribe_child`'s inline await
+            // completes, so emit the terminal event AFTER it — otherwise
+            // `elapsed_ms` would exclude the subscribe wait the client
+            // actually experiences, and a cancellation during that wait would
+            // record a success for a response never delivered. The
+            // non-blocking / no-subscribe hand-off returns immediately
+            // (fire-and-forget spawn or no-op), so its emit stays BEFORE the
+            // hand-off, unchanged. Exactly one of the two guarded emits runs.
+            let blocking_hand_off = subscribe && blocking_subscribe;
+            if !blocking_hand_off {
+                emit_get_terminal_event(
+                    op_manager,
+                    client_tx,
+                    instance_id,
+                    Some(reply_key),
+                    outcome,
+                    streamed,
+                    is_sub_op,
+                    attempts,
+                    hop_count,
+                )
+                .await;
+            }
+
             // Explicit-subscribe hand-off. Mirrors PUT 3a's
             // `maybe_subscribe_child` — subscribe is never handled in
             // the terminal-result construction to avoid double-subscribe
@@ -552,6 +692,21 @@ async fn drive_client_get_inner(
                 blocking_subscribe,
             )
             .await;
+
+            if blocking_hand_off {
+                emit_get_terminal_event(
+                    op_manager,
+                    client_tx,
+                    instance_id,
+                    Some(reply_key),
+                    outcome,
+                    streamed,
+                    is_sub_op,
+                    attempts,
+                    hop_count,
+                )
+                .await;
+            }
 
             Ok(DriverOutcome::Publish(host_result))
         }
@@ -571,6 +726,22 @@ async fn drive_client_get_inner(
                 %cause,
                 "GET client: retry loop exhausted — returning NotFound to client"
             );
+            // Terminal event for the previously-silent exhaustion path
+            // (only a `tracing::info!` fired before). `not_found` vs
+            // `timeout_exhausted` is distinguished by whether any reachable
+            // peer answered NotFound (`driver.saw_not_found`).
+            emit_get_terminal_event(
+                op_manager,
+                client_tx,
+                instance_id,
+                None,
+                exhausted_terminal_outcome(driver.saw_not_found),
+                false,
+                client_tx.is_sub_operation(),
+                driver.requests_sent,
+                None,
+            )
+            .await;
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
             ))))
@@ -603,6 +774,21 @@ struct GetRetryDriver<'a> {
     /// outcomes (Retry / Unexpected) leave it untouched and the next
     /// `build_request` overwrites `request_sent_at`.
     response_received_at: Option<tokio::time::Instant>,
+    /// Set once any attempt classified a reply as a definitive
+    /// `GetMsg::Response{NotFound}`. Used by the terminal-telemetry event
+    /// to distinguish a genuine `not_found` (a reachable peer answered
+    /// NotFound) from a `timeout_exhausted` (the budget was burned by
+    /// timeouts / unroutable attempts) when the retry loop exhausts —
+    /// the `RetryLoopOutcome::Exhausted` string does not carry that
+    /// structural distinction.
+    saw_not_found: bool,
+    /// Count of GET requests actually SENT for this client op, incremented
+    /// once per `build_request`. This is the `attempts` reported by the
+    /// terminal-telemetry event — NOT `retries`, which `advance_to_next_peer`
+    /// increments BEFORE its candidate lookup and so overcounts by one on
+    /// exhaustion (a one-candidate/isolated search that sent a single
+    /// request would otherwise report 2).
+    requests_sent: usize,
 }
 
 /// Terminal value for the GET driver.
@@ -759,6 +945,9 @@ impl RetryDriver for GetRetryDriver<'_> {
         // is read after the retry loop returns to compute
         // `time_to_response_start` for routing-prediction telemetry.
         self.request_sent_at = Some(tokio::time::Instant::now());
+        // Count actual requests sent (once per attempt) for the terminal
+        // event's `attempts` field — the accurate "requests sent" measure.
+        self.requests_sent += 1;
         NetMessage::from(GetMsg::Request {
             id: attempt_tx,
             instance_id: self.instance_id,
@@ -775,6 +964,15 @@ impl RetryDriver for GetRetryDriver<'_> {
             // Only capture on Terminal so non-terminal Retry/Unexpected
             // outcomes leave the field as None until a terminal arrives.
             self.response_received_at = Some(tokio::time::Instant::now());
+        }
+        // GET's ONLY source of `AttemptOutcome::Retry` is a
+        // `GetMsg::Response{NotFound}` (see the free `classify` fn — the
+        // NotFound arm is the sole `Retry` producer). Record it so the
+        // terminal-telemetry event can report `not_found` vs
+        // `timeout_exhausted` on exhaustion. If a future non-NotFound Retry
+        // source is added to `classify`, this must be narrowed accordingly.
+        if matches!(outcome, AttemptOutcome::Retry) {
+            self.saw_not_found = true;
         }
         outcome
     }
@@ -1865,6 +2063,8 @@ async fn drive_sub_op_get(
         attempt_visited: VisitedPeers::new(&tx),
         request_sent_at: None,
         response_received_at: None,
+        saw_not_found: false,
+        requests_sent: 0,
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -1909,6 +2109,18 @@ async fn drive_sub_op_get(
                 Terminal::LocalCompletion => {}
             }
 
+            // Capture telemetry fields from the terminal before the store
+            // re-query consumes ownership below.
+            let terminal_key = match &terminal {
+                Terminal::InlineFound { key, .. } | Terminal::Streaming { key, .. } => Some(*key),
+                Terminal::LocalCompletion => None,
+            };
+            let streamed = matches!(terminal, Terminal::Streaming { .. });
+            let hop_count = match &terminal {
+                Terminal::InlineFound { hop_count, .. } => Some(*hop_count),
+                Terminal::Streaming { .. } | Terminal::LocalCompletion => None,
+            };
+
             // Resolve a GetResult by re-querying the local store. Mirrors
             // `build_host_response` but returns the raw `GetResult` shape
             // instead of a HostResponse.
@@ -1918,7 +2130,7 @@ async fn drive_sub_op_get(
                     return_contract_code,
                 })
                 .await;
-            match lookup {
+            let result = match lookup {
                 Ok(ContractHandlerEvent::GetResponse {
                     key: Some(_),
                     response:
@@ -1937,9 +2149,39 @@ async fn drive_sub_op_get(
                     &instance_id,
                     streaming_assembly.error.as_deref(),
                 )),
-            }
+            };
+            // Sub-op GET terminal event: `is_sub_op = true` so analysts can
+            // exclude repair / renewal / related fetches from
+            // client-findability metrics.
+            emit_get_terminal_event(
+                op_manager,
+                tx,
+                instance_id,
+                terminal_key,
+                done_terminal_outcome(matches!(result, SubOpGetOutcome::Found(_))),
+                streamed,
+                true,
+                driver.requests_sent,
+                hop_count,
+            )
+            .await;
+            result
         }
-        RetryLoopOutcome::Exhausted(cause) => SubOpGetOutcome::NotFound(cause),
+        RetryLoopOutcome::Exhausted(cause) => {
+            emit_get_terminal_event(
+                op_manager,
+                tx,
+                instance_id,
+                None,
+                exhausted_terminal_outcome(driver.saw_not_found),
+                false,
+                true,
+                driver.requests_sent,
+                None,
+            )
+            .await;
+            SubOpGetOutcome::NotFound(cause)
+        }
         RetryLoopOutcome::Unexpected => SubOpGetOutcome::Infra(OpError::UnexpectedOpState),
         RetryLoopOutcome::InfraError(err) => SubOpGetOutcome::Infra(err),
     }
@@ -4131,6 +4373,177 @@ mod tests {
             !arm_body.contains("routing_finished("),
             "Exhausted arm must NOT call routing_finished — no wire success \
              attribution is appropriate for a peer set that returned NotFound."
+        );
+    }
+
+    /// The pure outcome-mapping functions the terminal arms use.
+    #[test]
+    fn get_terminal_outcome_mappings() {
+        // Done arm: state delivered => Success. A located-but-undelivered
+        // terminal (e.g. streaming assembly exhausted its retry budget,
+        // #4345) delivered nothing => TimeoutExhausted (the `streamed` flag
+        // on the event distinguishes it from a routing timeout).
+        assert_eq!(done_terminal_outcome(true), GetTerminalOutcome::Success);
+        assert_eq!(
+            done_terminal_outcome(false),
+            GetTerminalOutcome::TimeoutExhausted
+        );
+        // Exhausted arm: a reachable peer answered NotFound => NotFound;
+        // otherwise the budget was burned by timeouts / unroutable attempts.
+        assert_eq!(
+            exhausted_terminal_outcome(true),
+            GetTerminalOutcome::NotFound
+        );
+        assert_eq!(
+            exhausted_terminal_outcome(false),
+            GetTerminalOutcome::TimeoutExhausted
+        );
+        // Stable OTLP `outcome` strings.
+        assert_eq!(GetTerminalOutcome::Success.as_str(), "success");
+        assert_eq!(GetTerminalOutcome::NotFound.as_str(), "not_found");
+        assert_eq!(
+            GetTerminalOutcome::TimeoutExhausted.as_str(),
+            "timeout_exhausted"
+        );
+    }
+
+    /// The client GET driver must emit exactly ONE terminal telemetry event
+    /// on EACH terminal arm (Done + Exhausted), tag `is_sub_op` from the tx
+    /// (never a hardcoded true on the client path), and map the outcome via
+    /// the pure helpers. Source-scrape pin.
+    #[test]
+    fn client_get_emits_terminal_event_on_both_arms() {
+        let src = production_source();
+        let inner_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        let emits = inner_body.matches("emit_get_terminal_event(").count();
+        assert_eq!(
+            emits, 3,
+            "drive_client_get_inner must have three static emit sites: the \
+             Done arm's mutually-exclusive blocking/non-blocking pair (exactly \
+             one runs per op) plus the Exhausted arm (found {emits})"
+        );
+        assert!(
+            inner_body.contains("let blocking_hand_off = subscribe && blocking_subscribe;"),
+            "Done arm must gate the terminal-event emit on blocking_hand_off so a \
+             blocking subscribe hand-off emits AFTER the inline subscribe wait \
+             (so elapsed_ms includes the wait and a cancellation records no success)"
+        );
+        assert!(
+            inner_body.contains("done_terminal_outcome(host_result.is_ok())"),
+            "Done arm must map its outcome via done_terminal_outcome(host_result.is_ok())"
+        );
+        assert!(
+            inner_body.contains("exhausted_terminal_outcome(driver.saw_not_found)"),
+            "Exhausted arm must map its outcome via \
+             exhausted_terminal_outcome(driver.saw_not_found)"
+        );
+        assert!(
+            inner_body.contains("client_tx.is_sub_operation()"),
+            "client GET terminal events must tag is_sub_op from \
+             client_tx.is_sub_operation(), not a hardcoded value"
+        );
+    }
+
+    /// Core-bug regression guard: a streaming (> 64 KB) GET success must be
+    /// tagged `streamed=true`. The Done arm derives `streamed` from whether
+    /// the terminal was `Terminal::Streaming` (delivered as
+    /// `ResponseStreaming`, the class of success the inline `GetSuccess`
+    /// path could not observe).
+    #[test]
+    fn client_get_terminal_marks_streaming_success() {
+        let src = production_source();
+        let inner_body = extract_fn_body(src, "async fn drive_client_get_inner(");
+        assert!(
+            inner_body.contains("let streamed = matches!(terminal, Terminal::Streaming { .. });"),
+            "Done arm must set `streamed` true for the Streaming terminal so \
+             streaming (>64KB) successes are measurable."
+        );
+    }
+
+    /// Sub-op GETs (phantom-repair, renewal, related-fetch) construct their
+    /// tx via `Transaction::new` (parent = None), so `is_sub_operation()`
+    /// under-reports them. The sub-op driver must emit a terminal event on
+    /// both arms and tag `is_sub_op` EXPLICITLY (not derive it from the tx),
+    /// so client-findability metrics can exclude these. Source-scrape pin.
+    #[test]
+    fn sub_op_get_tags_terminal_event_explicitly() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_sub_op_get(");
+        let emits = body.matches("emit_get_terminal_event(").count();
+        assert_eq!(
+            emits, 2,
+            "drive_sub_op_get must emit a terminal event on each of the Done \
+             and Exhausted arms (found {emits})"
+        );
+        assert!(
+            !body.contains("is_sub_operation()"),
+            "sub-op terminal events must pass is_sub_op=true explicitly, not \
+             derive it from tx.is_sub_operation() — the sub-op tx has no \
+             parent, so is_sub_operation() would wrongly report false."
+        );
+    }
+
+    /// `attempts` must reflect requests actually SENT (`driver.requests_sent`,
+    /// incremented once per `build_request`), NOT `driver.retries` — which
+    /// `advance_to_next_peer` bumps BEFORE its candidate lookup and so
+    /// overcounts by one on exhaustion (an isolated one-candidate search that
+    /// sent a single request would otherwise report 2). Source-scrape pin.
+    #[test]
+    fn get_terminal_attempts_counts_requests_sent_not_retries() {
+        let src = production_source();
+        let build_body =
+            extract_fn_body(src, "fn build_request(&mut self, attempt_tx: Transaction)");
+        assert!(
+            build_body.contains("self.requests_sent += 1;"),
+            "build_request must increment requests_sent once per request sent"
+        );
+        assert!(
+            !src.contains("driver.retries + 1"),
+            "terminal-event attempts must come from driver.requests_sent, not \
+             driver.retries + 1 (retries overcounts by one on exhaustion)"
+        );
+        // attempts is wired from requests_sent (1 client-Done local + the 3
+        // direct emit-site args = 4 occurrences of `driver.requests_sent`).
+        let count = src.matches("driver.requests_sent").count();
+        assert_eq!(
+            count, 4,
+            "the four driver terminal-event attempts values must all come from \
+             driver.requests_sent (found {count})"
+        );
+    }
+
+    /// The two local-serve GET paths in `client_events.rs` (pre-join cache
+    /// and serve-DURING / subscribed local hit) bypass `start_client_get`, so
+    /// they must emit a client-terminal event directly — otherwise the client
+    /// findability metric omits every local hit (gateways serve many), biasing
+    /// it toward network misses. Source-scrape pin.
+    #[test]
+    fn client_events_local_get_paths_emit_terminal_event() {
+        const CLIENT_EVENTS: &str = include_str!("../../client_events.rs");
+        let count = CLIENT_EVENTS
+            .matches("emit_local_get_terminal_event(")
+            .count();
+        assert_eq!(
+            count, 2,
+            "both local-serve GET paths (pre-join + serve-DURING) must call \
+             emit_local_get_terminal_event (found {count})"
+        );
+    }
+
+    /// The local-hit helper marks a client-visible LOCAL success:
+    /// `outcome=Success`, `attempts=0` (the local-hit convention), not
+    /// streamed, not a sub-op. Source-scrape pin.
+    #[test]
+    fn emit_local_get_terminal_event_marks_local_hit() {
+        let src = production_source();
+        let body = extract_fn_body(src, "pub(crate) async fn emit_local_get_terminal_event(");
+        assert!(
+            body.contains("GetTerminalOutcome::Success"),
+            "a local-cache hit is a client-visible success"
+        );
+        assert!(
+            body.contains("no network request was sent"),
+            "local hit must pass attempts=0 (documented convention)"
         );
     }
 
