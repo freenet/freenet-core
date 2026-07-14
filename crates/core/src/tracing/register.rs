@@ -1604,7 +1604,11 @@ impl NetLogMessage {
             EventKind::Connect(_) => false,
             EventKind::Put(PutEvent::PutSuccess { .. }) => true,
             EventKind::Put(_) => false,
-            EventKind::Get(GetEvent::GetSuccess { .. } | GetEvent::GetNotFound { .. }) => true,
+            EventKind::Get(
+                GetEvent::GetSuccess { .. }
+                | GetEvent::GetNotFound { .. }
+                | GetEvent::ClientTerminal { .. },
+            ) => true,
             EventKind::Get(_) => false,
             EventKind::Subscribe(
                 SubscribeEvent::SubscribeSuccess { .. }
@@ -2162,6 +2166,41 @@ mod span_completed_tests {
             failure.span_completed(),
             "UpdateFailure must close its span"
         );
+    }
+
+    // ClientTerminal is the authoritative client-visible GET terminal event.
+    // It MUST close its span: for an inline success, `GetSuccess` already
+    // removed the span, so a ClientTerminal not treated as completing would be
+    // re-inserted as a fresh non-terminal span and leak (paired with the
+    // metrics_client `process_log` Vacant-branch guard). For a streaming
+    // success (no `GetSuccess` ever fired) it is the sole terminal and closes
+    // the span outright.
+    #[test]
+    fn client_terminal_event_completes_span() {
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        for outcome in [
+            GetTerminalOutcome::Success,
+            GetTerminalOutcome::NotFound,
+            GetTerminalOutcome::TimeoutExhausted,
+        ] {
+            let ev = msg(EventKind::Get(GetEvent::ClientTerminal {
+                id: tx,
+                requester: PeerKeyLocation::random(),
+                instance_id: ContractInstanceId::new([3u8; 32]),
+                key: Some(contract_key()),
+                outcome,
+                streamed: false,
+                is_sub_op: false,
+                attempts: 1,
+                hop_count: None,
+                elapsed_ms: 0,
+                timestamp: 0,
+            }));
+            assert!(
+                ev.span_completed(),
+                "ClientTerminal ({outcome:?}) must close its span"
+            );
+        }
     }
 
     // A non-terminal UPDATE event must NOT close the span — guards against

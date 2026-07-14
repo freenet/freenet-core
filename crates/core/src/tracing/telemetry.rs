@@ -3629,6 +3629,46 @@ mod tests {
         assert!(json["hop_count"].is_null());
     }
 
+    /// A local-cache-hit client GET emits a `ClientTerminal` with
+    /// `attempts=0` (the local-hit convention) so the findability metric
+    /// covers ALL client GET successes — gateways serve many local hits,
+    /// which would otherwise bias the number toward network misses.
+    #[test]
+    fn test_event_kind_to_json_get_terminal_local_hit() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::{GetEvent, GetTerminalOutcome};
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([1u8; 32]),
+            CodeHash::new([2u8; 32]),
+        );
+
+        let event = EventKind::Get(GetEvent::ClientTerminal {
+            id: tx,
+            requester: PeerKeyLocation::random(),
+            instance_id: ContractInstanceId::new([1u8; 32]),
+            key: Some(key),
+            outcome: GetTerminalOutcome::Success,
+            streamed: false,
+            is_sub_op: false,
+            attempts: 0,
+            hop_count: None,
+            elapsed_ms: 1,
+            timestamp: 1,
+        });
+
+        assert_eq!(event_kind_to_string(&event), "get_terminal");
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["outcome"], "success");
+        assert_eq!(json["attempts"], 0);
+        assert_eq!(json["streamed"], false);
+        assert_eq!(json["is_sub_op"], false);
+        assert!(json["key"].is_string());
+    }
+
     // ----- #4380: shadow sub-budget rate limiting -----
 
     /// Build a worker purely to exercise the admission policy. The endpoint

@@ -1259,7 +1259,12 @@ pub(crate) enum GetEvent {
         /// Sub-operation GET (phantom-repair, renewal, related-fetch);
         /// excluded from client-findability metrics.
         is_sub_op: bool,
-        /// Peer attempts made before this terminal outcome (1 = first peer).
+        /// GET requests actually SENT before this terminal outcome. `1` means
+        /// the first peer answered; `0` is the convention for a LOCAL-cache
+        /// hit that never routed to the network (see
+        /// `emit_local_get_terminal_event`), letting analysts split "all
+        /// client GET successes" (`attempts >= 0`) from "network GET
+        /// findability" (`attempts >= 1`).
         attempts: usize,
         /// Forward-path hop count when carried by the terminal reply.
         hop_count: Option<usize>,

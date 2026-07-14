@@ -509,10 +509,15 @@ mod opentelemetry_tracer {
                         }
                     }
                     std::collections::hash_map::Entry::Vacant(empty) => {
-                        let span = empty.insert(OTSpan::new(log.tx));
-                        // does not make much sense to treat a single isolated event as a span,
-                        // so just ignore those in case they were to happen
+                        // A terminal event arriving with NO existing span is an
+                        // isolated event — e.g. the tx's span was already
+                        // completed+removed by an earlier terminal (GetSuccess),
+                        // and this is a second terminal (ClientTerminal). Do NOT
+                        // insert a span for it: inserting-and-not-removing leaks
+                        // an empty OTSpan until GC. Only start a span for a
+                        // non-terminal first event.
                         if !span_completed {
+                            let span = empty.insert(OTSpan::new(log.tx));
                             span.add_log(&log);
                         }
                     }
@@ -533,10 +538,15 @@ mod opentelemetry_tracer {
                         }
                     }
                     dashmap::mapref::entry::Entry::Vacant(empty) => {
-                        let mut span = empty.insert(OTSpan::new(log.tx));
-                        // does not make much sense to treat a single isolated event as a span,
-                        // so just ignore those in case they were to happen
+                        // A terminal event arriving with NO existing span is an
+                        // isolated event — e.g. the tx's span was already
+                        // completed+removed by an earlier terminal (GetSuccess),
+                        // and this is a second terminal (ClientTerminal). Do NOT
+                        // insert a span for it: inserting-and-not-removing leaks
+                        // an empty OTSpan until GC. Only start a span for a
+                        // non-terminal first event.
                         if !span_completed {
+                            let mut span = empty.insert(OTSpan::new(log.tx));
                             span.add_log(&log);
                         }
                     }
