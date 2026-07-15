@@ -1504,9 +1504,13 @@ impl Ring {
         self.event_register.register_events(events).await;
     }
 
-    /// Maximum number of route events to load from the AOF event log on startup
-    /// and during periodic refresh. Caps memory use while retaining enough history
-    /// for the isotonic estimators to converge.
+    /// Maximum number of route events to load from the AOF event log on startup.
+    /// Caps memory use while retaining enough history for the isotonic estimators
+    /// to converge.
+    ///
+    /// Startup only: since #4808 the periodic loop no longer reads the event log
+    /// (it refits in place from each estimator's own in-memory window), so this is
+    /// consulted exactly once per process.
     const ROUTER_HISTORY_LIMIT: usize = 10_000;
 
     async fn refresh_router<ER: NetEventRegister>(
@@ -7976,6 +7980,72 @@ mod refresh_router_tests {
             "the event log must be read exactly once (startup) and NEVER again: \
              the periodic rebuild from disk discarded every relay-recorded event \
              (#4808). Got {total_calls} reads across >5 ticks"
+        );
+    }
+
+    /// The loop must actually REFIT — nothing else pins the one line that makes
+    /// #4808's fix do anything in production.
+    ///
+    /// Without this, deleting `router.write().refit_stale_estimators()` from
+    /// `refresh_router` leaves every other guard green: the never-reloads test
+    /// still sees its timeout and its single read, and the health-gauge scrape
+    /// still counts its call sites. This also restores the positive liveness proof
+    /// the superseded transient-error test provided via `total_calls > 4` — a bare
+    /// timeout cannot distinguish a healthy loop from one deadlocked on
+    /// `router.write()` or never ticking at all.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_router_loop_refits_stale_estimators() {
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+
+        // Seed past the staleness trigger so a refit is owed. These go straight
+        // into the in-memory router, exactly as a relay hop's
+        // `record_relay_route_event` does.
+        {
+            let mut guard = router.write();
+            for _ in 0..120 {
+                guard.add_event(crate::router::RouteEvent {
+                    peer: PeerKeyLocation::random(),
+                    contract_location: Location::random(),
+                    outcome: crate::router::RouteOutcome::Success {
+                        time_to_response_start: Duration::from_millis(100),
+                        payload_size: 5000,
+                        payload_transfer_time: Duration::from_millis(50),
+                    },
+                    op_type: Some(crate::node::network_status::OpType::Get),
+                });
+            }
+            assert!(
+                guard.refit_stale_estimators() > 0,
+                "sanity: a freshly-seeded router owes a refit before the loop runs"
+            );
+            // Re-dirty it so the loop has work to do.
+            for _ in 0..120 {
+                guard.add_event(crate::router::RouteEvent {
+                    peer: PeerKeyLocation::random(),
+                    contract_location: Location::random(),
+                    outcome: crate::router::RouteOutcome::SuccessUntimed,
+                    op_type: Some(crate::node::network_status::OpType::Get),
+                });
+            }
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(60 * 40),
+            super::Ring::refresh_router(
+                router.clone(),
+                WarmStartRegister { events: vec![] },
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .ok(); // timeout expected — a healthy loop runs forever
+
+        assert_eq!(
+            router.write().refit_stale_estimators(),
+            0,
+            "the loop must have consumed the outstanding staleness; a non-zero \
+             count here means it never called refit_stale_estimators (or never \
+             ticked), leaving the model to drift exactly as it did before #4808"
         );
     }
 

@@ -407,12 +407,22 @@ pub(crate) struct RouterSnapshotInfo {
     pub broadcast_stream_failures_last_snapshot: Option<u64>,
     /// Background-task health gauges (#4440), populated by `Ring` from the
     /// process-global `BACKGROUND_TASK_HEALTH` the monitored tasks publish into.
-    /// `refresh_router`'s transient `get_router_events` errors were made
-    /// non-fatal by the v0.2.74 #4438 hotfix, so a persistently-failing refresh
-    /// is now silent; these make it observable (partially addresses #4440 (a)).
     /// `last_success_age_secs` is seconds since the last successful run (`None`
     /// until the first success); `consecutive_failures` is the current run of
     /// failures since the last success.
+    ///
+    /// SEMANTICS CHANGED IN #4808 — read `consecutive_failures` with care. These
+    /// were added because `refresh_router`'s transient `get_router_events` errors
+    /// were made non-fatal by the v0.2.74 #4438 hotfix, leaving a persistently
+    /// failing refresh silent. The periodic loop no longer reads the event log at
+    /// all, so it has no fallible call and no failure arm: the only remaining
+    /// `record_refresh_router_failure` is the STARTUP read, and the first tick
+    /// (<=5 min later) unconditionally records a success, which clears the run.
+    /// `consecutive_failures` is therefore structurally 0 or 1, and 1 only within
+    /// the first tick — it can no longer report a persistent failure, because no
+    /// repeating fallible operation exists. Do NOT alert on it.
+    /// `last_success_age_secs` remains meaningful as a LIVENESS heartbeat: it
+    /// shows the refit pass is still ticking (expect < ~300s on a healthy node).
     pub refresh_router_last_success_age_secs: Option<u64>,
     pub refresh_router_consecutive_failures: Option<u64>,
     /// Placement-quality gauges (#4404 follow-up), populated by `Ring` on the
