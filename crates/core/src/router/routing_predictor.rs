@@ -118,11 +118,12 @@ struct PredictionStage {
     /// Observations added since the last training.
     ///
     /// Retraining keys off this rather than off total-count growth
-    /// (`len() >= trained_at * 3 / 2`) because eviction pins `len()` below
-    /// `max_observations`. Once `trained_at * 3 / 2` exceeded the reachable
-    /// count, the total-count rule became unsatisfiable and training froze
-    /// permanently. No constant rescues that formulation — capping the growth
-    /// term just moves the rung at which it freezes. See #4810.
+    /// (`len() >= trained_at * 3 / 2`) because eviction pins `len()` at or below
+    /// `max_observations` (it reaches the cap exactly, then drops to 9/10 of it).
+    /// Once `trained_at * 3 / 2` exceeded that reachable count, the total-count
+    /// rule became unsatisfiable and training froze permanently. No constant
+    /// rescues that formulation — capping the growth term just moves the rung at
+    /// which it freezes. See #4810.
     observations_since_train: usize,
 }
 
@@ -161,11 +162,18 @@ impl PredictionStage {
         if self.trained_at == 0 {
             return true;
         }
-        // Below the observation cap nothing has been evicted, so
+        // BEFORE THE FIRST EVICTION nothing has been discarded, so
         // `observations_since_train == n - trained_at` and this is exactly the
-        // historical `n >= trained_at + trained_at / 2` rule. Above the cap the
-        // two diverge: `n` stops growing but new observations keep arriving, so
-        // only this form stays satisfiable. See #4810.
+        // historical `n >= trained_at + trained_at / 2` rule — the pre-eviction
+        // cadence is preserved bit-for-bit.
+        //
+        // The boundary is the first eviction, NOT the cap: once eviction starts,
+        // `n` is still below `max_observations` (it drops to 9/10 of it) but the
+        // two forms have already diverged, because evicted observations still
+        // count as "arrived". At trained_at=3829 with a 5000 cap, for instance,
+        // `observations_since_train` reads 1173 while `n - trained_at` is 672.
+        // That divergence is the fix: `n` stops growing but new observations keep
+        // arriving, so only this form stays satisfiable. See #4810.
         self.observations_since_train >= (self.trained_at / 2).max(1)
     }
 
@@ -516,7 +524,14 @@ impl RoutingPredictor {
             }
         }
 
-        // Train based on data growth (not at fixed counts)
+        // Retrain on observation turnover (not at fixed counts).
+        //
+        // Note the ordering: `add()` above evicts inline, so by the time
+        // `should_train()` runs, a stage that just hit `max_observations + 1` has
+        // already been trimmed to 9/10 of the cap. The largest `len()` any
+        // `should_train()` can observe is therefore exactly `max_observations` —
+        // which is why a rule keyed off total count is unsatisfiable past a
+        // point, and why this one is keyed off turnover instead (#4810).
         if !self.batch_mode {
             if self.failure_stage.should_train() {
                 self.failure_stage.train();
@@ -1116,6 +1131,13 @@ mod tests {
         // fires, so an instantaneous `len() < trained_at + trained_at/2` could be
         // satisfied by a trough rather than by genuine unreachability. Comparing
         // against `max_observations` instead holds at every point in the cycle.
+        //
+        // Concretely, why the instantaneous form is not enough: change the cap
+        // above to 100_000 and the warmup ends at len=1000, trained_at=757. The
+        // instantaneous check passes (1000 < 1135) even though the old rule is
+        // nowhere near frozen — 1135 is perfectly reachable under that cap — so
+        // the test would pass while proving nothing. The structural check
+        // correctly fails there (1135 is not > 100_000).
         assert!(
             stage.trained_at + stage.trained_at / 2 > stage.max_observations,
             "test precondition: expected the old rule to be unsatisfiable, but \
