@@ -41,11 +41,14 @@ where
         };
         let hosted = om.ring.hosting_contracts_count();
         let needed = crate::contract::executor::summary_cache_count_target(hosted);
+        // needed >= SUMMARY_CACHE_COUNT_MIN > 0 by construction (summary_cache_count_target clamps); unwrap_or is just panic-proofing.
         if needed > self.summary_cache.cap().get() {
-            self.summary_cache.grow(NonZeroUsize::new(needed).unwrap());
+            self.summary_cache
+                .grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
         }
         if needed > self.delta_cache.cap().get() {
-            self.delta_cache.grow(NonZeroUsize::new(needed).unwrap());
+            self.delta_cache
+                .grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
         }
     }
 

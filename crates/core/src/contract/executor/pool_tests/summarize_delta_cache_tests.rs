@@ -13,9 +13,10 @@
 //! state would hand a peer the wrong bytes. The correctness tests below assert
 //! freshness after an update and would FAIL if the detector missed a write.
 
+use std::sync::Arc;
+
 use either::Either;
 use freenet_stdlib::prelude::*;
-use std::sync::Arc;
 
 use crate::config::ConfigArgs;
 use crate::contract::executor::mock_wasm_runtime::MockWasmRuntime;
