@@ -768,6 +768,24 @@ async fn drive_client_get_inner(
                 None,
             )
             .await;
+            // Dashboard op_stats GET counter (issue #4828). Exhaustion
+            // delivered no state to the client, so it is a FAILED GET —
+            // record it explicitly as such. Before #4828 this arm recorded
+            // nothing, so a GET dead-end (the dominant production
+            // `not_found` mode) incremented NEITHER `gets.0` nor `gets.1`
+            // and the ops card showed an idle-looking node while every GET
+            // failed.
+            //
+            // This must stay an explicit `false` rather than moving to a
+            // `deliver_outcome` funnel the way PUT/UPDATE do: the arm
+            // publishes `Ok(HostResponse::…NotFound)` so that clients can
+            // distinguish "contract genuinely absent" from "operation
+            // failed", which means a `matches!(Publish(Ok(_)))` classifier
+            // would score a dead-end as a SUCCESS.
+            crate::node::network_status::record_op_result(
+                crate::node::network_status::OpType::Get,
+                false,
+            );
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
             ))))
@@ -1993,6 +2011,26 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
                 tx = %client_tx,
                 error = %err,
                 "get: infrastructure error; publishing synthesized client error"
+            );
+            // Dashboard op_stats GET counter (issue #4828). An
+            // infrastructure error (the `Unexpected` / `InfraError`
+            // terminal outcomes, mapped to `InfrastructureError` in
+            // `drive_client_get`) publishes a synthesized client error
+            // below, so it is a terminal client-visible FAILED GET and
+            // must increment `op_stats.gets.1`. Before #4828 this path
+            // recorded nothing — the same silent-counter-rot bug class the
+            // rest of this PR fixes, left open for the one GET failure arm
+            // that does not surface through `Done`/`Exhausted`.
+            //
+            // This is the ONLY site that observes these outcomes: the
+            // `Unexpected`/`InfraError` arms return `Err` from
+            // `drive_client_get_inner`, which `drive_client_get` maps to
+            // `InfrastructureError` and delivers to the client here. The
+            // `Done` and `Exhausted` arms record in the driver and return
+            // `Publish`, so they never reach this arm — no double count.
+            crate::node::network_status::record_op_result(
+                crate::node::network_status::OpType::Get,
+                false,
             );
             let synthesized: HostResult = Err(ErrorKind::OperationError {
                 cause: format!("GET failed: {err}").into(),
@@ -4963,6 +5001,145 @@ mod tests {
              `true`. The success flag must track `host_result.is_ok()` so \
              telemetry does not diverge from the client-visible outcome. \
              Call window: {call_window}"
+        );
+    }
+
+    /// Issue #4828: the `Exhausted` arm publishes `NotFound` to the
+    /// client — the contract was never delivered — but before #4828 it
+    /// called `record_op_result` nowhere at all, so a GET dead-end
+    /// incremented NEITHER `op_stats.gets.0` nor `.1`. GET dead-ends are
+    /// the dominant production `not_found` mode, so the ops card showed
+    /// an idle-looking node while every GET failed.
+    ///
+    /// Note GET cannot use PUT/UPDATE's `deliver_outcome` funnel shape:
+    /// exhaustion publishes `Ok(HostResponse::…NotFound)`, so a
+    /// `matches!(Publish(Ok(_)))` classifier would score a dead-end as a
+    /// SUCCESS. The arm must therefore record `false` explicitly, which
+    /// is what this pin enforces.
+    #[test]
+    fn exhausted_arm_records_get_failure() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source();
+        // Isolate the Exhausted arm: from its match pattern to the start
+        // of the following `Unexpected` arm.
+        let arm_start = prod
+            .find("RetryLoopOutcome::Exhausted(cause) => {")
+            .expect("Exhausted arm must exist");
+        let arm_end = prod[arm_start..]
+            .find("RetryLoopOutcome::Unexpected")
+            .expect("Unexpected arm must follow Exhausted");
+        let arm = &prod[arm_start..arm_start + arm_end];
+
+        assert!(
+            arm.contains("record_op_result"),
+            "the GET Exhausted arm must call record_op_result — it \
+             publishes NotFound to the client, so the op_stats.gets \
+             counter must see it. Without this a GET dead-end increments \
+             neither ok nor fail and the node looks idle. Issue #4828."
+        );
+        assert!(
+            arm.contains("OpType::Get"),
+            "record_op_result in the Exhausted arm must be passed OpType::Get."
+        );
+        // Exhaustion delivered no state, so it must be recorded as a
+        // FAILURE. `true` here would be the mirror-image of the #4828 PUT
+        // bug (successes counted, failures invisible).
+        let call_pos = arm
+            .find("record_op_result")
+            .expect("record_op_result must be called in the Exhausted arm");
+        let tail = &arm[call_pos..];
+        let call_window = &tail[..tail.len().min(200)];
+        assert!(
+            call_window.contains("false,"),
+            "the GET Exhausted arm must record a FAILURE (`false`) — it \
+             publishes NotFound, having delivered no state to the client. \
+             Issue #4828. Call window: {call_window}"
+        );
+        // Guard the pin itself: `production_source` must actually be
+        // trimming the test module, or this test could match its own text.
+        assert!(
+            prod.len() < SOURCE.len(),
+            "production_source must trim the test module"
+        );
+    }
+
+    /// Issue #4828: the `Unexpected` / `InfraError` terminal outcomes
+    /// return `Err` from `drive_client_get_inner`, are mapped to
+    /// `DriverOutcome::InfrastructureError` in `drive_client_get`, and
+    /// publish a synthesized client error in `deliver_outcome`'s
+    /// `InfrastructureError` arm — a terminal client-visible FAILED GET.
+    /// Before #4828 that arm recorded no `op_stats.gets` counter, so this
+    /// GET failure path silently rotted the counter, the same bug class
+    /// this PR fixes (Codex + Claude Rule Review both flagged it). Unlike
+    /// the `Exhausted` arm (which publishes `Ok(NotFound)`), the failure
+    /// classification here is unambiguous: an `InfrastructureError` always
+    /// publishes a client `Err`, so this arm records `false`.
+    ///
+    /// No double count: the `Done` and `Exhausted` arms record in the
+    /// driver and return `DriverOutcome::Publish`, so they reach
+    /// `deliver_outcome`'s `Publish` arm, never this one.
+    #[test]
+    fn infra_error_arm_records_get_failure() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source();
+        let body = extract_fn_body(prod, "fn deliver_outcome(");
+        // Isolate the InfrastructureError arm within deliver_outcome.
+        let arm_start = body
+            .find("DriverOutcome::InfrastructureError(err) => {")
+            .expect("deliver_outcome must have an InfrastructureError arm");
+        let arm = &body[arm_start..];
+
+        assert!(
+            arm.contains("record_op_result"),
+            "deliver_outcome's InfrastructureError arm must call \
+             record_op_result — it publishes a synthesized client error, so \
+             this terminal GET failure must increment op_stats.gets. Without \
+             it the Unexpected/InfraError GET failure path silently rots the \
+             counter. Issue #4828."
+        );
+        assert!(
+            arm.contains("OpType::Get"),
+            "record_op_result in the InfrastructureError arm must be passed \
+             OpType::Get."
+        );
+        // Infrastructure errors publish a client `Err`, so they are an
+        // unambiguous FAILURE and must record `false`.
+        let call_pos = arm
+            .find("record_op_result")
+            .expect("record_op_result must be called in the InfraError arm");
+        let tail = &arm[call_pos..];
+        let call_window = &tail[..tail.len().min(200)];
+        assert!(
+            call_window.contains("false,"),
+            "deliver_outcome's InfrastructureError arm must record a FAILURE \
+             (`false`) — it publishes a synthesized client error, delivering \
+             no state. Issue #4828. Call window: {call_window}"
+        );
+        // Exact-once: a second record_op_result in this arm would
+        // double-count every infrastructure-error GET. Pin the count so a
+        // future edit that adds a stray call fails CI.
+        assert_eq!(
+            arm.matches("record_op_result(").count(),
+            1,
+            "deliver_outcome's InfrastructureError arm must record exactly \
+             once — a duplicate would double-count op_stats.gets. Issue #4828."
+        );
+        // And the Publish arm (which the Done/Exhausted driver arms reach,
+        // since they return DriverOutcome::Publish) must record NOTHING here
+        // — those arms already record in the driver, so recording again in
+        // deliver_outcome's Publish arm would double-count them.
+        let publish_region = &body[..arm_start];
+        assert!(
+            !publish_region.contains("record_op_result"),
+            "deliver_outcome's Publish arm must NOT call record_op_result — \
+             the Done/Exhausted arms already record in the driver and return \
+             Publish, so recording here too would double-count. Issue #4828."
+        );
+        // Guard the pin itself: `production_source` must actually be
+        // trimming the test module, or this test could match its own text.
+        assert!(
+            prod.len() < SOURCE.len(),
+            "production_source must trim the test module"
         );
     }
 

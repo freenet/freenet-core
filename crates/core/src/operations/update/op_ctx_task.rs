@@ -1340,6 +1340,19 @@ async fn drive_relay_broadcast_to(
         return Ok(());
     }
 
+    // Dashboard `updates_received` counter (issue #4828). Mirrors the
+    // streaming twin `drive_relay_broadcast_to_streaming`, and must stay
+    // in both: `broadcast_queue.rs` only picks the streaming variant above
+    // `streaming_threshold` (default 64 KB), so this non-streaming path
+    // carries every ordinary small delta — the normal River case. Before
+    // #4828 only the streaming twin recorded, so an actively-receiving
+    // subscriber displayed 0 (`cards.rs` renders `updates_received` as the
+    // ONLY UPDATE number for subscriber nodes).
+    //
+    // Placed after the `!changed` guard, matching the streaming twin: a
+    // broadcast that mutated nothing is not a received update.
+    crate::node::network_status::record_update_received();
+
     tracing::debug!(
         "UPDATE relay: contract {} @ {:?} updated via BroadcastTo",
         key,
@@ -3385,6 +3398,113 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Issue #4828: `record_update_received` must be recorded by BOTH
+    /// broadcast-apply paths, not just the streaming one. Before #4828 the
+    /// sole call site in the crate sat in the streaming path, but
+    /// `broadcast_queue.rs` only picks the streaming variant above
+    /// `streaming_threshold` (default 64 KB), so ordinary small deltas —
+    /// the normal River case — were invisible. `cards.rs` renders
+    /// `updates_received` as the ONLY UPDATE number for subscriber nodes,
+    /// so an actively-receiving subscriber displayed 0.
+    ///
+    /// Both paths must record AFTER their `if !changed` early-return, so
+    /// the counter tracks updates that actually mutated local state rather
+    /// than no-op re-broadcasts. The streaming path applies via the
+    /// extracted `apply_streaming_broadcast` helper (#4857), so its record
+    /// lives there and the streaming driver must delegate to it — pinned
+    /// below so the delegation cannot silently break the streaming record.
+    #[test]
+    fn both_broadcast_drivers_record_update_received() {
+        let full = include_str!("op_ctx_task.rs");
+        let src = production_source(full);
+        // Each broadcast path maps to the function that owns its `!changed`
+        // guard and its record call: the non-streaming driver records
+        // inline, the streaming driver records via `apply_streaming_broadcast`.
+        for sig in [
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
+        ] {
+            let body = extract_fn_body(src, sig);
+            // Exactly once: a second call double-counts every changed
+            // broadcast on this path; zero calls rots the counter.
+            let record_calls = body.matches("record_update_received()").count();
+            assert_eq!(
+                record_calls, 1,
+                "{sig} must call record_update_received() EXACTLY once — \
+                 `updates_received` is the only UPDATE number the dashboard \
+                 shows for subscriber nodes, and broadcast_queue.rs picks the \
+                 NON-streaming variant for every payload under \
+                 streaming_threshold (64 KB), i.e. the normal small-delta \
+                 case. Found {record_calls}. Issue #4828."
+            );
+            // Must sit AFTER the entire `if !changed { ... }` guard block —
+            // not merely after some `return` inside it, which a nested
+            // early-return could fake. Brace-match the guard block and
+            // require the record after its closing `}`, so no in-block path
+            // can record a no-op re-broadcast as a received update.
+            let changed_guard = body
+                .find("if !changed {")
+                .unwrap_or_else(|| panic!("{sig} must keep its `if !changed` early-return"));
+            let guard_open = changed_guard
+                + body[changed_guard..]
+                    .find('{')
+                    .expect("the `!changed` guard must have an opening brace");
+            let guard_end = {
+                let bytes = body.as_bytes();
+                let mut depth = 0i32;
+                let mut end = None;
+                for (i, &b) in bytes.iter().enumerate().skip(guard_open) {
+                    match b {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                end.expect("the `!changed` guard block must have a matching closing brace")
+            };
+            let record_pos = body
+                .find("record_update_received()")
+                .expect("checked above");
+            assert!(
+                record_pos > guard_end,
+                "{sig} must call record_update_received() AFTER the entire \
+                 `if !changed` guard block (past its closing brace), so no \
+                 in-block early-return path can record on a no-op broadcast. \
+                 Issue #4828."
+            );
+        }
+        // The streaming driver records via the extracted helper (#4857), so
+        // it must delegate to apply_streaming_broadcast EXACTLY once and must
+        // NOT record directly — zero delegations means the streaming path
+        // never records (counter rots for large payloads); a direct call or a
+        // second delegation would double-count.
+        let streaming_driver = extract_fn_body(src, "async fn drive_relay_broadcast_to_streaming(");
+        let delegations = streaming_driver
+            .matches("apply_streaming_broadcast(")
+            .count();
+        assert_eq!(
+            delegations, 1,
+            "drive_relay_broadcast_to_streaming must delegate to \
+             apply_streaming_broadcast EXACTLY once (found {delegations}); \
+             that helper owns the streaming record_update_received() call \
+             (#4857). Zero means the streaming path never records; two would \
+             double-count. Issue #4828."
+        );
+        assert!(
+            !streaming_driver.contains("record_update_received()"),
+            "drive_relay_broadcast_to_streaming must NOT call \
+             record_update_received() directly — the record lives in \
+             apply_streaming_broadcast (#4857). A direct call here would \
+             double-count the streaming path. Issue #4828."
+        );
     }
 
     /// Pin (telemetry accuracy / scope): `relayed_updates_total` counts

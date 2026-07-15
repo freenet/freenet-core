@@ -282,10 +282,6 @@ async fn drive_client_put_inner(
                 // (reverse-leg convergence) is a deliberate follow-up, not
                 // required for this PUT to report success correctly.
                 op_manager.completed(client_tx);
-                crate::node::network_status::record_op_result(
-                    crate::node::network_status::OpType::Put,
-                    true,
-                );
                 super::finalize_put_at_originator(
                     op_manager,
                     client_tx,
@@ -508,10 +504,6 @@ async fn drive_client_put_inner(
                     .await;
             }
             op_manager.ring.routing_finished(route_event);
-            crate::node::network_status::record_op_result(
-                crate::node::network_status::OpType::Put,
-                true,
-            );
 
             // Telemetry only — subscribe=false to avoid double-subscribe.
             //
@@ -1137,7 +1129,46 @@ async fn maybe_subscribe_child(
 
 // --- Outcome delivery ---
 
+/// Dashboard op_stats success classifier (issue #4828). Extracted so the
+/// success/failure mapping per `DriverOutcome` variant has direct unit
+/// coverage; `deliver_outcome` itself takes an `OpManager` which is
+/// expensive to construct in tests. Mirrors UPDATE's
+/// `classify_update_outcome_for_op_stats` (#4010).
+fn classify_put_outcome_for_op_stats(outcome: &DriverOutcome) -> bool {
+    matches!(outcome, DriverOutcome::Publish(Ok(_)))
+}
+
 fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: DriverOutcome) {
+    // Dashboard op_stats PUT counter (issue #4828). The legacy
+    // `report_result` recording path is bypassed for driver terminal
+    // replies (see `node::record_op_result` rustdoc), so every terminal
+    // outcome must be recorded here.
+    //
+    // Recording here rather than in the driver's arms is load-bearing:
+    // `run_client_put` -> `drive_client_put` -> `drive_client_put_inner`
+    // is the only call chain, so this single funnel sees EVERY terminal
+    // outcome. The pre-#4828 code recorded a hardcoded `true` in the two
+    // success arms instead, which left the `Done((Err(..), _))` #4111
+    // bypass, `Exhausted`, and `InfrastructureError` paths recording
+    // nothing at all — so `op_stats.puts.1` (the red "fail" number on the
+    // ops card) was structurally unreachable. Do NOT re-inline this into
+    // a driver arm; that is exactly how #4009/#4010 regrew here.
+    //
+    // Sub-operation gate: defensive. Today PUT has no sub-operation entry
+    // points (`Transaction::new_child_of` is only ever used to spawn
+    // SUBSCRIBE children), so `client_tx.is_sub_operation()` is always
+    // false on this path. The explicit gate matches UPDATE's and
+    // SUBSCRIBE's pattern so a future change that routes a sub-op tx
+    // through `run_client_put` doesn't silently start inflating the
+    // user-facing dashboard counter.
+    if !client_tx.is_sub_operation() {
+        let success = classify_put_outcome_for_op_stats(&outcome);
+        crate::node::network_status::record_op_result(
+            crate::node::network_status::OpType::Put,
+            success,
+        );
+    }
+
     match outcome {
         DriverOutcome::Publish(result) => {
             op_manager.send_client_result(client_tx, result);
@@ -4697,6 +4728,115 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Issue #4828 (same class as #4009 / #4010): `deliver_outcome` is the
+    /// single funnel every client PUT terminal outcome passes through
+    /// (`run_client_put` -> `drive_client_put` -> `drive_client_put_inner`
+    /// is the only call chain), so it MUST record the dashboard
+    /// `op_stats.puts` counter there. Recording in the driver's success
+    /// arms instead — which is what this file did before #4828 — left
+    /// every failure arm (`Done((Err(..), _))` #4111 bypass,
+    /// `Exhausted`, and the `InfrastructureError` synthesis) recording
+    /// nothing, so `op_stats.puts.1` (the red "fail" number on the ops
+    /// card) was structurally stuck at 0.
+    ///
+    /// Mirrors UPDATE's `deliver_outcome_records_update_op_result`, the
+    /// #4010 fix shape that did NOT rot.
+    #[test]
+    fn deliver_outcome_records_put_op_result() {
+        let prod = production_source();
+        let body = extract_fn_body(prod, "fn deliver_outcome(");
+
+        assert!(
+            body.contains("record_op_result"),
+            "deliver_outcome must call record_op_result so the dashboard \
+             PUT counter advances on EVERY driver terminal outcome — \
+             including the failure arms. Issue #4828."
+        );
+        assert!(
+            body.contains("OpType::Put"),
+            "record_op_result inside deliver_outcome must be passed \
+             OpType::Put (not Get/Update/Subscribe)."
+        );
+        // The success flag must be DERIVED from the outcome. An
+        // unconditional `true` is the #4828 bug — it is what made
+        // `op_stats.puts.1` unreachable. Mirrors the assertion text of
+        // GET's `record_op_result_reflects_host_result_outcome`.
+        let call_pos = body
+            .find("record_op_result")
+            .expect("record_op_result must be called in deliver_outcome");
+        let tail = &body[call_pos..];
+        let call_window = &tail[..tail.len().min(200)];
+        assert!(
+            !call_window.contains("true,"),
+            "record_op_result in deliver_outcome is passed an unconditional \
+             `true`. The success flag must be derived from the outcome via \
+             `classify_put_outcome_for_op_stats` so a failing PUT increments \
+             op_stats.puts.1. Issue #4828. Call window: {call_window}"
+        );
+        assert!(
+            body.contains("!client_tx.is_sub_operation()"),
+            "deliver_outcome must gate record_op_result on \
+             `!client_tx.is_sub_operation()` (note the leading `!`) for \
+             parity with SUBSCRIBE / UPDATE; defensive against a future \
+             change that routes a sub-op tx through run_client_put and \
+             silently inflates the user-facing dashboard counter."
+        );
+    }
+
+    /// Issue #4828: the PUT driver must NOT record `op_stats` itself.
+    /// `deliver_outcome` owns the counter for every terminal outcome; a
+    /// `record_op_result` re-inlined into a driver arm double-counts that
+    /// arm (and is how the pre-#4828 code came to record only successes).
+    /// This is the counterpart pin to `deliver_outcome_records_put_op_result`.
+    #[test]
+    fn put_driver_must_not_record_op_result_directly() {
+        let prod = production_source();
+        let body = extract_fn_body(prod, "async fn drive_client_put_inner(");
+
+        assert!(
+            !body.contains("record_op_result"),
+            "drive_client_put_inner must NOT call record_op_result — \
+             `deliver_outcome` is the single recording funnel for the PUT \
+             op_stats counter. Re-inlining the call into a driver arm \
+             double-counts that arm and re-opens #4828 (only the arms that \
+             remember to call it get counted)."
+        );
+    }
+
+    /// Issue #4828: pure-function coverage of every `DriverOutcome`
+    /// variant, pinning the success/failure mapping against an
+    /// accidental `success: !success` flip. Mirrors UPDATE's
+    /// `classify_update_outcome_covers_all_variants` (#4010).
+    #[test]
+    fn classify_put_outcome_covers_all_variants() {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let publish_ok = DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+            ContractResponse::PutResponse { key },
+        )));
+        let publish_err = DriverOutcome::Publish(Err(ErrorKind::OperationError {
+            cause: "synthetic".into(),
+        }
+        .into()));
+        let infra = DriverOutcome::InfrastructureError(OpError::UnexpectedOpState);
+
+        assert!(classify_put_outcome_for_op_stats(&publish_ok));
+        assert!(
+            !classify_put_outcome_for_op_stats(&publish_err),
+            "a published client error is a FAILED PUT — it must increment \
+             op_stats.puts.1. Issue #4828."
+        );
+        assert!(
+            !classify_put_outcome_for_op_stats(&infra),
+            "an infrastructure error publishes a synthesized client error, \
+             so it is a FAILED PUT. Issue #4828."
+        );
     }
 
     /// Pin (telemetry accuracy): BOTH relay PUT entry points must record
