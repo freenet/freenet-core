@@ -112,7 +112,8 @@ struct PredictionStage {
     count: usize,
     /// Cached K from the last training. Used for immutable predictions.
     cached_k: usize,
-    /// Number of observations when last trained (for growth-based retraining).
+    /// Number of observations when last trained (base for the retraining
+    /// threshold; see `observations_since_train`). Zero means never trained.
     trained_at: usize,
     /// Observations added since the last training.
     ///
@@ -169,6 +170,16 @@ impl PredictionStage {
     }
 
     /// Trigger training (metric learning + K selection).
+    ///
+    /// `get_optimal_k()` early-returns unless renegade's cached K has been
+    /// invalidated, so this only does real work when there is real work to do.
+    /// At saturation eviction is what invalidates it, and eviction is several
+    /// times more frequent than training (every ~`max_observations / 10` adds
+    /// vs every ~`max_observations * 0.45`), so each training here genuinely
+    /// re-learns rather than no-op'ing. Do not "optimize" the eviction path into
+    /// preserving the cache without revisiting the retraining cadence: that
+    /// would turn these calls into early-returns and silently re-freeze K
+    /// (#4810).
     fn train(&mut self) {
         if self.model.len() >= MIN_OBSERVATIONS_FOR_TRAINING {
             self.cached_k = self.model.get_optimal_k();
@@ -954,6 +965,23 @@ mod tests {
             "Should evict, got {}",
             predictor.len()
         );
+
+        // #4810: this test drives the LIVE `record_at_time` path deep into
+        // saturation, so it is where the training freeze was observable — and
+        // it sat here green for the whole time the freeze existed, because it
+        // only ever asserted the eviction bound. `growth_based_retraining`
+        // watches training but never saturates; this one saturates but never
+        // watched training. Both halves were covered and never intersected,
+        // which is exactly how #4810 got past CI. Assert the intersection:
+        // training must still be keeping up at saturation. At max=100,
+        // trained_at settles in [90, 100], so the retrain threshold is at most
+        // 50 and the counter can never sit above it for long. Pre-fix this
+        // reads ~100 (frozen, counting up forever).
+        assert!(
+            predictor.failure_stage.observations_since_train <= 50,
+            "training froze at saturation (#4810): {} observations since last train",
+            predictor.failure_stage.observations_since_train,
+        );
     }
 
     #[test]
@@ -1001,6 +1029,15 @@ mod tests {
         // But the failure and response time stages should have the observation
         assert_eq!(predictor.stage_sizes().0, 1);
         assert_eq!(predictor.stage_sizes().1, 1);
+
+        // A rejected observation must not count toward retraining either: the
+        // increment sits after the `!is_finite()` early-return in `add()`, so a
+        // stage fed nothing but Inf never trains. Without this, moving the
+        // increment above the early-return would still pass the size asserts.
+        assert_eq!(
+            predictor.transfer_speed_stage.observations_since_train, 0,
+            "rejected Inf observation must not count toward retraining",
+        );
     }
 
     #[test]
@@ -1070,16 +1107,21 @@ mod tests {
             i += 1;
         }
 
-        // Guard against a vacuous test: assert we are genuinely in the state
-        // the old rule could never escape. If this fails, the test is no longer
-        // exercising #4810 and the count below proves nothing.
-        let n = stage.len();
+        // Guard against a vacuous test: assert we are genuinely in the state the
+        // old rule could never escape, or the count below proves nothing.
+        //
+        // This is the STRUCTURAL form from #4810 ("any trained_at > 3333 freezes,
+        // because trained_at * 1.5 > 5000 from there on"), scaled to this cap. It
+        // is phase-independent: `len()` oscillates in [90, 100] as eviction
+        // fires, so an instantaneous `len() < trained_at + trained_at/2` could be
+        // satisfied by a trough rather than by genuine unreachability. Comparing
+        // against `max_observations` instead holds at every point in the cycle.
         assert!(
-            n < stage.trained_at + stage.trained_at / 2,
-            "test precondition: expected to be in the frozen zone, \
-             but old rule is still satisfiable (n={}, trained_at={})",
-            n,
+            stage.trained_at + stage.trained_at / 2 > stage.max_observations,
+            "test precondition: expected the old rule to be unsatisfiable, but \
+             trained_at={} still allows it under cap {}",
             stage.trained_at,
+            stage.max_observations,
         );
 
         // Training must still fire over a further run of observations.
@@ -1091,10 +1133,22 @@ mod tests {
             i += 1;
         }
 
+        // Bounded on BOTH sides. The lower bound catches the freeze; the upper
+        // bound catches a fix that restores training by making it fire far too
+        // often (e.g. an escape hatch like `if n >= max_observations * 9 / 10 {
+        // return true }`, which would train on EVERY event — an O(n^2)
+        // `ensure_trained` per routing event at n~4500). The cadence is the whole
+        // reason this fix is cheap, so pin it.
+        //
+        // Deterministic: trained_at settles in [90, 100], so the threshold is
+        // 45-50 and 1000 observations yield 21 trainings. The band absorbs
+        // incidental drift without admitting either failure mode.
         assert!(
-            trainings > 0,
-            "training froze permanently at saturation (#4810): 0 trainings over \
-             1000 observations with trained_at={}, len={}",
+            (15..=25).contains(&trainings),
+            "expected ~21 trainings over 1000 observations at saturation, got {} \
+             (0 = frozen (#4810); >25 = retraining far too often) with \
+             trained_at={}, len={}",
+            trainings,
             stage.trained_at,
             stage.len(),
         );
@@ -1114,7 +1168,12 @@ mod tests {
             }
         }
 
-        // The exact 50%-growth ladder documented in #4810.
+        // The exact 50%-growth ladder documented in #4810. It is DERIVED, not
+        // magic: it starts at MIN_OBSERVATIONS_FOR_TRAINING (20) and each rung
+        // is `t + t / 2` (integer division). If you change either the constant
+        // or the 50% factor, recompute this vector from the new values rather
+        // than editing it to match whatever the test now prints — the point of
+        // the assertion is that the cadence is the one that was designed.
         assert_eq!(ladder, vec![20, 30, 45, 67, 100, 150, 225, 337, 505]);
     }
 
