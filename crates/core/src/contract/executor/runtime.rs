@@ -428,6 +428,8 @@ impl Executor<Runtime> {
         contract_modules: SharedModuleCache<ContractKey>,
         delegate_modules: SharedModuleCache<DelegateKey>,
         delegate_contexts: crate::wasm_runtime::DelegateContextCache,
+        created_delegates_count: crate::wasm_runtime::SharedDelegateCounter,
+        inherited_origins: crate::wasm_runtime::SharedInheritedOrigins,
         shared_backend: Option<BackendEngine>,
         shared_contract_index: SharedContractIndex,
     ) -> anyhow::Result<Self> {
@@ -467,6 +469,8 @@ impl Executor<Runtime> {
             contract_modules,
             delegate_modules,
             delegate_contexts,
+            created_delegates_count,
+            inherited_origins,
             shared_backend.unwrap_or_else(|| {
                 // First executor — create a fresh backend engine; RuntimePool
                 // will extract and share it with subsequent executors.

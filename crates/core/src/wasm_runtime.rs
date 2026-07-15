@@ -39,8 +39,9 @@ pub(crate) use module_cache::{
     MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
 };
 pub(crate) use native_api::{
-    CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS, DELEGATE_SUBSCRIPTIONS,
-    DelegateContextCache, new_delegate_context_cache,
+    DELEGATE_SUBSCRIPTIONS, DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,
+    new_delegate_context_cache, new_delegate_counter, new_inherited_origins,
+    release_created_delegate_slot,
 };
 // Only constructed by name in test code (e.g. resolve_message_origin tests);
 // production read/write paths access the entry through the DashMap without

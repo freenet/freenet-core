@@ -70,8 +70,8 @@ impl DelegateRuntimeInterface for Runtime {
         // Keep the inherited-origins map tidy. Mark this delegate as just-used
         // so the cleanup keeps its entry, then drop entries for delegates that
         // have gone unused long enough. See `InheritedOriginsEntry`.
-        native_api::touch_inherited_origin(delegate_key);
-        native_api::prune_expired_inherited_origins();
+        native_api::touch_inherited_origin(&self.inherited_origins, delegate_key);
+        native_api::prune_expired_inherited_origins(&self.inherited_origins);
         let mut context: Vec<u8> = self
             .delegate_contexts
             .get(delegate_key)

@@ -146,6 +146,12 @@ impl Runtime {
                 // delegate cannot mutate or forge it. `None` outside hosted
                 // mode keeps secret ops on `SecretScope::Local`.
                 user_context.cloned(),
+                // This node's created-delegate count, enforcing
+                // MAX_CREATED_DELEGATES_PER_NODE across the pool's executors.
+                self.created_delegates_count.clone(),
+                // This node's attestation map, which a creation by an attested
+                // parent extends with the child's inherited origins.
+                self.inherited_origins.clone(),
             )
         };
 

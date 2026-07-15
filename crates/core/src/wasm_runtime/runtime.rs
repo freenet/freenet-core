@@ -274,6 +274,16 @@ pub struct Runtime {
     /// executors so a prompt round-trip routed to a different `Runtime` still
     /// sees the pending state. See `native_api::DelegateContextCache`.
     pub(super) delegate_contexts: super::native_api::DelegateContextCache,
+    /// This node's count of delegates created via the `create_delegate` host
+    /// function, enforcing `MAX_CREATED_DELEGATES_PER_NODE`. Shared across the
+    /// pool's executors (so the limit is per node, not per executor) and NOT
+    /// across nodes. See `native_api::SharedDelegateCounter`.
+    pub(crate) created_delegates_count: super::native_api::SharedDelegateCounter,
+    /// This node's child-delegate attestation map (child `DelegateKey` → the
+    /// origins it inherited from its parent). Shared across the pool's
+    /// executors and NOT across nodes — it is an authorization input, see
+    /// `native_api::SharedInheritedOrigins`.
+    pub(crate) inherited_origins: super::native_api::SharedInheritedOrigins,
 
     /// Local contract storage.
     pub(crate) contract_store: ContractStore,
@@ -428,6 +438,8 @@ impl Runtime {
             contract_store,
             delegate_modules: Arc::new(Mutex::new(ModuleCache::new(budget))),
             delegate_contexts: super::native_api::new_delegate_context_cache(),
+            created_delegates_count: super::native_api::new_delegate_counter(),
+            inherited_origins: super::native_api::new_inherited_origins(),
             state_store_db: None,
             state_write_callback: None,
             state_admit_callback: None,
@@ -475,6 +487,8 @@ impl Runtime {
         contract_modules: SharedModuleCache<ContractKey>,
         delegate_modules: SharedModuleCache<DelegateKey>,
         delegate_contexts: super::native_api::DelegateContextCache,
+        created_delegates_count: super::native_api::SharedDelegateCounter,
+        inherited_origins: super::native_api::SharedInheritedOrigins,
         shared_backend: BackendEngine,
         config: &RuntimeConfig,
     ) -> RuntimeResult<Self> {
@@ -493,6 +507,8 @@ impl Runtime {
             contract_store,
             delegate_modules,
             delegate_contexts,
+            created_delegates_count,
+            inherited_origins,
             state_store_db: None,
             state_write_callback: None,
             state_admit_callback: None,

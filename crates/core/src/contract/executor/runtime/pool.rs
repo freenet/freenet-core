@@ -82,6 +82,16 @@ pub struct RuntimePool {
     shared_delegate_modules: SharedModuleCache<DelegateKey>,
     /// Shared per-delegate `ctx.write()` cache (see `DelegateContextCache`).
     shared_delegate_contexts: crate::wasm_runtime::DelegateContextCache,
+    /// This node's created-delegate count, shared by every executor so
+    /// `MAX_CREATED_DELEGATES_PER_NODE` is enforced per node rather than per
+    /// executor. Pool-owned so a replacement executor inherits the live count
+    /// instead of resetting it to zero. See `SharedDelegateCounter`.
+    shared_delegate_counter: crate::wasm_runtime::SharedDelegateCounter,
+    /// This node's child-delegate attestation map, shared by every executor so
+    /// a child created via one executor is attributed the same origins when a
+    /// message reaches it via another. Pool-owned so a replacement executor
+    /// inherits the live map. See `SharedInheritedOrigins`.
+    shared_inherited_origins: crate::wasm_runtime::SharedInheritedOrigins,
     /// Shared backend engine used by all executors.
     ///
     /// All executors MUST share the same backend engine because compiled modules
@@ -380,6 +390,14 @@ impl RuntimePool {
         // Shared delegate-context cache so a prompt round-trip routed to a
         // different pool executor still finds its `ctx.write()` blob.
         let shared_delegate_contexts = crate::wasm_runtime::new_delegate_context_cache();
+        // One created-delegate count for this node, shared by every executor:
+        // the limit it enforces is per node, so a delegate created via one
+        // executor must draw down the same budget every other executor checks.
+        let shared_delegate_counter = crate::wasm_runtime::new_delegate_counter();
+        // One attestation map for this node, shared by every executor: a child
+        // delegate created via one executor must resolve to the same inherited
+        // origins when a later message reaches it via a different one.
+        let shared_inherited_origins = crate::wasm_runtime::new_inherited_origins();
 
         // Create shared recovery guard for corrupted-state self-healing.
         // All pool executors share this so recovery tracking is consistent.
@@ -402,6 +420,8 @@ impl RuntimePool {
             shared_contract_modules.clone(),
             shared_delegate_modules.clone(),
             shared_delegate_contexts.clone(),
+            shared_delegate_counter.clone(),
+            shared_inherited_origins.clone(),
             None, // No shared backend yet — this executor creates the engine
             shared_contract_index.clone(),
         )
@@ -424,6 +444,8 @@ impl RuntimePool {
                 shared_contract_modules.clone(),
                 shared_delegate_modules.clone(),
                 shared_delegate_contexts.clone(),
+                shared_delegate_counter.clone(),
+                shared_inherited_origins.clone(),
                 Some(shared_backend_engine.clone()),
                 shared_contract_index.clone(),
             )
@@ -491,6 +513,8 @@ impl RuntimePool {
             shared_contract_index,
             shared_delegate_modules,
             shared_delegate_contexts,
+            shared_delegate_counter,
+            shared_inherited_origins,
             shared_backend_engine,
             shared_recovery_guard,
             delegate_notification_tx,
@@ -673,6 +697,8 @@ impl RuntimePool {
             self.shared_contract_modules.clone(),
             self.shared_delegate_modules.clone(),
             self.shared_delegate_contexts.clone(),
+            self.shared_delegate_counter.clone(),
+            self.shared_inherited_origins.clone(),
             Some(self.shared_backend_engine.clone()),
             self.shared_contract_index.clone(),
         )
