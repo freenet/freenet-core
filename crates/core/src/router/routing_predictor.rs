@@ -112,8 +112,19 @@ struct PredictionStage {
     count: usize,
     /// Cached K from the last training. Used for immutable predictions.
     cached_k: usize,
-    /// Number of observations when last trained (for growth-based retraining).
+    /// Number of observations when last trained (base for the retraining
+    /// threshold; see `observations_since_train`). Zero means never trained.
     trained_at: usize,
+    /// Observations added since the last training.
+    ///
+    /// Retraining keys off this rather than off total-count growth
+    /// (`len() >= trained_at * 3 / 2`) because eviction pins `len()` at or below
+    /// `max_observations` (it reaches the cap exactly, then drops to 9/10 of it).
+    /// Once `trained_at * 3 / 2` exceeded that reachable count, the total-count
+    /// rule became unsatisfiable and training froze permanently. No constant
+    /// rescues that formulation — capping the growth term just moves the rung at
+    /// which it freezes. See #4810.
+    observations_since_train: usize,
 }
 
 impl PredictionStage {
@@ -124,6 +135,7 @@ impl PredictionStage {
             count: 0,
             cached_k: DEFAULT_K,
             trained_at: 0,
+            observations_since_train: 0,
         }
     }
 
@@ -134,12 +146,14 @@ impl PredictionStage {
         }
         self.model.add(obs, output);
         self.count += 1;
+        self.observations_since_train += 1;
         if self.count > self.max_observations {
             self.evict_oldest();
         }
     }
 
-    /// Check if training should happen based on data growth (50% since last train).
+    /// Check if training should happen: 50% of the last-trained size worth of
+    /// fresh observations has arrived since the last training.
     fn should_train(&self) -> bool {
         let n = self.model.len();
         if n < MIN_OBSERVATIONS_FOR_TRAINING {
@@ -148,15 +162,37 @@ impl PredictionStage {
         if self.trained_at == 0 {
             return true;
         }
-        // Retrain when data has grown 50% since last training
-        n >= self.trained_at + self.trained_at / 2
+        // BEFORE THE FIRST EVICTION nothing has been discarded, so
+        // `observations_since_train == n - trained_at` and this is exactly the
+        // historical `n >= trained_at + trained_at / 2` rule — the pre-eviction
+        // cadence is preserved bit-for-bit.
+        //
+        // The boundary is the first eviction, NOT the cap: once eviction starts,
+        // `n` is still below `max_observations` (it drops to 9/10 of it) but the
+        // two forms have already diverged, because evicted observations still
+        // count as "arrived". At trained_at=3829 with a 5000 cap, for instance,
+        // `observations_since_train` reads 1173 while `n - trained_at` is 672.
+        // That divergence is the fix: `n` stops growing but new observations keep
+        // arriving, so only this form stays satisfiable. See #4810.
+        self.observations_since_train >= (self.trained_at / 2).max(1)
     }
 
     /// Trigger training (metric learning + K selection).
+    ///
+    /// `get_optimal_k()` early-returns unless renegade's cached K has been
+    /// invalidated, so this only does real work when there is real work to do.
+    /// At saturation eviction is what invalidates it, and eviction is several
+    /// times more frequent than training (every ~`max_observations / 10` adds
+    /// vs every ~`max_observations * 0.45`), so each training here genuinely
+    /// re-learns rather than no-op'ing. Do not "optimize" the eviction path into
+    /// preserving the cache without revisiting the retraining cadence: that
+    /// would turn these calls into early-returns and silently re-freeze K
+    /// (#4810).
     fn train(&mut self) {
         if self.model.len() >= MIN_OBSERVATIONS_FOR_TRAINING {
             self.cached_k = self.model.get_optimal_k();
             self.trained_at = self.model.len();
+            self.observations_since_train = 0;
         }
     }
 
@@ -195,6 +231,9 @@ impl PredictionStage {
             }
         });
         self.count = self.model.len();
+        // Deliberately does NOT touch `observations_since_train`: eviction must
+        // not erase the record that new data has arrived, or retraining would
+        // freeze again at saturation (#4810).
     }
 }
 
@@ -485,7 +524,14 @@ impl RoutingPredictor {
             }
         }
 
-        // Train based on data growth (not at fixed counts)
+        // Retrain on observation turnover (not at fixed counts).
+        //
+        // Note the ordering: `add()` above evicts inline, so by the time
+        // `should_train()` runs, a stage that just hit `max_observations + 1` has
+        // already been trimmed to 9/10 of the cap. The largest `len()` any
+        // `should_train()` can observe is therefore exactly `max_observations` —
+        // which is why a rule keyed off total count is unsatisfiable past a
+        // point, and why this one is keyed off turnover instead (#4810).
         if !self.batch_mode {
             if self.failure_stage.should_train() {
                 self.failure_stage.train();
@@ -934,6 +980,23 @@ mod tests {
             "Should evict, got {}",
             predictor.len()
         );
+
+        // #4810: this test drives the LIVE `record_at_time` path deep into
+        // saturation, so it is where the training freeze was observable — and
+        // it sat here green for the whole time the freeze existed, because it
+        // only ever asserted the eviction bound. `growth_based_retraining`
+        // watches training but never saturates; this one saturates but never
+        // watched training. Both halves were covered and never intersected,
+        // which is exactly how #4810 got past CI. Assert the intersection:
+        // training must still be keeping up at saturation. At max=100,
+        // trained_at settles in [90, 100], so the retrain threshold is at most
+        // 50 and the counter can never sit above it for long. Pre-fix this
+        // reads ~100 (frozen, counting up forever).
+        assert!(
+            predictor.failure_stage.observations_since_train <= 50,
+            "training froze at saturation (#4810): {} observations since last train",
+            predictor.failure_stage.observations_since_train,
+        );
     }
 
     #[test]
@@ -981,6 +1044,15 @@ mod tests {
         // But the failure and response time stages should have the observation
         assert_eq!(predictor.stage_sizes().0, 1);
         assert_eq!(predictor.stage_sizes().1, 1);
+
+        // A rejected observation must not count toward retraining either: the
+        // increment sits after the `!is_finite()` early-return in `add()`, so a
+        // stage fed nothing but Inf never trains. Without this, moving the
+        // increment above the early-return would still pass the size asserts.
+        assert_eq!(
+            predictor.transfer_speed_stage.observations_since_train, 0,
+            "rejected Inf observation must not count toward retraining",
+        );
     }
 
     #[test]
@@ -1005,6 +1077,126 @@ mod tests {
             "Should have retrained, trained_at={}",
             predictor.failure_stage.trained_at,
         );
+    }
+
+    fn stage_obs(i: usize) -> RoutingObservation {
+        RoutingObservation {
+            peer_id: (i % 7) as f64,
+            contract_location: (i % 100) as f64 / 100.0,
+            distance: (i % 50) as f64 / 100.0,
+            time: i as f64 * 0.01,
+        }
+    }
+
+    /// Drive a stage exactly the way the live `record_at_time` path does:
+    /// add the observation (which may evict), then train if due.
+    /// Returns true if training fired.
+    fn add_then_maybe_train(stage: &mut PredictionStage, i: usize) -> bool {
+        stage.add(stage_obs(i), (i % 2) as f64);
+        if stage.should_train() {
+            stage.train();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Regression test for #4810: training must stay reachable once the stage
+    /// saturates its observation cap.
+    ///
+    /// The old rule (`n >= trained_at + trained_at / 2`) compares against the
+    /// TOTAL observation count, which eviction pins below `max_observations`.
+    /// Once `trained_at * 3 / 2` exceeds the reachable count, the condition is
+    /// unsatisfiable and training never fires again.
+    #[test]
+    fn regression_training_reachable_after_saturation() {
+        // Small cap so saturation is reached quickly. Ladder is 20 → 30 → 45 →
+        // 67 → 100, and at trained_at=100 the old rule needs n >= 150, which a
+        // 100-observation cap can never reach.
+        let mut stage = PredictionStage::new(100);
+        let mut i = 0;
+
+        // Warm up well past saturation.
+        for _ in 0..1_000 {
+            add_then_maybe_train(&mut stage, i);
+            i += 1;
+        }
+
+        // Guard against a vacuous test: assert we are genuinely in the state the
+        // old rule could never escape, or the count below proves nothing.
+        //
+        // This is the STRUCTURAL form from #4810 ("any trained_at > 3333 freezes,
+        // because trained_at * 1.5 > 5000 from there on"), scaled to this cap. It
+        // is phase-independent: `len()` oscillates in [90, 100] as eviction
+        // fires, so an instantaneous `len() < trained_at + trained_at/2` could be
+        // satisfied by a trough rather than by genuine unreachability. Comparing
+        // against `max_observations` instead holds at every point in the cycle.
+        //
+        // Concretely, why the instantaneous form is not enough: change the cap
+        // above to 100_000 and the warmup ends at len=1000, trained_at=757. The
+        // instantaneous check passes (1000 < 1135) even though the old rule is
+        // nowhere near frozen — 1135 is perfectly reachable under that cap — so
+        // the test would pass while proving nothing. The structural check
+        // correctly fails there (1135 is not > 100_000).
+        assert!(
+            stage.trained_at + stage.trained_at / 2 > stage.max_observations,
+            "test precondition: expected the old rule to be unsatisfiable, but \
+             trained_at={} still allows it under cap {}",
+            stage.trained_at,
+            stage.max_observations,
+        );
+
+        // Training must still fire over a further run of observations.
+        let mut trainings = 0;
+        for _ in 0..1_000 {
+            if add_then_maybe_train(&mut stage, i) {
+                trainings += 1;
+            }
+            i += 1;
+        }
+
+        // Bounded on BOTH sides. The lower bound catches the freeze; the upper
+        // bound catches a fix that restores training by making it fire far too
+        // often (e.g. an escape hatch like `if n >= max_observations * 9 / 10 {
+        // return true }`, which would train on EVERY event — an O(n^2)
+        // `ensure_trained` per routing event at n~4500). The cadence is the whole
+        // reason this fix is cheap, so pin it.
+        //
+        // Deterministic: trained_at settles in [90, 100], so the threshold is
+        // 45-50 and 1000 observations yield 21 trainings. The band absorbs
+        // incidental drift without admitting either failure mode.
+        assert!(
+            (15..=25).contains(&trainings),
+            "expected ~21 trainings over 1000 observations at saturation, got {} \
+             (0 = frozen (#4810); >25 = retraining far too often) with \
+             trained_at={}, len={}",
+            trainings,
+            stage.trained_at,
+            stage.len(),
+        );
+    }
+
+    /// Pins the pre-saturation retraining cadence from #4810 so the fix for the
+    /// frozen-at-saturation case does not perturb the 50%-growth ladder.
+    #[test]
+    fn pre_saturation_training_cadence_unchanged() {
+        // Cap far above the observations added, so nothing is ever evicted.
+        let mut stage = PredictionStage::new(100_000);
+        let mut ladder = Vec::new();
+
+        for i in 0..600 {
+            if add_then_maybe_train(&mut stage, i) {
+                ladder.push(stage.trained_at);
+            }
+        }
+
+        // The exact 50%-growth ladder documented in #4810. It is DERIVED, not
+        // magic: it starts at MIN_OBSERVATIONS_FOR_TRAINING (20) and each rung
+        // is `t + t / 2` (integer division). If you change either the constant
+        // or the 50% factor, recompute this vector from the new values rather
+        // than editing it to match whatever the test now prints — the point of
+        // the assertion is that the cadence is the one that was designed.
+        assert_eq!(ladder, vec![20, 30, 45, 67, 100, 150, 225, 337, 505]);
     }
 
     #[test]
