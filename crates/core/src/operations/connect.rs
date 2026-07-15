@@ -2128,6 +2128,42 @@ mod tests {
         estimator.record(&peer, Location::new(0.25), true);
     }
 
+    /// REGRESSION (#4811, gap 1): this estimator must get the batch-accuracy
+    /// refit like every other isotonic estimator in the tree.
+    ///
+    /// It never did. The refit was driven by `Router::refit_stale_estimators`,
+    /// reachable only from `Ring::refit_router_periodically`'s tick, and this
+    /// estimator lives OUTSIDE `Router` — behind its own `Arc<RwLock<..>>` on
+    /// `ConnectOp` — so the tick could not see it. Its incremental
+    /// pool-adjacent-violators fit therefore drifted from the batch fit forever,
+    /// with nothing to repair it, while `estimate()` kept biasing live CONNECT
+    /// forwarding off the drifted curve. Review noted its Bernoulli 0/1 outcomes
+    /// pool heavily, making it plausibly the worst drift case in the tree.
+    ///
+    /// Moving the trigger into `IsotonicEstimator::add_event` fixes it with no
+    /// wiring at all: `record` already funnels into `add_event`, so the estimator
+    /// now refits itself regardless of who owns it. That is the whole point of
+    /// the #4811 direction, and this is its pin — it fails against `main`, where
+    /// no amount of `record`ing ever refits this estimator.
+    #[test]
+    fn forward_estimator_refits_itself_despite_living_outside_router() {
+        let mut estimator = ConnectForwardEstimator::new();
+
+        // Well past the 10% turnover trigger. Distinct peers and desired
+        // locations, mixed Bernoulli outcomes — i.e. what `record` actually sees.
+        for i in 0..120u16 {
+            let peer = make_peer(3000 + i);
+            estimator.record(&peer, Location::new(f64::from(i % 50) / 100.0), i % 3 == 0);
+        }
+
+        assert!(
+            !estimator.estimator.is_stale_for_test(),
+            "ConnectForwardEstimator must not be left owing a refit: it is \
+             unreachable from Router, so if add_event does not refit it inline, \
+             nothing ever will and its curve drifts unrepaired forever (#4811)"
+        );
+    }
+
     #[test]
     fn expired_forward_attempts_are_cleared() {
         let mut op = ConnectOp::new_joiner(
