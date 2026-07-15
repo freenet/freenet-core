@@ -418,11 +418,22 @@ impl IsotonicEstimator {
     /// conclusion it supported survives the correction, because what lands on the
     /// hot path is the amortised few µs, not the whole fit.
     ///
-    /// It takes no locks and does no I/O — it is pure computation over `self` —
-    /// so it cannot deadlock or re-enter a caller that already holds one
-    /// (`Router::add_event` is called under `ring.router.write()`;
-    /// `ConnectForwardEstimator::record` under its own `RwLock`). It only extends
-    /// a critical section the caller already holds.
+    /// LOCK SAFETY. The fit itself takes no locks and does no I/O — it is pure
+    /// computation over `self` — so it cannot deadlock or re-enter a caller that
+    /// already holds one (`Router::add_event` is called under
+    /// `ring.router.write()`; `ConnectForwardEstimator::record` under its own
+    /// `RwLock`). It only extends a critical section the caller already holds.
+    ///
+    /// Precisely: that "no locks" claim covers `fit`, not every line reachable
+    /// from the refit. `refit`'s error arm calls `tracing::warn!`, and in release
+    /// builds the per-callsite rate limiter (`util/rate_limit_layer.rs`) does a
+    /// DashMap lookup, whose shard guard is a real `parking_lot` lock (it is
+    /// compiled out under `cfg(test)`, so no test would surface it). That is not
+    /// a deadlock risk — nothing reachable from that shard guard takes
+    /// `ring.router` or `connect_forward_estimator` back, so there is no cycle —
+    /// and it is inert today because the error arm is unreachable (see `refit`).
+    /// Anyone making that arm reachable must re-check this paragraph, not just
+    /// the retry cadence noted there.
     pub fn add_event(&mut self, event: IsotonicEvent) {
         self.add_event_incremental(event);
 
