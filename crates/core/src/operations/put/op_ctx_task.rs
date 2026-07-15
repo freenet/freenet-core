@@ -1253,6 +1253,10 @@ where
         return Ok(());
     }
 
+    // Routing/hosting attribution (Group C): count this as a genuine relayed
+    // PUT (past the dedup gate — a deduped duplicate is not a relay).
+    crate::node::network_status::record_relayed_put();
+
     tracing::debug!(
         tx = %incoming_tx,
         contract = %contract.key(),

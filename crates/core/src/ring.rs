@@ -1767,6 +1767,53 @@ impl Ring {
                 snapshot.terminal_consult_still_not_found = Some(still_not_found);
             }
 
+            // Streamed-transfer abort counters (Group B): isolate the
+            // large-contract failure class on the existing snapshot cadence.
+            // Same hand-mirror footgun as the counters above — a new
+            // `RouterSnapshotInfo` field is invisible to the collector unless
+            // added here AND in `event_kind_to_json` (pinned by
+            // `router_snapshot_json_includes_stream_abort_counters`). Read from
+            // the per-node network_status singleton where the abort sites record
+            // them; `None` only before the singleton is initialized.
+            if let Some(a) = crate::node::network_status::stream_abort_counts() {
+                snapshot.stream_recv_aborts_inactivity_total = Some(a.recv_inactivity);
+                snapshot.stream_recv_aborts_cancelled_total = Some(a.recv_cancelled);
+                snapshot.stream_recv_aborts_claim_timeout_total = Some(a.recv_claim_timeout);
+                snapshot.stream_recv_aborts_deserialize_total = Some(a.recv_deserialize);
+                snapshot.stream_send_aborts_cwnd_total = Some(a.send_cwnd);
+                snapshot.stream_recv_abort_frac_0 = Some(a.frac_0);
+                snapshot.stream_recv_abort_frac_1 = Some(a.frac_1);
+                snapshot.stream_recv_abort_frac_lt50 = Some(a.frac_lt50);
+                snapshot.stream_recv_abort_frac_50_90 = Some(a.frac_50_90);
+                snapshot.stream_recv_abort_frac_ge90 = Some(a.frac_ge90);
+            }
+
+            // Routing/hosting attribution (Group C): current connection gauges
+            // from `connection_manager` plus relayed-op counters and the
+            // gateway-connection gauge from the network_status singleton. Same
+            // hand-mirror footgun — pinned by
+            // `router_snapshot_json_includes_routing_attribution_counters`.
+            snapshot.ring_connections = Some(cm.connection_count() as u64);
+            snapshot.transient_connections = Some(cm.transient_count() as u64);
+            snapshot.connections_to_gateways =
+                crate::node::network_status::connections_to_gateways();
+            if let Some((gets, puts, subscribes, updates)) =
+                crate::node::network_status::relayed_op_counts()
+            {
+                snapshot.relayed_gets_total = Some(gets);
+                snapshot.relayed_puts_total = Some(puts);
+                snapshot.relayed_subscribes_total = Some(subscribes);
+                snapshot.relayed_updates_total = Some(updates);
+            }
+
+            // Connect-event emission counters (firehose-retirement precursor).
+            // Additive aggregate for a future net-negative retirement of the
+            // per-event `connect_connected` / `connect_rejected` firehose.
+            if let Some((accepts, rejects)) = crate::node::network_status::connect_emit_counts() {
+                snapshot.connect_accepts_emitted = Some(accepts);
+                snapshot.connect_rejects_emitted = Some(rejects);
+            }
+
             // Computed-upstream vs. stored-`is_upstream`-flag divergence counters
             // (#4642 piece D / #4671). Recorded at `send_unsubscribe_upstream`
             // where the stored flag is still consulted; exported here so the

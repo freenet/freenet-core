@@ -635,6 +635,10 @@ pub(crate) async fn start_relay_request_update(
         return Ok(());
     }
 
+    // Routing/hosting attribution (Group C): count this as a genuine relayed
+    // UPDATE (past the dedup gate — a deduped duplicate is not a relay).
+    crate::node::network_status::record_relayed_update();
+
     tracing::debug!(
         tx = %incoming_tx,
         %key,

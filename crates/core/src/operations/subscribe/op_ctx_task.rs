@@ -1509,6 +1509,10 @@ pub(crate) async fn start_relay_subscribe(
         return Ok(());
     }
 
+    // Routing/hosting attribution (Group C): count this as a genuine relayed
+    // SUBSCRIBE (past the dedup gate — a deduped duplicate is not a relay).
+    crate::node::network_status::record_relayed_subscribe();
+
     // Construct the guard IMMEDIATELY after `insert` so a panic in any
     // intervening work (fmt-allocating logs, future OOM) cannot leak
     // the dedup-set entry. The guard's Drop clears the entry; without

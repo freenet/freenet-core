@@ -219,6 +219,10 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                     elapsed.as_millis() as u64,
                     TransferDirection::Send,
                 );
+                // Aggregate sender-abort counter (Group B telemetry): the
+                // cwnd-wait timed out (ACKs stopped arriving) and this stream is
+                // being failed. Bucketed once here, never per-fragment.
+                crate::node::network_status::record_stream_send_abort_cwnd();
                 // Fail only this stream, not the connection (#4345). A cwnd-wait
                 // timeout means ACKs stopped arriving for this transfer; tearing
                 // down the whole connection would kill every other operation

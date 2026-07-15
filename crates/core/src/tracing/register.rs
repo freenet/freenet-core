@@ -540,6 +540,9 @@ impl<'a> NetEventLog<'a> {
         is_sub_op: bool,
         attempts: usize,
         hop_count: Option<usize>,
+        fragments_received: Option<u32>,
+        total_fragments: Option<u32>,
+        stream_abort_cause: Option<super::StreamAbortCause>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -556,6 +559,9 @@ impl<'a> NetEventLog<'a> {
                 is_sub_op,
                 attempts,
                 hop_count,
+                fragments_received,
+                total_fragments,
+                stream_abort_cause,
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
             }),
@@ -2193,6 +2199,9 @@ mod span_completed_tests {
                 is_sub_op: false,
                 attempts: 1,
                 hop_count: None,
+                fragments_received: None,
+                total_fragments: None,
+                stream_abort_cause: None,
                 elapsed_ms: 0,
                 timestamp: 0,
             }));

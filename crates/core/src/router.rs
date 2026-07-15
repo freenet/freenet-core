@@ -484,6 +484,49 @@ pub(crate) struct RouterSnapshotInfo {
     pub lattice_predecessor_distance: Option<f64>,
     pub lattice_probes_issued: Option<u64>,
     pub lattice_probe_improvements: Option<u64>,
+    /// Streamed-transfer (> 64 KB) abort counters, populated by `Ring` from the
+    /// per-node `network_status` singleton on the snapshot cadence. They isolate
+    /// the large-contract failure class (~50% of large fetches were failing)
+    /// WITHOUT a per-fragment/per-transfer event stream: five monotonic cause
+    /// totals (receiver inactivity / cancelled / claim-timeout / deserialize;
+    /// sender cwnd) plus a fragment-progress histogram (`*_frac_*`, one bump per
+    /// receiver abort) showing HOW FAR transfers got before dying. All monotonic
+    /// lifetime totals the collector differences across the cadence. `None`
+    /// until the ring's snapshot task populates them.
+    pub stream_recv_aborts_inactivity_total: Option<u64>,
+    pub stream_recv_aborts_cancelled_total: Option<u64>,
+    pub stream_recv_aborts_claim_timeout_total: Option<u64>,
+    pub stream_recv_aborts_deserialize_total: Option<u64>,
+    pub stream_send_aborts_cwnd_total: Option<u64>,
+    pub stream_recv_abort_frac_0: Option<u64>,
+    pub stream_recv_abort_frac_1: Option<u64>,
+    pub stream_recv_abort_frac_lt50: Option<u64>,
+    pub stream_recv_abort_frac_50_90: Option<u64>,
+    pub stream_recv_abort_frac_ge90: Option<u64>,
+    /// Routing/hosting attribution gauges + counters, populated by `Ring` on the
+    /// snapshot cadence. `ring_connections` / `transient_connections` are current
+    /// gauges (live + transient connection counts from `connection_manager`);
+    /// `connections_to_gateways` is how many of this node's active connections go
+    /// to gateways (the NAT-stranded fingerprint — a peer stuck on gateways only).
+    /// `relayed_*_total` are monotonic counts of operations this node RELAYED
+    /// (forwarded one hop as a routing intermediary, not as originator), one
+    /// increment per relay-driver entry. `None` until the ring's snapshot task
+    /// populates them.
+    pub ring_connections: Option<u64>,
+    pub transient_connections: Option<u64>,
+    pub connections_to_gateways: Option<u64>,
+    pub relayed_gets_total: Option<u64>,
+    pub relayed_puts_total: Option<u64>,
+    pub relayed_subscribes_total: Option<u64>,
+    pub relayed_updates_total: Option<u64>,
+    /// Connect-event emission counters (aggregate precursor to retiring the
+    /// per-event `connect_connected` / `connect_rejected` firehose), populated by
+    /// `Ring` on the snapshot cadence. The per-event emission is NOT retired yet
+    /// (a downstream dashboard likely still consumes it — see the increment-site
+    /// TODO); these additive counters make a future retirement net-negative.
+    /// Monotonic lifetime totals. `None` until the ring's snapshot task populates.
+    pub connect_accepts_emitted: Option<u64>,
+    pub connect_rejects_emitted: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
     /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
@@ -1388,6 +1431,31 @@ impl Router {
             lattice_predecessor_distance: None,
             lattice_probes_issued: None,
             lattice_probe_improvements: None,
+            // Streamed-transfer abort counters, populated by Ring from the
+            // network_status singleton on the snapshot cadence (Group B).
+            stream_recv_aborts_inactivity_total: None,
+            stream_recv_aborts_cancelled_total: None,
+            stream_recv_aborts_claim_timeout_total: None,
+            stream_recv_aborts_deserialize_total: None,
+            stream_send_aborts_cwnd_total: None,
+            stream_recv_abort_frac_0: None,
+            stream_recv_abort_frac_1: None,
+            stream_recv_abort_frac_lt50: None,
+            stream_recv_abort_frac_50_90: None,
+            stream_recv_abort_frac_ge90: None,
+            // Routing/hosting attribution, populated by Ring on the snapshot
+            // cadence (Group C).
+            ring_connections: None,
+            transient_connections: None,
+            connections_to_gateways: None,
+            relayed_gets_total: None,
+            relayed_puts_total: None,
+            relayed_subscribes_total: None,
+            relayed_updates_total: None,
+            // Connect-event emission counters, populated by Ring on the snapshot
+            // cadence (firehose-retirement precursor).
+            connect_accepts_emitted: None,
+            connect_rejects_emitted: None,
             // Renegade predictor diagnostics
             renegade_failure_events: self.renegade_predictor.len(),
             renegade_response_time_events: self.renegade_predictor.stage_sizes().1,

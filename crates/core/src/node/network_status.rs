@@ -218,6 +218,12 @@ pub struct NetworkStatus {
     pub nat_stats: NatStats,
     /// Terminal advertisement-consult counters (hosting redesign piece C).
     pub terminal_consult_stats: TerminalConsultStats,
+    /// Streamed-transfer abort counters (large-contract failure isolation).
+    pub stream_abort_stats: StreamAbortStats,
+    /// Relayed-operation counters (routing/hosting attribution).
+    pub relayed_op_stats: RelayedOpStats,
+    /// Connect-event emission counters (firehose-retirement precursor).
+    pub connect_emit_stats: ConnectEmitStats,
     /// Computed-upstream vs. stored-`is_upstream`-flag divergence counters
     /// (hosting redesign piece D, #4642 / #4671).
     pub upstream_divergence_stats: UpstreamDivergenceStats,
@@ -391,6 +397,85 @@ pub struct TerminalConsultStats {
     pub still_not_found: u64,
 }
 
+/// Streamed-transfer (> 64 KB `streaming_threshold`) abort counters, aggregated
+/// per-node so the large-contract failure class (~50% of large fetches were
+/// failing) is legible in central telemetry WITHOUT a per-fragment or
+/// per-transfer event stream. Recorded at the receiver stream-assembly abort
+/// sites (transport `StreamHandle::assemble` for inactivity/cancelled; the GET
+/// originator's `assemble_and_cache_stream` for claim-timeout/deserialize) and
+/// the sender cwnd-wait abort site; read into `RouterSnapshotInfo` on the
+/// existing snapshot cadence. All monotonic lifetime totals (the collector
+/// differences them across the cadence). The `frac_*` fields are a
+/// fragment-progress histogram bumped ONCE per receiver abort, bucketing how far
+/// the transfer got before dying — the WHERE signal.
+#[derive(Default)]
+pub struct StreamAbortStats {
+    /// Receiver aborts: no fragment arrived within the inactivity window.
+    pub recv_inactivity: u64,
+    /// Receiver aborts: stream cancelled / connection closed mid-transfer.
+    pub recv_cancelled: u64,
+    /// Receiver aborts: no inbound stream was ever claimed (claim timed out).
+    pub recv_claim_timeout: u64,
+    /// Receiver aborts: bytes fully received but payload failed to deserialize
+    /// or was structurally invalid (key mismatch / missing state).
+    pub recv_deserialize: u64,
+    /// Sender aborts: cwnd-wait timed out (ACKs stopped arriving) — the stream
+    /// was failed rather than blocking the connection forever.
+    pub send_cwnd: u64,
+    /// Fragment-progress histogram, one bump per receiver abort: 0% received.
+    pub frac_0: u64,
+    /// Fragment-progress histogram: 100% received but still aborted (payload /
+    /// deserialize failure after full receipt).
+    pub frac_1: u64,
+    /// Fragment-progress histogram: (0%, 50%) received.
+    pub frac_lt50: u64,
+    /// Fragment-progress histogram: [50%, 90%) received.
+    pub frac_50_90: u64,
+    /// Fragment-progress histogram: [90%, 100%) received.
+    pub frac_ge90: u64,
+}
+
+/// Immutable copy of [`StreamAbortStats`] returned by [`stream_abort_counts`]
+/// for the `Ring` snapshot task to mirror onto `RouterSnapshotInfo`.
+#[derive(Clone, Copy, Default)]
+pub struct StreamAbortSnapshot {
+    pub recv_inactivity: u64,
+    pub recv_cancelled: u64,
+    pub recv_claim_timeout: u64,
+    pub recv_deserialize: u64,
+    pub send_cwnd: u64,
+    pub frac_0: u64,
+    pub frac_1: u64,
+    pub frac_lt50: u64,
+    pub frac_50_90: u64,
+    pub frac_ge90: u64,
+}
+
+/// Count of operations this node RELAYED (forwarded a request one hop toward its
+/// key, as a routing intermediary — not the client originator). One increment
+/// per relay-driver entry. Per-node monotonic totals for routing/hosting
+/// attribution on the snapshot cadence; the collector differences them to see
+/// how much traffic a peer relays vs. originates.
+#[derive(Default)]
+pub struct RelayedOpStats {
+    pub gets: u64,
+    pub puts: u64,
+    pub subscribes: u64,
+    pub updates: u64,
+}
+
+/// Count of connect telemetry events this node EMITTED to the collector, added
+/// so the per-event `connect_connected` / `connect_rejected` firehose (~92k
+/// events / 18 min) can eventually be replaced by these aggregate snapshot
+/// counters. The per-event emission is NOT retired yet — a downstream dashboard
+/// likely still consumes the per-event stream — see the `TODO(follow-up)` at the
+/// increment site. Per-node monotonic totals.
+#[derive(Default)]
+pub struct ConnectEmitStats {
+    pub accepts_emitted: u64,
+    pub rejects_emitted: u64,
+}
+
 /// A connected peer with metadata.
 pub struct ConnectedPeer {
     pub address: SocketAddr,
@@ -551,6 +636,9 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         op_stats: OperationStats::default(),
         nat_stats: NatStats::default(),
         terminal_consult_stats: TerminalConsultStats::default(),
+        stream_abort_stats: StreamAbortStats::default(),
+        relayed_op_stats: RelayedOpStats::default(),
+        connect_emit_stats: ConnectEmitStats::default(),
         upstream_divergence_stats: UpstreamDivergenceStats::default(),
         reconcile_shadow_collapse: ReconcileShadowStats::default(),
         reconcile_shadow_renewal: ReconcileShadowStats::default(),
@@ -786,6 +874,202 @@ pub fn terminal_consult_counts() -> Option<(u64, u64, u64, u64)> {
     let s = status.read().ok()?;
     let c = &s.terminal_consult_stats;
     Some((c.attempts, c.hits, c.resolved_found, c.still_not_found))
+}
+
+/// Bump the fragment-progress histogram bucket for one receiver abort.
+/// `received`/`total` come from the stream handle; `None` (no handle, e.g. a
+/// claim timeout) counts as 0% (`frac_0`).
+fn bump_stream_frac(stats: &mut StreamAbortStats, received: Option<u32>, total: Option<u32>) {
+    match (received, total) {
+        (Some(r), Some(t)) if t > 0 => {
+            if r == 0 {
+                stats.frac_0 = stats.frac_0.saturating_add(1);
+            } else if r >= t {
+                stats.frac_1 = stats.frac_1.saturating_add(1);
+            } else {
+                // Integer-only bucketing avoids float rounding at the edges.
+                let pct = (r as u64) * 100 / (t as u64);
+                if pct < 50 {
+                    stats.frac_lt50 = stats.frac_lt50.saturating_add(1);
+                } else if pct < 90 {
+                    stats.frac_50_90 = stats.frac_50_90.saturating_add(1);
+                } else {
+                    stats.frac_ge90 = stats.frac_ge90.saturating_add(1);
+                }
+            }
+        }
+        // No usable fragment counts (claim timeout, or total unknown): treat as
+        // zero progress so every abort lands in exactly one bucket.
+        _ => stats.frac_0 = stats.frac_0.saturating_add(1),
+    }
+}
+
+/// Record a receiver stream-assembly abort: no fragment arrived within the
+/// inactivity window. Called from the transport `StreamHandle::assemble` site
+/// (covers both the GET originator and relay receive paths).
+pub fn record_stream_recv_abort_inactivity(received: Option<u32>, total: Option<u32>) {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.stream_abort_stats.recv_inactivity =
+                s.stream_abort_stats.recv_inactivity.saturating_add(1);
+            bump_stream_frac(&mut s.stream_abort_stats, received, total);
+        }
+    }
+}
+
+/// Record a receiver stream-assembly abort: the stream was cancelled or the
+/// connection closed mid-transfer.
+pub fn record_stream_recv_abort_cancelled(received: Option<u32>, total: Option<u32>) {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.stream_abort_stats.recv_cancelled =
+                s.stream_abort_stats.recv_cancelled.saturating_add(1);
+            bump_stream_frac(&mut s.stream_abort_stats, received, total);
+        }
+    }
+}
+
+/// Record a receiver stream abort: no inbound stream was ever claimed (the
+/// claim timed out); zero fragments observed.
+pub fn record_stream_recv_abort_claim_timeout() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.stream_abort_stats.recv_claim_timeout =
+                s.stream_abort_stats.recv_claim_timeout.saturating_add(1);
+            bump_stream_frac(&mut s.stream_abort_stats, None, None);
+        }
+    }
+}
+
+/// Record a receiver stream abort: all bytes arrived but the payload failed to
+/// deserialize or was structurally invalid (key mismatch / missing state).
+pub fn record_stream_recv_abort_deserialize(received: Option<u32>, total: Option<u32>) {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.stream_abort_stats.recv_deserialize =
+                s.stream_abort_stats.recv_deserialize.saturating_add(1);
+            bump_stream_frac(&mut s.stream_abort_stats, received, total);
+        }
+    }
+}
+
+/// Record a sender stream abort: cwnd-wait timed out (ACKs stopped arriving) and
+/// the stream was failed rather than blocking the connection.
+pub fn record_stream_send_abort_cwnd() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.stream_abort_stats.send_cwnd = s.stream_abort_stats.send_cwnd.saturating_add(1);
+        }
+    }
+}
+
+/// Read the current streamed-transfer abort counters for export to the
+/// `router_snapshot` telemetry event. `None` before the singleton is
+/// initialized (i.e. always populated in production snapshots).
+pub fn stream_abort_counts() -> Option<StreamAbortSnapshot> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    let a = &s.stream_abort_stats;
+    Some(StreamAbortSnapshot {
+        recv_inactivity: a.recv_inactivity,
+        recv_cancelled: a.recv_cancelled,
+        recv_claim_timeout: a.recv_claim_timeout,
+        recv_deserialize: a.recv_deserialize,
+        send_cwnd: a.send_cwnd,
+        frac_0: a.frac_0,
+        frac_1: a.frac_1,
+        frac_lt50: a.frac_lt50,
+        frac_50_90: a.frac_50_90,
+        frac_ge90: a.frac_ge90,
+    })
+}
+
+/// Record that this node relayed (forwarded one hop) a GET request.
+pub fn record_relayed_get() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.relayed_op_stats.gets = s.relayed_op_stats.gets.saturating_add(1);
+        }
+    }
+}
+
+/// Record that this node relayed (forwarded one hop) a PUT request.
+pub fn record_relayed_put() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.relayed_op_stats.puts = s.relayed_op_stats.puts.saturating_add(1);
+        }
+    }
+}
+
+/// Record that this node relayed (forwarded one hop) a SUBSCRIBE request.
+pub fn record_relayed_subscribe() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.relayed_op_stats.subscribes = s.relayed_op_stats.subscribes.saturating_add(1);
+        }
+    }
+}
+
+/// Record that this node relayed (forwarded one hop) an UPDATE request.
+pub fn record_relayed_update() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.relayed_op_stats.updates = s.relayed_op_stats.updates.saturating_add(1);
+        }
+    }
+}
+
+/// Read the current relayed-operation counters for export to `router_snapshot`.
+/// Returns `(gets, puts, subscribes, updates)` or `None` before the singleton
+/// is initialized.
+pub fn relayed_op_counts() -> Option<(u64, u64, u64, u64)> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    let r = &s.relayed_op_stats;
+    Some((r.gets, r.puts, r.subscribes, r.updates))
+}
+
+/// Record that a `connect_connected` telemetry event was emitted to the
+/// collector (aggregate precursor to retiring the per-event firehose).
+pub fn record_connect_accept_emitted() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.connect_emit_stats.accepts_emitted =
+                s.connect_emit_stats.accepts_emitted.saturating_add(1);
+        }
+    }
+}
+
+/// Record that a `connect_rejected` telemetry event was emitted to the
+/// collector (aggregate precursor to retiring the per-event firehose).
+pub fn record_connect_reject_emitted() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.connect_emit_stats.rejects_emitted =
+                s.connect_emit_stats.rejects_emitted.saturating_add(1);
+        }
+    }
+}
+
+/// Read the current connect-event emission counters for export to
+/// `router_snapshot`. Returns `(accepts_emitted, rejects_emitted)` or `None`
+/// before the singleton is initialized.
+pub fn connect_emit_counts() -> Option<(u64, u64)> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    let c = &s.connect_emit_stats;
+    Some((c.accepts_emitted, c.rejects_emitted))
+}
+
+/// Count of this node's active connections that are to gateways (the
+/// NAT-stranded fingerprint — a peer stuck on gateways only). Read from the
+/// authoritative tracked `connected_peers` list. `None` before the singleton is
+/// initialized.
+pub fn connections_to_gateways() -> Option<u64> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    Some(s.connected_peers.iter().filter(|p| p.is_gateway).count() as u64)
 }
 
 /// Record one computed-upstream vs. stored-`is_upstream`-flag comparison

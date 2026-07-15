@@ -1118,6 +1118,43 @@ impl GetTerminalOutcome {
     }
 }
 
+/// Why a streamed (> 64 KB `streaming_threshold`) GET transfer aborted before
+/// its state could be assembled and cached. Telemetry-only; carried on
+/// [`GetEvent::ClientTerminal`] so analysts can see WHERE large fetches fail
+/// (~50% of large fetches were failing with only a stringified cause). `None`
+/// on success and on non-streaming terminals.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub(crate) enum StreamAbortCause {
+    /// No inbound stream was ever claimed (claim timed out / errored); zero
+    /// fragments observed.
+    ClaimTimeout,
+    /// A claimed stream stalled — no fragment arrived within the inactivity
+    /// window.
+    InactivityTimeout,
+    /// The stream was cancelled / the connection closed mid-transfer.
+    Cancelled,
+    /// All fragments arrived but the assembled bytes failed to deserialize into
+    /// a GET streaming payload.
+    Deserialize,
+    /// The assembled payload was structurally invalid (key mismatch, missing
+    /// state, or a bad fragment reported by the transport).
+    PayloadInvalid,
+}
+
+impl StreamAbortCause {
+    /// Stable snake_case string for the OTLP/json export.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            StreamAbortCause::ClaimTimeout => "claim_timeout",
+            StreamAbortCause::InactivityTimeout => "inactivity_timeout",
+            StreamAbortCause::Cancelled => "cancelled",
+            StreamAbortCause::Deserialize => "deserialize",
+            StreamAbortCause::PayloadInvalid => "payload_invalid",
+        }
+    }
+}
+
 /// GET operation events for tracking the lifecycle of contract retrieval.
 ///
 /// Similar to `PutEvent`, this enum captures the full sequence of a Get operation:
@@ -1268,6 +1305,20 @@ pub(crate) enum GetEvent {
         attempts: usize,
         /// Forward-path hop count when carried by the terminal reply.
         hop_count: Option<usize>,
+        /// Fragments received on the streaming path. `None` for non-streaming
+        /// terminals and where no stream was ever claimed. On the streaming
+        /// SUCCESS path it is the total fragments received; on the streaming
+        /// FAILURE path it is the last assembly attempt's count. Isolates WHERE
+        /// a large fetch died (paired with `total_fragments`).
+        fragments_received: Option<u32>,
+        /// Total fragments the streamed payload expected. `None` for
+        /// non-streaming terminals or when no stream was ever claimed.
+        total_fragments: Option<u32>,
+        /// Why a streamed GET aborted; `None` on success and on non-streaming
+        /// terminals. Streaming outcomes flow EXCLUSIVELY through this event
+        /// (the inline `GetSuccess`/`GetFailure` paths miss them — see #4796),
+        /// so this is the only terminal that can carry the abort cause.
+        stream_abort_cause: Option<StreamAbortCause>,
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
