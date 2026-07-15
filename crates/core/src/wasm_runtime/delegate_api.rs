@@ -1497,14 +1497,14 @@ mod tests {
     /// two tests from colliding on a key; what makes them independent is that
     /// each node's map is its own.
     ///
-    /// It is also the production-facing half. Both the count and the attestation
-    /// map are per-*node* state, but a `static` made them process-wide, so every
-    /// node sharing a process (the simulation runner) pooled them:
-    /// `MAX_CREATED_DELEGATES_PER_NODE` became one budget drawn down by all
-    /// peers, and — since a DelegateKey is derived from code and params, so peers
-    /// running the same delegate collide by construction — one peer's inherited
-    /// origin was visible as another's. The latter decides what a delegate may
-    /// access.
+    /// It pins the scoping itself, which is a test-isolation property, not a
+    /// production one. Both the count and the attestation map are per-*node*
+    /// state that a `static` made process-wide. No production configuration is
+    /// affected: a node is a process (one `RuntimePool` per node), and the
+    /// simulation runner cannot create delegates at all (`MockWasmRuntime`'s
+    /// `execute_delegate_request` returns "delegates not supported"). So the
+    /// only context where per-node and per-process ever diverged is this test
+    /// suite — which is exactly the flake in #4813.
     #[tokio::test]
     async fn test_delegate_node_state_is_per_node_not_per_process() {
         use std::sync::atomic::Ordering;

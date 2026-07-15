@@ -173,12 +173,18 @@ pub(crate) const DELEGATE_INHERITED_ORIGINS_MAX_AGE: std::time::Duration =
 /// Per-node is the correct scope because this map is an **authorization**
 /// input — `resolve_message_origin` reads it to decide which contract a
 /// delegate message is attributed to, which in turn decides what that delegate
-/// may access. A `static` made it process-wide, so every node sharing a process
-/// (the simulation runner) pooled its attestations into one map. A `DelegateKey`
-/// is derived from the delegate's code and params, so two nodes running the same
-/// delegate code necessarily collide on the key — one node's inherited origin
-/// was visible as another's. It also made the map's contents depend on whatever
-/// else shared the process, which is what made
+/// may access. A `DelegateKey` is derived from the delegate's code and params,
+/// so two nodes running the same delegate code necessarily collide on the key;
+/// under a `static`, one node's attestations would be visible as another's.
+///
+/// No production configuration reaches that: a node is a process (one
+/// `RuntimePool` per node), and the simulation runner cannot create delegates
+/// at all — it uses `MockWasmRuntime`, whose `execute_delegate_request` returns
+/// "delegates not supported". The scope is per-node because that is what this
+/// state is, not because a live cross-node leak depended on it.
+///
+/// What the `static` did cause is test flakiness: it made the map's contents
+/// depend on whatever else shared the process, which is what made
 /// `test_create_delegate_non_attested_still_counts_toward_node_limit` flaky
 /// (#4813).
 pub(crate) type SharedInheritedOrigins = Arc<DashMap<DelegateKey, InheritedOriginsEntry>>;
@@ -237,11 +243,14 @@ pub(crate) fn touch_inherited_origin(map: &SharedInheritedOrigins, delegate_key:
 ///
 /// This is injected state, not a process-global: `Runtime` owns one and
 /// `RuntimePool` clones the `Arc` into every executor, so the executors of a
-/// single node share one count while separate nodes in the same process (the
-/// simulation runner, and the test suite) each get their own. A `static` here
-/// would make the "per-node" limit a per-*process* limit — every simulated peer
-/// would draw down one shared budget of `MAX_CREATED_DELEGATES_PER_NODE`, and
-/// concurrent tests would observe each other's creations.
+/// single node share one count while separate nodes in the same process (today,
+/// only the test suite) each get their own. A `static` here would make the
+/// "per-node" limit a per-*process* limit, so concurrent tests observed each
+/// other's creations.
+///
+/// In production the two coincide — a node is a process — so this scoping is a
+/// no-op there; it is the correct shape for per-node state rather than a fix for
+/// a live production limit bug.
 pub(crate) type SharedDelegateCounter = Arc<AtomicUsize>;
 
 pub(crate) fn new_delegate_counter() -> SharedDelegateCounter {
