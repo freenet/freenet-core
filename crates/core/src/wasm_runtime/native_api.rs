@@ -111,8 +111,8 @@ pub(crate) fn prune_expired_contexts(cache: &DelegateContextCache) {
     cache.retain(|_, entry| now.duration_since(entry.last_write) < DELEGATE_CONTEXT_TTL);
 }
 
-/// One entry in [`DELEGATE_INHERITED_ORIGINS`]: a child delegate's inherited
-/// contracts plus TTL metadata.
+/// One entry in a node's [`SharedInheritedOrigins`]: a child delegate's
+/// inherited contracts plus TTL metadata.
 ///
 /// Why a TTL: the map is cleaned only on `UnregisterDelegate`, which children
 /// created via `create_delegate` rarely receive — they are spawned inside the

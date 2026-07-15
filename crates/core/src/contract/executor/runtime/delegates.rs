@@ -259,9 +259,8 @@ impl Executor<Runtime> {
 ///    deliberately replaces (not composes with) any inherited WebApp origin.
 /// 2. `origin_contract` — set when a contract-backed web app dispatched
 ///    this request via the WebSocket API.
-/// 3. `DELEGATE_INHERITED_ORIGINS[delegate_key]` — set when a parent
-///    delegate created this delegate via `create_delegate`, inheriting its
-///    WebApp attestation.
+/// 3. `inherited_origins[delegate_key]` — set when a parent delegate created
+///    this delegate via `create_delegate`, inheriting its WebApp attestation.
 ///
 /// Extracted as a free function so the precedence rules can be unit-tested
 /// directly without standing up a full `Executor`. `inherited_origins` is the
