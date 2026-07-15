@@ -88,6 +88,18 @@ pub struct TransportMetrics {
     // Slowdowns during period
     slowdowns_triggered: AtomicU32,
 
+    // NAT hole-punch traversal counters (reset each snapshot).
+    /// Outbound NAT traversal attempts started during the period.
+    nat_traversal_attempts: AtomicU32,
+    /// NAT traversal attempts that established a connection during the period.
+    nat_traversal_established: AtomicU32,
+    /// NAT traversal attempts that failed for a non-version reason during the
+    /// period (unreachable / symmetric-NAT / generic transport error bucket).
+    nat_traversal_failed_error: AtomicU32,
+    /// NAT traversal attempts that failed due to a protocol version mismatch
+    /// during the period.
+    nat_traversal_failed_version: AtomicU32,
+
     // Per-peer wire-byte stats (bounded to MAX_TRACKED_PEERS entries).
     //
     // Receive side is metered post-authentication in
@@ -158,6 +170,10 @@ impl TransportMetrics {
             cwnd_sum: AtomicU64::new(0),
             cwnd_samples: AtomicU32::new(0),
             slowdowns_triggered: AtomicU32::new(0),
+            nat_traversal_attempts: AtomicU32::new(0),
+            nat_traversal_established: AtomicU32::new(0),
+            nat_traversal_failed_error: AtomicU32::new(0),
+            nat_traversal_failed_version: AtomicU32::new(0),
             min_rtt_us: AtomicU64::new(u64::MAX),
             max_rtt_us: AtomicU64::new(0),
             rtt_sum_us: AtomicU64::new(0),
@@ -227,6 +243,31 @@ impl TransportMetrics {
         if rtt_us > 0 {
             self.record_rtt_sample(rtt_us);
         }
+    }
+
+    /// Record the start of an outbound NAT traversal attempt.
+    pub fn record_nat_traversal_attempt(&self) {
+        self.nat_traversal_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a NAT traversal attempt that established a connection.
+    pub fn record_nat_traversal_established(&self) {
+        self.nat_traversal_established
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a NAT traversal attempt that failed for a non-version reason
+    /// (unreachable / symmetric-NAT / generic transport error).
+    pub fn record_nat_traversal_failed_error(&self) {
+        self.nat_traversal_failed_error
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a NAT traversal attempt that failed due to a protocol version
+    /// mismatch.
+    pub fn record_nat_traversal_failed_version(&self) {
+        self.nat_traversal_failed_version
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a cwnd sample (called periodically or on transfer completion).
@@ -437,6 +478,11 @@ impl TransportMetrics {
         let cwnd_sum = self.cwnd_sum.load(Ordering::Relaxed);
         let cwnd_samples = self.cwnd_samples.load(Ordering::Relaxed);
         let slowdowns_triggered = self.slowdowns_triggered.load(Ordering::Relaxed);
+        let nat_traversal_attempts = self.nat_traversal_attempts.load(Ordering::Relaxed);
+        let nat_traversal_established = self.nat_traversal_established.load(Ordering::Relaxed);
+        let nat_traversal_failed_error = self.nat_traversal_failed_error.load(Ordering::Relaxed);
+        let nat_traversal_failed_version =
+            self.nat_traversal_failed_version.load(Ordering::Relaxed);
         let min_rtt_us = self.min_rtt_us.load(Ordering::Relaxed);
         let max_rtt_us = self.max_rtt_us.load(Ordering::Relaxed);
         let rtt_sum_us = self.rtt_sum_us.load(Ordering::Relaxed);
@@ -476,6 +522,10 @@ impl TransportMetrics {
                 min_cwnd_bytes
             },
             slowdowns_triggered,
+            nat_traversal_attempts,
+            nat_traversal_established,
+            nat_traversal_failed_error,
+            nat_traversal_failed_version,
             avg_rtt_us,
             min_rtt_us: if min_rtt_us == u64::MAX {
                 0
@@ -506,6 +556,13 @@ impl TransportMetrics {
         // Read and reset counters
         let transfers_completed = self.transfers_completed.swap(0, Ordering::Relaxed);
         let transfers_failed = self.transfers_failed.swap(0, Ordering::Relaxed);
+        // NAT hole-punch counters mirror transfers_*: swapped-to-reset at the
+        // top and treated as activity inputs to the snapshot gate below.
+        let nat_traversal_attempts = self.nat_traversal_attempts.swap(0, Ordering::Relaxed);
+        let nat_traversal_established = self.nat_traversal_established.swap(0, Ordering::Relaxed);
+        let nat_traversal_failed_error = self.nat_traversal_failed_error.swap(0, Ordering::Relaxed);
+        let nat_traversal_failed_version =
+            self.nat_traversal_failed_version.swap(0, Ordering::Relaxed);
         // RTT samples count as activity in their own right: quiet connections
         // that only exchange keep-alive ping/pong traffic record RTT samples
         // but complete no transfers (#4000). Gating snapshot emission solely on
@@ -522,8 +579,24 @@ impl TransportMetrics {
         // avg/min/max = 0 next tick.
         let rtt_samples_pending = self.rtt_samples.load(Ordering::Relaxed);
 
+        // NAT traversal attempts/outcomes count as activity in their own
+        // right: a period whose only event is a NAT hole-punch (e.g. a failed
+        // traversal on a bootstrapping node with no other connections, hence no
+        // RTT keep-alive samples) must still emit a snapshot — otherwise the NAT
+        // visibility counters would be silently dropped, the exact
+        // under-counting this feature exists to fix. The counters were already
+        // swap-consumed above, so this is a pure gate check on the swapped values.
+        let nat_activity = nat_traversal_attempts != 0
+            || nat_traversal_established != 0
+            || nat_traversal_failed_error != 0
+            || nat_traversal_failed_version != 0;
+
         // No activity = no snapshot
-        if transfers_completed == 0 && transfers_failed == 0 && rtt_samples_pending == 0 {
+        if transfers_completed == 0
+            && transfers_failed == 0
+            && rtt_samples_pending == 0
+            && !nat_activity
+        {
             // Still reset other counters to prevent stale data. The RTT
             // accumulators (`rtt_samples`, `rtt_sum_us`, `min_rtt_us`,
             // `max_rtt_us`) are deliberately left untouched: they are only ever
@@ -595,6 +668,10 @@ impl TransportMetrics {
                 min_cwnd_bytes
             },
             slowdowns_triggered,
+            nat_traversal_attempts,
+            nat_traversal_established,
+            nat_traversal_failed_error,
+            nat_traversal_failed_version,
             avg_rtt_us,
             min_rtt_us: if min_rtt_us == u64::MAX {
                 0
@@ -639,6 +716,16 @@ pub struct TransportSnapshot {
     pub min_cwnd_bytes: u32,
     /// Number of LEDBAT slowdowns triggered.
     pub slowdowns_triggered: u32,
+    /// Outbound NAT traversal attempts started during the period.
+    pub nat_traversal_attempts: u32,
+    /// NAT traversal attempts that established a connection during the period.
+    pub nat_traversal_established: u32,
+    /// NAT traversal attempts that failed for a non-version reason during the
+    /// period (unreachable / symmetric-NAT / generic transport error).
+    pub nat_traversal_failed_error: u32,
+    /// NAT traversal attempts that failed due to a protocol version mismatch
+    /// during the period.
+    pub nat_traversal_failed_version: u32,
     /// Average RTT in microseconds (0 if no samples).
     pub avg_rtt_us: u64,
     /// Minimum RTT in microseconds (0 if no samples recorded).
@@ -823,6 +910,57 @@ mod tests {
 
         // Counters reset: a subsequent snapshot with no new activity is None.
         assert!(metrics.take_snapshot().is_none());
+    }
+
+    /// NAT hole-punch counters are period accumulators that also count as
+    /// snapshot activity: a period whose only event is a NAT traversal (e.g. a
+    /// failed hole-punch on a bootstrapping node with no transfers and no RTT
+    /// keep-alive samples) must still emit a snapshot, otherwise the NAT
+    /// visibility counters would be silently dropped by the no-activity gate.
+    #[test]
+    fn test_snapshot_emitted_for_nat_only_activity() {
+        let metrics = TransportMetrics::new();
+
+        metrics.record_nat_traversal_attempt();
+        metrics.record_nat_traversal_established();
+        metrics.record_nat_traversal_failed_error();
+        metrics.record_nat_traversal_failed_version();
+
+        let snapshot = metrics
+            .take_snapshot()
+            .expect("NAT-only activity must still produce a snapshot");
+        assert_eq!(snapshot.transfers_completed, 0);
+        assert_eq!(snapshot.transfers_failed, 0);
+        assert_eq!(snapshot.nat_traversal_attempts, 1);
+        assert_eq!(snapshot.nat_traversal_established, 1);
+        assert_eq!(snapshot.nat_traversal_failed_error, 1);
+        assert_eq!(snapshot.nat_traversal_failed_version, 1);
+
+        // Counters reset after the snapshot: a subsequent snapshot with no new
+        // activity is None.
+        assert!(metrics.take_snapshot().is_none());
+    }
+
+    /// `read_snapshot` (non-resetting dashboard read) reflects the NAT counters
+    /// without consuming them, so a following `take_snapshot` still sees them.
+    #[test]
+    fn read_snapshot_reflects_nat_counters() {
+        let metrics = TransportMetrics::new();
+        metrics.record_nat_traversal_attempt();
+        metrics.record_nat_traversal_attempt();
+        metrics.record_nat_traversal_failed_version();
+
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.nat_traversal_attempts, 2);
+        assert_eq!(snap.nat_traversal_failed_version, 1);
+        assert_eq!(snap.nat_traversal_established, 0);
+        assert_eq!(snap.nat_traversal_failed_error, 0);
+
+        // read_snapshot must NOT reset — take_snapshot still sees the counts.
+        let taken = metrics
+            .take_snapshot()
+            .expect("counts still present after a non-resetting read");
+        assert_eq!(taken.nat_traversal_attempts, 2);
     }
 
     #[test]

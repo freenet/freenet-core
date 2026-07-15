@@ -1253,6 +1253,18 @@ where
         return Ok(());
     }
 
+    // Routing/hosting attribution (Group C): count this as a genuine relayed
+    // PUT (past the dedup gate — a deduped duplicate is not a relay). Exclude
+    // the originator-loopback case: node.rs maps a client-originated PUT
+    // (`source_addr=None`) to `upstream_addr=own_addr` and drives it here, so
+    // counting it would inflate `relayed_puts_total` with the node's OWN
+    // originations rather than genuine downstream forwards.
+    let originator_loopback =
+        Some(upstream_addr) == op_manager.ring.connection_manager.get_own_addr();
+    if !originator_loopback {
+        crate::node::network_status::record_relayed_put();
+    }
+
     tracing::debug!(
         tx = %incoming_tx,
         contract = %contract.key(),
@@ -2914,6 +2926,18 @@ where
         // rejected duplicate would tell the upstream that the
         // contract stored when it did not.
         return Ok(());
+    }
+
+    // Routing/hosting attribution (Group C): count this as a genuine relayed
+    // PUT, mirroring `start_relay_put`. A direct `PutMsg::RequestStreaming`
+    // (or a `PutMsg::Request` that upgrades to streaming on forward) dispatches
+    // here, so without this the largest PUT relays were undercounted. Exclude
+    // the originator-loopback case (own streaming PUT mapped to
+    // `upstream_addr=own_addr`), consistent with the non-streaming path.
+    let originator_loopback =
+        Some(upstream_addr) == op_manager.ring.connection_manager.get_own_addr();
+    if !originator_loopback {
+        crate::node::network_status::record_relayed_put();
     }
 
     tracing::debug!(
@@ -4673,6 +4697,30 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Pin (telemetry accuracy): BOTH relay PUT entry points must record
+    /// `record_relayed_put` gated on `!originator_loopback`. The streaming
+    /// entry must record at all; a direct `RequestStreaming` would otherwise
+    /// be undercounted. Loopback = node.rs mapping a client PUT's
+    /// `source_addr=None` to `upstream_addr=own_addr`.
+    #[test]
+    fn relay_put_entries_gate_relayed_counter_on_loopback() {
+        let src = production_source();
+        for sig in [
+            "pub(crate) async fn start_relay_put<CB>(",
+            "pub(crate) async fn start_relay_put_streaming<CB>(",
+        ] {
+            let body = extract_fn_body(src, sig);
+            assert!(
+                body.contains("record_relayed_put()"),
+                "{sig} must record the relayed PUT counter"
+            );
+            assert!(
+                body.contains("if !originator_loopback"),
+                "{sig} must gate record_relayed_put on !originator_loopback"
+            );
+        }
     }
 
     /// Source-grep pin (#4361 / #4365): both relay PUT drivers must

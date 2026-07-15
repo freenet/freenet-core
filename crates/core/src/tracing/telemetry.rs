@@ -444,11 +444,33 @@ impl NetEventRegister for TelemetryReporter {
     ) -> BoxFuture<'a, ()> {
         async move {
             for log_msg in NetLogMessage::to_log_message(logs) {
+                let event_type = event_kind_to_string(&log_msg.kind);
+                // Aggregate connect-emission counts onto the periodic
+                // RouterSnapshot (`connect_accepts_emitted`/`_rejects_emitted`).
+                // This is the exact point the per-event `connect_connected` /
+                // `connect_rejected` firehose (~92k events / 18 min) is emitted
+                // to the collector.
+                //
+                // TODO(follow-up): retire per-event connect_rejected/
+                // connect_connected once the dashboard reads the snapshot
+                // counters — deferred because an external dashboard likely still
+                // consumes the per-event stream (topology / rejection panels).
+                // Retiring here (skip the two variants) would make net telemetry
+                // volume NEGATIVE.
+                match event_type.as_str() {
+                    "connect_connected" => {
+                        crate::node::network_status::record_connect_accept_emitted()
+                    }
+                    "connect_rejected" => {
+                        crate::node::network_status::record_connect_reject_emitted()
+                    }
+                    _ => {}
+                }
                 let event = TelemetryEvent {
                     timestamp: current_timestamp_ms(),
                     peer_id: log_msg.peer_id.to_string(),
                     transaction_id: log_msg.tx.to_string(),
-                    event_type: event_kind_to_string(&log_msg.kind),
+                    event_type,
                     event_data: event_kind_to_json(&log_msg.kind),
                     priority: EventPriority::Operational,
                 };
@@ -1426,6 +1448,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     is_sub_op,
                     attempts,
                     hop_count,
+                    fragments_received,
+                    total_fragments,
+                    stream_abort_cause,
                     elapsed_ms,
                     timestamp,
                 } => {
@@ -1444,6 +1469,19 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     });
                     if let Some(k) = key {
                         json["key"] = serde_json::Value::String(k.to_string());
+                    }
+                    // Streamed-transfer failure-isolation fields (Group B): only
+                    // present on the streaming path, so emit them only when set
+                    // to keep the common non-streaming terminal lean.
+                    if let Some(fr) = fragments_received {
+                        json["fragments_received"] = serde_json::json!(fr);
+                    }
+                    if let Some(tf) = total_fragments {
+                        json["total_fragments"] = serde_json::json!(tf);
+                    }
+                    if let Some(cause) = stream_abort_cause {
+                        json["stream_abort_cause"] =
+                            serde_json::Value::String(cause.as_str().to_string());
                     }
                     json
                 }
@@ -2348,6 +2386,69 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "terminal_consult_still_not_found".to_string(),
                     serde_json::json!(snapshot.terminal_consult_still_not_found),
                 );
+                // Streamed-transfer abort counters (Group B), routing/hosting
+                // attribution (Group C), and connect-emit counters — same
+                // hand-mirror footgun: a new `RouterSnapshotInfo` field is
+                // invisible to the collector unless added here. All `Option<u64>`
+                // so one loop suffices. Pinned by
+                // `router_snapshot_json_includes_stream_abort_counters` /
+                // `_routing_attribution_counters` / `_connect_emit_counters`.
+                for (key, value) in [
+                    (
+                        "stream_recv_aborts_inactivity_total",
+                        snapshot.stream_recv_aborts_inactivity_total,
+                    ),
+                    (
+                        "stream_recv_aborts_cancelled_total",
+                        snapshot.stream_recv_aborts_cancelled_total,
+                    ),
+                    (
+                        "stream_recv_aborts_claim_timeout_total",
+                        snapshot.stream_recv_aborts_claim_timeout_total,
+                    ),
+                    (
+                        "stream_recv_aborts_deserialize_total",
+                        snapshot.stream_recv_aborts_deserialize_total,
+                    ),
+                    (
+                        "stream_send_aborts_cwnd_total",
+                        snapshot.stream_send_aborts_cwnd_total,
+                    ),
+                    (
+                        "stream_recv_abort_frac_0",
+                        snapshot.stream_recv_abort_frac_0,
+                    ),
+                    (
+                        "stream_recv_abort_frac_1",
+                        snapshot.stream_recv_abort_frac_1,
+                    ),
+                    (
+                        "stream_recv_abort_frac_lt50",
+                        snapshot.stream_recv_abort_frac_lt50,
+                    ),
+                    (
+                        "stream_recv_abort_frac_50_90",
+                        snapshot.stream_recv_abort_frac_50_90,
+                    ),
+                    (
+                        "stream_recv_abort_frac_ge90",
+                        snapshot.stream_recv_abort_frac_ge90,
+                    ),
+                    ("ring_connections", snapshot.ring_connections),
+                    ("transient_connections", snapshot.transient_connections),
+                    ("connections_to_gateways", snapshot.connections_to_gateways),
+                    ("relayed_gets_total", snapshot.relayed_gets_total),
+                    ("relayed_puts_total", snapshot.relayed_puts_total),
+                    (
+                        "relayed_subscribes_total",
+                        snapshot.relayed_subscribes_total,
+                    ),
+                    ("relayed_updates_total", snapshot.relayed_updates_total),
+                    ("connect_accepts_emitted", snapshot.connect_accepts_emitted),
+                    ("connect_rejects_emitted", snapshot.connect_rejects_emitted),
+                ] {
+                    obj.insert(key.to_string(), serde_json::json!(value));
+                }
                 // Computed-upstream vs. stored-flag divergence counters (piece D,
                 // #4642 / #4671) — same hand-mirror footgun: a new
                 // `RouterSnapshotInfo` field is invisible to the collector unless
@@ -2827,6 +2928,87 @@ mod tests {
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
+    }
+
+    /// Pin: the streamed-transfer abort counters (Group B) must reach the
+    /// hand-mirrored OTLP body — same footgun as the counters above. These are
+    /// the large-contract failure-isolation signal; a silent drop re-blinds
+    /// central telemetry to WHERE large fetches fail.
+    #[test]
+    fn router_snapshot_json_includes_stream_abort_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.stream_recv_aborts_inactivity_total = Some(11);
+        info.stream_recv_aborts_cancelled_total = Some(12);
+        info.stream_recv_aborts_claim_timeout_total = Some(13);
+        info.stream_recv_aborts_deserialize_total = Some(14);
+        info.stream_send_aborts_cwnd_total = Some(15);
+        info.stream_recv_abort_frac_0 = Some(1);
+        info.stream_recv_abort_frac_1 = Some(2);
+        info.stream_recv_abort_frac_lt50 = Some(3);
+        info.stream_recv_abort_frac_50_90 = Some(4);
+        info.stream_recv_abort_frac_ge90 = Some(5);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("stream_recv_aborts_inactivity_total", 11),
+            ("stream_recv_aborts_cancelled_total", 12),
+            ("stream_recv_aborts_claim_timeout_total", 13),
+            ("stream_recv_aborts_deserialize_total", 14),
+            ("stream_send_aborts_cwnd_total", 15),
+            ("stream_recv_abort_frac_0", 1),
+            ("stream_recv_abort_frac_1", 2),
+            ("stream_recv_abort_frac_lt50", 3),
+            ("stream_recv_abort_frac_50_90", 4),
+            ("stream_recv_abort_frac_ge90", 5),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the routing/hosting attribution gauges + counters (Group C) must
+    /// reach the hand-mirrored OTLP body.
+    #[test]
+    fn router_snapshot_json_includes_routing_attribution_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.ring_connections = Some(21);
+        info.transient_connections = Some(22);
+        info.connections_to_gateways = Some(23);
+        info.relayed_gets_total = Some(24);
+        info.relayed_puts_total = Some(25);
+        info.relayed_subscribes_total = Some(26);
+        info.relayed_updates_total = Some(27);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("ring_connections", 21),
+            ("transient_connections", 22),
+            ("connections_to_gateways", 23),
+            ("relayed_gets_total", 24),
+            ("relayed_puts_total", 25),
+            ("relayed_subscribes_total", 26),
+            ("relayed_updates_total", 27),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the connect-emission counters (firehose-retirement precursor) must
+    /// reach the hand-mirrored OTLP body.
+    #[test]
+    fn router_snapshot_json_includes_connect_emit_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.connect_accepts_emitted = Some(41);
+        info.connect_rejects_emitted = Some(42);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(json["connect_accepts_emitted"], 41);
+        assert_eq!(json["connect_rejects_emitted"], 42);
     }
 
     /// Pin: the computed-upstream vs. stored-flag divergence counters (piece D,
@@ -3570,6 +3752,9 @@ mod tests {
             is_sub_op: false,
             attempts: 2,
             hop_count: Some(3),
+            fragments_received: Some(8),
+            total_fragments: Some(8),
+            stream_abort_cause: None,
             elapsed_ms: 1234,
             timestamp: 99999,
         });
@@ -3590,6 +3775,51 @@ mod tests {
         assert_eq!(json["elapsed_ms"], 1234);
         assert_eq!(json["timestamp"], 99999);
         assert!(json["key"].is_string());
+        // Streaming success carries fragment counts and NO abort cause.
+        assert_eq!(json["fragments_received"], 8);
+        assert_eq!(json["total_fragments"], 8);
+        assert!(json.get("stream_abort_cause").is_none());
+    }
+
+    /// A streamed GET FAILURE carries the classified abort cause and the
+    /// fragment progress of the last assembly attempt — the WHERE signal that
+    /// isolates the large-contract failure class (Group B). Streaming outcomes
+    /// flow exclusively through `ClientTerminal`, so this is the only terminal
+    /// event that can carry them.
+    #[test]
+    fn test_event_kind_to_json_get_terminal_streaming_failure_abort_cause() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::{GetEvent, GetTerminalOutcome, StreamAbortCause};
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let instance_id = ContractInstanceId::new([4u8; 32]);
+
+        let event = EventKind::Get(GetEvent::ClientTerminal {
+            id: tx,
+            requester: PeerKeyLocation::random(),
+            instance_id,
+            key: None,
+            outcome: GetTerminalOutcome::TimeoutExhausted,
+            streamed: true,
+            is_sub_op: false,
+            attempts: 3,
+            hop_count: None,
+            fragments_received: Some(3),
+            total_fragments: Some(10),
+            stream_abort_cause: Some(StreamAbortCause::InactivityTimeout),
+            elapsed_ms: 4321,
+            timestamp: 7,
+        });
+
+        assert_eq!(event_kind_to_string(&event), "get_terminal");
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["outcome"], "timeout_exhausted");
+        assert_eq!(json["streamed"], true);
+        assert_eq!(json["fragments_received"], 3);
+        assert_eq!(json["total_fragments"], 10);
+        assert_eq!(json["stream_abort_cause"], "inactivity_timeout");
     }
 
     /// A timeout-exhausted client GET now emits a `get_terminal` event with
@@ -3616,6 +3846,9 @@ mod tests {
             is_sub_op: false,
             attempts: 3,
             hop_count: None,
+            fragments_received: None,
+            total_fragments: None,
+            stream_abort_cause: None,
             elapsed_ms: 60000,
             timestamp: 1,
         });
@@ -3627,6 +3860,10 @@ mod tests {
         // No key and no hop_count on the timeout path — both serialize null.
         assert!(json["key"].is_null());
         assert!(json["hop_count"].is_null());
+        // Non-streaming terminal omits the streaming-only fields entirely.
+        assert!(json.get("fragments_received").is_none());
+        assert!(json.get("total_fragments").is_none());
+        assert!(json.get("stream_abort_cause").is_none());
     }
 
     /// A local-cache-hit client GET emits a `ClientTerminal` with
@@ -3656,6 +3893,9 @@ mod tests {
             is_sub_op: false,
             attempts: 0,
             hop_count: None,
+            fragments_received: None,
+            total_fragments: None,
+            stream_abort_cause: None,
             elapsed_ms: 1,
             timestamp: 1,
         });

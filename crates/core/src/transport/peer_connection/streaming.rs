@@ -365,6 +365,14 @@ impl StreamHandle {
         loop {
             // Check cancelled state
             if self.sync.read().cancelled {
+                // Aggregate receiver-abort counter (Group B telemetry). Recorded
+                // here so BOTH the GET originator and relay receive paths are
+                // covered; the GET originator classifies the per-op cause from
+                // the returned `StreamError` without re-recording this counter.
+                crate::node::network_status::record_stream_recv_abort_cancelled(
+                    Some(self.buffer.inserted_count() as u32),
+                    Some(self.buffer.total_fragments() as u32),
+                );
                 return Err(StreamError::Cancelled);
             }
 
@@ -398,6 +406,10 @@ impl StreamHandle {
                     // Re-check before declaring timeout — a fragment may have arrived
                     // in the race window between is_complete()/listen() above (TOCTOU).
                     if self.sync.read().cancelled {
+                        crate::node::network_status::record_stream_recv_abort_cancelled(
+                            Some(self.buffer.inserted_count() as u32),
+                            Some(self.buffer.total_fragments() as u32),
+                        );
                         return Err(StreamError::Cancelled);
                     }
                     if let Some(data) = self.buffer.assemble() {
@@ -410,6 +422,10 @@ impl StreamHandle {
                         total_fragments = self.buffer.total_fragments(),
                         timeout_secs = STREAM_INACTIVITY_TIMEOUT.as_secs(),
                         "Stream assembly timed out — no fragments received within inactivity window"
+                    );
+                    crate::node::network_status::record_stream_recv_abort_inactivity(
+                        Some(self.buffer.inserted_count() as u32),
+                        Some(self.buffer.total_fragments() as u32),
                     );
                     return Err(StreamError::InactivityTimeout);
                 }

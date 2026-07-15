@@ -1670,6 +1670,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 inbound_remote_connection.inbound_packet_sender,
                             ) {
                                 tracing::info!(peer_addr = %remote_addr, "NAT traversal connection established");
+                                crate::transport::TRANSPORT_METRICS
+                                    .record_nat_traversal_established();
                                 if result_sender.send(Ok(outbound_remote_conn)).is_err() {
                                     tracing::debug!(peer_addr = %remote_addr, "NAT traversal result receiver already dropped");
                                 }
@@ -1682,9 +1684,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             match &error {
                                 TransportError::ProtocolVersionMismatch { .. } => {
                                     tracing::warn!(%error);
+                                    crate::transport::TRANSPORT_METRICS
+                                        .record_nat_traversal_failed_version();
                                 }
                                 TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(_) | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
+                                    crate::transport::TRANSPORT_METRICS
+                                        .record_nat_traversal_failed_error();
                                 }
                             }
                             self.expected_non_gateway.remove(&remote_addr.ip());
@@ -1727,8 +1733,19 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     let (ongoing_connection, packets_sender) = self.traverse_nat(remote_addr, remote_public_key.clone());
 
                     if !self.connections.start_nat_traversal(remote_addr, packets_sender, open_connection) {
+                        // Rejected AFTER the `has_nat_traversal` guard above: a
+                        // gateway handshake is in progress, or the peer is in its
+                        // recently-closed grace period. No task is spawned and no
+                        // established/failed outcome will fire, so counting this
+                        // as an attempt would inflate the `nat_traversal_attempts`
+                        // denominator and skew the hole-punch success rate.
                         continue;
                     }
+
+                    // Admitted: a traversal task is now spawned and will emit
+                    // exactly one established/failed outcome. Count the attempt
+                    // here so the denominator matches the outcomes.
+                    crate::transport::TRANSPORT_METRICS.record_nat_traversal_attempt();
 
                     self.expected_non_gateway.insert(remote_addr.ip());
                     let task = GlobalExecutor::spawn(ongoing_connection

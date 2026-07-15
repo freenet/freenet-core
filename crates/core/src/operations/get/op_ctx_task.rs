@@ -55,8 +55,9 @@ use crate::operations::VisitedPeers;
 use crate::operations::bootstrap::bootstrap_gateway_target;
 use crate::ring::{Location, PeerKeyLocation};
 use crate::router::{RouteEvent, RouteOutcome};
-use crate::tracing::GetTerminalOutcome;
+use crate::tracing::{GetTerminalOutcome, StreamAbortCause};
 use crate::transport::peer_connection::StreamId;
+use crate::transport::peer_connection::streaming::StreamError;
 
 use super::{GetMsg, GetMsgResult, GetStreamingPayload};
 use crate::operations::orphan_streams::{OrphanStreamError, STREAM_CLAIM_TIMEOUT};
@@ -284,6 +285,9 @@ async fn emit_get_terminal_event(
     is_sub_op: bool,
     attempts: usize,
     hop_count: Option<usize>,
+    fragments_received: Option<u32>,
+    total_fragments: Option<u32>,
+    stream_abort_cause: Option<StreamAbortCause>,
 ) {
     if let Some(log_event) = crate::tracing::NetEventLog::get_terminal(
         &tx,
@@ -295,6 +299,9 @@ async fn emit_get_terminal_event(
         is_sub_op,
         attempts,
         hop_count,
+        fragments_received,
+        total_fragments,
+        stream_abort_cause,
     ) {
         op_manager
             .ring
@@ -330,6 +337,9 @@ pub(crate) async fn emit_local_get_terminal_event(
         false, // a real client GET, not a sub-op
         0,     // local hit: no network request was sent
         None,  // no hop count for a local hit
+        None,  // no stream: fragment/abort fields are streaming-only
+        None,
+        None,
     )
     .await;
 }
@@ -650,6 +660,13 @@ async fn drive_client_get_inner(
             let outcome = done_terminal_outcome(host_result.is_ok());
             let is_sub_op = client_tx.is_sub_operation();
             let attempts = driver.requests_sent;
+            // Streamed-transfer failure-isolation fields (Group B). Populated by
+            // the assembly wrapper on both the streaming success and failure
+            // paths; `None` on non-streaming terminals. `abort_cause` is `Some`
+            // only when a streaming assembly actually failed.
+            let stream_fragments_received = streaming_assembly.fragments_received;
+            let stream_total_fragments = streaming_assembly.total_fragments;
+            let stream_abort_cause = streaming_assembly.abort_cause;
 
             // For a BLOCKING subscribe hand-off the client result is not
             // delivered until `maybe_subscribe_child`'s inline await
@@ -672,6 +689,9 @@ async fn drive_client_get_inner(
                     is_sub_op,
                     attempts,
                     hop_count,
+                    stream_fragments_received,
+                    stream_total_fragments,
+                    stream_abort_cause,
                 )
                 .await;
             }
@@ -704,6 +724,9 @@ async fn drive_client_get_inner(
                     is_sub_op,
                     attempts,
                     hop_count,
+                    stream_fragments_received,
+                    stream_total_fragments,
+                    stream_abort_cause,
                 )
                 .await;
             }
@@ -739,6 +762,9 @@ async fn drive_client_get_inner(
                 false,
                 client_tx.is_sub_operation(),
                 driver.requests_sent,
+                None,
+                None, // no streaming header ever seen on the exhausted path
+                None,
                 None,
             )
             .await;
@@ -1009,6 +1035,33 @@ struct AssemblyOutcome {
     /// Threaded into the synthesized client error so the failure is
     /// diagnosable instead of the generic store-lookup message.
     error: Option<String>,
+    /// Fragments received / expected on the last streaming attempt (success or
+    /// failure), read from the stream handle and threaded into the terminal
+    /// telemetry event so WHERE a large fetch died is legible. `None` when the
+    /// terminal was not `Streaming`, or on the claim-timeout path (no handle).
+    fragments_received: Option<u32>,
+    total_fragments: Option<u32>,
+    /// Classified cause of a streaming assembly failure; `None` on success.
+    abort_cause: Option<StreamAbortCause>,
+}
+
+/// Fragment progress from a streaming GET assembly attempt (#4345 telemetry),
+/// threaded into the terminal event on the SUCCESS path.
+#[derive(Default, Clone, Copy)]
+struct StreamProgress {
+    fragments_received: Option<u32>,
+    total_fragments: Option<u32>,
+}
+
+/// Structured streaming-assembly failure (#4345 telemetry). `message` is the
+/// human-readable cause kept for the existing client-error synthesis
+/// (`synthesized_get_error_cause`); `cause` + fragment counts feed the terminal
+/// telemetry event so analysts can see WHERE a large fetch died.
+struct AssemblyFailure {
+    message: String,
+    cause: StreamAbortCause,
+    fragments_received: Option<u32>,
+    total_fragments: Option<u32>,
 }
 
 /// Drive the shared GET retry loop, treating stream-assembly failure
@@ -1081,8 +1134,13 @@ async fn drive_get_with_assembly_retry(
                 // so any earlier assembly failure is moot — clear the
                 // remembered error or an unrelated store-lookup miss
                 // (eviction race) would be mislabeled as an assembly
-                // failure by the caller's error synthesis.
-                assembly.error = None;
+                // failure by the caller's error synthesis. A prior failed
+                // streaming attempt may ALSO have set `fragments_received` /
+                // `total_fragments` / `abort_cause`; leaving them set would make
+                // the caller emit a `streamed=false` terminal event carrying
+                // another attempt's fragment counts + abort cause. Reset the
+                // whole outcome so no stale stream field survives.
+                assembly = AssemblyOutcome::default();
                 break result;
             }
             RetryLoopOutcome::Exhausted(cause) => {
@@ -1123,11 +1181,20 @@ async fn drive_get_with_assembly_retry(
                 "get: current_target has no socket_addr; \
                  cannot claim orphan stream"
             );
-            assembly.error = Some(
-                "selected target has no socket address; \
-                 cannot claim the response stream"
-                    .to_string(),
-            );
+            // Reset the whole assembly outcome (not just `error`): a prior
+            // failed streaming attempt may have left `fragments_received` /
+            // `total_fragments` / `abort_cause` set, and those belong to that
+            // attempt, not to this routing failure. Keep only the error string
+            // so the terminal event does not report another attempt's fragment
+            // progress or stream-abort cause.
+            assembly = AssemblyOutcome {
+                error: Some(
+                    "selected target has no socket address; \
+                     cannot claim the response stream"
+                        .to_string(),
+                ),
+                ..Default::default()
+            };
             break result;
         };
 
@@ -1135,9 +1202,12 @@ async fn drive_get_with_assembly_retry(
         match assemble_and_cache_stream(op_manager, peer_addr, stream_id, key, includes_contract)
             .await
         {
-            Ok(()) => {
+            Ok(progress) => {
                 assembly.transfer_duration = Some(stream_start.elapsed());
                 assembly.error = None;
+                assembly.fragments_received = progress.fragments_received;
+                assembly.total_fragments = progress.total_fragments;
+                assembly.abort_cause = None;
                 break result;
             }
             Err(e) => {
@@ -1145,11 +1215,18 @@ async fn drive_get_with_assembly_retry(
                 // `current_target` — the routing penalty must land on
                 // the candidate whose header never became a stream.
                 let failed_target = driver.current_target.clone();
+                // Capture the structured progress/cause for the terminal
+                // telemetry event BEFORE `e.message` is moved into
+                // `assembly.error`, so the emitted `get_terminal` carries WHERE
+                // this attempt died even after the string is consumed.
+                assembly.fragments_received = e.fragments_received;
+                assembly.total_fragments = e.total_fragments;
+                assembly.abort_cause = Some(e.cause);
                 match driver.advance() {
                     AdvanceOutcome::Next => {
                         tracing::warn!(
                             %key,
-                            error = %e,
+                            error = %e.message,
                             retries = driver.retries,
                             "get: stream assembly failed; \
                              retrying against next candidate (#4345)"
@@ -1169,7 +1246,7 @@ async fn drive_get_with_assembly_retry(
                         #[cfg(any(test, feature = "testing"))]
                         assembly_fault_injection::ASSEMBLY_RETRY_COUNT
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        assembly.error = Some(e);
+                        assembly.error = Some(e.message);
                         // Remember the header so a later wire
                         // exhaustion converts back to Done(Streaming)
                         // instead of surfacing a false NotFound.
@@ -1180,11 +1257,11 @@ async fn drive_get_with_assembly_retry(
                     AdvanceOutcome::Exhausted => {
                         tracing::warn!(
                             %key,
-                            error = %e,
+                            error = %e.message,
                             "get: stream assembly failed and retry budget \
                              exhausted — state will not be cached locally"
                         );
-                        assembly.error = Some(e);
+                        assembly.error = Some(e.message);
                         break result;
                     }
                 }
@@ -1606,13 +1683,19 @@ async fn assemble_and_cache_stream(
     stream_id: StreamId,
     expected_key: ContractKey,
     includes_contract: bool,
-) -> Result<(), String> {
+) -> Result<StreamProgress, AssemblyFailure> {
     // Test-only deterministic fault injection (#4345). Returning before
-    // the claim mirrors the production failure (the inbound stream is
-    // left orphaned for GC), so the retry path is exercised end-to-end.
+    // the claim mirrors the production claim-timeout failure (the inbound
+    // stream is left orphaned for GC), so the retry path is exercised
+    // end-to-end; classify it as ClaimTimeout for the terminal event.
     #[cfg(any(test, feature = "testing"))]
     if assembly_fault_injection::consume(&expected_key) {
-        return Err("injected stream assembly failure (assembly_fault_injection test hook)".into());
+        return Err(AssemblyFailure {
+            message: "injected stream assembly failure (assembly_fault_injection test hook)".into(),
+            cause: StreamAbortCause::ClaimTimeout,
+            fragments_received: None,
+            total_fragments: None,
+        });
     }
 
     let handle = match op_manager
@@ -1627,28 +1710,95 @@ async fn assemble_and_cache_stream(
                 %stream_id,
                 "stream already claimed (dedup)"
             );
-            return Ok(());
+            return Ok(StreamProgress::default());
         }
-        Err(e) => return Err(format!("claim_or_wait: {e}")),
+        Err(e) => {
+            // No inbound stream was ever claimed — zero fragments observed.
+            // Recorded here (not at the transport `StreamHandle::assemble`
+            // site) because this failure is owned by the claim layer, which
+            // never reaches `assemble`.
+            crate::node::network_status::record_stream_recv_abort_claim_timeout();
+            return Err(AssemblyFailure {
+                message: format!("claim_or_wait: {e}"),
+                cause: StreamAbortCause::ClaimTimeout,
+                fragments_received: None,
+                total_fragments: None,
+            });
+        }
     };
 
-    let bytes = handle
-        .assemble()
-        .await
-        .map_err(|e| format!("stream assembly: {e}"))?;
+    let bytes = match handle.assemble().await {
+        Ok(b) => b,
+        Err(e) => {
+            // Read fragment counts BEFORE building the error (the WHERE
+            // signal). The inactivity / cancelled AGGREGATE counters are
+            // recorded by the transport `StreamHandle::assemble` site itself
+            // (which also covers relay receive paths), so they are NOT
+            // re-recorded here — only the per-op terminal-event cause is
+            // classified from the `StreamError` variant.
+            let fragments_received = Some(handle.received_fragments() as u32);
+            let total_fragments = Some(handle.total_fragments() as u32);
+            let cause = match e {
+                StreamError::InactivityTimeout => StreamAbortCause::InactivityTimeout,
+                StreamError::Cancelled | StreamError::NotFound => StreamAbortCause::Cancelled,
+                StreamError::InvalidFragment { .. } => StreamAbortCause::PayloadInvalid,
+            };
+            return Err(AssemblyFailure {
+                message: format!("stream assembly: {e}"),
+                cause,
+                fragments_received,
+                total_fragments,
+            });
+        }
+    };
 
-    let payload: GetStreamingPayload =
-        bincode::deserialize(&bytes).map_err(|e| format!("deserialize: {e}"))?;
+    // Assembly succeeded: every expected fragment is present.
+    let fragments_received = Some(handle.received_fragments() as u32);
+    let total_fragments = Some(handle.total_fragments() as u32);
+
+    let payload: GetStreamingPayload = match bincode::deserialize(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::node::network_status::record_stream_recv_abort_deserialize(
+                fragments_received,
+                total_fragments,
+            );
+            return Err(AssemblyFailure {
+                message: format!("deserialize: {e}"),
+                cause: StreamAbortCause::Deserialize,
+                fragments_received,
+                total_fragments,
+            });
+        }
+    };
 
     if payload.key != expected_key {
-        return Err(format!(
-            "stream key mismatch: expected {expected_key}, got {}",
-            payload.key
-        ));
+        crate::node::network_status::record_stream_recv_abort_deserialize(
+            fragments_received,
+            total_fragments,
+        );
+        return Err(AssemblyFailure {
+            message: format!(
+                "stream key mismatch: expected {expected_key}, got {}",
+                payload.key
+            ),
+            cause: StreamAbortCause::PayloadInvalid,
+            fragments_received,
+            total_fragments,
+        });
     }
 
     let Some(state) = payload.value.state else {
-        return Err("stream payload has no state".into());
+        crate::node::network_status::record_stream_recv_abort_deserialize(
+            fragments_received,
+            total_fragments,
+        );
+        return Err(AssemblyFailure {
+            message: "stream payload has no state".into(),
+            cause: StreamAbortCause::PayloadInvalid,
+            fragments_received,
+            total_fragments,
+        });
     };
 
     let contract = if includes_contract {
@@ -1663,7 +1813,10 @@ async fn assemble_and_cache_stream(
     // false`; this path is the originator, which IS the client requester, so
     // the sticky `local_client_access` flag applies here.
     cache_contract_locally(op_manager, payload.key, state, contract, true).await;
-    Ok(())
+    Ok(StreamProgress {
+        fragments_received,
+        total_fragments,
+    })
 }
 
 /// Re-query the local store for the contract key, used on the
@@ -2163,6 +2316,9 @@ async fn drive_sub_op_get(
                 true,
                 driver.requests_sent,
                 hop_count,
+                streaming_assembly.fragments_received,
+                streaming_assembly.total_fragments,
+                streaming_assembly.abort_cause,
             )
             .await;
             result
@@ -2177,6 +2333,9 @@ async fn drive_sub_op_get(
                 false,
                 true,
                 driver.requests_sent,
+                None,
+                None, // no streaming header ever seen on the exhausted path
+                None,
                 None,
             )
             .await;
@@ -2312,6 +2471,18 @@ where
             "GET relay: duplicate Request for in-flight tx, dropping"
         );
         return Ok(());
+    }
+
+    // Routing/hosting attribution (Group C): count this as a genuine relayed
+    // GET (past the dedup gate — a deduped duplicate is not a relay). Exclude
+    // the originator-loopback case: node.rs maps a client-originated GET
+    // (`source_addr=None`) to `upstream_addr=own_addr` and drives it through
+    // this same entry, so counting it would inflate `relayed_gets_total` with
+    // the node's OWN originations rather than genuine downstream forwards.
+    let originator_loopback =
+        Some(upstream_addr) == op_manager.ring.connection_manager.get_own_addr();
+    if !originator_loopback {
+        crate::node::network_status::record_relayed_get();
     }
 
     tracing::debug!(
@@ -4606,6 +4777,26 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Pin (telemetry accuracy): `start_relay_get` must gate
+    /// `record_relayed_get` on `!originator_loopback`. node.rs maps a
+    /// client-originated GET (`source_addr=None`) to `upstream_addr=own_addr`
+    /// and drives it through this same entry, so counting the loopback edge
+    /// would inflate `relayed_gets_total` with the node's own originations.
+    #[test]
+    fn start_relay_get_excludes_originator_loopback_from_relayed_counter() {
+        let src = production_source();
+        let body = extract_fn_body(src, "pub(crate) async fn start_relay_get<CB>(");
+        assert!(
+            body.contains("record_relayed_get()"),
+            "start_relay_get must record the relayed GET counter"
+        );
+        assert!(
+            body.contains("if !originator_loopback"),
+            "record_relayed_get must be gated on !originator_loopback so the \
+             node's own originated GET (loopback) is not counted as a relay"
+        );
     }
 
     /// Bug #3 reproduction: the legacy Response{Found} branch at
