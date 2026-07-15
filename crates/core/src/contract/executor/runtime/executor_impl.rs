@@ -15,6 +15,43 @@ where
     S: crate::wasm_runtime::StateStorage + Send + Sync + 'static,
     <S as crate::wasm_runtime::StateStorage>::Error: Into<anyhow::Error>,
 {
+    /// Grow the summary/delta caches' COUNT target to cover the node's live
+    /// hosted-contract count before a summarize/delta computation, so the
+    /// interest-heartbeat's hosted working set stays cached across cycles (no
+    /// cold-module recompile). Tied to the real count via
+    /// `Ring::hosting_contracts_count()`, clamped `[COUNT_MIN, COUNT_MAX]`. The
+    /// byte budget (fixed at construction) is the independent hard RAM backstop —
+    /// this only moves the COUNT target.
+    ///
+    /// This covers the hosted set; the small tail of contracts that are in use but
+    /// already evicted from the hosted set (evicted-but-in-use, #4610) can make the
+    /// true summarize working set — `(is_hosting || contract_in_use) &&
+    /// state_present` — slightly exceed `hosting_contracts_count()`. The
+    /// `COUNT_MARGIN` slack absorbs the common case; any residual simply recomputes
+    /// harmlessly on the slow path.
+    ///
+    /// O(1) when already sized (the common case after warm-up): a count read plus a
+    /// compare. `LruCache::resize` grows lazily (no preallocation), so memory
+    /// tracks actual entries, not the cap.
+    fn ensure_cache_covers_hosted_set(&mut self) {
+        use std::num::NonZeroUsize;
+
+        let Some(om) = self.op_manager.as_ref() else {
+            return;
+        };
+        let hosted = om.ring.hosting_contracts_count();
+        let needed = crate::contract::executor::summary_cache_count_target(hosted);
+        // needed >= SUMMARY_CACHE_COUNT_MIN > 0 by construction (summary_cache_count_target clamps); unwrap_or is just panic-proofing.
+        if needed > self.summary_cache.cap().get() {
+            self.summary_cache
+                .grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+        }
+        if needed > self.delta_cache.cap().get() {
+            self.delta_cache
+                .grow(NonZeroUsize::new(needed).unwrap_or(NonZeroUsize::MIN));
+        }
+    }
+
     pub(in crate::contract::executor) fn bridged_lookup_key(
         &self,
         instance_id: &ContractInstanceId,
@@ -1164,6 +1201,11 @@ where
         &mut self,
         key: ContractKey,
     ) -> Result<StateSummary<'static>, ExecutorError> {
+        // Size the caches' count target to the live hosted set before any
+        // lookup/insert, so the interest-heartbeat's working set stays cached
+        // across cycles (the byte budget stays fixed as the RAM backstop).
+        self.ensure_cache_covers_hosted_set();
+
         // Fast path (the hot path on a busy node — tens/sec over MB-scale
         // states): if the state store holds a cheap change-detector hash for
         // this contract's CURRENT state AND we already have a summary cached
@@ -1243,6 +1285,11 @@ where
         key: ContractKey,
         their_summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ExecutorError> {
+        // Size the caches' count target to the live hosted set before any
+        // lookup/insert, so the interest-heartbeat's working set stays cached
+        // across cycles (the byte budget stays fixed as the RAM backstop).
+        self.ensure_cache_covers_hosted_set();
+
         // Hash the peer's summary up front — it's a small digest, so this is
         // cheap (unlike the full state). Only the STATE component of the cache
         // key gets the cheap change-detector treatment below.
