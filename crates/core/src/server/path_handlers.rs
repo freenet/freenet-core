@@ -2685,15 +2685,24 @@ mod tests {
             "overlay code path must not use innerHTML (XSS surface)"
         );
 
-        // The old Notification flow must be gone: no requestPermission(),
-        // no new Notification(...), no window.open('/permission/').
+        // The old permission-prompt-via-Notification flow must be gone: the
+        // permission OVERLAY code path must not request or construct a browser
+        // Notification (#3836 — delegate permission prompts must render as the
+        // in-page SSE overlay, never as a browser Notification users
+        // block/miss/dismiss). Scoped to `overlay_slice`, NOT the whole shell:
+        // browser Notifications are now legitimately used ELSEWHERE in the
+        // bridge for new-MESSAGE notifications (a best-effort UX where a
+        // missed/dismissed notification is fine, unlike a permission prompt),
+        // pinned separately by `bridge_js_notification_proxy_invariants`. The
+        // message-notification code sits well before the overlay root, so it is
+        // outside this slice.
         assert!(
-            !html.contains("Notification.requestPermission"),
-            "browser Notification permission request must be removed (#3836)"
+            !overlay_slice.contains("Notification.requestPermission"),
+            "permission overlay must not request browser Notification permission (#3836)"
         );
         assert!(
-            !html.contains("new Notification("),
-            "browser Notification construction must be removed (#3836)"
+            !overlay_slice.contains("new Notification("),
+            "permission overlay must not construct a browser Notification (#3836)"
         );
         assert!(
             !html.contains("window.open('/permission/")
