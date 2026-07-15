@@ -245,6 +245,40 @@ impl TransportMetrics {
         }
     }
 
+    /// Record a failed outbound transfer.
+    ///
+    /// The failure sibling of [`Self::record_transfer_completed`]. Together the
+    /// two count every outbound stream that resolves: `send_stream` /
+    /// `pipe_stream` either run to completion (completed) or return early from
+    /// one of their error sites (failed), never both.
+    ///
+    /// Call this once per failed stream, from the OUTBOUND-stream arms of
+    /// `PeerConnection::recv` — the place every outbound stream task's result
+    /// is observed. (`recv` also observes `inbound_stream_futures`; those are
+    /// not transfers this counter tracks.)
+    ///
+    /// It mirrors the `emit_transfer_failed` event for every stream whose
+    /// result is observed there, but the two are NOT unconditionally 1:1: the
+    /// event is emitted inside the stream task, while this counter increments
+    /// only at the observation site, so a task that panics or is orphaned by
+    /// connection teardown diverges. See the call sites in `peer_connection.rs`
+    /// for both gaps and for the classification rationale.
+    ///
+    /// Unlike the success path this records ONLY the counter: a failed transfer
+    /// has no meaningful duration, throughput, or payload size to aggregate,
+    /// and the bytes it did put on the wire are already counted at the socket
+    /// layer by `record_packet_sent`.
+    pub fn record_transfer_failed(&self) {
+        // Saturating, matching `record_transfer_completed` — a pinned u32::MAX
+        // is a better failure mode than wrapping to 0 and reporting a healthy
+        // node.
+        self.transfers_failed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(1))
+            })
+            .ok();
+    }
+
     /// Record the start of an outbound NAT traversal attempt.
     pub fn record_nat_traversal_attempt(&self) {
         self.nat_traversal_attempts.fetch_add(1, Ordering::Relaxed);
@@ -462,11 +496,12 @@ impl TransportMetrics {
     /// Read-only snapshot for the local dashboard. Does NOT reset counters
     /// (unlike `take_snapshot` which is consumed by the telemetry worker).
     ///
-    /// **Telemetry interaction**: `peak_throughput_bps`, `avg_cwnd_bytes`,
-    /// `avg_rtt_us`, and `slowdowns_triggered` are period accumulators that
-    /// `take_snapshot` resets every `transport_snapshot_interval_secs`
-    /// (default 30s).  Between resets these reflect recent activity; the
-    /// dashboard sees the current window, not a lifetime aggregate.
+    /// **Telemetry interaction**: `transfers_completed`, `transfers_failed`,
+    /// `peak_throughput_bps`, `avg_cwnd_bytes`, `avg_rtt_us`, and
+    /// `slowdowns_triggered` are period accumulators that `take_snapshot`
+    /// resets every `transport_snapshot_interval_secs` (default 30s).  Between
+    /// resets these reflect recent activity; the dashboard sees the current
+    /// window, not a lifetime aggregate.
     /// `cumulative_bytes_sent/received` are never reset and reflect totals.
     pub fn read_snapshot(&self) -> TransportSnapshot {
         let transfers_completed = self.transfers_completed.load(Ordering::Relaxed);
@@ -938,6 +973,45 @@ mod tests {
 
         // Counters reset after the snapshot: a subsequent snapshot with no new
         // activity is None.
+        assert!(metrics.take_snapshot().is_none());
+    }
+
+    /// Failed transfers count as snapshot activity in their own right: a period
+    /// whose ONLY activity is failures (a sick node whose every transfer dies,
+    /// with no completions and no RTT keep-alive samples) must still emit a
+    /// snapshot, otherwise `take_snapshot` returns `None`, the telemetry worker
+    /// uploads nothing, and the fail counter reads a permanent 0 — exactly the
+    /// #4827 symptom this fix exists to surface.
+    ///
+    /// The `&& transfers_failed == 0` conjunct in the no-activity gate was DEAD
+    /// until #4827 gave the counter a writer, so this is its first coverage.
+    /// Sibling pins: `test_snapshot_emitted_for_rtt_only_activity` (#4000) and
+    /// `test_snapshot_emitted_for_nat_only_activity`.
+    ///
+    /// Also the only coverage that a failure reaches `take_snapshot` at all —
+    /// the value telemetry actually uploads, distinct from the `read_snapshot`
+    /// the `peer_connection` wiring tests read.
+    #[test]
+    fn test_snapshot_emitted_for_failed_transfers_only() {
+        let metrics = TransportMetrics::new();
+
+        // No completions, no RTT samples, no NAT activity — only failures.
+        metrics.record_transfer_failed();
+        metrics.record_transfer_failed();
+        metrics.record_transfer_failed();
+
+        let snapshot = metrics
+            .take_snapshot()
+            .expect("failure-only activity must still produce a snapshot");
+        assert_eq!(snapshot.transfers_failed, 3);
+        assert_eq!(snapshot.transfers_completed, 0);
+        // No completion means no measured duration: the average is the sentinel
+        // 0, not a real timing. `cards.rs` must not render it as one.
+        assert_eq!(snapshot.avg_transfer_time_ms, 0);
+
+        // Counters reset after the snapshot: a subsequent snapshot with no new
+        // activity is None. Without the reset a single failure would re-emit a
+        // stale snapshot every period forever.
         assert!(metrics.take_snapshot().is_none());
     }
 

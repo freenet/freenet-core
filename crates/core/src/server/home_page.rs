@@ -758,6 +758,41 @@ mod tests {
         assert!(html.contains("23</span>"), "slowdown count missing");
         assert!(html.contains("847"), "transfers completed missing");
         assert!(html.contains("3"), "transfers failed missing");
+        assert!(
+            html.contains("1.200s avg"),
+            "a real average must still render when transfers completed"
+        );
+    }
+
+    /// An all-failures window must NOT render an average.
+    ///
+    /// `avg_transfer_time_ms` is a sentinel 0 when nothing completed
+    /// (metrics.rs guards the division), so rendering it would claim a measured
+    /// "0.000s avg" for transfers that produced no timing at all. The window is
+    /// reachable only since #4827 gave `transfers_failed` a writer: before that
+    /// the counter was structurally 0, so this row required >=1 completion and
+    /// the average was always real. A 30s all-failures window is exactly the
+    /// sick-node case #4827 exists to surface, so the first thing it renders
+    /// must not be a fabricated timing.
+    #[test]
+    fn transfer_card_omits_avg_when_nothing_completed() {
+        let mut snap = base_snapshot();
+        snap.bytes_uploaded = 5000;
+        snap.open_connections = 1;
+        snap.transport_snapshot.transfers_completed = 0;
+        snap.transport_snapshot.transfers_failed = 3;
+        // The sentinel metrics.rs produces when transfers_completed == 0.
+        snap.transport_snapshot.avg_transfer_time_ms = 0;
+        let html = build_transfer_card(&Some(snap));
+
+        assert!(
+            html.contains("0 ok / 3 fail"),
+            "the failure row must still render — surfacing it is the point of #4827"
+        );
+        assert!(
+            !html.contains("avg)"),
+            "must not present the sentinel 0 as a measured average; got: {html}"
+        );
     }
 
     #[test]
