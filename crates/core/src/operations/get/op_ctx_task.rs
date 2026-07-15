@@ -1134,8 +1134,13 @@ async fn drive_get_with_assembly_retry(
                 // so any earlier assembly failure is moot — clear the
                 // remembered error or an unrelated store-lookup miss
                 // (eviction race) would be mislabeled as an assembly
-                // failure by the caller's error synthesis.
-                assembly.error = None;
+                // failure by the caller's error synthesis. A prior failed
+                // streaming attempt may ALSO have set `fragments_received` /
+                // `total_fragments` / `abort_cause`; leaving them set would make
+                // the caller emit a `streamed=false` terminal event carrying
+                // another attempt's fragment counts + abort cause. Reset the
+                // whole outcome so no stale stream field survives.
+                assembly = AssemblyOutcome::default();
                 break result;
             }
             RetryLoopOutcome::Exhausted(cause) => {
@@ -1176,11 +1181,20 @@ async fn drive_get_with_assembly_retry(
                 "get: current_target has no socket_addr; \
                  cannot claim orphan stream"
             );
-            assembly.error = Some(
-                "selected target has no socket address; \
-                 cannot claim the response stream"
-                    .to_string(),
-            );
+            // Reset the whole assembly outcome (not just `error`): a prior
+            // failed streaming attempt may have left `fragments_received` /
+            // `total_fragments` / `abort_cause` set, and those belong to that
+            // attempt, not to this routing failure. Keep only the error string
+            // so the terminal event does not report another attempt's fragment
+            // progress or stream-abort cause.
+            assembly = AssemblyOutcome {
+                error: Some(
+                    "selected target has no socket address; \
+                     cannot claim the response stream"
+                        .to_string(),
+                ),
+                ..Default::default()
+            };
             break result;
         };
 
@@ -2460,8 +2474,16 @@ where
     }
 
     // Routing/hosting attribution (Group C): count this as a genuine relayed
-    // GET (past the dedup gate — a deduped duplicate is not a relay).
-    crate::node::network_status::record_relayed_get();
+    // GET (past the dedup gate — a deduped duplicate is not a relay). Exclude
+    // the originator-loopback case: node.rs maps a client-originated GET
+    // (`source_addr=None`) to `upstream_addr=own_addr` and drives it through
+    // this same entry, so counting it would inflate `relayed_gets_total` with
+    // the node's OWN originations rather than genuine downstream forwards.
+    let originator_loopback =
+        Some(upstream_addr) == op_manager.ring.connection_manager.get_own_addr();
+    if !originator_loopback {
+        crate::node::network_status::record_relayed_get();
+    }
 
     tracing::debug!(
         tx = %incoming_tx,
@@ -4755,6 +4777,26 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Pin (telemetry accuracy): `start_relay_get` must gate
+    /// `record_relayed_get` on `!originator_loopback`. node.rs maps a
+    /// client-originated GET (`source_addr=None`) to `upstream_addr=own_addr`
+    /// and drives it through this same entry, so counting the loopback edge
+    /// would inflate `relayed_gets_total` with the node's own originations.
+    #[test]
+    fn start_relay_get_excludes_originator_loopback_from_relayed_counter() {
+        let src = production_source();
+        let body = extract_fn_body(src, "pub(crate) async fn start_relay_get<CB>(");
+        assert!(
+            body.contains("record_relayed_get()"),
+            "start_relay_get must record the relayed GET counter"
+        );
+        assert!(
+            body.contains("if !originator_loopback"),
+            "record_relayed_get must be gated on !originator_loopback so the \
+             node's own originated GET (loopback) is not counted as a relay"
+        );
     }
 
     /// Bug #3 reproduction: the legacy Response{Found} branch at

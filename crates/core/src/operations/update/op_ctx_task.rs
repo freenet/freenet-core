@@ -702,6 +702,11 @@ pub(crate) async fn start_relay_broadcast_to(
         return Ok(());
     }
 
+    // NOT counted in `relayed_updates_total`: BroadcastTo is update-mesh
+    // fan-out to interested co-hosts, not a relayed UPDATE *request* toward the
+    // key. Counting fan-out here would conflate relay volume with fan-out
+    // volume (one update -> N broadcasts). See `record_relayed_update` doc.
+
     tracing::debug!(
         tx = %incoming_tx,
         %key,
@@ -1364,6 +1369,15 @@ pub(crate) async fn start_relay_request_update_streaming(
         return Ok(());
     }
 
+    // Routing/hosting attribution (Group C): count this as a genuine relayed
+    // UPDATE, mirroring the non-streaming `start_relay_request_update`.
+    // `relayed_updates_total` counts relayed UPDATE *requests* toward the key;
+    // `RequestUpdateStreaming` is the large-payload variant of that request, so
+    // it is counted. No loopback exclusion: UPDATE relay drivers run only for
+    // `source_addr.is_some()` (an internal/loopback UPDATE is dropped in
+    // node.rs and never reaches this driver).
+    crate::node::network_status::record_relayed_update();
+
     tracing::debug!(
         tx = %incoming_tx,
         %key,
@@ -1418,6 +1432,9 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
         );
         return Ok(());
     }
+
+    // NOT counted in `relayed_updates_total` (see `start_relay_broadcast_to`):
+    // BroadcastToStreaming is update-mesh fan-out, not a relayed request.
 
     tracing::debug!(
         tx = %incoming_tx,
@@ -2968,5 +2985,35 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Pin (telemetry accuracy / scope): `relayed_updates_total` counts
+    /// relayed UPDATE *requests* only. Both request entries record
+    /// `record_relayed_update`; the broadcast fan-out entries must NOT (they
+    /// are update-mesh fan-out, not a relayed request — counting them would
+    /// conflate relay volume with fan-out volume).
+    #[test]
+    fn relayed_update_counter_scope_requests_only() {
+        let full = include_str!("op_ctx_task.rs");
+        let src = production_source(full);
+        for sig in [
+            "pub(crate) async fn start_relay_request_update(",
+            "pub(crate) async fn start_relay_request_update_streaming(",
+        ] {
+            assert!(
+                extract_fn_body(src, sig).contains("record_relayed_update()"),
+                "{sig} must record the relayed UPDATE request counter"
+            );
+        }
+        for sig in [
+            "pub(crate) async fn start_relay_broadcast_to(",
+            "pub(crate) async fn start_relay_broadcast_to_streaming(",
+        ] {
+            assert!(
+                !extract_fn_body(src, sig).contains("record_relayed_update()"),
+                "{sig} must NOT record relayed_updates_total (fan-out, not a \
+                 relayed request)"
+            );
+        }
     }
 }

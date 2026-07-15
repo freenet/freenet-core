@@ -490,9 +490,13 @@ pub(crate) struct RouterSnapshotInfo {
     /// WITHOUT a per-fragment/per-transfer event stream: five monotonic cause
     /// totals (receiver inactivity / cancelled / claim-timeout / deserialize;
     /// sender cwnd) plus a fragment-progress histogram (`*_frac_*`, one bump per
-    /// receiver abort) showing HOW FAR transfers got before dying. All monotonic
-    /// lifetime totals the collector differences across the cadence. `None`
-    /// until the ring's snapshot task populates them.
+    /// receiver abort) showing HOW FAR transfers got before dying. Scope differs
+    /// by cause: `*_inactivity_total` / `*_cancelled_total` are recorded in
+    /// transport `StreamHandle::assemble` and AGGREGATE across GET + PUT + UPDATE
+    /// inbound streams, while `*_claim_timeout_total` / `*_deserialize_total` are
+    /// GET-fetch-only (the GET originator's `assemble_and_cache_stream`). All
+    /// monotonic lifetime totals the collector differences across the cadence.
+    /// `None` until the ring's snapshot task populates them.
     pub stream_recv_aborts_inactivity_total: Option<u64>,
     pub stream_recv_aborts_cancelled_total: Option<u64>,
     pub stream_recv_aborts_claim_timeout_total: Option<u64>,

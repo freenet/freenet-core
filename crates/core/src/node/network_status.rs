@@ -411,13 +411,21 @@ pub struct TerminalConsultStats {
 #[derive(Default)]
 pub struct StreamAbortStats {
     /// Receiver aborts: no fragment arrived within the inactivity window.
+    /// Recorded in transport `StreamHandle::assemble`, so this AGGREGATES across
+    /// GET + PUT + UPDATE inbound streams (any op that assembles a streamed
+    /// transfer), not GET fetches alone.
     pub recv_inactivity: u64,
     /// Receiver aborts: stream cancelled / connection closed mid-transfer.
+    /// Like `recv_inactivity`, recorded in transport `StreamHandle::assemble`
+    /// and therefore AGGREGATED across GET + PUT + UPDATE inbound streams.
     pub recv_cancelled: u64,
     /// Receiver aborts: no inbound stream was ever claimed (claim timed out).
+    /// GET-fetch-only: recorded in the GET originator's
+    /// `assemble_and_cache_stream`, so PUT/UPDATE streams are not included.
     pub recv_claim_timeout: u64,
     /// Receiver aborts: bytes fully received but payload failed to deserialize
     /// or was structurally invalid (key mismatch / missing state).
+    /// GET-fetch-only, same site as `recv_claim_timeout`.
     pub recv_deserialize: u64,
     /// Sender aborts: cwnd-wait timed out (ACKs stopped arriving) — the stream
     /// was failed rather than blocking the connection forever.
@@ -1011,7 +1019,13 @@ pub fn record_relayed_subscribe() {
     }
 }
 
-/// Record that this node relayed (forwarded one hop) an UPDATE request.
+/// Record that this node relayed (forwarded one hop) an UPDATE *request*
+/// toward the contract key. Counts both `UpdateMsg::RequestUpdate` and its
+/// large-payload variant `RequestUpdateStreaming` (the same logical relayed
+/// request). Does NOT count `BroadcastTo` / `BroadcastToStreaming`: those are
+/// update-mesh fan-out to interested co-hosts, not a request relayed one hop
+/// toward the key, and counting them would conflate relay volume with fan-out
+/// volume (one update -> N broadcasts).
 pub fn record_relayed_update() {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {

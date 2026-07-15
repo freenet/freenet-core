@@ -1509,10 +1509,6 @@ pub(crate) async fn start_relay_subscribe(
         return Ok(());
     }
 
-    // Routing/hosting attribution (Group C): count this as a genuine relayed
-    // SUBSCRIBE (past the dedup gate — a deduped duplicate is not a relay).
-    crate::node::network_status::record_relayed_subscribe();
-
     // Construct the guard IMMEDIATELY after `insert` so a panic in any
     // intervening work (fmt-allocating logs, future OOM) cannot leak
     // the dedup-set entry. The guard's Drop clears the entry; without
@@ -1524,6 +1520,19 @@ pub(crate) async fn start_relay_subscribe(
         op_manager: op_manager.clone(),
         incoming_tx,
     };
+
+    // Routing/hosting attribution (Group C): count this as a genuine relayed
+    // SUBSCRIBE (past the dedup gate — a deduped duplicate is not a relay).
+    // Recorded AFTER the inflight guard so the guard sits immediately after the
+    // dedup insert (the #3932 leak-safety invariant). Exclude the
+    // originator-loopback case: node.rs maps a client-originated SUBSCRIBE
+    // (`source_addr=None`) to `upstream_addr=own_addr` and drives it here, so
+    // counting it would inflate `relayed_subscribes_total` with own subscribes.
+    let originator_loopback =
+        Some(upstream_addr) == op_manager.ring.connection_manager.get_own_addr();
+    if !originator_loopback {
+        crate::node::network_status::record_relayed_subscribe();
+    }
 
     tracing::debug!(
         tx = %incoming_tx,
@@ -3848,6 +3857,32 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Pin (telemetry accuracy + #3932 ordering): `start_relay_subscribe`
+    /// must record `record_relayed_subscribe` AFTER the inflight guard (so the
+    /// guard sits immediately after the dedup insert) and gate it on
+    /// `!originator_loopback` (a client-originated SUBSCRIBE is mapped to
+    /// `upstream_addr=own_addr` and would otherwise be counted as a relay).
+    #[test]
+    fn start_relay_subscribe_records_after_guard_and_excludes_loopback() {
+        let full = include_str!("op_ctx_task.rs");
+        let src = production_source(full);
+        let body = extract_fn_body(src, "pub(crate) async fn start_relay_subscribe(");
+        let guard_pos = body
+            .find("let guard = RelaySubscribeInflightGuard {")
+            .expect("guard construction must exist");
+        let record_pos = body
+            .find("record_relayed_subscribe()")
+            .expect("must record the relayed SUBSCRIBE counter");
+        assert!(
+            record_pos > guard_pos,
+            "record_relayed_subscribe must come AFTER the inflight guard (#3932)"
+        );
+        assert!(
+            body.contains("if !originator_loopback"),
+            "record_relayed_subscribe must be gated on !originator_loopback"
+        );
     }
 
     // ---- #3808: inter-attempt retry pacing (jitter + delay) ----
