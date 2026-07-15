@@ -407,6 +407,35 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
         Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await
     }
 
+    /// Like [`new_mock_wasm_uncached`](Self::new_mock_wasm_uncached) but also wires
+    /// a real `OpManager`, so `Ring::hosting_contracts_count()` reflects contracts
+    /// hosted via `op_manager.ring.host_contract(..)`. Used by the summary-cache
+    /// sizing test to prove `ensure_cache_covers_hosted_set` grows the caches to
+    /// the live hosted count (observable via `MockStateStorage::get_count`).
+    #[cfg(test)]
+    pub async fn new_mock_wasm_uncached_with_op_manager(
+        _identifier: &str,
+        shared_storage: MockStateStorage,
+        op_manager: std::sync::Arc<crate::node::OpManager>,
+    ) -> anyhow::Result<Self> {
+        let state_store = crate::wasm_runtime::StateStore::new_uncached(shared_storage);
+
+        let runtime = MockWasmRuntime {
+            contract_store: InMemoryContractStore::default(),
+            validate_overrides: HashMap::new(),
+            update_overrides: HashMap::new(),
+        };
+
+        Executor::new(
+            state_store,
+            || Ok(()),
+            OperationMode::Local,
+            runtime,
+            Some(op_manager),
+        )
+        .await
+    }
+
     /// Mutable access to the inner `MockWasmRuntime` so tests can install
     /// per-contract `validate_overrides` / `update_overrides` after the
     /// executor is wrapped in a handler. The `runtime` field is private to
