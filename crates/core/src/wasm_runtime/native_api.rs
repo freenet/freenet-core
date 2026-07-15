@@ -663,6 +663,25 @@ impl DelegateCallEnv {
         }
 
         // Check per-node creation limit (counts ALL created delegates, not just origin)
+        //
+        // Deliberately check-then-act, unlike the decrement in
+        // `release_created_delegate_slot`, which is one atomic `fetch_update`.
+        // The asymmetry is intentional, not an oversight: the two sides have
+        // very different failure modes when a race is lost.
+        //
+        // Here, concurrent creators can all pass this check and each `fetch_add`
+        // below, overshooting by at most one per creator — bounded by the pool's
+        // executor count, against a limit of 1024, and it drains back as slots
+        // are released. On the decrement, a lost race instead wraps the count
+        // past zero to `usize::MAX`: permanently over the limit, wedging the node
+        // into rejecting every later creation. Bounded overshoot versus permanent
+        // wedge is why that side is CAS'd and this one is not.
+        //
+        // Reserving the slot here would mean releasing it again on each of the
+        // three fallible paths between this check and the `fetch_add` (oversized
+        // WASM, and the two store failures). Worth doing, but it reworks the
+        // error paths of a limit-enforcing function and belongs in its own
+        // change.
         if self.created_delegates_count.load(Ordering::Relaxed) >= MAX_CREATED_DELEGATES_PER_NODE {
             return Err(DelegateCreateError::NodeLimitExceeded);
         }

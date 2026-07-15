@@ -1598,8 +1598,10 @@ mod tests {
     /// A barrier lines the racers up on the same slot, and the round repeats,
     /// because a wrap is a race and one round proves little. Verified to have
     /// teeth rather than assumed: against the `load`-then-`fetch_sub` this
-    /// replaced it fails on every run (5/5, immediately), with more than one
-    /// racer claiming the slot and the count wrapping past zero.
+    /// replaced it fails immediately on every run (6/6 at this round count),
+    /// with more than one racer claiming the slot and the count wrapping past
+    /// zero. 200 rounds is deliberate — it is the smallest count still verified
+    /// to catch that, since this suite does not need 16k more OS threads.
     #[test]
     fn test_release_created_delegate_slot_concurrent_releases_do_not_wrap() {
         use super::super::native_api::{new_delegate_counter, release_created_delegate_slot};
@@ -1608,7 +1610,7 @@ mod tests {
 
         const RACERS: usize = 8;
 
-        for _ in 0..2_000 {
+        for _ in 0..200 {
             let counter = new_delegate_counter();
             counter.store(1, Ordering::Relaxed);
             // Release the racers together, so they contend for the ONE occupied
