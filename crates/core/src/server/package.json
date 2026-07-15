@@ -11,7 +11,7 @@
     "lint:prettier": "prettier --check \"**/assets/**/*.{js,css,html}\"",
     "lint:eslint": "eslint \"**/assets/**/*.js\"",
     "format": "prettier --write \"**/assets/**/*.{js,css,html}\"",
-    "test": "node base58_encode.test.mjs && node dashboard_refresh.test.mjs"
+    "test": "node base58_encode.test.mjs && node dashboard_refresh.test.mjs && node shell_bridge_notifications.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.0",

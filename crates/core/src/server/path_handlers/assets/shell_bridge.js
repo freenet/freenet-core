@@ -11,9 +11,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // Fallback consent store for when localStorage is unavailable (private mode),
   // so consent still works for the current session and 'granted' is honest.
   var inMemoryConsent = Object.create(null);
-  // Per-tag + global rate-limit state for the notification proxy.
-  var notifyTagTimes = Object.create(null);
-  var notifyRecent = [];
+  // Per-tag + global rate limiter for the notification proxy (see the
+  // marker-bracketed `makeNotifyRateLimiter` factory below, unit-tested in
+  // shell_bridge_notifications.test.mjs).
+  var notifyLimiter = makeNotifyRateLimiter();
 
   // FAIL CLOSED whenever a HOSTED browser has no usable per-user token (#4381).
   //
@@ -231,8 +232,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
   function contractConsentKey() {
     // Derive the contract key from the trusted, server-routed path
     // (/v[12]/contract/web/<KEY>/...), NEVER from message content — otherwise a
-    // contract could claim another contract's consent. Matches BOTH API
-    // versions, consistent with CONTRACT_PREFIX_RE, so v2 loads aren't stranded.
+    // contract could claim another contract's consent. Covers both API versions
+    // (v1 and v2) so a v2 load isn't stranded. This is a looser, unanchored
+    // match than CONTRACT_PREFIX_RE (which is anchored), which is fine because
+    // `location.pathname` is server-controlled and can't contain `?`/`#`.
     var m = location.pathname.match(/\/v[12]\/contract\/web\/([^/?#]+)/);
     return m ? 'freenet_notify:' + m[1] : null;
   }
@@ -294,32 +297,47 @@ function freenetBridge(authToken, userToken, hostedMode) {
     } catch (e) {}
   }
 
-  // Per-tag throttle (so distinct rooms aren't dropped) plus a rolling global
-  // cap (so a consented contract can't flood with unique tags). Bounds the
-  // per-tag map so a distinct-tag flood can't grow memory unbounded.
-  var NOTIFY_TAG_MIN_MS = 3000;
-  var NOTIFY_GLOBAL_MAX = 20;
-  var NOTIFY_GLOBAL_WINDOW_MS = 60000;
-
-  function notifyRateOk(tag) {
-    var now = Date.now();
-    var last = notifyTagTimes[tag];
-    if (last !== undefined && now - last < NOTIFY_TAG_MIN_MS) return false;
-    notifyRecent = notifyRecent.filter(function (t) {
-      return now - t < NOTIFY_GLOBAL_WINDOW_MS;
-    });
-    if (notifyRecent.length >= NOTIFY_GLOBAL_MAX) return false;
-    notifyTagTimes[tag] = now;
-    notifyRecent.push(now);
-    var keys = Object.keys(notifyTagTimes);
-    if (keys.length > 128) {
-      keys.sort(function (a, b) {
-        return notifyTagTimes[a] - notifyTagTimes[b];
-      });
-      for (var i = 0; i < keys.length - 64; i++) delete notifyTagTimes[keys[i]];
-    }
-    return true;
+  // A per-tag throttle (so distinct rooms aren't dropped) plus a rolling global
+  // cap (so a consented contract can't flood with unique tags), with a bounded
+  // per-tag map so a distinct-tag flood can't grow memory unbounded. `ok(tag,
+  // now)` takes the clock as an argument (rather than reading `Date.now()`
+  // inside) so the extracted factory is deterministically unit-testable.
+  //
+  // notify-rate-limiter:BEGIN — self-contained; extracted verbatim between these
+  // markers and unit-tested by
+  // crates/core/src/server/shell_bridge_notifications.test.mjs. Keep it pure
+  // (no reference to anything outside this function) so the extraction works.
+  function makeNotifyRateLimiter() {
+    var TAG_MIN_MS = 3000; // same-tag throttle window
+    var GLOBAL_MAX = 20; // max notifications per rolling window
+    var GLOBAL_WINDOW_MS = 60000;
+    var MAP_CAP = 128; // bound the per-tag map; evict down to MAP_CAP/2
+    var tagTimes = Object.create(null);
+    var recent = [];
+    return {
+      ok: function (tag, now) {
+        var last = tagTimes[tag];
+        if (last !== undefined && now - last < TAG_MIN_MS) return false;
+        recent = recent.filter(function (t) {
+          return now - t < GLOBAL_WINDOW_MS;
+        });
+        if (recent.length >= GLOBAL_MAX) return false;
+        tagTimes[tag] = now;
+        recent.push(now);
+        var keys = Object.keys(tagTimes);
+        if (keys.length > MAP_CAP) {
+          keys.sort(function (a, b) {
+            return tagTimes[a] - tagTimes[b];
+          });
+          for (var i = 0; i < keys.length - MAP_CAP / 2; i++) {
+            delete tagTimes[keys[i]];
+          }
+        }
+        return true;
+      },
+    };
   }
+  // notify-rate-limiter:END
 
   function notifyStatusToIframe(status) {
     sendToIframe({
@@ -442,7 +460,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
       ckey + ':' + (typeof msg.tag === 'string' ? msg.tag.slice(0, 64) : 'msg');
     // Per-tag throttle + rolling global cap: distinct rooms aren't dropped, but
     // a consented contract can't flood with unique tags.
-    if (!notifyRateOk(opts.tag)) return;
+    if (!notifyLimiter.ok(opts.tag, Date.now())) return;
     var n;
     try {
       n = new Notification(title, opts);

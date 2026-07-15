@@ -3341,7 +3341,7 @@ mod tests {
         // Notifications pass a rate limiter (per-tag + rolling global cap) so a
         // consented contract can't flood the user with OS notifications.
         assert!(
-            SHELL_BRIDGE_JS.contains("notifyRateOk("),
+            SHELL_BRIDGE_JS.contains("notifyLimiter.ok("),
             "notifications must pass the per-tag + global rate limiter"
         );
         // Attacker-controlled notification text is length-capped (text-only).
