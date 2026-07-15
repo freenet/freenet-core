@@ -650,6 +650,18 @@ impl HostingManager {
         Some(effective)
     }
 
+    /// Cap the hosted-contract COUNT to what the compiled-module cache can keep
+    /// hot (anti-recompile-thrash, #4642). `module_cache_budget_bytes` is the
+    /// node's resolved contract module-cache byte budget; the ceiling is
+    /// `budget / REPRESENTATIVE_COMPILED_MODULE_BYTES` (see
+    /// [`cache::max_hosted_for_module_budget`]). Called once at construction from
+    /// the resolved config, so an operator `--module-cache-budget-bytes` override
+    /// is honored. O(1); does not itself evict.
+    pub(crate) fn set_hosted_count_ceiling(&self, module_cache_budget_bytes: u64) {
+        let n = cache::max_hosted_for_module_budget(module_cache_budget_bytes);
+        self.hosting_cache.write().set_max_hosted_contracts(n);
+    }
+
     /// Pre-write admission gate for a state write (#4683, live since #4702): reject the write
     /// if replacing `key`'s tracked state size with `new_size` would push
     /// aggregate on-disk usage past the current disk budget. Read-only; the

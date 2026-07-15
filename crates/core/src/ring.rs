@@ -548,22 +548,28 @@ impl Ring {
             governance_config,
             time_source.clone(),
         ));
+        // Production passes the Ring's default `Arc<InstantTimeSrc>` (wall clock).
+        // Simulation tests can inject a controllable clock via
+        // `NodeConfig::hosting_time_source_override` so hosting-cache TTL /
+        // eviction is deterministic (#4642 piece A). Same `Arc` clone as the rest
+        // of the Ring when no override is set.
+        let hosting_manager = hosting::HostingManager::with_time_source(
+            config.config.max_hosting_storage,
+            config
+                .hosting_time_source_override
+                .clone()
+                .unwrap_or_else(|| time_source.clone()),
+        );
+        // Bound the hosted-contract COUNT by what the compiled-module cache can
+        // keep hot, so hosting never permits more contracts than the module cache
+        // has hot slots (anti-recompile-thrash, #4642). Reads the RESOLVED config
+        // so an operator `--module-cache-budget-bytes` override is honored.
+        hosting_manager.set_hosted_count_ceiling(config.config.module_cache_budget_bytes as u64);
         let ring = Ring {
             max_hops_to_live,
             router,
             connection_manager,
-            // Production passes the Ring's default `Arc<InstantTimeSrc>`
-            // (wall clock). Simulation tests can inject a controllable clock via
-            // `NodeConfig::hosting_time_source_override` so hosting-cache TTL /
-            // eviction is deterministic (#4642 piece A). Same `Arc` clone as the
-            // rest of the Ring when no override is set.
-            hosting_manager: hosting::HostingManager::with_time_source(
-                config.config.max_hosting_storage,
-                config
-                    .hosting_time_source_override
-                    .clone()
-                    .unwrap_or_else(|| time_source.clone()),
-            ),
+            hosting_manager,
             broken_invariants: BrokenInvariantsTracker::new(time_source.clone()),
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(

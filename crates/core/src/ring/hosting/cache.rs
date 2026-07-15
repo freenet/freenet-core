@@ -120,6 +120,29 @@ const DEFAULT_HOSTING_BUDGET_RAM_DIVISOR: u64 = 8;
 /// the smallest sane budget rather than the max.
 const FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Representative serialized compiled-contract-module size (~1.5 MiB), matching
+/// module_cache's `MEASURED_MODULE_SIZE` (#4452). Ties the hosted-count ceiling
+/// to how many modules the compiled-module cache can keep hot: the hosting
+/// budget measures state bytes (~380 KiB/contract) while the module cache
+/// measures compiled modules (~1.5 MiB each), so a state-byte budget alone
+/// permits ~2.5x more contracts than the module cache can keep hot, causing
+/// recompile thrash on large gateways.
+pub(crate) const REPRESENTATIVE_COMPILED_MODULE_BYTES: u64 = 1536 * 1024;
+
+/// Max eviction victims per `evict_over_budget` pass. Well above a normal
+/// byte-driven insert eviction (1-2), so it only throttles the one-time
+/// upgrade drain (when the count ceiling first binds on a node already hosting
+/// thousands of contracts) into ~15 min of 60s sweeps instead of one inline
+/// cliff.
+pub(crate) const MAX_EVICTIONS_PER_PASS: usize = 128;
+
+/// Hosted-count ceiling for a given compiled-module-cache byte budget: at most
+/// as many contracts as the module cache can keep hot. `.max(1)` guards the
+/// degenerate 0 case (a tiny/zero module-cache budget still permits one host).
+pub(crate) fn max_hosted_for_module_budget(module_cache_budget_bytes: u64) -> u64 {
+    (module_cache_budget_bytes / REPRESENTATIVE_COMPILED_MODULE_BYTES).max(1)
+}
+
 /// Default hosting-storage budget, scaled to the memory the node may use.
 ///
 /// Replaces the historical flat 1 GiB default. Returns
@@ -680,6 +703,11 @@ pub struct HostedContract {
 pub struct HostingCache<T: TimeSource> {
     /// Maximum bytes to use for cached contracts
     budget_bytes: u64,
+    /// Max hosted contracts, derived from compiled-module-cache capacity so the
+    /// hosted set never exceeds what the module cache can keep hot (anti-thrash,
+    /// #4642). `u64::MAX` until set via [`Self::set_max_hosted_contracts`] ->
+    /// behaviour-preserving default (existing tests unaffected).
+    max_hosted_contracts: u64,
     /// Current total bytes used
     current_bytes: u64,
     /// Contract metadata indexed by key. Eviction order is derived from each
@@ -782,6 +810,7 @@ impl<T: TimeSource> HostingCache<T> {
     pub fn new(budget_bytes: u64, time_source: T) -> Self {
         Self {
             budget_bytes,
+            max_hosted_contracts: u64::MAX,
             current_bytes: 0,
             contracts: HashMap::new(),
             access_seq: 0,
@@ -801,6 +830,17 @@ impl<T: TimeSource> HostingCache<T> {
     fn next_seq(&mut self) -> u64 {
         self.access_seq = self.access_seq.saturating_add(1);
         self.access_seq
+    }
+
+    /// Over budget on EITHER resource: state bytes past `budget_bytes`, OR
+    /// hosted-contract COUNT past `max_hosted_contracts` (the module-cache-derived
+    /// anti-thrash ceiling, #4642). `evict_over_budget` sheds until neither binds.
+    /// `max_hosted_contracts` defaults to `u64::MAX` (behaviour-preserving) until
+    /// `set_max_hosted_contracts` is called, so the count arm is inert in tests
+    /// and any node that never wires the ceiling.
+    fn over_budget(&self) -> bool {
+        self.current_bytes > self.budget_bytes
+            || self.contracts.len() as u64 > self.max_hosted_contracts
     }
 
     /// Evict contracts while the cache is over budget, choosing victims
@@ -864,7 +904,7 @@ impl<T: TimeSource> HostingCache<T> {
     where
         G: Fn(&ContractKey) -> (usize, usize),
     {
-        if self.current_bytes <= self.budget_bytes {
+        if !self.over_budget() {
             return Vec::new();
         }
 
@@ -929,8 +969,15 @@ impl<T: TimeSource> HostingCache<T> {
         let now = self.time_source.now();
         let mut evicted = Vec::new();
         for (key, local, downstream, _seq) in candidates {
-            if self.current_bytes <= self.budget_bytes {
-                break; // back under budget, stop evicting
+            if !self.over_budget() {
+                break; // back under both budgets (bytes AND count), stop evicting
+            }
+            // Cap the per-pass drain so the one-time shed when the count ceiling
+            // first binds (a node already hosting thousands of contracts) spreads
+            // across successive 60s sweeps instead of one inline cliff. A normal
+            // byte-driven insert eviction sheds 1-2, well under this cap.
+            if evicted.len() >= MAX_EVICTIONS_PER_PASS {
+                break;
             }
             if let Some(entry) = self.contracts.remove(&key) {
                 let was_in_use = local + downstream > 0;
@@ -1503,6 +1550,17 @@ impl<T: TimeSource> HostingCache<T> {
     /// `evict_over_budget` (on sweep or cache insert) enforces the new value.
     pub(crate) fn set_budget_bytes(&mut self, budget_bytes: u64) {
         self.budget_bytes = budget_bytes;
+    }
+
+    /// Set the hosted-contract COUNT ceiling (anti-recompile-thrash, #4642).
+    /// Derived from the compiled-module-cache byte budget via
+    /// [`max_hosted_for_module_budget`] so the hosted set never exceeds what the
+    /// module cache can keep hot. Like [`Self::set_budget_bytes`], O(1) and does
+    /// NOT itself evict — the next `evict_over_budget` (on sweep or cache insert)
+    /// enforces the new value, so the one-time drain when the ceiling first binds
+    /// is throttled to [`MAX_EVICTIONS_PER_PASS`] per pass.
+    pub(crate) fn set_max_hosted_contracts(&mut self, n: u64) {
+        self.max_hosted_contracts = n;
     }
 
     /// Snapshot the cache's aggregate resource gauges under a single read for
@@ -2146,6 +2204,71 @@ mod tests {
         assert_eq!(result.evicted, vec![(first, 0)]);
         assert!(cache.contains(&second));
         assert!(!cache.contains(&first));
+    }
+
+    /// Pure math: the hosted-count ceiling equals how many representative
+    /// compiled modules (~1.5 MiB) fit in a given module-cache byte budget, so
+    /// hosting never permits more contracts than the module cache can keep hot
+    /// (anti-recompile-thrash, #4642). `.max(1)` guards a degenerate zero budget.
+    #[test]
+    fn max_hosted_for_module_budget_maps_module_capacity_to_count() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(max_hosted_for_module_budget(1536 * MIB), 1024);
+        assert_eq!(max_hosted_for_module_budget(64 * MIB), 42);
+        assert_eq!(max_hosted_for_module_budget(768 * MIB), 512);
+        assert_eq!(max_hosted_for_module_budget(0), 1);
+    }
+
+    /// With a byte budget so large it never binds, the COUNT ceiling drives
+    /// eviction: inserting 5 zero-subscriber contracts under a ceiling of 2
+    /// drains the resident set to 2, keeping the 2 most-recently-accessed
+    /// (`victim_order`'s recency tiebreak among equal-subscriber entries).
+    #[test]
+    fn count_ceiling_sheds_to_max_hosted_keeping_most_recent() {
+        let (mut cache, _time) = make_cache(u64::MAX);
+        cache.set_max_hosted_contracts(2);
+
+        let keys: Vec<_> = (1..=5).map(make_key).collect();
+        for key in &keys {
+            cache.record_access(*key, 100, AccessType::Get, 0, |_| (0, 0));
+        }
+
+        // Byte budget never bound, so only the count ceiling shed contracts.
+        assert_eq!(cache.len(), 2, "resident set drains to the count ceiling");
+        // Survivors are the 2 most-recently-accessed (keys 4 and 5); the three
+        // older ones were shed by recency among equal (zero) subscriber counts.
+        assert!(cache.contains(&keys[3]));
+        assert!(cache.contains(&keys[4]));
+        assert!(!cache.contains(&keys[0]));
+        assert!(!cache.contains(&keys[1]));
+        assert!(!cache.contains(&keys[2]));
+    }
+
+    /// The per-pass drain cap ([`MAX_EVICTIONS_PER_PASS`]) throttles the one-time
+    /// shed when the count ceiling first binds on a node already hosting far more
+    /// than the ceiling: a single sweep evicts at most `MAX_EVICTIONS_PER_PASS`,
+    /// so the overage spreads across successive 60s sweeps instead of one cliff.
+    #[test]
+    fn count_ceiling_drain_is_capped_per_pass() {
+        // Seed MAX_EVICTIONS_PER_PASS + 3 contracts under a huge byte budget with
+        // the default (u64::MAX) ceiling, so none are evicted on insert.
+        let (mut cache, _time) = make_cache(u64::MAX);
+        let total = MAX_EVICTIONS_PER_PASS + 3;
+        for seed in 0..total {
+            cache.record_access(make_key(seed as u8), 100, AccessType::Get, 0, |_| (0, 0));
+        }
+        assert_eq!(cache.len(), total);
+
+        // Bind the ceiling at 1, then sweep. One pass caps at
+        // MAX_EVICTIONS_PER_PASS evictions, leaving the remainder (> 1) resident.
+        cache.set_max_hosted_contracts(1);
+        cache.sweep_expired(|_| (0, 0), MemoryPressure::AtCapacity);
+        assert_eq!(cache.len(), total - MAX_EVICTIONS_PER_PASS);
+        assert!(cache.len() > 1, "one pass does not drain the whole overage");
+
+        // A second pass finishes the drain down to the ceiling.
+        cache.sweep_expired(|_| (0, 0), MemoryPressure::AtCapacity);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
