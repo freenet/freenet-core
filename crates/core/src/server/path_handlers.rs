@@ -3263,10 +3263,12 @@ mod tests {
             !html.contains("__freenet_user_token"),
             "non-hosted shell must not mint a per-user token; got: {html}"
         );
-        assert!(
-            !html.contains("localStorage.setItem"),
-            "non-hosted shell must not persist a per-user token; got: {html}"
-        );
+        // NB: the always-injected bridge legitimately calls `localStorage.setItem`
+        // for per-contract notification preferences (consent / snooze — see
+        // `bridge_js_notification_proxy_invariants`). That is NOT a per-user
+        // identity token, so we do not blanket-ban `setItem` here; the
+        // token-persistence guard is the absence of the token key
+        // (`__freenet_user_token`, above) and of the 2-arg bridge call (below).
         assert!(
             !html.contains(", __freenet_user_token)"),
             "non-hosted shell must not call freenetBridge with a user token"
