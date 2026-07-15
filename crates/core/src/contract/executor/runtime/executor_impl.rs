@@ -15,6 +15,36 @@ where
     S: crate::wasm_runtime::StateStorage + Send + Sync + 'static,
     <S as crate::wasm_runtime::StateStorage>::Error: Into<anyhow::Error>,
 {
+    /// Grow the summary/delta caches to cover the node's live hosted-contract count
+    /// before a summarize/delta computation, so the interest-heartbeat's full hosted
+    /// working set stays cached across cycles (no cold-module recompile). Tied to the
+    /// real count via `Ring::hosting_contracts_count()`, clamped [MIN, MAX]. O(1) when
+    /// already sized (the common case after warm-up): a count read + a compare.
+    /// `lru::resize` grows lazily (no preallocation), so memory tracks actual entries.
+    fn ensure_cache_covers_hosted_set(&mut self) {
+        use crate::contract::executor::{
+            SUMMARY_CACHE_MARGIN, SUMMARY_CACHE_MAX, SUMMARY_CACHE_MIN,
+        };
+        use std::num::NonZeroUsize;
+
+        let Some(om) = self.op_manager.as_ref() else {
+            return;
+        };
+        let hosted = om.ring.hosting_contracts_count();
+        let needed = hosted
+            .saturating_add(SUMMARY_CACHE_MARGIN)
+            .clamp(SUMMARY_CACHE_MIN, SUMMARY_CACHE_MAX)
+            .next_power_of_two()
+            .min(SUMMARY_CACHE_MAX);
+        if needed > self.summary_cache.cap().get() {
+            self.summary_cache
+                .resize(NonZeroUsize::new(needed).unwrap());
+        }
+        if needed > self.delta_cache.cap().get() {
+            self.delta_cache.resize(NonZeroUsize::new(needed).unwrap());
+        }
+    }
+
     pub(in crate::contract::executor) fn bridged_lookup_key(
         &self,
         instance_id: &ContractInstanceId,
@@ -1164,6 +1194,10 @@ where
         &mut self,
         key: ContractKey,
     ) -> Result<StateSummary<'static>, ExecutorError> {
+        // Size the caches to the live hosted set before any lookup/insert, so the
+        // interest-heartbeat's full working set stays cached across cycles.
+        self.ensure_cache_covers_hosted_set();
+
         // Fast path (the hot path on a busy node — tens/sec over MB-scale
         // states): if the state store holds a cheap change-detector hash for
         // this contract's CURRENT state AND we already have a summary cached
@@ -1243,6 +1277,10 @@ where
         key: ContractKey,
         their_summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ExecutorError> {
+        // Size the caches to the live hosted set before any lookup/insert, so the
+        // interest-heartbeat's full working set stays cached across cycles.
+        self.ensure_cache_covers_hosted_set();
+
         // Hash the peer's summary up front — it's a small digest, so this is
         // cheap (unlike the full state). Only the STATE component of the cache
         // key gets the cheap change-detector treatment below.

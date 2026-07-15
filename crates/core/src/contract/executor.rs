@@ -971,6 +971,16 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     delegate_notification_tx: Option<DelegateNotificationSender>,
 }
 
+/// Summary/delta cache is sized to the live hosted-contract count (see
+/// `ensure_cache_covers_hosted_set`) so the ~5-min interest-heartbeat summarize
+/// never recompiles a cold module — coverage tied to the real count, not a
+/// contract-size assumption. MIN keeps small/mock nodes at the historical size;
+/// MAX bounds worst-case per-worker LRU-node overhead for pathologically tiny
+/// contracts (a byte-budget can hold far more small contracts than large ones).
+pub(crate) const SUMMARY_CACHE_MIN: usize = 1024;
+pub(crate) const SUMMARY_CACHE_MARGIN: usize = 256; // contracts hosted mid-cycle
+pub(crate) const SUMMARY_CACHE_MAX: usize = 65_536;
+
 impl<R, S> Executor<R, S>
 where
     S: StateStorage + Send + Sync + 'static,
@@ -1001,8 +1011,8 @@ where
             shared_summaries: None,
             shared_client_counts: None,
             recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            summary_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
-            delta_cache: LruCache::new(NonZeroUsize::new(1024).unwrap()),
+            summary_cache: LruCache::new(NonZeroUsize::new(SUMMARY_CACHE_MIN).unwrap()),
+            delta_cache: LruCache::new(NonZeroUsize::new(SUMMARY_CACHE_MIN).unwrap()),
             delegate_notification_tx: None,
         })
     }
