@@ -30,6 +30,20 @@ const MAX_REGRESSION_POINTS: usize = 500;
 /// worst. (That stayed a documentation caveat rather than a live fault only
 /// because ~10 events/min is ~40x the observed production median of ~14-16
 /// events/hour.)
+///
+/// A SLOW estimator loses nothing by the move, which is worth stating because the
+/// opposite is the natural guess. The old tick did not refit on a timer: it called
+/// `refit_stale_estimators` -> `refit_if_stale`, which returns early unless
+/// `refit_due()` — THIS predicate — already holds. So the tick was a poll of the
+/// same condition, and an estimator that had not earned turnover was skipped by it
+/// exactly as it is skipped now. The trigger condition is unchanged; only the
+/// latency between earning a refit and performing it changed, from "up to 5
+/// minutes" to zero. Nothing that used to be refit no longer is.
+///
+/// That the timer was never the real trigger is also why dropping it costs no
+/// accuracy: drift is produced by `add_event`'s incremental fitting, so an
+/// estimator receiving no events is not drifting, and refitting it on a timer
+/// would rebuild an identical fit from identical data.
 const REFIT_STALENESS_PERCENT: usize = 10;
 
 /// EWMA smoothing factor for per-peer adjustments.
