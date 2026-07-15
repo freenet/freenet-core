@@ -993,8 +993,8 @@ pub(crate) fn summary_cache_count_target(hosted: usize) -> usize {
 ///     evicted and the entry count (with its uncounted overhead) would grow
 ///     without bound — the #4565 OOM class this budget exists to close (same
 ///     failure the closed PR #4794 fixed with its delta-cache floor). With the
-///     floor the entry COUNT is capped at `byte_budget / SUMMARY_CACHE_ENTRY_OVERHEAD_BYTES`.
-pub(crate) const SUMMARY_CACHE_ENTRY_OVERHEAD_BYTES: usize = 512;
+///     floor the entry COUNT is capped at `byte_budget / CACHE_ENTRY_OVERHEAD_BYTES`.
+pub(crate) const CACHE_ENTRY_OVERHEAD_BYTES: usize = 512;
 
 /// Fraction of "memory the node may use" that sizes the per-executor SUMMARY
 /// cache byte budget. Summaries are small digests, so a modest share holds far
@@ -1092,7 +1092,7 @@ const SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
 struct ByteBoundedLruCache<K: std::hash::Hash + Eq, V> {
     inner: LruCache<K, V>,
     /// Running sum of every resident entry's weight
-    /// (`weigh(value) + SUMMARY_CACHE_ENTRY_OVERHEAD_BYTES`). Invariant: equals
+    /// (`weigh(value) + CACHE_ENTRY_OVERHEAD_BYTES`). Invariant: equals
     /// the sum over all entries.
     total_bytes: usize,
     /// Hard eviction threshold in bytes.
@@ -1115,7 +1115,7 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
     /// Counted weight of one entry: payload length plus the per-entry structural
     /// overhead allowance (which also floors empty values above zero).
     fn entry_weight(&self, value: &V) -> usize {
-        (self.weigh)(value).saturating_add(SUMMARY_CACHE_ENTRY_OVERHEAD_BYTES)
+        (self.weigh)(value).saturating_add(CACHE_ENTRY_OVERHEAD_BYTES)
     }
 
     /// Look up a key, marking it most-recently-used on a hit.
@@ -1551,11 +1551,11 @@ mod tests {
         /// The per-entry overhead floor means even ZERO-length values count toward
         /// the budget, so an unbounded stream of distinct empty-value keys cannot
         /// accumulate without bound (the empty-delta failure PR #4794 fixed). Entry
-        /// count is capped at `byte_budget / SUMMARY_CACHE_ENTRY_OVERHEAD_BYTES`.
+        /// count is capped at `byte_budget / CACHE_ENTRY_OVERHEAD_BYTES`.
         #[test]
         fn empty_values_stay_entry_bounded() {
             // Budget for exactly 32 entries at the overhead floor.
-            let byte_budget = 32 * SUMMARY_CACHE_ENTRY_OVERHEAD_BYTES;
+            let byte_budget = 32 * CACHE_ENTRY_OVERHEAD_BYTES;
             let count_cap = NonZeroUsize::new(65_536).unwrap();
             let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
                 ByteBoundedLruCache::new(count_cap, byte_budget, vec_len);
@@ -1588,7 +1588,7 @@ mod tests {
             // Byte total must match the 4 resident entries exactly (each 8 + overhead).
             assert_eq!(
                 cache.total_bytes(),
-                4 * (8 + SUMMARY_CACHE_ENTRY_OVERHEAD_BYTES),
+                4 * (8 + CACHE_ENTRY_OVERHEAD_BYTES),
                 "byte accounting must stay exact across count-cap evictions"
             );
             // Only the 4 most-recently-inserted keys survive.
@@ -1611,7 +1611,7 @@ mod tests {
             assert_eq!(cache.len(), 1);
             assert_eq!(
                 cache.total_bytes(),
-                300 + SUMMARY_CACHE_ENTRY_OVERHEAD_BYTES,
+                300 + CACHE_ENTRY_OVERHEAD_BYTES,
                 "replace must account only the new value, not old + new"
             );
         }
@@ -1632,6 +1632,44 @@ mod tests {
                 "grow must not change byte total"
             );
             assert_eq!(cache.len(), 2, "grow must not evict");
+        }
+
+        /// The `cap <= inner.cap()` no-shrink guard in [`Self::grow`] makes a
+        /// repeated grow to the SAME cap a no-op: it returns before
+        /// `lru::resize`, so no entry is evicted and byte accounting is
+        /// untouched. Pins the guard that stops a non-monotonic (equal-cap)
+        /// caller from corrupting `total_bytes` via an un-accounted resize
+        /// eviction. An equal cap also satisfies the no-shrink `debug_assert`,
+        /// so this exercises the early return without tripping it.
+        #[test]
+        fn grow_with_equal_cap_is_noop() {
+            let count_cap = NonZeroUsize::new(4).unwrap();
+            let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
+                ByteBoundedLruCache::new(count_cap, 32 * 1024 * 1024, vec_len);
+            cache.put(1, vec![0u8; 10]);
+            cache.put(2, vec![0u8; 20]);
+            cache.put(3, vec![0u8; 30]);
+            let len_before = cache.len();
+            let bytes_before = cache.total_bytes();
+            let cap_before = cache.cap().get();
+
+            // Grow to the SAME cap the cache already has: the `cap <= inner.cap()`
+            // guard returns early (equal cap also satisfies the no-shrink
+            // debug_assert), so this is a pure no-op (no resize, hence no
+            // un-accounted eviction).
+            cache.grow(count_cap);
+
+            assert_eq!(cache.len(), len_before, "equal-cap grow must not evict");
+            assert_eq!(
+                cache.total_bytes(),
+                bytes_before,
+                "equal-cap grow must not change the byte total"
+            );
+            assert_eq!(
+                cache.cap().get(),
+                cap_before,
+                "equal-cap grow must not change the count cap"
+            );
         }
     }
 
