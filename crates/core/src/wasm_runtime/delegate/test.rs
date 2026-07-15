@@ -1118,11 +1118,14 @@ fn inbound_app_message_wires_inherited_origins_ttl_in_order() {
         .rsplit("fn inbound_app_message(")
         .next()
         .expect("inbound_app_message impl must exist");
+    // Anchor on the call, not its arguments: the map these take is injected
+    // state now (#4813), and pinning the argument list would have failed that
+    // refactor for no reason. What must not regress is that both run, in order.
     let touch = body
-        .find("touch_inherited_origin(delegate_key)")
+        .find("touch_inherited_origin(")
         .expect("inbound_app_message must refresh inherited-origin liveness (touch)");
     let prune = body
-        .find("prune_expired_inherited_origins()")
+        .find("prune_expired_inherited_origins(")
         .expect("inbound_app_message must run the inherited-origins TTL sweep (prune)");
     assert!(
         touch < prune,

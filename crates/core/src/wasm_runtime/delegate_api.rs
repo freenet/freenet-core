@@ -321,6 +321,14 @@ mod tests {
         delegate_store: super::super::delegate_store::DelegateStore,
         secret_store: SecretsStore,
         db: Storage,
+        /// This env's own per-node delegate state, standing in for what a real
+        /// node's `Runtime` owns. Private to this `TestEnv`, so a test
+        /// asserting on either one cannot observe another test's delegate
+        /// creations — the coupling that made
+        /// `test_create_delegate_non_attested_still_counts_toward_node_limit`
+        /// flaky under a parallel suite run (#4813).
+        created_delegates_count: super::super::native_api::SharedDelegateCounter,
+        inherited_origins: super::super::native_api::SharedInheritedOrigins,
     }
 
     impl TestEnv {
@@ -345,6 +353,8 @@ mod tests {
                 delegate_store,
                 secret_store,
                 db,
+                created_delegates_count: super::super::native_api::new_delegate_counter(),
+                inherited_origins: super::super::native_api::new_inherited_origins(),
             }
         }
 
@@ -397,6 +407,8 @@ mod tests {
                     depth,
                     vec![],
                     None,
+                    self.created_delegates_count.clone(),
+                    self.inherited_origins.clone(),
                 )
             }
         }
@@ -425,6 +437,8 @@ mod tests {
                     0,
                     vec![],
                     None,
+                    self.created_delegates_count.clone(),
+                    self.inherited_origins.clone(),
                 )
             }
         }
@@ -456,6 +470,8 @@ mod tests {
                     0,
                     vec![],
                     None,
+                    self.created_delegates_count.clone(),
+                    self.inherited_origins.clone(),
                 )
             }
         }
@@ -484,6 +500,8 @@ mod tests {
                     0,
                     attestations,
                     None,
+                    self.created_delegates_count.clone(),
+                    self.inherited_origins.clone(),
                 )
             }
         }
@@ -579,6 +597,8 @@ mod tests {
                 0,
                 vec![],
                 None,
+                env_holder.created_delegates_count.clone(),
+                env_holder.inherited_origins.clone(),
             )
         };
 
@@ -662,6 +682,8 @@ mod tests {
                 0,
                 vec![],
                 None,
+                env_holder.created_delegates_count.clone(),
+                env_holder.inherited_origins.clone(),
             )
         };
 
@@ -691,6 +713,8 @@ mod tests {
                 0,
                 vec![],
                 None,
+                env_holder.created_delegates_count.clone(),
+                env_holder.inherited_origins.clone(),
             )
         };
 
@@ -1387,12 +1411,11 @@ mod tests {
         assert_eq!(env.creations_this_call.get(), 2);
     }
 
-    /// Child delegate inherits parent's attested contracts in DELEGATE_INHERITED_ORIGINS.
+    /// Child delegate inherits parent's attested contracts.
     #[tokio::test]
     async fn test_create_delegate_inherits_attestations() {
-        use super::super::native_api::DELEGATE_INHERITED_ORIGINS;
-
         let mut env_holder = TestEnv::new().await;
+        let origins = env_holder.inherited_origins.clone();
 
         let contract_id = ContractInstanceId::new([42u8; 32]);
         // SAFETY: env_holder is alive for the duration of this test
@@ -1406,27 +1429,35 @@ mod tests {
             .unwrap();
 
         // Verify the child inherited the parent's attestation
-        let inherited = DELEGATE_INHERITED_ORIGINS.get(&child_key);
+        let inherited = origins.get(&child_key);
         assert!(
             inherited.is_some(),
             "child should have inherited attestations"
         );
         assert_eq!(inherited.unwrap().value().origins, vec![contract_id]);
 
-        // Cleanup
-        DELEGATE_INHERITED_ORIGINS.remove(&child_key);
+        // No cleanup: the map is this env's own and dies with `env_holder`.
+        // It used to be a process-global that this test had to hand back,
+        // and the window before it did was the #4813 flake.
     }
 
-    /// Child created by non-attested parent does NOT appear in DELEGATE_INHERITED_ORIGINS
-    /// but still counts toward the per-node limit via CREATED_DELEGATES_COUNT.
+    /// Child created by non-attested parent gets no attestation entry, but
+    /// still counts toward the per-node limit.
+    ///
+    /// Both halves read this env's own state, so neither can be moved by a
+    /// concurrent test (#4813). Note the params (`&[1]`) match those in
+    /// `test_create_delegate_inherits_attestations`, so both derive the SAME
+    /// child_key — when the attestation map was a process-global, that sibling's
+    /// entry was visible here under that shared key and failed the `is_none()`
+    /// assertion below. The keys still collide; the maps no longer do.
     #[tokio::test]
     async fn test_create_delegate_non_attested_still_counts_toward_node_limit() {
-        use super::super::native_api::{CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS};
         use std::sync::atomic::Ordering;
 
         let mut env_holder = TestEnv::new().await;
-
-        let before = CREATED_DELEGATES_COUNT.load(Ordering::Relaxed);
+        let counter = env_holder.created_delegates_count.clone();
+        let origins = env_holder.inherited_origins.clone();
+        assert_eq!(counter.load(Ordering::Relaxed), 0, "fresh env starts at 0");
 
         // SAFETY: env_holder is alive for the duration of this test
         let env = unsafe { env_holder.make_env() }; // no attestations
@@ -1440,19 +1471,178 @@ mod tests {
 
         // Should NOT be in inherited attestations (parent had none)
         assert!(
-            DELEGATE_INHERITED_ORIGINS.get(&child_key).is_none(),
+            origins.get(&child_key).is_none(),
             "non-attested parent should not create attestation entry"
         );
 
-        // But SHOULD have incremented the global counter
-        let after = CREATED_DELEGATES_COUNT.load(Ordering::Relaxed);
-        assert!(
-            after > before,
-            "global counter should increment for all creations (before={before}, after={after})"
+        // But SHOULD have counted toward the node limit. An exact count is
+        // assertable now that the counter is this env's own; the old
+        // `after > before` was a workaround for a count anything could move.
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "creation by a non-attested parent must still count toward the node limit"
         );
 
-        // Cleanup
-        CREATED_DELEGATES_COUNT.fetch_sub(1, Ordering::Relaxed);
+        // No cleanup: both live in `env_holder` and die with it.
+    }
+
+    /// A node's delegate state is per node, not per process (#4813).
+    ///
+    /// This is the property that makes the two tests above deterministic. Both
+    /// create a delegate from the same WASM with params `&[1]`, so both derive
+    /// the SAME child_key — one asserting an attestation entry EXISTS under it,
+    /// the other asserting it does NOT. While the map was a `static`, those two
+    /// assertions raced on one entry, which is the flake in #4813. Nothing stops
+    /// two tests from colliding on a key; what makes them independent is that
+    /// each node's map is its own.
+    ///
+    /// It pins the scoping itself, which is a test-isolation property, not a
+    /// production one. Both the count and the attestation map are per-*node*
+    /// state that a `static` made process-wide. No production configuration is
+    /// affected: a node is a process (one `RuntimePool` per node), and the
+    /// simulation runner cannot create delegates at all (`MockWasmRuntime`'s
+    /// `execute_delegate_request` returns "delegates not supported"). So the
+    /// only context where per-node and per-process ever diverged is this test
+    /// suite — which is exactly the flake in #4813.
+    #[tokio::test]
+    async fn test_delegate_node_state_is_per_node_not_per_process() {
+        use std::sync::atomic::Ordering;
+
+        // Two envs stand in for two nodes in one process.
+        let mut node_a = TestEnv::new().await;
+        let mut node_b = TestEnv::new().await;
+
+        let a_counter = node_a.created_delegates_count.clone();
+        let b_counter = node_b.created_delegates_count.clone();
+        let b_origins = node_b.inherited_origins.clone();
+
+        let contract_id = ContractInstanceId::new([42u8; 32]);
+        // SAFETY: both holders are alive for the duration of this test
+        let env_a = unsafe { node_a.make_env_with_attestations(vec![contract_id]) };
+        // SAFETY: node_b is alive for the duration of this test
+        let env_b = unsafe { node_b.make_env() }; // no attestations
+        let child_key = env_a
+            .create_delegate_sync(&minimal_delegate_wasm(), &[1], [0u8; 32], [0u8; 24])
+            .unwrap();
+
+        // Node B creates from the same code and params, so it derives the SAME
+        // key. The collision is real and unavoidable; what keeps the two envs
+        // independent is that each owns its map. Isolation comes from the map,
+        // not from the keys differing.
+        let b_child_key = env_b
+            .create_delegate_sync(&minimal_delegate_wasm(), &[1], [0u8; 32], [0u8; 24])
+            .unwrap();
+        assert_eq!(
+            child_key, b_child_key,
+            "identical code+params must still collide on the key"
+        );
+
+        assert_eq!(
+            a_counter.load(Ordering::Relaxed),
+            1,
+            "the creating node counts its own delegate"
+        );
+        assert_eq!(
+            b_counter.load(Ordering::Relaxed),
+            1,
+            "node B counts only its own creation, not node A's"
+        );
+        assert!(
+            b_origins.get(&child_key).is_none(),
+            "node A's attestation must not be visible to node B under the shared \
+             key — this map decides which contract a delegate message is \
+             attributed to, hence what that delegate may access"
+        );
+    }
+
+    /// Releasing a slot saturates at zero rather than wrapping.
+    ///
+    /// A delegate registered directly by an app was never counted, so an
+    /// unregister can legitimately arrive with the count already at zero.
+    #[test]
+    fn test_release_created_delegate_slot_saturates_at_zero() {
+        use super::super::native_api::{new_delegate_counter, release_created_delegate_slot};
+        use std::sync::atomic::Ordering;
+
+        let counter = new_delegate_counter();
+        assert!(
+            !release_created_delegate_slot(&counter),
+            "releasing an already-empty count releases nothing"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "releasing an already-empty count must stay at 0, not wrap to usize::MAX"
+        );
+
+        counter.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            release_created_delegate_slot(&counter),
+            "the one occupied slot is released"
+        );
+        assert!(
+            !release_created_delegate_slot(&counter),
+            "a second release finds nothing left"
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 0, "one release per slot");
+    }
+
+    /// Concurrent releases at count == 1 cannot wrap the count.
+    ///
+    /// Pool executors share one node's counter, so two unregisters can land
+    /// together. A `load`-then-`fetch_sub` pair (what this replaced) would let
+    /// both observe `1` and both subtract, wrapping to `usize::MAX` —
+    /// permanently above `MAX_CREATED_DELEGATES_PER_NODE`, which would wedge the
+    /// node into rejecting every later delegate creation.
+    /// A barrier lines the racers up on the same slot, and the round repeats,
+    /// because a wrap is a race and one round proves little. Verified to have
+    /// teeth rather than assumed: against the `load`-then-`fetch_sub` this
+    /// replaced it fails immediately on every run (6/6 at this round count),
+    /// with more than one racer claiming the slot and the count wrapping past
+    /// zero. 200 rounds is deliberate — it is the smallest count still verified
+    /// to catch that, since this suite does not need 16k more OS threads.
+    #[test]
+    fn test_release_created_delegate_slot_concurrent_releases_do_not_wrap() {
+        use super::super::native_api::{new_delegate_counter, release_created_delegate_slot};
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Barrier};
+
+        const RACERS: usize = 8;
+
+        for _ in 0..200 {
+            let counter = new_delegate_counter();
+            counter.store(1, Ordering::Relaxed);
+            // Release the racers together, so they contend for the ONE occupied
+            // slot rather than arriving spread out and finding it already empty.
+            let barrier = Arc::new(Barrier::new(RACERS));
+
+            let threads: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let counter = counter.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        release_created_delegate_slot(&counter)
+                    })
+                })
+                .collect();
+            let released = threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|&released| released)
+                .count();
+
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                0,
+                "concurrent releases must saturate at 0, never wrap"
+            );
+            assert_eq!(
+                released, 1,
+                "exactly one racer may claim the single occupied slot"
+            );
+        }
     }
 
     // These tests check the eviction rule directly. They build a small map by
@@ -1640,38 +1830,38 @@ mod tests {
     /// Runs the real `prune_expired_inherited_origins` / `touch_inherited_origin`
     /// (the functions production calls; the other tests use the `_at` variants
     /// with a hand-picked time). Checks that touching a delegate with no entry
-    /// does not create one, and that a fresh entry is kept. Uses its own keys so
-    /// it can't disturb other tests that share the global map.
+    /// does not create one, and that a fresh entry is kept. Operates on its own
+    /// map, so its keys are its own business — it used to need distinct keys to
+    /// avoid disturbing tests sharing the global map.
     #[test]
-    fn test_global_inherited_origin_wrappers_smoke() {
+    fn test_inherited_origin_wrappers_smoke() {
         use super::super::native_api::{
-            DELEGATE_INHERITED_ORIGINS, InheritedOriginsEntry, prune_expired_inherited_origins,
+            InheritedOriginsEntry, new_inherited_origins, prune_expired_inherited_origins,
             touch_inherited_origin,
         };
         use freenet_stdlib::prelude::CodeHash;
 
+        let origins = new_inherited_origins();
         let child = DelegateKey::new([0x7b; 32], CodeHash::new([0x7b; 32]));
         let absent = DelegateKey::new([0x7c; 32], CodeHash::new([0x7c; 32]));
-        DELEGATE_INHERITED_ORIGINS.insert(
+        origins.insert(
             child.clone(),
             InheritedOriginsEntry::new(vec![ContractInstanceId::new([0x7d; 32])]),
         );
 
         // touch must NOT create an entry for a delegate with no inherited origin.
-        touch_inherited_origin(&absent);
+        touch_inherited_origin(&origins, &absent);
         assert!(
-            !DELEGATE_INHERITED_ORIGINS.contains_key(&absent),
+            !origins.contains_key(&absent),
             "touch must be a no-op (never insert) for a key with no entry"
         );
 
-        // touch refreshes an existing entry; the global sweep keeps it fresh.
-        touch_inherited_origin(&child);
-        prune_expired_inherited_origins();
+        // touch refreshes an existing entry; the sweep keeps it fresh.
+        touch_inherited_origin(&origins, &child);
+        prune_expired_inherited_origins(&origins);
         assert!(
-            DELEGATE_INHERITED_ORIGINS.contains_key(&child),
-            "global prune must keep a freshly-touched entry"
+            origins.contains_key(&child),
+            "prune must keep a freshly-touched entry"
         );
-
-        DELEGATE_INHERITED_ORIGINS.remove(&child);
     }
 }

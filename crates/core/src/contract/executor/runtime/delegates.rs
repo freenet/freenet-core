@@ -172,19 +172,14 @@ impl Executor<Runtime> {
                 });
 
                 // Clean up delegate creation tracking to prevent unbounded growth
-                crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS.remove(&key);
+                self.runtime.inherited_origins.remove(&key);
 
-                // Decrement the global created-delegates counter so the slot can be reused.
-                // Only decrement if count > 0 to avoid underflow for delegates not created
-                // via the host function (e.g., registered directly by apps).
-                {
-                    use std::sync::atomic::Ordering;
-                    let count = &crate::wasm_runtime::CREATED_DELEGATES_COUNT;
-                    let prev = count.load(Ordering::Relaxed);
-                    if prev > 0 {
-                        count.fetch_sub(1, Ordering::Relaxed);
-                    }
-                }
+                // Release this node's created-delegate slot so it can be reused.
+                // Saturates at zero: delegates registered directly by apps were
+                // never counted. See `release_created_delegate_slot`.
+                crate::wasm_runtime::release_created_delegate_slot(
+                    &self.runtime.created_delegates_count,
+                );
 
                 match self.runtime.unregister_delegate(&key) {
                     Ok(_) => Ok(HostResponse::Ok),
@@ -204,7 +199,12 @@ impl Executor<Runtime> {
                 inbound,
                 params,
             } => {
-                let origin = resolve_message_origin(caller_delegate, origin_contract, &key);
+                let origin = resolve_message_origin(
+                    &self.runtime.inherited_origins,
+                    caller_delegate,
+                    origin_contract,
+                    &key,
+                );
                 match self.runtime.inbound_app_message(
                     &key,
                     &params,
@@ -259,13 +259,15 @@ impl Executor<Runtime> {
 ///    deliberately replaces (not composes with) any inherited WebApp origin.
 /// 2. `origin_contract` — set when a contract-backed web app dispatched
 ///    this request via the WebSocket API.
-/// 3. `DELEGATE_INHERITED_ORIGINS[delegate_key]` — set when a parent
-///    delegate created this delegate via `create_delegate`, inheriting its
-///    WebApp attestation.
+/// 3. `inherited_origins[delegate_key]` — set when a parent delegate created
+///    this delegate via `create_delegate`, inheriting its WebApp attestation.
 ///
 /// Extracted as a free function so the precedence rules can be unit-tested
-/// directly without standing up a full `Executor`.
+/// directly without standing up a full `Executor`. `inherited_origins` is the
+/// node's attestation map, passed in rather than reached for globally so a
+/// test's map is its own (#4813).
 fn resolve_message_origin(
+    inherited_origins: &crate::wasm_runtime::SharedInheritedOrigins,
     caller_delegate: Option<&DelegateKey>,
     origin_contract: Option<&ContractInstanceId>,
     delegate_key: &DelegateKey,
@@ -279,7 +281,7 @@ fn resolve_message_origin(
         // inbound_app_message instead, so a child that only ever gets messages
         // from other delegates (those don't reach this branch) still counts as
         // active and isn't dropped.
-        crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS
+        inherited_origins
             .get(delegate_key)
             .and_then(|entry| entry.origins.first().copied().map(MessageOrigin::WebApp))
     }
@@ -294,6 +296,17 @@ mod resolve_message_origin_tests {
         DelegateKey::new([seed; 32], CodeHash::new([seed; 32]))
     }
 
+    /// A fresh attestation map, standing in for one node's.
+    ///
+    /// Each test gets its own, so no test can see another's entries. These
+    /// tests used to share one process-global map, which forced them to pick
+    /// collision-avoiding keys and to hand back their entries before asserting
+    /// (so a panic wouldn't leak into a sibling). Neither dance is needed now,
+    /// and both are gone. See #4813.
+    fn origins() -> crate::wasm_runtime::SharedInheritedOrigins {
+        crate::wasm_runtime::new_inherited_origins()
+    }
+
     /// Caller delegate identity wins over a concurrently-supplied WebApp
     /// contract (regression for issue #3860 precedence rule).
     #[test]
@@ -302,7 +315,8 @@ mod resolve_message_origin_tests {
         let recipient = dkey(0xB2);
         let app_contract = ContractInstanceId::new([0xC3; 32]);
 
-        let origin = resolve_message_origin(Some(&caller), Some(&app_contract), &recipient);
+        let origin =
+            resolve_message_origin(&origins(), Some(&caller), Some(&app_contract), &recipient);
 
         match origin {
             Some(MessageOrigin::Delegate(k)) => assert_eq!(k, caller),
@@ -310,15 +324,14 @@ mod resolve_message_origin_tests {
         }
     }
 
-    /// With only `origin_contract` set, the receiver sees `WebApp(..)` —
-    /// the historical behavior for web-app-driven dispatch must be
-    /// preserved.
+    /// With only `origin_contract` set, the receiver sees `WebApp(..)` — the
+    /// historical behavior for web-app-driven dispatch must be preserved.
     #[test]
     fn origin_contract_alone_yields_webapp() {
         let recipient = dkey(0xB2);
         let app_contract = ContractInstanceId::new([0xC3; 32]);
 
-        let origin = resolve_message_origin(None, Some(&app_contract), &recipient);
+        let origin = resolve_message_origin(&origins(), None, Some(&app_contract), &recipient);
 
         match origin {
             Some(MessageOrigin::WebApp(id)) => assert_eq!(id, app_contract),
@@ -326,44 +339,35 @@ mod resolve_message_origin_tests {
         }
     }
 
-    /// With neither argument set and no inherited origin in the static
-    /// map, the receiver sees `None` (matches pre-#3860 behavior for
-    /// orphaned dispatches and the fall-through case for unrelated
-    /// recipients in tests).
+    /// With neither argument set and no inherited origin in the node's map, the
+    /// receiver sees `None` (matches pre-#3860 behavior for orphaned dispatches
+    /// and the fall-through case for unrelated recipients).
     #[test]
     fn no_arguments_and_no_inherited_yields_none() {
-        // Pick a recipient key with no entry in DELEGATE_INHERITED_ORIGINS.
-        // Using a randomized seed avoids collision with anything another
-        // test populated in the same process.
         let recipient = dkey(0xEE);
-        crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS.remove(&recipient);
 
-        let origin = resolve_message_origin(None, None, &recipient);
+        let origin = resolve_message_origin(&origins(), None, None, &recipient);
         assert!(origin.is_none(), "Expected None, got {origin:?}");
     }
 
-    /// Caller delegate identity also wins over an inherited WebApp origin
-    /// in `DELEGATE_INHERITED_ORIGINS`. This documents the deliberate
-    /// "inter-delegate calls revoke inherited contract access" semantics
-    /// from the `MessageOrigin::Delegate` rustdoc.
+    /// Caller delegate identity also wins over an inherited WebApp origin. This
+    /// documents the deliberate "inter-delegate calls revoke inherited contract
+    /// access" semantics from the `MessageOrigin::Delegate` rustdoc.
     #[test]
     fn caller_delegate_overrides_inherited_origin() {
         let caller = dkey(0xA1);
         let recipient = dkey(0xB3);
         let inherited_contract = ContractInstanceId::new([0xDD; 32]);
+        let origins = origins();
 
-        // Plant an inherited WebApp origin for the recipient so the
-        // fallback branch would have something to return.
-        crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS.insert(
+        // Plant an inherited WebApp origin for the recipient so the fallback
+        // branch would have something to return.
+        origins.insert(
             recipient.clone(),
             crate::wasm_runtime::InheritedOriginsEntry::new(vec![inherited_contract]),
         );
 
-        let origin = resolve_message_origin(Some(&caller), None, &recipient);
-
-        // Cleanup before assertions so a panic doesn't leak state into
-        // sibling tests sharing the same process.
-        crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS.remove(&recipient);
+        let origin = resolve_message_origin(&origins, Some(&caller), None, &recipient);
 
         match origin {
             Some(MessageOrigin::Delegate(k)) => assert_eq!(k, caller),
@@ -377,21 +381,56 @@ mod resolve_message_origin_tests {
     /// `no_arguments_and_no_inherited_yields_none`.
     #[test]
     fn inherited_origin_fallback_yields_webapp() {
-        use crate::wasm_runtime::{DELEGATE_INHERITED_ORIGINS, InheritedOriginsEntry};
+        use crate::wasm_runtime::InheritedOriginsEntry;
 
         let recipient = dkey(0xC5);
         let contract = ContractInstanceId::new([0xC6; 32]);
-        DELEGATE_INHERITED_ORIGINS.insert(
+        let origins = origins();
+        origins.insert(
             recipient.clone(),
             InheritedOriginsEntry::new(vec![contract]),
         );
 
-        let origin = resolve_message_origin(None, None, &recipient);
-        DELEGATE_INHERITED_ORIGINS.remove(&recipient);
+        let origin = resolve_message_origin(&origins, None, None, &recipient);
 
         assert!(
             matches!(origin, Some(MessageOrigin::WebApp(c)) if c == contract),
             "fallback must yield the inherited WebApp origin, got {origin:?}"
+        );
+    }
+
+    /// Two nodes' attestation maps are independent (#4813).
+    ///
+    /// A `DelegateKey` is derived from the delegate's code and params, so two
+    /// nodes running the same delegate collide on the key by construction.
+    /// While this map was a `static`, that collision meant one node's inherited
+    /// origin resolved as another's — and this map decides which contract a
+    /// delegate message is attributed to, hence what it may access.
+    #[test]
+    fn inherited_origin_does_not_leak_across_nodes() {
+        use crate::wasm_runtime::InheritedOriginsEntry;
+
+        // The same delegate key on both nodes, as identical code+params gives.
+        let recipient = dkey(0xC5);
+        let contract = ContractInstanceId::new([0xC6; 32]);
+
+        let node_a = origins();
+        let node_b = origins();
+        node_a.insert(
+            recipient.clone(),
+            InheritedOriginsEntry::new(vec![contract]),
+        );
+
+        assert!(
+            matches!(
+                resolve_message_origin(&node_a, None, None, &recipient),
+                Some(MessageOrigin::WebApp(c)) if c == contract
+            ),
+            "node A resolves its own inherited origin"
+        );
+        assert!(
+            resolve_message_origin(&node_b, None, None, &recipient).is_none(),
+            "node B must NOT resolve node A's inherited origin for the same key"
         );
     }
 }

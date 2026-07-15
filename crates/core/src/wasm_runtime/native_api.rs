@@ -111,8 +111,8 @@ pub(crate) fn prune_expired_contexts(cache: &DelegateContextCache) {
     cache.retain(|_, entry| now.duration_since(entry.last_write) < DELEGATE_CONTEXT_TTL);
 }
 
-/// One entry in [`DELEGATE_INHERITED_ORIGINS`]: a child delegate's inherited
-/// contracts plus TTL metadata.
+/// One entry in a node's [`SharedInheritedOrigins`]: a child delegate's
+/// inherited contracts plus TTL metadata.
 ///
 /// Why a TTL: the map is cleaned only on `UnregisterDelegate`, which children
 /// created via `create_delegate` rarely receive — they are spawned inside the
@@ -165,9 +165,33 @@ pub(crate) const DELEGATE_INHERITED_ORIGINS_MAX_AGE: std::time::Duration =
 /// When a delegate with an origin contract creates a child, the child inherits
 /// the same origin so it can interact with the same app context.
 /// DelegateKey (child) → inherited origins + TTL metadata.
-pub(crate) static DELEGATE_INHERITED_ORIGINS: LazyLock<
-    DashMap<DelegateKey, InheritedOriginsEntry>,
-> = LazyLock::new(DashMap::default);
+///
+/// This is injected state, not a process-global: `Runtime` owns one and
+/// `RuntimePool` clones the `Arc` into every executor, so a node's executors
+/// share one map while separate nodes in the same process each get their own.
+///
+/// Per-node is the correct scope because this map is an **authorization**
+/// input — `resolve_message_origin` reads it to decide which contract a
+/// delegate message is attributed to, which in turn decides what that delegate
+/// may access. A `DelegateKey` is derived from the delegate's code and params,
+/// so two nodes running the same delegate code necessarily collide on the key;
+/// under a `static`, one node's attestations would be visible as another's.
+///
+/// No production configuration reaches that: a node is a process (one
+/// `RuntimePool` per node), and the simulation runner cannot create delegates
+/// at all — it uses `MockWasmRuntime`, whose `execute_delegate_request` returns
+/// "delegates not supported". The scope is per-node because that is what this
+/// state is, not because a live cross-node leak depended on it.
+///
+/// What the `static` did cause is test flakiness: it made the map's contents
+/// depend on whatever else shared the process, which is what made
+/// `test_create_delegate_non_attested_still_counts_toward_node_limit` flaky
+/// (#4813).
+pub(crate) type SharedInheritedOrigins = Arc<DashMap<DelegateKey, InheritedOriginsEntry>>;
+
+pub(crate) fn new_inherited_origins() -> SharedInheritedOrigins {
+    Arc::new(DashMap::default())
+}
 
 /// Drop entries idle past `..._TTL` or older than `..._MAX_AGE`, measured
 /// against `now`. Kept separate from `prune_expired_inherited_origins` so tests
@@ -184,10 +208,10 @@ pub(crate) fn prune_inherited_origins_at(
     });
 }
 
-/// Sweep the global map. Called amortised from `inbound_app_message` (no
+/// Sweep this node's map. Called amortised from `inbound_app_message` (no
 /// background task). O(n) per call, but n ≤ `MAX_CREATED_DELEGATES_PER_NODE`.
-pub(crate) fn prune_expired_inherited_origins() {
-    prune_inherited_origins_at(&DELEGATE_INHERITED_ORIGINS, tokio::time::Instant::now());
+pub(crate) fn prune_expired_inherited_origins(map: &SharedInheritedOrigins) {
+    prune_inherited_origins_at(map, tokio::time::Instant::now());
 }
 
 /// Set one delegate's `last_access` to `now`, if it has an entry. Kept separate
@@ -208,18 +232,52 @@ pub(crate) fn touch_inherited_origin_at(
 /// calls that never read the inherited origin — so any still-alive child keeps
 /// its origin. No-op if the delegate has no entry; still bounded by the MAX_AGE
 /// cap.
-pub(crate) fn touch_inherited_origin(delegate_key: &DelegateKey) {
-    touch_inherited_origin_at(
-        &DELEGATE_INHERITED_ORIGINS,
-        delegate_key,
-        tokio::time::Instant::now(),
-    );
+pub(crate) fn touch_inherited_origin(map: &SharedInheritedOrigins, delegate_key: &DelegateKey) {
+    touch_inherited_origin_at(map, delegate_key, tokio::time::Instant::now());
 }
 
-/// Global counter of all delegates created via the `create_delegate` host function.
-/// Used to enforce `MAX_CREATED_DELEGATES_PER_NODE` regardless of attestation status.
-/// Decremented on `UnregisterDelegate` to allow reuse of slots.
-pub(crate) static CREATED_DELEGATES_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Per-node counter of all delegates created via the `create_delegate` host
+/// function. Used to enforce `MAX_CREATED_DELEGATES_PER_NODE` regardless of
+/// attestation status. Decremented on `UnregisterDelegate` to allow reuse of
+/// slots.
+///
+/// This is injected state, not a process-global: `Runtime` owns one and
+/// `RuntimePool` clones the `Arc` into every executor, so the executors of a
+/// single node share one count while separate nodes in the same process (today,
+/// only the test suite) each get their own. A `static` here would make the
+/// "per-node" limit a per-*process* limit, so concurrent tests observed each
+/// other's creations.
+///
+/// In production the two coincide — a node is a process — so this scoping is a
+/// no-op there; it is the correct shape for per-node state rather than a fix for
+/// a live production limit bug.
+pub(crate) type SharedDelegateCounter = Arc<AtomicUsize>;
+
+pub(crate) fn new_delegate_counter() -> SharedDelegateCounter {
+    Arc::new(AtomicUsize::new(0))
+}
+
+/// Release one slot from a node's created-delegate count, saturating at zero.
+///
+/// Saturating rather than wrapping is required: not every unregistered delegate
+/// was created via the `create_delegate` host function (an app can register one
+/// directly), so the count can legitimately already be zero here.
+///
+/// The load and the subtract are one atomic step. A `load`-then-`fetch_sub`
+/// pair is not equivalent: two concurrent unregisters (pool executors share
+/// this counter) could both observe `1` and both subtract, wrapping the count
+/// to `usize::MAX` — which reads as permanently over
+/// `MAX_CREATED_DELEGATES_PER_NODE` and would wedge the node into rejecting
+/// every subsequent delegate creation.
+/// Returns whether a slot was actually released — `false` means the count was
+/// already zero.
+pub(crate) fn release_created_delegate_slot(counter: &SharedDelegateCounter) -> bool {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            prev.checked_sub(1)
+        })
+        .is_ok()
+}
 
 // Thread-local tracking of the currently-executing delegate instance ID.
 // Set before a WASM process() call, cleared after. This allows the new
@@ -412,6 +470,13 @@ pub(super) struct DelegateCallEnv {
     pub(super) creations_this_call: std::cell::Cell<u32>,
     /// Origin contract IDs for this delegate (from parent or direct registration).
     origin_contracts: Vec<ContractInstanceId>,
+    /// The owning node's created-delegate count, enforcing
+    /// `MAX_CREATED_DELEGATES_PER_NODE`. See [`SharedDelegateCounter`].
+    created_delegates_count: SharedDelegateCounter,
+    /// The owning node's child-delegate attestation map, which a successful
+    /// creation extends when the parent has origins. See
+    /// [`SharedInheritedOrigins`].
+    inherited_origins: SharedInheritedOrigins,
 }
 
 // SAFETY: DelegateCallEnv is only inserted into DELEGATE_ENV immediately before
@@ -479,6 +544,8 @@ impl DelegateCallEnv {
         creation_depth: u32,
         origin_contracts: Vec<ContractInstanceId>,
         user_context: Option<UserSecretContext>,
+        created_delegates_count: SharedDelegateCounter,
+        inherited_origins: SharedInheritedOrigins,
     ) -> Self {
         Self {
             context,
@@ -493,6 +560,8 @@ impl DelegateCallEnv {
             creation_depth,
             creations_this_call: std::cell::Cell::new(0),
             origin_contracts,
+            created_delegates_count,
+            inherited_origins,
         }
     }
 
@@ -594,7 +663,26 @@ impl DelegateCallEnv {
         }
 
         // Check per-node creation limit (counts ALL created delegates, not just origin)
-        if CREATED_DELEGATES_COUNT.load(Ordering::Relaxed) >= MAX_CREATED_DELEGATES_PER_NODE {
+        //
+        // Deliberately check-then-act, unlike the decrement in
+        // `release_created_delegate_slot`, which is one atomic `fetch_update`.
+        // The asymmetry is intentional, not an oversight: the two sides have
+        // very different failure modes when a race is lost.
+        //
+        // Here, concurrent creators can all pass this check and each `fetch_add`
+        // below, overshooting by at most one per creator — bounded by the pool's
+        // executor count, against a limit of 1024, and it drains back as slots
+        // are released. On the decrement, a lost race instead wraps the count
+        // past zero to `usize::MAX`: permanently over the limit, wedging the node
+        // into rejecting every later creation. Bounded overshoot versus permanent
+        // wedge is why that side is CAS'd and this one is not.
+        //
+        // Reserving the slot here would mean releasing it again on each of the
+        // three fallible paths between this check and the `fetch_add` (oversized
+        // WASM, and the two store failures). Worth doing, but it reworks the
+        // error paths of a limit-enforcing function and belongs in its own
+        // change.
+        if self.created_delegates_count.load(Ordering::Relaxed) >= MAX_CREATED_DELEGATES_PER_NODE {
             return Err(DelegateCreateError::NodeLimitExceeded);
         }
 
@@ -634,11 +722,11 @@ impl DelegateCallEnv {
 
         // Increment per-call counter and global node counter
         self.creations_this_call.set(current + 1);
-        CREATED_DELEGATES_COUNT.fetch_add(1, Ordering::Relaxed);
+        self.created_delegates_count.fetch_add(1, Ordering::Relaxed);
 
         // Propagate app attestation to child
         if !self.origin_contracts.is_empty() {
-            DELEGATE_INHERITED_ORIGINS.insert(
+            self.inherited_origins.insert(
                 child_key.clone(),
                 InheritedOriginsEntry::new(self.origin_contracts.clone()),
             );
