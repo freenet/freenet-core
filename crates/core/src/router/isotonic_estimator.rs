@@ -360,7 +360,17 @@ impl IsotonicEstimator {
                 // drifted regression beats a panicking node.
                 //
                 // `events_since_refit` is deliberately NOT reset, so the next
-                // poll retries rather than waiting for another full turnover.
+                // `add_event` retries rather than waiting for another full
+                // turnover. Note the cadence that implies now that the refit is
+                // on the write path: a PERSISTENTLY failing fit retries (and
+                // warns) on every subsequent event, not every 5 minutes as under
+                // the old polled task. That is acceptable only because this arm
+                // is unreachable in practice — `NegativePointWithIntersectOrigin`
+                // requires `intersect_origin: true` and both constructors pass
+                // `false`. If a reachable error variant is ever added here, reset
+                // the counter or rate-limit the warn before doing so; otherwise
+                // this becomes a ~150us refit attempt plus a log line per event
+                // on the relay hot path.
                 tracing::warn!(
                     %error,
                     events = self.raw_events.len(),

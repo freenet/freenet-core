@@ -3964,7 +3964,8 @@ mod tests {
 
     /// Regression test for crash: "user-provided comparison function does not
     /// correctly implement a total order" — originally observed in the periodic
-    /// router-refresh task (now `Ring::refit_router_periodically`).
+    /// router-refresh task (`Ring::refit_router_periodically`, since deleted in
+    /// #4811; the refit now runs inline in `IsotonicEstimator::add_event`).
     ///
     /// When `mean_transfer_size` has no samples (count=0), `compute()` returns
     /// NaN (0.0/0.0). If `xfer_speed` is also 0, the division NaN/0.0 stays NaN.
