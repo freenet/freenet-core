@@ -1527,9 +1527,9 @@ mod tests {
             .unwrap();
 
         // Node B creates from the same code and params, so it derives the SAME
-        // key — the collision is real and is what the `static` map turned into a
-        // cross-node (and cross-test) leak. Isolation comes from the map, not
-        // from the keys differing.
+        // key. The collision is real and unavoidable; what keeps the two envs
+        // independent is that each owns its map. Isolation comes from the map,
+        // not from the keys differing.
         let b_child_key = env_b
             .create_delegate_sync(&minimal_delegate_wasm(), &[1], [0u8; 32], [0u8; 24])
             .unwrap();
