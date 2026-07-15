@@ -1552,42 +1552,36 @@ impl Ring {
             {
                 return;
             }
-            let history = match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
-                Ok(h) => {
-                    // Health gauge (#4440): a successful read clears the
-                    // consecutive-failure run and stamps the last-success time so
-                    // a *persistently* failing refresh (silent since the #4438
-                    // non-fatal hotfix) becomes observable on the snapshot
-                    // cadence. The read succeeded regardless of whether the
-                    // history is empty, so record success here, not below.
-                    BACKGROUND_TASK_HEALTH.record_refresh_router_success();
-                    h
-                }
-                Err(error) => {
-                    // get_router_events errors are transient and recoverable —
-                    // e.g. file-descriptor exhaustion ("os error 24") when the
-                    // AOF segment file can't be opened during a connection-churn
-                    // spike. Router refresh is a best-effort optimization, so we
-                    // keep the existing in-memory router in place and retry on
-                    // the next interval rather than killing the node. (A genuine
-                    // panic inside this task is still caught by the
-                    // BackgroundTaskMonitor — only this expected, transient read
-                    // failure is swallowed here.)
-                    //
-                    // Health gauge (#4440): bump the consecutive-failure run so
-                    // the escalation #4438 deliberately left non-fatal is at
-                    // least visible in telemetry.
-                    BACKGROUND_TASK_HEALTH.record_refresh_router_failure();
-                    tracing::error!(
-                        error = %error,
-                        "Failed to refresh routing history from event log; \
-                         keeping existing router and retrying on next interval"
-                    );
-                    continue;
-                }
-            };
-            if !history.is_empty() {
-                *router.write() = Router::new(&history);
+            // Refit the isotonic estimators in place from their own in-memory
+            // raw points. Each estimator only refits once >10% of its window has
+            // turned over, so an idle router does no work here.
+            //
+            // This deliberately does NOT re-read the event log. Until #4808 this
+            // loop did `*router.write() = Router::new(&history)`, rebuilding the
+            // whole router from disk every 5 minutes. That was destructive:
+            // `operations::record_relay_route_event` feeds the in-memory router
+            // ONLY — it never persists — so every relay-recorded event was
+            // discarded on each rebuild, giving relay events a <=5 minute
+            // half-life and resetting the model faster than it could reach
+            // `MIN_EVENTS_FOR_PREDICTION`. Observed in production as a peer's
+            // event count collapsing 29 -> 2 within one 30s window, and
+            // fleet-wide as 271,518 events lost to resets against 261,710
+            // gained (net zero accumulation).
+            //
+            // Within a session the on-disk log is a strict SUBSET of what the
+            // live router already knows (same originator events, minus every
+            // relay event), so rebuilding from it could only ever lose
+            // information. The batch-accuracy benefit that motivated the rebuild
+            // is preserved — and made complete — by refitting from `raw_points`,
+            // which holds every observation regardless of origin.
+            //
+            // Health gauge (#4440): this now marks "the refit pass ran", which is
+            // still the liveness signal the gauge exists to provide. The former
+            // fallible log read is gone, so there is no failure arm to record.
+            let refit_count = router.write().refit_stale_estimators();
+            BACKGROUND_TASK_HEALTH.record_refresh_router_success();
+            if refit_count > 0 {
+                tracing::debug!(refit_count, "Refit stale isotonic estimators");
             }
         }
     }
@@ -6273,7 +6267,7 @@ mod background_task_health_tests {
     /// Asserting against the process-global `BACKGROUND_TASK_HEALTH` after
     /// running `refresh_router` would be racy (concurrent tests share the
     /// global), so this pins the call sites in source instead — three startup
-    /// records plus two in the loop = five total.
+    /// records plus one in the loop = four total.
     #[test]
     fn refresh_router_records_health_on_startup_and_in_loop() {
         let src = include_str!("ring.rs");
@@ -6291,18 +6285,24 @@ mod background_task_health_tests {
 
         let successes = body.matches(".record_refresh_router_success()").count();
         let failures = body.matches(".record_refresh_router_failure()").count();
-        // Startup: 2 Ok arms (success) + 1 Err arm (failure). Loop: 1 Ok
-        // (success) + 1 Err (failure). Total 3 success + 2 failure.
+        // Startup: 2 Ok arms (success) + 1 Err arm (failure). Loop: 1 success
+        // per refit pass. Total 3 success + 1 failure.
+        //
+        // The loop's failure arm went away with #4808: it existed only to report
+        // a failed periodic `get_router_events` read, and the loop no longer
+        // reads the log at all (it refits in place from the estimators' own
+        // raw points). The startup read is still fallible, so its Err arm — and
+        // the gauge's reason to exist — remain.
         assert_eq!(
             successes, 3,
             "refresh_router must record a success on both startup Ok arms and \
-             the loop Ok arm (got {successes}); a dropped startup record would \
-             mask a startup-only success in the health gauge"
+             the loop's refit pass (got {successes}); a dropped startup record \
+             would mask a startup-only success in the health gauge"
         );
         assert_eq!(
-            failures, 2,
-            "refresh_router must record a failure on both the startup Err arm \
-             and the loop Err arm (got {failures})"
+            failures, 1,
+            "refresh_router must record a failure on the startup Err arm (got \
+             {failures}); the loop has no fallible read since #4808"
         );
     }
 }
@@ -7927,54 +7927,55 @@ mod refresh_router_tests {
         }
     }
 
-    /// Regression test: a transient `get_router_events` error inside the
-    /// periodic refresh loop must NOT terminate the task (which, as a monitored
-    /// background task, would be node-fatal and crash-loop the gateway).
+    /// Regression for #4808, and the successor to the old
+    /// `refresh_router_survives_transient_get_router_events_error`.
     ///
-    /// The mock fails the startup load plus the first few periodic ticks, then
-    /// succeeds. We assert the loop kept polling past the errors (call count >
-    /// the number of injected failures) AND eventually recovered by loading the
-    /// history — both impossible if the error arm had `return`ed.
+    /// Two invariants, both of which the pre-#4808 loop violated:
+    ///
+    /// 1. **The periodic loop must NEVER re-read the event log.** It used to,
+    ///    doing `*router.write() = Router::new(&history)` every 5 minutes.
+    ///    Relay hops never persist (`operations::record_relay_route_event` feeds
+    ///    the in-memory router only), so each rebuild silently discarded every
+    ///    relay-learned event — resetting the model faster than it could reach
+    ///    `MIN_EVENTS_FOR_PREDICTION`. The log is a strict SUBSET of what the
+    ///    live router knows, so reloading it can only lose information. Asserting
+    ///    the read happens exactly ONCE (the startup load) is the tripwire: if
+    ///    anyone re-introduces a periodic disk rebuild, this fails.
+    /// 2. **A transient read error must not terminate the task** — as a monitored
+    ///    background task, returning would be node-fatal and crash-loop the
+    ///    gateway. The mock fails the startup read; the loop must still run.
     #[tokio::test(start_paused = true)]
-    async fn refresh_router_survives_transient_get_router_events_error() {
+    async fn refresh_router_never_reloads_from_disk_after_startup() {
         let events = make_route_events(100);
         let calls = Arc::new(AtomicUsize::new(0));
-        // Fail the startup load (call 0) and the first 3 periodic ticks
-        // (calls 1..=3), then succeed from call 4 onward.
+        // Fail the startup load only; nothing after it should read at all.
         let register = FlakyRegister {
             events: events.clone(),
-            fail_first: 4,
+            fail_first: 1,
             calls: calls.clone(),
         };
         let router = Arc::new(RwLock::new(Router::new(&[])));
 
-        // The periodic loop ticks every 5 minutes; under start_paused the
-        // timeout auto-advances virtual time, so ~40 min covers >5 ticks and
-        // lets the loop poll well past the injected failures and recover.
-        tokio::time::timeout(
+        // The loop ticks every 5 minutes; under start_paused the timeout
+        // auto-advances virtual time, so ~40 min covers >5 ticks.
+        let outcome = tokio::time::timeout(
             Duration::from_secs(60 * 40),
             super::Ring::refresh_router(router.clone(), register, CancellationToken::new()),
         )
-        .await
-        .ok(); // timeout is expected — the loop runs forever when healthy
+        .await;
 
-        // The loop must have kept polling past every injected failure rather
-        // than returning on the first Err.
-        let total_calls = calls.load(Ordering::SeqCst);
         assert!(
-            total_calls > 4,
-            "refresh loop should keep polling past transient errors, but only \
-             called get_router_events {total_calls} times (<= the 4 injected failures), \
-             implying it returned/died instead of retrying"
+            outcome.is_err(),
+            "refresh_router must keep looping (a timeout is the healthy outcome); \
+             it returned instead, which for a monitored task is node-fatal"
         );
 
-        // And it must have recovered: once get_router_events started succeeding,
-        // the router got populated from the historical events.
-        let snapshot = router.read().snapshot();
+        let total_calls = calls.load(Ordering::SeqCst);
         assert_eq!(
-            snapshot.success_events, 100,
-            "router should have recovered and loaded history after the transient \
-             errors cleared"
+            total_calls, 1,
+            "the event log must be read exactly once (startup) and NEVER again: \
+             the periodic rebuild from disk discarded every relay-recorded event \
+             (#4808). Got {total_calls} reads across >5 ticks"
         );
     }
 

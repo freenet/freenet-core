@@ -917,6 +917,47 @@ impl Router {
         }
     }
 
+    /// Refit every isotonic estimator whose data window has turned over enough to
+    /// warrant it (see [`IsotonicEstimator::refit_if_stale`]), returning how many
+    /// were refit.
+    ///
+    /// `add_event` maintains each fit incrementally, which is an approximation of
+    /// the batch pool-adjacent-violators result. This restores the exact fit
+    /// without discarding anything: it rebuilds from each estimator's own
+    /// in-memory `raw_points`, which already holds every observation the router
+    /// has seen — originator and relay hop alike.
+    ///
+    /// This REPLACES the previous approach of rebuilding the whole `Router` from
+    /// the on-disk event log, which lost every relay-recorded event because
+    /// `operations::record_relay_route_event` never persists (issue #4808).
+    pub(crate) fn refit_stale_estimators(&mut self) -> usize {
+        let mut refit_count = 0;
+
+        for estimator in [
+            &mut self.response_start_time_estimator,
+            &mut self.transfer_rate_estimator,
+            &mut self.failure_estimator,
+        ] {
+            if estimator.refit_if_stale() {
+                refit_count += 1;
+            }
+        }
+
+        for per_op in [
+            &mut self.per_op_failure,
+            &mut self.per_op_response_time,
+            &mut self.per_op_transfer_rate,
+        ] {
+            for estimator in per_op.values_mut() {
+                if estimator.refit_if_stale() {
+                    refit_count += 1;
+                }
+            }
+        }
+
+        refit_count
+    }
+
     fn select_closest_peers<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
@@ -1523,6 +1564,81 @@ mod tests {
     use crate::ring::Distance;
 
     use super::*;
+
+    /// Feed `count` timed GET successes straight into the in-memory router, which
+    /// is exactly what `operations::record_relay_route_event` does on a relay hop:
+    /// `add_event` only, never persisted to the event log.
+    fn add_relay_recorded_successes(router: &mut Router, count: usize) {
+        for _ in 0..count {
+            router.add_event(RouteEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                outcome: RouteOutcome::Success {
+                    time_to_response_start: Duration::from_millis(100),
+                    payload_size: 5000,
+                    payload_transfer_time: Duration::from_millis(50),
+                },
+                op_type: Some(OpType::Get),
+            });
+        }
+    }
+
+    #[test]
+    fn refit_stale_estimators_preserves_relay_recorded_events() {
+        // REGRESSION (#4808). The periodic router refresh used to rebuild the whole
+        // router from the on-disk event log:
+        //
+        //     if !history.is_empty() { *router.write() = Router::new(&history); }
+        //
+        // Relay hops never persist (`record_relay_route_event` feeds the in-memory
+        // router only), so every relay-recorded event was silently discarded on
+        // each pass. In production a peer's event count collapsed 29 -> 2 inside a
+        // single 30s window, and prediction could never latch because the model was
+        // reset faster than it reached MIN_EVENTS_FOR_PREDICTION.
+        //
+        // The refresh now refits in place from each estimator's own `raw_points`.
+        // This test pins the invariant that made the old code wrong: a refresh pass
+        // must never lose an observation the router already has.
+        let mut router = Router::new(&[]);
+        add_relay_recorded_successes(&mut router, 120);
+
+        let events_before = router.failure_estimator.len();
+        assert!(
+            router.has_sufficient_routing_events(),
+            "sanity: 120 relay events must clear the prediction gate before the refit"
+        );
+
+        let refit_count = router.refit_stale_estimators();
+        assert!(
+            refit_count > 0,
+            "120 events into a fresh router is well past the staleness trigger"
+        );
+
+        assert_eq!(
+            router.failure_estimator.len(),
+            events_before,
+            "a refresh pass must preserve relay-recorded events, not discard them"
+        );
+        assert!(
+            router.has_sufficient_routing_events(),
+            "prediction must stay active across a refresh; the old rebuild switched \
+             it off by resetting the model to the on-disk (originator-only) subset"
+        );
+    }
+
+    #[test]
+    fn refit_stale_estimators_is_idempotent_and_cheap_when_idle() {
+        // An idle router must do no refit work: the trigger is data turnover, not
+        // wall-clock, so a quiet node's 5-minute tick is a no-op.
+        let mut router = Router::new(&[]);
+        add_relay_recorded_successes(&mut router, 120);
+        assert!(router.refit_stale_estimators() > 0, "first pass refits");
+        assert_eq!(
+            router.refit_stale_estimators(),
+            0,
+            "a second pass with no new events must refit nothing"
+        );
+    }
 
     #[test]
     fn estimators_use_intended_adjustment_modes() {
