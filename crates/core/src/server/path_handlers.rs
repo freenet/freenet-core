@@ -3307,6 +3307,54 @@ mod tests {
         );
     }
 
+    /// freenet/river#408: the browser-notification proxy carries several
+    /// security-relevant invariants (a sandboxed contract app hands notifications
+    /// to the real-origin shell over the postMessage bridge). Pin them by source
+    /// so a refactor can't silently drop them — same discipline as the other
+    /// `SHELL_BRIDGE_JS.contains` guards above.
+    #[test]
+    fn bridge_js_notification_proxy_invariants() {
+        // Consent key is derived ONLY from the trusted server-routed path, never
+        // from message content, and matches BOTH API versions so a v2 load isn't
+        // stranded (permission granted but every notification silently dropped).
+        assert!(
+            SHELL_BRIDGE_JS.contains(r"/\/v[12]\/contract\/web\/([^/?#]+)/"),
+            "notification consent key must derive from the /v[12]/contract/web/<key> path"
+        );
+        // Every notification is gated on BOTH the browser permission AND this
+        // contract's own consent, so one contract's gateway-wide browser grant
+        // can't notify the user on behalf of a different contract.
+        assert!(
+            SHELL_BRIDGE_JS
+                .contains("Notification.permission !== 'granted' || !contractHasConsent()"),
+            "showAppNotification must gate on browser permission AND per-contract consent"
+        );
+        // "Not now" must be durable so a contract that re-sends the enable prompt
+        // can't re-pin the host-owned bar over the app.
+        assert!(
+            SHELL_BRIDGE_JS.contains("isNotifySnoozed()")
+                && SHELL_BRIDGE_JS.contains("setNotifySnoozed()"),
+            "notification dismissal must be enforced via the snooze guard"
+        );
+        // Notifications pass a rate limiter (per-tag + rolling global cap) so a
+        // consented contract can't flood the user with OS notifications.
+        assert!(
+            SHELL_BRIDGE_JS.contains("notifyRateOk("),
+            "notifications must pass the per-tag + global rate limiter"
+        );
+        // Attacker-controlled notification text is length-capped (text-only).
+        assert!(
+            SHELL_BRIDGE_JS.contains("String(msg.title).slice(0, 128)"),
+            "notification title must be length-capped"
+        );
+        // The permission prompt is only fired from a real click on the shell
+        // affordance (transient activation must come from the shell frame).
+        assert!(
+            SHELL_BRIDGE_JS.contains("Notification.requestPermission(done)"),
+            "permission prompt must be requested from the shell affordance click"
+        );
+    }
+
     /// REFUSE-PLAINTEXT-TOKEN, client side (Codex review, #4513): the durable
     /// per-user token is a high-value bearer secret and must never cross a
     /// plaintext wire. Two INDEPENDENT guards enforce this so a refactor of
