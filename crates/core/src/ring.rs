@@ -488,7 +488,7 @@ impl Ring {
     /// Max hops to be performed for certain operations (e.g. propagating connection of a peer in the network).
     pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
-    pub fn new<ER: NetEventRegister + Clone>(
+    pub fn new<ER: NetEventRegister>(
         config: &NodeConfig,
         event_loop_notifier: EventLoopNotificationsSender,
         event_register: ER,
@@ -505,18 +505,19 @@ impl Ring {
         };
 
         // Single shutdown signal for every long-lived background task spawned
-        // below. Created up front so `refresh_router` (spawned before the
-        // `Ring` struct literal exists) shares the same token that gets moved
+        // below. Created up front so `refit_router_periodically` (spawned before
+        // the `Ring` struct literal exists) shares the same token that gets moved
         // into the struct. See issue #4278.
         let shutdown = CancellationToken::new();
 
+        // Starts cold and learns from this session only — there is no warm start
+        // from the event log (see `refit_router_periodically`).
         let router = Arc::new(RwLock::new(Router::new(&[])));
         crate::node::network_status::set_router(router.clone());
         task_monitor.register(
-            "refresh_router",
-            GlobalExecutor::spawn(Self::refresh_router(
+            "refit_router_periodically",
+            GlobalExecutor::spawn(Self::refit_router_periodically(
                 router.clone(),
-                event_register.clone(),
                 shutdown.clone(),
             )),
         );
@@ -1504,48 +1505,46 @@ impl Ring {
         self.event_register.register_events(events).await;
     }
 
-    /// Maximum number of route events to load from the AOF event log on startup.
-    /// Caps memory use while retaining enough history for the isotonic estimators
-    /// to converge.
+    /// Periodically refit the router's isotonic estimators in place, from their
+    /// own in-memory raw events. Never reads the event log — see the loop body.
     ///
-    /// Startup only: since #4808 the periodic loop no longer reads the event log
-    /// (it refits in place from each estimator's own in-memory window), so this is
-    /// consulted exactly once per process.
-    const ROUTER_HISTORY_LIMIT: usize = 10_000;
-
-    async fn refresh_router<ER: NetEventRegister>(
-        router: Arc<RwLock<Router>>,
-        register: ER,
-        shutdown: CancellationToken,
-    ) {
-        // Load routing history immediately on startup so the router doesn't
-        // start cold — without this, peers route suboptimally for ~5 minutes
-        // until the first periodic refresh.
-        //
-        // Health gauge (#4440): the startup read is recorded too, with the same
-        // semantics as the periodic loop (any Ok read = success, empty or not).
-        // Without this, a node whose startup read succeeds but whose every later
-        // periodic refresh fails would report `last_success_age_secs == null`
-        // forever — masking that it did succeed once.
-        match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
-            Ok(history) if !history.is_empty() => {
-                BACKGROUND_TASK_HEALTH.record_refresh_router_success();
-                tracing::info!(
-                    events = history.len(),
-                    "Restored routing history from event log"
-                );
-                *router.write() = Router::new(&history);
-            }
-            Ok(_) => {
-                BACKGROUND_TASK_HEALTH.record_refresh_router_success();
-                tracing::debug!("No routing history to restore on startup");
-            }
-            Err(error) => {
-                BACKGROUND_TASK_HEALTH.record_refresh_router_failure();
-                tracing::warn!(%error, "Failed to load routing history on startup, starting cold");
-            }
-        }
-
+    /// The node starts with a cold router (`Router::new(&[])`) and learns purely
+    /// from this session's observations. There is deliberately no warm start from
+    /// the on-disk event log, and the reader that used to attempt one was deleted
+    /// (#4808 follow-up). Three reasons it is not worth resurrecting:
+    ///
+    /// 1. **It effectively never fired in production.** The restore read filtered
+    ///    records to `record_ts >= NEW_RECORDS_TS`. `NEW_RECORDS_TS` is a
+    ///    *process-global* `OnceLock` (`tracing::register`), stamped
+    ///    `SystemTime::now()` at the FIRST event-register construction in the
+    ///    process — `EventRegister::new`, or `OTEventRegister::new` under
+    ///    `trace-ot`. A production node builds its register (`node.rs`) before it
+    ///    can write a single route event and before `OpManager::new` -> `Ring::new`
+    ///    spawns this task, so the cutoff was always >= that process's start and
+    ///    every prior-session record was discarded. Dead since #3672 (2026-03-27).
+    ///
+    ///    Note the invariant is "effectively never in production", NOT "structurally
+    ///    unreachable" — do not tighten this claim. Two ways the branch can be
+    ///    reached: both sides truncate to whole seconds, so a prior-session record
+    ///    written in the same wall-clock second as the stamp passes; and an
+    ///    in-process multi-node test that shares one `data_dir` (see
+    ///    `tests/in_process_restart.rs`) makes the second node's `get_or_init` a
+    ///    no-op, so it would read the first node's records. Neither happens on a
+    ///    real node. Corroborated in production: across 8 gateway startups captured
+    ///    in vega's retained logs, the INFO "Restored routing history from event
+    ///    log" line and its WARN error arm each appear ZERO times, while ~141k
+    ///    other INFO lines from `freenet::ring` are captured — i.e. the read always
+    ///    returned `Ok(empty)`, exactly as the filter predicts.
+    /// 2. **Half of the state is meaningless across a restart anyway.** The
+    ///    per-peer `peer_adjustments` are keyed to a neighbour set that CONNECT
+    ///    rebuilds differently on every start.
+    /// 3. **A partial restore is what caused #4808.** Reloading a log that holds
+    ///    only originator events (relay hops never persist) discards everything
+    ///    the live router learned by relaying.
+    ///
+    /// The cost of starting cold is bounded: post-#4809 a peer reaches
+    /// `MIN_EVENTS_FOR_PREDICTION` in a few hours at observed event rates.
+    async fn refit_router_periodically(router: Arc<RwLock<Router>>, shutdown: CancellationToken) {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
         interval.tick().await;
         loop {
@@ -1557,7 +1556,7 @@ impl Ring {
                 return;
             }
             // Refit the isotonic estimators in place from their own in-memory
-            // raw points. Each estimator only refits once >10% of its window has
+            // raw events. Each estimator only refits once >10% of its window has
             // turned over, so an idle router does no work here.
             //
             // This deliberately does NOT re-read the event log. Until #4808 this
@@ -1576,14 +1575,18 @@ impl Ring {
             // live router already knows (same originator events, minus every
             // relay event), so rebuilding from it could only ever lose
             // information. The batch-accuracy benefit that motivated the rebuild
-            // is preserved — and made complete — by refitting from `raw_points`,
+            // is preserved — and made complete — by refitting from `raw_events`,
             // which holds every observation regardless of origin.
             //
-            // Health gauge (#4440): this now marks "the refit pass ran", which is
-            // still the liveness signal the gauge exists to provide. The former
-            // fallible log read is gone, so there is no failure arm to record.
+            // Liveness (#4440): the task now has no fallible step, so there is no
+            // failure arm to record (the `consecutive_failures` gauge went with the
+            // startup read that was its only failure source). The success stamp
+            // stays as a pure heartbeat: `BackgroundTaskMonitor` only watches for
+            // task *death*, so a loop that is alive but starved — deadlocked on
+            // `router.write()`, or never scheduled — is invisible to it and shows
+            // up only as a rising `last_success_age_secs`.
             let refit_count = router.write().refit_stale_estimators();
-            BACKGROUND_TASK_HEALTH.record_refresh_router_success();
+            BACKGROUND_TASK_HEALTH.record_refit_router_success();
             if refit_count > 0 {
                 tracing::debug!(refit_count, "Refit stale isotonic estimators");
             }
@@ -1932,11 +1935,13 @@ impl Ring {
             snapshot.broadcast_stream_failures_last_snapshot =
                 Some(broadcast_stream_failures_delta);
 
-            // Background-task health gauges (#4440): make a persistently-failing
-            // (but non-fatal, post-#4438) `refresh_router` observable.
-            let rr_health = BACKGROUND_TASK_HEALTH.refresh_router_snapshot();
-            snapshot.refresh_router_last_success_age_secs = rr_health.last_success_age_secs;
-            snapshot.refresh_router_consecutive_failures = Some(rr_health.consecutive_failures);
+            // Liveness heartbeat (#4440) for the periodic refit task. The
+            // `BackgroundTaskMonitor` catches it dying; this catches it being
+            // alive but starved. Its companion `consecutive_failures` gauge went
+            // with the startup restore that was its only failure source (#4808
+            // follow-up).
+            let refit_router_age = BACKGROUND_TASK_HEALTH.refit_router_last_success_age_secs();
+            snapshot.refresh_router_last_success_age_secs = refit_router_age;
 
             // Placement-quality gauge (#4404 follow-up): host-to-hosted-key
             // ring-distance distribution. If the SubscribeHint placement
@@ -2007,8 +2012,7 @@ impl Ring {
                 broadcast_stream_attempts_total = bs.streaming_attempts_total,
                 broadcast_stream_failures_total = bs.streaming_failures_total,
                 broadcast_stream_failures_last_snapshot = broadcast_stream_failures_delta,
-                refresh_router_last_success_age_secs = ?rr_health.last_success_age_secs,
-                refresh_router_consecutive_failures = rr_health.consecutive_failures,
+                refresh_router_last_success_age_secs = ?refit_router_age,
                 hosted_contracts_count = ?snapshot.hosted_contracts_count,
                 hosted_key_distance_median = ?snapshot.hosted_key_distance_median,
                 hosted_key_distance_p90 = ?snapshot.hosted_key_distance_p90,
@@ -6024,34 +6028,37 @@ fn window_delta(current_total: u64, prev_total: &mut u64) -> u64 {
     delta
 }
 
-/// Process-global health gauges for monitored background tasks (#4440).
+/// Process-global liveness heartbeat for the periodic router-refit task (#4440).
 ///
-/// A task that the [`BackgroundTaskMonitor`](crate::node::background_task_monitor)
-/// only watches for *death* can still run for hours while every individual run
-/// fails — `refresh_router`'s `get_router_events` errors were made non-fatal by
-/// the v0.2.74 #4438 hotfix (a transient fd-exhaustion read failure must not
-/// kill the node), so a *persistent* failure is now completely silent. This
-/// records, per monitored task, the time of the last successful run and the
-/// current run of consecutive failures, so the snapshot task can emit
-/// `last_success_age` / `consecutive_failures` gauges on the existing
-/// `router_snapshot` cadence (partially addresses #4440 item (a)).
+/// The [`BackgroundTaskMonitor`](crate::node::background_task_monitor) watches
+/// monitored tasks for *death* only. A task that is alive but starved — blocked
+/// forever on `router.write()`, or simply never scheduled — looks identical to a
+/// healthy one from the monitor's perspective. This records the time of the last
+/// completed pass so the snapshot task can emit a `last_success_age` gauge on the
+/// existing `router_snapshot` cadence, turning "alive but doing nothing" into a
+/// visible, rising number (partially addresses #4440 item (a)).
 ///
-/// The task *publishes* (`record_success` / `record_failure`) and the `Ring`
-/// snapshot task *reads* (`refresh_router`), mirroring `BROADCAST_STREAM_METRICS`
-/// (and the module-cache metrics, which were a sibling process-global until
-/// #4488 threaded them as a per-node `Arc`). Currently scoped to
-/// `refresh_router`, the one monitored task with a non-fatal per-run failure
-/// mode; add fields here if another monitored task grows the same pattern.
+/// The task *publishes* (`record_refit_router_success`) and the `Ring` snapshot
+/// task *reads*, mirroring `BROADCAST_STREAM_METRICS` (and the module-cache
+/// metrics, which were a sibling process-global until #4488 threaded them as a
+/// per-node `Arc`).
+///
+/// This used to also carry a `consecutive_failures` counter per task. That gauge
+/// was removed in the #4808 follow-up: it existed to surface a *non-fatal*
+/// `get_router_events` read failure (#4438 made the read non-fatal, which made a
+/// persistent failure silent), and deleting the startup restore removed the last
+/// fallible call in the task. With no failure source left, the counter was pinned
+/// at 0 forever. What remains is a pure heartbeat, so there is deliberately no
+/// failure arm to record.
 ///
 /// Per-node meaning holds only in single-node-per-process production. In a
-/// multi-node simulation every node's `refresh_router` shares this
-/// process-global, so the snapshot reads the aggregate (last-write-wins
-/// last-success across nodes; the consecutive-failure run is shared) — the same
+/// multi-node simulation every node's refit task shares this process-global, so
+/// the snapshot reads the aggregate (last-write-wins across nodes) — the same
 /// caveat that drove #4488 for the module-cache metrics.
 static BACKGROUND_TASK_HEALTH: std::sync::LazyLock<BackgroundTaskHealth> =
     std::sync::LazyLock::new(BackgroundTaskHealth::new);
 
-/// Monotonic process clock for the background-task health gauges. `tokio::time`
+/// Monotonic process clock for the background-task health gauge. `tokio::time`
 /// so the age respects `start_paused(true)` virtual time under simulation
 /// (a `std::time::Instant` would advance in real wall-clock and break
 /// deterministic tests). Sampled at publish time and at snapshot read time; the
@@ -6059,92 +6066,62 @@ static BACKGROUND_TASK_HEALTH: std::sync::LazyLock<BackgroundTaskHealth> =
 static BACKGROUND_TASK_HEALTH_EPOCH: std::sync::LazyLock<Instant> =
     std::sync::LazyLock::new(Instant::now);
 
-/// Health gauges for one monitored background task. See [`BACKGROUND_TASK_HEALTH`].
+/// Liveness heartbeat for one monitored background task. See
+/// [`BACKGROUND_TASK_HEALTH`].
 struct TaskHealth {
-    /// Millis-since-[`BACKGROUND_TASK_HEALTH_EPOCH`] of the last successful run,
-    /// or [`NO_SUCCESS`](Self::NO_SUCCESS) if the task has never succeeded.
+    /// Millis-since-[`BACKGROUND_TASK_HEALTH_EPOCH`] of the last completed pass,
+    /// or [`NO_SUCCESS`](Self::NO_SUCCESS) if the task has never completed one.
     last_success_millis: AtomicU64,
-    /// Consecutive failures since the last success (reset to 0 on success).
-    consecutive_failures: AtomicU64,
 }
 
 impl TaskHealth {
-    /// Sentinel for "no successful run yet". `u64::MAX` millis is ~584 million
+    /// Sentinel for "no completed pass yet". `u64::MAX` millis is ~584 million
     /// years of uptime, so it can never collide with a real elapsed value.
     const NO_SUCCESS: u64 = u64::MAX;
 
     const fn new() -> Self {
         Self {
             last_success_millis: AtomicU64::new(Self::NO_SUCCESS),
-            consecutive_failures: AtomicU64::new(0),
         }
     }
 }
 
-/// Per-task background-task health, currently just `refresh_router`. See
+/// Per-task background-task health, currently just the router-refit task. See
 /// [`BACKGROUND_TASK_HEALTH`].
 struct BackgroundTaskHealth {
-    refresh_router: TaskHealth,
-}
-
-/// A point-in-time read of one task's health for telemetry emission.
-#[derive(Debug, Clone, Copy)]
-struct TaskHealthSnapshot {
-    /// Seconds since the last successful run, or `None` if it never succeeded.
-    last_success_age_secs: Option<u64>,
-    /// Consecutive failures since the last success.
-    consecutive_failures: u64,
+    refit_router: TaskHealth,
 }
 
 impl BackgroundTaskHealth {
     fn new() -> Self {
         Self {
-            refresh_router: TaskHealth::new(),
+            refit_router: TaskHealth::new(),
         }
     }
 
-    /// Record a successful run of `refresh_router`: stamp the last-success time
-    /// and clear the consecutive-failure run. Cheap `Relaxed` atomics.
-    fn record_refresh_router_success(&self) {
+    /// Record a completed pass of `Ring::refit_router_periodically`: stamp the
+    /// last-success time. Cheap `Relaxed` atomic.
+    fn record_refit_router_success(&self) {
         let elapsed_millis = BACKGROUND_TASK_HEALTH_EPOCH.elapsed().as_millis() as u64;
-        self.refresh_router
+        self.refit_router
             .last_success_millis
             .store(elapsed_millis, std::sync::atomic::Ordering::Relaxed);
-        self.refresh_router
-            .consecutive_failures
-            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Record a failed run of `refresh_router` (transient `get_router_events`
-    /// error). Bumps the consecutive-failure run; does not touch last-success.
-    fn record_refresh_router_failure(&self) {
-        self.refresh_router
-            .consecutive_failures
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Read `refresh_router`'s health for telemetry.
-    fn refresh_router_snapshot(&self) -> TaskHealthSnapshot {
+    /// Seconds since the refit task's last completed pass, or `None` if it has
+    /// never completed one.
+    fn refit_router_last_success_age_secs(&self) -> Option<u64> {
         let last_success_millis = self
-            .refresh_router
+            .refit_router
             .last_success_millis
             .load(std::sync::atomic::Ordering::Relaxed);
-        let consecutive_failures = self
-            .refresh_router
-            .consecutive_failures
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let last_success_age_secs = if last_success_millis == TaskHealth::NO_SUCCESS {
-            None
-        } else {
-            // saturating: if the clock and the stored stamp disagree (they
-            // shouldn't — same monotonic source), never underflow to a huge age.
-            let now_millis = BACKGROUND_TASK_HEALTH_EPOCH.elapsed().as_millis() as u64;
-            Some(now_millis.saturating_sub(last_success_millis) / 1000)
-        };
-        TaskHealthSnapshot {
-            last_success_age_secs,
-            consecutive_failures,
+        if last_success_millis == TaskHealth::NO_SUCCESS {
+            return None;
         }
+        // saturating: if the clock and the stored stamp disagree (they
+        // shouldn't — same monotonic source), never underflow to a huge age.
+        let now_millis = BACKGROUND_TASK_HEALTH_EPOCH.elapsed().as_millis() as u64;
+        Some(now_millis.saturating_sub(last_success_millis) / 1_000)
     }
 }
 
@@ -6210,6 +6187,59 @@ fn read_fd_soft_limit() -> Option<u64> {
 }
 
 #[cfg(test)]
+mod background_task_health_tests {
+    //! Validates the background-task liveness heartbeat (#4440): a task that has
+    //! never completed a pass must report `None` age (not a bogus zero), and once
+    //! it has, the age must track time since that pass. Tests a LOCAL
+    //! `BackgroundTaskHealth` so they never touch the shared process-global.
+
+    use super::BackgroundTaskHealth;
+
+    /// Before any completed pass, the age is `None` (the `NO_SUCCESS` sentinel),
+    /// not a misleading age of 0 — which would read as "just ran" on a task that
+    /// has never run at all.
+    #[tokio::test(start_paused = true)]
+    async fn never_succeeded_reports_none_age() {
+        let h = BackgroundTaskHealth::new();
+        assert_eq!(
+            h.refit_router_last_success_age_secs(),
+            None,
+            "no completed pass yet => None age, never a bogus 0"
+        );
+    }
+
+    /// A completed pass stamps the time; the age starts at ~0 and grows with
+    /// virtual time. This is the whole point of the gauge: a loop that stops
+    /// refitting but stays alive shows up as a climbing age, which is invisible to
+    /// the `BackgroundTaskMonitor` death-watch.
+    #[tokio::test(start_paused = true)]
+    async fn success_stamps_age_which_grows_with_time() {
+        let h = BackgroundTaskHealth::new();
+        h.record_refit_router_success();
+        assert_eq!(
+            h.refit_router_last_success_age_secs(),
+            Some(0),
+            "age is ~0 immediately after a completed pass"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(90)).await;
+        assert_eq!(
+            h.refit_router_last_success_age_secs(),
+            Some(90),
+            "age grows with time since the last completed pass"
+        );
+
+        // A later pass re-stamps, resetting the age.
+        h.record_refit_router_success();
+        assert_eq!(
+            h.refit_router_last_success_age_secs(),
+            Some(0),
+            "a fresh pass resets the age"
+        );
+    }
+}
+
+#[cfg(test)]
 mod fd_usage_tests {
     //! Validates the node-health fd gauges (#4440): the open-fd count and the
     //! `RLIMIT_NOFILE` soft limit must report sane values on Linux so the
@@ -6229,131 +6259,6 @@ mod fd_usage_tests {
         assert!(
             soft >= open,
             "open fds ({open}) must not exceed the soft limit ({soft})"
-        );
-    }
-}
-
-#[cfg(test)]
-mod background_task_health_tests {
-    //! Validates the background-task health gauges (#4440): a persistently
-    //! failing `refresh_router` (non-fatal since the #4438 hotfix) must surface
-    //! as a rising `consecutive_failures` and a stale `last_success_age`, and a
-    //! task that has never succeeded must report `None` age (not a bogus zero).
-    //! Tests a LOCAL `BackgroundTaskHealth` so they never touch the shared
-    //! process-global.
-
-    use super::BackgroundTaskHealth;
-
-    /// Before any success, the age is `None` (the `NO_SUCCESS` sentinel), not a
-    /// misleading age of 0. Failures accumulate without touching last-success.
-    #[tokio::test(start_paused = true)]
-    async fn never_succeeded_reports_none_age_and_accumulates_failures() {
-        let h = BackgroundTaskHealth::new();
-        let s = h.refresh_router_snapshot();
-        assert_eq!(
-            s.last_success_age_secs, None,
-            "no success yet => None age, never a bogus 0"
-        );
-        assert_eq!(s.consecutive_failures, 0);
-
-        h.record_refresh_router_failure();
-        h.record_refresh_router_failure();
-        let s = h.refresh_router_snapshot();
-        assert_eq!(
-            s.last_success_age_secs, None,
-            "still never succeeded after failures"
-        );
-        assert_eq!(s.consecutive_failures, 2, "failures accumulate");
-    }
-
-    /// A success stamps the time (age starts at ~0 and grows with virtual time)
-    /// and clears the consecutive-failure run; a later failure run grows again
-    /// while the age keeps climbing from the last success.
-    #[tokio::test(start_paused = true)]
-    async fn success_resets_failures_and_stamps_age() {
-        let h = BackgroundTaskHealth::new();
-        h.record_refresh_router_failure();
-        h.record_refresh_router_failure();
-
-        h.record_refresh_router_success();
-        let s = h.refresh_router_snapshot();
-        assert_eq!(s.consecutive_failures, 0, "success clears the failure run");
-        assert_eq!(
-            s.last_success_age_secs,
-            Some(0),
-            "age is ~0 immediately after success"
-        );
-
-        // Advance virtual time; the age must reflect time since last success.
-        tokio::time::advance(std::time::Duration::from_secs(90)).await;
-        let s = h.refresh_router_snapshot();
-        assert_eq!(
-            s.last_success_age_secs,
-            Some(90),
-            "age grows with time since last success"
-        );
-
-        // A new failure run grows consecutive_failures but does NOT refresh the
-        // last-success stamp — the age keeps climbing, which is the signal that
-        // refresh is stuck.
-        h.record_refresh_router_failure();
-        tokio::time::advance(std::time::Duration::from_secs(10)).await;
-        let s = h.refresh_router_snapshot();
-        assert_eq!(s.consecutive_failures, 1);
-        assert_eq!(
-            s.last_success_age_secs,
-            Some(100),
-            "age unaffected by failures; still measured from last success"
-        );
-    }
-
-    /// Source-scrape pin: the startup read in `refresh_router` (the `match`
-    /// before the periodic loop) must record into the health gauge on every
-    /// arm, with the SAME semantics as the loop — both `Ok` arms record a
-    /// success, the `Err` arm records a failure. Without this, a node whose
-    /// startup read succeeds but whose later periodic refreshes all fail would
-    /// report `last_success_age_secs == null` forever, masking that it did
-    /// succeed once.
-    ///
-    /// Asserting against the process-global `BACKGROUND_TASK_HEALTH` after
-    /// running `refresh_router` would be racy (concurrent tests share the
-    /// global), so this pins the call sites in source instead — three startup
-    /// records plus one in the loop = four total.
-    #[test]
-    fn refresh_router_records_health_on_startup_and_in_loop() {
-        let src = include_str!("ring.rs");
-        // Restrict to the `refresh_router` fn body so unrelated mentions (this
-        // test, the rustdoc on the metrics struct) don't count. The body runs
-        // from its signature to the start of the next method.
-        let start = src
-            .find("async fn refresh_router")
-            .expect("refresh_router fn present");
-        let after = &src[start..];
-        let end = after
-            .find("async fn emit_router_snapshot_telemetry")
-            .expect("next method present");
-        let body = &after[..end];
-
-        let successes = body.matches(".record_refresh_router_success()").count();
-        let failures = body.matches(".record_refresh_router_failure()").count();
-        // Startup: 2 Ok arms (success) + 1 Err arm (failure). Loop: 1 success
-        // per refit pass. Total 3 success + 1 failure.
-        //
-        // The loop's failure arm went away with #4808: it existed only to report
-        // a failed periodic `get_router_events` read, and the loop no longer
-        // reads the log at all (it refits in place from the estimators' own
-        // raw points). The startup read is still fallible, so its Err arm — and
-        // the gauge's reason to exist — remain.
-        assert_eq!(
-            successes, 3,
-            "refresh_router must record a success on both startup Ok arms and \
-             the loop's refit pass (got {successes}); a dropped startup record \
-             would mask a startup-only success in the health gauge"
-        );
-        assert_eq!(
-            failures, 1,
-            "refresh_router must record a failure on the startup Err arm (got \
-             {failures}); the loop has no fallible read since #4808"
         );
     }
 }
@@ -7809,239 +7714,33 @@ mod op_manager_state_tests {
 }
 
 #[cfg(test)]
-mod refresh_router_tests {
+mod refit_router_tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use either::Either;
-    use futures::FutureExt;
     use parking_lot::RwLock;
     use tokio_util::sync::CancellationToken;
 
     use crate::ring::PeerKeyLocation;
     use crate::ring::location::Location;
-    use crate::router::{RouteEvent, RouteOutcome, Router};
-    use crate::tracing::{NetEventLog, NetEventRegister};
-
-    /// Mock register that returns pre-populated RouteEvents on startup.
-    #[derive(Clone)]
-    struct WarmStartRegister {
-        events: Vec<RouteEvent>,
-    }
-
-    impl NetEventRegister for WarmStartRegister {
-        fn register_events<'a>(
-            &'a self,
-            _events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
-        ) -> futures::future::BoxFuture<'a, ()> {
-            async {}.boxed()
-        }
-
-        fn notify_of_time_out(
-            &mut self,
-            _tx: crate::message::Transaction,
-            _op_type: &str,
-            _target_peer: Option<String>,
-        ) -> futures::future::BoxFuture<'_, ()> {
-            async {}.boxed()
-        }
-
-        fn trait_clone(&self) -> Box<dyn NetEventRegister> {
-            Box::new(self.clone())
-        }
-
-        fn get_router_events(
-            &self,
-            number: usize,
-        ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
-            let events = self.events.iter().take(number).cloned().collect();
-            async move { Ok(events) }.boxed()
-        }
-    }
-
-    fn make_route_events(count: usize) -> Vec<RouteEvent> {
-        (0..count)
-            .map(|_| RouteEvent {
-                peer: PeerKeyLocation::random(),
-                contract_location: Location::random(),
-                outcome: RouteOutcome::Success {
-                    time_to_response_start: Duration::from_millis(50),
-                    payload_size: 1000,
-                    payload_transfer_time: Duration::from_millis(100),
-                },
-                op_type: None,
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn refresh_router_loads_history_on_startup() {
-        let events = make_route_events(100);
-        let register = WarmStartRegister {
-            events: events.clone(),
-        };
-        let router = Arc::new(RwLock::new(Router::new(&[])));
-
-        // Verify the router starts empty
-        let snapshot = router.read().snapshot();
-        assert_eq!(snapshot.failure_events, 0);
-        assert_eq!(snapshot.success_events, 0);
-
-        // Run refresh_router with a timeout so it doesn't loop forever.
-        // The startup load happens before the interval loop, so it completes
-        // within the first few milliseconds.
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            super::Ring::refresh_router(router.clone(), register, CancellationToken::new()),
-        )
-        .await
-        .ok(); // timeout is expected — the function loops forever
-
-        // Verify the router was populated from the historical events
-        let snapshot = router.read().snapshot();
-        assert_eq!(
-            snapshot.success_events, 100,
-            "Router should have been populated with startup history"
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_router_handles_empty_history() {
-        let register = WarmStartRegister { events: vec![] };
-        let router = Arc::new(RwLock::new(Router::new(&[])));
-
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            super::Ring::refresh_router(router.clone(), register, CancellationToken::new()),
-        )
-        .await
-        .ok();
-
-        // Router should remain empty
-        let snapshot = router.read().snapshot();
-        assert_eq!(snapshot.failure_events, 0);
-        assert_eq!(snapshot.success_events, 0);
-    }
-
-    /// Mock register whose `get_router_events` fails the first `fail_first`
-    /// times it is called, then returns the configured events on every
-    /// subsequent call. Records the total call count so tests can confirm the
-    /// refresh loop keeps polling past a transient error rather than dying.
-    #[derive(Clone)]
-    struct FlakyRegister {
-        events: Vec<RouteEvent>,
-        fail_first: usize,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl NetEventRegister for FlakyRegister {
-        fn register_events<'a>(
-            &'a self,
-            _events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
-        ) -> futures::future::BoxFuture<'a, ()> {
-            async {}.boxed()
-        }
-
-        fn notify_of_time_out(
-            &mut self,
-            _tx: crate::message::Transaction,
-            _op_type: &str,
-            _target_peer: Option<String>,
-        ) -> futures::future::BoxFuture<'_, ()> {
-            async {}.boxed()
-        }
-
-        fn trait_clone(&self) -> Box<dyn NetEventRegister> {
-            Box::new(self.clone())
-        }
-
-        fn get_router_events(
-            &self,
-            number: usize,
-        ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            let fail = call < self.fail_first;
-            let events: Vec<RouteEvent> = self.events.iter().take(number).cloned().collect();
-            async move {
-                if fail {
-                    // Mimics the production failure: an AOF segment read failing
-                    // under fd exhaustion ("No file descriptors available").
-                    Err(anyhow::anyhow!(
-                        "No file descriptors available (os error 24)"
-                    ))
-                } else {
-                    Ok(events)
-                }
-            }
-            .boxed()
-        }
-    }
-
-    /// Regression for #4808, and the successor to the old
-    /// `refresh_router_survives_transient_get_router_events_error`.
-    ///
-    /// Two invariants, both of which the pre-#4808 loop violated:
-    ///
-    /// 1. **The periodic loop must NEVER re-read the event log.** It used to,
-    ///    doing `*router.write() = Router::new(&history)` every 5 minutes.
-    ///    Relay hops never persist (`operations::record_relay_route_event` feeds
-    ///    the in-memory router only), so each rebuild silently discarded every
-    ///    relay-learned event — resetting the model faster than it could reach
-    ///    `MIN_EVENTS_FOR_PREDICTION`. The log is a strict SUBSET of what the
-    ///    live router knows, so reloading it can only lose information. Asserting
-    ///    the read happens exactly ONCE (the startup load) is the tripwire: if
-    ///    anyone re-introduces a periodic disk rebuild, this fails.
-    /// 2. **A transient read error must not terminate the task** — as a monitored
-    ///    background task, returning would be node-fatal and crash-loop the
-    ///    gateway. The mock fails the startup read; the loop must still run.
-    #[tokio::test(start_paused = true)]
-    async fn refresh_router_never_reloads_from_disk_after_startup() {
-        let events = make_route_events(100);
-        let calls = Arc::new(AtomicUsize::new(0));
-        // Fail the startup load only; nothing after it should read at all.
-        let register = FlakyRegister {
-            events: events.clone(),
-            fail_first: 1,
-            calls: calls.clone(),
-        };
-        let router = Arc::new(RwLock::new(Router::new(&[])));
-
-        // The loop ticks every 5 minutes; under start_paused the timeout
-        // auto-advances virtual time, so ~40 min covers >5 ticks.
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(60 * 40),
-            super::Ring::refresh_router(router.clone(), register, CancellationToken::new()),
-        )
-        .await;
-
-        assert!(
-            outcome.is_err(),
-            "refresh_router must keep looping (a timeout is the healthy outcome); \
-             it returned instead, which for a monitored task is node-fatal"
-        );
-
-        let total_calls = calls.load(Ordering::SeqCst);
-        assert_eq!(
-            total_calls, 1,
-            "the event log must be read exactly once (startup) and NEVER again: \
-             the periodic rebuild from disk discarded every relay-recorded event \
-             (#4808). Got {total_calls} reads across >5 ticks"
-        );
-    }
+    use crate::router::Router;
 
     /// The loop must actually REFIT — nothing else pins the one line that makes
     /// #4808's fix do anything in production.
     ///
     /// Without this, deleting `router.write().refit_stale_estimators()` from
-    /// `refresh_router` leaves every other guard green: the never-reloads test
-    /// still sees its timeout and its single read, and the health-gauge scrape
-    /// still counts its call sites. This also restores the positive liveness proof
-    /// the superseded transient-error test provided via `total_calls > 4` — a bare
+    /// `refit_router_periodically` leaves every other guard green: the shutdown
+    /// test still returns promptly, and "the loop never reads the log" is a
+    /// compile-time property that holds trivially for a loop that does nothing.
+    /// This is also the only positive liveness proof in the module — a bare
     /// timeout cannot distinguish a healthy loop from one deadlocked on
     /// `router.write()` or never ticking at all.
+    ///
+    /// Ported unchanged from `refresh_router_loop_refits_stale_estimators` (added
+    /// in the #4809 review); the only edit is dropping the event-register argument,
+    /// which `refit_router_periodically` no longer takes.
     #[tokio::test(start_paused = true)]
-    async fn refresh_router_loop_refits_stale_estimators() {
+    async fn refit_router_periodically_refits_stale_estimators() {
         let router = Arc::new(RwLock::new(Router::new(&[])));
 
         // Seed past the staleness trigger so a refit is owed. These go straight
@@ -8078,11 +7777,7 @@ mod refresh_router_tests {
 
         tokio::time::timeout(
             Duration::from_secs(60 * 40),
-            super::Ring::refresh_router(
-                router.clone(),
-                WarmStartRegister { events: vec![] },
-                CancellationToken::new(),
-            ),
+            super::Ring::refit_router_periodically(router.clone(), CancellationToken::new()),
         )
         .await
         .ok(); // timeout expected — a healthy loop runs forever
@@ -8096,20 +7791,18 @@ mod refresh_router_tests {
         );
     }
 
-    /// Regression for #4278: the periodic `refresh_router` loop ticks every 5
-    /// minutes. With the shutdown token cancelled, the task must return
-    /// *promptly* (well within one tick) rather than parking on the 5-minute
-    /// `interval.tick()`. Before the fix there was no token to race against, so
-    /// the only way out of the loop was the 5-minute tick — a shutdown would
-    /// hang for up to that long.
+    /// Regression for #4278: the periodic loop ticks every 5 minutes. With the
+    /// shutdown token cancelled, the task must return *promptly* (well within one
+    /// tick) rather than parking on the 5-minute `interval.tick()`. Before the fix
+    /// there was no token to race against, so the only way out of the loop was the
+    /// 5-minute tick — a shutdown would hang for up to that long.
     ///
-    /// Uses `start_paused`: virtual time only advances when every task is idle,
-    /// so if the loop were genuinely blocked on the 5-minute tick this
-    /// `timeout` would *fire* (the test would fail on the `expect`). The fix
-    /// makes the future resolve at t≈0 because the token is already cancelled.
+    /// Uses `start_paused`: virtual time only advances when every task is idle, so
+    /// if the loop were genuinely blocked on the 5-minute tick this `timeout` would
+    /// *fire* (the test would fail on the `expect`). The fix makes the future
+    /// resolve at t≈0 because the token is already cancelled.
     #[tokio::test(start_paused = true)]
-    async fn refresh_router_returns_promptly_on_shutdown() {
-        let register = WarmStartRegister { events: vec![] };
+    async fn refit_router_periodically_returns_promptly_on_shutdown() {
         let router = Arc::new(RwLock::new(Router::new(&[])));
 
         let shutdown = CancellationToken::new();
@@ -8122,10 +7815,13 @@ mod refresh_router_tests {
         // and trip this timeout.
         tokio::time::timeout(
             Duration::from_secs(1),
-            super::Ring::refresh_router(router.clone(), register, shutdown),
+            super::Ring::refit_router_periodically(router.clone(), shutdown),
         )
         .await
-        .expect("refresh_router must return promptly once the shutdown token is cancelled");
+        .expect(
+            "refit_router_periodically must return promptly once the shutdown token \
+             is cancelled",
+        );
     }
 }
 

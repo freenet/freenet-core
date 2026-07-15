@@ -442,7 +442,8 @@ mod tests {
     /// branches, so an integration test would need a full multi-node migration to
     /// exercise them; pinning the call sites in source is the cheap, deterministic
     /// guard (same approach as
-    /// `refresh_router_records_health_on_startup_and_in_loop` in `ring.rs`).
+    /// `broadcast_to_single_peer_records_attempt_on_every_streaming_exit_pin` in
+    /// `node/network_bridge/broadcast_queue.rs`).
     #[test]
     fn migration_counter_sites_present() {
         // SEND: exactly one `record_sent()` in the migration helper module.

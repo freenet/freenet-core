@@ -18,7 +18,6 @@ use crate::{
         update::UpdateMsg,
     },
     ring::Location,
-    router::RouteEvent,
 };
 
 #[cfg(feature = "trace-ot")]
@@ -260,13 +259,6 @@ pub(super) mod test {
             _target_peer: Option<String>,
         ) -> BoxFuture<'_, ()> {
             async {}.boxed()
-        }
-
-        fn get_router_events(
-            &self,
-            _number: usize,
-        ) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
-            async { Ok(vec![]) }.boxed()
         }
     }
 

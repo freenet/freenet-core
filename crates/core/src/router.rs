@@ -405,26 +405,31 @@ pub(crate) struct RouterSnapshotInfo {
     pub broadcast_stream_attempts_total: Option<u64>,
     pub broadcast_stream_failures_total: Option<u64>,
     pub broadcast_stream_failures_last_snapshot: Option<u64>,
-    /// Background-task health gauges (#4440), populated by `Ring` from the
-    /// process-global `BACKGROUND_TASK_HEALTH` the monitored tasks publish into.
-    /// `last_success_age_secs` is seconds since the last successful run (`None`
-    /// until the first success); `consecutive_failures` is the current run of
-    /// failures since the last success.
+    /// Liveness heartbeat for the periodic router-refit task (#4440), populated
+    /// by `Ring` from the process-global `BACKGROUND_TASK_HEALTH` that task
+    /// publishes into. Seconds since its last completed pass, or `None` until the
+    /// first one.
     ///
-    /// SEMANTICS CHANGED IN #4808 — read `consecutive_failures` with care. These
-    /// were added because `refresh_router`'s transient `get_router_events` errors
-    /// were made non-fatal by the v0.2.74 #4438 hotfix, leaving a persistently
-    /// failing refresh silent. The periodic loop no longer reads the event log at
-    /// all, so it has no fallible call and no failure arm: the only remaining
-    /// `record_refresh_router_failure` is the STARTUP read, and the first tick
-    /// (<=5 min later) unconditionally records a success, which clears the run.
-    /// `consecutive_failures` is therefore structurally 0 or 1, and 1 only within
-    /// the first tick — it can no longer report a persistent failure, because no
-    /// repeating fallible operation exists. Do NOT alert on it.
-    /// `last_success_age_secs` remains meaningful as a LIVENESS heartbeat: it
-    /// shows the refit pass is still ticking (expect < ~300s on a healthy node).
+    /// This is the LAST survivor of the #4440 background-task health gauges, and
+    /// it is a pure liveness signal — expect < ~300s on a healthy node. It is
+    /// worth keeping because `BackgroundTaskMonitor` only watches for task
+    /// *death*: a task that is alive but starved — deadlocked on `router.write()`,
+    /// or never scheduled — is invisible to the monitor and shows up here as a
+    /// rising age.
+    ///
+    /// The companion `consecutive_failures` gauge was removed in the #4808
+    /// follow-up. It was added because `refresh_router`'s transient
+    /// `get_router_events` errors were made non-fatal by the v0.2.74 #4438 hotfix,
+    /// leaving a persistently-failing refresh silent. Deleting the startup restore
+    /// removed the last fallible call in the task, so the counter had no remaining
+    /// failure source and was structurally pinned at 0 forever.
+    ///
+    /// The field name still says `refresh_router` though the task is now
+    /// `Ring::refit_router_periodically`. That is deliberate: this name is an OTLP
+    /// key, and renaming it would silently break the existing metric series and
+    /// any dashboard panel querying it. Renaming the key is a separate, riskier
+    /// change than the code rename that prompted it.
     pub refresh_router_last_success_age_secs: Option<u64>,
-    pub refresh_router_consecutive_failures: Option<u64>,
     /// Placement-quality gauges (#4404 follow-up), populated by `Ring` on the
     /// snapshot cadence from the contracts this node hosts. They make the
     /// effect of the SubscribeHint placement migration observable: the migration
@@ -1459,7 +1464,6 @@ impl Router {
             broadcast_stream_failures_total: None,
             broadcast_stream_failures_last_snapshot: None,
             refresh_router_last_success_age_secs: None,
-            refresh_router_consecutive_failures: None,
             // Placement-quality + placement-migration gauges populated by Ring on
             // the snapshot cadence (#4404 follow-up).
             hosted_contracts_count: None,
@@ -3984,7 +3988,8 @@ mod tests {
     }
 
     /// Regression test for crash: "user-provided comparison function does not
-    /// correctly implement a total order" in refresh_router.
+    /// correctly implement a total order" — originally observed in the periodic
+    /// router-refresh task (now `Ring::refit_router_periodically`).
     ///
     /// When `mean_transfer_size` has no samples (count=0), `compute()` returns
     /// NaN (0.0/0.0). If `xfer_speed` is also 0, the division NaN/0.0 stays NaN.

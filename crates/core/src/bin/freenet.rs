@@ -85,11 +85,14 @@ mod build_info {
 /// by a `memfd`, plus AOF segment files, UDP sockets, the WS API, etc. systemd's
 /// `DefaultLimitNOFILE` soft limit is typically 1024, and freenet never raised
 /// it, so a busy gateway exhausted file descriptors. The resulting `EMFILE`
-/// killed a monitored background task (`refresh_router` opening an AOF segment),
-/// which the `BackgroundTaskMonitor` treats as node-fatal — producing a
-/// systemd crash-loop. Raising the soft limit to the hard limit at startup gives
-/// the node the FD headroom the kernel already permits, without operator
-/// intervention or a unit-file change.
+/// killed a monitored background task — at the time, the periodic router refresh
+/// opening an AOF segment to reload routing history; that read has since been
+/// deleted (#4808 follow-up), but the module cache, the AOF *writer*, and the
+/// sockets all still consume fds, so the exhaustion mode is unchanged — which the
+/// `BackgroundTaskMonitor` treats as node-fatal, producing a systemd crash-loop.
+/// Raising the soft limit to the hard limit at startup gives the node the FD
+/// headroom the kernel already permits, without operator intervention or a
+/// unit-file change.
 ///
 /// Best-effort and non-fatal: on any error we `warn!` and continue with the
 /// inherited limit rather than failing startup. No-op on non-unix.

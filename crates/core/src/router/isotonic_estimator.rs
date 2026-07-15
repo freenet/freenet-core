@@ -22,8 +22,9 @@ const MAX_REGRESSION_POINTS: usize = 500;
 ///
 /// NOTE: this bounds only how *often* a refit is EARNED. The realised cadence is
 /// `min(caller's poll interval, this)` — `refit_if_stale` does nothing until
-/// someone calls it, and today the only caller is `Ring::refresh_router`'s
-/// 5-minute tick. Above ~10 events/min the tick binds instead and a window can
+/// someone calls it, and today the only caller is
+/// `Ring::refit_router_periodically`'s 5-minute tick. Above ~10 events/min the
+/// tick binds instead and a window can
 /// turn over entirely between refits. That is far above the observed production
 /// median (~14-16 events/hour), where turnover always binds first.
 const REFIT_STALENESS_PERCENT: usize = 10;
