@@ -34,24 +34,13 @@ where
     /// compare. `LruCache::resize` grows lazily (no preallocation), so memory
     /// tracks actual entries, not the cap.
     fn ensure_cache_covers_hosted_set(&mut self) {
-        use crate::contract::executor::{
-            SUMMARY_CACHE_COUNT_MARGIN, SUMMARY_CACHE_COUNT_MAX, SUMMARY_CACHE_COUNT_MIN,
-        };
         use std::num::NonZeroUsize;
 
         let Some(om) = self.op_manager.as_ref() else {
             return;
         };
         let hosted = om.ring.hosting_contracts_count();
-        let needed = hosted
-            .saturating_add(SUMMARY_CACHE_COUNT_MARGIN)
-            .clamp(SUMMARY_CACHE_COUNT_MIN, SUMMARY_CACHE_COUNT_MAX)
-            .next_power_of_two()
-            // Defensive: `next_power_of_two` of a value already clamped to
-            // `COUNT_MAX` (a power of two) cannot exceed `COUNT_MAX`, so this is a
-            // no-op today — kept to stay correct if `COUNT_MAX` is ever set to a
-            // non-power-of-two.
-            .min(SUMMARY_CACHE_COUNT_MAX);
+        let needed = crate::contract::executor::summary_cache_count_target(hosted);
         if needed > self.summary_cache.cap().get() {
             self.summary_cache.grow(NonZeroUsize::new(needed).unwrap());
         }

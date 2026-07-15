@@ -957,6 +957,26 @@ pub(crate) const SUMMARY_CACHE_COUNT_MARGIN: usize = 256;
 /// two so `next_power_of_two()` never overshoots it.
 pub(crate) const SUMMARY_CACHE_COUNT_MAX: usize = 65_536;
 
+/// Count target for the summary/delta cache given the live hosted-contract
+/// count: cover the hosted set (plus margin), clamped to [MIN, MAX] and rounded
+/// up to a power of two (LruCache sizing), never exceeding MAX.
+///
+/// Pure, so the boundary math (zero/one/min/mid/max/overflow) is unit-testable
+/// without the OpManager/Ring integration path. `saturating_add` keeps a
+/// `usize::MAX` hosted count from overflowing, and clamping before
+/// `next_power_of_two` keeps that call from panicking on a huge input.
+pub(crate) fn summary_cache_count_target(hosted: usize) -> usize {
+    hosted
+        .saturating_add(SUMMARY_CACHE_COUNT_MARGIN)
+        .clamp(SUMMARY_CACHE_COUNT_MIN, SUMMARY_CACHE_COUNT_MAX)
+        .next_power_of_two()
+        // Defensive: `next_power_of_two` of a value already clamped to
+        // `COUNT_MAX` (a power of two) cannot exceed `COUNT_MAX`, so this is a
+        // no-op today — kept to stay correct if `COUNT_MAX` is ever set to a
+        // non-power-of-two.
+        .min(SUMMARY_CACHE_COUNT_MAX)
+}
+
 /// Per-entry structural-overhead allowance (bytes) added to every summary/delta
 /// value's payload length when accounting for the byte budget.
 ///
@@ -1647,6 +1667,52 @@ mod tests {
             "worst-case cache aggregate {total} (summary {summary_aggregate} + delta \
              {delta_aggregate} + module {module_ceiling}) must stay under half the \
              gateway limit {gateway_limit}"
+        );
+    }
+
+    /// Boundary coverage for [`summary_cache_count_target`], the clamp + round-up
+    /// math that sizes the summary/delta caches from the live hosted count. Covers
+    /// the edges testing.md requires (zero, one, the clamp bounds, a mid value that
+    /// rounds up, and overflow) that the integration test (fixed 1024/3000/5000
+    /// hosted counts) never reaches.
+    #[test]
+    fn summary_cache_count_target_boundaries() {
+        // Zero / one (cold start): margin (256) < MIN (1024), so both clamp up to MIN.
+        assert_eq!(summary_cache_count_target(0), SUMMARY_CACHE_COUNT_MIN);
+        assert_eq!(summary_cache_count_target(1), SUMMARY_CACHE_COUNT_MIN);
+
+        // Largest hosted count whose +margin still lands exactly at MIN stays at MIN;
+        // one more rounds up to the next power of two. Margin is added BEFORE the
+        // clamp, so feeding MIN itself does NOT yield MIN (asserted just below).
+        assert_eq!(
+            summary_cache_count_target(SUMMARY_CACHE_COUNT_MIN - SUMMARY_CACHE_COUNT_MARGIN),
+            SUMMARY_CACHE_COUNT_MIN
+        ); // 768 + 256 == 1024 == MIN, already a power of two
+        assert_eq!(
+            summary_cache_count_target(SUMMARY_CACHE_COUNT_MIN - SUMMARY_CACHE_COUNT_MARGIN + 1),
+            2048
+        ); // 769 + 256 == 1025 -> next_power_of_two == 2048
+
+        // Feeding MIN itself: 1024 + 256 == 1280 -> next_power_of_two == 2048.
+        assert_eq!(summary_cache_count_target(SUMMARY_CACHE_COUNT_MIN), 2048);
+
+        // A mid value rounds up to the enclosing power of two:
+        // 2600 + 256 == 2856, and next_power_of_two(2856) == 4096.
+        assert_eq!(summary_cache_count_target(2600), 4096);
+
+        // At and above MAX everything clamps to MAX; usize::MAX must not overflow or
+        // panic (saturating_add plus clamp-before-next_power_of_two guarantee this).
+        assert_eq!(
+            summary_cache_count_target(SUMMARY_CACHE_COUNT_MAX),
+            SUMMARY_CACHE_COUNT_MAX
+        );
+        assert_eq!(
+            summary_cache_count_target(SUMMARY_CACHE_COUNT_MAX + 10_000),
+            SUMMARY_CACHE_COUNT_MAX
+        );
+        assert_eq!(
+            summary_cache_count_target(usize::MAX),
+            SUMMARY_CACHE_COUNT_MAX
         );
     }
 
