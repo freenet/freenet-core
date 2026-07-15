@@ -1604,7 +1604,17 @@ mod tests {
 
     #[test]
     fn add_event_preserves_relay_recorded_events() {
-        // REGRESSION (#4808). The periodic router refresh used to rebuild the whole
+        // SCOPE, honestly: this guards the refit's NO-DATA-LOSS property, not the
+        // refit TRIGGER. It stays green if the `refit_if_stale()` call is deleted
+        // from `add_event` (no refit, nothing lost), so it is not the #4811 guard —
+        // `add_event_leaves_no_estimator_stale` is. And because `len()` derives
+        // from `raw_events` and `refit` rebuilds from exactly that, preservation is
+        // close to structural: it can only fail if a refit corrupts the window.
+        // Carried forward cheaply, the same caveat #4809 recorded for its
+        // predecessor (`refit_stale_estimators_preserves_relay_recorded_events`).
+        // Cheap, not evidence.
+        //
+        // #4808 CONTEXT. The periodic router refresh used to rebuild the whole
         // router from the on-disk event log:
         //
         //     if !history.is_empty() { *router.write() = Router::new(&history); }
