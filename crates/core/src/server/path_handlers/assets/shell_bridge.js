@@ -6,6 +6,8 @@ function freenetBridge(authToken, userToken, hostedMode) {
   var connections = new Map();
   var lastClipboard = 0;
   var lastDownload = 0;
+  var lastNotification = 0;
+  var notifyAffordanceShown = false;
 
   // FAIL CLOSED whenever a HOSTED browser has no usable per-user token (#4381).
   //
@@ -207,6 +209,174 @@ function freenetBridge(authToken, userToken, hostedMode) {
     iframe.contentWindow.postMessage(msg, '*');
   }
 
+  // --- Browser notifications proxy ---------------------------------------
+  // The app runs in the sandboxed (opaque-origin) iframe and CANNOT use the
+  // Notifications API. The shell is same-origin with the node (a real origin)
+  // and can. So the app postMessages the shell, which shows the notification.
+  //
+  // Permission scope: the Notifications permission is per-ORIGIN, and every
+  // contract on this gateway shares the shell's origin (they differ only by
+  // path). A browser grant is therefore gateway-WIDE. To keep it effectively
+  // per-contract we additionally require a stored per-contract consent flag
+  // before EVER showing a notification, and we only ask for the browser
+  // permission from a real click on the in-shell affordance below. So one
+  // contract's grant never lets a different contract on the same gateway
+  // notify the user without its own explicit opt-in.
+  function contractConsentKey() {
+    // Derive the contract key from the trusted, server-routed path
+    // (/v1/contract/web/<KEY>/...), NEVER from message content — otherwise a
+    // contract could claim another contract's consent.
+    var m = location.pathname.match(/\/v1\/contract\/web\/([^/?#]+)/);
+    return m ? 'freenet_notify:' + m[1] : null;
+  }
+
+  function contractHasConsent() {
+    var k = contractConsentKey();
+    if (!k) return false;
+    try {
+      return localStorage.getItem(k) === 'granted';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setContractConsent() {
+    var k = contractConsentKey();
+    if (!k) return;
+    try {
+      localStorage.setItem(k, 'granted');
+    } catch (e) {}
+  }
+
+  function notifyStatusToIframe(status) {
+    sendToIframe({
+      __freenet_shell__: true,
+      type: 'notification_status',
+      status: status,
+    });
+  }
+
+  // Show a small, clearly host-owned affordance and, on a REAL click in this
+  // shell frame, request the browser permission. The prompt must be triggered
+  // by a gesture in the shell: a click inside the sandboxed iframe does not
+  // reliably grant the shell the transient activation the browser requires for
+  // Notification.requestPermission().
+  function maybeOfferNotifications() {
+    if (typeof Notification === 'undefined') {
+      notifyStatusToIframe('unsupported');
+      return;
+    }
+    if (Notification.permission === 'denied') {
+      notifyStatusToIframe('denied');
+      return;
+    }
+    if (Notification.permission === 'granted' && contractHasConsent()) {
+      notifyStatusToIframe('granted');
+      return;
+    }
+    if (notifyAffordanceShown) return;
+    notifyAffordanceShown = true;
+
+    var bar = document.createElement('div');
+    bar.setAttribute('role', 'dialog');
+    bar.setAttribute('aria-label', 'Enable notifications');
+    bar.style.cssText =
+      'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);' +
+      'z-index:2147483647;display:flex;align-items:center;gap:12px;' +
+      'max-width:calc(100% - 32px);padding:10px 14px;border-radius:10px;' +
+      'background:#1b1f24;color:#fff;font:14px/1.3 system-ui,sans-serif;' +
+      'box-shadow:0 4px 20px rgba(0,0,0,0.35);';
+    var label = document.createElement('span');
+    label.textContent = 'Get notified of new messages?';
+    label.style.cssText = 'flex:1;';
+    var enable = document.createElement('button');
+    enable.textContent = 'Enable';
+    enable.style.cssText =
+      'cursor:pointer;border:none;border-radius:6px;padding:6px 12px;' +
+      'background:#007FFF;color:#fff;font:inherit;font-weight:600;';
+    var dismiss = document.createElement('button');
+    dismiss.textContent = 'Not now';
+    dismiss.style.cssText =
+      'cursor:pointer;border:none;border-radius:6px;padding:6px 10px;' +
+      'background:transparent;color:#9aa4b2;font:inherit;';
+
+    function close() {
+      notifyAffordanceShown = false;
+      try {
+        document.body.removeChild(bar);
+      } catch (e) {}
+    }
+    enable.addEventListener('click', function () {
+      var done = function (perm) {
+        if (perm === 'granted') {
+          setContractConsent();
+          notifyStatusToIframe('granted');
+        } else {
+          notifyStatusToIframe(perm === 'denied' ? 'denied' : 'default');
+        }
+        close();
+      };
+      try {
+        // requestPermission is promise-based on modern browsers and
+        // callback-based on older ones — support both.
+        var p = Notification.requestPermission(done);
+        if (p && typeof p.then === 'function') p.then(done);
+      } catch (e) {
+        close();
+      }
+    });
+    dismiss.addEventListener('click', function () {
+      notifyStatusToIframe('dismissed');
+      close();
+    });
+    bar.appendChild(label);
+    bar.appendChild(enable);
+    bar.appendChild(dismiss);
+    document.body.appendChild(bar);
+  }
+
+  function showAppNotification(msg) {
+    if (typeof Notification === 'undefined') return;
+    // Gate on BOTH the browser permission and this contract's own consent.
+    if (Notification.permission !== 'granted' || !contractHasConsent()) return;
+    // Rate-limit as an anti-spam backstop (the app already filters what it
+    // sends). Charge the budget for every attempt, accepted or not.
+    var now = Date.now();
+    if (now - lastNotification < 1000) return;
+    lastNotification = now;
+    // Notification renders text only (no markup), so no HTML-injection risk;
+    // still cap length to prevent oversized/abusive content.
+    var title = String(msg.title).slice(0, 128);
+    var opts = {};
+    if (typeof msg.body === 'string') opts.body = msg.body.slice(0, 256);
+    // Coalesce per contract (+ optional app tag) so a busy room replaces rather
+    // than stacks notifications; scope the tag to the contract so contracts
+    // can't collide.
+    var ckey = contractConsentKey() || 'freenet_notify:app';
+    opts.tag =
+      ckey + ':' + (typeof msg.tag === 'string' ? msg.tag.slice(0, 64) : 'msg');
+    var n;
+    try {
+      n = new Notification(title, opts);
+    } catch (e) {
+      return;
+    }
+    n.onclick = function () {
+      try {
+        window.focus();
+      } catch (e) {}
+      // Tell the app which notification was clicked so it can route to the room.
+      sendToIframe({
+        __freenet_shell__: true,
+        type: 'notification_click',
+        tag: typeof msg.tag === 'string' ? msg.tag : null,
+      });
+      try {
+        n.close();
+      } catch (e) {}
+    };
+  }
+
   window.addEventListener('message', function (event) {
     if (event.source !== iframe.contentWindow) return;
     var msg = event.data;
@@ -385,6 +555,18 @@ function freenetBridge(authToken, userToken, hostedMode) {
             URL.revokeObjectURL(url);
           } catch (e) {}
         }, 60000);
+      } else if (msg.type === 'notification_enable_prompt') {
+        // The app (opaque origin) can't use the Notifications API itself, so it
+        // asks the shell to offer notifications. We show an in-shell affordance
+        // and fire the actual permission prompt from a real click in THIS frame
+        // (see maybeOfferNotifications for why the gesture must be here).
+        maybeOfferNotifications();
+      } else if (msg.type === 'notification' && typeof msg.title === 'string') {
+        // The app asks the shell to display a browser notification. Gated on
+        // the browser permission AND this contract's own stored consent, and
+        // rate-limited + length-capped (content is attacker-controlled message
+        // text). See showAppNotification.
+        showAppNotification(msg);
       } else if (msg.type === 'navigate' && typeof msg.href === 'string') {
         // Navigation from the sandboxed iframe. The iframe cannot navigate
         // the top window itself, so it postMessages the shell, which does
