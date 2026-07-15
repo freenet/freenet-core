@@ -399,11 +399,20 @@ impl IsotonicEstimator {
     /// COST. The refit is amortised over the events that earn it: one O(n log n)
     /// batch fit per ~51 events on a saturated window, on a path that already
     /// pays O(k log k) twice per call (`add_points` and `remove_points` each
-    /// clone, sort, and re-run PAV). It takes no locks and does no I/O — it is
-    /// pure computation over `self` — so it cannot deadlock or re-enter a caller
-    /// that already holds one (`Router::add_event` is called under
-    /// `ring.router.write()`; `ConnectForwardEstimator::record` under its own
-    /// `RwLock`). It only extends a critical section the caller already holds.
+    /// clone, sort, and re-run PAV). Measured on this estimator at a saturated
+    /// 500-point window (release build, 20-50 distinct peers — a realistic
+    /// neighbour set): one refit costs ~150µs, `add_event` costs ~39µs without it,
+    /// and the amortised overhead is ~1.5-5.7µs/event, i.e. **+4-14% on a call
+    /// that was already the expensive part**. Note #4808's oft-quoted "~27µs per
+    /// saturated refit" does not reproduce — it is ~5x optimistic — but the
+    /// conclusion it supported survives the correction, because what lands on the
+    /// hot path is the amortised few µs, not the whole fit.
+    ///
+    /// It takes no locks and does no I/O — it is pure computation over `self` —
+    /// so it cannot deadlock or re-enter a caller that already holds one
+    /// (`Router::add_event` is called under `ring.router.write()`;
+    /// `ConnectForwardEstimator::record` under its own `RwLock`). It only extends
+    /// a critical section the caller already holds.
     pub fn add_event(&mut self, event: IsotonicEvent) {
         self.add_event_incremental(event);
 
