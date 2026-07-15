@@ -36,7 +36,6 @@ use crate::config::GlobalRng;
 
 use crate::config::{GlobalExecutor, TelemetryConfig};
 use crate::message::Transaction;
-use crate::router::RouteEvent;
 use crate::transport::TRANSPORT_METRICS;
 
 use super::{EventKind, NetEventLog, NetEventRegister, NetLogMessage};
@@ -511,11 +510,6 @@ impl NetEventRegister for TelemetryReporter {
             let _ = sender.try_send(TelemetryCommand::Event(event));
         }
         .boxed()
-    }
-
-    fn get_router_events(&self, _number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
-        // Telemetry reporter doesn't store events locally
-        async { Ok(vec![]) }.boxed()
     }
 }
 
@@ -2127,7 +2121,6 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "broadcast_stream_failures_total": snapshot.broadcast_stream_failures_total,
                 "broadcast_stream_failures_last_snapshot": snapshot.broadcast_stream_failures_last_snapshot,
                 "refresh_router_last_success_age_secs": snapshot.refresh_router_last_success_age_secs,
-                "refresh_router_consecutive_failures": snapshot.refresh_router_consecutive_failures,
                 "per_op_curves": snapshot.per_op_curves,
             });
             // Placement-quality + placement-migration gauges (#4404 follow-up).
@@ -3133,11 +3126,21 @@ mod tests {
     }
 
     /// Pin: the UPDATE-broadcast stream-assembly gauges and the background-task
-    /// health gauges (#4440) must also reach the hand-mirrored OTLP body — same
-    /// footgun as the fd / module-cache gauges above. The broadcast
+    /// liveness heartbeat (#4440) must also reach the hand-mirrored OTLP body —
+    /// same footgun as the fd / module-cache gauges above. The broadcast
     /// stream-assembly failure rate is the signal that flagged the v0.2.73
     /// incident, so a silent drop here would re-blind us to a re-enable going
     /// wrong.
+    ///
+    /// This used to cover a second background-task gauge,
+    /// `refresh_router_consecutive_failures`. It was removed in the #4808
+    /// follow-up along with the startup routing-history restore: it existed to
+    /// surface a *non-fatal* `get_router_events` read failure, and deleting the
+    /// restore removed the last fallible call in the task, pinning the counter at
+    /// 0 forever. `refresh_router_last_success_age_secs` survives as a pure
+    /// liveness heartbeat and is still pinned here — the
+    /// `BackgroundTaskMonitor` only watches for task death, so this is the only
+    /// signal that would show the refit loop alive but starved.
     #[test]
     fn router_snapshot_json_includes_broadcast_and_bgtask_gauges() {
         use arbitrary::{Arbitrary, Unstructured};
@@ -3148,14 +3151,12 @@ mod tests {
         info.broadcast_stream_failures_total = Some(41);
         info.broadcast_stream_failures_last_snapshot = Some(43);
         info.refresh_router_last_success_age_secs = Some(47);
-        info.refresh_router_consecutive_failures = Some(53);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("broadcast_stream_attempts_total", 37),
             ("broadcast_stream_failures_total", 41),
             ("broadcast_stream_failures_last_snapshot", 43),
             ("refresh_router_last_success_age_secs", 47),
-            ("refresh_router_consecutive_failures", 53),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

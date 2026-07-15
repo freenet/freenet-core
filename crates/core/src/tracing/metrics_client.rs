@@ -644,13 +644,6 @@ mod opentelemetry_tracer {
             }
             .boxed()
         }
-
-        fn get_router_events(
-            &self,
-            _number: usize,
-        ) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
-            async { Ok(vec![]) }.boxed()
-        }
     }
 }
 

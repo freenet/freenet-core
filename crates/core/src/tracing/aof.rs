@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use byteorder::ByteOrder;
 use tokio::{
@@ -9,12 +8,9 @@ use tokio::{
     sync::Mutex,
 };
 
-use super::{EventKind, NEW_RECORDS_TS, NetLogMessage, RouteEvent};
+use super::{NEW_RECORDS_TS, NetLogMessage};
 
 static FILE_LOCK: Mutex<()> = Mutex::const_new(());
-
-/// Log the incompatible-format warning only once per process lifetime.
-static LOGGED_COMPAT_WARNING: AtomicBool = AtomicBool::new(false);
 
 const RECORD_LENGTH: usize = core::mem::size_of::<u32>();
 const EVENT_KIND_LENGTH: usize = 1;
@@ -406,8 +402,8 @@ impl LogFile {
     /// Close the active segment, open the next one, and drop the oldest
     /// segments while the on-disk record count exceeds the configured cap.
     /// Holding `FILE_LOCK` here serializes rotation against
-    /// `read_all_events` and `get_router_events` (which both take the same
-    /// lock), so reader paths never observe a half-rotated state. The lock
+    /// `read_all_events` (which takes the same lock), so reader paths never
+    /// observe a half-rotated state. The lock
     /// is *not* held across the unlocked `update_recs` call in
     /// `persist_log` — readers inspect the filesystem rather than in-memory
     /// state, so the brief gap between the locked `write_all` and the
@@ -578,101 +574,6 @@ impl LogFile {
         }
     }
 
-    pub async fn get_router_events(
-        max_event_number: usize,
-        event_log_path: &Path,
-    ) -> anyhow::Result<Vec<RouteEvent>> {
-        const MAX_EVENT_HISTORY: usize = 10_000;
-        let event_num = max_event_number.min(MAX_EVENT_HISTORY);
-
-        let _guard = FILE_LOCK.lock().await;
-        let new_records_ts = NEW_RECORDS_TS
-            .get()
-            .expect("set on initialization")
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("should be older than unix epoch")
-            .as_secs() as i64;
-
-        let indices = Self::scan_segment_indices(event_log_path)?;
-        let mut route_buffers: Vec<Vec<u8>> = Vec::new();
-        let mut visited: usize = 0;
-        'segments: for idx in indices {
-            if visited >= event_num {
-                break;
-            }
-            let path = Self::segment_path(event_log_path, idx);
-            let file = match OpenOptions::new().read(true).open(&path).await {
-                Ok(f) => f,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            let mut reader = BufReader::new(file);
-            loop {
-                if visited >= event_num {
-                    break 'segments;
-                }
-                let mut header = [0u8; EVENT_LOG_HEADER_SIZE];
-                match reader.read_exact(&mut header).await {
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => {
-                        let pos = reader.stream_position().await;
-                        tracing::error!(%e, ?pos, "error while trying to read file");
-                        return Err(e.into());
-                    }
-                    Ok(_) => {}
-                }
-                let length = DefaultEndian::read_u32(&header[..4]);
-                if header[4] == EventKind::ROUTE {
-                    let mut buf = vec![0u8; length as usize];
-                    reader.read_exact(&mut buf).await?;
-                    route_buffers.push(buf);
-                } else {
-                    reader.seek(io::SeekFrom::Current(length as i64)).await?;
-                }
-                visited += 1;
-            }
-        }
-
-        if route_buffers.is_empty() {
-            return Ok(vec![]);
-        }
-
-        let deserialized_records = tokio::task::spawn_blocking(move || {
-            let mut filtered = vec![];
-            let mut skipped = 0usize;
-            for buf in route_buffers {
-                let record: NetLogMessage = match bincode::deserialize(&buf) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        // Skip records from older versions with incompatible
-                        // serialization format (e.g. PeerId field order change
-                        // in v0.2.9). The event log is only used for router
-                        // model training, so skipping stale records is safe.
-                        skipped += 1;
-                        continue;
-                    }
-                };
-                if let EventKind::Route(outcome) = record.kind {
-                    let record_ts = record.datetime.timestamp();
-                    if record_ts >= new_records_ts {
-                        filtered.push(outcome);
-                    }
-                }
-            }
-            if skipped > 0 && !LOGGED_COMPAT_WARNING.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    skipped,
-                    "skipped event log records with incompatible serialization format \
-                     (from a previous version); this warning will not repeat"
-                );
-            }
-            Ok::<_, anyhow::Error>(filtered)
-        })
-        .await??;
-
-        Ok(deserialized_records)
-    }
-
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         let _guard = FILE_LOCK.lock().await;
         let file = self.file.as_mut().unwrap();
@@ -713,13 +614,29 @@ mod tests {
 
     use crate::{
         dev_tool::{PeerId, Transaction},
-        tracing::NetEventLog,
+        tracing::{EventKind, NetEventLog},
     };
 
     use super::*;
 
     fn ensure_records_ts() {
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
+    }
+
+    /// Count the `Route` records the log surfaces through its public reader.
+    ///
+    /// These tests exercise the AOF write / rotate / legacy-migrate machinery
+    /// and use the route-record count purely as the read-back assertion. They
+    /// used to call `LogFile::get_router_events`, which was deleted as dead code
+    /// in the #4808 follow-up (nothing consumed `EventKind::Route` from the log
+    /// any more); `read_all_events` is the surviving reader and covers the same
+    /// segments, so the coverage is unchanged.
+    async fn count_route_records(log_path: &Path) -> anyhow::Result<usize> {
+        let recs = LogFile::read_all_events(log_path).await?;
+        Ok(recs
+            .iter()
+            .filter(|m| matches!(m.kind, EventKind::Route(_)))
+            .count())
     }
 
     fn build_events(
@@ -766,8 +683,8 @@ mod tests {
             log.persist_log(msg).await;
         }
 
-        let ev = LogFile::get_router_events(TEST_LOGS, &log_path).await?;
-        assert_eq!(ev.len(), total_route_events);
+        let route_records = count_route_records(&log_path).await?;
+        assert_eq!(route_records, total_route_events);
         Ok(())
     }
 
@@ -800,8 +717,8 @@ mod tests {
             log.persist_log(msg).await;
         }
 
-        let ev = LogFile::get_router_events(TEST_LOGS, &log_path).await?;
-        assert_eq!(ev.len(), total_route_events);
+        let route_records = count_route_records(&log_path).await?;
+        assert_eq!(route_records, total_route_events);
         Ok(())
     }
 
@@ -816,8 +733,7 @@ mod tests {
 
         // Push exactly one segment beyond the cap so the first segment
         // (records 0..MAX_RECORDS_PER_SEGMENT) gets dropped and the
-        // surviving record count lands at MAX_LOG_RECORDS — the
-        // `get_router_events` ceiling.
+        // surviving record count lands at MAX_LOG_RECORDS.
         const TEST_LOGS: usize = MAX_LOG_RECORDS + MAX_RECORDS_PER_SEGMENT;
 
         let mut log = LogFile::open(&log_path).await?;
@@ -841,8 +757,8 @@ mod tests {
             log.persist_log(msg).await;
         }
 
-        let ev = LogFile::get_router_events(TEST_LOGS, &log_path).await?;
-        assert_eq!(ev.len(), total_route_events);
+        let route_records = count_route_records(&log_path).await?;
+        assert_eq!(route_records, total_route_events);
         Ok(())
     }
 
@@ -1103,8 +1019,8 @@ mod tests {
             .iter()
             .filter(|m| matches!(m.kind, EventKind::Route(_)))
             .count();
-        let ev = LogFile::get_router_events(LEGACY_LOGS, &log_path).await?;
-        assert_eq!(ev.len(), route_count);
+        let route_records = count_route_records(&log_path).await?;
+        assert_eq!(route_records, route_count);
         Ok(())
     }
 

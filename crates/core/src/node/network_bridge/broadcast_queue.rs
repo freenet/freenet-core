@@ -1283,8 +1283,8 @@ mod tests {
     ///
     /// Asserting against the process-global `BROADCAST_STREAM_METRICS` after
     /// running the broadcast would be racy (concurrent tests share the global),
-    /// so this pins the call sites in source instead — mirroring the
-    /// `refresh_router` health-gauge pin in `ring.rs`.
+    /// so this pins the call sites in source instead — mirroring
+    /// `migration_counter_sites_present` in `ring/placement_migration_metrics.rs`.
     #[test]
     fn broadcast_to_single_peer_records_attempt_on_every_streaming_exit_pin() {
         let src = include_str!("broadcast_queue.rs");

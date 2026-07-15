@@ -35,7 +35,6 @@ pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
         target_peer: Option<String>,
     ) -> BoxFuture<'_, ()>;
     fn trait_clone(&self) -> Box<dyn NetEventRegister>;
-    fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>>;
 }
 
 #[cfg(feature = "trace-ot")]
@@ -78,19 +77,6 @@ impl<const N: usize> NetEventRegister for CombinedRegister<N> {
                 reg.notify_of_time_out(tx, &op_type, target_peer.clone())
                     .await;
             }
-        }
-        .boxed()
-    }
-
-    fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
-        async move {
-            for reg in &self.0 {
-                let events = reg.get_router_events(number).await?;
-                if !events.is_empty() {
-                    return Ok(events);
-                }
-            }
-            Ok(vec![])
         }
         .boxed()
     }
@@ -149,23 +135,6 @@ impl NetEventRegister for DynamicRegister {
                 reg.notify_of_time_out(tx, &op_type, target_peer.clone())
                     .await;
             }
-        }
-        .boxed()
-    }
-
-    fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
-        async move {
-            // Aggregate events from all registers up to the requested limit
-            let mut collected = Vec::new();
-            for reg in &self.0 {
-                if collected.len() >= number {
-                    break;
-                }
-                let remaining = number - collected.len();
-                let events = reg.get_router_events(remaining).await?;
-                collected.extend(events);
-            }
-            Ok(collected)
         }
         .boxed()
     }
@@ -1990,10 +1959,6 @@ impl NetEventRegister for EventRegister {
             }
         }
         .boxed()
-    }
-
-    fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
-        async move { aof::LogFile::get_router_events(number, &self.log_file).await }.boxed()
     }
 }
 
