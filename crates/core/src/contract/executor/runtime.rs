@@ -1538,6 +1538,47 @@ mod remove_contract_tests {
         );
     }
 
+    /// Regression for #4754: reclaiming a contract must also drop its compiled
+    /// module from the shared module cache, mirroring the delegate path. Before
+    /// the fix, `reclaim_contract_storage` deleted state + `.wasm` but left the
+    /// module lingering until byte-budget LRU pressure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_contract_evicts_compiled_module_from_cache() {
+        let (mut executor, _contracts_dir, _temp) = build_disk_executor("module-cache").await;
+        let (container, key) = make_contract(0x55, 0x66);
+        let params = container.params();
+        let state = WrappedState::new(b"payload".to_vec());
+
+        executor
+            .runtime
+            .contract_store
+            .store_contract(container)
+            .expect("store contract code");
+        executor
+            .state_store
+            .store(key, state, params)
+            .await
+            .expect("store contract state");
+
+        // Populate the module cache for this key (fake blobs are never
+        // compiled, so seed a minimal module directly).
+        executor.runtime.seed_contract_module_for_test(key);
+        assert!(
+            executor.runtime.contract_module_cached_for_test(&key),
+            "module must be cached before eviction"
+        );
+
+        executor
+            .reclaim_contract_storage(&key)
+            .await
+            .expect("reclaim must succeed");
+
+        assert!(
+            !executor.runtime.contract_module_cached_for_test(&key),
+            "compiled module must be evicted from the cache after reclamation"
+        );
+    }
+
     /// Double eviction is idempotent: a second `remove_contract` on an
     /// already-reclaimed contract is a harmless no-op, not an error.
     #[tokio::test(flavor = "multi_thread")]

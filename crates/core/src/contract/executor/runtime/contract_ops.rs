@@ -570,7 +570,12 @@ impl Executor<Runtime> {
             }
         };
         let code_result = match self.runtime.contract_store.remove_contract(key) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Reclaim the compiled module eagerly too, not just on LRU
+                // pressure. See remove_contract_module (issue #4754).
+                self.runtime.remove_contract_module(key);
+                Ok(())
+            }
             Err(e) => {
                 tracing::warn!(
                     contract = %key,
