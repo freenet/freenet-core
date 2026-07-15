@@ -1010,9 +1010,13 @@ const DELTA_CACHE_MIN_BYTES: usize = 8 * 1024 * 1024;
 /// ceiling. Per-executor × up to 16 pool workers → ≤ 1 GiB aggregate delta-cache
 /// RAM. Combined with the summary cache (≤ 512 MiB aggregate) and the shared
 /// module cache (≤ 1.5 GiB) the total cache commitment stays a safe fraction of a
-/// production gateway's memory (≈ 3 GiB worst case, well under the ~7.6 GiB
+/// production gateway's memory (≈ 3 GiB worst case, well under the 7600 MiB (= 7.42 GiB)
 /// gateway limit). NOTE: this budget is PER-EXECUTOR; aggregate RAM is
 /// `pool_size × (summary_budget + delta_budget)`, not a single node-wide figure.
+/// `pool_size` tracks CPU count (core count), so a RAM-scaled per-executor budget
+/// is multiplied by cores: on an exotic high-core/low-RAM box the aggregate is a
+/// larger fraction of that box's RAM; production gateways have modest core counts
+/// and stay safe (asserted by `cache_byte_budgets_are_aggregate_safe`).
 const DELTA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Per-executor SUMMARY-cache byte budget, scaled to the memory the node may use
@@ -1056,9 +1060,15 @@ const SUMMARY_CACHE_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
 /// digests → count binds (coverage); large values → bytes bind (safety). See the
 /// module-level cache-sizing comment above.
 ///
-/// A single value larger than the whole budget is still stored (so the contract
-/// can be served once) and is the first thing evicted on the next insert —
-/// matching [`crate::wasm_runtime::ModuleCache`]'s oversized-value handling.
+/// A single value whose accounted weight alone exceeds the whole budget is NOT
+/// cached: [`Self::put`] returns early without inserting it. The values are
+/// contract-controlled and can reach the WASM memory limit, so retaining even one
+/// oversized entry (times every pool worker times both caches) would defeat the
+/// hard cap and is a real OOM vector (#4565). This deliberately does NOT match
+/// [`crate::wasm_runtime::ModuleCache`]'s "keep one oversized entry" handling:
+/// that cache's values are trusted operator-supplied modules; these are not, so
+/// they get no oversized exemption. Net: `total_bytes <= byte_budget` holds
+/// STRICTLY after every put.
 struct ByteBoundedLruCache<K: std::hash::Hash + Eq, V> {
     inner: LruCache<K, V>,
     /// Running sum of every resident entry's weight
@@ -1094,9 +1104,23 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
     }
 
     /// Insert (or replace) a value, then evict LRU entries until within the byte
-    /// budget.
+    /// budget. A value whose accounted weight alone exceeds the budget is NOT
+    /// cached (early return): the values are contract-controlled, so caching one
+    /// would defeat the hard cap, and the caller already owns its own copy of the
+    /// result, so caching buys nothing. Any pre-existing entry under the same key
+    /// is left untouched (it was already within budget, so the invariant holds).
     fn put(&mut self, key: K, value: V) {
         let added = self.entry_weight(&value);
+        // Skip-oversized guard (#4565): a single value larger than the whole
+        // budget would otherwise stay resident (the pop-loop below keeps the MRU
+        // entry), leaving total_bytes > byte_budget and breaking the hard cap.
+        // StateSummary/StateDelta are contract-controlled and can reach the WASM
+        // memory limit, so refuse to cache such a value at all. The caller already
+        // owns its result; a later cache miss simply recomputes. Result:
+        // total_bytes <= byte_budget holds STRICTLY after every put.
+        if added > self.byte_budget {
+            return;
+        }
         // `push` returns the displaced entry: the OLD value when `key` already
         // existed, OR the LRU entry evicted to honor the COUNT cap. In BOTH cases
         // subtract its weight so the running total stays exact (a replace does not
@@ -1107,8 +1131,11 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
                 .saturating_sub(self.entry_weight(&displaced));
         }
         self.total_bytes = self.total_bytes.saturating_add(added);
-        // Byte backstop: pop LRU entries until within budget, keeping at least the
-        // just-inserted MRU entry resident even if it alone exceeds the budget.
+        // Byte backstop: pop LRU entries until within budget. With the
+        // skip-oversized guard above, the just-inserted entry alone is always
+        // within budget, so this converges to total_bytes <= byte_budget every
+        // time. The len() > 1 guard is kept as defense-in-depth but is no longer
+        // what bounds the total (no entry can alone exceed the budget now).
         while self.total_bytes > self.byte_budget && self.inner.len() > 1 {
             match self.inner.pop_lru() {
                 Some((_, evicted)) => {
@@ -1125,13 +1152,21 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
     }
 
     /// Grow the COUNT cap. Only ever grows (callers guard on `new > cap`), so this
-    /// never evicts and the byte total stays exact; a shrink would evict entries
-    /// without byte accounting, so it is rejected in debug builds.
+    /// never evicts and the byte total stays exact. A shrink WOULD evict entries
+    /// via `lru::resize` WITHOUT byte accounting, drifting `total_bytes` high, so a
+    /// non-growing request is made a no-op in RELEASE too (not just a debug
+    /// assert): the early return below is the real guard against a future
+    /// non-monotonic caller.
     fn grow(&mut self, cap: NonZeroUsize) {
         debug_assert!(
             cap >= self.inner.cap(),
             "ByteBoundedLruCache::grow must not shrink (would leak byte accounting)"
         );
+        // Release-safe guard: a shrink (or a no-op re-grow to the same cap) must
+        // not reach `lru::resize`, which would evict without updating `total_bytes`.
+        if cap <= self.inner.cap() {
+            return;
+        }
         self.inner.resize(cap);
     }
 
@@ -1453,6 +1488,46 @@ mod tests {
             );
         }
 
+        /// P1 skip-oversized: a value whose accounted weight alone exceeds the
+        /// byte budget is NOT cached at all, so `total_bytes` stays 0 and the
+        /// cache stays empty. A within-budget value inserted afterward caches
+        /// normally and stays within budget. Pins the skip-oversized fix (#4565).
+        #[test]
+        fn oversized_value_is_not_cached() {
+            let byte_budget = 8 * 1024 * 1024; // 8 MiB
+            let count_cap = NonZeroUsize::new(65_536).unwrap();
+            let mut cache: ByteBoundedLruCache<u64, Vec<u8>> =
+                ByteBoundedLruCache::new(count_cap, byte_budget, vec_len);
+
+            // A 16-MiB value alone exceeds the 8-MiB budget, so it must be refused.
+            cache.put(1, vec![0u8; 16 * 1024 * 1024]);
+            assert!(
+                cache.get(&1).is_none(),
+                "an over-budget value must not be cached"
+            );
+            assert_eq!(
+                cache.len(),
+                0,
+                "cache must stay empty after an over-budget put"
+            );
+            assert_eq!(
+                cache.total_bytes(),
+                0,
+                "total_bytes must stay 0 when nothing was cached"
+            );
+
+            // A normal-sized value still caches and stays within budget.
+            cache.put(2, vec![0u8; 1024]);
+            assert!(cache.get(&2).is_some(), "a within-budget value must cache");
+            assert_eq!(cache.len(), 1);
+            assert!(
+                cache.total_bytes() <= byte_budget,
+                "total_bytes {} must stay within budget {}",
+                cache.total_bytes(),
+                byte_budget
+            );
+        }
+
         /// The per-entry overhead floor means even ZERO-length values count toward
         /// the budget, so an unbounded stream of distinct empty-value keys cannot
         /// accumulate without bound (the empty-delta failure PR #4794 fixed). Entry
@@ -1543,7 +1618,7 @@ mod tests {
     /// The default per-executor byte budgets stay within their documented clamps,
     /// and the worst-case aggregate across the max pool size (16 workers) plus the
     /// shared module-cache ceiling stays a safe fraction of a production gateway's
-    /// memory (the ~7.6 GiB gateway limit the review flagged).
+    /// memory (the 7600 MiB = 7.42 GiB gateway limit the review flagged).
     #[test]
     fn cache_byte_budgets_are_aggregate_safe() {
         let summary = summary_cache_budget_bytes();
@@ -1564,7 +1639,8 @@ mod tests {
         // Shared module cache ceiling (single, not per-worker).
         let module_ceiling = crate::wasm_runtime::MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES; // 1.5 GiB
         let total = summary_aggregate + delta_aggregate + module_ceiling;
-        // Keep total cache commitment under half the ~7.6 GiB gateway limit.
+        // Keep total cache commitment under half the gateway limit (7600 MiB, i.e.
+        // ~7.42 GiB / ~7.97 GB; 7_600 * 1024 * 1024 is 7600 MiB, not 7.6 GiB).
         let gateway_limit: usize = 7_600 * 1024 * 1024;
         assert!(
             total <= gateway_limit / 2,
