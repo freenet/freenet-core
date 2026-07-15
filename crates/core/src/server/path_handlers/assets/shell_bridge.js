@@ -6,8 +6,14 @@ function freenetBridge(authToken, userToken, hostedMode) {
   var connections = new Map();
   var lastClipboard = 0;
   var lastDownload = 0;
-  var lastNotification = 0;
   var notifyAffordanceShown = false;
+  var notifySnoozedThisSession = false;
+  // Fallback consent store for when localStorage is unavailable (private mode),
+  // so consent still works for the current session and 'granted' is honest.
+  var inMemoryConsent = Object.create(null);
+  // Per-tag + global rate-limit state for the notification proxy.
+  var notifyTagTimes = Object.create(null);
+  var notifyRecent = [];
 
   // FAIL CLOSED whenever a HOSTED browser has no usable per-user token (#4381).
   //
@@ -224,28 +230,95 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // notify the user without its own explicit opt-in.
   function contractConsentKey() {
     // Derive the contract key from the trusted, server-routed path
-    // (/v1/contract/web/<KEY>/...), NEVER from message content — otherwise a
-    // contract could claim another contract's consent.
-    var m = location.pathname.match(/\/v1\/contract\/web\/([^/?#]+)/);
+    // (/v[12]/contract/web/<KEY>/...), NEVER from message content — otherwise a
+    // contract could claim another contract's consent. Matches BOTH API
+    // versions, consistent with CONTRACT_PREFIX_RE, so v2 loads aren't stranded.
+    var m = location.pathname.match(/\/v[12]\/contract\/web\/([^/?#]+)/);
     return m ? 'freenet_notify:' + m[1] : null;
+  }
+
+  function contractSnoozeKey() {
+    var k = contractConsentKey();
+    return k ? k + ':snooze' : null;
   }
 
   function contractHasConsent() {
     var k = contractConsentKey();
     if (!k) return false;
     try {
-      return localStorage.getItem(k) === 'granted';
+      if (localStorage.getItem(k) === 'granted') return true;
+    } catch (e) {}
+    // Fall back to the in-memory record so a private-mode shell (where
+    // localStorage throws) still delivers this session's notifications.
+    return inMemoryConsent[k] === true;
+  }
+
+  // Records consent; returns false only when there's no contract key to gate on
+  // (so the caller must not report 'granted'). Always records in memory so the
+  // session works even if persistence fails; persistence is best-effort.
+  function setContractConsent() {
+    var k = contractConsentKey();
+    if (!k) return false;
+    inMemoryConsent[k] = true;
+    try {
+      localStorage.setItem(k, 'granted');
+    } catch (e) {}
+    return true;
+  }
+
+  var NOTIFY_SNOOZE_MS = 24 * 60 * 60 * 1000; // 24h "Not now" cooldown
+
+  function isNotifySnoozed() {
+    if (notifySnoozedThisSession) return true;
+    var k = contractSnoozeKey();
+    if (!k) return false;
+    try {
+      var v = localStorage.getItem(k);
+      if (!v) return false;
+      var ts = parseInt(v, 10);
+      return isFinite(ts) && Date.now() - ts < NOTIFY_SNOOZE_MS;
     } catch (e) {
       return false;
     }
   }
 
-  function setContractConsent() {
-    var k = contractConsentKey();
+  function setNotifySnoozed() {
+    // In-memory flag makes dismissal effective THIS session even against a
+    // contract that spams notification_enable_prompt; the persisted timestamp
+    // makes "Not now" stick across reloads for NOTIFY_SNOOZE_MS.
+    notifySnoozedThisSession = true;
+    var k = contractSnoozeKey();
     if (!k) return;
     try {
-      localStorage.setItem(k, 'granted');
+      localStorage.setItem(k, String(Date.now()));
     } catch (e) {}
+  }
+
+  // Per-tag throttle (so distinct rooms aren't dropped) plus a rolling global
+  // cap (so a consented contract can't flood with unique tags). Bounds the
+  // per-tag map so a distinct-tag flood can't grow memory unbounded.
+  var NOTIFY_TAG_MIN_MS = 3000;
+  var NOTIFY_GLOBAL_MAX = 20;
+  var NOTIFY_GLOBAL_WINDOW_MS = 60000;
+
+  function notifyRateOk(tag) {
+    var now = Date.now();
+    var last = notifyTagTimes[tag];
+    if (last !== undefined && now - last < NOTIFY_TAG_MIN_MS) return false;
+    notifyRecent = notifyRecent.filter(function (t) {
+      return now - t < NOTIFY_GLOBAL_WINDOW_MS;
+    });
+    if (notifyRecent.length >= NOTIFY_GLOBAL_MAX) return false;
+    notifyTagTimes[tag] = now;
+    notifyRecent.push(now);
+    var keys = Object.keys(notifyTagTimes);
+    if (keys.length > 128) {
+      keys.sort(function (a, b) {
+        return notifyTagTimes[a] - notifyTagTimes[b];
+      });
+      for (var i = 0; i < keys.length - 64; i++) delete notifyTagTimes[keys[i]];
+    }
+    return true;
   }
 
   function notifyStatusToIframe(status) {
@@ -272,6 +345,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
     }
     if (Notification.permission === 'granted' && contractHasConsent()) {
       notifyStatusToIframe('granted');
+      return;
+    }
+    // Respect a prior "Not now": makes dismissal effective against a contract
+    // that re-sends notification_enable_prompt, and persists for a cooldown.
+    if (isNotifySnoozed()) {
+      notifyStatusToIframe('dismissed');
       return;
     }
     if (notifyAffordanceShown) return;
@@ -307,10 +386,15 @@ function freenetBridge(authToken, userToken, hostedMode) {
       } catch (e) {}
     }
     enable.addEventListener('click', function () {
+      var called = false;
       var done = function (perm) {
-        if (perm === 'granted') {
-          setContractConsent();
+        if (called) return; // some browsers fire BOTH the callback and promise
+        called = true;
+        if (perm === 'granted' && setContractConsent()) {
           notifyStatusToIframe('granted');
+        } else if (perm === 'granted') {
+          // Granted but no contract key to gate on — nothing would deliver.
+          notifyStatusToIframe('undeliverable');
         } else {
           notifyStatusToIframe(perm === 'denied' ? 'denied' : 'default');
         }
@@ -318,14 +402,20 @@ function freenetBridge(authToken, userToken, hostedMode) {
       };
       try {
         // requestPermission is promise-based on modern browsers and
-        // callback-based on older ones — support both.
+        // callback-based on older ones — support both. Resolve `done` on
+        // rejection too, so a failed prompt never strands the affordance.
         var p = Notification.requestPermission(done);
-        if (p && typeof p.then === 'function') p.then(done);
+        if (p && typeof p.then === 'function') {
+          p.then(done, function () {
+            done('default');
+          });
+        }
       } catch (e) {
-        close();
+        done('default');
       }
     });
     dismiss.addEventListener('click', function () {
+      setNotifySnoozed();
       notifyStatusToIframe('dismissed');
       close();
     });
@@ -339,11 +429,6 @@ function freenetBridge(authToken, userToken, hostedMode) {
     if (typeof Notification === 'undefined') return;
     // Gate on BOTH the browser permission and this contract's own consent.
     if (Notification.permission !== 'granted' || !contractHasConsent()) return;
-    // Rate-limit as an anti-spam backstop (the app already filters what it
-    // sends). Charge the budget for every attempt, accepted or not.
-    var now = Date.now();
-    if (now - lastNotification < 1000) return;
-    lastNotification = now;
     // Notification renders text only (no markup), so no HTML-injection risk;
     // still cap length to prevent oversized/abusive content.
     var title = String(msg.title).slice(0, 128);
@@ -355,10 +440,17 @@ function freenetBridge(authToken, userToken, hostedMode) {
     var ckey = contractConsentKey() || 'freenet_notify:app';
     opts.tag =
       ckey + ':' + (typeof msg.tag === 'string' ? msg.tag.slice(0, 64) : 'msg');
+    // Per-tag throttle + rolling global cap: distinct rooms aren't dropped, but
+    // a consented contract can't flood with unique tags.
+    if (!notifyRateOk(opts.tag)) return;
     var n;
     try {
       n = new Notification(title, opts);
     } catch (e) {
+      // e.g. mobile Chrome, where non-persistent `new Notification()` throws
+      // (it requires ServiceWorkerRegistration.showNotification). Tell the app
+      // so it need not keep sending; the in-app unread badge is the fallback.
+      notifyStatusToIframe('undeliverable');
       return;
     }
     n.onclick = function () {
