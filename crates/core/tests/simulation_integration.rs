@@ -9224,20 +9224,27 @@ async fn test_connection_growth_plateau_diagnostic() {
     );
 }
 
-/// Diagnostic test for #3570: GET operations have high timeout rate in realistic networks.
+/// GET-reliability test for #3570 (originally: GET operations timed out in
+/// realistic networks).
 ///
-/// This test creates a 100-node network, PUTs a contract from a gateway, then has
-/// every node attempt to GET the same contract. It measures:
-/// - Overall GET success rate
-/// - Latency distribution (p50, p90, p99)
-/// - Failure modes (NotFound vs Failure vs Timeout)
+/// Creates a 100-node network, PUTs a contract from a gateway, waits for the
+/// ring to form, then has every node GET the same contract. It logs detailed
+/// statistics (success rate, latency p50/p90/p99, failure modes, dispatch
+/// accounting) AND asserts three hard floors:
+/// - `success_rate >= 0.90` — GETs that reach the network succeed;
+/// - `nodes_with_state >= 90/100` — retrievability: nodes end up holding the
+///   contract (the primary, non-gameable measure — see the inline rationale);
+/// - `network_successes >= N` — a meaningful number of GETs traversed the
+///   network (hop >= 1), so success isn't all local cache hits.
 ///
-/// The test is intentionally diagnostic — it logs detailed statistics rather than
-/// asserting a hard threshold, so we can gather evidence on what's happening.
-/// A soft assertion ensures GET success rate doesn't fall below 50% (catastrophic).
+/// GETs are fired only AFTER a join-convergence barrier
+/// (`wait_for_join_convergence_before_ops`), so the metric reflects GET
+/// reliability in a formed ring rather than cold-start join timing (#4361/#4362).
 ///
-/// Uses `run_controlled_simulation` for deterministic reproduction.
-// Long-running diagnostic test (~2min). Runs in nightly CI.
+/// Uses `run_controlled_simulation` (turmoil runner) for near-deterministic
+/// reproduction.
+// Long-running test (~a few min of virtual time). Runs in nightly CI only
+// (gated by the `nightly_tests` feature), so regular PR CI does not exercise it.
 #[cfg(feature = "nightly_tests")]
 #[test_log::test]
 fn test_get_reliability_diagnostic() {
@@ -9255,7 +9262,7 @@ fn test_get_reliability_diagnostic() {
     let rt = create_runtime();
 
     let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
+        let mut sim = SimNetwork::new(
             NETWORK_NAME,
             NUM_GATEWAYS,
             NUM_NODES,
@@ -9266,6 +9273,28 @@ fn test_get_reliability_diagnostic() {
             SEED,
         )
         .await;
+        // Measure GET reliability against a FORMED network, not a forming one.
+        // The controlled-event client fires each node's single GET sequentially
+        // (~3s apart, no retry). Without this barrier the higher-index nodes'
+        // GETs fire before those nodes finish joining the ring and are rejected
+        // with PeerNotJoined before any routing happens — so the metric measured
+        // cold-start join *speed*, not GET reliability (a deterministic 42/100
+        // dispatched, with every GET that DID dispatch succeeding; #4361/#4362).
+        // Wait until ~95% of peers have joined before firing operations, so every
+        // scheduled GET originates from a joined node and the number reflects
+        // routing/findability. NOTE: placement migration (SubscribeHint) stays
+        // OFF — it is a deliberately-disabled anti-pattern, not a findability
+        // mechanism (see #4601/#4640). At this test's max_connections=12,
+        // findability is provided by ordinary small-world (Kleinberg) routing
+        // over the formed ring plus gateway fallback; the nearest-neighbor ring
+        // lattice (#4760) is gated off below max_connections=25
+        // (NN_LATTICE_MIN_MAX_CONNECTIONS) and does NOT apply at this scale.
+        sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(900));
+        // Against an already-formed ring a GET completes in ~1ms, so the default
+        // 3s inter-op settle would spend 100*3s = 300s of virtual time (and the
+        // wall-clock to simulate it) waiting for nothing. Shrink it — this only
+        // paces the read sweep, it does not change what is measured.
+        sim.with_controlled_op_interval(Duration::from_millis(300));
         let logs_handle = sim.event_logs_handle();
         (sim, logs_handle)
     });
@@ -9303,8 +9332,17 @@ fn test_get_reliability_diagnostic() {
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
-        Duration::from_secs(600), // 10 min simulation
-        Duration::from_secs(120), // 2 min post-operations wait
+        // The join-convergence barrier above consumes virtual time letting the
+        // ring form (up to its 900s cap) BEFORE the GET sweep (~100 * 300ms ≈
+        // 30s) and the post-op wait run against it. INVARIANT: this duration
+        // must exceed `barrier max_wait (900) + GET sweep + post_op (120)`, so a
+        // slow-forming ring produces a clean retrievability assertion failure at
+        // the cap rather than a confusing turmoil timeout. Worst case here
+        // ≈ 3 + 900 + 30 + 120 ≈ 1053s < 1400s. The sim returns as soon as the
+        // controlled client finishes, so this only caps the worst case — it does
+        // not lengthen a fast-converging run.
+        Duration::from_secs(1400),
+        Duration::from_secs(120), // post-operations wait
     );
 
     assert!(
@@ -9505,21 +9543,19 @@ fn test_get_reliability_diagnostic() {
         );
     }
 
-    // Soft assertion — this is diagnostic, but catastrophic failure should still fail the test
+    // Sanity floor: enough GET outcomes to analyze at all.
     assert!(
         total_outcomes >= 10,
         "Only {} GET outcome transactions — too few for meaningful analysis",
         total_outcomes
     );
-    // Success-rate floor raised from the catastrophic-only 0.50 to 0.90 now
-    // that #4362 is fixed: with late joiners actually joining, the measured
-    // run reaches 100% (91/91). 0.90 leaves headroom for seed-to-seed jitter
-    // while still catching a real regression.
+    // GET success-rate floor: of the GETs that reached the network, essentially
+    // all must succeed. The measured run reaches 100%. 0.90 leaves headroom
+    // while still catching a routing regression. See #3570 for context.
     assert!(
         success_rate >= 0.90,
-        "GET success rate {:.1}% below 0.90 floor (#4362 fixed should keep this high). \
-         {} succeeded, {} not_found, {} failures, {} timeouts out of {} total. \
-         See #3570 for context.",
+        "GET success rate {:.1}% below 0.90 floor. \
+         {} succeeded, {} not_found, {} failures, {} timeouts out of {} total.",
         success_rate * 100.0,
         successes,
         not_found,
@@ -9527,34 +9563,63 @@ fn test_get_reliability_diagnostic() {
         timeouts,
         total_outcomes
     );
-    // Dispatch accounting (#4361): scheduled GETs that never dispatch an
-    // operation silently shrink the denominator, so the success rate can
-    // look healthy while most of the test never ran. The historical floor
-    // was NUM_NODES/3 (33) because the bootstrap acceptance collapse (#4362)
-    // left ~46/100 nodes with no completed transport handshake when their
-    // GET signal arrived (rejected with PeerNotJoined, no harness retry).
-    // With #4362 fixed (joiners re-route off saturated gateways and join
-    // early under a short non-escalating reject backoff), the measured run
-    // dispatches 86/100. Floor set to 80/100 = achieved minus a ~6-node
-    // safety margin for seed-to-seed jitter; still ~2.4x the broken baseline,
-    // so it locks the fix in without being flaky.
+    // RETRIEVABILITY floor — the primary success metric (#4361/#4362).
+    //
+    // This asserts on how many nodes END UP HOLDING the contract, NOT on how
+    // many issued a *network* GET (`dispatched_nodes`, logged above for
+    // diagnostics only). The dispatch count is a poor success gate: it is
+    // confounded by caching — a node whose scheduled GET finds the contract
+    // already cached locally (from a neighbour's earlier GET) resolves without a
+    // network request, so BETTER placement drives the network-dispatch count
+    // DOWN. Retrievability — did each node actually obtain the contract, whether
+    // over the network or from a local copy — is the honest, non-gameable
+    // measure of GET reliability.
+    //
+    // History: this used to assert `dispatched_nodes >= 0.8 * NUM_NODES`,
+    // calibrated by #4599 against a run scoring 86 — but that run had
+    // placement-migration (`SubscribeHint`) accidentally ON. #4601 correctly
+    // disabled migration in sims (it is a deliberately-disabled anti-pattern,
+    // not a findability mechanism), and the metric fell to 42/100. That was a
+    // BOOTSTRAP-TIMING artifact, not a findability defect: the controlled client
+    // fires each node's one-shot, no-retry GET roughly sequentially, so
+    // higher-index nodes' GETs fired before those nodes finished joining and
+    // were rejected with PeerNotJoined (every GET that DID run succeeded). The
+    // fix is the `wait_for_join_convergence_before_ops` barrier above — wait for
+    // peers to join, THEN GET — which lifts retrievability to a measured 97/100
+    // (only nodes 0-2 miss, whose GETs fire first and race the initial PUT's
+    // propagation), far above the 51/100 no-barrier baseline. Floor at 90/100 =
+    // measured minus a ~7-node margin. The margin is not seed jitter (the seed
+    // is fixed) but headroom for the turmoil runner's residual (~1%)
+    // non-determinism and benign placement shifts; it still catches a real
+    // regression.
     assert!(
-        dispatched_nodes >= NUM_NODES * 8 / 10,
-        "Only {}/{} scheduled GETs dispatched an operation — the test \
-         exercised only a fraction of its workload; the bootstrap acceptance \
-         collapse (#4362) appears to have regressed (#4361)",
+        nodes_with_state >= NUM_NODES * 90 / 100,
+        "Only {}/{} nodes ended up holding the contract — retrievability below \
+         the 90% floor. Every joined node GETs the contract, so this should be \
+         high in a formed network (dispatched_nodes={}, success_rate={:.1}%). \
+         See #4361/#4362.",
+        nodes_with_state,
+        NUM_NODES,
         dispatched_nodes,
-        NUM_NODES
+        success_rate * 100.0
     );
     // Network-traversal floor (#4361): before this assertion existed, every
     // "success" in the failing runs was a local cache hit (hop_count == 0)
     // on a node that already held the contract — multi-hop GET was never
-    // exercised at all. Require that a meaningful number of successes
-    // actually traversed the network.
+    // exercised at all. This also guards the one gap in the retrievability
+    // metric above: `nodes_with_state` counts a node whether it obtained the
+    // contract over the network OR via relay-path caching, so on its own a high
+    // count could in principle be reached with few client GETs actually
+    // completing. Requiring a substantial number of *successful, network-
+    // traversing* GETs closes that: broad routing must have happened, not just
+    // storage population. Measured run: 65/65 network-traversed; floor 30 leaves
+    // ~2x headroom for turmoil non-determinism while still asserting real
+    // routing (6x the previous catastrophic-only floor of 5).
     assert!(
-        network_successes >= 5,
+        network_successes >= 30,
         "Only {} of {} successful GETs traversed the network (hop_count >= 1) \
-         — the success metric is measuring local availability, not routing (#4361)",
+         — too few client GETs actually routed; the success/retrievability \
+         metrics may be measuring local availability, not routing (#4361)",
         network_successes,
         successes
     );

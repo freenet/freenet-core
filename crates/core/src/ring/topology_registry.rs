@@ -86,6 +86,17 @@ pub struct TopologySnapshot {
     pub active_subscription_keys: HashSet<ContractInstanceId>,
     /// Timestamp when this snapshot was taken (for staleness detection)
     pub timestamp_nanos: u64,
+    /// The peer's current established ring-connection count at snapshot time.
+    ///
+    /// Stamped by the snapshot registration sites (which hold the live
+    /// `ConnectionManager`), not by `generate_topology_snapshot` (which runs on
+    /// the `HostingManager` and has no connection view). `0` when unstamped.
+    /// Used as a join/`peer_ready` progress signal — unlike snapshot *presence*
+    /// (gated only on `get_own_addr()`, which is the bind address and set
+    /// early), a non-zero connection count means the peer has completed at least
+    /// one handshake and can originate operations. See
+    /// `SimNetwork::wait_for_join_convergence_before_ops`.
+    pub connection_count: usize,
 }
 
 impl TopologySnapshot {
@@ -97,6 +108,7 @@ impl TopologySnapshot {
             contracts: HashMap::new(),
             active_subscription_keys: HashSet::new(),
             timestamp_nanos: 0,
+            connection_count: 0,
         }
     }
 

@@ -1296,6 +1296,38 @@ pub struct SimNetwork {
     pub skip_convergence_wait: bool,
     /// Optional churn (crash/restart) configuration for the chaos driver.
     churn_config: Option<ChurnConfig>,
+    /// Optional pre-operation join-convergence barrier for
+    /// [`run_controlled_simulation`](Self::run_controlled_simulation). When
+    /// `Some((min_fraction, max_wait))`, the controlled-event client waits —
+    /// before firing any scheduled operation — until at least `min_fraction`
+    /// of the network's peers have completed their network join, or `max_wait`
+    /// virtual time elapses, whichever comes first. Join is detected via the
+    /// topology-snapshot registry: a peer only registers a snapshot once its
+    /// own address/location is established (`peer_ready`), so the count of
+    /// distinct snapshot peers is a direct join tally (see
+    /// `ring::register_topology_snapshots_periodically`, which `continue`s
+    /// while `get_own_addr()` is `None`).
+    ///
+    /// `None` (default) preserves the historical behavior of firing operations
+    /// after a fixed 3s warmup, racing topology formation. This barrier exists
+    /// because a cold-start GET-reliability measurement must run against a
+    /// FORMED network: with only the fixed warmup, higher-index nodes' one-shot,
+    /// no-retry GETs fire before those nodes finish joining and are rejected
+    /// with `PeerNotJoined`, so the metric conflates join speed with GET
+    /// reliability. See `test_get_reliability_diagnostic`. Opt in via
+    /// [`wait_for_join_convergence_before_ops`](Self::wait_for_join_convergence_before_ops).
+    wait_for_join_before_ops: Option<(f64, Duration)>,
+    /// Optional override for the delay the controlled-event client waits after
+    /// triggering each scheduled operation before triggering the next one.
+    /// `None` (default) uses the historical fixed 3s settle. A test whose
+    /// operations complete quickly against an already-formed network (e.g. a
+    /// read-only GET sweep behind `wait_for_join_convergence_before_ops`) can
+    /// shrink this to avoid spending ~3s of virtual time — and the wall-clock
+    /// to simulate it — per operation for work that finishes in milliseconds.
+    /// Only affects regular client-request operations; special in-client ops
+    /// (clock advance, crash/recover) keep their own fixed settle. See
+    /// [`with_controlled_op_interval`](Self::with_controlled_op_interval).
+    controlled_op_interval: Option<Duration>,
     /// Optional governance-manager config override applied to every node
     /// this network builds. Lets governance sim tests compress the
     /// production minute-to-hour timescales and lower `min_samples` so the
@@ -1499,6 +1531,8 @@ impl SimNetwork {
             use_mock_wasm: false,
             skip_convergence_wait: false,
             churn_config: None,
+            wait_for_join_before_ops: None,
+            controlled_op_interval: None,
             governance_config_override: None,
             // Fail-closed by default: pin the placement-migration (`SubscribeHint`)
             // cascade OFF for every simulation unless a test explicitly opts in
@@ -1720,6 +1754,45 @@ impl SimNetwork {
     /// other sim is left untouched and cannot be perturbed by migration load.
     /// Like `with_governance_config`, this patches the already-built node/gateway
     /// configs (config_* ran during construction with the disabled default).
+    /// Make [`run_controlled_simulation`](Self::run_controlled_simulation) wait
+    /// for the ring to form before firing any scheduled operation: the
+    /// controlled-event client blocks until at least `min_fraction` of this
+    /// network's peers (gateways + nodes) have joined — registered a topology
+    /// snapshot, which a peer only does once its own address is established
+    /// (`peer_ready`) — or `max_wait` virtual time elapses, whichever comes
+    /// first.
+    ///
+    /// Without this, operations fire after a fixed 3s warmup and race topology
+    /// formation; a node whose one-shot, no-retry GET fires before it finishes
+    /// joining is rejected with `PeerNotJoined` and never dispatches, so a
+    /// cold-start reliability metric ends up measuring join speed rather than
+    /// GET reliability. Opt-in; the default is the historical fixed-warmup
+    /// behavior. See the `wait_for_join_before_ops` field.
+    #[allow(dead_code)]
+    pub fn wait_for_join_convergence_before_ops(
+        &mut self,
+        min_fraction: f64,
+        max_wait: Duration,
+    ) -> &mut Self {
+        // Clamp to [0, 1]: a fraction > 1.0 would make the target unreachable
+        // and always burn the full `max_wait` before proceeding.
+        self.wait_for_join_before_ops = Some((min_fraction.clamp(0.0, 1.0), max_wait));
+        self
+    }
+
+    /// Override the delay the controlled-event client waits after triggering
+    /// each scheduled *regular* operation (GET/PUT/etc.) before triggering the
+    /// next. Default is a fixed 3s settle. Lower it for a test whose operations
+    /// finish quickly against a formed network to avoid burning ~3s of virtual
+    /// time — and the wall-clock to simulate it — per operation. Does not affect
+    /// special in-client ops (clock advance, crash/recover). See the
+    /// `controlled_op_interval` field.
+    #[allow(dead_code)]
+    pub fn with_controlled_op_interval(&mut self, interval: Duration) -> &mut Self {
+        self.controlled_op_interval = Some(interval);
+        self
+    }
+
     #[allow(dead_code)]
     pub fn enable_placement_migration(&mut self) -> &mut Self {
         let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
@@ -4838,10 +4911,81 @@ impl SimNetwork {
         // `network_name` is still needed after `sim.run()` for topology capture).
         let network_name_for_client = network_name.clone();
 
+        // Optional pre-operation join-convergence barrier (see
+        // `wait_for_join_convergence_before_ops`). Captured by value into the
+        // client closure.
+        let wait_for_join_before_ops = self.wait_for_join_before_ops;
+        let total_peers_expected = self.number_of_nodes + self.number_of_gateways;
+        // Delay between triggering successive regular operations (default 3s).
+        let controlled_op_interval = self
+            .controlled_op_interval
+            .unwrap_or_else(|| Duration::from_secs(3));
+        // A peer counts as "joined" for the barrier once it has >= 1 established
+        // ring connection. This is a slightly STRONGER condition than the
+        // `peer_ready` bar `ensure_peer_ready` checks before letting a peer
+        // originate an operation (`peer_ready` is set at handshake completion,
+        // just before the connection is added to the ring), so any peer the
+        // barrier counts as joined is definitely `peer_ready` — the barrier can
+        // only over-wait, never under-wait, and every scheduled GET dispatches
+        // rather than being rejected with `PeerNotJoined`. We deliberately do
+        // NOT wait for the stronger min_connections/full-ring criterion: a
+        // single connection is all a node needs to originate a GET (routing
+        // stays correct from a lightly-connected node via the gateway-fallback
+        // path), and waiting for a fully-formed ring roughly doubles the
+        // barrier's wall-clock for no change in what the metric measures.
+        const PEER_READY_MIN_CONNECTIONS: usize = 1;
+        let join_conn_threshold = PEER_READY_MIN_CONNECTIONS;
+
         // Register the test client that triggers controlled events
         sim.client("test", async move {
             // Give nodes time to start and establish connections
             tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Optional join-convergence barrier: wait until enough peers have
+            // finished joining before firing any scheduled operation, so the
+            // operations run against a FORMED network instead of racing topology
+            // formation. A peer registers a topology snapshot only after its own
+            // address is established (`peer_ready`), so the distinct snapshot
+            // count is a live join tally. Poll it, advancing virtual time via
+            // short sleeps, until the target fraction joins or the cap elapses.
+            // Default (`None`) skips this entirely, preserving historical timing.
+            if let Some((min_fraction, max_wait)) = wait_for_join_before_ops {
+                let target = ((total_peers_expected as f64) * min_fraction).ceil() as usize;
+                let poll_interval = Duration::from_secs(5);
+                let mut waited = Duration::ZERO;
+                loop {
+                    // Count peers that have reached the join threshold. Snapshot
+                    // *presence* is gated only on the (early) bind address, so it
+                    // is NOT a join signal; the stamped `connection_count` is.
+                    let joined = get_all_topology_snapshots(&network_name_for_client)
+                        .iter()
+                        .filter(|s| s.connection_count >= join_conn_threshold)
+                        .count();
+                    if joined >= target {
+                        tracing::info!(
+                            joined,
+                            target,
+                            total = total_peers_expected,
+                            waited_secs = waited.as_secs(),
+                            "controlled sim: ring join-convergence reached — firing operations"
+                        );
+                        break;
+                    }
+                    if waited >= max_wait {
+                        tracing::warn!(
+                            joined,
+                            target,
+                            total = total_peers_expected,
+                            waited_secs = waited.as_secs(),
+                            "controlled sim: join-convergence cap reached before target — \
+                             firing operations against a partially-formed network"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                    waited += poll_interval;
+                }
+            }
 
             // Trigger events in the specified order
             for (event_id, node_label) in operation_sequence {
@@ -4930,7 +5074,8 @@ impl SimNetwork {
                     }
 
                     // Wait for operation to complete before triggering next
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    // (overridable via `with_controlled_op_interval`; default 3s).
+                    tokio::time::sleep(controlled_op_interval).await;
                 } else {
                     tracing::warn!(
                         event_id,
