@@ -8735,132 +8735,304 @@ fn test_relay_route_events_multihop() {
     );
 }
 
-/// Regression test for GET retry with alternatives in sparse topologies.
+/// Sparse-hosting GET reachability via **relay-side multi-hop forwarding**.
 ///
-/// With HTL=2 and 10 nodes, PUT only caches the contract at 2-3 nodes along the
-/// route. When distant nodes GET, their initial routing candidate may not have
-/// the contract. The fix ensures the GET state machine tries alternative peers
-/// (from k_closest) and re-queries k_closest when alternatives are exhausted,
-/// rather than immediately returning NotFound.
+/// A GET whose **first-choice candidate does not host the contract** must still
+/// resolve to a peer that does, instead of handing the client a NotFound. With
+/// hosting sparse, the peer closest to a contract's key is frequently not a
+/// holder, and a GET that gives up there fails for a contract that plainly
+/// exists one hop away. The mechanism that carries the GET past that first
+/// candidate is a relay forwarding onward toward the key
+/// (`get::op_ctx_task::relay_advance_to_next_peer` and the HTL walk), and that
+/// is what this test drives.
 ///
-/// Without the fix: distant nodes return NotFound because the first-choice peer
-/// doesn't have the contract and there's no retry.
-/// With the fix: the GET retries with alternative peers until one succeeds.
+/// **This test does NOT cover client-side alternative-retry (#3444)** — i.e.
+/// `get::op_ctx_task::advance_to_next_peer` — and is deliberately not named for
+/// it. That path is inert on the normal (non-empty-ring) path: see #4841 and the
+/// "Scope" section below. This test stays green if the client-side retry is
+/// deleted entirely. It was previously called
+/// `test_get_retry_with_alternatives_sparse_topology`, a name that claimed
+/// coverage it never had — the old version passed on relay forwarding too. When
+/// #4841 is fixed, the client-retry coverage belongs in a NEW test; do not
+/// stretch this one to claim it.
 ///
-/// Exercises: `get.rs` alternative retry (line ~1521) and k_closest re-query (line ~1569)
+/// # Scenario — established by construction, not by seed luck
 ///
-/// Seed history: this test was `#[ignore]`d in PR #3488 because the original
-/// seed (`0xBEEF_CAFE_0001`) stopped producing a sparse-but-reachable topology
-/// after a freenet-stdlib bump shifted RNG-dependent topology formation (the
-/// stdlib's enum layout changes bincode serialization sizes, which perturbs the
-/// seeded RNG stream). #3506 re-seeded it for the current stdlib: with
-/// `SEED = 0x3506_000B_0001` the gateway PUT at HTL=2 caches the contract at
-/// exactly 2 of the 10 nodes (verified with a PUT-only run of this same
-/// topology), so 8 of the 10 GET requesters must use the retry-with-alternatives
-/// path to reach a cacher, and all 10 do, deterministically across repeated
-/// runs. Like every seed-coupled topology test, a future stdlib/topology change
-/// could perturb the RNG stream again and require another re-seed; that is
-/// expected maintenance rather than a regression in the GET retry logic itself
-/// (which is also covered by `test_get_routing_coverage_low_htl`).
+/// Peer locations, peer connections and contract placement are all set
+/// explicitly, so nothing here depends on which topology a seeded RNG stream
+/// happens to produce:
+///
+/// * **decoy** sits closest to the key and never hosts the contract, so greedy
+///   keyward routing always lands on it first and it cannot answer.
+/// * **two holders** sit further from the key than the decoy but closer than the
+///   requester, and are the only peers that hold the contract, placed there
+///   directly by `SeedDemandlessCopy`.
+/// * **requester** sits far from the key and is wired to the decoy and both
+///   holders; the decoy is wired to both holders.
+///
+/// So the GET's route is forced: requester -> decoy (cannot serve) -> holder
+/// (serves). Reaching the state requires leaving the first-choice candidate.
+///
+/// # Why the mechanics are what they are (each verified against the code)
+///
+/// * `SeedDemandlessCopy`, not `SeedHostedContract`, places the holders. The
+///   relay serve gate is `check_local_with_interest_gate`, which keys on
+///   `interest_manager.has_local_interest`. `SeedMode::Demandless` calls
+///   `register_local_hosting`, so the gate passes; `SeedMode::Subscribed` — what
+///   `SeedHostedContract` uses — calls `ring.host_contract` + `ring.subscribe`
+///   but never `register_local_hosting`, so a `SeedHostedContract` holder logs
+///   "stale cache (no local interest), will forward" and refuses to serve.
+///
+/// * `ring_max_htl` is 3 because a relay short-circuits on `htl == 0` and
+///   answers NotFound **before** checking its local copy (in
+///   `get::op_ctx_task`, "Short-circuit 1: HTL = 0" precedes "Short-circuit 2:
+///   Local cache hit"). The holder must therefore arrive with `htl >= 1` to be
+///   allowed to serve: requester (htl=3) -> decoy (htl=2) -> holder (htl=1).
+///
+/// * There is exactly **one** requester. A GET's return path caches the state at
+///   each hop, so the decoy holds the contract once the first GET completes and
+///   stops being a decoy. Additional requesters would be served by the decoy at
+///   hop 1 and would exercise nothing.
+///
+/// * **Routing is greedy, but NOT because of `rnd_if_htl_above`.** That parameter
+///   is inert: it is plumbed to `ConnectionManager` and read exactly once
+///   (`connection_manager.rs`, in the `should_accept` debug line) as a **tracing
+///   log field**. There is no `htl > rnd_if_htl_above` branch anywhere in the
+///   crate, so no value of it makes routing non-greedy. The value passed here is
+///   arbitrary — do not "tune" it expecting a routing change.
+///
+/// * **Route determinism depends on staying under ~10 routing events.**
+///   `Router::select_peer`'s sub-50-event path sorts untried-before-tried
+///   (`fa.cmp(&fb).then_with(|| da.cmp(db))`) — i.e. *ahead of* distance — and
+///   `peer_adjustments` is populated for every peer once the global regression
+///   reaches `ADJUSTMENT_PRIOR_SIZE` (10) events. So in the 10..50 regime a peer
+///   with history sorts behind one without, regardless of distance, which could
+///   route straight to a holder and skip the decoy. One GET is ~1-3 events, so
+///   there is comfortable margin, and the traversal assertion below fails loudly
+///   if it is ever crossed. Anyone adding operations to this test should know.
+///
+/// # Why it is built this way
+///
+/// This test previously obtained its sparse-hosting precondition **by luck**: it
+/// hoped a seeded PUT at HTL=2 would happen to cache the contract at exactly 2
+/// of 10 nodes. That premise is a lottery over the seeded RNG stream, and any
+/// perturbation of the tokio scheduler reshuffles it — even adding a background
+/// task that never fires. It broke twice on that basis (`#[ignore]`d in #3488
+/// after a freenet-stdlib bump shifted bincode sizes; re-seeded in #3506 to
+/// `SEED = 0x3506_000B_0001`) and was on course for a third re-seed. Seeding the
+/// holders and wiring the route directly removes the lottery.
+///
+/// # Scope: what this does NOT cover, and why it cannot
+///
+/// It does not cover the client-side retry loop
+/// (`get::op_ctx_task::advance_to_next_peer`) — note this is a DIFFERENT
+/// function from the relay-side `relay_advance_to_next_peer` that this test does
+/// drive. On the normal (non-empty-ring) path the client loop cannot steer a
+/// retry to a different peer:
+///
+/// * a client GET is sent via the originator loopback, whose relay re-picks the
+///   wire hop greedily ("Actual routing is done by `process_message` on the
+///   loop-back; this is just so `advance_to_next_peer` has a starting `tried`
+///   set");
+/// * the client's `tried` set reaches the wire only via the attempt's visited
+///   bloom, and `carry_tried_into_visited` is gated on `connection_count() == 0`
+///   (the #4361 bootstrap case);
+/// * `MAX_RELAY_RETRIES = 1`, so relays do not cover for it either — they
+///   forward once and bubble NotFound, deferring cross-peer retry to the client
+///   driver that cannot perform it.
+///
+/// So every client retry re-picks the same first candidate (observed: at
+/// `ring_max_htl = 1`, four attempts with fresh transactions all forwarded to
+/// the same decoy while two connected holders were never contacted), and no
+/// assertion about retry-driven success can be satisfied by construction. You
+/// cannot write a passing end-to-end test for an inert path, so the client-side
+/// retry has NO end-to-end coverage today — tracked in #4841.
+///
+/// This is not coverage that this rewrite dropped: the pre-#4841 version of this
+/// test claimed the client retry in its name but was also passing on relay
+/// forwarding. When #4841 is fixed, add a NEW test for the client-retry path
+/// rather than widening this one.
 #[test_log::test]
-fn test_get_retry_with_alternatives_sparse_topology() {
-    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+fn test_get_reaches_sparse_holder_via_relay_forwarding() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
 
-    // Seed reselected for the current freenet-stdlib layout (see #3506). Under
-    // this seed the gateway PUT at HTL=2 caches the contract at exactly 2 of the
-    // 10 nodes, and all 10 GET requesters reach one of those 2 cachers via the
-    // GET retry-with-alternatives path. Verified sparse + reachable + deterministic
-    // before un-ignoring; see the doc comment above for the full rationale.
+    // The seed still drives node keys and gateway placement, but no assertion
+    // in this test depends on the topology it produces: peer locations, peer
+    // connections and contract placement are all set explicitly below.
     const SEED: u64 = 0x3506_000B_0001;
     const NETWORK_NAME: &str = "get-retry-sparse";
 
     GlobalTestMetrics::reset();
     setup_deterministic_state(SEED);
 
+    let contract = SimOperation::create_test_contract(0xBE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+
+    // Regular-node order maps to labels as node_locations[i] -> node(i + 1).
+    const DECOY_OFFSET: f64 = 0.002;
+    const HOLDER_OFFSET: f64 = 0.02;
+    const REQUESTER_OFFSET: f64 = 0.45;
+    let node_locations = vec![
+        wrap(key_loc + DECOY_OFFSET),     // node 1: decoy, closest to the key
+        wrap(key_loc + HOLDER_OFFSET),    // node 2: holder A
+        wrap(key_loc - HOLDER_OFFSET),    // node 3: holder B
+        wrap(key_loc + REQUESTER_OFFSET), // node 4: requester, far from the key
+    ];
+    let num_nodes = node_locations.len();
+
+    let decoy = NodeLabel::node(NETWORK_NAME, 1);
+    let holders = [
+        NodeLabel::node(NETWORK_NAME, 2),
+        NodeLabel::node(NETWORK_NAME, 3),
+    ];
+    let requester = NodeLabel::node(NETWORK_NAME, 4);
+
     let rt = create_runtime();
-
-    let num_nodes = 10;
-
-    let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new_with_node_locations(
             NETWORK_NAME,
             1,         // 1 gateway
-            num_nodes, // 10 nodes — large enough that PUT won't reach all
-            2,         // ring_max_htl = 2 — VERY low, PUT caches at only ~2-3 nodes
-            1,         // rnd_if_htl_above
-            6,         // max_connections
+            num_nodes, // 4 regular nodes
+            3,         // ring_max_htl — see "Why the mechanics are what they are"
+            3,         // rnd_if_htl_above — INERT, see below; value is arbitrary
+            12,        // max_connections — ample, so no preseeded edge is capped away
             3,         // min_connections
             SEED,
+            &node_locations,
         )
         .await;
         let logs_handle = sim.event_logs_handle();
         (sim, logs_handle)
     });
 
-    let contract = SimOperation::create_test_contract(0xBE);
-    let contract_id = *contract.key().id();
-    let contract_key = contract.key();
+    // Wire the whole route explicitly, so it does not depend on CONNECT racing:
+    // the requester reaches the decoy and both holders, and the decoy can
+    // forward onward to a holder.
+    sim.preseed_direct_star(
+        &requester,
+        &[decoy.clone(), holders[0].clone(), holders[1].clone()],
+    );
+    sim.preseed_direct_star(&decoy, &[holders[0].clone(), holders[1].clone()]);
 
-    let mut operations = vec![
-        // Gateway PUTs the contract (HTL=2 → only ~2-3 nodes cache)
-        ScheduledOperation::new(
-            NodeLabel::gateway(NETWORK_NAME, 0),
-            SimOperation::Put {
+    // Setup sanity. `new_with_node_locations` realises locations approximately
+    // (it picks the loopback port nearest each target), so assert the ordering
+    // the scenario depends on against the ACHIEVED locations rather than the
+    // requested ones. get_peer_locations() is [gateway, node1..node4].
+    let locs = sim.get_peer_locations();
+    let decoy_dist = ring_dist(locs[1], key_loc);
+    let holder_dists = [ring_dist(locs[2], key_loc), ring_dist(locs[3], key_loc)];
+    let requester_dist = ring_dist(locs[4], key_loc);
+    // The gateway's location is NOT chosen by this test — it is derived from the
+    // seed — and preseeding does not suppress organic CONNECT, so the requester
+    // does connect to it. That makes the gateway a live routing candidate whose
+    // distance to the key is a seed-derived quantity, i.e. exactly the kind of
+    // dependency this test exists to remove. Assert it rather than rely on the
+    // margin: HTL has zero slack here (requester 3 -> decoy 2 -> holder 1), so a
+    // gateway hop inserted into the route would exhaust HTL and yield NotFound.
+    let gateway_dist = ring_dist(locs[0], key_loc);
+    for (i, holder_dist) in holder_dists.iter().enumerate() {
+        assert!(
+            *holder_dist < gateway_dist,
+            "scenario setup wrong: the seed-derived gateway landed closer to the key \
+             than holder {i}, so it can win a greedy pick and insert a hop into the \
+             forced route. With no HTL slack that turns the GET into a NotFound. \
+             Re-pick SEED or move the holders. \
+             holder_dist={holder_dist}, gateway_dist={gateway_dist}"
+        );
+        assert!(
+            decoy_dist < *holder_dist,
+            "scenario setup wrong: the decoy must be strictly closer to the key than \
+             holder {i} so that a keyward-routed GET lands on the decoy (which does not \
+             host the contract) before any holder — otherwise the first hop would serve \
+             it and nothing would be exercised. \
+             decoy_dist={decoy_dist}, holder_dist={holder_dist}"
+        );
+        assert!(
+            *holder_dist < requester_dist,
+            "scenario setup wrong: holder {i} must be strictly closer to the key than \
+             the requester, so the requester's candidate list is ordered \
+             [decoy, holders, ...] and the decoy forwards onward to a holder. \
+             holder_dist={holder_dist}, requester_dist={requester_dist}"
+        );
+    }
+
+    // Place the contract at exactly two peers, BY CONSTRUCTION. Seed ops are
+    // applied at node startup, before any scheduled operation runs, so the
+    // sparse-hosting precondition holds without depending on a PUT's incidental
+    // caching. Advertisements stay off (harness default), so these holders are
+    // reachable only by being routed to — which is what keeps the decoy unable
+    // to answer.
+    let mut operations = Vec::new();
+    for holder in &holders {
+        operations.push(ScheduledOperation::new(
+            holder.clone(),
+            SimOperation::SeedDemandlessCopy {
                 contract: contract.clone(),
                 state: vec![10, 20, 30, 40],
-                subscribe: false,
-            },
-        ),
-    ];
-
-    // All 10 nodes GET with fetch_contract=true
-    // Nodes far from caching nodes must retry with alternatives
-    for i in 1..=num_nodes {
-        operations.push(ScheduledOperation::new(
-            NodeLabel::node(NETWORK_NAME, i),
-            SimOperation::Get {
-                contract_id,
-                return_contract_code: true,
-                subscribe: false,
             },
         ));
     }
+    operations.push(ScheduledOperation::new(
+        requester.clone(),
+        SimOperation::Get {
+            contract_id,
+            return_contract_code: true,
+            subscribe: false,
+        },
+    ));
 
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
-        Duration::from_secs(300), // simulation duration
-        Duration::from_secs(90),  // post-operations wait for retries
+        Duration::from_secs(60),
+        Duration::from_millis(500),
     );
 
     assert!(
         result.turmoil_result.is_ok(),
-        "Simulation failed: {:?}",
+        "simulation should complete: {:?}",
         result.turmoil_result.err()
     );
 
-    // Verify that all nodes got the contract state despite sparse caching.
-    // Without the retry fix, distant nodes would get NotFound.
-    let mut nodes_without_state = Vec::new();
-    for i in 1..=num_nodes {
-        let label = NodeLabel::node(NETWORK_NAME, i);
-        let storage = result
+    let stored = |label: &NodeLabel| {
+        result
             .node_storages
-            .get(&label)
-            .unwrap_or_else(|| panic!("node {i} should have a storage handle"));
-        if storage.get_stored_state(&contract_key).is_none() {
-            nodes_without_state.push(format!("node-{i}"));
-        }
-    }
+            .get(label)
+            .unwrap_or_else(|| panic!("{label:?} should have a storage handle"))
+            .get_stored_state(&contract_key)
+    };
 
+    // The claim: the requester got the state even though its first-choice
+    // candidate could not serve it.
     assert!(
-        nodes_without_state.is_empty(),
-        "GET retry regression: {} of {} nodes failed to get contract state \
-         (contract cached at only ~2-3 nodes due to HTL=2, retry should find it). \
-         Failed nodes: {:?}. See PR #3444.",
-        nodes_without_state.len(),
-        num_nodes,
-        nodes_without_state
+        stored(&requester).is_some(),
+        "sparse-hosting GET regression: the requester did not get the contract state. \
+         The contract is hosted at exactly 2 seeded holders and the requester's \
+         first-choice candidate is the decoy, which does not host it — so the GET \
+         gave up at the first candidate instead of a relay forwarding it onward to \
+         a holder (`relay_advance_to_next_peer` + the HTL walk)."
+    );
+
+    // Non-vacuity: prove the GET actually travelled requester -> decoy -> holder
+    // rather than being served at the first hop. The decoy is never seeded, so
+    // the only way it can hold the state at the end of the run is by caching it
+    // on the return path of a GET that passed through it and was answered
+    // further along. If a future change lets the decoy answer this GET itself,
+    // this fails loudly instead of the test silently degrading into "the first
+    // hop had it anyway".
+    assert!(
+        stored(&decoy).is_some(),
+        "the decoy has no state at the end of the run, so the successful GET did not \
+         pass through it. The decoy is the requester's first-choice candidate and is \
+         never seeded, so a GET that resolves must traverse it and cache on the way \
+         back. This test no longer covers what it claims."
     );
 
     // StateVerifier anomaly check
@@ -8871,9 +9043,9 @@ fn test_get_retry_with_alternatives_sparse_topology() {
         verifier.verify()
     });
     tracing::info!(
-        "test_get_retry_with_alternatives_sparse_topology PASSED: \
-         all {} nodes got contract state, {} anomalies, {} events",
-        num_nodes,
+        "test_get_reaches_sparse_holder_via_relay_forwarding PASSED: \
+         requester got contract state from a holder past the decoy, \
+         {} anomalies, {} events",
         report.anomalies.len(),
         report.total_events
     );

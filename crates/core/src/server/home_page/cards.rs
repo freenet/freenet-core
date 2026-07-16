@@ -381,15 +381,31 @@ pub fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>)
         String::new()
     };
 
+    // Only render the average when something actually completed.
+    // `avg_transfer_time_ms` is a sentinel 0 when `transfers_completed == 0`
+    // (metrics.rs guards the division), so an all-failures window would
+    // otherwise render "0 ok / 3 fail (0.000s avg)" — presenting the sentinel
+    // as a measured timing. That window became reachable when #4827 gave
+    // `transfers_failed` a writer: before that the counter was structurally 0,
+    // so this row only ever rendered with >=1 completion and the avg was always
+    // real.
+    let avg_str = if ts.transfers_completed > 0 {
+        format!(
+            r#" <span class="transfer-detail">({avg}s avg)</span>"#,
+            avg = format_args!("{:.3}", ts.avg_transfer_time_ms as f64 / 1000.0),
+        )
+    } else {
+        String::new()
+    };
+
     let xfer_str = if ts.transfers_completed > 0 || ts.transfers_failed > 0 {
         format!(
             r#"<div class="transfer-stat">
                 <span class="transfer-label">Transfers (avg time)</span>
-                <span class="transfer-value">{ok} ok / {fail} fail <span class="transfer-detail">({avg}s avg)</span></span>
+                <span class="transfer-value">{ok} ok / {fail} fail{avg_str}</span>
             </div>"#,
             ok = ts.transfers_completed,
             fail = ts.transfers_failed,
-            avg = format_args!("{:.3}", ts.avg_transfer_time_ms as f64 / 1000.0),
         )
     } else {
         String::new()
