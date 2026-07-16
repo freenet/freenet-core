@@ -1183,14 +1183,55 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             // Report to global metrics for periodic telemetry snapshots
                             super::TRANSPORT_METRICS.record_transfer_completed(&stats);
                         }
+                        // Both Err arms count the transfer as failed (#4827).
+                        //
+                        // "Transient" here classifies CONNECTION liveness, not
+                        // the transfer's fate: it means "don't tear down the
+                        // connection", NOT "this transfer might still finish".
+                        // The stream task has already returned — this stream is
+                        // dead either way, so both arms are real transfer
+                        // failures. Instrumenting only the terminal arm would
+                        // leave the counter ~always 0 (every common failure —
+                        // cwnd-wait timeout, pipe stall, inbound-feed error,
+                        // socket send error — is transient), which is the bug
+                        // this fixes.
+                        //
+                        // Never counted twice for one stream: one spawned task
+                        // yields one result, `FuturesUnordered` yields that
+                        // result exactly once, and nothing awaits between the
+                        // yield and the increment. (Counted zero times in the
+                        // orphan case below, so this is an upper bound, not an
+                        // exact count.)
+                        //
+                        // Relation to the `emit_transfer_failed` event stream:
+                        // that event is emitted INSIDE the stream task, whereas
+                        // this counter increments only where the task's result
+                        // is observed. The two therefore agree 1:1 for every
+                        // stream whose result reaches this match — but not for:
+                        //  - A task that PANICS: the `?` above turns it into
+                        //    `TransportError::Other`, so it reaches neither arm
+                        //    and is missing from BOTH the counter and the event
+                        //    stream (symmetric).
+                        //  - A task ORPHANED at teardown: `Drop` does not abort
+                        //    or drain `outbound_stream_futures`, and dropping a
+                        //    `JoinHandle` detaches the task — it runs on and
+                        //    still emits its event, but no `recv()` remains to
+                        //    observe its result (ASYMMETRIC: the event fires,
+                        //    the counter does not). This concentrates at
+                        //    teardown, and `record_transfer_completed` above has
+                        //    the same gap.
                         Err(e) if e.is_transient_send_failure() => {
+                            super::TRANSPORT_METRICS.record_transfer_failed();
                             tracing::warn!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 error = %e,
                                 "Outbound stream send failed, operation layer will timeout and retry"
                             );
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            super::TRANSPORT_METRICS.record_transfer_failed();
+                            return Err(e);
+                        }
                     }
                 },
                 _ = timeout_check.tick() => {
@@ -3820,6 +3861,234 @@ mod tests {
         assert_eq!(
             target, remote_addr,
             "recovered send must be addressed to the connected peer"
+        );
+    }
+
+    /// Build a `PeerConnection` wired to a no-op socket, for tests that only
+    /// need to drive `recv()`'s outbound-stream arms.
+    ///
+    /// Uses `RealTime` deliberately: the recv loop's timers sleep on the
+    /// connection's `TimeSource`, and a mock clock whose `sleep` is a no-op
+    /// would spin those arms hot.
+    ///
+    /// The other arms DO fire within the bounded wait these tests use — only
+    /// `timeout_check` (5s) does not. `ack_interval` is picked by
+    /// `SimulationTransportOpt::is_enabled()` (false here), so `ack_check` and
+    /// `rate_update_check` tick at `ACK_CHECK_INTERVAL` (100ms) and the resend
+    /// arm first fires at 10ms, then every 2ms. They are harmless because they
+    /// are no-ops on an idle fixture: nothing was sent, so there is nothing to
+    /// resend and `ack_check` returns early on `receipts.is_empty()`. The
+    /// outbound-stream arm is the only one that observes anything — not the
+    /// only one that runs.
+    ///
+    /// Returns the inbound sender alongside the connection: it MUST be held
+    /// alive by the caller. Dropping it closes `inbound_packet_recv`, and the
+    /// recv loop treats a closed inbound channel as a dead connection and
+    /// returns immediately — before the outbound-stream arm is ever polled.
+    #[allow(clippy::type_complexity)]
+    fn test_conn_for_outbound_stream_arm(
+        remote_addr: SocketAddr,
+    ) -> (
+        PeerConnection<TestSocket, crate::simulation::RealTime>,
+        mpsc::Sender<PacketData<UnknownEncryption>>,
+    ) {
+        use crate::simulation::RealTime;
+        use crate::transport::crypto::TransportKeypair;
+
+        let time_source = RealTime::new();
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        let socket = Arc::new(TestSocket::new(
+            mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16).0,
+        ));
+        let rolling_rtt_stats = crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+            remote_addr,
+            time_source.clone(),
+        );
+
+        let conn = PeerConnection::new(RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker,
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher,
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            remote_protoc_version: None,
+            transport_secret_key: keypair.secret,
+            congestion_controller,
+            token_bucket,
+            socket,
+            global_bandwidth: None,
+            rolling_rtt_stats,
+            time_source,
+        });
+        (conn, inbound_tx)
+    }
+
+    /// Serializes the #4827 `transfers_failed` tests. `TRANSPORT_METRICS` is a
+    /// process-wide global and these tests assert an EXACT +1 delta, so they
+    /// must not observe each other's increment. An exact delta (rather than a
+    /// weaker `>=`) is what makes them fail on a double-count as well as on the
+    /// original never-counts bug.
+    ///
+    /// `tokio::sync::Mutex` (not `parking_lot`/`std`): the guard is held across
+    /// an `.await`, which `clippy::await_holding_lock` rightly rejects for a
+    /// sync guard.
+    static TRANSFERS_FAILED_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// Regression test for #4827: a failed outbound stream must increment
+    /// `transfers_failed`.
+    ///
+    /// The bug: `transfers_failed` was declared, read, reset, rendered on the
+    /// dashboard, and uploaded to telemetry, but NOTHING ever incremented it —
+    /// it was structurally pinned at 0, so a node whose transfers were all
+    /// failing rendered as `N ok / 0 fail` and looked perfectly healthy.
+    ///
+    /// This drives the REAL `recv()` loop rather than calling
+    /// `record_transfer_failed` directly, because the bug was missing WIRING,
+    /// not a missing counter: a test that only exercised the metrics function
+    /// would pass even with both call sites deleted. The pre-existing tests
+    /// (`metrics.rs`) only assert the counter STAYS 0, which is exactly why CI
+    /// never caught this — do not copy that pattern.
+    ///
+    /// Both arms are covered because both are real transfer failures and both
+    /// emit `emit_transfer_failed`; see the call sites for why "transient"
+    /// classifies connection liveness, not the transfer's fate.
+    #[tokio::test]
+    async fn recv_records_transfer_failed_on_transient_stream_failure() {
+        let _guard = TRANSFERS_FAILED_TEST_LOCK.lock().await;
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 4).into(), 50004);
+        // `_inbound_tx` must stay alive: dropping it closes the inbound channel
+        // and recv() returns before the outbound-stream arm is polled.
+        let (mut conn, _inbound_tx) = test_conn_for_outbound_stream_arm(remote_addr);
+
+        let before = crate::transport::TRANSPORT_METRICS
+            .read_snapshot()
+            .transfers_failed;
+
+        // `OutboundStreamFailed` is what send_stream/pipe_stream's stream-scoped
+        // error sites return (cwnd-wait timeout, pipe inactivity stall,
+        // inbound-feed error) — the dominant outbound-stream failure by far. It
+        // is `is_transient_send_failure()`, so it takes the connection-survives
+        // arm.
+        let err = TransportError::OutboundStreamFailed(remote_addr);
+        assert!(
+            err.is_transient_send_failure(),
+            "test premise: OutboundStreamFailed must be classified transient, \
+             otherwise this test is silently exercising the other arm"
+        );
+        conn.outbound_stream_futures
+            .push(tokio::spawn(async move { Err(err) }));
+
+        // The transient arm logs and keeps looping, so recv() never returns
+        // here — the bounded wait is just an upper bound for giving up. The
+        // arm itself fires as soon as the future is ready.
+        let recv_result = tokio::time::timeout(Duration::from_millis(500), conn.recv()).await;
+        assert!(
+            recv_result.is_err(),
+            "a transient stream failure must NOT end recv() — the connection \
+             survives and only the stream fails (#4345)"
+        );
+
+        let after = crate::transport::TRANSPORT_METRICS
+            .read_snapshot()
+            .transfers_failed;
+        assert_eq!(
+            after,
+            before + 1,
+            "a transient outbound-stream failure must increment transfers_failed \
+             (#4827): the counter had no writer and was permanently 0"
+        );
+    }
+
+    /// Regression test for #4827, terminal arm — see
+    /// `recv_records_transfer_failed_on_transient_stream_failure`.
+    ///
+    /// A non-transient stream error tears the connection down. The transfer
+    /// still failed, and `emit_transfer_failed` still fired for it, so the
+    /// counter must move before the error propagates.
+    ///
+    /// Reachability note: from an outbound stream this arm is only reachable
+    /// via `TransportError::Serialization` — the sole non-transient error
+    /// `packet_sending` can produce (a bincode failure from
+    /// `try_serialize_msg_to_packet_data`); every other outbound-stream error
+    /// is `OutboundStreamFailed` or `SendFailed`, both transient. That is
+    /// exactly why instrumenting ONLY this arm would have left the counter
+    /// ~always 0 and not fixed #4827.
+    ///
+    /// The injected error is `ConnectionEstablishmentFailure` carrying a unique
+    /// sentinel `cause`, NOT `ConnectionClosed`: a closed inbound channel also
+    /// yields `ConnectionClosed` (see the `inbound.ok_or_else(..)` site in
+    /// `recv`), so asserting on that variant could pass for the wrong reason.
+    /// The sentinel proves the error came from OUR stream task. What the arm
+    /// actually keys off is the `!is_transient_send_failure()` predicate, which
+    /// the test asserts directly.
+    #[tokio::test]
+    async fn recv_records_transfer_failed_on_terminal_stream_failure() {
+        let _guard = TRANSFERS_FAILED_TEST_LOCK.lock().await;
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 5).into(), 50005);
+        // `_inbound_tx` must stay alive — see the transient test above.
+        let (mut conn, _inbound_tx) = test_conn_for_outbound_stream_arm(remote_addr);
+
+        let before = crate::transport::TRANSPORT_METRICS
+            .read_snapshot()
+            .transfers_failed;
+
+        const SENTINEL: &str = "4827-terminal-stream-failure-sentinel";
+        let err = TransportError::ConnectionEstablishmentFailure {
+            cause: SENTINEL.into(),
+        };
+        assert!(
+            !err.is_transient_send_failure(),
+            "test premise: the injected error must NOT be classified transient, \
+             otherwise this test is silently exercising the other arm"
+        );
+        conn.outbound_stream_futures
+            .push(tokio::spawn(async move { Err(err) }));
+
+        // The terminal arm returns the error, so recv() resolves on its own.
+        let recv_result = tokio::time::timeout(Duration::from_millis(500), conn.recv())
+            .await
+            .expect("recv() must return promptly on a terminal stream failure");
+        match recv_result {
+            Err(TransportError::ConnectionEstablishmentFailure { cause }) => assert_eq!(
+                cause, SENTINEL,
+                "the terminal arm must propagate OUR stream error unchanged"
+            ),
+            other => panic!(
+                "the terminal arm must propagate the injected stream error; a \
+                 different error means recv() bailed out somewhere else and the \
+                 outbound-stream arm was never reached. Got: {other:?}"
+            ),
+        }
+
+        let after = crate::transport::TRANSPORT_METRICS
+            .read_snapshot()
+            .transfers_failed;
+        assert_eq!(
+            after,
+            before + 1,
+            "a terminal outbound-stream failure must increment transfers_failed \
+             (#4827) before the error propagates"
         );
     }
 
