@@ -193,9 +193,18 @@
     //   - Why string surgery, not URLSearchParams.delete(): delete() reserializes
     //     the whole query, form-encoding co-inherited params (`%20`->`+`,
     //     `~`->`%7E`); a raw-pair filter preserves the kept params' bytes.
-    var gatewayOrigin;
+    // Prefer the frame's real location for the gateway-origin check: location.href
+    // is the served URL and is NOT affected by a contract-declared <base href>,
+    // so a contract can't relabel an external destination as gateway-local to
+    // make us mutate its query. Fall back to document.baseURI only when location
+    // has no http(s) origin (e.g. an about:srcdoc test/dev context).
+    var gatewayOrigin = null;
     try {
-      gatewayOrigin = new URL(document.baseURI).origin;
+      var loc = new URL(location.href);
+      gatewayOrigin =
+        loc.protocol === 'http:' || loc.protocol === 'https:'
+          ? loc.origin
+          : new URL(document.baseURI).origin;
     } catch (err) {
       gatewayOrigin = null;
     }
