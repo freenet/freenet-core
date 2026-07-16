@@ -510,9 +510,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
           }
         } catch (e) {}
       } else if (msg.type === 'open_url' && typeof msg.url === 'string') {
-        // Open external URLs in a new tab. Popups from the sandboxed iframe
-        // inherit the opaque origin, breaking CORS on target sites. The shell
-        // opens the URL instead, giving proper origin. See issue #1499.
+        // Open a URL in a new tab. External links come here from the anchor
+        // interceptor; same-origin (in-app) URLs also arrive from the
+        // window.open override (#4645). Popups the sandboxed iframe opens
+        // itself inherit the opaque origin, breaking CORS on target sites and
+        // (hosted) losing the per-user key. The shell opens the URL instead,
+        // giving proper origin. See issue #1499.
         //
         // Security model: this scheme allow-list is the PRIMARY gate, not
         // defence in depth. A malicious contract iframe can postMessage

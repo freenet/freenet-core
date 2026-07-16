@@ -81,18 +81,41 @@
   // real origin, so having IT open the URL (via the same `open_url` bridge the
   // cross-origin anchor path uses) yields a normal tab that works.
   //
-  // The returned WindowProxy is intentionally dropped (return null). A popup
-  // opened from here would be a DIFFERENT opaque origin than this document, so
-  // the opener could never script it across that boundary anyway; nothing is
-  // lost by not handing back a reference, and null matches the shell's
-  // `noopener` open. Non-http(s) targets (empty/about:blank, javascript:,
-  // blob:, data:) fall back to the native open so unrelated behavior is
-  // unchanged; `open_url`'s scheme allow-list is the security gate for the
-  // forwarded case, exactly as for anchor clicks.
+  // Behavior notes (this changes window.open semantics for contract apps, so be
+  // precise about what is and isn't forwarded):
+  //   - Only NEW-window requests are forwarded. `_self`/`_parent`/`_top` name
+  //     an EXISTING context (in-place navigation, no sandbox-inheriting popup),
+  //     so they stay native.
+  //   - The `name` (window name) and `features` (size/position) arguments are
+  //     dropped for a forwarded open: the shell always opens a fresh tab. Named
+  //     -window reuse and popup sizing don't survive; on a hosted node such a
+  //     popup was a dead sandboxed context anyway, so this is not a regression
+  //     there.
+  //   - The returned WindowProxy is dropped (return null). A popup opened from
+  //     here is a DIFFERENT opaque origin the opener could never script across
+  //     anyway, and null matches the shell's `noopener` open. Chained callers
+  //     (`window.open(url).focus()`) will throw on null — an accepted break, as
+  //     that popup was a dead end on a hosted node.
+  //   - Non-http(s) targets (empty/about:blank, javascript:, blob:, data:) and
+  //     URL objects/other args are handled below; `open_url`'s scheme allow-list
+  //     is the security gate for whatever IS forwarded, exactly as for anchors.
+  //   - Loopback targets (localhost/127.0.0.1/...) are NOT forwarded: the shell
+  //     `open_url` handler refuses them, so forwarding would silently drop the
+  //     open. We fall back to native there, preserving prior local-node behavior
+  //     (local nodes have no per-user dead-end to fix). Hosted nodes use a real
+  //     domain, so this never affects the case #4645 is about.
   var nativeWindowOpen =
     typeof window.open === 'function' ? window.open.bind(window) : null;
   function fallbackOpen(url, name, features) {
     return nativeWindowOpen ? nativeWindowOpen(url, name, features) : null;
+  }
+  // Kept in sync with the loopback block in shell_bridge.js's open_url handler:
+  // forward only what that handler will actually open.
+  function isLoopbackHost(hostname) {
+    var h = hostname.toLowerCase();
+    return (
+      h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0'
+    );
   }
   window.open = function (url, name, features) {
     // Only intercept a genuinely nested context that has a shell to forward to.
@@ -100,7 +123,25 @@
     if (!window.parent || window.parent === window) {
       return fallbackOpen(url, name, features);
     }
-    if (typeof url !== 'string' || url === '') {
+    // In-place navigation targets are not new-window requests; leave to native.
+    if (name === '_self' || name === '_parent' || name === '_top') {
+      return fallbackOpen(url, name, features);
+    }
+    // A missing/empty target is native about:blank; keep it native so
+    // `var w = window.open(); w.document.write(...)` flows are unchanged.
+    if (url === undefined || url === null) {
+      return fallbackOpen(url, name, features);
+    }
+    // Coerce URL objects / other stringifiables the way the native API does,
+    // so window.open(new URL(...)) is forwarded rather than sent to native
+    // (which would recreate the sandbox-inherited dead end this patch prevents).
+    var urlStr;
+    try {
+      urlStr = String(url);
+    } catch (err) {
+      return fallbackOpen(url, name, features);
+    }
+    if (urlStr === '') {
       return fallbackOpen(url, name, features);
     }
     var resolved;
@@ -108,13 +149,21 @@
       // Resolve relative targets (e.g. window.open('page2')) against the
       // iframe's base so the shell receives an absolute URL; new URL() with a
       // relative string and no base would throw.
-      resolved = new URL(url, document.baseURI);
+      resolved = new URL(urlStr, document.baseURI);
     } catch (err) {
       return fallbackOpen(url, name, features);
     }
     if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') {
       return fallbackOpen(url, name, features);
     }
+    if (isLoopbackHost(resolved.hostname)) {
+      return fallbackOpen(url, name, features);
+    }
+    // Strip the internal `__sandbox` routing param: a hash-only or query-
+    // relative target (e.g. window.open('#x')) inherits `?__sandbox=1` from the
+    // iframe's base, and opening THAT top-level would serve raw sandbox content
+    // with no shell wrapper. Removing it makes the shell serve the wrapper page.
+    resolved.searchParams.delete('__sandbox');
     window.parent.postMessage(
       {
         __freenet_shell__: true,

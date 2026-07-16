@@ -7,8 +7,11 @@
 //!         allow="clipboard-read; clipboard-write">`
 //! with an opaque origin that cannot access other contracts' data.
 //! Popups inherit the sandbox (no `allow-popups-to-escape-sandbox`); external links
-//! are opened via the `open_url` shell bridge message to avoid CORS issues. Sandbox content
-//! is protected from top-level access via Sec-Fetch-Dest checks in client_api.rs.
+//! are opened via the `open_url` shell bridge message to avoid CORS issues. The
+//! injected interceptor also overrides programmatic `window.open` in the iframe,
+//! routing http(s) opens through the same `open_url` bridge so a new tab gets the
+//! shell's real origin instead of a sandbox-inheriting opaque one (freenet-core#4645).
+//! Sandbox content is protected from top-level access via Sec-Fetch-Dest checks in client_api.rs.
 
 use std::{
     path::{Path, PathBuf},
@@ -1041,8 +1044,9 @@ async fn sandbox_content_body(
 
     // Inject the WebSocket shim and navigation interceptor before any other scripts.
     // The shim overrides window.WebSocket so that wasm-bindgen routes connections
-    // through the shell page's bridge. The interceptor catches <a> clicks and
-    // routes them through postMessage for multi-page navigation.
+    // through the shell page's bridge. The interceptor catches <a> clicks AND
+    // overrides programmatic window.open, routing both through postMessage for
+    // multi-page navigation without a sandbox-inheriting popup (#4645).
     let injected_scripts =
         format!("<script>{WEBSOCKET_SHIM_JS}</script><script>{NAVIGATION_INTERCEPTOR_JS}</script>");
     if let Some(pos) = body.find("</head>") {
@@ -1144,6 +1148,15 @@ const WEBSOCKET_SHIM_JS: &str = include_str!("path_handlers/assets/websocket_shi
 /// Same-origin links with an explicit non-`_self` target are left to the
 /// browser so webapps that legitimately want multi-tab navigation within
 /// their own contract still work.
+///
+/// The interceptor also overrides programmatic `window.open`: an app that opens
+/// a new tab from its own JS bypasses the click/auxclick listeners, and on a
+/// hosted node the resulting opaque-origin popup can't read the per-user access
+/// key and dead-ends (freenet-core#4645). http(s) new-window opens are forwarded
+/// through the same `open_url` bridge (real origin); `_self`/`_parent`/`_top`,
+/// non-http(s) schemes, and loopback targets (which `open_url` refuses) fall back
+/// to the native open. The returned WindowProxy is dropped (null), matching the
+/// shell's `noopener` open.
 const NAVIGATION_INTERCEPTOR_JS: &str =
     include_str!("path_handlers/assets/navigation_interceptor.js");
 
@@ -4293,15 +4306,20 @@ mod tests {
     /// `window.open` and route http(s) targets through the shell's `open_url`
     /// bridge (real origin), returning null.
     ///
-    /// Pin the contract so a future edit can't silently drop the override:
+    /// Pin the contract so a future edit can't silently drop the override or
+    /// regress the edge cases the review surfaced. Behavioral coverage lives in
+    /// `crates/core/tests/playwright/tests/window-open.spec.ts` (runs in CI via
+    /// playwright-shell.yml); these source pins are the cheap CI-required guard.
     ///   1. `window.open` is reassigned (the override exists).
     ///   2. The override forwards through the SAME `open_url` bridge as the
-    ///      cross-origin anchor path.
-    ///   3. Relative targets are resolved against `document.baseURI` so the
-    ///      shell receives an absolute URL (a bare relative string would make
-    ///      `new URL()` throw and the forward would be lost).
-    ///   4. Only http/https is forwarded; other schemes fall back to native so
-    ///      unrelated behavior (about:blank, blob:, javascript:) is unchanged.
+    ///      cross-origin anchor path, posting the RESOLVED ABSOLUTE url
+    ///      (`resolved.href`) — not the raw arg, which would drop relative opens.
+    ///   3. Targets are resolved against `document.baseURI` so the shell gets an
+    ///      absolute URL.
+    ///   4. Only http/https is forwarded; other schemes fall back to native.
+    ///   5. `_self`/`_parent`/`_top` (in-place navigation) fall back to native.
+    ///   6. Loopback targets fall back to native (open_url refuses them).
+    ///   7. The arg is coerced to a string so URL objects are forwarded.
     #[test]
     fn navigation_interceptor_overrides_window_open() {
         let js = NAVIGATION_INTERCEPTOR_JS;
@@ -4310,8 +4328,8 @@ mod tests {
             "interceptor must override window.open so programmatic opens don't \
              create a sandbox-inherited null-origin popup (#4645)"
         );
-        // The override must forward through the shell's open_url bridge, in the
-        // __freenet_shell__ namespace, exactly like the cross-origin anchor path.
+        // The override is the final construct in the IIFE, so slicing to EOF
+        // scopes assertions to it (nothing but the `})();` close follows).
         let open_fn_idx = js
             .find("window.open = function")
             .expect("window.open override present");
@@ -4324,11 +4342,19 @@ mod tests {
             override_block.contains("__freenet_shell__: true"),
             "window.open override must use the __freenet_shell__ namespace (#4645)"
         );
-        // Relative targets resolved against the iframe base, else new URL() throws.
+        // Must post the RESOLVED absolute URL, not the raw (possibly relative)
+        // arg — posting `url` raw would make open_url's `new URL(msg.url)` throw
+        // on a relative target and silently drop the open.
         assert!(
-            override_block.contains("new URL(url, document.baseURI)"),
-            "window.open override must resolve relative targets against \
-             document.baseURI so the shell gets an absolute URL (#4645)"
+            override_block.contains("url: resolved.href"),
+            "window.open override must post the resolved absolute URL \
+             (resolved.href), not the raw arg (#4645)"
+        );
+        // Resolve against the iframe base so relative targets become absolute.
+        assert!(
+            override_block.contains("document.baseURI"),
+            "window.open override must resolve targets against document.baseURI \
+             so the shell gets an absolute URL (#4645)"
         );
         // http(s)-only forward; everything else falls back to native open.
         assert!(
@@ -4337,10 +4363,41 @@ mod tests {
             "window.open override must only forward http(s); other schemes \
              fall back to native (#4645)"
         );
+        // In-place navigation targets are not new-window requests -> native.
+        assert!(
+            override_block.contains("name === '_self'"),
+            "window.open override must leave _self/_parent/_top to native so \
+             in-place navigation isn't turned into a new tab (#4645)"
+        );
+        // Loopback targets must fall back to native: open_url refuses them, so
+        // forwarding would silently drop the open on local nodes.
+        assert!(
+            override_block.contains("isLoopbackHost(resolved.hostname)"),
+            "window.open override must fall back to native for loopback hosts \
+             (open_url refuses them) so local-node opens aren't silently dropped (#4645)"
+        );
+        // Coerce the arg so window.open(new URL(...)) is forwarded, not sent to
+        // native (which would recreate the dead end).
+        assert!(
+            override_block.contains("String(url)"),
+            "window.open override must string-coerce the arg so URL objects are \
+             forwarded rather than dead-ended (#4645)"
+        );
+        // Non-forwarded cases delegate to the captured native window.open.
         assert!(
             override_block.contains("fallbackOpen"),
             "window.open override must fall back to native open for the \
              non-forwarded cases (#4645)"
+        );
+        // The forwarded case drops the WindowProxy (matches the shell's
+        // noopener open) and asks for a plain tab (shiftKey false).
+        assert!(
+            override_block.contains("shiftKey: false"),
+            "window.open override must request a plain tab (shiftKey false) (#4645)"
+        );
+        assert!(
+            override_block.contains("return null;"),
+            "window.open override must return null for the forwarded case (#4645)"
         );
     }
 
