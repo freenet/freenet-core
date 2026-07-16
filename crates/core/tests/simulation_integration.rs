@@ -9316,9 +9316,14 @@ fn test_get_reliability_diagnostic() {
         ),
     ];
 
-    // Every node GETs the contract — this exercises multi-hop routing
-    // across the full network topology
-    for i in 0..NUM_NODES {
+    // Every regular node GETs the contract — this exercises multi-hop routing
+    // across the full network topology. NOTE the label range: `config_nodes`
+    // builds the regular nodes with `node_no` starting at `number_of_gateways`,
+    // so their labels are node-{NUM_GATEWAYS}..node-{NUM_GATEWAYS + NUM_NODES - 1},
+    // NOT node-0..node-{NUM_NODES - 1}. Iterating 0..NUM_NODES would schedule GETs
+    // for NUM_GATEWAYS phantom labels (no such node) and skip the top NUM_GATEWAYS
+    // real nodes — so iterate the real range instead.
+    for i in NUM_GATEWAYS..NUM_GATEWAYS + NUM_NODES {
         operations.push(ScheduledOperation::new(
             NodeLabel::node(NETWORK_NAME, i),
             SimOperation::Get {
@@ -9509,10 +9514,13 @@ fn test_get_reliability_diagnostic() {
         );
     }
 
-    // Check which nodes got the contract state
+    // Check which regular nodes got the contract state. Same real-node label
+    // range as the GET loop above (offset by NUM_GATEWAYS): iterating 0..NUM_NODES
+    // would count NUM_GATEWAYS phantom labels as "missing" and skip that many real
+    // nodes, biasing the retrievability count.
     let mut nodes_with_state = 0;
     let mut nodes_without_state = Vec::new();
-    for i in 0..NUM_NODES {
+    for i in NUM_GATEWAYS..NUM_GATEWAYS + NUM_NODES {
         let label = NodeLabel::node(NETWORK_NAME, i);
         if let Some(storage) = result.node_storages.get(&label) {
             if storage.get_stored_state(&contract_key).is_some() {
@@ -9585,13 +9593,12 @@ fn test_get_reliability_diagnostic() {
     // higher-index nodes' GETs fired before those nodes finished joining and
     // were rejected with PeerNotJoined (every GET that DID run succeeded). The
     // fix is the `wait_for_join_convergence_before_ops` barrier above — wait for
-    // peers to join, THEN GET — which lifts retrievability to a measured 97/100
-    // (only nodes 0-2 miss, whose GETs fire first and race the initial PUT's
-    // propagation), far above the 51/100 no-barrier baseline. Floor at 90/100 =
-    // measured minus a ~7-node margin. The margin is not seed jitter (the seed
-    // is fixed) but headroom for the turmoil runner's residual (~1%)
-    // non-determinism and benign placement shifts; it still catches a real
-    // regression.
+    // peers to join, THEN GET — which lifts retrievability to a measured 100/100
+    // (over the real regular-node label range, see the loops above), far above
+    // the ~51/100 no-barrier baseline. Floor at 90/100 leaves headroom below the
+    // measured value for the turmoil runner's residual (~1%) non-determinism and
+    // benign placement shifts (the seed is fixed, so this is not seed jitter); it
+    // still catches a real regression.
     assert!(
         nodes_with_state >= NUM_NODES * 90 / 100,
         "Only {}/{} nodes ended up holding the contract — retrievability below \
