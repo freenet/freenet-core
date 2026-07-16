@@ -110,17 +110,27 @@
     return nativeWindowOpen ? nativeWindowOpen(url, name, features) : null;
   }
   // Kept in sync with the loopback block in shell_bridge.js's open_url handler:
-  // forward only what that handler will actually open.
+  // forward only what that handler will actually open. WHATWG `URL.hostname`
+  // serializes an IPv6 literal WITH brackets (`[::1]`), so strip them before
+  // comparing or `http://[::1]/` would slip past the loopback fallback.
   function isLoopbackHost(hostname) {
-    var h = hostname.toLowerCase();
+    var h = hostname.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
     return (
       h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0'
     );
   }
   window.open = function (url, name, features) {
-    // Only intercept a genuinely nested context that has a shell to forward to.
-    // A top-level document (no distinct parent) keeps native behavior.
-    if (!window.parent || window.parent === window) {
+    // Only intercept when this frame is the shell's DIRECT child. A top-level
+    // document (parent === window) keeps native behavior; so does a DEEPER
+    // descendant (a contract that embeds another served page), whose parent is
+    // an app frame rather than the shell — forwarding open_url there would post
+    // to the app frame, which the shell never sees, silently losing the open.
+    // For the direct app frame, parent and top are both the shell.
+    if (
+      !window.parent ||
+      window.parent === window ||
+      window.parent !== window.top
+    ) {
       return fallbackOpen(url, name, features);
     }
     // In-place navigation targets are not new-window requests; leave to native.
@@ -160,12 +170,26 @@
     // `?__sandbox=1` and, opened top-level, serve raw sandbox content with no
     // shell wrapper. Stripping on the base leaves an ABSOLUTE external target
     // untouched (it ignores the base), so we never reserialize an external
-    // query string — mutating the resolved URL's query would turn `%20` into
-    // `+` and `~` into `%7E` and could break signed/opaque links.
+    // query string.
+    //
+    // Remove only the raw `__sandbox` pair by string surgery, NOT via
+    // URLSearchParams.delete(): delete() reserializes the WHOLE query, which
+    // form-encodes co-inherited params (`%20`->`+`, `~`->`%7E`) and could break
+    // a signed/opaque param the base carries alongside `__sandbox` (e.g. an
+    // invitation deep-link). Reassigning `.search` with the kept pairs preserves
+    // their bytes.
     var baseHref;
     try {
       var base = new URL(document.baseURI);
-      base.searchParams.delete('__sandbox');
+      if (base.search) {
+        var kept = base.search
+          .slice(1)
+          .split('&')
+          .filter(function (pair) {
+            return pair !== '__sandbox' && pair.slice(0, 10) !== '__sandbox=';
+          });
+        base.search = kept.join('&');
+      }
       baseHref = base.href;
     } catch (err) {
       baseHref = document.baseURI;

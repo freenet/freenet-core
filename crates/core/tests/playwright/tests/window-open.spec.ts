@@ -221,6 +221,8 @@ test("does not forward loopback targets (open_url refuses them); stays native", 
     buildSrcdoc(BASE, [
       { label: "loopback-ip", expr: "'http://127.0.0.1:8080/x'" },
       { label: "loopback-name", expr: "'http://localhost:8080/x'" },
+      // URL.hostname serializes IPv6 with brackets ([::1]); must still match.
+      { label: "loopback-ipv6", expr: "'http://[::1]:8080/x'" },
     ]),
   );
   const report = collected.report!;
@@ -228,20 +230,84 @@ test("does not forward loopback targets (open_url refuses them); stays native", 
   expect(collected.forwarded.length).toBe(0);
   expect(report.nativeCalls).toContain("http://127.0.0.1:8080/x");
   expect(report.nativeCalls).toContain("http://localhost:8080/x");
+  expect(report.nativeCalls).toContain("http://[::1]:8080/x");
 });
 
-test("strips the __sandbox routing param so a hash-only open serves the shell wrapper", async ({
+test("strips only __sandbox from a hash-only open, preserving co-inherited app params", async ({
   page,
 }) => {
-  // A hash-only target inherits ?__sandbox=1 from the iframe base; forwarding
-  // that unchanged would open raw sandbox content top-level (no shell wrapper).
-  const collected = await runHarness(page, buildSrcdoc(BASE, [{ label: "hash-only", expr: "'#deep/link'" }]));
+  // A hash-only target inherits the base query (?__sandbox=1 plus any app params
+  // like an invitation deep-link) — forwarding ?__sandbox=1 unchanged would open
+  // raw sandbox content top-level. Strip ONLY __sandbox; the co-param's bytes
+  // (%20, ~) must survive (URLSearchParams.delete would form-encode them).
+  const baseWithParam =
+    "https://node.example/v1/contract/web/KEY/?__sandbox=1&invite=a%20b~";
+  const collected = await runHarness(
+    page,
+    buildSrcdoc(baseWithParam, [{ label: "hash-only", expr: "'#deep/link'" }]),
+  );
   const report = collected.report!;
   expect(report.error).toBeUndefined();
   expect(collected.forwarded.length).toBe(1);
   const url = collected.forwarded[0].url;
   expect(url).not.toContain("__sandbox");
-  expect(url).toBe("https://node.example/v1/contract/web/KEY/#deep/link");
+  // Co-param preserved byte-for-byte (no %20 -> + or ~ -> %7E corruption).
+  expect(url).toBe(
+    "https://node.example/v1/contract/web/KEY/?invite=a%20b~#deep/link",
+  );
+});
+
+test("does not intercept in a nested descendant frame (parent !== top)", async ({
+  page,
+}) => {
+  // A contract that embeds ANOTHER served page nests the interceptor two deep:
+  // window.parent is the app frame, not the shell (window.top). Forwarding there
+  // would post to the app frame, which the shell never sees, silently losing the
+  // open. The guard must fall back to native for such descendants. The inner
+  // frame reports its window.open return value to `top`; NATIVE_SPY proves the
+  // override fell back rather than forwarding.
+  const inner = `<!doctype html><html><head><base href="${BASE}"></head><body>
+<script>
+  window.open = function (u) { window.__native = String(u); return { __spy: true }; };
+</script>
+<script>${INTERCEPTOR}</script>
+<script>
+  var r = window.open('https://example.com/x');
+  top.postMessage({ __nested__: true, ret: (r && r.__spy) ? 'NATIVE_SPY' : (r === null ? 'null' : typeof r), parentIsTop: window.parent === window.top }, '*');
+</script>
+</body></html>`;
+  // Outer app frame simply embeds the inner frame (both sandboxed). Escape the
+  // inner document's </script> tags so they don't prematurely close the outer
+  // frame's own inline <script> when this HTML is parsed.
+  const innerEmbedded = JSON.stringify(inner).replace(/<\/script>/g, "<\\/script>");
+  const outer = `<!doctype html><html><body>
+<script>
+  var b = document.createElement('iframe');
+  b.setAttribute('sandbox', 'allow-scripts allow-popups');
+  b.srcdoc = ${innerEmbedded};
+  document.body.appendChild(b);
+</script>
+</body></html>`;
+
+  await page.goto("about:blank");
+  const result = await page.evaluate(
+    (outerArg: string) =>
+      new Promise<{ ret: string; parentIsTop: boolean }>((resolve) => {
+        window.addEventListener("message", (e: MessageEvent) => {
+          const m = e.data as Record<string, unknown>;
+          if (m && m.__nested__) resolve({ ret: m.ret as string, parentIsTop: m.parentIsTop as boolean });
+        });
+        const a = document.createElement("iframe");
+        a.setAttribute("sandbox", "allow-scripts allow-popups");
+        a.srcdoc = outerArg;
+        document.body.appendChild(a);
+      }),
+    outer,
+  );
+  // In the nested frame, parent (app frame) is NOT top (this page).
+  expect(result.parentIsTop).toBe(false);
+  // So the override fell back to native rather than forwarding a lost open_url.
+  expect(result.ret).toBe("NATIVE_SPY");
 });
 
 test("does not override window.open at top level (parent guard)", async ({ page }) => {

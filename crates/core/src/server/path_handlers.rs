@@ -4385,6 +4385,13 @@ mod tests {
             "window.open override must string-coerce the arg so URL objects are \
              forwarded rather than dead-ended (#4645)"
         );
+        // Only the shell's DIRECT child forwards: a deeper descendant's parent
+        // is an app frame the shell never hears, so it must stay native.
+        assert!(
+            override_block.contains("window.parent !== window.top"),
+            "window.open override must only intercept the shell's direct child \
+             (window.parent === window.top), else nested-frame opens are lost (#4645)"
+        );
         // Non-forwarded cases delegate to the captured native window.open.
         assert!(
             override_block.contains("fallbackOpen"),
