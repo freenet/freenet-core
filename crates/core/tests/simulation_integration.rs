@@ -8794,6 +8794,23 @@ fn test_relay_route_events_multihop() {
 ///   stops being a decoy. Additional requesters would be served by the decoy at
 ///   hop 1 and would exercise nothing.
 ///
+/// * **Routing is greedy, but NOT because of `rnd_if_htl_above`.** That parameter
+///   is inert: it is plumbed to `ConnectionManager` and read exactly once
+///   (`connection_manager.rs`, in the `should_accept` debug line) as a **tracing
+///   log field**. There is no `htl > rnd_if_htl_above` branch anywhere in the
+///   crate, so no value of it makes routing non-greedy. The value passed here is
+///   arbitrary — do not "tune" it expecting a routing change.
+///
+/// * **Route determinism depends on staying under ~10 routing events.**
+///   `Router::select_peer`'s sub-50-event path sorts untried-before-tried
+///   (`fa.cmp(&fb).then_with(|| da.cmp(db))`) — i.e. *ahead of* distance — and
+///   `peer_adjustments` is populated for every peer once the global regression
+///   reaches `ADJUSTMENT_PRIOR_SIZE` (10) events. So in the 10..50 regime a peer
+///   with history sorts behind one without, regardless of distance, which could
+///   route straight to a holder and skip the decoy. One GET is ~1-3 events, so
+///   there is comfortable margin, and the traversal assertion below fails loudly
+///   if it is ever crossed. Anyone adding operations to this test should know.
+///
 /// # Why it is built this way
 ///
 /// This test previously obtained its sparse-hosting precondition **by luck**: it
@@ -8884,7 +8901,7 @@ fn test_get_reaches_sparse_holder_via_relay_forwarding() {
             1,         // 1 gateway
             num_nodes, // 4 regular nodes
             3,         // ring_max_htl — see "Why the mechanics are what they are"
-            3,         // rnd_if_htl_above — >= ring_max_htl, so routing is always greedy
+            3,         // rnd_if_htl_above — INERT, see below; value is arbitrary
             12,        // max_connections — ample, so no preseeded edge is capped away
             3,         // min_connections
             SEED,
@@ -8912,7 +8929,23 @@ fn test_get_reaches_sparse_holder_via_relay_forwarding() {
     let decoy_dist = ring_dist(locs[1], key_loc);
     let holder_dists = [ring_dist(locs[2], key_loc), ring_dist(locs[3], key_loc)];
     let requester_dist = ring_dist(locs[4], key_loc);
+    // The gateway's location is NOT chosen by this test — it is derived from the
+    // seed — and preseeding does not suppress organic CONNECT, so the requester
+    // does connect to it. That makes the gateway a live routing candidate whose
+    // distance to the key is a seed-derived quantity, i.e. exactly the kind of
+    // dependency this test exists to remove. Assert it rather than rely on the
+    // margin: HTL has zero slack here (requester 3 -> decoy 2 -> holder 1), so a
+    // gateway hop inserted into the route would exhaust HTL and yield NotFound.
+    let gateway_dist = ring_dist(locs[0], key_loc);
     for (i, holder_dist) in holder_dists.iter().enumerate() {
+        assert!(
+            *holder_dist < gateway_dist,
+            "scenario setup wrong: the seed-derived gateway landed closer to the key \
+             than holder {i}, so it can win a greedy pick and insert a hop into the \
+             forced route. With no HTL slack that turns the GET into a NotFound. \
+             Re-pick SEED or move the holders. \
+             holder_dist={holder_dist}, gateway_dist={gateway_dist}"
+        );
         assert!(
             decoy_dist < *holder_dist,
             "scenario setup wrong: the decoy must be strictly closer to the key than \
