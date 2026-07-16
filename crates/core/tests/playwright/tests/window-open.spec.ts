@@ -192,6 +192,44 @@ test("falls back to native for non-http(s), empty, and in-place (_self) targets"
   expect(report.nativeCalls).toContain("javascript:alert(1)");
 });
 
+test("strips __sandbox from an absolute same-origin open (window.open(location.href)), keeping subpath + params", async ({
+  page,
+}) => {
+  // window.open(location.href) is an ABSOLUTE same-origin URL that carries
+  // ?__sandbox=1; opened top-level the shell would redirect it to the shell root
+  // and drop the subpath + app params. Strip __sandbox but keep everything else.
+  const sameOriginAbs =
+    "https://node.example/v1/contract/web/KEY/sub/page?__sandbox=1&invite=a%20b~";
+  const collected = await runHarness(
+    page,
+    buildSrcdoc(BASE, [{ label: "same-origin-abs", expr: JSON.stringify(sameOriginAbs) }]),
+  );
+  const report = collected.report!;
+  expect(report.error).toBeUndefined();
+  expect(collected.forwarded.length).toBe(1);
+  const url = collected.forwarded[0].url;
+  expect(url).not.toContain("__sandbox");
+  // Subpath preserved and the co-param kept byte-for-byte (no %20 -> +).
+  expect(url).toBe(
+    "https://node.example/v1/contract/web/KEY/sub/page?invite=a%20b~",
+  );
+});
+
+test("forwards window.open(null) as the coerced relative 'null' target (native parity)", async ({
+  page,
+}) => {
+  // Native Web IDL coerces null to the string "null" (a relative URL), unlike an
+  // omitted arg (about:blank). So it must be forwarded, not sent to native.
+  const collected = await runHarness(page, buildSrcdoc(BASE, [{ label: "null-arg", expr: "null" }]));
+  const report = collected.report!;
+  expect(report.error).toBeUndefined();
+  expect(report.nativeCalls.length).toBe(0);
+  expect(collected.forwarded.length).toBe(1);
+  expect(collected.forwarded[0].url).toBe(
+    "https://node.example/v1/contract/web/KEY/null",
+  );
+});
+
 test("forwards absolute external URLs without reserializing the query string", async ({
   page,
 }) => {

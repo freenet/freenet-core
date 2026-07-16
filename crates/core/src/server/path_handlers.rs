@@ -4502,15 +4502,15 @@ mod tests {
         );
     }
 
-    /// `URL.hostname` strips the brackets from IPv6 literals, so a URL
-    /// `http://[::1]/` parses with `hostname === '::1'` (no brackets), and
-    /// the previous comparison `h === '[::1]'` never matched. The IPv6
-    /// loopback was effectively unblocked. The relaxation in
-    /// freenet/river#231 (accepting http: in addition to https:) makes
-    /// the gap newly reachable for typical home services, so fix it
-    /// alongside the http: change.
+    /// WHATWG `URL.hostname` serializes an IPv6 literal WITH brackets, so
+    /// `new URL('http://[::1]/').hostname === '[::1]'`. The handler must
+    /// therefore STRIP the brackets before comparing against `::1`, or the
+    /// loopback refusal never matches and a forged link to the viewer's IPv6
+    /// loopback slips through. (An earlier version of this test and the code
+    /// comment both had the fact inverted — asserting hostname is bracket-LESS —
+    /// so the test passed while the IPv6 loopback was in fact unblocked. #4645.)
     #[test]
-    fn shell_open_url_handler_blocks_ipv6_loopback_without_brackets() {
+    fn shell_open_url_handler_blocks_ipv6_loopback() {
         let js = SHELL_BRIDGE_JS;
         let open_url_idx = js
             .find("msg.type === 'open_url'")
@@ -4522,19 +4522,18 @@ mod tests {
             .unwrap_or(rest.len());
         let block = &rest[..next_branch];
 
-        // The block list must compare against `::1` (no brackets), the
-        // form `URL.hostname` actually returns. The bracketed form is a
-        // dead arm.
+        // The handler must strip surrounding brackets from the hostname before
+        // the loopback comparison, so the serialized `[::1]` matches `::1`.
         assert!(
-            block.contains("'::1'"),
-            "open_url handler must block the IPv6 loopback hostname `::1` \
-             (no brackets — URL.hostname strips them); got block: {block}"
+            block.contains(r"replace(/^\[/"),
+            "open_url handler must strip the leading bracket from an IPv6 \
+             hostname before comparing, else `[::1]` never matches `::1` and \
+             IPv6 loopback is unblocked (#4645); got block: {block}"
         );
         assert!(
-            !block.contains("'[::1]'"),
-            "open_url handler must NOT compare against `[::1]` with \
-             brackets — that arm is dead because URL.hostname strips \
-             brackets from IPv6 literals; got block: {block}"
+            block.contains("'::1'"),
+            "open_url handler must compare the bracket-stripped hostname \
+             against `::1`; got block: {block}"
         );
     }
 

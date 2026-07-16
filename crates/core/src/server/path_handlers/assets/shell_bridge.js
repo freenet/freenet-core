@@ -541,10 +541,14 @@ function freenetBridge(authToken, userToken, hostedMode) {
         try {
           var u = new URL(msg.url);
           if (u.protocol !== 'https:' && u.protocol !== 'http:') return;
-          // URL.hostname strips brackets from IPv6 literals, so a URL
-          // `http://[::1]/` parses with hostname `::1`, NOT `[::1]`.
-          // Compare against the bracket-less form.
-          var h = u.hostname.toLowerCase();
+          // WHATWG URL.hostname serializes an IPv6 literal WITH brackets, so
+          // `http://[::1]/` has hostname `[::1]`, NOT `::1`. Strip the brackets
+          // before comparing, or the `::1` arm never matches and a forged link
+          // to the viewer's IPv6 loopback slips past this refusal.
+          var h = u.hostname
+            .toLowerCase()
+            .replace(/^\[/, '')
+            .replace(/\]$/, '');
           if (
             h === 'localhost' ||
             h === '127.0.0.1' ||

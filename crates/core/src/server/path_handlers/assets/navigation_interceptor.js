@@ -146,9 +146,11 @@
     ) {
       return fallbackOpen(url, name, features);
     }
-    // A missing/empty target is native about:blank; keep it native so
-    // `var w = window.open(); w.document.write(...)` flows are unchanged.
-    if (url === undefined || url === null) {
+    // An OMITTED target (window.open()) is native about:blank; keep it native so
+    // `var w = window.open(); w.document.write(...)` flows are unchanged. Explicit
+    // null is NOT omitted: native Web IDL coerces it to the string "null" (a
+    // relative URL), so let it fall through to the string coercion below.
+    if (url === undefined) {
       return fallbackOpen(url, name, features);
     }
     // Coerce URL objects / other stringifiables the way the native API does,
@@ -164,39 +166,10 @@
       return fallbackOpen(url, name, features);
     }
     // Resolve relative targets (e.g. window.open('page2')) against the iframe's
-    // base so the shell receives an absolute URL. Strip the internal `__sandbox`
-    // routing param from the BASE first, not the resolved URL: a hash-only or
-    // query-relative target (e.g. window.open('#x')) would otherwise inherit
-    // `?__sandbox=1` and, opened top-level, serve raw sandbox content with no
-    // shell wrapper. Stripping on the base leaves an ABSOLUTE external target
-    // untouched (it ignores the base), so we never reserialize an external
-    // query string.
-    //
-    // Remove only the raw `__sandbox` pair by string surgery, NOT via
-    // URLSearchParams.delete(): delete() reserializes the WHOLE query, which
-    // form-encodes co-inherited params (`%20`->`+`, `~`->`%7E`) and could break
-    // a signed/opaque param the base carries alongside `__sandbox` (e.g. an
-    // invitation deep-link). Reassigning `.search` with the kept pairs preserves
-    // their bytes.
-    var baseHref;
-    try {
-      var base = new URL(document.baseURI);
-      if (base.search) {
-        var kept = base.search
-          .slice(1)
-          .split('&')
-          .filter(function (pair) {
-            return pair !== '__sandbox' && pair.slice(0, 10) !== '__sandbox=';
-          });
-        base.search = kept.join('&');
-      }
-      baseHref = base.href;
-    } catch (err) {
-      baseHref = document.baseURI;
-    }
+    // base so the shell receives an absolute URL.
     var resolved;
     try {
-      resolved = new URL(urlStr, baseHref);
+      resolved = new URL(urlStr, document.baseURI);
     } catch (err) {
       return fallbackOpen(url, name, features);
     }
@@ -205,6 +178,35 @@
     }
     if (isLoopbackHost(resolved.hostname)) {
       return fallbackOpen(url, name, features);
+    }
+    // Strip the internal `__sandbox` routing param, but ONLY from a SAME-ORIGIN
+    // (this node's own) target, and ONLY the raw pair via string surgery.
+    //   - Why strip: `__sandbox=1` reaches the resolved URL both when a hash-only
+    //     / query-relative target (window.open('#x')) inherits it from the base
+    //     AND when an app duplicates its page (window.open(location.href), an
+    //     absolute same-origin URL). Opened top-level, the shell redirects
+    //     `?__sandbox=1` to the shell root, DROPPING the subpath and app params
+    //     (e.g. an invitation). Removing it opens the page the app intended.
+    //   - Why same-origin only: an ABSOLUTE EXTERNAL target is forwarded
+    //     byte-for-byte — its `__sandbox` (if any) is the destination's, not
+    //     ours, and reserializing its query could break signed/opaque links.
+    //   - Why string surgery, not URLSearchParams.delete(): delete() reserializes
+    //     the whole query, form-encoding co-inherited params (`%20`->`+`,
+    //     `~`->`%7E`); a raw-pair filter preserves the kept params' bytes.
+    var gatewayOrigin;
+    try {
+      gatewayOrigin = new URL(document.baseURI).origin;
+    } catch (err) {
+      gatewayOrigin = null;
+    }
+    if (gatewayOrigin && resolved.origin === gatewayOrigin && resolved.search) {
+      var kept = resolved.search
+        .slice(1)
+        .split('&')
+        .filter(function (pair) {
+          return pair !== '__sandbox' && pair.slice(0, 10) !== '__sandbox=';
+        });
+      resolved.search = kept.join('&');
     }
     window.parent.postMessage(
       {
