@@ -81,7 +81,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
         '(for example via "open link in new tab", a middle-click, or a ' +
         'right-click menu). Tabs opened that way run in a restricted mode ' +
         'that can’t reach the access key this hosted node uses to keep ' +
-        'your data separate, so the app won’t load here.';
+        'your data separate, so the app won’t load here. The address in this ' +
+        'tab looks normal, so reloading or retyping it here seems like it ' +
+        'should work. It will not: this tab itself is the one stuck in ' +
+        'restricted mode. Open a brand-new tab to continue.';
     } else {
       h.textContent = 'Browser storage required';
       lead.textContent =
@@ -105,8 +108,9 @@ function freenetBridge(authToken, userToken, hostedMode) {
       var howto = document.createElement('p');
       howto.style.cssText = 'margin:0 0 0.5rem;';
       howto.textContent =
-        'To continue, open this address in a normal browser tab ' +
-        '(one you start yourself, e.g. Ctrl/Cmd+T, then paste):';
+        'Open a brand-new browser tab yourself (Ctrl/Cmd+T), then paste this ' +
+        'address into it. Reloading or editing the address in this tab will ' +
+        'not work:';
       inner.appendChild(howto);
       var row = document.createElement('div');
       row.style.cssText = 'display:flex;gap:0.5rem;flex-wrap:wrap;';

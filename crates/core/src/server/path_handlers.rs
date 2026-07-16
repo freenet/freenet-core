@@ -3472,6 +3472,21 @@ mod tests {
             SHELL_BRIDGE_JS.contains("Copy address"),
             "fail-closed page must offer a one-click copy of the address"
         );
+        // The recovery copy must be explicit that THIS tab is the one stuck and
+        // that reloading / retyping the URL here will keep failing — the exact
+        // confusion a user reported (the address bar shows the clean URL, so a
+        // reload looks like it should work but stays sandboxed). Steer them to a
+        // genuinely new top-level tab.
+        assert!(
+            SHELL_BRIDGE_JS.contains("brand-new"),
+            "recovery copy must tell the user to open a brand-new tab (a reload \
+             of this sandbox-inherited tab keeps failing) (#4645)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("Reloading or editing the address in this tab will"),
+            "recovery copy must warn that reloading/editing the address in this \
+             same tab will not work (#4645)"
+        );
         // The three distinct causes (opaque-origin restricted tab, plain http,
         // storage disabled) get distinct headings so the guidance actually
         // matches the situation rather than blaming https/storage for all.
@@ -4263,6 +4278,69 @@ mod tests {
             js.contains("addEventListener('auxclick'"),
             "interceptor must register an auxclick listener so middle-click \
              on cross-origin links is also routed through open_url (#3853)"
+        );
+    }
+
+    /// Regression test for freenet/freenet-core#4645.
+    ///
+    /// Anchor clicks are intercepted, but an app that calls `window.open()`
+    /// from its own JS bypasses the click/auxclick listeners. In a sandboxed
+    /// iframe (opaque origin, no `allow-popups-to-escape-sandbox`) that popup
+    /// inherits the sandbox, gets a null origin, cannot read the per-user
+    /// access key, and dead-ends on the "Open this app in a normal tab"
+    /// per-user-isolation page — the exact symptom users hit when a hosted
+    /// app opens a new tab. The interceptor must therefore override
+    /// `window.open` and route http(s) targets through the shell's `open_url`
+    /// bridge (real origin), returning null.
+    ///
+    /// Pin the contract so a future edit can't silently drop the override:
+    ///   1. `window.open` is reassigned (the override exists).
+    ///   2. The override forwards through the SAME `open_url` bridge as the
+    ///      cross-origin anchor path.
+    ///   3. Relative targets are resolved against `document.baseURI` so the
+    ///      shell receives an absolute URL (a bare relative string would make
+    ///      `new URL()` throw and the forward would be lost).
+    ///   4. Only http/https is forwarded; other schemes fall back to native so
+    ///      unrelated behavior (about:blank, blob:, javascript:) is unchanged.
+    #[test]
+    fn navigation_interceptor_overrides_window_open() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+        assert!(
+            js.contains("window.open = function"),
+            "interceptor must override window.open so programmatic opens don't \
+             create a sandbox-inherited null-origin popup (#4645)"
+        );
+        // The override must forward through the shell's open_url bridge, in the
+        // __freenet_shell__ namespace, exactly like the cross-origin anchor path.
+        let open_fn_idx = js
+            .find("window.open = function")
+            .expect("window.open override present");
+        let override_block = &js[open_fn_idx..];
+        assert!(
+            override_block.contains("type: 'open_url'"),
+            "window.open override must forward through the open_url bridge (#4645)"
+        );
+        assert!(
+            override_block.contains("__freenet_shell__: true"),
+            "window.open override must use the __freenet_shell__ namespace (#4645)"
+        );
+        // Relative targets resolved against the iframe base, else new URL() throws.
+        assert!(
+            override_block.contains("new URL(url, document.baseURI)"),
+            "window.open override must resolve relative targets against \
+             document.baseURI so the shell gets an absolute URL (#4645)"
+        );
+        // http(s)-only forward; everything else falls back to native open.
+        assert!(
+            override_block.contains("resolved.protocol !== 'http:'")
+                && override_block.contains("resolved.protocol !== 'https:'"),
+            "window.open override must only forward http(s); other schemes \
+             fall back to native (#4645)"
+        );
+        assert!(
+            override_block.contains("fallbackOpen"),
+            "window.open override must fall back to native open for the \
+             non-forwarded cases (#4645)"
         );
     }
 
