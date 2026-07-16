@@ -4364,10 +4364,12 @@ mod tests {
              fall back to native (#4645)"
         );
         // In-place navigation targets are not new-window requests -> native.
+        // Names are normalized (case-insensitive) before the reserved check.
         assert!(
-            override_block.contains("name === '_self'"),
-            "window.open override must leave _self/_parent/_top to native so \
-             in-place navigation isn't turned into a new tab (#4645)"
+            override_block.contains("targetName === '_self'")
+                && override_block.contains("String(name).toLowerCase()"),
+            "window.open override must leave _self/_parent/_top (case-insensitive) \
+             to native so in-place navigation isn't turned into a new tab (#4645)"
         );
         // Loopback targets must fall back to native: open_url refuses them, so
         // forwarding would silently drop the open on local nodes.

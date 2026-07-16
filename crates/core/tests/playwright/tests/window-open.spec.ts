@@ -176,6 +176,8 @@ test("falls back to native for non-http(s), empty, and in-place (_self) targets"
       { label: "blob", expr: "'blob:https://x/abc'" },
       { label: "data", expr: "'data:text/html,x'" },
       { label: "self-target", expr: "'https://example.com/z', '_self'" },
+      // Target keywords are ASCII case-insensitive: _SELF must stay native too.
+      { label: "self-upper", expr: "'https://example.com/zz', '_SELF'" },
     ]),
   );
   const report = collected.report!;
@@ -183,10 +185,32 @@ test("falls back to native for non-http(s), empty, and in-place (_self) targets"
   // Nothing was forwarded — every case must reach the native open.
   expect(collected.forwarded.length).toBe(0);
   for (const r of report.results) expect(r.ret).toBe("NATIVE_SPY");
-  // _self forwards a real URL to native (in-place navigation), not the shell.
+  // _self / _SELF forward a real URL to native (in-place navigation).
   expect(report.nativeCalls).toContain("https://example.com/z");
+  expect(report.nativeCalls).toContain("https://example.com/zz");
   expect(report.nativeCalls).toContain("about:blank");
   expect(report.nativeCalls).toContain("javascript:alert(1)");
+});
+
+test("forwards absolute external URLs without reserializing the query string", async ({
+  page,
+}) => {
+  // The __sandbox strip must NOT touch an absolute external target: reserializing
+  // its query (%20 -> +, ~ -> %7E) could invalidate signed/opaque links.
+  const signed = "https://example.com/o?X-Amz-Signature=abc&a=%2F%2f%20~";
+  const collected = await runHarness(
+    page,
+    buildSrcdoc(BASE, [{ label: "signed-external", expr: JSON.stringify(signed) }]),
+  );
+  const report = collected.report!;
+  expect(report.error).toBeUndefined();
+  expect(collected.forwarded.length).toBe(1);
+  const url = collected.forwarded[0].url;
+  // No form-encoding corruption and no dropped/added params.
+  expect(url).not.toContain("+");
+  expect(url).toContain("%20");
+  expect(url).toContain("~");
+  expect(url).toContain("X-Amz-Signature=abc");
 });
 
 test("does not forward loopback targets (open_url refuses them); stays native", async ({

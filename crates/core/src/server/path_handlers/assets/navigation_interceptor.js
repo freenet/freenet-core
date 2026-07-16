@@ -124,7 +124,16 @@
       return fallbackOpen(url, name, features);
     }
     // In-place navigation targets are not new-window requests; leave to native.
-    if (name === '_self' || name === '_parent' || name === '_top') {
+    // The reserved keywords are ASCII case-insensitive natively, so normalize
+    // (coerce + lowercase) before comparing; window.open(url, '_SELF') must
+    // still navigate in place, not open a tab. `_blank`/custom names are new
+    // windows and stay intercepted.
+    var targetName = name == null ? '' : String(name).toLowerCase();
+    if (
+      targetName === '_self' ||
+      targetName === '_parent' ||
+      targetName === '_top'
+    ) {
       return fallbackOpen(url, name, features);
     }
     // A missing/empty target is native about:blank; keep it native so
@@ -144,12 +153,26 @@
     if (urlStr === '') {
       return fallbackOpen(url, name, features);
     }
+    // Resolve relative targets (e.g. window.open('page2')) against the iframe's
+    // base so the shell receives an absolute URL. Strip the internal `__sandbox`
+    // routing param from the BASE first, not the resolved URL: a hash-only or
+    // query-relative target (e.g. window.open('#x')) would otherwise inherit
+    // `?__sandbox=1` and, opened top-level, serve raw sandbox content with no
+    // shell wrapper. Stripping on the base leaves an ABSOLUTE external target
+    // untouched (it ignores the base), so we never reserialize an external
+    // query string — mutating the resolved URL's query would turn `%20` into
+    // `+` and `~` into `%7E` and could break signed/opaque links.
+    var baseHref;
+    try {
+      var base = new URL(document.baseURI);
+      base.searchParams.delete('__sandbox');
+      baseHref = base.href;
+    } catch (err) {
+      baseHref = document.baseURI;
+    }
     var resolved;
     try {
-      // Resolve relative targets (e.g. window.open('page2')) against the
-      // iframe's base so the shell receives an absolute URL; new URL() with a
-      // relative string and no base would throw.
-      resolved = new URL(urlStr, document.baseURI);
+      resolved = new URL(urlStr, baseHref);
     } catch (err) {
       return fallbackOpen(url, name, features);
     }
@@ -159,11 +182,6 @@
     if (isLoopbackHost(resolved.hostname)) {
       return fallbackOpen(url, name, features);
     }
-    // Strip the internal `__sandbox` routing param: a hash-only or query-
-    // relative target (e.g. window.open('#x')) inherits `?__sandbox=1` from the
-    // iframe's base, and opening THAT top-level would serve raw sandbox content
-    // with no shell wrapper. Removing it makes the shell serve the wrapper page.
-    resolved.searchParams.delete('__sandbox');
     window.parent.postMessage(
       {
         __freenet_shell__: true,
