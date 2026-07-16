@@ -2980,9 +2980,13 @@ impl Ring {
                 .map(|l| l.as_f64())
                 .unwrap_or(0.0);
 
-            let snapshot = ring
+            let mut snapshot = ring
                 .hosting_manager
                 .generate_topology_snapshot(peer_addr, location);
+            // Stamp the live connection count so consumers can use it as a
+            // join/peer_ready progress signal (snapshot presence alone only
+            // means the bind address is set — see `TopologySnapshot::connection_count`).
+            snapshot.connection_count = ring.connection_manager.connection_count();
             let contract_count = snapshot.contracts.len();
             register_topology_snapshot(&network_name, snapshot);
 
@@ -5772,9 +5776,10 @@ impl Ring {
             .map(|l| l.as_f64())
             .unwrap_or(0.0);
 
-        let snapshot = self
+        let mut snapshot = self
             .hosting_manager
             .generate_topology_snapshot(peer_addr, location);
+        snapshot.connection_count = self.connection_manager.connection_count();
         topology_registry::register_topology_snapshot(network_name, snapshot);
     }
 
