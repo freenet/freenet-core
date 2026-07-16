@@ -81,7 +81,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
         '(for example via "open link in new tab", a middle-click, or a ' +
         'right-click menu). Tabs opened that way run in a restricted mode ' +
         'that can’t reach the access key this hosted node uses to keep ' +
-        'your data separate, so the app won’t load here.';
+        'your data separate, so the app won’t load here. The address in this ' +
+        'tab looks normal, so reloading or retyping it here seems like it ' +
+        'should work. It will not: this tab itself is the one stuck in ' +
+        'restricted mode. Open a brand-new tab to continue.';
     } else {
       h.textContent = 'Browser storage required';
       lead.textContent =
@@ -105,8 +108,9 @@ function freenetBridge(authToken, userToken, hostedMode) {
       var howto = document.createElement('p');
       howto.style.cssText = 'margin:0 0 0.5rem;';
       howto.textContent =
-        'To continue, open this address in a normal browser tab ' +
-        '(one you start yourself, e.g. Ctrl/Cmd+T, then paste):';
+        'Open a brand-new browser tab yourself (Ctrl/Cmd+T), then paste this ' +
+        'address into it. Reloading or editing the address in this tab will ' +
+        'not work:';
       inner.appendChild(howto);
       var row = document.createElement('div');
       row.style.cssText = 'display:flex;gap:0.5rem;flex-wrap:wrap;';
@@ -506,9 +510,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
           }
         } catch (e) {}
       } else if (msg.type === 'open_url' && typeof msg.url === 'string') {
-        // Open external URLs in a new tab. Popups from the sandboxed iframe
-        // inherit the opaque origin, breaking CORS on target sites. The shell
-        // opens the URL instead, giving proper origin. See issue #1499.
+        // Open a URL in a new tab. External links come here from the anchor
+        // interceptor; same-origin (in-app) URLs also arrive from the
+        // window.open override (#4645). Popups the sandboxed iframe opens
+        // itself inherit the opaque origin, breaking CORS on target sites and
+        // (hosted) losing the per-user key. The shell opens the URL instead,
+        // giving proper origin. See issue #1499.
         //
         // Security model: this scheme allow-list is the PRIMARY gate, not
         // defence in depth. A malicious contract iframe can postMessage
@@ -534,10 +541,14 @@ function freenetBridge(authToken, userToken, hostedMode) {
         try {
           var u = new URL(msg.url);
           if (u.protocol !== 'https:' && u.protocol !== 'http:') return;
-          // URL.hostname strips brackets from IPv6 literals, so a URL
-          // `http://[::1]/` parses with hostname `::1`, NOT `[::1]`.
-          // Compare against the bracket-less form.
-          var h = u.hostname.toLowerCase();
+          // WHATWG URL.hostname serializes an IPv6 literal WITH brackets, so
+          // `http://[::1]/` has hostname `[::1]`, NOT `::1`. Strip the brackets
+          // before comparing, or the `::1` arm never matches and a forged link
+          // to the viewer's IPv6 loopback slips past this refusal.
+          var h = u.hostname
+            .toLowerCase()
+            .replace(/^\[/, '')
+            .replace(/\]$/, '');
           if (
             h === 'localhost' ||
             h === '127.0.0.1' ||

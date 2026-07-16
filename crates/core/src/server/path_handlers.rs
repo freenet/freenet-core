@@ -7,8 +7,11 @@
 //!         allow="clipboard-read; clipboard-write">`
 //! with an opaque origin that cannot access other contracts' data.
 //! Popups inherit the sandbox (no `allow-popups-to-escape-sandbox`); external links
-//! are opened via the `open_url` shell bridge message to avoid CORS issues. Sandbox content
-//! is protected from top-level access via Sec-Fetch-Dest checks in client_api.rs.
+//! are opened via the `open_url` shell bridge message to avoid CORS issues. The
+//! injected interceptor also overrides programmatic `window.open` in the iframe,
+//! routing http(s) opens through the same `open_url` bridge so a new tab gets the
+//! shell's real origin instead of a sandbox-inheriting opaque one (freenet-core#4645).
+//! Sandbox content is protected from top-level access via Sec-Fetch-Dest checks in client_api.rs.
 
 use std::{
     path::{Path, PathBuf},
@@ -1041,8 +1044,9 @@ async fn sandbox_content_body(
 
     // Inject the WebSocket shim and navigation interceptor before any other scripts.
     // The shim overrides window.WebSocket so that wasm-bindgen routes connections
-    // through the shell page's bridge. The interceptor catches <a> clicks and
-    // routes them through postMessage for multi-page navigation.
+    // through the shell page's bridge. The interceptor catches <a> clicks AND
+    // overrides programmatic window.open, routing both through postMessage for
+    // multi-page navigation without a sandbox-inheriting popup (#4645).
     let injected_scripts =
         format!("<script>{WEBSOCKET_SHIM_JS}</script><script>{NAVIGATION_INTERCEPTOR_JS}</script>");
     if let Some(pos) = body.find("</head>") {
@@ -1144,6 +1148,15 @@ const WEBSOCKET_SHIM_JS: &str = include_str!("path_handlers/assets/websocket_shi
 /// Same-origin links with an explicit non-`_self` target are left to the
 /// browser so webapps that legitimately want multi-tab navigation within
 /// their own contract still work.
+///
+/// The interceptor also overrides programmatic `window.open`: an app that opens
+/// a new tab from its own JS bypasses the click/auxclick listeners, and on a
+/// hosted node the resulting opaque-origin popup can't read the per-user access
+/// key and dead-ends (freenet-core#4645). http(s) new-window opens are forwarded
+/// through the same `open_url` bridge (real origin); `_self`/`_parent`/`_top`,
+/// non-http(s) schemes, and loopback targets (which `open_url` refuses) fall back
+/// to the native open. The returned WindowProxy is dropped (null), matching the
+/// shell's `noopener` open.
 const NAVIGATION_INTERCEPTOR_JS: &str =
     include_str!("path_handlers/assets/navigation_interceptor.js");
 
@@ -3472,6 +3485,21 @@ mod tests {
             SHELL_BRIDGE_JS.contains("Copy address"),
             "fail-closed page must offer a one-click copy of the address"
         );
+        // The recovery copy must be explicit that THIS tab is the one stuck and
+        // that reloading / retyping the URL here will keep failing — the exact
+        // confusion a user reported (the address bar shows the clean URL, so a
+        // reload looks like it should work but stays sandboxed). Steer them to a
+        // genuinely new top-level tab.
+        assert!(
+            SHELL_BRIDGE_JS.contains("brand-new"),
+            "recovery copy must tell the user to open a brand-new tab (a reload \
+             of this sandbox-inherited tab keeps failing) (#4645)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("Reloading or editing the address in this tab will"),
+            "recovery copy must warn that reloading/editing the address in this \
+             same tab will not work (#4645)"
+        );
         // The three distinct causes (opaque-origin restricted tab, plain http,
         // storage disabled) get distinct headings so the guidance actually
         // matches the situation rather than blaming https/storage for all.
@@ -4266,6 +4294,122 @@ mod tests {
         );
     }
 
+    /// Regression test for freenet/freenet-core#4645.
+    ///
+    /// Anchor clicks are intercepted, but an app that calls `window.open()`
+    /// from its own JS bypasses the click/auxclick listeners. In a sandboxed
+    /// iframe (opaque origin, no `allow-popups-to-escape-sandbox`) that popup
+    /// inherits the sandbox, gets a null origin, cannot read the per-user
+    /// access key, and dead-ends on the "Open this app in a normal tab"
+    /// per-user-isolation page — the exact symptom users hit when a hosted
+    /// app opens a new tab. The interceptor must therefore override
+    /// `window.open` and route http(s) targets through the shell's `open_url`
+    /// bridge (real origin), returning null.
+    ///
+    /// Pin the contract so a future edit can't silently drop the override or
+    /// regress the edge cases the review surfaced. Behavioral coverage lives in
+    /// `crates/core/tests/playwright/tests/window-open.spec.ts` (runs in CI via
+    /// playwright-shell.yml); these source pins are the cheap CI-required guard.
+    ///   1. `window.open` is reassigned (the override exists).
+    ///   2. The override forwards through the SAME `open_url` bridge as the
+    ///      cross-origin anchor path, posting the RESOLVED ABSOLUTE url
+    ///      (`resolved.href`) — not the raw arg, which would drop relative opens.
+    ///   3. Targets are resolved against `document.baseURI` so the shell gets an
+    ///      absolute URL.
+    ///   4. Only http/https is forwarded; other schemes fall back to native.
+    ///   5. `_self`/`_parent`/`_top` (in-place navigation) fall back to native.
+    ///   6. Loopback targets fall back to native (open_url refuses them).
+    ///   7. The arg is coerced to a string so URL objects are forwarded.
+    #[test]
+    fn navigation_interceptor_overrides_window_open() {
+        let js = NAVIGATION_INTERCEPTOR_JS;
+        assert!(
+            js.contains("window.open = function"),
+            "interceptor must override window.open so programmatic opens don't \
+             create a sandbox-inherited null-origin popup (#4645)"
+        );
+        // The override is the final construct in the IIFE, so slicing to EOF
+        // scopes assertions to it (nothing but the `})();` close follows).
+        let open_fn_idx = js
+            .find("window.open = function")
+            .expect("window.open override present");
+        let override_block = &js[open_fn_idx..];
+        assert!(
+            override_block.contains("type: 'open_url'"),
+            "window.open override must forward through the open_url bridge (#4645)"
+        );
+        assert!(
+            override_block.contains("__freenet_shell__: true"),
+            "window.open override must use the __freenet_shell__ namespace (#4645)"
+        );
+        // Must post the RESOLVED absolute URL, not the raw (possibly relative)
+        // arg — posting `url` raw would make open_url's `new URL(msg.url)` throw
+        // on a relative target and silently drop the open.
+        assert!(
+            override_block.contains("url: resolved.href"),
+            "window.open override must post the resolved absolute URL \
+             (resolved.href), not the raw arg (#4645)"
+        );
+        // Resolve against the iframe base so relative targets become absolute.
+        assert!(
+            override_block.contains("document.baseURI"),
+            "window.open override must resolve targets against document.baseURI \
+             so the shell gets an absolute URL (#4645)"
+        );
+        // http(s)-only forward; everything else falls back to native open.
+        assert!(
+            override_block.contains("resolved.protocol !== 'http:'")
+                && override_block.contains("resolved.protocol !== 'https:'"),
+            "window.open override must only forward http(s); other schemes \
+             fall back to native (#4645)"
+        );
+        // In-place navigation targets are not new-window requests -> native.
+        // Names are normalized (case-insensitive) before the reserved check.
+        assert!(
+            override_block.contains("targetName === '_self'")
+                && override_block.contains("String(name).toLowerCase()"),
+            "window.open override must leave _self/_parent/_top (case-insensitive) \
+             to native so in-place navigation isn't turned into a new tab (#4645)"
+        );
+        // Loopback targets must fall back to native: open_url refuses them, so
+        // forwarding would silently drop the open on local nodes.
+        assert!(
+            override_block.contains("isLoopbackHost(resolved.hostname)"),
+            "window.open override must fall back to native for loopback hosts \
+             (open_url refuses them) so local-node opens aren't silently dropped (#4645)"
+        );
+        // Coerce the arg so window.open(new URL(...)) is forwarded, not sent to
+        // native (which would recreate the dead end).
+        assert!(
+            override_block.contains("String(url)"),
+            "window.open override must string-coerce the arg so URL objects are \
+             forwarded rather than dead-ended (#4645)"
+        );
+        // Only the shell's DIRECT child forwards: a deeper descendant's parent
+        // is an app frame the shell never hears, so it must stay native.
+        assert!(
+            override_block.contains("window.parent !== window.top"),
+            "window.open override must only intercept the shell's direct child \
+             (window.parent === window.top), else nested-frame opens are lost (#4645)"
+        );
+        // Non-forwarded cases delegate to the captured native window.open.
+        assert!(
+            override_block.contains("fallbackOpen"),
+            "window.open override must fall back to native open for the \
+             non-forwarded cases (#4645)"
+        );
+        // The forwarded case drops the WindowProxy (matches the shell's
+        // noopener open) and asks for a plain tab (shiftKey false).
+        assert!(
+            override_block.contains("shiftKey: false"),
+            "window.open override must request a plain tab (shiftKey false) (#4645)"
+        );
+        assert!(
+            override_block.contains("return null;"),
+            "window.open override must return null for the forwarded case (#4645)"
+        );
+    }
+
     /// Regression test for freenet/freenet-core#3853 shell-side.
     ///
     /// The shell `open_url` handler must read `msg.shiftKey` and, when true,
@@ -4358,15 +4502,15 @@ mod tests {
         );
     }
 
-    /// `URL.hostname` strips the brackets from IPv6 literals, so a URL
-    /// `http://[::1]/` parses with `hostname === '::1'` (no brackets), and
-    /// the previous comparison `h === '[::1]'` never matched. The IPv6
-    /// loopback was effectively unblocked. The relaxation in
-    /// freenet/river#231 (accepting http: in addition to https:) makes
-    /// the gap newly reachable for typical home services, so fix it
-    /// alongside the http: change.
+    /// WHATWG `URL.hostname` serializes an IPv6 literal WITH brackets, so
+    /// `new URL('http://[::1]/').hostname === '[::1]'`. The handler must
+    /// therefore STRIP the brackets before comparing against `::1`, or the
+    /// loopback refusal never matches and a forged link to the viewer's IPv6
+    /// loopback slips through. (An earlier version of this test and the code
+    /// comment both had the fact inverted — asserting hostname is bracket-LESS —
+    /// so the test passed while the IPv6 loopback was in fact unblocked. #4645.)
     #[test]
-    fn shell_open_url_handler_blocks_ipv6_loopback_without_brackets() {
+    fn shell_open_url_handler_blocks_ipv6_loopback() {
         let js = SHELL_BRIDGE_JS;
         let open_url_idx = js
             .find("msg.type === 'open_url'")
@@ -4378,19 +4522,18 @@ mod tests {
             .unwrap_or(rest.len());
         let block = &rest[..next_branch];
 
-        // The block list must compare against `::1` (no brackets), the
-        // form `URL.hostname` actually returns. The bracketed form is a
-        // dead arm.
+        // The handler must strip surrounding brackets from the hostname before
+        // the loopback comparison, so the serialized `[::1]` matches `::1`.
         assert!(
-            block.contains("'::1'"),
-            "open_url handler must block the IPv6 loopback hostname `::1` \
-             (no brackets — URL.hostname strips them); got block: {block}"
+            block.contains(r"replace(/^\[/"),
+            "open_url handler must strip the leading bracket from an IPv6 \
+             hostname before comparing, else `[::1]` never matches `::1` and \
+             IPv6 loopback is unblocked (#4645); got block: {block}"
         );
         assert!(
-            !block.contains("'[::1]'"),
-            "open_url handler must NOT compare against `[::1]` with \
-             brackets — that arm is dead because URL.hostname strips \
-             brackets from IPv6 literals; got block: {block}"
+            block.contains("'::1'"),
+            "open_url handler must compare the bracket-stripped hostname \
+             against `::1`; got block: {block}"
         );
     }
 
