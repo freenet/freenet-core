@@ -2128,6 +2128,112 @@ mod tests {
         estimator.record(&peer, Location::new(0.25), true);
     }
 
+    /// REGRESSION (#4811, gap 1): this estimator must get the batch-accuracy
+    /// refit like every other isotonic estimator in the tree.
+    ///
+    /// It never did. The refit was driven by `Router::refit_stale_estimators`,
+    /// reachable only from `Ring::refit_router_periodically`'s tick, and this
+    /// estimator lives OUTSIDE `Router` — behind its own `Arc<RwLock<..>>` on
+    /// **`OpManager`** (`node/op_state_manager.rs`, built once in `OpManager::new`),
+    /// so the tick could not see it. Note the owner: `ConnectOp` below is only a
+    /// `#[cfg(test)]` fixture. In production this estimator is **node-lifetime**,
+    /// which is what turns the missing refit from a nuisance into a leak.
+    ///
+    /// Two consequences, both fixed by refitting on the write path:
+    ///
+    /// 1. **Drift, unrepaired forever.** The incremental pool-adjacent-violators
+    ///    fit is an approximation of a batch PAV pass, so its curve drifted with
+    ///    nothing to correct it, while `estimate()` kept biasing live CONNECT
+    ///    forwarding off the drifted curve. Its Bernoulli 0/1 outcomes pool
+    ///    heavily, making it plausibly the worst drift case in the tree.
+    /// 2. **An unbounded, remote-peer-keyed map.** `peer_adjustments` only ever
+    ///    INSERTS on the incremental path (`add_event`); the ONLY thing that
+    ///    prunes it to the current window is a refit (see `IsotonicEstimator::fit`).
+    ///    `raw_events` is capped at `MAX_REGRESSION_POINTS`, but with no refit the
+    ///    map was not capped by anything: it grew one entry per distinct peer ever
+    ///    seen in CONNECT forwarding, for the node's whole life — the exact hazard
+    ///    `.claude/rules/code-style.md` bans, driven by remote peers. It also made
+    ///    the `connect_forward_estimator.read().clone()` calls on the CONNECT path
+    ///    (`connect/op_ctx_task.rs`) monotonically more expensive with uptime,
+    ///    since the clone copies that map.
+    ///
+    /// Moving the trigger into `IsotonicEstimator::add_event` fixes both with no
+    /// wiring at all: `record` already funnels into `add_event`, so the estimator
+    /// now refits itself regardless of who owns it, which bounds `peer_adjustments`
+    /// to the window (plus at most one refit interval of new peers). That is the
+    /// whole point of the #4811 direction, and this is its pin — it fails against
+    /// `main`, where no amount of `record`ing ever refits this estimator.
+    #[test]
+    fn forward_estimator_refits_itself_despite_living_outside_router() {
+        let mut estimator = ConnectForwardEstimator::new();
+
+        // Well past the 10% turnover trigger. Distinct peers and desired
+        // locations, mixed Bernoulli outcomes — i.e. what `record` actually sees.
+        for i in 0..120u16 {
+            let peer = make_peer(3000 + i);
+            estimator.record(&peer, Location::new(f64::from(i % 50) / 100.0), i % 3 == 0);
+        }
+
+        assert!(
+            !estimator.estimator.is_stale_for_test(),
+            "ConnectForwardEstimator must not be left owing a refit: it is \
+             unreachable from Router, so if add_event does not refit it inline, \
+             nothing ever will and its curve drifts unrepaired forever (#4811)"
+        );
+    }
+
+    /// REGRESSION (#4811, gap 1 — the consequence that actually bites): the
+    /// refit is the ONLY thing that bounds this estimator's `peer_adjustments`.
+    ///
+    /// `IsotonicEstimator::add_event` only ever INSERTS into `peer_adjustments`;
+    /// nothing evicts from it. `raw_events` is capped at `MAX_REGRESSION_POINTS`,
+    /// but the map is pruned to the current window only by a refit
+    /// (`IsotonicEstimator::fit` rebuilds it from `raw_events`). Because nothing
+    /// refit THIS estimator, and because it hangs off `OpManager` and so lives as
+    /// long as the node, the map grew one entry per distinct peer ever seen in
+    /// CONNECT forwarding, forever — an unbounded collection keyed by remote
+    /// peers, which `.claude/rules/code-style.md` bans outright. It also made the
+    /// `connect_forward_estimator.read().clone()` calls on the CONNECT path
+    /// (`connect/op_ctx_task.rs`) grow more expensive with uptime.
+    ///
+    /// Feeding many more DISTINCT peers than the window can hold is the shape of
+    /// the leak: a long-lived node forwards CONNECTs to far more peers than fit
+    /// in 500 events. Against `main` this map would hold every one of them.
+    #[test]
+    fn forward_estimator_bounds_peer_adjustments_to_its_window() {
+        let mut estimator = ConnectForwardEstimator::new();
+
+        // Far more DISTINCT peers than the event window can hold, which is the
+        // shape of the leak: a long-lived node forwards CONNECTs to far more
+        // peers than fit in one window. Asserted as a RATIO rather than against
+        // `MAX_REGRESSION_POINTS` — that constant is private to the estimator's
+        // module, and a ratio does not rot if the window is ever resized.
+        let distinct_peers: usize = 2000;
+        for i in 0..distinct_peers {
+            let peer = make_peer(10_000 + u16::try_from(i).expect("port fits u16"));
+            estimator.record(&peer, Location::new((i % 50) as f64 / 100.0), i % 3 == 0);
+        }
+
+        let adjustments = estimator.estimator.peer_adjustments.len();
+        assert!(
+            adjustments < distinct_peers / 2,
+            "peer_adjustments must stay bounded by the event window, not by how \
+             many peers this node has ever forwarded to. The refit is the only \
+             thing that prunes this map, and the estimator is node-lifetime, so \
+             without an inline refit it retains every peer ever seen: got \
+             {adjustments} entries after {distinct_peers} distinct peers — on \
+             `main` this is {distinct_peers} (#4811)"
+        );
+        // Guard against passing for the wrong reason: an estimator that recorded
+        // nothing, or one that pruned everything, would also be "bounded".
+        assert!(
+            adjustments > 100,
+            "sanity: the estimator must still hold a full window's worth of peers \
+             (got {adjustments}); a near-empty map would satisfy the bound above \
+             while meaning the estimator had stopped tracking anything"
+        );
+    }
+
     #[test]
     fn expired_forward_attempts_are_cleared() {
         let mut op = ConnectOp::new_joiner(

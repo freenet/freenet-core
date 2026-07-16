@@ -20,13 +20,30 @@ const MAX_REGRESSION_POINTS: usize = 500;
 /// small, rare enough that the O(n log n) refit amortises to a handful of
 /// operations per event.
 ///
-/// NOTE: this bounds only how *often* a refit is EARNED. The realised cadence is
-/// `min(caller's poll interval, this)` — `refit_if_stale` does nothing until
-/// someone calls it, and today the only caller is
-/// `Ring::refit_router_periodically`'s 5-minute tick. Above ~10 events/min the
-/// tick binds instead and a window can
-/// turn over entirely between refits. That is far above the observed production
-/// median (~14-16 events/hour), where turnover always binds first.
+/// This is the WHOLE cadence, not a lower bound on it. [`IsotonicEstimator::add_event`]
+/// evaluates the trigger inline, and it is the only writer of both
+/// `events_since_refit` and `raw_events`, so a refit happens on the very event
+/// that earns it. Until #4811 the trigger was instead polled by
+/// `Ring::refit_router_periodically`'s 5-minute tick, making the realised cadence
+/// `min(5 minutes, this)`: above ~10 events/min the tick bound instead, and a
+/// window could turn over entirely between refits — precisely where drift is
+/// worst. (That stayed a documentation caveat rather than a live fault only
+/// because ~10 events/min is ~40x the observed production median of ~14-16
+/// events/hour.)
+///
+/// A SLOW estimator loses nothing by the move, which is worth stating because the
+/// opposite is the natural guess. The old tick did not refit on a timer: it called
+/// `refit_stale_estimators` -> `refit_if_stale`, which returns early unless
+/// `refit_due()` — THIS predicate — already holds. So the tick was a poll of the
+/// same condition, and an estimator that had not earned turnover was skipped by it
+/// exactly as it is skipped now. The trigger condition is unchanged; only the
+/// latency between earning a refit and performing it changed, from "up to 5
+/// minutes" to zero. Nothing that used to be refit no longer is.
+///
+/// That the timer was never the real trigger is also why dropping it costs no
+/// accuracy: drift is produced by `add_event`'s incremental fitting, so an
+/// estimator receiving no events is not drifting, and refitting it on a timer
+/// would rebuild an identical fit from identical data.
 const REFIT_STALENESS_PERCENT: usize = 10;
 
 /// EWMA smoothing factor for per-peer adjustments.
@@ -297,11 +314,29 @@ impl IsotonicEstimator {
     ///
     /// Rebuilds BOTH halves of the estimator — see [`Self::fit`] for why the
     /// global curve and the per-peer adjustments cannot be refit independently.
-    pub fn refit_if_stale(&mut self) -> bool {
+    ///
+    /// Called from [`Self::add_event`] only. It is deliberately NOT public: a
+    /// caller polling it could never observe a stale estimator, because
+    /// `add_event` clears staleness before it returns (see there for why the
+    /// check belongs on the write path).
+    fn refit_if_stale(&mut self) -> bool {
         if !self.refit_due() {
             return false;
         }
         self.refit()
+    }
+
+    /// Test-only view of [`Self::refit_due`], for guards in other modules
+    /// (`router`, `operations::connect`) that pin the #4811 invariant: once
+    /// [`Self::add_event`] returns, the estimator is never left stale.
+    ///
+    /// Reading the predicate rather than counting refits is deliberate — it
+    /// asserts the property that matters (no outstanding staleness) rather than
+    /// the mechanism, and it fails loudly if the `refit_if_stale` call in
+    /// `add_event` is ever dropped.
+    #[cfg(test)]
+    pub(crate) fn is_stale_for_test(&self) -> bool {
+        self.refit_due()
     }
 
     /// Whether enough of the window has turned over to justify a refit.
@@ -339,7 +374,17 @@ impl IsotonicEstimator {
                 // drifted regression beats a panicking node.
                 //
                 // `events_since_refit` is deliberately NOT reset, so the next
-                // poll retries rather than waiting for another full turnover.
+                // `add_event` retries rather than waiting for another full
+                // turnover. Note the cadence that implies now that the refit is
+                // on the write path: a PERSISTENTLY failing fit retries (and
+                // warns) on every subsequent event, not every 5 minutes as under
+                // the old polled task. That is acceptable only because this arm
+                // is unreachable in practice — `NegativePointWithIntersectOrigin`
+                // requires `intersect_origin: true` and both constructors pass
+                // `false`. If a reachable error variant is ever added here, reset
+                // the counter or rate-limit the warn before doing so; otherwise
+                // this becomes a ~150us refit attempt plus a log line per event
+                // on the relay hot path.
                 tracing::warn!(
                     %error,
                     events = self.raw_events.len(),
@@ -350,8 +395,80 @@ impl IsotonicEstimator {
         }
     }
 
-    /// Adds a new event to the estimator.
+    /// Adds a new event to the estimator, refitting it if this event pushes the
+    /// window past the staleness threshold ([`Self::refit_if_stale`]).
+    ///
+    /// WHY THE REFIT LIVES HERE (#4811). This method is the sole writer of both
+    /// inputs to the staleness trigger — `events_since_refit` and `raw_events` —
+    /// so it is the only moment staleness can change. Evaluating the trigger here
+    /// therefore catches every transition into staleness at the instant it
+    /// happens, and makes "the estimator is never stale once `add_event` returns"
+    /// an invariant rather than something a poller converges on.
+    ///
+    /// Until #4811 the trigger was polled by `Ring::refit_router_periodically`'s
+    /// 5-minute tick instead. That was a pull where a push is natural, and it
+    /// paid for the privilege three times over:
+    ///
+    /// - It could only ever refit LATER than this does, never sooner, so it
+    ///   widened the drift window it existed to close (see
+    ///   [`REFIT_STALENESS_PERCENT`]).
+    /// - It could only refit estimators reachable from `Router`, so
+    ///   `operations::connect::ConnectForwardEstimator` — which lives outside
+    ///   `Router`, behind its own lock — silently drifted forever. Refitting on
+    ///   the write path fixes that with no wiring: every estimator refits itself,
+    ///   whoever owns it.
+    /// - It kept a `task_monitor`-registered (hence node-fatal) task alive to
+    ///   poll an in-memory counter.
+    ///
+    /// COST. The refit is amortised over the events that earn it: one O(n log n)
+    /// batch fit per ~51 events on a saturated window, on a path that already
+    /// pays O(k log k) twice per call (`add_points` and `remove_points` each
+    /// clone, sort, and re-run PAV). Measured on this estimator at a saturated
+    /// 500-point window (release build, 20-50 distinct peers — a realistic
+    /// neighbour set): one refit costs ~150µs, `add_event` costs ~39µs without it,
+    /// and the amortised overhead is ~1.5-5.7µs/event, i.e. **+4-14% on a call
+    /// that was already the expensive part**. Note #4808's oft-quoted "~27µs per
+    /// saturated refit" does not reproduce — it is ~5x optimistic — but the
+    /// conclusion it supported survives the correction, because what lands on the
+    /// hot path is the amortised few µs, not the whole fit.
+    ///
+    /// LOCK SAFETY. The fit itself takes no locks and does no I/O — it is pure
+    /// computation over `self` — so it cannot deadlock or re-enter a caller that
+    /// already holds one (`Router::add_event` is called under
+    /// `ring.router.write()`; `ConnectForwardEstimator::record` under its own
+    /// `RwLock`). It only extends a critical section the caller already holds.
+    ///
+    /// Precisely: that "no locks" claim covers `fit`, not every line reachable
+    /// from the refit. `refit`'s error arm calls `tracing::warn!`, and in release
+    /// builds the per-callsite rate limiter (`util/rate_limit_layer.rs`) does a
+    /// DashMap lookup, whose shard guard is a real `parking_lot` lock (it is
+    /// compiled out under `cfg(test)`, so no test would surface it). That is not
+    /// a deadlock risk — nothing reachable from that shard guard takes
+    /// `ring.router` or `connect_forward_estimator` back, so there is no cycle —
+    /// and it is inert today because the error arm is unreachable (see `refit`).
+    /// Anyone making that arm reachable must re-check this paragraph, not just
+    /// the retry cadence noted there.
     pub fn add_event(&mut self, event: IsotonicEvent) {
+        self.add_event_incremental(event);
+
+        // Restore the exact batch fit once this event has turned over enough of
+        // the window. Runs last so the incremental state above is complete and
+        // correct on the ~50/51 events that do not earn a refit; on the one that
+        // does, `refit` rebuilds both halves from `raw_events` and supersedes it.
+        self.refit_if_stale();
+    }
+
+    /// The incremental half of [`Self::add_event`]: extend the window by one
+    /// event and patch the existing fit in place, WITHOUT considering a refit.
+    ///
+    /// Split out because this is the half that DRIFTS. Keeping it callable on its
+    /// own is what lets `incremental_fit_drifts_from_batch_and_refit_repairs_it`
+    /// and `refit_prunes_peers_that_fell_out_of_the_window` build a genuinely
+    /// refit-free fit to measure against a batch build — the tripwire that
+    /// justifies the refit existing at all, and the proof that pruning is needed.
+    /// Through `add_event` they no longer can: it repairs the drift as it goes,
+    /// which is the entire point of #4811.
+    fn add_event_incremental(&mut self, event: IsotonicEvent) {
         let route_distance = event.route_distance();
         let point = Point::new(route_distance.as_f64(), event.result);
 
@@ -1134,8 +1251,13 @@ mod tests {
     /// the boundary is the smallest k with `100k > 10(100 + k)`, i.e. k > 11.11 —
     /// k = 12 fires, k = 11 does not. Pinning BOTH sides matters: bracketing only
     /// 10 and 20 leaves `>` vs `>=` (and several off-by-ones) undetected.
+    ///
+    /// This side pins the HOLD-OFF: `add_event` must not refit eagerly. Since
+    /// #4811 the trigger is evaluated inside `add_event`, so an over-eager trigger
+    /// would refit on the relay hot path every time, which is exactly the cost the
+    /// amortisation argument rules out.
     #[test]
-    fn refit_if_stale_holds_off_just_below_the_turnover_boundary() {
+    fn add_event_holds_off_just_below_the_turnover_boundary() {
         let mut estimator = IsotonicEstimator::new(positive_events(100), EstimatorType::Positive);
         assert_eq!(estimator.events_since_refit, 0, "constructor starts fresh");
 
@@ -1143,47 +1265,66 @@ mod tests {
             estimator.add_event(event);
         }
         assert!(
-            !estimator.refit_if_stale(),
+            !estimator.is_stale_for_test(),
             "11 new events over a 111-event window is 9.9% — under the trigger"
         );
         assert_eq!(
             estimator.events_since_refit, 11,
-            "a held-off refit must not clear the counter, or turnover never accumulates"
+            "a held-off refit must not clear the counter, or turnover never \
+             accumulates — 11 adds must still be pending, un-refit"
         );
     }
 
+    /// The firing side of the boundary above, and the core #4811 pin: the 12th
+    /// `add_event` — the one that earns the refit — performs it ITSELF, with no
+    /// poller involved.
+    ///
+    /// Before #4811 this could only be observed by a caller polling
+    /// `refit_if_stale()`, and the refit landed whenever that caller next ran
+    /// (`Ring::refit_router_periodically`'s 5-minute tick). Now it is synchronous
+    /// with the event that earns it: `events_since_refit` is back to 0 by the time
+    /// `add_event` returns. Mutation check: deleting the `refit_if_stale()` call
+    /// from `add_event` leaves the counter at 12 and fails both assertions.
     #[test]
-    fn refit_if_stale_fires_at_the_turnover_boundary() {
+    fn add_event_refits_inline_at_the_turnover_boundary() {
         let mut estimator = IsotonicEstimator::new(positive_events(100), EstimatorType::Positive);
-        for event in positive_events(12) {
+        for event in positive_events(11) {
             estimator.add_event(event);
         }
-        assert!(
-            estimator.refit_if_stale(),
-            "12 new events over a 112-event window is 10.7% — past the trigger"
+        assert_eq!(
+            estimator.events_since_refit, 11,
+            "sanity: 11 adds are pending and un-refit (see the hold-off guard)"
         );
+
+        // The 12th add crosses 12*100 > 112*10 and must refit on the spot.
+        estimator.add_event(positive_events(1).pop().expect("one event"));
+
         assert_eq!(
             estimator.events_since_refit, 0,
-            "a completed refit resets the turnover counter"
+            "the add that earns the refit must perform it inline, resetting the \
+             turnover counter before it returns (#4811)"
         );
         assert!(
-            !estimator.refit_if_stale(),
-            "an immediate second call has no new data and must not refit"
+            !estimator.is_stale_for_test(),
+            "an estimator must never be left stale once add_event returns"
         );
     }
 
     #[test]
-    fn refit_if_stale_fires_at_exactly_min_points() {
+    fn add_event_refits_inline_at_exactly_min_points() {
         // Pins the `< MIN_POINTS_FOR_REGRESSION` guard's boundary: one fewer must
-        // hold off (covered above), exactly MIN must be allowed through.
+        // hold off (covered by `add_event_never_refits_below_min_points`), exactly
+        // MIN must be allowed through — and, since #4811, by `add_event` itself.
         let mut estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
         for event in positive_events(MIN_POINTS_FOR_REGRESSION) {
             estimator.add_event(event);
         }
-        assert!(
-            estimator.refit_if_stale(),
-            "at exactly MIN_POINTS_FOR_REGRESSION the guard must allow a refit"
+        assert_eq!(
+            estimator.events_since_refit, 0,
+            "at exactly MIN_POINTS_FOR_REGRESSION the guard must allow the refit, \
+             and add_event must have performed it"
         );
+        assert!(!estimator.is_stale_for_test());
     }
 
     #[test]
@@ -1239,11 +1380,16 @@ mod tests {
         let mut estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
 
         // Fill the window, then push it fully over with a disjoint peer set.
+        //
+        // Deliberately via `add_event_incremental`, NOT `add_event`: since #4811
+        // `add_event` refits inline, and a refit is precisely what prunes the map.
+        // Feeding through `add_event` would prune as it went and destroy this
+        // test's premise — the unbounded growth it exists to demonstrate.
         for event in positive_events(MAX_REGRESSION_POINTS) {
-            estimator.add_event(event);
+            estimator.add_event_incremental(event);
         }
         for event in positive_events(MAX_REGRESSION_POINTS) {
-            estimator.add_event(event);
+            estimator.add_event_incremental(event);
         }
         assert_eq!(
             estimator.raw_events.len(),
@@ -1268,35 +1414,52 @@ mod tests {
     }
 
     #[test]
-    fn refit_if_stale_is_noop_below_min_points() {
+    fn add_event_never_refits_below_min_points() {
         // Under MIN_POINTS_FOR_REGRESSION the regression refuses to estimate at
-        // all, so refitting buys nothing and must not thrash.
+        // all, so refitting buys nothing and must not thrash. Every one of these
+        // adds is past the turnover percentage (k*100 > k*10 for any k >= 1), so
+        // only the MIN_POINTS guard holds them off — which makes this the guard's
+        // real pin now that `add_event` evaluates the trigger on every call.
         let mut estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
         for event in positive_events(MIN_POINTS_FOR_REGRESSION - 1) {
             estimator.add_event(event);
         }
-        assert!(!estimator.refit_if_stale());
+        assert!(!estimator.is_stale_for_test());
+        assert_eq!(
+            estimator.events_since_refit,
+            MIN_POINTS_FOR_REGRESSION - 1,
+            "below MIN_POINTS_FOR_REGRESSION no refit may run, so the turnover \
+             counter must still be carrying every add"
+        );
     }
 
     #[test]
-    fn refit_preserves_every_observation() {
+    fn add_event_preserves_every_observation_across_its_inline_refits() {
         // The regression this guards: a refit must never DISCARD data. The bug it
         // replaces rebuilt the router from an on-disk log that lacked relay
         // events, so the model shrank on every pass (#4808).
+        //
+        // Since #4811 the refits happen inside these `add_event` calls (50 adds
+        // over a 200-event seed crosses the trigger twice), so this now pins the
+        // no-loss property across the real, inline mechanism rather than across a
+        // hand-invoked one.
         let mut estimator = IsotonicEstimator::new(positive_events(200), EstimatorType::Positive);
         let before = estimator.len();
 
         for event in positive_events(50) {
             estimator.add_event(event);
         }
-        let after_adds = estimator.len();
-        assert!(after_adds > before, "sanity: adds grow the model");
 
-        assert!(estimator.refit_if_stale(), "50/250 is past the trigger");
         assert_eq!(
             estimator.len(),
-            after_adds,
-            "refit must preserve the observation count exactly, not shrink it"
+            before + 50,
+            "add_event must preserve every observation across the refits it \
+             performs, not shrink the model"
+        );
+        assert_eq!(
+            estimator.raw_events.len(),
+            250,
+            "the refit rebuilds from raw_events; it must not disturb the window"
         );
     }
 
@@ -1334,9 +1497,14 @@ mod tests {
             })
             .collect();
 
+        // Fed through `add_event_incremental`, NOT `add_event`: since #4811 the
+        // latter refits inline, so it cannot produce the un-repaired fit this test
+        // needs to measure drift against. That is the fix working, not a reason to
+        // weaken the tripwire — the incremental path is still what runs between
+        // refits, and it is still what drifts.
         let mut incremental = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
         for event in events.iter().cloned() {
-            incremental.add_event(event);
+            incremental.add_event_incremental(event);
         }
 
         // The batch reference: exactly what the estimator's own constructor builds

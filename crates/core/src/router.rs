@@ -405,31 +405,6 @@ pub(crate) struct RouterSnapshotInfo {
     pub broadcast_stream_attempts_total: Option<u64>,
     pub broadcast_stream_failures_total: Option<u64>,
     pub broadcast_stream_failures_last_snapshot: Option<u64>,
-    /// Liveness heartbeat for the periodic router-refit task (#4440), populated
-    /// by `Ring` from the process-global `BACKGROUND_TASK_HEALTH` that task
-    /// publishes into. Seconds since its last completed pass, or `None` until the
-    /// first one.
-    ///
-    /// This is the LAST survivor of the #4440 background-task health gauges, and
-    /// it is a pure liveness signal — expect < ~300s on a healthy node. It is
-    /// worth keeping because `BackgroundTaskMonitor` only watches for task
-    /// *death*: a task that is alive but starved — deadlocked on `router.write()`,
-    /// or never scheduled — is invisible to the monitor and shows up here as a
-    /// rising age.
-    ///
-    /// The companion `consecutive_failures` gauge was removed in the #4808
-    /// follow-up. It was added because `refresh_router`'s transient
-    /// `get_router_events` errors were made non-fatal by the v0.2.74 #4438 hotfix,
-    /// leaving a persistently-failing refresh silent. Deleting the startup restore
-    /// removed the last fallible call in the task, so the counter had no remaining
-    /// failure source and was structurally pinned at 0 forever.
-    ///
-    /// The field name still says `refresh_router` though the task is now
-    /// `Ring::refit_router_periodically`. That is deliberate: this name is an OTLP
-    /// key, and renaming it would silently break the existing metric series and
-    /// any dashboard panel querying it. Renaming the key is a separate, riskier
-    /// change than the code rename that prompted it.
-    pub refresh_router_last_success_age_secs: Option<u64>,
     /// Placement-quality gauges (#4404 follow-up), populated by `Ring` on the
     /// snapshot cadence from the contracts this node hosts. They make the
     /// effect of the SubscribeHint placement migration observable: the migration
@@ -979,47 +954,6 @@ impl Router {
         }
     }
 
-    /// Refit every isotonic estimator whose data window has turned over enough to
-    /// warrant it (see [`IsotonicEstimator::refit_if_stale`]), returning how many
-    /// were refit.
-    ///
-    /// `add_event` maintains each fit incrementally, which is an approximation of
-    /// the batch pool-adjacent-violators result. This restores the exact fit
-    /// without discarding anything: it rebuilds from each estimator's own
-    /// in-memory `raw_points`, which already holds every observation the router
-    /// has seen — originator and relay hop alike.
-    ///
-    /// This REPLACES the previous approach of rebuilding the whole `Router` from
-    /// the on-disk event log, which lost every relay-recorded event because
-    /// `operations::record_relay_route_event` never persists (issue #4808).
-    pub(crate) fn refit_stale_estimators(&mut self) -> usize {
-        let mut refit_count = 0;
-
-        for estimator in [
-            &mut self.response_start_time_estimator,
-            &mut self.transfer_rate_estimator,
-            &mut self.failure_estimator,
-        ] {
-            if estimator.refit_if_stale() {
-                refit_count += 1;
-            }
-        }
-
-        for per_op in [
-            &mut self.per_op_failure,
-            &mut self.per_op_response_time,
-            &mut self.per_op_transfer_rate,
-        ] {
-            for estimator in per_op.values_mut() {
-                if estimator.refit_if_stale() {
-                    refit_count += 1;
-                }
-            }
-        }
-
-        refit_count
-    }
-
     fn select_closest_peers<'a>(
         &self,
         peers: impl IntoIterator<Item = &'a PeerKeyLocation>,
@@ -1463,7 +1397,6 @@ impl Router {
             broadcast_stream_attempts_total: None,
             broadcast_stream_failures_total: None,
             broadcast_stream_failures_last_snapshot: None,
-            refresh_router_last_success_age_secs: None,
             // Placement-quality + placement-migration gauges populated by Ring on
             // the snapshot cadence (#4404 follow-up).
             hosted_contracts_count: None,
@@ -1670,8 +1603,18 @@ mod tests {
     }
 
     #[test]
-    fn refit_stale_estimators_preserves_relay_recorded_events() {
-        // REGRESSION (#4808). The periodic router refresh used to rebuild the whole
+    fn add_event_preserves_relay_recorded_events() {
+        // SCOPE, honestly: this guards the refit's NO-DATA-LOSS property, not the
+        // refit TRIGGER. It stays green if the `refit_if_stale()` call is deleted
+        // from `add_event` (no refit, nothing lost), so it is not the #4811 guard —
+        // `add_event_leaves_no_estimator_stale` is. And because `len()` derives
+        // from `raw_events` and `refit` rebuilds from exactly that, preservation is
+        // close to structural: it can only fail if a refit corrupts the window.
+        // Carried forward cheaply, the same caveat #4809 recorded for its
+        // predecessor (`refit_stale_estimators_preserves_relay_recorded_events`).
+        // Cheap, not evidence.
+        //
+        // #4808 CONTEXT. The periodic router refresh used to rebuild the whole
         // router from the on-disk event log:
         //
         //     if !history.is_empty() { *router.write() = Router::new(&history); }
@@ -1682,48 +1625,80 @@ mod tests {
         // single 30s window, and prediction could never latch because the model was
         // reset faster than it reached MIN_EVENTS_FOR_PREDICTION.
         //
-        // The refresh now refits in place from each estimator's own `raw_points`.
-        // This test pins the invariant that made the old code wrong: a refresh pass
-        // must never lose an observation the router already has.
+        // The refit now happens inside `add_event`, rebuilding in place from each
+        // estimator's own `raw_events` (#4811). This pins the invariant that made
+        // the old code wrong: refitting must never lose an observation the router
+        // already has. It is fed exclusively through the relay path, which is the
+        // one the old rebuild could not see.
         let mut router = Router::new(&[]);
         add_relay_recorded_successes(&mut router, 120);
 
-        let events_before = router.failure_estimator.len();
-        assert!(
-            router.has_sufficient_routing_events(),
-            "sanity: 120 relay events must clear the prediction gate before the refit"
-        );
-
-        let refit_count = router.refit_stale_estimators();
-        assert!(
-            refit_count > 0,
-            "120 events into a fresh router is well past the staleness trigger"
-        );
-
         assert_eq!(
             router.failure_estimator.len(),
-            events_before,
-            "a refresh pass must preserve relay-recorded events, not discard them"
+            120,
+            "the refits performed inside add_event must preserve relay-recorded \
+             events, not discard them"
         );
         assert!(
             router.has_sufficient_routing_events(),
-            "prediction must stay active across a refresh; the old rebuild switched \
+            "prediction must stay active across the refits; the old rebuild switched \
              it off by resetting the model to the on-disk (originator-only) subset"
         );
     }
 
+    /// The #4811 replacement for `refit_router_periodically_refits_stale_estimators`
+    /// (itself the port of #4809's `refresh_router_loop_refits_stale_estimators`).
+    ///
+    /// That guard pinned the ONE line that made #4809's fix do anything: the loop
+    /// calling `refit_stale_estimators`. Both the loop and that method are gone —
+    /// `add_event` now evaluates the trigger itself — so the guarantee is pinned
+    /// here against the mechanism that replaced them, in the same terms: after
+    /// feeding the router, NO estimator may be left owing a refit.
+    ///
+    /// It is the same assertion the loop test made (`refit_stale_estimators() == 0`
+    /// afterwards, i.e. "the outstanding staleness was consumed"), just without a
+    /// poller to consume it. Mutation-verified: deleting the `refit_if_stale()`
+    /// call from `IsotonicEstimator::add_event` fails this test.
     #[test]
-    fn refit_stale_estimators_is_idempotent_and_cheap_when_idle() {
-        // An idle router must do no refit work: the trigger is data turnover, not
-        // wall-clock, so a quiet node's 5-minute tick is a no-op.
+    fn add_event_leaves_no_estimator_stale() {
         let mut router = Router::new(&[]);
+
+        // Straight into the in-memory router, exactly as a relay hop's
+        // `record_relay_route_event` does — far past the staleness trigger.
         add_relay_recorded_successes(&mut router, 120);
-        assert!(router.refit_stale_estimators() > 0, "first pass refits");
-        assert_eq!(
-            router.refit_stale_estimators(),
-            0,
-            "a second pass with no new events must refit nothing"
+
+        let stale: Vec<&str> = [
+            ("response_start_time", &router.response_start_time_estimator),
+            ("transfer_rate", &router.transfer_rate_estimator),
+            ("failure", &router.failure_estimator),
+        ]
+        .into_iter()
+        .filter(|(_, est)| est.is_stale_for_test())
+        .map(|(name, _)| name)
+        .collect();
+        assert!(
+            stale.is_empty(),
+            "add_event must leave no global estimator owing a refit; {stale:?} are \
+             stale, so the model drifts exactly as it did before #4808"
         );
+
+        for (label, per_op) in [
+            ("per_op_failure", &router.per_op_failure),
+            ("per_op_response_time", &router.per_op_response_time),
+            ("per_op_transfer_rate", &router.per_op_transfer_rate),
+        ] {
+            assert!(
+                !per_op.is_empty(),
+                "sanity: {label} must have been populated by the seeded events, \
+                 or this guard is vacuous"
+            );
+            for (op_type, est) in per_op {
+                assert!(
+                    !est.is_stale_for_test(),
+                    "{label}[{op_type:?}] left stale by add_event"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3989,7 +3964,8 @@ mod tests {
 
     /// Regression test for crash: "user-provided comparison function does not
     /// correctly implement a total order" — originally observed in the periodic
-    /// router-refresh task (now `Ring::refit_router_periodically`).
+    /// router-refresh task (`Ring::refit_router_periodically`, since deleted in
+    /// #4811; the refit now runs inline in `IsotonicEstimator::add_event`).
     ///
     /// When `mean_transfer_size` has no samples (count=0), `compute()` returns
     /// NaN (0.0/0.0). If `xfer_speed` is also 0, the division NaN/0.0 stays NaN.

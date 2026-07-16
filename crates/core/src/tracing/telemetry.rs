@@ -2120,7 +2120,6 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "broadcast_stream_attempts_total": snapshot.broadcast_stream_attempts_total,
                 "broadcast_stream_failures_total": snapshot.broadcast_stream_failures_total,
                 "broadcast_stream_failures_last_snapshot": snapshot.broadcast_stream_failures_last_snapshot,
-                "refresh_router_last_success_age_secs": snapshot.refresh_router_last_success_age_secs,
                 "per_op_curves": snapshot.per_op_curves,
             });
             // Placement-quality + placement-migration gauges (#4404 follow-up).
@@ -3125,24 +3124,28 @@ mod tests {
         }
     }
 
-    /// Pin: the UPDATE-broadcast stream-assembly gauges and the background-task
-    /// liveness heartbeat (#4440) must also reach the hand-mirrored OTLP body —
-    /// same footgun as the fd / module-cache gauges above. The broadcast
-    /// stream-assembly failure rate is the signal that flagged the v0.2.73
-    /// incident, so a silent drop here would re-blind us to a re-enable going
-    /// wrong.
+    /// Pin: the UPDATE-broadcast stream-assembly gauges must also reach the
+    /// hand-mirrored OTLP body — same footgun as the fd / module-cache gauges
+    /// above. The broadcast stream-assembly failure rate is the signal that
+    /// flagged the v0.2.73 incident, so a silent drop here would re-blind us to a
+    /// re-enable going wrong.
     ///
-    /// This used to cover a second background-task gauge,
-    /// `refresh_router_consecutive_failures`. It was removed in the #4808
-    /// follow-up along with the startup routing-history restore: it existed to
-    /// surface a *non-fatal* `get_router_events` read failure, and deleting the
-    /// restore removed the last fallible call in the task, pinning the counter at
-    /// 0 forever. `refresh_router_last_success_age_secs` survives as a pure
-    /// liveness heartbeat and is still pinned here — the
-    /// `BackgroundTaskMonitor` only watches for task death, so this is the only
-    /// signal that would show the refit loop alive but starved.
+    /// This used to cover the #4440 background-task health gauges too. Both are
+    /// now gone, each with the thing it measured:
+    ///
+    /// - `refresh_router_consecutive_failures` went in the #4808 follow-up with
+    ///   the startup routing-history restore — the task's last fallible call, so
+    ///   the counter had no failure source left and was pinned at 0 forever.
+    /// - `refresh_router_last_success_age_secs` went in #4811 with
+    ///   `Ring::refit_router_periodically` itself. It was a liveness heartbeat for
+    ///   that loop, and only for it: it existed because `BackgroundTaskMonitor`
+    ///   watches for task *death* only, leaving "alive but starved" invisible.
+    ///   With the refit moved onto `IsotonicEstimator::add_event` there is no loop
+    ///   to starve — a stalled refit now means a stalled relay path, which is
+    ///   loudly visible in the operation telemetry rather than needing a
+    ///   dedicated gauge.
     #[test]
-    fn router_snapshot_json_includes_broadcast_and_bgtask_gauges() {
+    fn router_snapshot_json_includes_broadcast_gauges() {
         use arbitrary::{Arbitrary, Unstructured};
         let mut u = Unstructured::new(&[0u8; 4096]);
         let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
@@ -3150,13 +3153,11 @@ mod tests {
         info.broadcast_stream_attempts_total = Some(37);
         info.broadcast_stream_failures_total = Some(41);
         info.broadcast_stream_failures_last_snapshot = Some(43);
-        info.refresh_router_last_success_age_secs = Some(47);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("broadcast_stream_attempts_total", 37),
             ("broadcast_stream_failures_total", 41),
             ("broadcast_stream_failures_last_snapshot", 43),
-            ("refresh_router_last_success_age_secs", 47),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
