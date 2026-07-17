@@ -22,10 +22,11 @@ const NUM_SMALL_CONTRACTS: usize = 3;
 /// Settle time after the PUTs before booting the late-joining getter node.
 const PUT_SETTLE_SECS: u64 = 5;
 /// Retention gap between the two GET phases. Must be strictly greater than
-/// `SUBSCRIPTION_LEASE_DURATION` (480s, `crates/core/src/ring/hosting.rs`) so
-/// phase 2 exercises the lease-renewal machinery — every shorter timer
-/// (renewal interval 120s) is crossed as well. A short gap would make phase 2
-/// a duplicate of phase 1: no retention/eviction path fires below 120s.
+/// `SUBSCRIPTION_LEASE_DURATION` (480s, `crates/core/src/ring/hosting.rs`).
+/// Nothing subscribes in this test, so during the gap the leases lapse and
+/// the demand-driven collapse/cleanup runs for real; phase 2 asserts that
+/// cleanup did not drop or orphan the stored state. A short gap would make
+/// phase 2 a duplicate of phase 1: no timer-based path fires below 120s.
 const RETENTION_DELAY_SECS: u64 = 540;
 /// Single overall deadline per GET. There is deliberately NO retry loop: the
 /// nightly nextest profile sets retries=0 because a GET that only succeeds on
