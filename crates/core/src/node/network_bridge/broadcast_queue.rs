@@ -868,7 +868,8 @@ mod tests {
     use crate::util::time_source::SharedMockTimeSource;
 
     use super::{
-        BroadcastStreamMetrics, record_streaming_delivery, streaming_completion_delivered,
+        BroadcastStreamMetrics, record_delivery_to_interest, record_streaming_delivery,
+        streaming_completion_delivered,
     };
 
     /// `BroadcastStreamMetrics` counts every attempt and, separately, only the
@@ -1201,6 +1202,135 @@ mod tests {
                  the state), or the next summary-mismatch resend is suppressed"
             );
         }
+    }
+
+    /// Issue #4857 — a sender-side `Delivered` poisons the neighbor-summary cache
+    /// to our OWN current summary even when the RECEIVER dropped the delta with
+    /// `ContractQueueFull`, stranding a rarely-changing field until the ~5-min
+    /// heartbeat.
+    ///
+    /// This drives the exact poisoning site the issue cites
+    /// (`record_delivery_to_interest`, ~L543) on the DELTA path
+    /// (`sent_delta = true`) — the branch the inline delta broadcast uses
+    /// (~L828). The existing streaming tests
+    /// (`drop_outcome_does_not_refresh_interest_or_cache_summary`,
+    /// `full_state_delivery_caches_summary_so_next_broadcast_is_delta`) only
+    /// drive the full-state wrapper `record_streaming_delivery`; none of them
+    /// frame the #4857 scenario where the transport delivered but the receiver
+    /// dropped.
+    ///
+    /// Scenario (node↔node broadcast, verbatim from the issue):
+    /// - The sender's cache of the neighbor holds the neighbor's REAL summary
+    ///   `S0` (a rarely-changing field F at its old value), learned via a prior
+    ///   summary exchange.
+    /// - The sender's own state advances to `S1` (field F changed). It computes a
+    ///   per-neighbor delta `diff(cached = S0, our = S1)` — which carries F — and
+    ///   broadcasts it.
+    /// - The transport DELIVERS the delta:
+    ///   `BroadcastDeliveryOutcome::Delivered` is SENDER-SIDE completion (the last
+    ///   fragment was handed to the transport / the inline send returned `Ok`),
+    ///   NOT a receiver ack. So the broadcast queue applies the delivery gate.
+    /// - BUT the receiver's per-contract executor queue is saturated, so it drops
+    ///   the delta with `ContractQueueFull`. Per #4251 that drop is SILENT — no
+    ///   `ResyncRequest` is sent back (op_ctx_task.rs ~L1237, gated
+    ///   `is_delta && !queue_full`). The neighbor's state is still `S0`.
+    ///
+    /// The bug this pins: the sender-side `Delivered` caches the sender's OWN
+    /// current summary `S1` as the neighbor's summary, so the sender now believes
+    /// the neighbor is fully current. The user-visible consequence is that the
+    /// "skip if summaries are equal" gate in `broadcast_to_single_peer` (~L600)
+    /// then fires on the next cycle, so the sender NEVER re-attempts F to this
+    /// neighbor — the field is stranded until the heartbeat un-poisons the cache
+    /// (node.rs ~L2703).
+    ///
+    /// Passes on origin/main (documents the current, buggy behavior). The
+    /// proposed fix — do not cache from a sender-side delivery signal alone —
+    /// would leave the cache at `S0`; then `S0 != S1`, the equality gate would
+    /// NOT fire, and the delta carrying F would be re-sent without waiting for the
+    /// heartbeat. Under that fix the poisoning `assert_eq!` below would fail,
+    /// which is exactly what makes this a regression pin for #4857.
+    #[tokio::test]
+    async fn queue_full_drop_at_receiver_poisons_neighbor_summary_cache_4857() {
+        // Replicates `broadcast_to_single_peer`'s "skip if summaries are equal"
+        // gate (~L600): the next broadcast to this neighbor is SUPPRESSED when the
+        // sender's cached summary of the neighbor equals the sender's own current
+        // summary (the sender believes the neighbor already has our state).
+        fn would_skip_broadcast(our: &StateSummary<'_>, their: Option<&StateSummary<'_>>) -> bool {
+            matches!(their, Some(t) if t.as_ref() == our.as_ref())
+        }
+
+        let time_source = SharedMockTimeSource::new();
+        let manager = InterestManager::new(time_source.clone());
+        let contract = make_contract_key(57);
+        let neighbor = make_peer_key();
+
+        // The neighbor's REAL summary (rarely-changing field F at its old value)
+        // and the sender's CURRENT summary after F changed.
+        let s0 = StateSummary::from(vec![0u8, 0, 0, 0]);
+        let s1 = StateSummary::from(vec![1u8, 0, 0, 0]);
+        assert_ne!(
+            s0.as_ref(),
+            s1.as_ref(),
+            "precondition: neighbor's real summary S0 differs from ours S1 (F changed)"
+        );
+
+        // The sender learned the neighbor's real summary S0 via a prior summary
+        // exchange, so a delta computed against S0 would carry F.
+        manager.register_peer_interest(&contract, neighbor.clone(), Some(s0.clone()), false);
+        assert_eq!(
+            manager.get_peer_summary(&contract, &neighbor),
+            Some(s0.clone()),
+            "precondition: the sender's cache of the neighbor holds S0"
+        );
+        assert!(
+            !would_skip_broadcast(&s1, manager.get_peer_summary(&contract, &neighbor).as_ref()),
+            "precondition: with the correct cache (S0 != S1) the equality gate does \
+             NOT fire, so the field-F delta would be sent"
+        );
+
+        // The sender broadcasts the delta diff(S0, S1). The transport DELIVERS it
+        // (sender-side completion), so the inline delta path applies the delivery
+        // gate with our_summary = S1. The receiver, however, drops the delta with
+        // ContractQueueFull (silent, no ResyncRequest — #4251): it stays at S0.
+        record_delivery_to_interest(
+            &manager,
+            /* sent_delta */ true,
+            &contract,
+            &neighbor,
+            Some(&s1),
+            /* state_size */ 4096,
+            /* payload_size */ 64,
+        );
+
+        // #4857 POISONING: the sender-side Delivered cached OUR OWN current
+        // summary S1 as the neighbor's summary — even though the neighbor never
+        // applied the delta and is still at S0. (This is the assertion that would
+        // FAIL under the proposed fix.)
+        assert_eq!(
+            manager.get_peer_summary(&contract, &neighbor),
+            Some(s1.clone()),
+            "#4857: a sender-side Delivered poisons the neighbor-summary cache to \
+             our own current summary, even though the receiver dropped the delta \
+             (ContractQueueFull) and is still at S0"
+        );
+
+        // CONSEQUENCE: the sender now believes the neighbor is current, so the
+        // equality gate suppresses the next broadcast of the SAME state — F is
+        // never re-attempted to this neighbor.
+        assert!(
+            would_skip_broadcast(&s1, manager.get_peer_summary(&contract, &neighbor).as_ref()),
+            "#4857: post-poison the cache equals our current summary, so \
+             broadcast_to_single_peer's equality gate suppresses the re-send — the \
+             neighbor stays diverged (missing F) until the ~5-min heartbeat \
+             un-poisons the cache (node.rs ~L2703)"
+        );
+        // And the divergence is real: had the cache NOT been poisoned (still S0),
+        // the gate would not fire and the field-F delta would go out.
+        assert!(
+            !would_skip_broadcast(&s1, Some(&s0)),
+            "sanity: with the un-poisoned cache S0 (!= S1) the equality gate would \
+             NOT fire, so the correct behavior re-sends the field-F delta"
+        );
     }
 
     /// Regression pin for the #4473 path-B summarize storm (counterpart to
