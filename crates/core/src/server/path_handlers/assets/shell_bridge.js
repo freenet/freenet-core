@@ -13,8 +13,18 @@ function freenetBridge(authToken, userToken, hostedMode) {
   var inMemoryConsent = Object.create(null);
   // Per-tag + global rate limiter for the notification proxy (see the
   // marker-bracketed `makeNotifyRateLimiter` factory below, unit-tested in
-  // shell_bridge_notifications.test.mjs).
-  var notifyLimiter = makeNotifyRateLimiter();
+  // shell_bridge_notifications.test.mjs). Its rolling global window is
+  // persisted per-contract via makeNotifyRateStore so a full page reload can't
+  // reset the flood cap (#4849).
+  var notifyLimiter = makeNotifyRateLimiter(makeNotifyRateStore());
+  // bfcache restore does NOT re-run this IIFE, so a page restored from the
+  // back-forward cache keeps its stale in-memory flood-cap window. Resync it
+  // from the store on a persisted `pageshow` so a Back-restored contract page
+  // can't reset the cap (#4849). The shell's open WebSocket + EventSource
+  // usually make it bfcache-ineligible, but this doesn't rely on that.
+  window.addEventListener('pageshow', function (e) {
+    if (e && e.persisted) notifyLimiter.resync();
+  });
 
   // FAIL CLOSED whenever a HOSTED browser has no usable per-user token (#4381).
   //
@@ -301,6 +311,58 @@ function freenetBridge(authToken, userToken, hostedMode) {
     } catch (e) {}
   }
 
+  // Contract-scoped persistence for the notification rate limiter's rolling
+  // global window, so a full page reload can't reset the flood cap (#4849): a
+  // consented contract could otherwise fire the whole GLOBAL_MAX budget, force
+  // a reload (e.g. a same-contract v1<->v2 `navigate`, which the shell treats
+  // as cross-contract and reloads the top document), and start over with an
+  // empty limiter. Keyed by the SAME version-less contract key as consent
+  // (`freenet_notify:<key>`), so the window survives that v1<->v2 reload while
+  // staying isolated per contract. sessionStorage is the right store: per-tab
+  // (each tab is its own notification surface), same-origin so it persists
+  // across the shell's in-place navigate, and auto-cleared when the tab closes.
+  // Returns null when there's no contract key — the limiter then runs in-memory
+  // only, which is harmless because without a contract key there is no consent
+  // and so no notification ever fires.
+  // notify-rate-store:BEGIN — the sessionStorage adapter for the flood-cap
+  // window. Extracted verbatim between these markers by
+  // shell_bridge_notifications.test.mjs (with stubbed `sessionStorage` /
+  // `contractConsentKey`) so its load/save behavior — the Array.isArray guard,
+  // JSON round-trip, non-finite + future-timestamp filtering, and fail-safe
+  // try/catch — is actually exercised, not just source-grepped.
+  function makeNotifyRateStore() {
+    var ckey = contractConsentKey();
+    if (!ckey) return null;
+    var storeKey = ckey + ':rate';
+    return {
+      load: function () {
+        try {
+          var raw = sessionStorage.getItem(storeKey);
+          if (!raw) return null;
+          var arr = JSON.parse(raw);
+          if (!Array.isArray(arr)) return null;
+          // Drop non-finite entries, and any timestamp in the FUTURE relative
+          // to now: a backward wall-clock correction between loads would
+          // otherwise leave future-dated entries that the 60s window filter
+          // keeps (its `now - t` goes negative), locking out notifications
+          // until the clock catches up. Clamping here bounds that to 60s (#4849).
+          var nowMs = Date.now();
+          return arr.filter(function (t) {
+            return typeof t === 'number' && isFinite(t) && t <= nowMs;
+          });
+        } catch (e) {
+          return null;
+        }
+      },
+      save: function (recent) {
+        try {
+          sessionStorage.setItem(storeKey, JSON.stringify(recent));
+        } catch (e) {}
+      },
+    };
+  }
+  // notify-rate-store:END
+
   // A per-tag throttle (so distinct rooms aren't dropped) plus a rolling global
   // cap (so a consented contract can't flood with unique tags), with a bounded
   // per-tag map so a distinct-tag flood can't grow memory unbounded. `ok(tag,
@@ -311,13 +373,24 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // markers and unit-tested by
   // crates/core/src/server/shell_bridge_notifications.test.mjs. Keep it pure
   // (no reference to anything outside this function) so the extraction works.
-  function makeNotifyRateLimiter() {
+  function makeNotifyRateLimiter(store) {
     var TAG_MIN_MS = 3000; // same-tag throttle window
     var GLOBAL_MAX = 20; // max notifications per rolling window
     var GLOBAL_WINDOW_MS = 60000;
     var MAP_CAP = 128; // bound the per-tag map; evict down to MAP_CAP/2
     var tagTimes = Object.create(null);
+    // The rolling global window of accepted-notification timestamps. Optionally
+    // rehydrated from an injected `store` so a full page RELOAD can't reset the
+    // flood cap (#4849). `store` is an optional {load, save} adapter, kept OUT
+    // of this factory so the factory stays pure (references only its params and
+    // locals) and the Node unit test can extract it verbatim between the
+    // markers and drive it — or inject an in-memory store. Any stale entries in
+    // a rehydrated window are dropped by the window filter on the first `ok`.
     var recent = [];
+    if (store && typeof store.load === 'function') {
+      var loaded = store.load();
+      if (loaded && loaded.length) recent = loaded;
+    }
     return {
       ok: function (tag, now) {
         var last = tagTimes[tag];
@@ -328,6 +401,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
         if (recent.length >= GLOBAL_MAX) return false;
         tagTimes[tag] = now;
         recent.push(now);
+        // Persist the window so a reload rehydrates it (see #4849). Saved only
+        // on the accept path: a stale (unfiltered) persisted window is dropped
+        // by the filter above on the next load, so this is always conservative.
+        if (store && typeof store.save === 'function') store.save(recent);
         var keys = Object.keys(tagTimes);
         if (keys.length > MAP_CAP) {
           keys.sort(function (a, b) {
@@ -338,6 +415,24 @@ function freenetBridge(authToken, userToken, hostedMode) {
           }
         }
         return true;
+      },
+      // Re-read the persisted window into `recent`. Used on bfcache restore: a
+      // back-forward-cache page keeps its stale in-memory window and never
+      // re-runs the constructor, so a Back-restored older contract page could
+      // otherwise reset the flood cap (#4849). Conservative — replaces only
+      // when the store has a non-empty window, so a transient empty/error load
+      // never resets an in-memory window.
+      resync: function () {
+        if (store && typeof store.load === 'function') {
+          var loaded = store.load();
+          if (loaded && loaded.length) recent = loaded;
+        }
+      },
+      // Current size of the per-tag map, so the unit test can assert the
+      // MAP_CAP eviction actually bounds it (removing the eviction block would
+      // let this grow past MAP_CAP and fail the test). Not used in production.
+      tagCount: function () {
+        return Object.keys(tagTimes).length;
       },
     };
   }
@@ -1043,6 +1138,16 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // that caused the originating tab to silently miss prompts whenever it
   // wasn't foregrounded; SSE eliminates both the polling-floor latency and
   // the visibility race.
+  // perm-overlay-flow:BEGIN — the delegate permission-prompt overlay and its
+  // Server-Sent-Events stream. #3836 requires that NOTHING in this whole region
+  // constructs a browser Notification: delegate permission prompts must render
+  // as in-page overlay cards, never as OS notifications a user can miss or
+  // dismiss. The Rust guard `shell_page_permission_overlay_present_and_safe`
+  // scans this marker-bounded region (NOT a code anchor), so the SSE
+  // `prompt_added`/`prompt_removed` handlers below — part of the prompt-render
+  // flow — are INSIDE the guarded region (#4849 F2). The legitimate
+  // message-notification code (showAppNotification) sits far above BEGIN, so it
+  // is outside this region and unaffected.
   var overlayRoot = null;
   var overlayCards = {}; // nonce -> card element
   var OVERLAY_CSS =
@@ -1468,4 +1573,5 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // legacy 3-second poll so users on those clients still see prompts.
     startFallbackPoll();
   }
+  // perm-overlay-flow:END
 }
