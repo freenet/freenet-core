@@ -2683,16 +2683,31 @@ mod tests {
             html.contains("function setText(el, text)"),
             "setText helper (textContent-only) missing"
         );
-        // innerHTML must not appear anywhere in the overlay code path. The
-        // boundary marker below was previously `setInterval(checkPermissions`
-        // but that polling loop is gone; we now bound the slice at the
-        // EventSource-fallback `setInterval(reconcileFromPending`.
-        let overlay_start = html.find("__freenet_perm_overlay").unwrap();
+        // Bound the overlay code path by the explicit `perm-overlay-flow`
+        // markers in shell_bridge.js, NOT a code anchor. The previous bound
+        // (`setInterval(reconcileFromPending` / `EventSource`) stopped SHORT of
+        // the SSE `prompt_added`/`prompt_removed` handlers, which ARE part of
+        // the prompt-render flow #3836 protects — so a browser Notification
+        // reintroduced into an SSE handler would have slipped past this guard.
+        // The markers bracket the whole overlay + SSE region so the asserts
+        // below scan all of it (#4849 F2).
+        let overlay_start = html
+            .find("perm-overlay-flow:BEGIN")
+            .expect("perm-overlay-flow:BEGIN marker must bracket the overlay flow");
         let overlay_end = html[overlay_start..]
-            .find("setInterval(reconcileFromPending")
-            .or_else(|| html[overlay_start..].find("EventSource"))
-            .expect("overlay slice must end at the SSE setup or fallback poll");
+            .find("perm-overlay-flow:END")
+            .expect("perm-overlay-flow:END marker must bracket the overlay flow");
         let overlay_slice = &html[overlay_start..overlay_start + overlay_end];
+        // The negative asserts below are only meaningful if the slice actually
+        // CONTAINS the SSE prompt-render surface. Pin that the marker-bounded
+        // region includes the `prompt_added`/`prompt_removed` handlers, so a
+        // refactor that moves them past `perm-overlay-flow:END` (shrinking the
+        // slice) fails HERE rather than silently making the negative asserts
+        // pass vacuously — the exact regression F2 exists to prevent (#4849).
+        assert!(
+            overlay_slice.contains("'prompt_added'") && overlay_slice.contains("'prompt_removed'"),
+            "overlay guard slice must cover the SSE prompt handlers (#4849 F2)"
+        );
         assert!(
             !overlay_slice.contains("innerHTML"),
             "overlay code path must not use innerHTML (XSS surface)"
@@ -3376,6 +3391,52 @@ mod tests {
         assert!(
             SHELL_BRIDGE_JS.contains("Notification.requestPermission(done)"),
             "permission prompt must be requested from the shell affordance click"
+        );
+    }
+
+    /// Regression for #4849: the notification-proxy flood-cap (the rolling
+    /// global window in `makeNotifyRateLimiter`) must be PERSISTED per-contract
+    /// so a full page reload can't reset it. Without this, a consented contract
+    /// could fire the whole budget, force a reload (a same-contract v1<->v2
+    /// `navigate`, which the shell reloads as cross-contract), and start over
+    /// with an empty limiter. The behavioral proof is in
+    /// shell_bridge_notifications.test.mjs (the reload rehydration case); this
+    /// pins the WIRING at the source level so a refactor can't silently drop
+    /// the persistence and re-open the reload-reset hole.
+    #[test]
+    fn bridge_js_notification_flood_cap_persisted_across_reload() {
+        // The limiter is constructed WITH the persistence store, not the old
+        // no-arg makeNotifyRateLimiter().
+        assert!(
+            SHELL_BRIDGE_JS.contains("makeNotifyRateLimiter(makeNotifyRateStore())"),
+            "rate limiter must be constructed with the persistence store (#4849)"
+        );
+        // The store is keyed off the version-less contract consent key (so the
+        // window survives a v1<->v2 reload) with a `:rate` suffix, and is backed
+        // by sessionStorage (per-tab, same-origin, reload-surviving).
+        assert!(
+            SHELL_BRIDGE_JS.contains("ckey + ':rate'"),
+            "rate window must use a contract-scoped storage key (#4849)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("sessionStorage.getItem(storeKey)")
+                && SHELL_BRIDGE_JS.contains("sessionStorage.setItem(storeKey"),
+            "rate window must be persisted in sessionStorage (#4849)"
+        );
+        // The factory actually rehydrates from and saves to the injected store.
+        assert!(
+            SHELL_BRIDGE_JS.contains("store.load()")
+                && SHELL_BRIDGE_JS.contains("store.save(recent)"),
+            "limiter must rehydrate from and persist to the injected store (#4849)"
+        );
+        // The bfcache reset variant is closed by a `pageshow`-persisted resync
+        // (the IIFE does not re-run on back-forward-cache restore, so the
+        // in-memory window would otherwise stay stale). Pin the wiring so a
+        // refactor can't silently drop it.
+        assert!(
+            SHELL_BRIDGE_JS.contains("pageshow")
+                && SHELL_BRIDGE_JS.contains("notifyLimiter.resync()"),
+            "flood-cap window must be resynced from the store on bfcache restore (#4849)"
         );
     }
 
