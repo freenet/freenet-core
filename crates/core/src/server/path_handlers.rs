@@ -2698,15 +2698,24 @@ mod tests {
             "overlay code path must not use innerHTML (XSS surface)"
         );
 
-        // The old Notification flow must be gone: no requestPermission(),
-        // no new Notification(...), no window.open('/permission/').
+        // The old permission-prompt-via-Notification flow must be gone: the
+        // permission OVERLAY code path must not request or construct a browser
+        // Notification (#3836 — delegate permission prompts must render as the
+        // in-page SSE overlay, never as a browser Notification users
+        // block/miss/dismiss). Scoped to `overlay_slice`, NOT the whole shell:
+        // browser Notifications are now legitimately used ELSEWHERE in the
+        // bridge for new-MESSAGE notifications (a best-effort UX where a
+        // missed/dismissed notification is fine, unlike a permission prompt),
+        // pinned separately by `bridge_js_notification_proxy_invariants`. The
+        // message-notification code sits well before the overlay root, so it is
+        // outside this slice.
         assert!(
-            !html.contains("Notification.requestPermission"),
-            "browser Notification permission request must be removed (#3836)"
+            !overlay_slice.contains("Notification.requestPermission"),
+            "permission overlay must not request browser Notification permission (#3836)"
         );
         assert!(
-            !html.contains("new Notification("),
-            "browser Notification construction must be removed (#3836)"
+            !overlay_slice.contains("new Notification("),
+            "permission overlay must not construct a browser Notification (#3836)"
         );
         assert!(
             !html.contains("window.open('/permission/")
@@ -3276,10 +3285,12 @@ mod tests {
             !html.contains("__freenet_user_token"),
             "non-hosted shell must not mint a per-user token; got: {html}"
         );
-        assert!(
-            !html.contains("localStorage.setItem"),
-            "non-hosted shell must not persist a per-user token; got: {html}"
-        );
+        // NB: the always-injected bridge legitimately calls `localStorage.setItem`
+        // for per-contract notification preferences (consent / snooze — see
+        // `bridge_js_notification_proxy_invariants`). That is NOT a per-user
+        // identity token, so we do not blanket-ban `setItem` here; the
+        // token-persistence guard is the absence of the token key
+        // (`__freenet_user_token`, above) and of the 2-arg bridge call (below).
         assert!(
             !html.contains(", __freenet_user_token)"),
             "non-hosted shell must not call freenetBridge with a user token"
@@ -3317,6 +3328,54 @@ mod tests {
         assert!(
             SHELL_USER_TOKEN_JS.contains("__freenet_user_token__"),
             "user-token snippet must persist under the durable localStorage key"
+        );
+    }
+
+    /// freenet/river#408: the browser-notification proxy carries several
+    /// security-relevant invariants (a sandboxed contract app hands notifications
+    /// to the real-origin shell over the postMessage bridge). Pin them by source
+    /// so a refactor can't silently drop them — same discipline as the other
+    /// `SHELL_BRIDGE_JS.contains` guards above.
+    #[test]
+    fn bridge_js_notification_proxy_invariants() {
+        // Consent key is derived ONLY from the trusted server-routed path, never
+        // from message content, and matches BOTH API versions so a v2 load isn't
+        // stranded (permission granted but every notification silently dropped).
+        assert!(
+            SHELL_BRIDGE_JS.contains(r"/\/v[12]\/contract\/web\/([^/?#]+)/"),
+            "notification consent key must derive from the /v[12]/contract/web/<key> path"
+        );
+        // Every notification is gated on BOTH the browser permission AND this
+        // contract's own consent, so one contract's gateway-wide browser grant
+        // can't notify the user on behalf of a different contract.
+        assert!(
+            SHELL_BRIDGE_JS
+                .contains("Notification.permission !== 'granted' || !contractHasConsent()"),
+            "showAppNotification must gate on browser permission AND per-contract consent"
+        );
+        // "Not now" must be durable so a contract that re-sends the enable prompt
+        // can't re-pin the host-owned bar over the app.
+        assert!(
+            SHELL_BRIDGE_JS.contains("isNotifySnoozed()")
+                && SHELL_BRIDGE_JS.contains("setNotifySnoozed()"),
+            "notification dismissal must be enforced via the snooze guard"
+        );
+        // Notifications pass a rate limiter (per-tag + rolling global cap) so a
+        // consented contract can't flood the user with OS notifications.
+        assert!(
+            SHELL_BRIDGE_JS.contains("notifyLimiter.ok("),
+            "notifications must pass the per-tag + global rate limiter"
+        );
+        // Attacker-controlled notification text is length-capped (text-only).
+        assert!(
+            SHELL_BRIDGE_JS.contains("String(msg.title).slice(0, 128)"),
+            "notification title must be length-capped"
+        );
+        // The permission prompt is only fired from a real click on the shell
+        // affordance (transient activation must come from the shell frame).
+        assert!(
+            SHELL_BRIDGE_JS.contains("Notification.requestPermission(done)"),
+            "permission prompt must be requested from the shell affordance click"
         );
     }
 
