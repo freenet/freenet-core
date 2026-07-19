@@ -5670,7 +5670,7 @@ mod tests {
             // Assemble the needle from parts so the contiguous call string never
             // appears verbatim in this file — otherwise `.contains(<literal>)`
             // would match its OWN argument via `include_str!` (self-reference).
-            let needle = concat!("merge_backoff", ".record_success(");
+            let needle = concat!("merge_backoff", ".record_success");
             assert!(
                 !SOURCE.contains(needle),
                 "node.rs must NOT reset the merge backoff anywhere — a \

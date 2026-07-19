@@ -300,7 +300,7 @@ async fn drive_client_update(
                     // merge works now — clear any merge-failure backoff so inbound
                     // broadcasts resume (#4864 review P2, delta-only).
                     if is_delta_update {
-                        op_manager.ring.merge_backoff.record_success(key.id());
+                        op_manager.ring.merge_backoff.record_success_local(key.id());
                     }
                     execution
                 }
@@ -395,7 +395,7 @@ async fn drive_client_update(
                     // Successful client-local DELTA merge on the remote-target
                     // path clears the backoff too (#4864 review P2, delta-only).
                     if is_delta_update {
-                        op_manager.ring.merge_backoff.record_success(key.id());
+                        op_manager.ring.merge_backoff.record_success_local(key.id());
                     }
                     execution
                 }
@@ -1244,7 +1244,11 @@ async fn drive_relay_broadcast_to(
     // verbatim by `record_failure` in the error arm, so lazy computation would
     // only duplicate the work on the failure path.
     let payload_hash = crate::ring::merge_backoff::merge_payload_hash(is_delta, &payload_bytes);
-    match op_manager.ring.merge_backoff.check(key.id(), payload_hash) {
+    match op_manager
+        .ring
+        .merge_backoff
+        .check(key.id(), sender_addr, payload_hash)
+    {
         crate::ring::merge_backoff::MergeDecision::Allow => {}
         decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
         | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
@@ -1286,7 +1290,10 @@ async fn drive_relay_broadcast_to(
             // do NOT reset here; the resync-apply path in node.rs does not reset
             // either (see the note there).
             if is_delta {
-                op_manager.ring.merge_backoff.record_success(key.id());
+                op_manager
+                    .ring
+                    .merge_backoff
+                    .record_success_from_sender(key.id(), sender_addr);
             }
             result
         }
@@ -1303,10 +1310,12 @@ async fn drive_relay_broadcast_to(
                 } else {
                     crate::ring::merge_backoff::MergeFailureClass::Invalid
                 };
-                op_manager
-                    .ring
-                    .merge_backoff
-                    .record_failure(key.id(), class, payload_hash);
+                op_manager.ring.merge_backoff.record_failure(
+                    key.id(),
+                    sender_addr,
+                    class,
+                    payload_hash,
+                );
             }
 
             // On benign stale-version rejection (not OOG/traps/validation
@@ -2053,7 +2062,7 @@ async fn apply_streaming_broadcast(
     match op_manager
         .ring
         .merge_backoff
-        .check(key.id(), stream_payload_hash)
+        .check(key.id(), sender_addr, stream_payload_hash)
     {
         crate::ring::merge_backoff::MergeDecision::Allow => {}
         decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
@@ -2127,10 +2136,12 @@ async fn apply_streaming_broadcast(
                 } else {
                     crate::ring::merge_backoff::MergeFailureClass::Invalid
                 };
-                op_manager
-                    .ring
-                    .merge_backoff
-                    .record_failure(key.id(), class, stream_payload_hash);
+                op_manager.ring.merge_backoff.record_failure(
+                    key.id(),
+                    sender_addr,
+                    class,
+                    stream_payload_hash,
+                );
             }
 
             // Classify failure: real failure → self-heal via
@@ -2624,7 +2635,7 @@ mod tests {
             .find("broadcast_dedup_cache.check_and_insert")
             .expect("dedup check missing");
         let backoff_pos = driver_src
-            .find("merge_backoff.check(")
+            .find(".check(key.id(), sender_addr, payload_hash)")
             .expect("merge_backoff.check gate missing in BroadcastTo driver");
         let merge_pos = driver_src
             .find("super::update_contract(")
@@ -2648,7 +2659,7 @@ mod tests {
     fn broadcast_to_backoff_records_success_and_gated_failure() {
         let driver_src = broadcast_to_driver_src();
         let success_pos = driver_src
-            .find("merge_backoff.record_success(")
+            .find(".record_success_from_sender(")
             .expect("drive_relay_broadcast_to must clear the backoff on a successful merge");
         // The reset must be gated on is_delta (delta-only convergence signal).
         let is_delta_gate_pos = driver_src
@@ -2656,8 +2667,8 @@ mod tests {
             .expect("backoff reset must be gated on `if is_delta` (#4861)");
         assert!(
             is_delta_gate_pos < success_pos,
-            "merge_backoff.record_success MUST be inside an `if is_delta` gate so \
-             a full-state apply does not reset the backoff (#4861 fork oscillation)"
+            "merge_backoff.record_success_from_sender MUST be inside an `if is_delta` \
+             gate so a full-state apply does not reset the backoff (#4861 fork oscillation)"
         );
         let record_pos = driver_src
             .find(".record_failure(")
@@ -2731,7 +2742,7 @@ mod tests {
         // rustfmt breaks across lines here (the longer `stream_payload_hash`
         // pushes the chain over the chain-width limit).
         let backoff_pos = driver_src
-            .find(".check(key.id(), stream_payload_hash)")
+            .find(".check(key.id(), sender_addr, stream_payload_hash)")
             .expect("streaming merge path missing merge_backoff.check gate");
         let merge_pos = driver_src
             .find("super::update_contract(")
@@ -2744,7 +2755,9 @@ mod tests {
         // a full-state merge is the same fork-flippable operation as a resync
         // apply, so the streaming path must NOT reset the backoff. (Assemble
         // the needle so this literal is not a self-referential match.)
-        let record_success = concat!("record_", "success(");
+        // Match any `record_success*` variant (record_success_from_sender /
+        // record_success_local) — the streaming full-state path must call none.
+        let record_success = concat!("record_", "success");
         assert!(
             !driver_src.contains(record_success),
             "streaming path must NOT reset the backoff — a full-state merge is \
@@ -2773,10 +2786,11 @@ mod tests {
             .or_else(|| after.find("\n#[cfg(test)]"))
             .unwrap_or(after.len());
         let body = &src[start..start + 1 + end];
-        let success = concat!("merge_backoff.record_", "success(");
+        let success = concat!(".record_", "success_local(");
         assert!(
             body.contains(success),
-            "drive_client_update must reset the backoff on a successful merge (#4864 P2)"
+            "drive_client_update must reset the backoff on a successful merge via \
+             record_success_local (contract-wide only, not per-sender) (#4864 P2)"
         );
         assert!(
             body.contains("is_delta_update"),
@@ -3385,15 +3399,34 @@ mod tests {
         )
     }
 
-    /// Like [`build_queue_full_test_node`], but the stand-in handler FAILS every
-    /// delta `UpdateQuery` with a generic contract-exec rejection (recorded by
-    /// the backoff) and SUCCEEDS every full-state `UpdateQuery`, while counting
-    /// the `UpdateQuery` events that reach it. `GetSummaryQuery` (from the
+    /// A `ContractQueueFull` executor error (transient backpressure). Satisfies
+    /// `is_contract_queue_full()` but NOT `is_contract_exec_rejection()`, so the
+    /// backoff recording gate MUST skip it (queue-full is load, not poison).
+    fn queue_full_err() -> crate::contract::ExecutorError {
+        crate::contract::ExecutorError::other(crate::contract::ContractQueueFull)
+    }
+
+    /// What the exec-reject stand-in handler returns for a DELTA `UpdateQuery`.
+    #[derive(Clone, Copy)]
+    enum DeltaOutcome {
+        /// Fail with a contract-exec rejection (recorded by the backoff).
+        ExecReject,
+        /// Fail with `ContractQueueFull` (NOT recorded — transient load).
+        QueueFull,
+        /// Succeed (state changed) — used to exercise a clean DELTA merge.
+        Success,
+    }
+
+    /// Build a node whose stand-in contract handler resolves every DELTA
+    /// `UpdateQuery` per `delta_outcome` (fail-exec-reject / fail-queue-full /
+    /// succeed) and SUCCEEDS every full-state `UpdateQuery`, while counting the
+    /// `UpdateQuery` events that reach it. `GetSummaryQuery` (from the
     /// post-success proactive-summary spawn) is answered benignly. The counter
-    /// lets a test assert the backoff PREVENTS executor invocation (#4864 review
-    /// testing H1).
-    async fn build_exec_reject_test_node(
+    /// lets a test assert whether the backoff PREVENTS executor invocation
+    /// (#4864 review testing H1 / P1).
+    async fn build_broadcast_test_node(
         id: &str,
+        delta_outcome: DeltaOutcome,
     ) -> (
         Arc<OpManager>,
         crate::node::EventLoopNotificationsReceiver,
@@ -3457,9 +3490,19 @@ mod tests {
                             UpdateData::Delta(_) | UpdateData::RelatedDelta { .. }
                         );
                         if is_delta {
-                            ContractHandlerEvent::UpdateResponse {
-                                new_value: Err(exec_reject_err(key)),
-                                state_changed: false,
+                            match delta_outcome {
+                                DeltaOutcome::ExecReject => ContractHandlerEvent::UpdateResponse {
+                                    new_value: Err(exec_reject_err(key)),
+                                    state_changed: false,
+                                },
+                                DeltaOutcome::QueueFull => ContractHandlerEvent::UpdateResponse {
+                                    new_value: Err(queue_full_err()),
+                                    state_changed: false,
+                                },
+                                DeltaOutcome::Success => ContractHandlerEvent::UpdateResponse {
+                                    new_value: Ok(WrappedState::from(vec![1u8, 2, 3])),
+                                    state_changed: true,
+                                },
                             }
                         } else {
                             ContractHandlerEvent::UpdateResponse {
@@ -3481,6 +3524,19 @@ mod tests {
         let guard: Box<dyn std::any::Any> =
             Box::new((handler, result_router_rx, task_monitor, wait_for_event));
         (op_manager, notification_rx, update_query_count, guard)
+    }
+
+    /// Convenience wrapper: a node whose stand-in handler fails every delta with
+    /// a contract-exec rejection (the common case for the backoff-gate tests).
+    async fn build_exec_reject_test_node(
+        id: &str,
+    ) -> (
+        Arc<OpManager>,
+        crate::node::EventLoopNotificationsReceiver,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        Box<dyn std::any::Any>,
+    ) {
+        build_broadcast_test_node(id, DeltaOutcome::ExecReject).await
     }
 
     /// #4864 review (testing H1): the load-bearing #4861 behavior — the backoff
@@ -3628,6 +3684,215 @@ mod tests {
             queries_after_trip,
             "the backoff tripped across the full-state success (no reset) — the \
              following delta merge is skipped"
+        );
+    }
+
+    /// #4864 review P1 (the adversarial regression, driven through the REAL
+    /// driver): one sender tripping its Invalid channel must NOT suppress a
+    /// DIFFERENT sender's delta — the second sender's merge still reaches the
+    /// executor. A contract-wide gate would blackout the healthy sender here,
+    /// which is the peer-triggerable-blackout this per-sender rework prevents.
+    #[tokio::test]
+    async fn backoff_gate_is_scoped_per_sender_in_driver() {
+        use std::sync::atomic::Ordering;
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, update_queries, _guard) =
+            build_exec_reject_test_node("backoff-per-sender-4864").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([41u8; 32]),
+            CodeHash::new([42u8; 32]),
+        );
+        let sender_a: SocketAddr = "127.0.0.1:12400".parse().unwrap();
+        let sender_b: SocketAddr = "127.0.0.1:12500".parse().unwrap();
+
+        // Sender A trips its own Invalid channel (3 consecutive delta failures).
+        for bytes in [vec![1u8], vec![2u8], vec![3u8]] {
+            let _ = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(bytes),
+                Vec::new(),
+                sender_a,
+            )
+            .await;
+            let _ = drain_resync_targets(&mut notification_rx, key);
+        }
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            3,
+            "A's 3 failing merges reached the executor"
+        );
+
+        // A's next delta is now suppressed (A's channel tripped).
+        let ra = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![4u8]),
+            Vec::new(),
+            sender_a,
+        )
+        .await;
+        assert!(ra.is_ok(), "A's suppressed broadcast completes Ok");
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            3,
+            "A's suppressed delta MUST NOT reach the executor"
+        );
+
+        // Sender B's delta (distinct payload) STILL reaches the executor — the
+        // contract stays live for healthy senders despite A's backoff. It fails
+        // via the stand-in, so B's channel starts counting, but the merge RAN.
+        let rb = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![5u8]),
+            Vec::new(),
+            sender_b,
+        )
+        .await;
+        let _ = drain_resync_targets(&mut notification_rx, key);
+        assert!(
+            rb.is_err(),
+            "B's delta reaches the merge (fails via stand-in)"
+        );
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            4,
+            "B's delta MUST reach the executor despite A's per-sender backoff"
+        );
+    }
+
+    /// #4864 review item 7(b): `ContractQueueFull` is transient backpressure, not
+    /// poison — the driver's `is_contract_exec_rejection()` gate must NOT record
+    /// it, so no amount of consecutive queue-full failures trips the backoff.
+    /// Every delta keeps reaching the executor (no suppression).
+    #[tokio::test]
+    async fn queue_full_failures_do_not_trip_backoff() {
+        use std::sync::atomic::Ordering;
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, update_queries, _guard) =
+            build_broadcast_test_node("backoff-queuefull-4864", DeltaOutcome::QueueFull).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([51u8; 32]),
+            CodeHash::new([52u8; 32]),
+        );
+        let sender: SocketAddr = "127.0.0.1:12600".parse().unwrap();
+
+        // Five consecutive queue-full delta failures (well past the N=3 Invalid
+        // trip threshold). None may be recorded to the backoff.
+        for bytes in [vec![1u8], vec![2u8], vec![3u8], vec![4u8], vec![5u8]] {
+            let _ = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(bytes),
+                Vec::new(),
+                sender,
+            )
+            .await;
+            let _ = drain_resync_targets(&mut notification_rx, key);
+        }
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            5,
+            "every queue-full delta must still reach the executor — queue-full \
+             must NOT trip the backoff (it is transient load, not poison)"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::merges_suppressed_by_backoff(),
+            0,
+            "no merge may be suppressed — queue-full never records a backoff entry"
+        );
+        assert_eq!(
+            op_manager.ring.merge_backoff.contracts_in_backoff(),
+            0,
+            "no contract may be in backoff after only queue-full failures"
+        );
+    }
+
+    /// #4864 review item 6: a successful client-local DELTA driven through the
+    /// REAL `drive_client_update` clears the CONTRACT-WIDE side (Timeout + memo)
+    /// via `record_success_local`, but must NOT clear a remote sender's Invalid
+    /// channel (a local success says nothing about that sender's fork).
+    #[tokio::test]
+    async fn client_local_delta_success_clears_contract_side_not_other_senders() {
+        let (op_manager, _notification_rx, _update_queries, _guard) =
+            build_broadcast_test_node("backoff-client-local-4864", DeltaOutcome::Success).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([61u8; 32]),
+            CodeHash::new([62u8; 32]),
+        );
+        // Make the local node host the contract so drive_client_update's
+        // target=None path applies the update locally instead of erroring.
+        op_manager
+            .ring
+            .host_contract(key, 100, crate::ring::AccessType::Put);
+
+        let remote_sender: SocketAddr = "127.0.0.1:12700".parse().unwrap();
+        let probe_sender: SocketAddr = "127.0.0.1:12800".parse().unwrap();
+
+        // Seed a contract-wide Timeout (trips at 1) and a remote sender's tripped
+        // Invalid channel (3 consecutive).
+        op_manager.ring.merge_backoff.record_failure(
+            key.id(),
+            remote_sender,
+            crate::ring::merge_backoff::MergeFailureClass::Timeout,
+            0x01,
+        );
+        for h in [0x11u64, 0x12, 0x13] {
+            op_manager.ring.merge_backoff.record_failure(
+                key.id(),
+                remote_sender,
+                crate::ring::merge_backoff::MergeFailureClass::Invalid,
+                h,
+            );
+        }
+        // Precondition: the contract-wide Timeout suppresses a fresh probe sender.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "seeded contract-wide Timeout should suppress before the client success"
+        );
+
+        // Drive a successful client-local DELTA through the real driver.
+        let outcome = drive_client_update(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            UpdateData::Delta(StateDelta::from(vec![7u8, 7, 7])),
+            RelatedContracts::default(),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "client-local delta merge should succeed via the stand-in: {outcome:?}"
+        );
+
+        // Contract-wide side (Timeout + memo) is cleared: the probe sender, which
+        // has no Invalid channel of its own, is now Allowed.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::Allow,
+            "record_success_local must clear the contract-wide Timeout + memo"
+        );
+        // But the remote sender's Invalid channel is UNTOUCHED — still suppressed.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), remote_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "a local client's success must NOT clear a remote sender's Invalid \
+             channel (it says nothing about that sender's fork)"
         );
     }
 
