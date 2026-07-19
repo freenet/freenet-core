@@ -745,6 +745,14 @@ impl WasmEngine for WasmtimeEngine {
             let typed_func = set_id_func
                 .typed::<i64, ()>(&*store)
                 .map_err(|e| WasmError::Export(e.to_string()))?;
+            // Re-arm the epoch deadline before this SECOND guest call (#4864
+            // round-4 P2). The store is reused across calls, so without re-arming
+            // __frnt_set_id would inherit whatever ticks REMAIN from the
+            // instantiation deadline armed above — a module whose start function
+            // ran near the budget would leave set_id ~zero ticks and trap it
+            // spuriously. Every guest entry must be immediately preceded by its
+            // own arm (pinned by `every_guest_entry_is_preceded_by_arm_epoch_deadline`).
+            arm_epoch_deadline(store, self.epoch_deadline_ticks);
             block_on_async(typed_func.call_async(&mut *store, id)).map_err(|e| {
                 classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string()))
             })?;
@@ -2136,17 +2144,16 @@ mod tests {
         );
     }
 
-    /// Source-scrape pin (#4864 review, fix 8): every guest-entry call site
-    /// (`instantiate_async` / `call_async`) MUST be preceded by an
-    /// `arm_epoch_deadline` in the same function, so a future refactor cannot
-    /// silently re-open the unbounded-runaway-guest hole by adding a guest-entry
-    /// path without arming the epoch deadline.
+    /// Source-scrape pin (#4864 review, fix 8 + round-4 P2): EVERY guest-entry
+    /// call site (`instantiate_async` / `call_async`) — not just the first — MUST
+    /// be preceded by an `arm_epoch_deadline(` since the previous guest entry in
+    /// the same function. The store is reused across calls, so a SECOND guest
+    /// call that is not re-armed inherits the first call's remaining epoch budget
+    /// (the `__frnt_set_id` case). This also future-proofs against a refactor
+    /// adding a guest-entry path without arming the deadline.
     #[test]
     fn every_guest_entry_is_preceded_by_arm_epoch_deadline() {
         let src = include_str!("wasmtime_engine.rs");
-        // The engine methods that run guest code (exclude test bodies + the
-        // helper defs). Each must contain `arm_epoch_deadline` before its first
-        // guest-entry `block_on_async(...call_async/instantiate_async)`.
         for fn_name in [
             "fn create_instance(",
             "fn initiate_buffer(",
@@ -2165,26 +2172,40 @@ mod tests {
                 .or_else(|| after.find("\n    pub(crate) fn "))
                 .unwrap_or(after.len());
             let body = &after[..end];
-            let arm_pos = body.find("arm_epoch_deadline").unwrap_or_else(|| {
-                panic!("`{fn_name}` runs guest code but never calls arm_epoch_deadline (#4864)")
-            });
-            // The guest-entry call in these methods is a block_on_async of a
-            // `.call_async(` / `.instantiate_async(`. Match the method-call
-            // syntax (leading dot + open paren) so a prose mention of
-            // "call_async" in a doc comment is not treated as the entry site.
-            // Take the EARLIEST of the two so arm must precede whichever guest
-            // entry comes first in the body.
-            let entry_pos = [body.find(".call_async("), body.find(".instantiate_async(")]
-                .into_iter()
-                .flatten()
-                .min();
-            if let Some(entry_pos) = entry_pos {
+
+            // Every guest-entry occurrence (both call kinds), sorted. Match the
+            // method-call syntax (leading dot + open paren) so a prose mention of
+            // "call_async" in a doc comment is not treated as an entry.
+            let mut entries: Vec<usize> = body
+                .match_indices(".call_async(")
+                .chain(body.match_indices(".instantiate_async("))
+                .map(|(i, _)| i)
+                .collect();
+            entries.sort_unstable();
+            if entries.is_empty() {
+                continue;
+            }
+            // Real arm CALLS only (`arm_epoch_deadline(`), not prose/identifier
+            // mentions like this pin's own name.
+            let arms: Vec<usize> = body
+                .match_indices("arm_epoch_deadline(")
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                !arms.is_empty(),
+                "`{fn_name}` runs guest code but never calls arm_epoch_deadline (#4864)"
+            );
+            // Each guest entry must have an arm SINCE the previous entry (before
+            // the first entry, `prev == 0`).
+            let mut prev = 0usize;
+            for entry_pos in entries {
                 assert!(
-                    arm_pos < entry_pos,
-                    "`{fn_name}`: arm_epoch_deadline ({arm_pos}) must precede the \
-                     guest-entry call ({entry_pos}) — else the guest runs with a \
-                     stale/unset deadline"
+                    arms.iter().any(|&a| a > prev && a < entry_pos),
+                    "`{fn_name}`: guest entry at {entry_pos} has no arm_epoch_deadline \
+                     since the previous guest entry ({prev}) — a store reused across \
+                     calls must be re-armed before EACH guest call (#4864 round-4)"
                 );
+                prev = entry_pos;
             }
         }
     }
