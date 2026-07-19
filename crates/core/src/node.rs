@@ -2949,6 +2949,26 @@ async fn handle_interest_sync_message(
             op_manager.interest_manager.record_resync_request_received();
             crate::config::GlobalTestMetrics::record_resync_request();
 
+            // CHEAP existence check BEFORE the rate limiters (#4864 round-4 P1).
+            // Both limiter buckets allocate a slot (vacant-at-capacity) BEFORE any
+            // existence check, so a peer spraying bogus contract keys could
+            // exhaust the strictly-capped limiter maps and then DENY new legit
+            // (peer, contract) keys (fail-closed → no response). A cheap
+            // synchronous redb point-lookup for state presence — the same probe
+            // the interest-sync gates use — rejects unknown contracts before they
+            // can touch a limiter slot. (A known contract whose state we can no
+            // longer fetch a moment later still bails at get_contract_state below,
+            // but only after passing this gate plus the rate limits.)
+            if !op_manager.ring.contract_state_present(&key) {
+                tracing::debug!(
+                    from = %source,
+                    contract = %key,
+                    event = "resync_response_no_state",
+                    "ResyncRequest for a contract we have no state for — not responding (pre-limiter existence check)"
+                );
+                return None;
+            }
+
             // Rate-limit the full-state response per (peer, contract) (#4861).
             // This is the mixed-version-rollout guard: a not-yet-upgraded peer
             // that still emits unlimited ResyncRequests must not be able to make
@@ -4036,6 +4056,109 @@ mod tests {
         let addr = Address::Hostname("localhost:not_a_port".to_string());
         let result = NodeConfig::parse_socket_addr(&addr).await;
         assert!(result.is_err());
+    }
+
+    /// #4864 round-4 P1: a peer spraying `ResyncRequest`s for contracts we do
+    /// NOT hold must not be able to exhaust the strictly-capped resync-response
+    /// limiter maps. Both limiters allocate a bucket slot (vacant-at-capacity)
+    /// the moment `check_and_record` runs, so if the existence check did not
+    /// precede them, N distinct bogus keys would occupy N slots and then start
+    /// DENYING new legit `(peer, contract)` keys (fail-closed → no response for
+    /// contracts we actually host).
+    ///
+    /// The `ResyncRequest` arm now does a cheap synchronous redb state-presence
+    /// point lookup BEFORE either limiter and bails on absence, so bogus keys
+    /// never touch a limiter slot. This test fires 50 distinct bogus keys and
+    /// asserts (a) every response is `None`, and (b) both limiter maps stay
+    /// EMPTY — proving the pre-limiter existence gate holds.
+    ///
+    /// Requires a real (empty) redb hosting store: with NO storage handle,
+    /// `contract_state_present` conservatively returns `true` for every key
+    /// (see `hosting.rs::contract_state_present`), which would let the requests
+    /// through and populate the limiters, making the test vacuous. Gated on the
+    /// `redb` feature (a default feature; runs under `--features testing`) for
+    /// the same reason the #4612 store test is: only the redb backend has the
+    /// cheap synchronous existence check.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn resync_request_for_bogus_keys_does_not_consume_limiter_slots() {
+        // Build a real OpManager (mirrors `build_broadcast_test_node` in
+        // operations/update/op_ctx_task.rs; no contract-handler spawn needed
+        // because the existence check returns before any handler interaction).
+        let config_args = crate::config::ConfigArgs {
+            id: Some("resync-bogus-4864".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr("127.0.0.1:14000".parse().unwrap());
+
+        // Attach an EMPTY redb hosting store so `contract_state_present`
+        // returns false for unknown keys (a fresh store creates the STATE
+        // table but holds no state). Keep `dir` alive for the whole test so
+        // the temp directory is not removed while the store is open.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .expect("storage");
+        op_manager.ring.set_hosting_storage(storage);
+
+        let source: SocketAddr = "127.0.0.1:15000".parse().unwrap();
+        for i in 0u8..50 {
+            // Distinct bogus key per iteration; none of these are stored.
+            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                freenet_stdlib::prelude::ContractInstanceId::new([i; 32]),
+                freenet_stdlib::prelude::CodeHash::new([i; 32]),
+            );
+            let response = handle_interest_sync_message(
+                &op_manager,
+                source,
+                crate::message::InterestMessage::ResyncRequest { key },
+            )
+            .await;
+            assert!(
+                response.is_none(),
+                "ResyncRequest for a contract with no stored state (bogus key {i}) \
+                 must produce no response"
+            );
+        }
+
+        assert_eq!(
+            op_manager.ring.resync_response_limiter.len(),
+            0,
+            "#4864: bogus keys must NOT occupy per-(peer, contract) limiter slots \
+             (the pre-limiter existence check must reject them first)"
+        );
+        assert_eq!(
+            op_manager.ring.resync_response_global_limiter.len(),
+            0,
+            "#4864: bogus keys must NOT occupy global per-contract limiter slots \
+             (the pre-limiter existence check must reject them first)"
+        );
     }
 
     // Superseded: Old addr-only equality (same_addr_different_keys → equal) was replaced
@@ -5631,13 +5754,20 @@ mod tests {
             );
         }
 
-        /// Pin (#4861): the responder MUST rate-limit the full-state
-        /// `ResyncResponse` per (peer, contract), gating BEFORE the expensive
-        /// state/summary fetch, so a not-yet-upgraded peer flooding
-        /// `ResyncRequest`s can't make this node full-state-reply in a loop.
+        /// Pin (#4861 + #4864 round-4): the responder MUST, in order, (1) do a
+        /// cheap state-presence check, (2) rate-limit per (peer, contract), (3)
+        /// apply the global per-contract cap, and only then (4) do the expensive
+        /// state/summary fetch. The existence check gating FIRST is the #4864
+        /// round-4 fix — otherwise a peer spraying bogus keys exhausts the capped
+        /// limiter maps and denies legit (peer, contract) keys.
         #[test]
         fn resync_request_handler_rate_limits_response() {
             let arm = resync_request_arm();
+            // (1) cheap existence check BEFORE either limiter.
+            let exists_pos = arm.find("contract_state_present(&key)").expect(
+                "ResyncRequest handler must do a cheap state-presence check BEFORE \
+                 the rate limiters (#4864 round-4)",
+            );
             let gate_pos = arm.find("resync_response_limiter").expect(
                 "ResyncRequest handler must rate-limit the response via \
                  resync_response_limiter (#4861)",
@@ -5656,6 +5786,12 @@ mod tests {
             let global_pos = arm.find("resync_response_global_limiter").expect(
                 "ResyncRequest handler must also apply the GLOBAL per-contract \
                  response cap (#4861)",
+            );
+            assert!(
+                exists_pos < gate_pos,
+                "the cheap existence check ({exists_pos}) must run BEFORE the \
+                 per-peer limiter ({gate_pos}) so a bogus contract never consumes \
+                 a limiter slot (#4864 round-4)"
             );
             assert!(
                 gate_pos < global_pos && global_pos < state_fetch_pos,

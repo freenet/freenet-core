@@ -1114,38 +1114,62 @@ async fn send_queue_full_resync_request(
     sender_addr: SocketAddr,
     incoming_tx: Transaction,
 ) {
-    if op_manager
+    if !op_manager
         .interest_manager
         .should_send_resync_request(&key, sender_addr)
     {
-        tracing::info!(
-            tx = %incoming_tx,
-            contract = %key,
-            target = %sender_addr,
-            event = "resync_request_sent",
-            reason = "queue_full",
-            "UPDATE relay: sending rate-limited ResyncRequest after queue-full drop (#4857)"
-        );
-        if let Err(e) = op_manager
-            .notify_node_event(NodeEvent::SendInterestMessage {
-                target: sender_addr,
-                message: InterestMessage::ResyncRequest { key },
-            })
-            .await
-        {
-            tracing::warn!(
-                tx = %incoming_tx,
-                error = %e,
-                "UPDATE relay: failed to send queue-full ResyncRequest"
-            );
-        }
-    } else {
+        // Per-(contract, sender)/30s throttle (existing #4857 bound).
         tracing::debug!(
             tx = %incoming_tx,
             contract = %key,
             sender = %sender_addr,
             event = "queue_full_resync_throttled",
             "UPDATE relay: queue-full ResyncRequest throttled (rate limit) to avoid amplification"
+        );
+        return;
+    }
+
+    // ALSO subject to the GLOBAL per-contract emit cap (#4864 round-4 P1): the
+    // #4857 queue-full heal path previously bypassed it, so a saturated contract
+    // with many senders still emitted per-(contract, sender)/30s. Routing it
+    // through resync_emit_limiter bounds the contract's TOTAL queue-full resync
+    // emission the same way the delta-failure path is (node.rs mirrors this with
+    // record_resync_request_suppressed on global-cap suppression).
+    if !op_manager
+        .ring
+        .resync_emit_limiter
+        .check_and_record(*key.id())
+    {
+        crate::config::GlobalTestMetrics::record_resync_request_suppressed();
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            sender = %sender_addr,
+            event = "queue_full_resync_suppressed_global",
+            "UPDATE relay: queue-full ResyncRequest suppressed by global per-contract cap"
+        );
+        return;
+    }
+
+    tracing::info!(
+        tx = %incoming_tx,
+        contract = %key,
+        target = %sender_addr,
+        event = "resync_request_sent",
+        reason = "queue_full",
+        "UPDATE relay: sending rate-limited ResyncRequest after queue-full drop (#4857)"
+    );
+    if let Err(e) = op_manager
+        .notify_node_event(NodeEvent::SendInterestMessage {
+            target: sender_addr,
+            message: InterestMessage::ResyncRequest { key },
+        })
+        .await
+    {
+        tracing::warn!(
+            tx = %incoming_tx,
+            error = %e,
+            "UPDATE relay: failed to send queue-full ResyncRequest"
         );
     }
 }
@@ -3073,13 +3097,15 @@ mod tests {
         );
     }
 
-    /// Issue #4857 / #4251 reconciliation pin. On a queue-full broadcast drop,
-    /// BOTH broadcast drivers must emit a RATE-LIMITED `ResyncRequest` — neither
-    /// suppress it (permanent divergence, #4857) nor emit it unthrottled
-    /// (full-state storm, #4251). Both route through the shared
-    /// `send_queue_full_resync_request` helper, which nests the
-    /// `InterestMessage::ResyncRequest` emit INSIDE the `should_send_resync_request`
-    /// rate-limit gate. Auto-fetch stays suppressed on each driver's queue-full arm.
+    /// Issue #4857 / #4251 reconciliation pin (+ #4864 round-4). On a queue-full
+    /// broadcast drop, BOTH broadcast drivers must emit a RATE-LIMITED
+    /// `ResyncRequest` — neither suppress it (permanent divergence, #4857) nor
+    /// emit it unthrottled (full-state storm, #4251). Both route through the
+    /// shared `send_queue_full_resync_request` helper, which gates the
+    /// `InterestMessage::ResyncRequest` emit behind BOTH the per-(contract, sender)
+    /// `should_send_resync_request` throttle AND the global per-contract
+    /// `resync_emit_limiter` cap (each a `!gate { return; }` guard before the
+    /// emit). Auto-fetch stays suppressed on each driver's queue-full arm.
     #[test]
     fn broadcast_to_sends_throttled_resync_on_queue_full() {
         let src = include_str!("op_ctx_task.rs");
@@ -3149,25 +3175,26 @@ mod tests {
             "streaming queue-full arm must NOT auto-fetch (#4251)"
         );
 
-        // The shared helper nests the emit INSIDE the throttle gate: the
-        // `should_send_resync_request` check comes BEFORE the emit, which comes
-        // BEFORE the throttled `else` branch. An emit outside the gate would
-        // re-open the #4251 storm.
+        // The shared helper gates the single emit behind BOTH the per-(contract,
+        // sender) throttle AND the global per-contract emit cap (#4251/#4857 +
+        // #4864 round-4). Each is a `!gate { return; }` guard that precedes the
+        // emit, so an unthrottled emission cannot re-open the #4251 storm.
         let helper = fn_body("async fn send_queue_full_resync_request(");
-        let gate = helper
+        let per_sender = helper
             .find(".should_send_resync_request(")
             .expect("helper must gate on should_send_resync_request (rate limit, #4251)");
+        let global_cap = helper.find("resync_emit_limiter").expect(
+            "helper must ALSO gate on the global per-contract emit cap \
+             (resync_emit_limiter, #4864 round-4)",
+        );
         let emit = helper
             .find("InterestMessage::ResyncRequest")
             .expect("helper must emit InterestMessage::ResyncRequest (heal, #4857)");
-        let gate_else = helper
-            .find("} else {")
-            .expect("helper must have a throttled `else` branch");
         assert!(
-            gate < emit && emit < gate_else,
-            "the ResyncRequest emit MUST be nested INSIDE the \
-             `if should_send_resync_request {{ .. }}` gate (before the throttled \
-             `else`), so an unthrottled emission cannot re-open the #4251 storm"
+            per_sender < emit && global_cap < emit,
+            "the ResyncRequest emit ({emit}) MUST come AFTER both the per-sender \
+             throttle ({per_sender}) and the global emit cap ({global_cap}), so an \
+             unthrottled emission cannot re-open the #4251 storm"
         );
     }
 
@@ -3840,6 +3867,75 @@ mod tests {
             op_manager.ring.merge_backoff.contracts_in_backoff(),
             0,
             "no contract may be in backoff after only queue-full failures"
+        );
+    }
+
+    /// #4864 round-4 P1 (item 3): the #4857 queue-full resync heal must be bound
+    /// by the GLOBAL per-contract emit cap. A flood of DISTINCT senders (each
+    /// passing its own per-(contract, sender) throttle) sending queue-full deltas
+    /// for ONE contract must emit at most `EMIT_BURST` ResyncRequests total — not
+    /// one per sender. Without the global cap this would be one per sender.
+    #[tokio::test]
+    async fn queue_full_resync_flood_is_bounded_by_global_emit_cap() {
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, _update_queries, _guard) =
+            build_broadcast_test_node("queuefull-emit-cap-4864", DeltaOutcome::QueueFull).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([71u8; 32]),
+            CodeHash::new([72u8; 32]),
+        );
+        // Six DISTINCT senders (each clears its own per-sender throttle) each send
+        // a distinct-payload queue-full delta for the SAME contract.
+        let sender_count = 6u16;
+        for i in 0..sender_count {
+            let sender: SocketAddr = format!("127.0.0.1:{}", 13000 + i).parse().unwrap();
+            let _ = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(vec![i as u8]),
+                Vec::new(),
+                sender,
+            )
+            .await;
+        }
+        // The global per-contract emit cap (EMIT_BURST = 2) bounds total emissions
+        // regardless of sender count — NOT one per sender.
+        let emissions = drain_resync_targets(&mut notification_rx, key);
+        let burst = crate::ring::resync_rate_limit::EMIT_BURST as usize;
+        assert_eq!(
+            emissions.len(),
+            burst,
+            "queue-full resync emissions ({}) must be bounded by the global \
+             per-contract cap (EMIT_BURST = {}), not one per sender ({sender_count})",
+            emissions.len(),
+            burst
+        );
+    }
+
+    /// Pin (#4864 round-4 item 3): the queue-full resync heal helper must route
+    /// through BOTH the per-(contract, sender) throttle AND the global
+    /// per-contract emit cap — the latter was the #4857 bypass.
+    #[test]
+    fn queue_full_resync_helper_goes_through_global_emit_cap() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn send_queue_full_resync_request(")
+            .expect("send_queue_full_resync_request not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        let body = &src[start..start + 1 + end];
+        assert!(
+            body.contains("resync_emit_limiter"),
+            "the queue-full resync helper must route through the GLOBAL \
+             per-contract emit cap (resync_emit_limiter) (#4864 round-4)"
+        );
+        assert!(
+            body.contains("should_send_resync_request"),
+            "and keep the per-(contract, sender) throttle"
         );
     }
 
