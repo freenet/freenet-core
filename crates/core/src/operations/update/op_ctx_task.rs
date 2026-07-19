@@ -1235,13 +1235,61 @@ async fn drive_relay_broadcast_to(
                     AutoFetchReason::InboundRelay,
                 );
             } else if queue_full {
-                tracing::debug!(
-                    tx = %incoming_tx,
-                    contract = %key,
-                    sender = %sender_addr,
-                    event = "queue_full_amplification_suppressed",
-                    "UPDATE relay: per-contract queue saturated, suppressed ResyncRequest/auto-fetch to avoid amplification"
-                );
+                // Issue #4857: a queue-full drop is SILENT. The receiver never
+                // applied the delta, but the SENDER cached its summary as ours
+                // on send-Ok (broadcast_queue.rs::record_delivery_to_interest),
+                // so it believes we are current and will never re-send the
+                // dropped change. Left unhealed, a rarely-changing field
+                // (member_info, a ban, a config) diverges permanently until the
+                // ~5-min InterestSync heartbeat happens to correct it.
+                //
+                // Emit a ResyncRequest so the sender CLEARS its cached summary
+                // of us (node.rs ResyncRequest handler) and re-sends full state.
+                // Issue #4251 suppressed this ENTIRELY because one request per
+                // dropped delta amplifies into a full-state storm onto the same
+                // saturated queue (~40 ResyncRequests/sec on a hot contract).
+                // The rate limit bounds that to at most one request per
+                // (contract, sender) per RESYNC_REQUEST_MIN_INTERVAL, which
+                // heals the divergence without re-opening the storm. The auto-
+                // fetch branch stays suppressed on queue-full (we already hold
+                // the contract; a GET onto the same saturated queue is pure
+                // amplification with no healing value).
+                //
+                // do NOT re-add an unthrottled emission here — see #4251/#4857.
+                if op_manager
+                    .interest_manager
+                    .should_send_resync_request(&key, sender_addr)
+                {
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        target = %sender_addr,
+                        event = "resync_request_sent",
+                        reason = "queue_full",
+                        "UPDATE relay: sending rate-limited ResyncRequest after queue-full drop (#4857)"
+                    );
+                    if let Err(e) = op_manager
+                        .notify_node_event(NodeEvent::SendInterestMessage {
+                            target: sender_addr,
+                            message: InterestMessage::ResyncRequest { key },
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            tx = %incoming_tx,
+                            error = %e,
+                            "UPDATE relay: failed to send queue-full ResyncRequest"
+                        );
+                    }
+                } else {
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        sender = %sender_addr,
+                        event = "queue_full_resync_throttled",
+                        "UPDATE relay: queue-full ResyncRequest throttled (rate limit) to avoid amplification"
+                    );
+                }
             }
             return Err(err);
         }
@@ -2583,15 +2631,16 @@ mod tests {
         );
     }
 
-    /// Issue #4251 regression pin: `drive_relay_broadcast_to` MUST
-    /// gate ResyncRequest emission AND `try_auto_fetch_contract` on
-    /// `!err.is_contract_queue_full()`. The two amplification branches
-    /// are what turn a single saturated contract into a network-wide
-    /// storm — ResyncRequest asks the sender for full state (bigger
-    /// payload onto the same full queue), and auto-fetch enqueues a
-    /// GET right back onto the saturated handler.
+    /// Issue #4857 / #4251 reconciliation pin: on a queue-full broadcast
+    /// drop, `drive_relay_broadcast_to` must emit a RATE-LIMITED
+    /// `ResyncRequest` — neither suppress it (which left rarely-changing
+    /// fields permanently diverged, #4857) nor emit it unthrottled (which
+    /// amplified into a full-state storm, #4251). The queue-full arm MUST
+    /// therefore BOTH gate on `should_send_resync_request` (the rate limit)
+    /// AND emit `InterestMessage::ResyncRequest` (the heal). Auto-fetch stays
+    /// suppressed on queue-full (a GET onto the saturated queue heals nothing).
     #[test]
-    fn broadcast_to_suppresses_amplification_on_queue_full() {
+    fn broadcast_to_sends_throttled_resync_on_queue_full() {
         let src = include_str!("op_ctx_task.rs");
         let start = src
             .find("async fn drive_relay_broadcast_to(")
@@ -2603,26 +2652,194 @@ mod tests {
             .unwrap_or(after.len());
         let driver_src = &src[start..start + 1 + end];
 
-        // Gate must be present; both amplification call sites must still
-        // exist (suppressed on queue-full, not deleted). Runtime gating
-        // behavior is covered by the update.rs tests; this is a structural
-        // pin so a refactor that drops the check fails CI.
+        // The queue-full classification must still exist (it drives the arm).
         assert!(
-            driver_src.contains("is_contract_queue_full()"),
-            "drive_relay_broadcast_to must call is_contract_queue_full() \
-             to gate the ResyncRequest / auto-fetch amplification — see \
-             issue #4251"
+            driver_src.contains("let queue_full = err.is_contract_queue_full();"),
+            "drive_relay_broadcast_to must still classify queue-full via \
+             is_contract_queue_full() — see issue #4251"
+        );
+
+        // Scope the heal assertions to the `else if queue_full { ... }` arm so
+        // the delta-apply arm's ResyncRequest cannot satisfy this pin.
+        let arm_start = driver_src
+            .find("} else if queue_full {")
+            .expect("queue-full arm missing in drive_relay_broadcast_to");
+        let queue_full_arm = &driver_src[arm_start..];
+
+        assert!(
+            queue_full_arm.contains("should_send_resync_request"),
+            "the queue-full arm MUST gate its ResyncRequest on \
+             should_send_resync_request — the rate limit that bounds the #4251 \
+             amplification. Dropping the throttle re-opens the ResyncRequest storm."
         );
         assert!(
-            driver_src.contains("InterestMessage::ResyncRequest"),
-            "drive_relay_broadcast_to should still contain the ResyncRequest \
-             branch (gated on !queue_full)"
+            queue_full_arm.contains("InterestMessage::ResyncRequest"),
+            "the queue-full arm MUST emit InterestMessage::ResyncRequest so the \
+             sender clears its poisoned summary cache and re-sends full state — \
+             without it a silently-dropped delta diverges permanently (#4857)."
         );
         assert!(
-            driver_src.contains("try_auto_fetch_contract"),
-            "drive_relay_broadcast_to should still contain the auto-fetch \
-             branch (gated on !queue_full)"
+            !queue_full_arm.contains("try_auto_fetch_contract"),
+            "the queue-full arm must NOT auto-fetch — a GET onto the same \
+             saturated queue is pure amplification with no healing value (#4251)."
         );
+    }
+
+    /// Drain the event-loop notification channel (non-blocking) and return the
+    /// targets of every `ResyncRequest(key)` emitted since the last drain.
+    fn drain_resync_targets(
+        rx: &mut crate::node::EventLoopNotificationsReceiver,
+        key: ContractKey,
+    ) -> Vec<SocketAddr> {
+        let mut targets = Vec::new();
+        while let Ok(ev) = rx.notifications_receiver.try_recv() {
+            if let Either::Right(NodeEvent::SendInterestMessage {
+                target,
+                message: InterestMessage::ResyncRequest { key: k },
+            }) = ev
+            {
+                if k == key {
+                    targets.push(target);
+                }
+            }
+        }
+        targets
+    }
+
+    /// Issue #4857 behavioral reproduction: when an inbound broadcast delta is
+    /// dropped with `ContractQueueFull`, `drive_relay_broadcast_to` MUST emit a
+    /// `ResyncRequest` back to the sender so the sender clears its poisoned
+    /// summary cache and re-sends the dropped change — and that emission MUST be
+    /// rate-limited so a burst of drops does not re-open the #4251 storm.
+    ///
+    /// On `origin/main` this test FAILS: the queue-full arm suppresses the
+    /// ResyncRequest entirely, so `first` is empty (the divergence is silent and
+    /// permanent). With the fix, the first drop emits exactly one ResyncRequest
+    /// and the immediate second drop is throttled.
+    ///
+    /// The drop is injected at the contract-handler seam (a stand-in handler
+    /// answers every `UpdateQuery` with `ContractQueueFull`) rather than by
+    /// saturating the real 100-slot fair queue, which is non-deterministic.
+    #[tokio::test]
+    async fn queue_full_broadcast_emits_throttled_resync_request() {
+        // ── Build a minimal real OpManager (mirrors op_state_manager.rs
+        //    build_reroot_test_op_manager). ────────────────────────────────
+        let config_args = crate::config::ConfigArgs {
+            id: Some("queue-full-resync-4857".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (mut notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        let self_addr: SocketAddr = "127.0.0.1:12000".parse().unwrap();
+        op_manager.ring.connection_manager.set_own_addr(self_addr);
+
+        // ── Contract-handler stand-in: answer GetQuery with "no state" and
+        //    every UpdateQuery with ContractQueueFull (the silent drop a
+        //    saturated receiver hits under load). ──────────────────────────
+        let handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+                        key: None,
+                        response: Ok(StoreResponse {
+                            state: None,
+                            contract: None,
+                        }),
+                    },
+                    ContractHandlerEvent::UpdateQuery { .. } => {
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Err(crate::contract::ExecutorError::other(
+                                crate::contract::ContractQueueFull,
+                            )),
+                            state_changed: false,
+                        }
+                    }
+                    other => panic!("unexpected handler event in stand-in: {other:?}"),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12100".parse().unwrap();
+
+        // First broadcast delta → dropped queue-full → MUST emit a ResyncRequest.
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        let first = drain_resync_targets(&mut notification_rx, key);
+        assert_eq!(
+            first,
+            vec![sender_addr],
+            "a queue-full drop MUST emit exactly one ResyncRequest to the sender \
+             so it clears its poisoned summary and re-sends (heals #4857)"
+        );
+
+        // Second broadcast with DIFFERENT delta bytes (so it is not a dedup hit)
+        // within the throttle window → still queue-full, but ResyncRequest is
+        // throttled (bounds the #4251 amplification).
+        let r2 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![4, 5, 6]),
+            Vec::new(),
+            sender_addr,
+        )
+        .await;
+        assert!(
+            r2.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "second broadcast should still hit queue-full, got {r2:?}"
+        );
+        let second = drain_resync_targets(&mut notification_rx, key);
+        assert!(
+            second.is_empty(),
+            "a second queue-full drop within the throttle window MUST NOT emit \
+             another ResyncRequest (bounds #4251 amplification), got {second:?}"
+        );
+
+        handler.abort();
     }
 
     /// Issue #4251 follow-up: the four `run_relay_*` driver wrappers each
