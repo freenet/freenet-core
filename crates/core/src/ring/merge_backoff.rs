@@ -61,7 +61,9 @@
 //!
 //! ## The two suppression signals
 //!
-//! Both are cleared by a successful DELTA merge:
+//! Both are cleared by a successful DELTA merge (the contract-wide Timeout + memo
+//! only when the state advanced, `changed == true`; the per-sender Invalid channel
+//! unconditionally — see [`Self::record_success_from_sender`]):
 //!
 //! - **Cooldown** ([`MergeDecision::InBackoff`]): time-based. The per-sender
 //!   Invalid channel skips only that sender's deltas; the contract-wide Timeout
