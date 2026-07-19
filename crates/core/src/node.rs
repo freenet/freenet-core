@@ -3063,6 +3063,10 @@ async fn handle_interest_sync_message(
                 Ok(ContractHandlerEvent::UpdateResponse {
                     new_value: Ok(_), ..
                 }) => {
+                    // A resync full-state apply that merged cleanly means the
+                    // contract's merge works for this state — clear any
+                    // merge-failure backoff so normal broadcasts resume (#4861).
+                    op_manager.ring.merge_backoff.record_success(key.id());
                     tracing::info!(
                         from = %source,
                         contract = %key,
@@ -3072,6 +3076,9 @@ async fn handle_interest_sync_message(
                     );
                 }
                 Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+                    // Merge ran and produced no change (state already current);
+                    // still a successful merge, so clear the backoff (#4861).
+                    op_manager.ring.merge_backoff.record_success(key.id());
                     tracing::info!(
                         from = %source,
                         contract = %key,

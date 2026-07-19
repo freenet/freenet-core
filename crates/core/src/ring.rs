@@ -132,6 +132,7 @@ mod peer_connection_backoff;
 mod peer_key_location;
 mod placement_migration_metrics;
 pub mod topology_registry;
+pub(crate) mod merge_backoff;
 pub(crate) mod update_rate_limit;
 
 // GET auto-subscribe (`AUTO_SUBSCRIBE_ON_GET`) was REMOVED in piece E of the
@@ -212,6 +213,13 @@ pub(crate) struct Ring {
     /// `crate::ring::update_rate_limit` and `docs/design/contract-hardening.md`
     /// Phase 2.
     pub(crate) update_rate_limiter: Arc<update_rate_limit::UpdateRateLimiter>,
+    /// Per-contract merge-failure backoff (#4861). Quarantines "poison"
+    /// contracts whose WASM merges reliably fail/time out: while a contract is
+    /// in its exponential cooldown the UPDATE broadcast drivers skip the merge
+    /// (and its `ResyncRequest` amplification) entirely, so it costs O(1) per
+    /// inbound broadcast instead of O(WASM merge). Cleared the instant a merge
+    /// succeeds. See `crate::ring::merge_backoff`.
+    pub(crate) merge_backoff: Arc<merge_backoff::MergeBackoff>,
     /// Per-contract ban list. Populated by the governance reaper on
     /// `BanTriggered` / `BanLifted` transitions; consulted at the
     /// inbound dispatch site to drop wire requests for banned
@@ -601,6 +609,7 @@ impl Ring {
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
                 time_source.clone(),
             )),
+            merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
             contract_ban_list: Arc::new(contract_ban_list::ContractBanList::new(
                 time_source.clone(),
             )),
@@ -1269,6 +1278,12 @@ impl Ring {
             // bounded; CLEANUP_AGE is 5 minutes so this drops entries
             // for pairs that haven't tried an UPDATE since then.
             ring.update_rate_limiter.cleanup();
+
+            // Sweep idle merge-failure backoff entries (#4861) on the same
+            // cadence. Drops entries for contracts past their cooldown that
+            // haven't failed a merge recently; a poison contract still in
+            // cooldown is preserved.
+            ring.merge_backoff.cleanup_expired();
 
             // Phase 7 ban-list maintenance. Defense-in-depth — the
             // BanLifted decisions below explicitly unban, but if any

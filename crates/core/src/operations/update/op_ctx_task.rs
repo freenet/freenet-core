@@ -1204,6 +1204,28 @@ async fn drive_relay_broadcast_to(
         return Ok(());
     }
 
+    // ── Step 3b: merge-failure backoff gate (#4861) ───────────────────────
+    //
+    // Quarantine "poison" contracts whose merges reliably fail/time out. While a
+    // contract is in cooldown (or this exact payload is known-failed) skip the
+    // WASM merge entirely and — critically — do NOT emit the ResyncRequest
+    // amplification or clear the sender's cached summary. Complete exactly like
+    // the dedup-skip path above. Cleared the instant a merge succeeds (below).
+    let payload_hash = crate::ring::merge_backoff::merge_payload_hash(is_delta, &payload_bytes);
+    match op_manager.ring.merge_backoff.check(key.id(), payload_hash) {
+        crate::ring::merge_backoff::MergeDecision::Allow => {}
+        decision => {
+            crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
+            tracing::debug!(
+                tx = %incoming_tx,
+                %key,
+                ?decision,
+                "UPDATE relay: BroadcastTo merge skipped — contract in merge-failure backoff"
+            );
+            return Ok(());
+        }
+    }
+
     // ── Step 4: apply broadcast via WASM merge ────────────────────────────
     let update_result = super::update_contract(
         op_manager,
@@ -1220,8 +1242,31 @@ async fn drive_relay_broadcast_to(
         changed,
         ..
     } = match update_result {
-        Ok(result) => result,
+        Ok(result) => {
+            // Merge succeeded → the contract's state advanced, so any prior
+            // merge-failure backoff for it is stale. Clear it (#4861).
+            op_manager.ring.merge_backoff.record_success(key.id());
+            result
+        }
         Err(err) => {
+            // Record the merge failure for the per-contract backoff (#4861),
+            // but ONLY for genuine contract-exec failures (the merge ran and the
+            // contract rejected it or it timed out). `is_contract_exec_rejection`
+            // excludes queue-full (transient load) and missing-contract failures
+            // (healed by the auto-fetch below) — backing either off would be
+            // wrong. A timeout gets the longer Timeout-class cooldown.
+            if err.is_contract_exec_rejection() {
+                let class = if err.is_wasm_timeout() {
+                    crate::ring::merge_backoff::MergeFailureClass::Timeout
+                } else {
+                    crate::ring::merge_backoff::MergeFailureClass::Invalid
+                };
+                op_manager
+                    .ring
+                    .merge_backoff
+                    .record_failure(key.id(), class, payload_hash);
+            }
+
             // On benign stale-version rejection (not OOG/traps/validation
             // failures — see `is_invalid_update_rejection`), nudge the sender's
             // peer-summary cache of us toward Some(our_summary). Helper gates
@@ -1939,6 +1984,24 @@ async fn apply_streaming_broadcast(
         return Ok(());
     }
 
+    // Step 5b: merge-failure backoff gate (#4861). Streaming broadcasts are
+    // always full state (`is_delta = false`) and never emit a ResyncRequest, so
+    // only the merge-skip applies. Cleared the instant a merge succeeds (below).
+    let stream_payload_hash = crate::ring::merge_backoff::merge_payload_hash(false, &state_bytes);
+    match op_manager.ring.merge_backoff.check(key.id(), stream_payload_hash) {
+        crate::ring::merge_backoff::MergeDecision::Allow => {}
+        decision => {
+            crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
+            tracing::debug!(
+                tx = %incoming_tx,
+                %key,
+                ?decision,
+                "UPDATE relay (driver streaming): merge skipped — contract in merge-failure backoff"
+            );
+            return Ok(());
+        }
+    }
+
     let state_for_telemetry = WrappedState::from(state_bytes.clone());
 
     // Step 6: telemetry — broadcast received.
@@ -1974,8 +2037,26 @@ async fn apply_streaming_broadcast(
         changed,
         ..
     } = match update_result {
-        Ok(exec) => exec,
+        Ok(exec) => {
+            op_manager.ring.merge_backoff.record_success(key.id());
+            exec
+        }
         Err(err) => {
+            // Record poison-contract merge failures for the backoff (#4861),
+            // same classification as the non-streaming driver: only genuine
+            // contract-exec rejections, timeout → longer cooldown.
+            if err.is_contract_exec_rejection() {
+                let class = if err.is_wasm_timeout() {
+                    crate::ring::merge_backoff::MergeFailureClass::Timeout
+                } else {
+                    crate::ring::merge_backoff::MergeFailureClass::Invalid
+                };
+                op_manager
+                    .ring
+                    .merge_backoff
+                    .record_failure(key.id(), class, stream_payload_hash);
+            }
+
             // Classify failure: real failure → self-heal via
             // try_auto_fetch_contract; benign stale-version rejection →
             // send_summary_back_on_rejection. Mirrors legacy at
@@ -2437,6 +2518,114 @@ mod tests {
              when the WASM merge rejects — otherwise the sender's cached view \
              of us stays wrong and it keeps full-state-broadcasting identical \
              content"
+        );
+    }
+
+    /// Helper: return the source of `drive_relay_broadcast_to`'s body,
+    /// bounded to the next top-level `async fn` / test module.
+    #[cfg(test)]
+    fn broadcast_to_driver_src() -> &'static str {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_broadcast_to(")
+            .expect("drive_relay_broadcast_to not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        &src[start..start + 1 + end]
+    }
+
+    /// Pin (#4861): the merge-failure backoff gate MUST run AFTER the dedup
+    /// check and BEFORE `update_contract`. If it ran after the merge, a poison
+    /// contract would still re-run the (failing, expensive) WASM merge on every
+    /// inbound broadcast — the exact CPU churn the backoff exists to stop.
+    #[test]
+    fn broadcast_to_backoff_gate_runs_before_merge() {
+        let driver_src = broadcast_to_driver_src();
+        let dedup_pos = driver_src
+            .find("broadcast_dedup_cache.check_and_insert")
+            .expect("dedup check missing");
+        let backoff_pos = driver_src
+            .find("merge_backoff.check(")
+            .expect("merge_backoff.check gate missing in BroadcastTo driver");
+        let merge_pos = driver_src
+            .find("super::update_contract(")
+            .expect("update_contract call missing");
+        assert!(
+            dedup_pos < backoff_pos && backoff_pos < merge_pos,
+            "merge_backoff.check MUST appear after the dedup check and before \
+             update_contract() (order: dedup {dedup_pos} < backoff {backoff_pos} \
+             < merge {merge_pos})"
+        );
+    }
+
+    /// Pin (#4861): a successful merge MUST clear the backoff (state advanced),
+    /// and a failure MUST be recorded — but ONLY for genuine contract-exec
+    /// rejections. Gating `record_failure` on `is_contract_exec_rejection()`
+    /// excludes queue-full (transient load) and missing-contract failures
+    /// (healed by auto-fetch); backing either off would block recovery.
+    #[test]
+    fn broadcast_to_backoff_records_success_and_gated_failure() {
+        let driver_src = broadcast_to_driver_src();
+        assert!(
+            driver_src.contains("merge_backoff.record_success("),
+            "drive_relay_broadcast_to must clear the backoff on a successful merge"
+        );
+        let record_pos = driver_src
+            .find(".record_failure(")
+            .expect("merge_backoff.record_failure missing in BroadcastTo driver");
+        // The record_failure must be inside an is_contract_exec_rejection guard.
+        let guard_pos = driver_src
+            .find("if err.is_contract_exec_rejection() {")
+            .expect("record_failure must be gated on is_contract_exec_rejection");
+        assert!(
+            guard_pos < record_pos,
+            "merge_backoff.record_failure MUST be gated on \
+             is_contract_exec_rejection() so queue-full and missing-contract \
+             failures do NOT create a backoff entry (#4861)"
+        );
+        assert!(
+            driver_src.contains("is_wasm_timeout()"),
+            "the failure class must distinguish a WASM timeout (longer cooldown) \
+             via is_wasm_timeout()"
+        );
+    }
+
+    /// Pin (#4861): the streaming full-state driver must carry the same
+    /// backoff gate + record wiring (a poison contract must be quarantined on
+    /// the streaming path too).
+    #[test]
+    fn broadcast_to_streaming_has_backoff_wiring() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_broadcast_to_streaming(")
+            .expect("streaming driver not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        let driver_src = &src[start..start + 1 + end];
+
+        let backoff_pos = driver_src
+            .find("merge_backoff.check(")
+            .expect("streaming driver missing merge_backoff.check gate");
+        let merge_pos = driver_src
+            .find("super::update_contract(")
+            .expect("streaming driver missing update_contract");
+        assert!(
+            backoff_pos < merge_pos,
+            "streaming driver's merge_backoff.check MUST run before update_contract"
+        );
+        assert!(
+            driver_src.contains("merge_backoff.record_success("),
+            "streaming driver must clear the backoff on a successful merge"
+        );
+        assert!(
+            driver_src.contains(".record_failure(") && driver_src.contains("is_contract_exec_rejection()"),
+            "streaming driver must record gated failures like the non-streaming driver"
         );
     }
 

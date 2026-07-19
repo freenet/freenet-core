@@ -3421,6 +3421,9 @@ std::thread_local! {
     // `StateDelta` ships via `ProbeReconcile`).
     static GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // UPDATE broadcast merges skipped by the per-contract merge-failure backoff
+    // (poison-contract quarantine, #4861).
+    static GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Global test metrics for tracking events across the simulation network.
@@ -3464,6 +3467,7 @@ impl GlobalTestMetrics {
         GLOBAL_PUT_PROBE_NEW_CONTRACT_BYTES.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES.with(|c| c.set(0));
+        GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
@@ -3475,6 +3479,18 @@ impl GlobalTestMetrics {
     /// Returns the total number of ResyncRequests received since last reset.
     pub fn resync_requests() -> u64 {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.get())
+    }
+
+    /// Records that an UPDATE broadcast merge was skipped by the per-contract
+    /// merge-failure backoff (poison-contract quarantine, #4861).
+    pub fn record_merge_suppressed_by_backoff() {
+        GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Returns the number of merges skipped by the merge-failure backoff since
+    /// last reset.
+    pub fn merges_suppressed_by_backoff() -> u64 {
+        GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF.with(|c| c.get())
     }
 
     /// Records that a delta was sent in a state change broadcast.
