@@ -1244,9 +1244,18 @@ async fn drive_relay_broadcast_to(
         ..
     } = match update_result {
         Ok(result) => {
-            // Merge succeeded → the contract's state advanced, so any prior
-            // merge-failure backoff for it is stale. Clear it (#4861).
-            op_manager.ring.merge_backoff.record_success(key.id());
+            // Reset the merge-failure backoff ONLY on a successful DELTA merge
+            // (#4861): a delta that applies cleanly proves the incoming change
+            // was compatible with local state — genuine convergence. A
+            // successful FULL-STATE apply just replaces state and "succeeds"
+            // regardless of which fork it carries, so it proves nothing about
+            // convergence (the semantic fork-oscillation poison class flips
+            // forks on every full-state apply). Full-state broadcasts therefore
+            // do NOT reset here; the resync-apply path in node.rs does not reset
+            // either (see the note there).
+            if is_delta {
+                op_manager.ring.merge_backoff.record_success(key.id());
+            }
             result
         }
         Err(err) => {
@@ -2587,17 +2596,27 @@ mod tests {
         );
     }
 
-    /// Pin (#4861): a successful merge MUST clear the backoff (state advanced),
-    /// and a failure MUST be recorded — but ONLY for genuine contract-exec
-    /// rejections. Gating `record_failure` on `is_contract_exec_rejection()`
-    /// excludes queue-full (transient load) and missing-contract failures
-    /// (healed by auto-fetch); backing either off would block recovery.
+    /// Pin (#4861): the backoff reset MUST be gated on `is_delta` (only a
+    /// successful DELTA merge resets — a full-state apply proves nothing about
+    /// convergence, see the fork-oscillation note), and a failure MUST be
+    /// recorded — but ONLY for genuine contract-exec rejections. Gating
+    /// `record_failure` on `is_contract_exec_rejection()` excludes queue-full
+    /// (transient load) and missing-contract failures (healed by auto-fetch);
+    /// backing either off would block recovery.
     #[test]
     fn broadcast_to_backoff_records_success_and_gated_failure() {
         let driver_src = broadcast_to_driver_src();
+        let success_pos = driver_src
+            .find("merge_backoff.record_success(")
+            .expect("drive_relay_broadcast_to must clear the backoff on a successful merge");
+        // The reset must be gated on is_delta (delta-only convergence signal).
+        let is_delta_gate_pos = driver_src
+            .find("if is_delta {")
+            .expect("backoff reset must be gated on `if is_delta` (#4861)");
         assert!(
-            driver_src.contains("merge_backoff.record_success("),
-            "drive_relay_broadcast_to must clear the backoff on a successful merge"
+            is_delta_gate_pos < success_pos,
+            "merge_backoff.record_success MUST be inside an `if is_delta` gate so \
+             a full-state apply does not reset the backoff (#4861 fork oscillation)"
         );
         let record_pos = driver_src
             .find(".record_failure(")

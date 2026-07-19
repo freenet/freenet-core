@@ -231,6 +231,12 @@ pub(crate) struct Ring {
     /// unlimited `ResyncRequest`s cannot make an upgraded peer full-state-reply
     /// in a loop. See `crate::ring::resync_rate_limit`.
     pub(crate) resync_response_limiter: Arc<resync_rate_limit::ResyncResponseLimiter>,
+    /// GLOBAL per-contract cap on `ResyncResponse` emission, aggregated across
+    /// ALL requesters (#4861). Per-(peer, contract) limiting alone is
+    /// insufficient — production saw ~45 distinct requester IPs drive ~9,733
+    /// full-state responses/day for one forked contract. Checked AFTER the
+    /// per-peer limit. See `crate::ring::resync_rate_limit`.
+    pub(crate) resync_response_global_limiter: Arc<resync_rate_limit::ResyncResponseGlobalLimiter>,
     /// Per-contract ban list. Populated by the governance reaper on
     /// `BanTriggered` / `BanLifted` transitions; consulted at the
     /// inbound dispatch site to drop wire requests for banned
@@ -625,6 +631,9 @@ impl Ring {
             resync_response_limiter: Arc::new(resync_rate_limit::new_response_limiter(
                 time_source.clone(),
             )),
+            resync_response_global_limiter: Arc::new(
+                resync_rate_limit::new_response_global_limiter(time_source.clone()),
+            ),
             contract_ban_list: Arc::new(contract_ban_list::ContractBanList::new(
                 time_source.clone(),
             )),
@@ -1305,6 +1314,7 @@ impl Ring {
             // bounded.
             ring.resync_emit_limiter.cleanup();
             ring.resync_response_limiter.cleanup();
+            ring.resync_response_global_limiter.cleanup();
 
             // Phase 7 ban-list maintenance. Defense-in-depth — the
             // BanLifted decisions below explicitly unban, but if any

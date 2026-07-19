@@ -2,10 +2,22 @@
 //!
 //! ## What this does
 //!
-//! A "poison" contract is one whose delta/state merges reliably fail: either
-//! the contract's `update_state` rejects every apply ("Invalid update"), or —
-//! worse — every apply exceeds the execution budget (a runaway merge). In the
-//! #4861 incident a handful of such contracts drove network-wide CPU churn:
+//! A "poison" contract is one whose delta/state merges reliably fail. The #4861
+//! incident surfaced three distinct poison classes, all of which this backoff
+//! must contain WITHOUT assuming the divergence ever heals (the fault is a
+//! contract-layer bug; core's job is only to BOUND the cost):
+//!
+//! - **Compute poison** — every merge exceeds the execution budget (a runaway
+//!   `update_state`). The [`MergeFailureClass::Timeout`] class targets this.
+//! - **Semantic fork oscillation** — two stable divergent states, each side's
+//!   deltas rejected by the other; every resync full-state apply just flips the
+//!   node to the other fork forever (~1 cycle/min). Contained here because the
+//!   backoff is reset ONLY by a genuine successful DELTA merge, never by a
+//!   fork-flipping full-state/resync apply (see the note in `node.rs`).
+//! - **Deserialization poison** — a malformed delta circulating that no holder
+//!   can apply. Presents as [`MergeFailureClass::Invalid`].
+//!
+//! In all three, a handful of such contracts drove network-wide CPU churn:
 //! every re-broadcast that slipped past the 60s [`BroadcastDedupCache`] re-ran
 //! the (failing, expensive) WASM merge, and every delta failure emitted a
 //! full-state `ResyncRequest`, which pulled a fresh full state that failed
@@ -590,6 +602,43 @@ mod tests {
         ts.advance_time(Duration::from_secs(60));
         b.cleanup_expired();
         assert_eq!(b.len(), 1, "an entry still in cooldown must not be swept");
+    }
+
+    #[test]
+    fn fork_oscillation_escalates_into_backoff_without_reset() {
+        // Regression for the #4861 semantic fork-oscillation poison class: two
+        // divergent forks each reject the other's delta, and every ResyncResponse
+        // full-state apply flips the node to the other fork — a "success" that
+        // proves nothing about convergence. Because a resync apply does NOT reset
+        // the backoff (node.rs) and a full-state apply doesn't reset it either
+        // (only a successful DELTA merge does), the alternating delta failures
+        // accumulate and the contract enters backoff, suppressing further merges
+        // (and thus the ResyncRequest amplification). If a resync/full-state
+        // apply reset the entry, the count would return to 1 every cycle and the
+        // loop would never be contained.
+        let (b, ts) = mk();
+        let c = mk_contract(1);
+        let fork_a_delta = 0xAAAA;
+        let fork_b_delta = 0xBBBB;
+
+        // Cycle 1: a fork-B delta fails to apply against fork-A state.
+        b.record_failure(&c, MergeFailureClass::Invalid, fork_b_delta);
+        // ... a resync flips us to fork B (NO record_success — that's the fix).
+        // Cycle 2: a fork-A delta now fails against fork-B state. Let the first
+        // (~30s) cooldown lapse so this models a genuine later re-attempt.
+        ts.advance_time(Duration::from_secs(40));
+        b.record_failure(&c, MergeFailureClass::Invalid, fork_a_delta);
+
+        // Two consecutive failures without a reset ⇒ escalated (~60s) cooldown.
+        // 40s later a fresh (non-memoized) delta is still suppressed, proving the
+        // count escalated past a single-failure 30s cooldown rather than resetting
+        // each cycle.
+        ts.advance_time(Duration::from_secs(40));
+        assert_eq!(
+            b.check(&c, 0xCCCC),
+            MergeDecision::InBackoff,
+            "alternating fork deltas must escalate the backoff (no resync reset)"
+        );
     }
 
     #[test]

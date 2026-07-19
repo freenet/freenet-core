@@ -57,6 +57,16 @@ pub(crate) const RESPOND_REFILL_INTERVAL: Duration = Duration::from_secs(30);
 /// Burst of full-state responses to a single peer for a contract.
 pub(crate) const RESPOND_BURST: f64 = 1.0;
 
+/// GLOBAL per-contract minimum interval between sent `ResyncResponse`s,
+/// aggregated across ALL requesters (#4861). Per-`(peer, contract)` limiting
+/// alone is insufficient: production saw ~45 distinct requester IPs for one
+/// forked contract driving ~9,733 full-state responses in a day. This caps a
+/// single contract's total resync-response cost at ≈12/min regardless of how
+/// many distinct peers ask.
+pub(crate) const RESPOND_GLOBAL_REFILL_INTERVAL: Duration = Duration::from_secs(5);
+/// Burst of full-state responses for a contract across all requesters.
+pub(crate) const RESPOND_GLOBAL_BURST: f64 = 2.0;
+
 /// Hard cap on tracked keys (per limiter). At ~64 bytes/entry, 16 384 ≈ 1 MB.
 pub(crate) const MAX_TRACKED_KEYS: usize = 16_384;
 
@@ -201,6 +211,8 @@ impl<K: Eq + Hash + Clone> TokenBucketLimiter<K> {
 pub(crate) type ResyncEmitLimiter = TokenBucketLimiter<ContractInstanceId>;
 /// A per-`(peer, contract)` `ResyncResponse` responder limiter.
 pub(crate) type ResyncResponseLimiter = TokenBucketLimiter<(SocketAddr, ContractInstanceId)>;
+/// A GLOBAL per-contract `ResyncResponse` limiter (aggregated over all peers).
+pub(crate) type ResyncResponseGlobalLimiter = TokenBucketLimiter<ContractInstanceId>;
 
 /// Build the emit-side limiter with the tuned defaults.
 pub(crate) fn new_emit_limiter(
@@ -214,7 +226,7 @@ pub(crate) fn new_emit_limiter(
     )
 }
 
-/// Build the responder-side limiter with the tuned defaults.
+/// Build the per-`(peer, contract)` responder-side limiter with tuned defaults.
 pub(crate) fn new_response_limiter(
     time_source: Arc<dyn TimeSource + Send + Sync>,
 ) -> ResyncResponseLimiter {
@@ -222,6 +234,18 @@ pub(crate) fn new_response_limiter(
         time_source,
         RESPOND_BURST,
         RESPOND_REFILL_INTERVAL,
+        MAX_TRACKED_KEYS,
+    )
+}
+
+/// Build the GLOBAL per-contract responder-side limiter with tuned defaults.
+pub(crate) fn new_response_global_limiter(
+    time_source: Arc<dyn TimeSource + Send + Sync>,
+) -> ResyncResponseGlobalLimiter {
+    TokenBucketLimiter::new(
+        time_source,
+        RESPOND_GLOBAL_BURST,
+        RESPOND_GLOBAL_REFILL_INTERVAL,
         MAX_TRACKED_KEYS,
     )
 }
@@ -331,6 +355,40 @@ mod tests {
         assert!(
             (10..=12).contains(&allowed),
             "responder flood over 5 min must send ~11 responses, got {allowed}"
+        );
+    }
+
+    #[test]
+    fn global_responder_cap_bounds_across_many_distinct_peers() {
+        // #4861: per-(peer, contract) limiting is insufficient — production saw
+        // ~45 distinct requester IPs for one forked contract. The GLOBAL
+        // per-contract limiter caps total responses regardless of requester
+        // count. Simulate 45 distinct peers each requesting the SAME contract
+        // once per second for 5 minutes; the global limiter (keyed by contract
+        // only) admits at most burst + window/interval.
+        let ts = SharedMockTimeSource::new();
+        let l = new_response_global_limiter(Arc::new(ts.clone()));
+        let contract = mk_contract(1);
+        for _ in 0..300 {
+            // 45 distinct peers hammer within the same second — all hit the one
+            // per-contract bucket, so only the first with a token gets through.
+            for p in 0..45u8 {
+                let _ = p; // peer identity is irrelevant to the GLOBAL limiter
+                l.check_and_record(contract);
+            }
+            ts.advance_time(Duration::from_secs(1));
+        }
+        // burst(2) + 300s / 5s = 2 + 60 = 62 admits, out of 300*45 = 13500 asks.
+        let allowed = l.allowed_total();
+        assert!(
+            (60..=64).contains(&allowed),
+            "global cap must bound one contract to ~62 responses over 5 min \
+             regardless of requester count, got {allowed}"
+        );
+        assert!(
+            allowed < 100,
+            "global cap keeps a single forked contract well under the ~9,733/day \
+             production storm, got {allowed} in 5 min"
         );
     }
 

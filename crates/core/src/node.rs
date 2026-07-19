@@ -2969,6 +2969,26 @@ async fn handle_interest_sync_message(
                 return None;
             }
 
+            // GLOBAL per-contract cap, checked AFTER the per-peer limit (#4861).
+            // Per-(peer, contract) alone is insufficient: production saw ~45
+            // distinct requester IPs drive ~9,733 full-state responses/day for
+            // one forked contract. This bounds a single contract's total
+            // resync-response cost (~12/min) regardless of requester count.
+            if !op_manager
+                .ring
+                .resync_response_global_limiter
+                .check_and_record(*key.id())
+            {
+                crate::config::GlobalTestMetrics::record_resync_response_suppressed();
+                tracing::debug!(
+                    from = %source,
+                    contract = %key,
+                    event = "resync_response_suppressed_global",
+                    "ResyncResponse suppressed by global per-contract rate limit"
+                );
+                return None;
+            }
+
             // Clear cached summary for this peer
             let peer_key = get_peer_key_from_addr(op_manager, source);
             if let Some(ref pk) = peer_key {
@@ -3083,10 +3103,19 @@ async fn handle_interest_sync_message(
                 Ok(ContractHandlerEvent::UpdateResponse {
                     new_value: Ok(_), ..
                 }) => {
-                    // A resync full-state apply that merged cleanly means the
-                    // contract's merge works for this state — clear any
-                    // merge-failure backoff so normal broadcasts resume (#4861).
-                    op_manager.ring.merge_backoff.record_success(key.id());
+                    // NOTE (#4861): deliberately do NOT reset the merge-failure
+                    // backoff here. A full-state resync apply "succeeds" (even
+                    // with changed=true) merely by REPLACING the local state — it
+                    // proves nothing about convergence. In the observed semantic
+                    // fork-oscillation poison class, two stable divergent states
+                    // reject each other's deltas and every resync apply just
+                    // flips the node to the other fork (~1 cycle/min forever); if
+                    // that reset the backoff, the backoff would never trip and the
+                    // storm would continue. The backoff is reset ONLY by a
+                    // genuine successful merge in the broadcast drivers (a delta
+                    // apply / streaming full-state broadcast), which is real
+                    // convergence progress. See the source-scrape pin
+                    // `resync_apply_does_not_reset_merge_backoff`.
                     tracing::info!(
                         from = %source,
                         contract = %key,
@@ -3096,9 +3125,8 @@ async fn handle_interest_sync_message(
                     );
                 }
                 Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
-                    // Merge ran and produced no change (state already current);
-                    // still a successful merge, so clear the backoff (#4861).
-                    op_manager.ring.merge_backoff.record_success(key.id());
+                    // As above (#4861): a no-change resync apply is not a
+                    // convergence signal, so it must not reset the backoff.
                     tracing::info!(
                         from = %source,
                         contract = %key,
@@ -5599,9 +5627,44 @@ mod tests {
                  state fetch ({state_fetch_pos}) so a suppressed request pays no \
                  fetch/summary cost"
             );
+            // The GLOBAL per-contract cap must also gate, after the per-peer
+            // limit and before the state fetch (#4861).
+            let global_pos = arm.find("resync_response_global_limiter").expect(
+                "ResyncRequest handler must also apply the GLOBAL per-contract \
+                 response cap (#4861)",
+            );
+            assert!(
+                gate_pos < global_pos && global_pos < state_fetch_pos,
+                "global cap ({global_pos}) must be checked after the per-peer \
+                 limit ({gate_pos}) and before the state fetch ({state_fetch_pos})"
+            );
             assert!(
                 arm.contains("record_resync_response_suppressed()"),
                 "the suppressed branch must record the resync-response-suppressed metric"
+            );
+        }
+
+        /// Pin (#4861): NO code path in node.rs may reset the merge-failure
+        /// backoff. In particular the ResyncResponse APPLY arm must not — a
+        /// full-state resync apply "succeeds" by replacing local state even in
+        /// the semantic fork-oscillation poison class (it just flips the node to
+        /// the other fork), so resetting here would make the backoff never trip
+        /// and let the ~1-cycle/min storm continue. The backoff is reset ONLY by
+        /// a genuine successful DELTA / streaming-broadcast merge in the UPDATE
+        /// broadcast drivers (`operations/update/op_ctx_task.rs`), which is real
+        /// convergence progress.
+        #[test]
+        fn resync_apply_does_not_reset_merge_backoff() {
+            // Assemble the needle from parts so the contiguous call string never
+            // appears verbatim in this file — otherwise `.contains(<literal>)`
+            // would match its OWN argument via `include_str!` (self-reference).
+            let needle = concat!("merge_backoff", ".record_success(");
+            assert!(
+                !SOURCE.contains(needle),
+                "node.rs must NOT reset the merge backoff anywhere — a \
+                 resync-apply (or any node.rs) reset would defeat the #4861 \
+                 fork-oscillation containment. Reset belongs only in the broadcast \
+                 drivers on a genuine merge success."
             );
         }
     }
