@@ -426,6 +426,42 @@ impl ExecutorError {
         }
     }
 
+    /// Returns true ONLY when the contract's WASM merge/validate exceeded the
+    /// execution time limit — the #4861 poison-contract case where every apply
+    /// runs past `max_execution_seconds`. Both the wall-clock timeout and the
+    /// epoch-deadline interrupt (#4861) converge on `WasmError::Timeout` →
+    /// `ContractExecError::MaxComputeTimeExceeded` → `update_exec_error`, whose
+    /// cause is "execution error: The operation exceeded the maximum allowed
+    /// compute time".
+    ///
+    /// Used by the per-contract merge-failure backoff (#4861) to select the
+    /// longer *Timeout*-class cooldown: a runaway merge is far more expensive to
+    /// re-attempt than a cheap `InvalidUpdate` rejection, so a contract that
+    /// times out should be quarantined harder than one that merely rejects a
+    /// stale delta. Narrow by design — matched on the same stable
+    /// "execution error:" prefix as `is_invalid_update_rejection`, so out-of-gas,
+    /// traps, and other exec errors return false and keep the base
+    /// (Invalid-class) cooldown.
+    ///
+    /// String-matched (not a typed downcast like `is_contract_queue_full`)
+    /// deliberately: the timeout must KEEP its `Update{cause}` representation so
+    /// `is_contract_exec_rejection` still returns true for it (a timeout means
+    /// the contract IS present locally, so no auto-fetch), and so a client-local
+    /// UPDATE timeout still surfaces a typed `ContractError::Update` to the
+    /// client. The compute-time message is defined in this crate
+    /// (`ContractExecError::MaxComputeTimeExceeded`), so the string is stable.
+    pub fn is_wasm_timeout(&self) -> bool {
+        match &self.inner {
+            Either::Left(req_err) => matches!(
+                req_err.as_ref(),
+                RequestError::ContractError(StdContractError::Update { cause, .. })
+                    if cause.starts_with("execution error:")
+                        && cause.contains("maximum allowed compute time")
+            ),
+            Either::Right(_) => false,
+        }
+    }
+
     /// Returns true if this error is the typed `ContractQueueFull` marker.
     ///
     /// Produced by:
@@ -1977,6 +2013,87 @@ mod tests {
             assert!(
                 !err.is_fatal(),
                 "MaxComputeTimeExceeded must not be fatal - it would kill the entire contract handler"
+            );
+        }
+
+        // ── is_wasm_timeout predicate (#4861) ─────────────────────────────
+        //
+        // Selects the longer Timeout-class merge-failure backoff. Must match
+        // ONLY the compute-time-exceeded case, distinct from OOG / invalid
+        // update / queue-full, all of which flow through similar wrappers.
+
+        #[test]
+        fn test_wasm_timeout_true_for_max_compute_time_update_error() {
+            let key = test_fixtures::make_contract_key();
+            // Exact representation the UPDATE merge path produces on a timeout
+            // (both wall-clock and epoch-deadline converge here).
+            let err = ExecutorError::request(StdContractError::update_exec_error(
+                key,
+                "The operation exceeded the maximum allowed compute time",
+            ));
+            assert!(
+                err.is_wasm_timeout(),
+                "max-compute-time update error MUST be recognized as a wasm timeout"
+            );
+            // A timeout keeps its exec-rejection classification (contract IS
+            // present ⇒ auto-fetch must stay suppressed) ...
+            assert!(
+                err.is_contract_exec_rejection(),
+                "a timeout is a contract-exec rejection (auto-fetch stays gated)"
+            );
+            // ... and is NOT a benign invalid-update rejection.
+            assert!(!err.is_invalid_update_rejection());
+        }
+
+        #[test]
+        fn test_wasm_timeout_via_execution_conversion_on_upsert() {
+            use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+            let key = test_fixtures::make_contract_key();
+            let contract_err: ContractError =
+                RuntimeInnerError::ContractExecError(ContractExecError::MaxComputeTimeExceeded)
+                    .into();
+            // The UPDATE merge path constructs the ExecutorError with
+            // op = Some(Upsert(key)), routing through update_exec_error.
+            let err =
+                ExecutorError::execution(contract_err, Some(super::super::InnerOpError::Upsert(key)));
+            assert!(
+                err.is_wasm_timeout(),
+                "MaxComputeTimeExceeded on the Upsert path MUST classify as a wasm timeout"
+            );
+        }
+
+        #[test]
+        fn test_wasm_timeout_false_for_out_of_gas() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::update_exec_error(
+                key,
+                "The operation ran out of gas. This might be caused by an infinite loop or an inefficient computation.",
+            ));
+            assert!(
+                !err.is_wasm_timeout(),
+                "out-of-gas MUST NOT be classified as a wasm timeout"
+            );
+        }
+
+        #[test]
+        fn test_wasm_timeout_false_for_invalid_update() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::update_exec_error(
+                key,
+                "invalid contract update, reason: stale",
+            ));
+            assert!(
+                !err.is_wasm_timeout(),
+                "benign invalid-update rejection MUST NOT be a wasm timeout"
+            );
+        }
+
+        #[test]
+        fn test_wasm_timeout_false_for_queue_full() {
+            let err = ExecutorError::other(ContractQueueFull);
+            assert!(
+                !err.is_wasm_timeout(),
+                "queue-full backpressure MUST NOT be a wasm timeout"
             );
         }
 

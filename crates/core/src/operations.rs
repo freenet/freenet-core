@@ -184,6 +184,14 @@ impl OpError {
     pub fn is_contract_queue_full(&self) -> bool {
         matches!(self, Self::ExecutorError(e) if e.is_contract_queue_full())
     }
+
+    /// Returns true ONLY when the contract's WASM merge/validate hit the
+    /// execution time limit (#4861). Used by the per-contract merge-failure
+    /// backoff to select the longer Timeout-class cooldown. See
+    /// `ExecutorError::is_wasm_timeout`.
+    pub fn is_wasm_timeout(&self) -> bool {
+        matches!(self, Self::ExecutorError(e) if e.is_wasm_timeout())
+    }
 }
 
 impl<T> From<SendError<T>> for OpError {
