@@ -354,6 +354,17 @@ static EPOCH_TICKER_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 static EPOCH_TICKS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Millis-since-base of the last emitted "ticker stale" ERROR (rate-limit).
 static EPOCH_TICKER_STALE_WARNED_MS: AtomicU64 = AtomicU64::new(0);
+/// Whether the process-wide epoch ticker thread has SUCCESSFULLY started
+/// (#4864 round-8). Set true only on a successful spawn; a failed spawn resets
+/// it so the NEXT `register_engine_for_epoch` retries. A `OnceLock` latched
+/// "started" even when the spawn FAILED, permanently disabling preemption after
+/// a single transient thread-exhaustion failure.
+static EPOCH_TICKER_STARTED: AtomicBool = AtomicBool::new(false);
+/// Millis-since-[`epoch_ticker_base`] of the FIRST time any store armed a
+/// deadline (#4864 round-8). `0` = no arm yet. Lets the liveness check flag a
+/// ticker that NEVER started (heartbeat stuck at 0) once we've been arming for
+/// well past the startup window, instead of staying silent forever.
+static EPOCH_FIRST_ARM_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Registry of live engines the epoch ticker drives.
 ///
@@ -378,10 +389,35 @@ fn register_engine_for_epoch(engine: &Engine) {
     start_epoch_ticker();
 }
 
-/// Lazily start the single process-wide epoch ticker thread.
+/// Claim the exclusive right to attempt the epoch-ticker spawn (#4864 round-8).
+/// Returns `true` for exactly the ONE caller that flips the flag false→true;
+/// every other caller (already started, or another thread mid-attempt) gets
+/// `false`. Factored out (pure over the injected flag) so the retry state machine
+/// is unit-testable without spawning a thread.
+fn epoch_ticker_try_claim(started: &AtomicBool) -> bool {
+    if started.load(Ordering::Acquire) {
+        return false;
+    }
+    started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Release a claim after the spawn FAILED (#4864 round-8), so the next
+/// `register_engine_for_epoch` retries. Without this, a transient thread-spawn
+/// failure would latch "started" and permanently disable epoch preemption.
+fn epoch_ticker_reset_after_failed_spawn(started: &AtomicBool) {
+    started.store(false, Ordering::Release);
+}
+
+/// Lazily start the single process-wide epoch ticker thread, RETRYING on a
+/// failed spawn (#4864 round-8): a `OnceLock` latched even a failed spawn,
+/// permanently disabling preemption after one transient thread-exhaustion.
 fn start_epoch_ticker() {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| {
+    if !epoch_ticker_try_claim(&EPOCH_TICKER_STARTED) {
+        return;
+    }
+    {
         // Pin the heartbeat origin before the thread starts.
         let _ = epoch_ticker_base();
         let spawn = std::thread::Builder::new()
@@ -422,13 +458,20 @@ fn start_epoch_ticker() {
                 }
             });
         if let Err(e) = spawn {
-            // Extremely unlikely (thread-spawn failure). Without the ticker the
-            // epoch deadline never advances, so timeouts fall back to the
-            // wall-clock poll in `execute_wasm_blocking` (the pre-#4861
-            // behavior) — degraded, not broken.
-            tracing::error!("failed to spawn wasm-epoch-ticker thread: {e}");
+            // Thread-spawn failure (e.g. transient thread exhaustion). RESET the
+            // started flag so the next engine registration retries (#4864
+            // round-8) — a latched failure would permanently disable preemption.
+            // Meanwhile timeouts fall back to the wall-clock poll in
+            // `execute_wasm_blocking` (the pre-#4861 behavior) — degraded, not
+            // broken. The never-started liveness check in
+            // `detect_stale_epoch_ticker` makes a persistent failure loud.
+            epoch_ticker_reset_after_failed_spawn(&EPOCH_TICKER_STARTED);
+            tracing::error!(
+                "failed to spawn wasm-epoch-ticker thread: {e}; will retry on next \
+                 engine registration"
+            );
         }
-    });
+    }
 }
 
 /// Cheap per-arm liveness check for the epoch ticker (#4864 review). If the
@@ -437,17 +480,53 @@ fn start_epoch_ticker() {
 /// rate-limited ERROR so the degradation is loudly visible. (Execution still
 /// falls back to the wall-clock poll in `execute_wasm_blocking`, so this is
 /// degraded, not broken.)
+/// Pure liveness decision for the epoch ticker (#4864 review + round-8), factored
+/// out so it is unit-testable without the global ticker statics. Reports the
+/// ticker DEAD when EITHER:
+/// - it ticked before but its heartbeat is now older than `stale_after_ms`
+///   (went-silent — the thread died); OR
+/// - it has NEVER ticked (`heartbeat_ms == 0`) AND we have been arming deadlines
+///   for longer than `stale_after_ms` since the first arm (never-started — e.g. a
+///   spawn failure the retry never got to re-attempt). `first_arm_ms == 0` (no
+///   arm yet) is never "dead": there is nothing to preempt.
+fn epoch_ticker_is_dead(
+    heartbeat_ms: u64,
+    first_arm_ms: u64,
+    now_ms: u64,
+    stale_after_ms: u64,
+) -> bool {
+    if heartbeat_ms == 0 {
+        first_arm_ms != 0 && now_ms.saturating_sub(first_arm_ms) > stale_after_ms
+    } else {
+        now_ms.saturating_sub(heartbeat_ms) > stale_after_ms
+    }
+}
+
 fn detect_stale_epoch_ticker() {
-    let heartbeat = EPOCH_TICKER_HEARTBEAT_MS.load(Ordering::Relaxed);
-    if heartbeat == 0 {
-        return; // ticker has not completed a first iteration yet — not "stale"
-    }
     let now_ms = epoch_ticker_base().elapsed().as_millis() as u64;
+    // Record the FIRST-EVER arm time (never the 0 sentinel) so the never-started
+    // branch of `epoch_ticker_is_dead` can measure how long we've been arming
+    // without a single tick (#4864 round-8). Ignore the result: either this call
+    // set it, or a concurrent arm already did — both are correct.
+    let _prev =
+        EPOCH_FIRST_ARM_MS.compare_exchange(0, now_ms.max(1), Ordering::Relaxed, Ordering::Relaxed);
+
+    let heartbeat = EPOCH_TICKER_HEARTBEAT_MS.load(Ordering::Relaxed);
+    let first_arm = EPOCH_FIRST_ARM_MS.load(Ordering::Relaxed);
     let stale_after_ms = 10 * EPOCH_TICK_PERIOD.as_millis() as u64;
-    if now_ms.saturating_sub(heartbeat) <= stale_after_ms {
-        return; // healthy
+    if !epoch_ticker_is_dead(heartbeat, first_arm, now_ms, stale_after_ms) {
+        return; // healthy, or still inside the startup grace window
     }
-    // Stale: emit at most ~once/60s (compare-and-swap so exactly one thread wins).
+
+    // The age we report: silence since the last tick, or (never-started) time
+    // since the first arm.
+    let heartbeat_age_ms = if heartbeat == 0 {
+        now_ms.saturating_sub(first_arm)
+    } else {
+        now_ms.saturating_sub(heartbeat)
+    };
+
+    // Emit at most ~once/60s (compare-and-swap so exactly one thread wins).
     let last_warn = EPOCH_TICKER_STALE_WARNED_MS.load(Ordering::Relaxed);
     // `last_warn == 0` is the zero-init sentinel ("never warned"), NOT a real
     // warning at base-epoch 0: allow the FIRST warn unconditionally, else an
@@ -459,8 +538,9 @@ fn detect_stale_epoch_ticker() {
             .is_ok()
     {
         tracing::error!(
-            heartbeat_age_ms = now_ms.saturating_sub(heartbeat),
+            heartbeat_age_ms,
             ticks_total = EPOCH_TICKS_TOTAL.load(Ordering::Relaxed),
+            never_started = heartbeat == 0,
             "wasm-epoch-ticker appears DEAD — epoch preemption disabled; runaway \
              guest timeouts now fall back to the wall-clock poll only"
         );
@@ -2259,6 +2339,94 @@ mod tests {
         // The margin is exactly one tick above the naive ceil for a whole-second
         // budget (the case the review flagged for [4.9s, 5.0s] finishers).
         assert_eq!(epoch_deadline_ticks(5.0) - 1, 50);
+    }
+
+    /// #4864 round-8: the epoch-ticker start is RETRYABLE — a claim whose spawn
+    /// succeeds latches "started"; a claim whose spawn FAILS is reset so a later
+    /// registration retries. Tests the pure state machine over a LOCAL flag (a
+    /// real thread-spawn failure is not forceable in a unit test).
+    #[test]
+    fn epoch_ticker_claim_retries_after_failed_spawn() {
+        use super::{epoch_ticker_reset_after_failed_spawn, epoch_ticker_try_claim};
+        let started = AtomicBool::new(false);
+
+        // The first caller claims the spawn; a concurrent/later caller does not.
+        assert!(
+            epoch_ticker_try_claim(&started),
+            "the first caller claims the spawn"
+        );
+        assert!(
+            !epoch_ticker_try_claim(&started),
+            "a second caller must NOT double-spawn while a claim stands"
+        );
+
+        // Simulate a FAILED spawn → reset → the next caller retries.
+        epoch_ticker_reset_after_failed_spawn(&started);
+        assert!(
+            epoch_ticker_try_claim(&started),
+            "after a failed spawn resets the flag, the next caller retries (not latched)"
+        );
+
+        // Simulate a SUCCESSFUL spawn → no reset → subsequent callers never re-spawn.
+        assert!(
+            !epoch_ticker_try_claim(&started),
+            "after a successful claim (no reset), the ticker is never re-spawned"
+        );
+    }
+
+    /// #4864 review + round-8: the epoch-ticker liveness decision, over injected
+    /// inputs (no global statics). Covers the went-silent case (ticked, then the
+    /// heartbeat aged out) AND the never-started case (heartbeat stuck at 0 while
+    /// we've been arming deadlines past the startup window — e.g. a spawn failure
+    /// the retry never re-attempted).
+    #[test]
+    fn epoch_ticker_is_dead_covers_silent_and_never_started() {
+        use super::epoch_ticker_is_dead;
+        let stale = 1000u64;
+
+        // No arm yet → nothing to preempt → never "dead".
+        assert!(!epoch_ticker_is_dead(0, 0, 5000, stale));
+
+        // Never ticked, but arming only just began (within the window) → alive.
+        assert!(!epoch_ticker_is_dead(0, 100, 100 + stale, stale));
+        // Never ticked, arming longer than the window → DEAD (never started).
+        assert!(epoch_ticker_is_dead(0, 100, 100 + stale + 1, stale));
+
+        // Ticked recently → alive.
+        assert!(!epoch_ticker_is_dead(5000, 100, 5000 + stale, stale));
+        // Ticked, then went silent past the window → DEAD.
+        assert!(epoch_ticker_is_dead(5000, 100, 5000 + stale + 1, stale));
+    }
+
+    /// #4864 round-8 pin: `start_epoch_ticker` must use the RETRYABLE claim/reset
+    /// form (compare_exchange on `EPOCH_TICKER_STARTED` + reset on spawn failure),
+    /// NOT a `OnceLock` that latches a failed spawn forever.
+    #[test]
+    fn start_epoch_ticker_uses_retryable_claim_not_oncelock() {
+        let src = include_str!("wasmtime_engine.rs");
+        let start = src
+            .find("fn start_epoch_ticker(")
+            .expect("start_epoch_ticker not found");
+        let after = &src[start..];
+        let end = after[1..]
+            .find("\nfn ")
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let body = &after[..end];
+        assert!(
+            body.contains("epoch_ticker_try_claim(&EPOCH_TICKER_STARTED)"),
+            "start_epoch_ticker must claim the spawn via epoch_ticker_try_claim (#4864 round-8)"
+        );
+        assert!(
+            body.contains("epoch_ticker_reset_after_failed_spawn(&EPOCH_TICKER_STARTED)"),
+            "start_epoch_ticker must RESET the flag on spawn failure so a later \
+             registration retries (#4864 round-8)"
+        );
+        assert!(
+            !body.contains("OnceLock"),
+            "start_epoch_ticker must NOT gate on a OnceLock — that latches a failed \
+             spawn forever and permanently disables epoch preemption"
+        );
     }
 
     /// WAT whose module START function loops forever — exercises an epoch
