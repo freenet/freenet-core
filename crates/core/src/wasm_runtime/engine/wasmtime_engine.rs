@@ -955,13 +955,21 @@ impl WasmEngine for WasmtimeEngine {
             }
         };
 
-        // Arm the epoch deadline before the guest runs on the blocking thread
-        // (#4861). The wall-clock poll below is a backstop; the epoch trap is
-        // what actually stops a runaway synchronous guest.
-        arm_epoch_deadline(&mut store, self.epoch_deadline_ticks);
+        // #4864 round-7: arm the epoch deadline INSIDE the blocking closure, as
+        // the guest's first act — NOT here, before the closure is enqueued.
+        // Arming before enqueue let the queue wait on a saturated blocking pool
+        // consume the epoch budget, so a queued job would insta-trap on start and
+        // a HEALTHY contract would be quarantined (contract-wide Timeout). Arming
+        // at guest-start makes the epoch budget (and the wall-clock backstop in
+        // execute_wasm_blocking) measure from when the guest actually runs. The
+        // wall-clock poll is a backstop; the epoch trap is what actually stops a
+        // runaway synchronous guest. Capture the tick budget by value since the
+        // closure can't borrow `self`.
+        let epoch_ticks = self.epoch_deadline_ticks;
 
         let result = execute_wasm_blocking(
             move || {
+                arm_epoch_deadline(&mut store, epoch_ticks);
                 // Use call_async because async_support(true) is enabled in the engine Config
                 let r = block_on_async(func.call_async(&mut store, (a, b)));
                 (r, store)
@@ -1027,14 +1035,18 @@ impl WasmEngine for WasmtimeEngine {
             }
         };
 
-        // Arm the epoch deadline before the guest runs on the blocking thread
-        // (#4861). This is the primary contract merge/validate path — the wall-
-        // clock poll below only aborts the tokio task, so the epoch trap is what
-        // actually stops a runaway synchronous guest that ignores the timeout.
-        arm_epoch_deadline(&mut store, self.epoch_deadline_ticks);
+        // #4864 round-7: arm the epoch deadline INSIDE the blocking closure, as
+        // the guest's first act — NOT here, before the closure is enqueued (see
+        // call_2i64_blocking for the full rationale). This is the primary contract
+        // merge/validate path, so a pre-enqueue arm consumed by queue wait would
+        // quarantine a healthy contract under blocking-pool saturation. The wall-
+        // clock poll only aborts the tokio task; the epoch trap is what actually
+        // stops a runaway synchronous guest that ignores the timeout.
+        let epoch_ticks = self.epoch_deadline_ticks;
 
         let result = execute_wasm_blocking(
             move || {
+                arm_epoch_deadline(&mut store, epoch_ticks);
                 // Use call_async because async_support(true) is enabled in the engine Config
                 let r = block_on_async(func.call_async(&mut store, (a, b, c)));
                 (r, store)
@@ -1842,24 +1854,108 @@ enum BlockingResult {
     Panic(anyhow::Error),
 }
 
+/// Verdict from the wall-clock backstop poll in [`execute_wasm_blocking`].
+#[derive(Debug, PartialEq, Eq)]
+enum WallVerdict {
+    /// Neither bound exceeded yet — keep polling.
+    KeepWaiting,
+    /// The guest RAN and consumed its full budget (measured from guest-start,
+    /// not from enqueue) — a real, contract-intrinsic timeout backing up the
+    /// epoch trap. Quarantine-worthy.
+    GuestOverran,
+    /// The closure never got off the blocking-pool queue within the queue bound
+    /// — transient scheduler overload the guest never entered. NOT a contract
+    /// fault; must not be charged to the contract.
+    QueuedTooLong,
+}
+
+/// #4864 round-7: classify the wall-clock backstop, bounding queue wait and the
+/// per-guest compute budget SEPARATELY.
+///
+/// The epoch deadline is now armed INSIDE the blocking closure (at guest-start,
+/// see `call_2i64_blocking` / `call_3i64_blocking`), so the wall-clock loop
+/// measures the guest's budget from `started_at`, not from enqueue. That closes
+/// two failure modes under blocking-pool saturation:
+///
+/// - (a) A job that sat queued past `budget` and then ran would, if the budget
+///   were measured from enqueue (and the epoch armed pre-enqueue), insta-trip on
+///   start and be quarantined as a real timeout even though it is HEALTHY. Now a
+///   not-yet-started job that hits the queue bound is [`WallVerdict::QueuedTooLong`]
+///   (transient), and a job that starts gets its FULL budget from its own start.
+/// - (b) A job that started just before an enqueue-relative deadline would be
+///   classified as a real timeout after mere milliseconds of guest time. Now the
+///   guest must actually consume `budget` of run time to earn `GuestOverran`.
+///
+/// The total wall bound is `queue_wait + budget`, each individually `<= budget`.
+///
+/// - `started_at`: `Some(elapsed-at-guest-start)` once the guest began running,
+///   `None` while still queued.
+/// - `elapsed`: time since enqueue.
+/// - `budget`: both the per-guest compute budget AND the queue bound.
+fn classify_wall_timeout(
+    started_at: Option<Duration>,
+    elapsed: Duration,
+    budget: Duration,
+) -> WallVerdict {
+    match started_at {
+        // Guest is running: a real timeout only once it has consumed its full
+        // budget measured from its OWN start, not from enqueue.
+        Some(started_at) => {
+            if elapsed.saturating_sub(started_at) >= budget {
+                WallVerdict::GuestOverran
+            } else {
+                WallVerdict::KeepWaiting
+            }
+        }
+        // Never started: transient scheduler overload once queued past the bound.
+        None => {
+            if elapsed >= budget {
+                WallVerdict::QueuedTooLong
+            } else {
+                WallVerdict::KeepWaiting
+            }
+        }
+    }
+}
+
 fn execute_wasm_blocking<F>(f: F, max_execution_seconds: f64) -> BlockingResult
 where
     F: FnOnce() -> WasmResult + Send + 'static,
 {
-    let timeout = Duration::from_secs_f64(max_execution_seconds);
+    // `budget` bounds BOTH the queue wait (before the guest starts) and the
+    // guest's own compute time (after it starts), SEPARATELY — see
+    // `classify_wall_timeout`.
+    let budget = Duration::from_secs_f64(max_execution_seconds);
     let start = std::time::Instant::now();
 
-    // #4864 round-6: distinguish a guest that RAN and blew the wall-clock
-    // deadline (a real, contract-intrinsic timeout — the epoch backstop) from a
-    // closure that never got off the blocking-pool queue (a transient scheduler
-    // overload the guest never entered). The wrapped closure's FIRST act flips
-    // `started`, so a wall-clock fire with `started == false` means the guest
-    // never ran and the failure must NOT be charged to the contract.
+    // #4864 round-6/7: distinguish a guest that RAN and blew its budget (a real,
+    // contract-intrinsic timeout — the epoch backstop) from a closure that never
+    // got off the blocking-pool queue (a transient scheduler overload the guest
+    // never entered). The wrapper records `started_at` (ms since enqueue) then
+    // flips `started` as the closure's first acts; the CALLER's closure then arms
+    // the epoch deadline as ITS first act, so the guest's budget starts at
+    // guest-start, not at enqueue. A wall-clock fire with `started == false` means
+    // the guest never ran and the failure must NOT be charged to the contract.
     let started = Arc::new(AtomicBool::new(false));
+    let started_at_ms = Arc::new(AtomicU64::new(0));
     let started_for_guest = Arc::clone(&started);
+    let started_at_for_guest = Arc::clone(&started_at_ms);
     let f = move || {
+        // Record started_at BEFORE flipping `started`, so the poll loop that
+        // observes started==true (SeqCst) is guaranteed to read a valid
+        // started_at.
+        started_at_for_guest.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
         started_for_guest.store(true, Ordering::SeqCst);
         f()
+    };
+
+    // Read the guest-start clock as `Some` only once the guest has actually
+    // started, so a stale started_at of 0 is never mistaken for a guest that
+    // began at t=0 while it is in fact still queued.
+    let read_started_at = || -> Option<Duration> {
+        started
+            .load(Ordering::SeqCst)
+            .then(|| Duration::from_millis(started_at_ms.load(Ordering::SeqCst)))
     };
 
     // `block_in_place` (in the multi-thread arm below) is only legal on a
@@ -1894,28 +1990,27 @@ where
                     };
                 }
 
-                if start.elapsed() >= timeout {
-                    task_handle.abort();
-                    // #4864 round-6: only a guest that actually STARTED is a real
-                    // (contract-intrinsic) timeout. A closure still queued on a
-                    // saturated blocking pool never ran, so classify it as a
-                    // transient scheduler overload instead of quarantining the
-                    // contract.
-                    if started.load(Ordering::SeqCst) {
+                match classify_wall_timeout(read_started_at(), start.elapsed(), budget) {
+                    WallVerdict::KeepWaiting => {}
+                    WallVerdict::GuestOverran => {
+                        task_handle.abort();
                         tracing::warn!(
                             timeout_secs = max_execution_seconds,
                             elapsed_ms = start.elapsed().as_millis(),
-                            "WASM execution timed out (guest running; epoch backstop)"
+                            "WASM execution timed out (guest running past its budget; epoch backstop)"
                         );
                         return BlockingResult::Timeout;
                     }
-                    tracing::warn!(
-                        timeout_secs = max_execution_seconds,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "WASM execution timed out while QUEUED (guest never started; \
-                         blocking-pool saturation) — treated as transient, contract not quarantined"
-                    );
-                    return BlockingResult::QueuedTimeout;
+                    WallVerdict::QueuedTooLong => {
+                        task_handle.abort();
+                        tracing::warn!(
+                            timeout_secs = max_execution_seconds,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "WASM execution timed out while QUEUED (guest never started; \
+                             blocking-pool saturation) — treated as transient, contract not quarantined"
+                        );
+                        return BlockingResult::QueuedTimeout;
+                    }
                 }
 
                 std::thread::sleep(Duration::from_millis(10));
@@ -1956,27 +2051,30 @@ where
                     }
                 }
 
-                if start.elapsed() >= timeout {
-                    // #4864 round-6: same started-flag classification as the
-                    // multi-thread arm. The detached thread is left to finish
-                    // and drop the store on its own (as before); only the
-                    // RESULT classification differs by whether the guest ran.
-                    if started.load(Ordering::SeqCst) {
+                // Same started-flag classification as the multi-thread arm. The
+                // detached thread is left to finish and drop the store on its own
+                // (as before); only the RESULT classification differs by whether
+                // the guest ran.
+                match classify_wall_timeout(read_started_at(), start.elapsed(), budget) {
+                    WallVerdict::KeepWaiting => {}
+                    WallVerdict::GuestOverran => {
                         tracing::warn!(
                             timeout_secs = max_execution_seconds,
                             elapsed_ms = start.elapsed().as_millis(),
-                            "WASM execution timed out (guest running; epoch backstop, no tokio runtime)"
+                            "WASM execution timed out (guest running past its budget; epoch backstop, no tokio runtime)"
                         );
                         return BlockingResult::Timeout;
                     }
-                    tracing::warn!(
-                        timeout_secs = max_execution_seconds,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "WASM execution timed out while QUEUED (guest never started; \
-                         blocking-pool saturation, no tokio runtime) — treated as transient, \
-                         contract not quarantined"
-                    );
-                    return BlockingResult::QueuedTimeout;
+                    WallVerdict::QueuedTooLong => {
+                        tracing::warn!(
+                            timeout_secs = max_execution_seconds,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "WASM execution timed out while QUEUED (guest never started; \
+                             blocking-pool saturation, no tokio runtime) — treated as transient, \
+                             contract not quarantined"
+                        );
+                        return BlockingResult::QueuedTimeout;
+                    }
                 }
 
                 std::thread::sleep(Duration::from_millis(10));
@@ -2273,6 +2371,105 @@ mod tests {
                 );
                 prev = entry_pos;
             }
+        }
+    }
+
+    /// #4864 round-7 (Codex P1): the wall-clock backstop must bound queue wait and
+    /// per-guest compute budget SEPARATELY, measured from `started_at` (guest
+    /// start) rather than from enqueue. Encodes both failure modes the fix closes.
+    #[test]
+    fn classify_wall_timeout_bounds_queue_and_budget_separately() {
+        use super::{WallVerdict, classify_wall_timeout};
+        let budget = Duration::from_millis(100);
+
+        // Not started, under the queue bound → keep waiting.
+        assert_eq!(
+            classify_wall_timeout(None, Duration::from_millis(50), budget),
+            WallVerdict::KeepWaiting
+        );
+        // Not started, past the queue bound → transient (never charged to the
+        // contract). This is fix (a): a job that never got off the queue is not a
+        // contract fault.
+        assert_eq!(
+            classify_wall_timeout(None, Duration::from_millis(100), budget),
+            WallVerdict::QueuedTooLong
+        );
+        assert_eq!(
+            classify_wall_timeout(None, Duration::from_millis(250), budget),
+            WallVerdict::QueuedTooLong
+        );
+
+        // Started at t=0, guest under budget → keep waiting.
+        assert_eq!(
+            classify_wall_timeout(Some(Duration::ZERO), Duration::from_millis(50), budget),
+            WallVerdict::KeepWaiting
+        );
+        // Started at t=0, guest consumed its full budget → real timeout.
+        assert_eq!(
+            classify_wall_timeout(Some(Duration::ZERO), Duration::from_millis(100), budget),
+            WallVerdict::GuestOverran
+        );
+
+        // Fix (b): started LATE (queued 90ms) — total elapsed 150ms exceeds
+        // `budget`, but the guest has only run 60ms (< budget), so it is NOT a real
+        // timeout. Pre-fix (enqueue-relative) this would have fired GuestOverran
+        // after only 10ms of guest time, quarantining a healthy contract.
+        assert_eq!(
+            classify_wall_timeout(
+                Some(Duration::from_millis(90)),
+                Duration::from_millis(150),
+                budget
+            ),
+            WallVerdict::KeepWaiting
+        );
+        // Same late start, once the guest has run its full budget (90 + 100 = 190).
+        assert_eq!(
+            classify_wall_timeout(
+                Some(Duration::from_millis(90)),
+                Duration::from_millis(190),
+                budget
+            ),
+            WallVerdict::GuestOverran
+        );
+    }
+
+    /// #4864 round-7 pin: the blocking guest-entry paths MUST arm the epoch
+    /// deadline INSIDE the closure passed to `execute_wasm_blocking` (so the
+    /// budget starts at guest-start), not before it (which would let queue wait on
+    /// a saturated pool consume the budget and quarantine a healthy contract).
+    /// Asserts the `arm_epoch_deadline(` call in each fn sits AFTER the
+    /// `execute_wasm_blocking(` call. Complements
+    /// `every_guest_entry_is_preceded_by_arm_epoch_deadline`, which only checks the
+    /// arm precedes the guest entry textually (true both before and after the fix).
+    #[test]
+    fn blocking_paths_arm_epoch_inside_the_closure() {
+        let src = include_str!("wasmtime_engine.rs");
+        for fn_name in ["fn call_2i64_blocking(", "fn call_3i64_blocking("] {
+            let start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("`{fn_name}` not found"));
+            let rest = &src[start + fn_name.len()..];
+            // Bound the body at the next method or the impl close.
+            let end = ["\n    fn ", "\n}"]
+                .iter()
+                .filter_map(|needle| rest.find(needle))
+                .min()
+                .map(|i| start + fn_name.len() + i)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+
+            let ewb = body
+                .find("execute_wasm_blocking(")
+                .unwrap_or_else(|| panic!("`{fn_name}` must call execute_wasm_blocking"));
+            let arm = body
+                .find("arm_epoch_deadline(")
+                .unwrap_or_else(|| panic!("`{fn_name}` must arm the epoch deadline"));
+            assert!(
+                arm > ewb,
+                "`{fn_name}`: arm_epoch_deadline must be INSIDE the execute_wasm_blocking \
+                 closure (after the call), not before it — else queue wait consumes the \
+                 epoch budget and a healthy contract is quarantined (#4864 round-7)"
+            );
         }
     }
 
