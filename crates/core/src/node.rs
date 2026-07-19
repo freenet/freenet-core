@@ -3112,9 +3112,10 @@ async fn handle_interest_sync_message(
                     // flips the node to the other fork (~1 cycle/min forever); if
                     // that reset the backoff, the backoff would never trip and the
                     // storm would continue. The backoff is reset ONLY by a
-                    // genuine successful merge in the broadcast drivers (a delta
-                    // apply / streaming full-state broadcast), which is real
-                    // convergence progress. See the source-scrape pin
+                    // genuine successful DELTA merge in the broadcast driver —
+                    // full-state merges (streaming broadcast included) never
+                    // reset, since they carry the same fork-flip ambiguity. See
+                    // the source-scrape pin
                     // `resync_apply_does_not_reset_merge_backoff`.
                     tracing::info!(
                         from = %source,
@@ -5650,9 +5651,10 @@ mod tests {
         /// the semantic fork-oscillation poison class (it just flips the node to
         /// the other fork), so resetting here would make the backoff never trip
         /// and let the ~1-cycle/min storm continue. The backoff is reset ONLY by
-        /// a genuine successful DELTA / streaming-broadcast merge in the UPDATE
-        /// broadcast drivers (`operations/update/op_ctx_task.rs`), which is real
-        /// convergence progress.
+        /// a genuine successful DELTA merge in the UPDATE broadcast driver
+        /// (`operations/update/op_ctx_task.rs`) — full-state merges, streaming
+        /// broadcast included, never reset because they carry the same
+        /// fork-flip ambiguity as a resync apply.
         #[test]
         fn resync_apply_does_not_reset_merge_backoff() {
             // Assemble the needle from parts so the contiguous call string never
