@@ -300,7 +300,13 @@ async fn drive_client_update(
                     // merge works now — clear any merge-failure backoff so inbound
                     // broadcasts resume (#4864 review P2, delta-only).
                     if is_delta_update {
-                        op_manager.ring.merge_backoff.record_success_local(key.id());
+                        // Contract-wide clear only when the state advanced
+                        // (execution.changed) — a no-op client delta must not
+                        // wipe a live Timeout quarantine (#4864 round-4).
+                        op_manager
+                            .ring
+                            .merge_backoff
+                            .record_success_local(key.id(), execution.changed);
                     }
                     execution
                 }
@@ -395,7 +401,13 @@ async fn drive_client_update(
                     // Successful client-local DELTA merge on the remote-target
                     // path clears the backoff too (#4864 review P2, delta-only).
                     if is_delta_update {
-                        op_manager.ring.merge_backoff.record_success_local(key.id());
+                        // Contract-wide clear only when the state advanced
+                        // (execution.changed) — a no-op client delta must not
+                        // wipe a live Timeout quarantine (#4864 round-4).
+                        op_manager
+                            .ring
+                            .merge_backoff
+                            .record_success_local(key.id(), execution.changed);
                     }
                     execution
                 }
@@ -1290,10 +1302,15 @@ async fn drive_relay_broadcast_to(
             // do NOT reset here; the resync-apply path in node.rs does not reset
             // either (see the note there).
             if is_delta {
-                op_manager
-                    .ring
-                    .merge_backoff
-                    .record_success_from_sender(key.id(), sender_addr);
+                // Per-sender Invalid channel clears unconditionally on a clean
+                // delta apply (channel-trust); the contract-wide Timeout + memo
+                // clear only when the state ADVANCED (result.changed) — a no-op
+                // delta must not wipe a live Timeout quarantine (#4864 round-4).
+                op_manager.ring.merge_backoff.record_success_from_sender(
+                    key.id(),
+                    sender_addr,
+                    result.changed,
+                );
             }
             result
         }
@@ -2124,6 +2141,19 @@ async fn apply_streaming_broadcast(
             // is always full state, so it NEVER resets the backoff here; a
             // recovered contract's entry simply ages out via the reaper if
             // failures stop.
+            //
+            // BUT a state-advancing full-state apply (exec.changed) invalidates
+            // the failed-payload MEMO's premise: a delta that failed against the
+            // OLD state may be valid against the new one (#4864 round-4 P2). This
+            // clears ONLY the memo — NOT any cooldown channel — so it is NOT a
+            // backoff reset (the delta-only no-reset doctrine stands; the
+            // streaming pin still forbids resetting the backoff here).
+            if exec.changed {
+                op_manager
+                    .ring
+                    .merge_backoff
+                    .invalidate_payload_memo(key.id());
+            }
             exec
         }
         Err(err) => {

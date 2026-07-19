@@ -3125,6 +3125,21 @@ async fn handle_interest_sync_message(
                     // reset, since they carry the same fork-flip ambiguity. See
                     // the source-scrape pin
                     // `resync_apply_does_not_reset_merge_backoff`.
+                    //
+                    // BUT this CHANGED apply advances the state, which
+                    // invalidates the failed-payload MEMO's premise (a delta that
+                    // failed against the old state may be valid against the new
+                    // one) — clear ONLY the memo (#4864 round-4 P2). This is NOT a
+                    // backoff reset: no cooldown channel is touched, so the
+                    // strictly-delta-only no-reset doctrine and the
+                    // `resync_apply_does_not_reset_merge_backoff` pin (which
+                    // forbids a backoff reset from any node.rs site) both still
+                    // hold — `invalidate_payload_memo` is a distinct method that
+                    // clears only the memo, never a cooldown.
+                    op_manager
+                        .ring
+                        .merge_backoff
+                        .invalidate_payload_memo(key.id());
                     tracing::info!(
                         from = %source,
                         contract = %key,

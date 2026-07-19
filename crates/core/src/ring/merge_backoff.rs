@@ -75,13 +75,20 @@
 //!   memoized — no trip gate. Contract execution is deterministic, so the exact
 //!   bad bytes fail identically for every sender; re-running is pure waste, and
 //!   trip-gating would hand each fresh sender in the fork storm 3 free
-//!   executions of a known-bad payload. The skip can never block a legitimate
-//!   delta (new content = different bytes = memo miss), and it is ZERO-COST:
-//!   the driver returns without running the merge, so the presenting sender's
-//!   channel is NOT advanced and no `ResyncRequest` is emitted (the benign
-//!   stale-reject penalises a channel only when the merge actually RUNS and
-//!   fails). Any successful merge (a state-generation bump) drops the memo,
-//!   re-admitting every payload.
+//!   executions of a known-bad payload. A payload with NEW content is a memo
+//!   miss (different bytes) and always runs; the skip is ZERO-COST — the driver
+//!   returns without running the merge, so the presenting sender's channel is
+//!   NOT advanced and no `ResyncRequest` is emitted (the benign stale-reject
+//!   penalises a channel only when the merge actually RUNS and fails). The one
+//!   bounded staleness window: a delta that failed against state A can become
+//!   valid against state B, but the EXACT same bytes stay memoized until the
+//!   state advances. That window is bounded three ways — any `changed` DELTA
+//!   success drops the whole memo; a state-advancing FULL-STATE apply
+//!   ([`Self::invalidate_payload_memo`], called on a changed streaming/resync
+//!   apply) drops the memo without touching cooldowns; and the ~5-min InterestSync
+//!   anti-entropy plus the [`FAILED_PAYLOAD_TTL`] (10 min) heal it otherwise. A
+//!   PUT-path state advance that does NOT route through those sites leaves the
+//!   memo stale for at most the TTL — an accepted, TTL-bounded corner.
 //!
 //! ## Failure classes
 //!
@@ -544,12 +551,28 @@ impl MergeBackoff {
         }
     }
 
-    /// A successful DELTA merge from `sender`: clears THIS sender's `Invalid`
-    /// channel, plus the contract-wide `Timeout` cooldown and the failed-payload
-    /// memo (the state advanced, so every remembered failure is stale). Other
-    /// senders' `Invalid` channels are left intact — they may genuinely sit on
-    /// the other fork.
-    pub fn record_success_from_sender(&self, contract: &ContractInstanceId, sender: SocketAddr) {
+    /// A successful DELTA merge from `sender`.
+    ///
+    /// The per-sender `Invalid` channel clear is UNCONDITIONAL on a clean delta
+    /// apply (even a no-op `changed == false`): the delta was accepted by the
+    /// contract, which is a channel-TRUST signal for that sender regardless of
+    /// whether it advanced state.
+    ///
+    /// The contract-wide clear (`Timeout` cooldown + failed-payload memo) is
+    /// gated on `changed == true` (#4864 round-4 P1): those signals record that
+    /// the STATE was poison, so they are stale only once the state actually
+    /// ADVANCES. A no-op success (`UpdateNoChange`) means the state did NOT
+    /// advance — the memoized failures and the Timeout quarantine are still
+    /// valid, and clearing them on routine no-op deltas would let a busy
+    /// contract wipe a live 120s→2h Timeout quarantine on every unrelated delta
+    /// (leaving only the 60s dedup floor). Other senders' `Invalid` channels are
+    /// always left intact — they may genuinely sit on the other fork.
+    pub fn record_success_from_sender(
+        &self,
+        contract: &ContractInstanceId,
+        sender: SocketAddr,
+        changed: bool,
+    ) {
         if self
             .invalid_by_sender
             .remove(&(*contract, sender))
@@ -557,15 +580,36 @@ impl MergeBackoff {
         {
             self.invalid_size.fetch_sub(1, Ordering::Relaxed);
         }
-        self.clear_contract_side(contract);
+        if changed {
+            self.clear_contract_side(contract);
+        }
     }
 
     /// A successful client-local DELTA merge: clears the contract-wide `Timeout`
-    /// cooldown and the failed-payload memo ONLY. Per-sender `Invalid` channels
-    /// are untouched — a local client's success proves the contract merges but
-    /// says nothing about any specific remote sender's fork.
-    pub fn record_success_local(&self, contract: &ContractInstanceId) {
-        self.clear_contract_side(contract);
+    /// cooldown and the failed-payload memo — but ONLY when `changed == true`
+    /// (the state actually advanced; see [`Self::record_success_from_sender`] for
+    /// why a no-op success must not clear). Per-sender `Invalid` channels are
+    /// untouched — a local client's success proves the contract merges but says
+    /// nothing about any specific remote sender's fork.
+    pub fn record_success_local(&self, contract: &ContractInstanceId, changed: bool) {
+        if changed {
+            self.clear_contract_side(contract);
+        }
+    }
+
+    /// A state-advancing FULL-STATE apply (streaming full-state broadcast with
+    /// `changed == true`, or a changed `ResyncResponse` apply) invalidates the
+    /// failed-payload memo's premise: a delta that failed against the OLD state
+    /// may be valid against the new one. Clears ONLY the failed-payload memo —
+    /// NOT any cooldown channel. This is NOT a backoff reset: the strictly
+    /// delta-only no-reset doctrine stands (a full-state apply is fork-flippable
+    /// and never proves convergence, so the `Timeout`/`Invalid` cooldowns
+    /// persist). It only re-admits payloads whose known-bad verdict no longer
+    /// holds after the state generation changed.
+    pub fn invalidate_payload_memo(&self, contract: &ContractInstanceId) {
+        if let Some(mut cs) = self.contract.get_mut(contract) {
+            cs.failed_payloads.clear();
+        }
     }
 
     /// Drop the contract-wide entry (clears both the `Timeout` cooldown and the
@@ -746,7 +790,7 @@ mod tests {
         assert!(b.check(&c, s, 2).is_allowed());
         b.record_failure(&c, s, MergeFailureClass::Invalid, 3);
         assert!(b.check(&c, s, 4).is_allowed());
-        b.record_success_from_sender(&c, s);
+        b.record_success_from_sender(&c, s, true);
         assert_eq!(b.invalid_len(), 0, "success clears the sender's channel");
         assert_eq!(b.suppressed_total(), 0, "nothing was ever suppressed");
         b.record_failure(&c, s, MergeFailureClass::Invalid, 5);
@@ -766,7 +810,7 @@ mod tests {
             b.record_failure(&c, s, MergeFailureClass::Invalid, h);
         }
         assert!(!b.check(&c, s, 2).is_allowed());
-        b.record_success_from_sender(&c, s);
+        b.record_success_from_sender(&c, s, true);
         assert_eq!(b.check(&c, s, 2), MergeDecision::Allow);
         assert_eq!(
             b.check(&c, s, 1),
@@ -793,7 +837,7 @@ mod tests {
             b.record_failure(&c, s2, MergeFailureClass::Invalid, h);
         }
         // A success from s1 clears s1 but not s2.
-        b.record_success_from_sender(&c, s1);
+        b.record_success_from_sender(&c, s1, true);
         assert_eq!(b.check(&c, s1, 100), MergeDecision::Allow, "s1 cleared");
         assert_eq!(
             b.check(&c, s2, 101),
@@ -814,11 +858,94 @@ mod tests {
         for h in [2u64, 3, 4] {
             b.record_failure(&c, s, MergeFailureClass::Invalid, h);
         }
-        b.record_success_local(&c);
+        b.record_success_local(&c, true);
         // Contract-wide Timeout gone: a fresh sender with no channel is Allowed.
         assert_eq!(b.check(&c, mk_addr(99), 100), MergeDecision::Allow);
         // The sender's own Invalid channel is untouched — still suppressing.
         assert_eq!(b.check(&c, s, 100), MergeDecision::InBackoff);
+    }
+
+    /// #4864 round-4 P1: the contract-side clear (Timeout + memo) requires
+    /// `changed == true`. A no-op success (changed=false) must leave the memo AND
+    /// the Timeout cooldown intact — the state did not advance, so the recorded
+    /// poison is still valid. `changed == true` clears both.
+    #[test]
+    fn contract_side_clear_requires_changed_true() {
+        let (b, _ts) = mk();
+        let c = mk_contract(1);
+        let s = mk_addr(10);
+        // Contract-wide Timeout (trips at 1) + a memoized poison payload 0xBAD.
+        b.record_failure(&c, s, MergeFailureClass::Timeout, 0xBAD);
+        // A no-op delta success (changed=false) must NOT clear the contract side.
+        b.record_success_from_sender(&c, s, false);
+        assert_eq!(
+            b.check(&c, mk_addr(99), 0xBAD),
+            MergeDecision::KnownFailedPayload,
+            "memo must survive a no-change success (state did not advance)"
+        );
+        assert_eq!(
+            b.check(&c, mk_addr(99), 0x11),
+            MergeDecision::InBackoff,
+            "Timeout cooldown must survive a no-change success"
+        );
+        // A changed=true success clears the contract side.
+        b.record_success_from_sender(&c, s, true);
+        assert_eq!(
+            b.check(&c, mk_addr(99), 0xBAD),
+            MergeDecision::Allow,
+            "memo cleared on a state-advancing success"
+        );
+        assert_eq!(b.check(&c, mk_addr(99), 0x11), MergeDecision::Allow);
+    }
+
+    /// #4864 round-4 P1: the per-sender Invalid channel clear is UNCONDITIONAL on
+    /// a clean delta apply — even a no-op (changed=false) apply clears it (the
+    /// delta was accepted → channel-trust signal for that sender).
+    #[test]
+    fn sender_invalid_channel_clears_on_clean_delta_regardless_of_changed() {
+        let (b, _ts) = mk();
+        let c = mk_contract(1);
+        let s = mk_addr(10);
+        for h in [1u64, 2, 3] {
+            b.record_failure(&c, s, MergeFailureClass::Invalid, h);
+        }
+        assert_eq!(b.invalid_len(), 1);
+        b.record_success_from_sender(&c, s, false);
+        assert_eq!(
+            b.invalid_len(),
+            0,
+            "the sender's Invalid channel clears even on a no-change apply"
+        );
+    }
+
+    /// #4864 round-4 P2: `invalidate_payload_memo` (called on a state-advancing
+    /// full-state apply) re-admits memoized payloads but leaves cooldown channels
+    /// intact — it is a memo invalidation, NOT a backoff reset.
+    #[test]
+    fn invalidate_payload_memo_readmits_payload_but_keeps_cooldown_channel() {
+        let (b, ts) = mk();
+        let c = mk_contract(1);
+        let s = mk_addr(10);
+        // Trip s's Invalid channel with payload 0xBAD, then advance past the ~30s
+        // cooldown but within the 10-min memo TTL.
+        for _ in 0..3 {
+            b.record_failure(&c, s, MergeFailureClass::Invalid, 0xBAD);
+        }
+        ts.advance_time(Duration::from_secs(60));
+        assert_eq!(b.check(&c, s, 0xBAD), MergeDecision::KnownFailedPayload);
+        assert_eq!(b.check(&c, s, 0x11), MergeDecision::Allow);
+        // A state-advancing full-state apply invalidates the memo's premise.
+        b.invalidate_payload_memo(&c);
+        assert_eq!(
+            b.check(&c, s, 0xBAD),
+            MergeDecision::Allow,
+            "memo cleared → the payload is re-admitted after the state advanced"
+        );
+        assert_eq!(
+            b.invalid_len(),
+            1,
+            "the cooldown channel is NOT cleared by memo invalidation"
+        );
     }
 
     #[test]
