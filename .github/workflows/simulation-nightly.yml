@@ -31,7 +31,18 @@ jobs:
   large-scale-simulation:
     name: Large Scale Simulation
     runs-on: ubicloud-standard-16
-    timeout-minutes: 150
+    # This job runs the nextest suite (~109 min) then the 500-node step
+    # (≤60 min, its own cap below) sequentially, plus ~4 min build/setup.
+    # 150 became too tight once the nextest suite grew (~77→~109 min over
+    # mid-2026): the job hit 150 min mid-way through the 500-node step and
+    # CANCELLED it. A cancelled job is not a `failure`, so the alert jobs
+    # (which gate on `result == 'failure'`) never fired — the 500-node
+    # reliability gate was silently skipped for weeks. 195 fits both steps
+    # with ~20 min headroom. If the nextest suite keeps growing, prefer
+    # splitting the 500-node step into its own parallel job (with its own
+    # timeout wired into the notify jobs' `needs`/`if`) over raising this
+    # further.
+    timeout-minutes: 195
 
     env:
       RUST_LOG: info,turmoil=warn
@@ -108,9 +119,11 @@ jobs:
             --no-capture \
             --profile nightly
 
-      # Large scale test (500 nodes) - uses direct runner (no turmoil overhead)
-      # With simulation-mode timer optimizations (~5x fewer timer firings),
-      # completes in ~4 min locally for 10000 events.
+      # Large scale test (500 nodes) - uses direct runner (no turmoil overhead).
+      # Takes ~33-46 min on the CI runner (the "~4 min locally" figure this
+      # comment used to cite was badly stale). The 60-min step cap below is the
+      # binding limit on this step; if it trips, the sim genuinely slowed —
+      # investigate rather than reflexively bumping the cap.
       - name: Large scale test (500 nodes)
         timeout-minutes: 60
         env:
