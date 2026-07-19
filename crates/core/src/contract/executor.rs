@@ -2071,6 +2071,39 @@ mod tests {
             );
         }
 
+        /// Pin (#4861 review): the DESERIALIZATION-poison class — a contract's
+        /// `update_state` returning `ContractError::Deser` for a malformed
+        /// circulating delta (the `FBFRDjxV…` production case) — MUST reach the
+        /// merge-failure backoff. It routes `ContractExecError::ContractError`
+        /// through `update_exec_error`, so the cause carries the
+        /// "execution error:" prefix and `is_contract_exec_rejection` (the
+        /// backoff recording gate) matches; it is neither a timeout nor an
+        /// invalid-update rejection.
+        #[test]
+        fn test_deser_poison_classifies_as_exec_rejection_for_backoff() {
+            use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+            let key = test_fixtures::make_contract_key();
+            let deser = freenet_stdlib::prelude::ContractError::Deser(
+                "Semantic(None, \"invalid type: null, expected map\")".to_string(),
+            );
+            let contract_err: ContractError =
+                RuntimeInnerError::ContractExecError(ContractExecError::from(deser)).into();
+            let err = ExecutorError::execution(
+                contract_err,
+                Some(super::super::InnerOpError::Upsert(key)),
+            );
+            assert!(
+                err.is_contract_exec_rejection(),
+                "a contract-returned Deser error on the Upsert path must satisfy \
+                 the backoff recording gate"
+            );
+            assert!(!err.is_wasm_timeout(), "deser poison is not a timeout");
+            assert!(
+                !err.is_invalid_update_rejection(),
+                "deser poison is not the benign invalid-update rejection"
+            );
+        }
+
         #[test]
         fn test_wasm_timeout_false_for_out_of_gas() {
             let key = test_fixtures::make_contract_key();
