@@ -2873,6 +2873,19 @@ mod tests {
                 && driver_src.contains("is_contract_exec_rejection()"),
             "streaming path must record gated failures like the non-streaming driver"
         );
+        // #4864 round-7: the streaming record gate MUST also exclude scheduler
+        // timeouts (the guest-never-ran, queued-on-a-saturated-pool case), exactly
+        // like the relay driver (pinned in
+        // broadcast_to_backoff_records_success_and_gated_failure). Without this
+        // needle a refactor dropping the exclusion from the streaming driver would
+        // silently re-quarantine a healthy contract on transient scheduler
+        // overload — the round-6/7 regression this exclusion exists to prevent.
+        assert!(
+            driver_src.contains("!err.is_scheduler_timeout()"),
+            "streaming record gate MUST exclude scheduler timeouts \
+             (!err.is_scheduler_timeout(), #4864 round-6/7): a queued-never-ran \
+             failure is transient load, not a contract fault — mirror of the relay pin"
+        );
     }
 
     /// Pin (#4864 review P2): a successful client-local DELTA merge in

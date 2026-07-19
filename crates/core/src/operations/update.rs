@@ -525,6 +525,23 @@ pub(crate) fn log_broadcast_to_streaming_failure(
             event = "queue_full",
             "BroadcastToStreaming update skipped: per-contract queue saturated"
         );
+    } else if err.is_scheduler_timeout() {
+        // #4864 round-7: the merge closure sat queued on a saturated execution
+        // pool past the deadline and the guest NEVER ran. The contract IS present
+        // (so no auto-fetch — the return value below already gates on
+        // is_contract_exec_rejection, which is true for a scheduler timeout), and
+        // this fires under exactly the load it represents. DEBUG, not WARN,
+        // mirroring the #4251 queue-full treatment: a WARN here would be loud
+        // precisely when the node is most overloaded, and it would be factually
+        // wrong to blame the contract ("not ready locally") for a pool-saturation
+        // event.
+        tracing::debug!(
+            tx = %tx,
+            %key,
+            error = %err,
+            event = "scheduler_overloaded",
+            "BroadcastToStreaming update skipped: execution pool saturated, guest never ran (transient)"
+        );
     } else {
         tracing::warn!(
             tx = %tx,
@@ -1203,6 +1220,21 @@ mod tests {
             ExecutorError::other(crate::contract::ContractQueueFull)
         }
 
+        fn scheduler_timeout_failure() -> ExecutorError {
+            // Mirrors the production cause: ContractExecError::SchedulerOverloaded
+            // via update_exec_error → "execution error: The operation was queued
+            // too long on a saturated execution pool and never ran". The guest
+            // never ran, so this is transient load, not a contract fault, yet it
+            // KEEPS the "execution error:" prefix (contract present ⇒ no
+            // auto-fetch). Matches is_scheduler_timeout.
+            let req: RequestError = StdContractError::update_exec_error(
+                make_contract_key(1),
+                "The operation was queued too long on a saturated execution pool and never ran",
+            )
+            .into();
+            req.into()
+        }
+
         #[test]
         fn update_contract_failure_logs_info_for_invalid_update_rejection() {
             let logger = TestLogger::new().capture_logs().with_level("info").init();
@@ -1402,6 +1434,54 @@ mod tests {
                 "the misleading 'contract not ready locally' message must not appear \
                  for queue-full — the contract IS present, the queue is just busy, \
                  got: {:?}",
+                logger.logs()
+            );
+        }
+
+        /// #4864 round-7: a SCHEDULER timeout (the merge closure sat queued on a
+        /// saturated execution pool and the guest never ran) must log at DEBUG,
+        /// NOT WARN — like queue-full (#4251), a WARN here would be loud precisely
+        /// under the overload it represents — and must NOT blame the contract with
+        /// the "contract not ready locally" message (the contract IS present).
+        /// Auto-fetch is skipped (contract present ⇒ is_contract_exec_rejection).
+        #[test]
+        fn broadcast_to_streaming_failure_skips_auto_fetch_and_uses_debug_for_scheduler_timeout() {
+            let logger = TestLogger::new().capture_logs().with_level("debug").init();
+            let tx = Transaction::new::<UpdateMsg>();
+            let err: OpError = scheduler_timeout_failure().into();
+            // Precondition: the fixture really is classified as a scheduler timeout.
+            assert!(
+                err.is_scheduler_timeout(),
+                "fixture must classify as a scheduler timeout"
+            );
+
+            let needs_auto_fetch =
+                log_broadcast_to_streaming_failure(&tx, &make_contract_key(1), &err);
+
+            assert!(
+                !needs_auto_fetch,
+                "scheduler timeout MUST NOT trigger self-heal auto-fetch — the contract \
+                 IS present, the pool was just saturated; enqueuing a GET onto the \
+                 saturated handler is the amplification we avoid"
+            );
+            assert!(
+                logger.contains("scheduler_overloaded"),
+                "scheduler timeout must emit event=scheduler_overloaded, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger.logs().iter().any(|l| l.contains("WARN")),
+                "scheduler timeout must NOT log at WARN — it fires under exactly the \
+                 saturation it represents, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger
+                    .logs()
+                    .iter()
+                    .any(|l| l.contains("contract not ready locally")),
+                "the misleading 'contract not ready locally' message must not appear \
+                 for a scheduler timeout — the contract IS present, got: {:?}",
                 logger.logs()
             );
         }
