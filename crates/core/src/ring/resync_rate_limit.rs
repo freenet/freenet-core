@@ -33,6 +33,16 @@
 //! [`DashMap`] with a strict [`AtomicUsize`] size cap so an attacker churning
 //! keys cannot grow the map, plus a periodic TTL sweep hooked into the Ring
 //! reaper.
+//!
+//! There is deliberately NO per-connection cleanup on peer disconnect for the
+//! per-`(peer, contract)` responder map (#4864 review — declined): a
+//! disconnected peer's entries simply age out via the [`CLEANUP_AGE`] TTL sweep,
+//! and the total is bounded by the strict [`MAX_TRACKED_KEYS`] cap plus the
+//! global per-contract cap. Under extreme `(peer, contract)` churn a NEW key at
+//! capacity is denied (`check_and_record` returns `false`), which for the
+//! responder means "don't send this response" — a safe, conservative outcome,
+//! not a correctness bug. This matches the `UpdateRateLimiter` precedent, which
+//! also relies on the TTL sweep rather than disconnect hooks.
 
 use std::hash::Hash;
 use std::net::SocketAddr;

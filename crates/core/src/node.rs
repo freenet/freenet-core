@@ -2959,7 +2959,7 @@ async fn handle_interest_sync_message(
                 .resync_response_limiter
                 .check_and_record((source, *key.id()))
             {
-                crate::config::GlobalTestMetrics::record_resync_response_suppressed();
+                crate::config::GlobalTestMetrics::record_resync_response_suppressed_per_peer();
                 tracing::debug!(
                     from = %source,
                     contract = %key,
@@ -2979,7 +2979,7 @@ async fn handle_interest_sync_message(
                 .resync_response_global_limiter
                 .check_and_record(*key.id())
             {
-                crate::config::GlobalTestMetrics::record_resync_response_suppressed();
+                crate::config::GlobalTestMetrics::record_resync_response_suppressed_global();
                 tracing::debug!(
                     from = %source,
                     contract = %key,
@@ -3086,7 +3086,15 @@ async fn handle_interest_sync_message(
                 "Received ResyncResponse with full state"
             );
 
-            // Apply the full state using an update
+            // Apply the full state using an update.
+            //
+            // This full-state WASM merge is deliberately NOT gated by the
+            // merge-failure backoff (#4861): unlike the broadcast drivers, the
+            // resync path is already double-bounded — the emitter-side per- and
+            // per-(peer,contract) + global rate limits throttle how often
+            // ResyncRequests (and thus these responses) are produced at all, and
+            // epoch preemption caps the cost of each individual merge. Gating it
+            // here would also risk suppressing a genuine heal.
             let state = freenet_stdlib::prelude::State::from(state_bytes.clone());
             let update_data = freenet_stdlib::prelude::UpdateData::State(state);
 
@@ -5640,8 +5648,10 @@ mod tests {
                  limit ({gate_pos}) and before the state fetch ({state_fetch_pos})"
             );
             assert!(
-                arm.contains("record_resync_response_suppressed()"),
-                "the suppressed branch must record the resync-response-suppressed metric"
+                arm.contains("record_resync_response_suppressed_per_peer()")
+                    && arm.contains("record_resync_response_suppressed_global()"),
+                "each suppressed branch must record its own (per-peer vs global) \
+                 resync-response-suppressed metric (#4864 review)"
             );
         }
 
