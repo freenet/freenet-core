@@ -2949,6 +2949,26 @@ async fn handle_interest_sync_message(
             op_manager.interest_manager.record_resync_request_received();
             crate::config::GlobalTestMetrics::record_resync_request();
 
+            // Rate-limit the full-state response per (peer, contract) (#4861).
+            // This is the mixed-version-rollout guard: a not-yet-upgraded peer
+            // that still emits unlimited ResyncRequests must not be able to make
+            // this (upgraded) node full-state-reply in a loop. When suppressed,
+            // simply don't respond — the requester will retry later.
+            if !op_manager
+                .ring
+                .resync_response_limiter
+                .check_and_record((source, *key.id()))
+            {
+                crate::config::GlobalTestMetrics::record_resync_response_suppressed();
+                tracing::debug!(
+                    from = %source,
+                    contract = %key,
+                    event = "resync_response_suppressed",
+                    "ResyncResponse suppressed by per-(peer, contract) rate limit"
+                );
+                return None;
+            }
+
             // Clear cached summary for this peer
             let peer_key = get_peer_key_from_addr(op_manager, source);
             if let Some(ref pk) = peer_key {
@@ -5556,6 +5576,32 @@ mod tests {
                 "ResyncRequest handler must clear the cached summary with \
                  `update_peer_summary(&key, pk, None)` (the `None` clears it). \
                  Caching a summary here instead would defeat the #4145 backstop."
+            );
+        }
+
+        /// Pin (#4861): the responder MUST rate-limit the full-state
+        /// `ResyncResponse` per (peer, contract), gating BEFORE the expensive
+        /// state/summary fetch, so a not-yet-upgraded peer flooding
+        /// `ResyncRequest`s can't make this node full-state-reply in a loop.
+        #[test]
+        fn resync_request_handler_rate_limits_response() {
+            let arm = resync_request_arm();
+            let gate_pos = arm.find("resync_response_limiter").expect(
+                "ResyncRequest handler must rate-limit the response via \
+                 resync_response_limiter (#4861)",
+            );
+            let state_fetch_pos = arm
+                .find("get_contract_state(op_manager, &key)")
+                .expect("state fetch not found in ResyncRequest arm");
+            assert!(
+                gate_pos < state_fetch_pos,
+                "the responder rate-limit gate ({gate_pos}) must run BEFORE the \
+                 state fetch ({state_fetch_pos}) so a suppressed request pays no \
+                 fetch/summary cost"
+            );
+            assert!(
+                arm.contains("record_resync_response_suppressed()"),
+                "the suppressed branch must record the resync-response-suppressed metric"
             );
         }
     }

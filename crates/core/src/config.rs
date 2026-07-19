@@ -3424,6 +3424,10 @@ std::thread_local! {
     // UPDATE broadcast merges skipped by the per-contract merge-failure backoff
     // (poison-contract quarantine, #4861).
     static GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // ResyncRequest emissions / ResyncResponse sends suppressed by the resync
+    // rate limiters (#4861).
+    static GLOBAL_RESYNC_REQUESTS_SUPPRESSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_RESYNC_RESPONSES_SUPPRESSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Global test metrics for tracking events across the simulation network.
@@ -3468,6 +3472,8 @@ impl GlobalTestMetrics {
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES.with(|c| c.set(0));
         GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF.with(|c| c.set(0));
+        GLOBAL_RESYNC_REQUESTS_SUPPRESSED.with(|c| c.set(0));
+        GLOBAL_RESYNC_RESPONSES_SUPPRESSED.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
@@ -3491,6 +3497,28 @@ impl GlobalTestMetrics {
     /// last reset.
     pub fn merges_suppressed_by_backoff() -> u64 {
         GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF.with(|c| c.get())
+    }
+
+    /// Records that a `ResyncRequest` emission was suppressed by the per-contract
+    /// resync emit rate limiter (#4861).
+    pub fn record_resync_request_suppressed() {
+        GLOBAL_RESYNC_REQUESTS_SUPPRESSED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Returns the number of ResyncRequest emissions suppressed since last reset.
+    pub fn resync_requests_suppressed() -> u64 {
+        GLOBAL_RESYNC_REQUESTS_SUPPRESSED.with(|c| c.get())
+    }
+
+    /// Records that a `ResyncResponse` send was suppressed by the
+    /// per-(peer, contract) responder rate limiter (#4861).
+    pub fn record_resync_response_suppressed() {
+        GLOBAL_RESYNC_RESPONSES_SUPPRESSED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Returns the number of ResyncResponse sends suppressed since last reset.
+    pub fn resync_responses_suppressed() -> u64 {
+        GLOBAL_RESYNC_RESPONSES_SUPPRESSED.with(|c| c.get())
     }
 
     /// Records that a delta was sent in a state change broadcast.

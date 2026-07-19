@@ -133,6 +133,7 @@ mod peer_key_location;
 mod placement_migration_metrics;
 pub mod topology_registry;
 pub(crate) mod merge_backoff;
+pub(crate) mod resync_rate_limit;
 pub(crate) mod update_rate_limit;
 
 // GET auto-subscribe (`AUTO_SUBSCRIBE_ON_GET`) was REMOVED in piece E of the
@@ -220,6 +221,16 @@ pub(crate) struct Ring {
     /// inbound broadcast instead of O(WASM merge). Cleared the instant a merge
     /// succeeds. See `crate::ring::merge_backoff`.
     pub(crate) merge_backoff: Arc<merge_backoff::MergeBackoff>,
+    /// Per-contract cap on how often THIS node emits a `ResyncRequest` (#4861).
+    /// Bounds the full-state resync amplification independently of the merge
+    /// outcome. See `crate::ring::resync_rate_limit`.
+    pub(crate) resync_emit_limiter: Arc<resync_rate_limit::ResyncEmitLimiter>,
+    /// Per-`(peer, contract)` cap on how often this node answers a given peer's
+    /// `ResyncRequest` with a full-state `ResyncResponse` (#4861). The
+    /// mixed-version-rollout guard: a not-yet-upgraded peer that still emits
+    /// unlimited `ResyncRequest`s cannot make an upgraded peer full-state-reply
+    /// in a loop. See `crate::ring::resync_rate_limit`.
+    pub(crate) resync_response_limiter: Arc<resync_rate_limit::ResyncResponseLimiter>,
     /// Per-contract ban list. Populated by the governance reaper on
     /// `BanTriggered` / `BanLifted` transitions; consulted at the
     /// inbound dispatch site to drop wire requests for banned
@@ -610,6 +621,10 @@ impl Ring {
                 time_source.clone(),
             )),
             merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
+            resync_emit_limiter: Arc::new(resync_rate_limit::new_emit_limiter(time_source.clone())),
+            resync_response_limiter: Arc::new(resync_rate_limit::new_response_limiter(
+                time_source.clone(),
+            )),
             contract_ban_list: Arc::new(contract_ban_list::ContractBanList::new(
                 time_source.clone(),
             )),
@@ -1284,6 +1299,12 @@ impl Ring {
             // haven't failed a merge recently; a poison contract still in
             // cooldown is preserved.
             ring.merge_backoff.cleanup_expired();
+
+            // Sweep recovered/idle resync rate-limiter buckets (#4861) so the
+            // per-contract emit and per-(peer, contract) responder maps stay
+            // bounded.
+            ring.resync_emit_limiter.cleanup();
+            ring.resync_response_limiter.cleanup();
 
             // Phase 7 ban-list maintenance. Defense-in-depth — the
             // BanLifted decisions below explicitly unban, but if any

@@ -1296,45 +1296,61 @@ async fn drive_relay_broadcast_to(
 
             if is_delta && !queue_full {
                 // Delta application failed → send ResyncRequest. Mirrors
-                // update.rs:710-758.
-                tracing::warn!(
-                    tx = %incoming_tx,
-                    contract = %key,
-                    sender = %sender_addr,
-                    error = %err,
-                    event = "delta_apply_failed",
-                    "UPDATE relay: delta apply failed, sending ResyncRequest"
-                );
-
-                if let Some(sender_pkl) = op_manager
-                    .ring
-                    .connection_manager
-                    .get_peer_by_addr(sender_addr)
-                {
-                    let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
-                    op_manager
-                        .interest_manager
-                        .update_peer_summary(&key, &sender_key, None);
-                }
-
-                tracing::info!(
-                    tx = %incoming_tx,
-                    contract = %key,
-                    target = %sender_addr,
-                    event = "resync_request_sent",
-                    "UPDATE relay: sending ResyncRequest after delta failure"
-                );
-                if let Err(e) = op_manager
-                    .notify_node_event(NodeEvent::SendInterestMessage {
-                        target: sender_addr,
-                        message: InterestMessage::ResyncRequest { key },
-                    })
-                    .await
-                {
+                // update.rs:710-758. Rate-limited per-contract (#4861): a poison
+                // contract that fails deltas from many senders must not drive a
+                // full-state resync storm. When the emit is suppressed, skip the
+                // sender summary-clear too — it is part of the resync handshake,
+                // so clearing it without emitting would just force the sender to
+                // full-state us on the next interest cycle.
+                if op_manager.ring.resync_emit_limiter.check_and_record(*key.id()) {
                     tracing::warn!(
                         tx = %incoming_tx,
-                        error = %e,
-                        "UPDATE relay: failed to send ResyncRequest"
+                        contract = %key,
+                        sender = %sender_addr,
+                        error = %err,
+                        event = "delta_apply_failed",
+                        "UPDATE relay: delta apply failed, sending ResyncRequest"
+                    );
+
+                    if let Some(sender_pkl) = op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_addr(sender_addr)
+                    {
+                        let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+                        op_manager
+                            .interest_manager
+                            .update_peer_summary(&key, &sender_key, None);
+                    }
+
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        target = %sender_addr,
+                        event = "resync_request_sent",
+                        "UPDATE relay: sending ResyncRequest after delta failure"
+                    );
+                    if let Err(e) = op_manager
+                        .notify_node_event(NodeEvent::SendInterestMessage {
+                            target: sender_addr,
+                            message: InterestMessage::ResyncRequest { key },
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            tx = %incoming_tx,
+                            error = %e,
+                            "UPDATE relay: failed to send ResyncRequest"
+                        );
+                    }
+                } else {
+                    crate::config::GlobalTestMetrics::record_resync_request_suppressed();
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        contract = %key,
+                        target = %sender_addr,
+                        event = "resync_request_suppressed",
+                        "UPDATE relay: ResyncRequest suppressed by per-contract rate limit"
                     );
                 }
             } else if !is_delta && !err.is_contract_exec_rejection() && !queue_full {
@@ -2590,6 +2606,33 @@ mod tests {
             driver_src.contains("is_wasm_timeout()"),
             "the failure class must distinguish a WASM timeout (longer cooldown) \
              via is_wasm_timeout()"
+        );
+    }
+
+    /// Pin (#4861): the `ResyncRequest` emission on delta-apply failure MUST be
+    /// gated by the per-contract emit rate limiter, and the sender summary-clear
+    /// MUST live inside that gate (it is part of the resync handshake — clearing
+    /// it without emitting would force the sender to full-state us next cycle).
+    #[test]
+    fn broadcast_to_resync_emit_is_rate_limited() {
+        let driver_src = broadcast_to_driver_src();
+        let gate_pos = driver_src
+            .find("resync_emit_limiter.check_and_record(")
+            .expect("ResyncRequest emit must be gated by resync_emit_limiter");
+        let summary_clear_pos = driver_src
+            .find("update_peer_summary(&key, &sender_key, None)")
+            .expect("sender summary-clear missing");
+        let resync_pos = driver_src
+            .find("InterestMessage::ResyncRequest")
+            .expect("ResyncRequest emission missing");
+        assert!(
+            gate_pos < summary_clear_pos && summary_clear_pos < resync_pos,
+            "emit rate-limit gate ({gate_pos}) must wrap BOTH the summary-clear \
+             ({summary_clear_pos}) and the ResyncRequest emission ({resync_pos})"
+        );
+        assert!(
+            driver_src.contains("record_resync_request_suppressed()"),
+            "the suppressed branch must record the resync-request-suppressed metric"
         );
     }
 
