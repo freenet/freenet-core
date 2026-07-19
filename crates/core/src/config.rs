@@ -3451,6 +3451,7 @@ std::thread_local! {
     static GLOBAL_RESYNC_REQUESTS_SUPPRESSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_RESYNC_RESPONSES_SUPPRESSED_PER_PEER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_RESYNC_RESPONSES_UNSOLICITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Global test metrics for tracking events across the simulation network.
@@ -3498,6 +3499,7 @@ impl GlobalTestMetrics {
         GLOBAL_RESYNC_REQUESTS_SUPPRESSED.with(|c| c.set(0));
         GLOBAL_RESYNC_RESPONSES_SUPPRESSED_PER_PEER.with(|c| c.set(0));
         GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL.with(|c| c.set(0));
+        GLOBAL_RESYNC_RESPONSES_UNSOLICITED.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
@@ -3557,6 +3559,19 @@ impl GlobalTestMetrics {
     /// since last reset.
     pub fn resync_responses_suppressed_global() -> u64 {
         GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL.with(|c| c.get())
+    }
+
+    /// Records a received `ResyncResponse` DROPPED because it had no matching
+    /// outstanding `ResyncRequest` — unsolicited or replayed, or TTL-expired
+    /// (#4864 round-8, Codex P1). The apply is refused before any WASM runs.
+    pub fn record_resync_response_unsolicited() {
+        GLOBAL_RESYNC_RESPONSES_UNSOLICITED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Returns the number of unsolicited/replayed ResyncResponses dropped since
+    /// last reset.
+    pub fn resync_responses_unsolicited() -> u64 {
+        GLOBAL_RESYNC_RESPONSES_UNSOLICITED.with(|c| c.get())
     }
 
     /// Returns total ResyncResponse sends suppressed (per-peer + global) since

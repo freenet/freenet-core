@@ -3109,6 +3109,34 @@ async fn handle_interest_sync_message(
                 "Received ResyncResponse with full state"
             );
 
+            // #4864 round-8 (Codex P1): CORRELATE with an outstanding ResyncRequest
+            // WE sent to this peer for this contract, BEFORE touching the contract
+            // handler. The apply below runs a full-state WASM merge that is
+            // deliberately NOT backoff-gated, so an unsolicited or replayed
+            // ResyncResponse would burn up to a full WASM budget per message,
+            // bypassing every emitter-side gate (those only bound OUR requests).
+            // `consume` require-and-consumes a matching (contract, source) entry;
+            // consume-on-first-match makes replay dead, and a stale (TTL-expired)
+            // or absent entry drops the response without running WASM. Mixed-version
+            // safe: an old peer only ever answers OUR request, so a legit response
+            // always has an entry unless it raced the 60s TTL (anti-entropy heals
+            // that corner).
+            if !op_manager
+                .ring
+                .outstanding_resync_requests
+                .consume(*key.id(), source)
+            {
+                crate::config::GlobalTestMetrics::record_resync_response_unsolicited();
+                tracing::debug!(
+                    from = %source,
+                    contract = %key,
+                    event = "resync_response_unsolicited",
+                    "ResyncResponse with no matching outstanding request — dropping \
+                     without applying (unsolicited, replayed, or TTL-expired)"
+                );
+                return None;
+            }
+
             // Apply the full state using an update.
             //
             // This full-state WASM merge is deliberately NOT gated by the
@@ -4347,6 +4375,333 @@ mod tests {
             }
             other => panic!("expected Some(ResyncResponse) for a held contract, got {other:?}"),
         }
+    }
+
+    /// #4864 round-8 (Codex P1): an UNSOLICITED `ResyncResponse` — one with NO
+    /// matching outstanding `ResyncRequest` we recorded for that
+    /// `(contract, source)` — MUST be dropped by the correlation gate BEFORE any
+    /// state is applied. This is the SECURITY property: the resync apply runs a
+    /// full-state WASM merge that is deliberately NOT backoff-gated, so without
+    /// the gate a peer could spray unsolicited full-state responses and burn a
+    /// full WASM merge budget per message, bypassing every emitter-side rate
+    /// limit (those only bound OUR requests). The gate
+    /// (`outstanding_resync_requests.consume(..)`) runs before
+    /// `notify_contract_handler(ContractHandlerEvent::UpdateQuery { .. })`, so an
+    /// unsolicited response never reaches the contract handler at all.
+    ///
+    /// Asserts: (a) the handler returns `None`; (b) NO `UpdateQuery` ever reached
+    /// the (stand-in) contract handler — the WASM-apply path was never entered;
+    /// (c) the unsolicited-drop metric incremented exactly once.
+    #[tokio::test]
+    async fn resync_response_unsolicited_is_dropped_without_applying() {
+        use crate::contract::ContractHandlerEvent;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build a real OpManager (same harness as
+        // resync_request_for_held_contract_passes_gate_and_responds).
+        let config_args = crate::config::ConfigArgs {
+            id: Some("resync-resp-unsolicited-4864".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr("127.0.0.1:14200".parse().unwrap());
+
+        // Stand-in contract handler: flips `update_query_seen` to true if it EVER
+        // receives an UpdateQuery (proof the WASM-apply path was entered),
+        // answering it so nothing hangs. For this test it must NEVER fire — any
+        // event reaching the handler is the regression this guards against.
+        let update_query_seen = std::sync::Arc::new(AtomicBool::new(false));
+        let handler_flag = update_query_seen.clone();
+        let _handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::UpdateQuery { .. } => {
+                        handler_flag.store(true, Ordering::SeqCst);
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(freenet_stdlib::prelude::WrappedState::new(vec![
+                                1u8, 2, 3,
+                            ])),
+                            state_changed: true,
+                        }
+                    }
+                    other => panic!(
+                        "an unsolicited ResyncResponse must not reach the contract \
+                         handler, got: {other:?}"
+                    ),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([202u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([203u8; 32]),
+        );
+        let source: SocketAddr = "127.0.0.1:15200".parse().unwrap();
+
+        // NO outstanding entry seeded → the response is unsolicited.
+        assert_eq!(
+            op_manager.ring.outstanding_resync_requests.len(),
+            0,
+            "precondition: no outstanding ResyncRequest recorded for this (contract, source)"
+        );
+
+        crate::config::GlobalTestMetrics::reset();
+
+        let response = handle_interest_sync_message(
+            &op_manager,
+            source,
+            crate::message::InterestMessage::ResyncResponse {
+                key,
+                state_bytes: vec![1u8, 2, 3],
+                summary_bytes: vec![4u8, 5, 6],
+            },
+        )
+        .await;
+
+        // Give the (should-be-idle) handler task a scheduling window: if the gate
+        // had wrongly forwarded an UpdateQuery, it would surface now. (The arm
+        // AWAITS the handler round-trip, so a leak would already have set the flag
+        // before the call above returned; this is belt-and-suspenders.)
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            response.is_none(),
+            "an unsolicited ResyncResponse must produce no reply"
+        );
+        assert!(
+            !update_query_seen.load(Ordering::SeqCst),
+            "SECURITY (#4864 round-8): the correlation gate must drop the unsolicited \
+             ResyncResponse BEFORE any UpdateQuery / WASM apply — the contract handler \
+             must never see it"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::resync_responses_unsolicited(),
+            1,
+            "the unsolicited-drop must be counted exactly once (#4864 round-8)"
+        );
+    }
+
+    /// #4864 round-8 (Codex P1): a SOLICITED `ResyncResponse` — one that matches
+    /// an outstanding `ResyncRequest` we recorded — passes the correlation gate
+    /// and IS applied (reaches the contract handler's `UpdateQuery`). Crucially
+    /// the gate `consume`s the entry on first match, so an identical REPLAY of the
+    /// same response finds nothing and is dropped WITHOUT a second apply — replay
+    /// is dead.
+    ///
+    /// Asserts (first call): the `UpdateQuery` reached the handler (applied), and
+    /// the outstanding entry was consumed (`len() == 0`), and the unsolicited-drop
+    /// metric stayed 0. (Replay call): returns `None`, NO second `UpdateQuery`, and
+    /// the unsolicited-drop metric incremented to 1.
+    #[tokio::test]
+    async fn resync_response_solicited_applies_then_replay_is_suppressed() {
+        use crate::contract::ContractHandlerEvent;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build a real OpManager (same harness as
+        // resync_request_for_held_contract_passes_gate_and_responds).
+        let config_args = crate::config::ConfigArgs {
+            id: Some("resync-resp-solicited-4864".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr("127.0.0.1:14300".parse().unwrap());
+
+        // Stand-in contract handler: answers UpdateQuery with a SUCCESSFUL,
+        // state-changed merge (mirrors the ResyncResponse arm's
+        // `UpdateResponse { new_value: Ok(_), state_changed: true, .. }` match)
+        // and records that the apply was reached.
+        let update_query_seen = std::sync::Arc::new(AtomicBool::new(false));
+        let handler_flag = update_query_seen.clone();
+        let _handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::UpdateQuery { .. } => {
+                        handler_flag.store(true, Ordering::SeqCst);
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(freenet_stdlib::prelude::WrappedState::new(vec![
+                                9u8, 8, 7,
+                            ])),
+                            state_changed: true,
+                        }
+                    }
+                    other => {
+                        panic!("unexpected handler event in solicited-resync stand-in: {other:?}")
+                    }
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([204u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([205u8; 32]),
+        );
+        let source: SocketAddr = "127.0.0.1:15300".parse().unwrap();
+
+        // Seed the outstanding entry: WE sent a ResyncRequest to `source` for
+        // `key`, so the incoming response is solicited.
+        op_manager
+            .ring
+            .outstanding_resync_requests
+            .record(*key.id(), source);
+        assert_eq!(
+            op_manager.ring.outstanding_resync_requests.len(),
+            1,
+            "precondition: exactly one outstanding ResyncRequest recorded"
+        );
+
+        crate::config::GlobalTestMetrics::reset();
+
+        // FIRST delivery: solicited → passes the gate → applied.
+        let resp1 = handle_interest_sync_message(
+            &op_manager,
+            source,
+            crate::message::InterestMessage::ResyncResponse {
+                key,
+                state_bytes: vec![1u8, 2, 3],
+                summary_bytes: vec![4u8, 5, 6],
+            },
+        )
+        .await;
+        assert!(
+            resp1.is_none(),
+            "a ResyncResponse never produces a reply (it applies locally)"
+        );
+        assert!(
+            update_query_seen.load(Ordering::SeqCst),
+            "a solicited ResyncResponse must be applied (reach the UpdateQuery apply)"
+        );
+        assert_eq!(
+            op_manager.ring.outstanding_resync_requests.len(),
+            0,
+            "the correlation gate must CONSUME the outstanding entry on apply (#4864 round-8)"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::resync_responses_unsolicited(),
+            0,
+            "a solicited response must NOT be counted as unsolicited"
+        );
+
+        // REPLAY: byte-identical response. The entry was already consumed, so the
+        // gate finds nothing and drops it — no second apply.
+        update_query_seen.store(false, Ordering::SeqCst);
+        let resp2 = handle_interest_sync_message(
+            &op_manager,
+            source,
+            crate::message::InterestMessage::ResyncResponse {
+                key,
+                state_bytes: vec![1u8, 2, 3],
+                summary_bytes: vec![4u8, 5, 6],
+            },
+        )
+        .await;
+
+        // Window for a wrongly-forwarded UpdateQuery to surface (belt-and-suspenders;
+        // a real leak would have set the flag before the awaited call returned).
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            resp2.is_none(),
+            "a replayed ResyncResponse must produce no reply"
+        );
+        assert!(
+            !update_query_seen.load(Ordering::SeqCst),
+            "SECURITY (#4864 round-8): a replayed ResyncResponse must NOT reach a second \
+             UpdateQuery apply — consume-on-first-match makes replay dead"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::resync_responses_unsolicited(),
+            1,
+            "the replayed response must be counted as an unsolicited drop (#4864 round-8)"
+        );
+    }
+
+    /// #4864 round-8 (Codex P1) source-scrape pin: the `ResyncResponse` receive
+    /// arm MUST require-and-consume an outstanding `ResyncRequest`
+    /// (`outstanding_resync_requests.consume(..)`) BEFORE it applies the state via
+    /// `ContractHandlerEvent::UpdateQuery`. If the consume ever moves after (or is
+    /// downgraded to a non-consuming peek), an unsolicited or replayed
+    /// ResyncResponse would reach the un-backoff-gated full-state WASM merge —
+    /// exactly the DoS surface the behavioral tests above guard against.
+    #[test]
+    fn resync_response_arm_consumes_outstanding_before_apply() {
+        let src = include_str!("node.rs");
+        let arm = src
+            .find(r#"event = "resync_response_received""#)
+            .expect("ResyncResponse receive anchor not found");
+        let region = &src[arm..];
+        let consume = region.find("outstanding_resync_requests").expect(
+            "ResyncResponse arm must correlate via outstanding_resync_requests (#4864 round-8)",
+        );
+        let apply = region
+            .find("ContractHandlerEvent::UpdateQuery")
+            .expect("ResyncResponse arm must apply via UpdateQuery");
+        assert!(
+            consume < apply,
+            "outstanding_resync_requests.consume MUST run BEFORE the UpdateQuery apply so an \
+             unsolicited/replayed ResyncResponse never reaches WASM (#4864 round-8)"
+        );
+        assert!(
+            region[consume..(consume + 120).min(region.len())].contains(".consume("),
+            "the correlation must be a require-and-consume (.consume), not a peek"
+        );
     }
 
     // Superseded: Old addr-only equality (same_addr_different_keys → equal) was replaced
@@ -6029,11 +6384,17 @@ mod tests {
         /// 10-min TTL.
         #[test]
         fn resync_changed_apply_invalidates_payload_memo() {
-            // Window-bound to the ResyncResponse apply arm so the far-away test
-            // literals below cannot satisfy the needles (self-reference guard).
+            // Window-bound to the ResyncResponse RECEIVE-and-apply arm so the
+            // far-away test literals below cannot satisfy the needles
+            // (self-reference guard). Anchored on the receive-log event (assembled
+            // via concat so this literal isn't self-matched) rather than the first
+            // `InterestMessage::ResyncResponse {` — that matched the SEND-side
+            // construction in the ResyncRequest arm, and the #4864 round-8 consume
+            // gate inserted between the receive log and the apply pushed the
+            // sub-arm markers past the old fixed window.
             let start = SOURCE
-                .find(concat!("InterestMessage::Resync", "Response {"))
-                .expect("ResyncResponse arm not found");
+                .find(concat!("event = \"resync_response_", "received\""))
+                .expect("ResyncResponse receive arm not found");
             let arm = &SOURCE[start..(start + 6000).min(SOURCE.len())];
             let invalidate = concat!("invalidate_", "payload_memo(");
             // Match the PATTERN form (trailing comma) so a prose mention of

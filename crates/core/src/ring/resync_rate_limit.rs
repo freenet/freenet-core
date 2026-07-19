@@ -260,6 +260,127 @@ pub(crate) fn new_response_global_limiter(
     )
 }
 
+/// TTL for an outstanding `ResyncRequest` correlation entry (#4864 round-8). One
+/// [`EMIT_REFILL_INTERVAL`] (60s): a legitimate `ResyncResponse` arrives well
+/// within this, so a later one is treated as unsolicited and healed by the ~5-min
+/// anti-entropy heartbeat instead of executing a full-state WASM merge.
+pub(crate) const OUTSTANDING_RESYNC_TTL: Duration = Duration::from_secs(60);
+
+/// Correlation map for outstanding `ResyncRequest`s (#4864 round-8, Codex P1).
+///
+/// A received `ResyncResponse` triggers a full-state WASM merge on the resync
+/// apply path that is deliberately NOT gated by the merge-failure backoff (a
+/// full-state apply is fork-flippable, so gating it there could suppress a
+/// genuine heal). Without correlation, that makes the apply path an unmetered
+/// DoS surface: a peer can stream or replay unsolicited `ResyncResponse`s, each
+/// burning up to a full WASM budget, bypassing every emitter-side gate (the emit
+/// limiter only bounds OUR requests).
+///
+/// This records `(contract, target_addr)` when WE emit a `ResyncRequest`; the
+/// receive arm require-and-consumes a matching `(contract, source_addr)` entry
+/// BEFORE the apply, dropping the response (no WASM) on no match.
+/// Consume-on-first-match makes replay dead — a second copy of a solicited
+/// response finds no entry.
+///
+/// Mixed-version safe: an old peer only ever sends a `ResyncResponse` in reply to
+/// OUR `ResyncRequest`, so a legitimate response always has a matching entry
+/// unless it raced the [`OUTSTANDING_RESYNC_TTL`] — that corner heals via
+/// anti-entropy. Bounded exactly like the limiters (strict [`MAX_TRACKED_KEYS`]
+/// cap + reaper TTL sweep) so a request storm can't grow the map without bound.
+pub(crate) struct OutstandingResyncRequests {
+    /// `(contract, peer)` → the time we emitted the request.
+    entries: DashMap<(ContractInstanceId, SocketAddr), Instant>,
+    size: AtomicUsize,
+    max_tracked: usize,
+    ttl: Duration,
+    time_source: Arc<dyn TimeSource + Send + Sync>,
+}
+
+impl OutstandingResyncRequests {
+    pub fn new(time_source: Arc<dyn TimeSource + Send + Sync>) -> Self {
+        Self {
+            entries: DashMap::new(),
+            size: AtomicUsize::new(0),
+            max_tracked: MAX_TRACKED_KEYS,
+            ttl: OUTSTANDING_RESYNC_TTL,
+            time_source,
+        }
+    }
+
+    /// Record that we emitted a `ResyncRequest` for `contract` to `target`.
+    ///
+    /// Re-emitting to the same `(contract, target)` refreshes the timestamp. A
+    /// brand-new key at the strict cap is DROPPED (fail-closed): the eventual
+    /// response is then treated as unsolicited, so we forgo one heal that
+    /// anti-entropy recovers — never a correctness loss, and the cap keeps an
+    /// attacker from growing the map by inducing our emissions.
+    pub fn record(&self, contract: ContractInstanceId, target: SocketAddr) {
+        let now = self.time_source.now();
+        use dashmap::mapref::entry::Entry;
+        match self.entries.entry((contract, target)) {
+            Entry::Occupied(mut occ) => {
+                *occ.get_mut() = now;
+            }
+            Entry::Vacant(vac) => {
+                let prev = self.size.fetch_add(1, Ordering::Relaxed);
+                if prev >= self.max_tracked {
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
+                vac.insert(now);
+            }
+        }
+    }
+
+    /// Require-and-consume a matching outstanding entry for a received
+    /// `ResyncResponse` from `source`. Returns `true` iff a NON-EXPIRED matching
+    /// entry existed — the caller may then apply the state. The entry is REMOVED
+    /// on any match (expired or not), so a replay/duplicate of the same response
+    /// finds nothing and is rejected.
+    pub fn consume(&self, contract: ContractInstanceId, source: SocketAddr) -> bool {
+        let now = self.time_source.now();
+        match self.entries.remove(&(contract, source)) {
+            Some((_, emitted)) => {
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                now.saturating_duration_since(emitted) <= self.ttl
+            }
+            None => false,
+        }
+    }
+
+    /// Drop entries older than the TTL. Call from the Ring reaper so a burst of
+    /// requests whose responses never arrive cannot pin memory past the TTL.
+    pub fn cleanup(&self) {
+        let now = self.time_source.now();
+        let ttl = self.ttl;
+        let mut removed = 0usize;
+        self.entries.retain(|_, emitted| {
+            if now.saturating_duration_since(*emitted) > ttl {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if removed > 0 {
+            self.size.fetch_sub(removed, Ordering::Relaxed);
+        }
+    }
+
+    /// Number of tracked outstanding requests (tests / dashboard).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Build the outstanding-request correlation map.
+pub(crate) fn new_outstanding_resync_requests(
+    time_source: Arc<dyn TimeSource + Send + Sync>,
+) -> OutstandingResyncRequests {
+    OutstandingResyncRequests::new(time_source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +392,101 @@ mod tests {
 
     fn mk_peer(byte: u8) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, byte], 30000 + byte as u16))
+    }
+
+    #[test]
+    fn outstanding_resync_solicited_response_consumes_and_replay_is_rejected() {
+        let ts = SharedMockTimeSource::new();
+        let m = new_outstanding_resync_requests(Arc::new(ts.clone()));
+        let c = mk_contract(1);
+        let peer = mk_peer(1);
+
+        // No entry → an unsolicited response is rejected and applies nothing.
+        assert!(
+            !m.consume(c, peer),
+            "a response with no outstanding request must be rejected"
+        );
+
+        // We emit a request → the response from that peer is authorized ONCE.
+        m.record(c, peer);
+        assert_eq!(m.len(), 1);
+        assert!(
+            m.consume(c, peer),
+            "the solicited response must be accepted"
+        );
+        assert_eq!(m.len(), 0, "consume must remove the entry");
+
+        // Replay of the same response finds no entry → rejected (replay is dead).
+        assert!(
+            !m.consume(c, peer),
+            "a replayed/duplicate response must be rejected after the first consume"
+        );
+    }
+
+    #[test]
+    fn outstanding_resync_is_scoped_per_contract_and_peer() {
+        let ts = SharedMockTimeSource::new();
+        let m = new_outstanding_resync_requests(Arc::new(ts.clone()));
+        let c = mk_contract(1);
+        m.record(c, mk_peer(1));
+        // A response for the SAME contract from a DIFFERENT peer is unsolicited.
+        assert!(!m.consume(c, mk_peer(2)));
+        // A response for a DIFFERENT contract from the recorded peer is unsolicited.
+        assert!(!m.consume(mk_contract(2), mk_peer(1)));
+        // The real match still stands and consumes.
+        assert!(m.consume(c, mk_peer(1)));
+    }
+
+    #[test]
+    fn outstanding_resync_ttl_expiry_rejects_and_cleanup_reaps() {
+        let ts = SharedMockTimeSource::new();
+        let m = new_outstanding_resync_requests(Arc::new(ts.clone()));
+        let c = mk_contract(1);
+        let peer = mk_peer(1);
+
+        // Just UNDER the TTL → still accepted.
+        m.record(c, peer);
+        ts.advance_time(OUTSTANDING_RESYNC_TTL - Duration::from_millis(1));
+        assert!(
+            m.consume(c, peer),
+            "a response within the TTL must be accepted"
+        );
+
+        // Past the TTL → the stale entry is consumed-and-REJECTED.
+        m.record(c, peer);
+        ts.advance_time(OUTSTANDING_RESYNC_TTL + Duration::from_millis(1));
+        assert!(
+            !m.consume(c, peer),
+            "a response arriving past the TTL must be rejected as unsolicited"
+        );
+        assert_eq!(m.len(), 0, "a consumed (even if stale) entry is removed");
+
+        // cleanup() reaps expired entries whose response never arrived.
+        m.record(mk_contract(9), mk_peer(9));
+        assert_eq!(m.len(), 1);
+        ts.advance_time(OUTSTANDING_RESYNC_TTL + Duration::from_secs(1));
+        m.cleanup();
+        assert_eq!(m.len(), 0, "cleanup must reap entries older than the TTL");
+    }
+
+    #[test]
+    fn outstanding_resync_is_strictly_capped() {
+        let ts = SharedMockTimeSource::new();
+        let m = new_outstanding_resync_requests(Arc::new(ts.clone()));
+        // Fill to the cap with distinct (contract, peer) keys.
+        for i in 0..MAX_TRACKED_KEYS {
+            let c = ContractInstanceId::new([(i % 256) as u8; 32]);
+            let peer = SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 40000));
+            m.record(c, peer);
+        }
+        assert_eq!(m.len(), MAX_TRACKED_KEYS, "map fills to exactly the cap");
+        // One more distinct key is dropped (fail-closed), not admitted.
+        let overflow_c = ContractInstanceId::new([0xAB; 32]);
+        let overflow_peer = SocketAddr::from(([172, 16, 0, 1], 41000));
+        m.record(overflow_c, overflow_peer);
+        assert_eq!(m.len(), MAX_TRACKED_KEYS, "over-cap insert is dropped");
+        // Its response is therefore treated as unsolicited.
+        assert!(!m.consume(overflow_c, overflow_peer));
     }
 
     #[test]

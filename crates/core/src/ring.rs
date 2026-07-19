@@ -237,6 +237,14 @@ pub(crate) struct Ring {
     /// full-state responses/day for one forked contract. Checked AFTER the
     /// per-peer limit. See `crate::ring::resync_rate_limit`.
     pub(crate) resync_response_global_limiter: Arc<resync_rate_limit::ResyncResponseGlobalLimiter>,
+    /// Correlation map for outstanding `ResyncRequest`s WE emitted (#4864
+    /// round-8, Codex P1). The `ResyncResponse` apply path runs a full-state WASM
+    /// merge that is deliberately NOT backoff-gated, so without correlation it is
+    /// an unmetered DoS surface — a peer could stream/replay unsolicited responses
+    /// bypassing every emitter-side gate. The receive arm require-and-consumes a
+    /// matching `(contract, source)` entry BEFORE applying; consume-on-first-match
+    /// kills replay. See `crate::ring::resync_rate_limit::OutstandingResyncRequests`.
+    pub(crate) outstanding_resync_requests: Arc<resync_rate_limit::OutstandingResyncRequests>,
     /// Per-contract ban list. Populated by the governance reaper on
     /// `BanTriggered` / `BanLifted` transitions; consulted at the
     /// inbound dispatch site to drop wire requests for banned
@@ -633,6 +641,9 @@ impl Ring {
             )),
             resync_response_global_limiter: Arc::new(
                 resync_rate_limit::new_response_global_limiter(time_source.clone()),
+            ),
+            outstanding_resync_requests: Arc::new(
+                resync_rate_limit::new_outstanding_resync_requests(time_source.clone()),
             ),
             contract_ban_list: Arc::new(contract_ban_list::ContractBanList::new(
                 time_source.clone(),
@@ -1315,6 +1326,11 @@ impl Ring {
             ring.resync_emit_limiter.cleanup();
             ring.resync_response_limiter.cleanup();
             ring.resync_response_global_limiter.cleanup();
+
+            // Reap outstanding-ResyncRequest correlation entries past their TTL
+            // (#4864 round-8) so a burst of requests whose responses never arrive
+            // cannot pin the map past OUTSTANDING_RESYNC_TTL.
+            ring.outstanding_resync_requests.cleanup();
 
             // Phase 7 ban-list maintenance. Defense-in-depth — the
             // BanLifted decisions below explicitly unban, but if any

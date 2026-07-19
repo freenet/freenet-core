@@ -1174,6 +1174,13 @@ async fn send_queue_full_resync_request(
         reason = "queue_full",
         "UPDATE relay: sending rate-limited ResyncRequest after queue-full drop (#4857)"
     );
+    // #4864 round-8: record the outstanding request so the matching ResyncResponse
+    // from this peer is authorized ONCE at the receive arm; an unsolicited or
+    // replayed response finds no entry and is dropped without running WASM.
+    op_manager
+        .ring
+        .outstanding_resync_requests
+        .record(*key.id(), sender_addr);
     if let Err(e) = op_manager
         .notify_node_event(NodeEvent::SendInterestMessage {
             target: sender_addr,
@@ -1452,6 +1459,14 @@ async fn drive_relay_broadcast_to(
                         event = "resync_request_sent",
                         "UPDATE relay: sending ResyncRequest after delta failure"
                     );
+                    // #4864 round-8: record the outstanding request so only the
+                    // matching ResyncResponse from this peer is authorized (once)
+                    // at the receive arm; unsolicited/replayed responses are
+                    // dropped without running WASM.
+                    op_manager
+                        .ring
+                        .outstanding_resync_requests
+                        .record(*key.id(), sender_addr);
                     if let Err(e) = op_manager
                         .notify_node_event(NodeEvent::SendInterestMessage {
                             target: sender_addr,
@@ -4044,6 +4059,44 @@ mod tests {
         assert!(
             body.contains("begin_resync_request"),
             "and keep the per-(contract, sender) throttle"
+        );
+    }
+
+    /// #4864 round-8 pin (Codex P1): every PRODUCTION `ResyncRequest` emission
+    /// MUST be preceded by an `outstanding_resync_requests.record(...)` so the
+    /// receive arm can correlate (and consume) the matching `ResyncResponse`. A
+    /// future emit site that forgets to record would make its legitimate response
+    /// look unsolicited (a silent heal regression) — and the record is the whole
+    /// basis of the receive-side DoS gate, so it must never drift from the emit.
+    #[test]
+    fn every_production_resync_request_emit_records_outstanding() {
+        let src = include_str!("op_ctx_task.rs");
+        // Bound to PRODUCTION code (before the test module) so the mock emit in
+        // the harness below is not counted.
+        let prod_end = src.find("\nmod tests {").unwrap_or(src.len());
+        let prod = &src[..prod_end];
+
+        let mut emits = 0usize;
+        let mut cursor = 0usize;
+        while let Some(rel) = prod[cursor..].find("message: InterestMessage::ResyncRequest") {
+            let pos = cursor + rel;
+            emits += 1;
+            // Look back a bounded window for the record call that authorizes the
+            // ResyncResponse this emit will provoke (fmt-robust: match the field
+            // identifier, which survives line-wrapping of the method chain).
+            let window_start = pos.saturating_sub(600);
+            assert!(
+                prod[window_start..pos].contains("outstanding_resync_requests"),
+                "a production ResyncRequest emit at byte {pos} is NOT preceded by an \
+                 outstanding_resync_requests.record(...) within 600 bytes — the \
+                 receive arm would drop its response as unsolicited (#4864 round-8)"
+            );
+            cursor = pos + 1;
+        }
+        assert!(
+            emits >= 2,
+            "expected at least the queue-full-helper and delta-failure ResyncRequest \
+             emit sites in production ({emits} found) — has the emit path moved?"
         );
     }
 
