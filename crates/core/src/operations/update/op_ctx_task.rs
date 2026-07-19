@@ -1045,6 +1045,73 @@ async fn drive_relay_request_update(
     Ok(())
 }
 
+/// On a queue-full broadcast drop, emit a RATE-LIMITED `ResyncRequest` to the
+/// sender so it clears its poisoned summary cache of us and re-sends the change
+/// it believes we already have (#4857).
+///
+/// A `ContractQueueFull` drop is SILENT: the receiver never applied the delta /
+/// full state, but the SENDER cached its own summary as ours on send-Ok
+/// (`broadcast_queue.rs::record_delivery_to_interest`), so it believes we are
+/// current and will never re-send the dropped change. Left unhealed, a
+/// rarely-changing field (member_info, a ban, a config) diverges permanently
+/// until the ~5-min InterestSync heartbeat happens to correct it. An inbound
+/// `ResyncRequest` makes the sender clear that cached summary (node.rs handler)
+/// and re-send full state.
+///
+/// Issue #4251 suppressed this entirely because one request per dropped delta
+/// amplifies into a full-state storm onto the same saturated queue (~40
+/// ResyncRequests/sec on a hot contract). The rate limit
+/// (`InterestManager::should_send_resync_request`) bounds that to at most one
+/// request per (contract, sender) per `RESYNC_REQUEST_MIN_INTERVAL`.
+///
+/// Shared by both broadcast drivers (`drive_relay_broadcast_to` and
+/// `drive_relay_broadcast_to_streaming`) so the two queue-full paths cannot
+/// drift. The caller keeps auto-fetch suppressed on queue-full (we already hold
+/// the contract; a GET onto the same saturated queue is pure amplification).
+///
+/// do NOT re-add an unthrottled emission — see #4251/#4857.
+async fn send_queue_full_resync_request(
+    op_manager: &OpManager,
+    key: ContractKey,
+    sender_addr: SocketAddr,
+    incoming_tx: Transaction,
+) {
+    if op_manager
+        .interest_manager
+        .should_send_resync_request(&key, sender_addr)
+    {
+        tracing::info!(
+            tx = %incoming_tx,
+            contract = %key,
+            target = %sender_addr,
+            event = "resync_request_sent",
+            reason = "queue_full",
+            "UPDATE relay: sending rate-limited ResyncRequest after queue-full drop (#4857)"
+        );
+        if let Err(e) = op_manager
+            .notify_node_event(NodeEvent::SendInterestMessage {
+                target: sender_addr,
+                message: InterestMessage::ResyncRequest { key },
+            })
+            .await
+        {
+            tracing::warn!(
+                tx = %incoming_tx,
+                error = %e,
+                "UPDATE relay: failed to send queue-full ResyncRequest"
+            );
+        }
+    } else {
+        tracing::debug!(
+            tx = %incoming_tx,
+            contract = %key,
+            sender = %sender_addr,
+            event = "queue_full_resync_throttled",
+            "UPDATE relay: queue-full ResyncRequest throttled (rate limit) to avoid amplification"
+        );
+    }
+}
+
 /// Inner driver for `BroadcastTo`. Mirrors `update.rs:595-825`.
 ///
 /// 1. Update sender's cached summary in `interest_manager`.
@@ -1235,13 +1302,12 @@ async fn drive_relay_broadcast_to(
                     AutoFetchReason::InboundRelay,
                 );
             } else if queue_full {
-                tracing::debug!(
-                    tx = %incoming_tx,
-                    contract = %key,
-                    sender = %sender_addr,
-                    event = "queue_full_amplification_suppressed",
-                    "UPDATE relay: per-contract queue saturated, suppressed ResyncRequest/auto-fetch to avoid amplification"
-                );
+                // Issue #4857: a queue-full drop is SILENT — the sender cached
+                // our summary on send-Ok and will never re-send the dropped
+                // change. Emit a rate-limited ResyncRequest so it re-syncs. The
+                // auto-fetch branch stays suppressed on queue-full (we already
+                // hold the contract). Shared with the streaming driver.
+                send_queue_full_resync_request(op_manager, key, sender_addr, incoming_tx).await;
             }
             return Err(err);
         }
@@ -1815,6 +1881,31 @@ async fn drive_relay_broadcast_to_streaming(
         sender_summary_bytes,
     } = payload;
 
+    apply_streaming_broadcast(
+        op_manager,
+        incoming_tx,
+        key,
+        state_bytes,
+        sender_summary_bytes,
+        sender_addr,
+    )
+    .await
+}
+
+/// Apply an assembled streaming full-state broadcast (steps 4-9 of
+/// `drive_relay_broadcast_to_streaming`): update the sender's cached summary,
+/// dedup, WASM-merge the full state, classify failures, and fan out the
+/// proactive summary. Extracted from the driver so the #4857 queue-full heal on
+/// the streaming path is unit-testable without the transport stream plumbing
+/// (steps 1-3: claim + assemble + deserialize).
+async fn apply_streaming_broadcast(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    key: ContractKey,
+    state_bytes: Vec<u8>,
+    sender_summary_bytes: Vec<u8>,
+    sender_addr: SocketAddr,
+) -> Result<(), OpError> {
     // Step 4: update sender's cached summary.
     let sender_summary = StateSummary::from(sender_summary_bytes.clone());
     if let Some(sender_pkl) = op_manager
@@ -1909,6 +2000,17 @@ async fn drive_relay_broadcast_to_streaming(
                     )
                     .await;
                 });
+            } else if err.is_contract_queue_full() {
+                // Issue #4857 on the STREAMING full-state path: identical
+                // poisoning to the non-streaming driver. A delivered streaming
+                // full-state broadcast caches the peer summary
+                // (broadcast_queue.rs → record_streaming_delivery →
+                // record_delivery_to_interest), so a queue-full drop here leaves
+                // the sender believing we are current while our subsequent CRDT
+                // deltas merge onto a diverged base WITHOUT error — the
+                // delta-apply-failure heal never fires. Emit the same
+                // rate-limited ResyncRequest as the non-streaming path.
+                send_queue_full_resync_request(op_manager, key, sender_addr, incoming_tx).await;
             }
             return Err(err);
         }
@@ -2561,8 +2663,8 @@ mod tests {
     fn broadcast_to_streaming_dedup_runs_before_merge() {
         let src = include_str!("op_ctx_task.rs");
         let start = src
-            .find("async fn drive_relay_broadcast_to_streaming(")
-            .expect("drive_relay_broadcast_to_streaming not found");
+            .find("async fn apply_streaming_broadcast(")
+            .expect("apply_streaming_broadcast not found");
         let after = &src[start + 1..];
         let end = after
             .find("\nasync fn ")
@@ -2579,49 +2681,347 @@ mod tests {
         assert!(
             dedup_pos < merge_pos,
             "broadcast_dedup_cache.check_and_insert MUST appear before \
-             update_contract() in drive_relay_broadcast_to_streaming"
+             update_contract() in apply_streaming_broadcast"
         );
     }
 
-    /// Issue #4251 regression pin: `drive_relay_broadcast_to` MUST
-    /// gate ResyncRequest emission AND `try_auto_fetch_contract` on
-    /// `!err.is_contract_queue_full()`. The two amplification branches
-    /// are what turn a single saturated contract into a network-wide
-    /// storm — ResyncRequest asks the sender for full state (bigger
-    /// payload onto the same full queue), and auto-fetch enqueues a
-    /// GET right back onto the saturated handler.
+    /// Issue #4857 / #4251 reconciliation pin. On a queue-full broadcast drop,
+    /// BOTH broadcast drivers must emit a RATE-LIMITED `ResyncRequest` — neither
+    /// suppress it (permanent divergence, #4857) nor emit it unthrottled
+    /// (full-state storm, #4251). Both route through the shared
+    /// `send_queue_full_resync_request` helper, which nests the
+    /// `InterestMessage::ResyncRequest` emit INSIDE the `should_send_resync_request`
+    /// rate-limit gate. Auto-fetch stays suppressed on each driver's queue-full arm.
     #[test]
-    fn broadcast_to_suppresses_amplification_on_queue_full() {
+    fn broadcast_to_sends_throttled_resync_on_queue_full() {
         let src = include_str!("op_ctx_task.rs");
-        let start = src
-            .find("async fn drive_relay_broadcast_to(")
-            .expect("drive_relay_broadcast_to not found");
-        let after = &src[start + 1..];
-        let end = after
-            .find("\nasync fn ")
-            .or_else(|| after.find("\n#[cfg(test)]"))
-            .unwrap_or(after.len());
-        let driver_src = &src[start..start + 1 + end];
 
-        // Gate must be present; both amplification call sites must still
-        // exist (suppressed on queue-full, not deleted). Runtime gating
-        // behavior is covered by the update.rs tests; this is a structural
-        // pin so a refactor that drops the check fails CI.
+        // Slice a top-level `async fn NAME(` body out of the source (up to the
+        // next top-level `async fn` or the test module).
+        let fn_body = |name: &str| -> &str {
+            let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
+            let after = &src[start + 1..];
+            let end = after
+                .find("\nasync fn ")
+                .or_else(|| after.find("\n#[cfg(test)]"))
+                .unwrap_or(after.len());
+            &src[start..start + 1 + end]
+        };
+        // Slice the queue-full match arm (from `marker` up to its closing
+        // `return Err(err);`) out of a driver body.
+        let queue_full_arm = |body: &'static str, marker: &str| -> &'static str {
+            let arm_start = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("queue-full arm `{marker}` missing"));
+            let arm_end = body[arm_start..]
+                .find("return Err(err);")
+                .expect("return after queue-full arm missing");
+            &body[arm_start..arm_start + arm_end]
+        };
+
+        // Non-streaming driver delegates to the helper and does NOT auto-fetch.
+        let ns = fn_body("async fn drive_relay_broadcast_to(");
         assert!(
-            driver_src.contains("is_contract_queue_full()"),
-            "drive_relay_broadcast_to must call is_contract_queue_full() \
-             to gate the ResyncRequest / auto-fetch amplification — see \
-             issue #4251"
+            ns.contains("let queue_full = err.is_contract_queue_full();"),
+            "drive_relay_broadcast_to must still classify queue-full (#4251)"
+        );
+        let ns_arm = queue_full_arm(ns, "} else if queue_full {");
+        assert!(
+            ns_arm.contains("send_queue_full_resync_request("),
+            "drive_relay_broadcast_to queue-full arm MUST delegate to \
+             send_queue_full_resync_request (heals #4857)"
         );
         assert!(
-            driver_src.contains("InterestMessage::ResyncRequest"),
-            "drive_relay_broadcast_to should still contain the ResyncRequest \
-             branch (gated on !queue_full)"
+            !ns_arm.contains("try_auto_fetch_contract"),
+            "drive_relay_broadcast_to queue-full arm must NOT auto-fetch (#4251)"
+        );
+
+        // Streaming path: the queue-full arm lives in `apply_streaming_broadcast`
+        // (steps 4-9, extracted from the driver for testability). It delegates to
+        // the SAME helper and does NOT auto-fetch (auto-fetch lives in the
+        // separate log_broadcast_to_streaming_failure branch). Missing arm ⇒
+        // #4857 open on the streaming full-state path.
+        assert!(
+            fn_body("async fn drive_relay_broadcast_to_streaming(")
+                .contains("apply_streaming_broadcast("),
+            "drive_relay_broadcast_to_streaming must delegate to \
+             apply_streaming_broadcast — otherwise the streaming apply/heal logic \
+             is unreachable"
+        );
+        let st = fn_body("async fn apply_streaming_broadcast(");
+        let st_arm = queue_full_arm(st, "} else if err.is_contract_queue_full() {");
+        assert!(
+            st_arm.contains("send_queue_full_resync_request("),
+            "apply_streaming_broadcast queue-full arm MUST delegate to \
+             send_queue_full_resync_request — otherwise #4857 stays OPEN on the \
+             streaming full-state path"
         );
         assert!(
-            driver_src.contains("try_auto_fetch_contract"),
-            "drive_relay_broadcast_to should still contain the auto-fetch \
-             branch (gated on !queue_full)"
+            !st_arm.contains("try_auto_fetch_contract"),
+            "streaming queue-full arm must NOT auto-fetch (#4251)"
+        );
+
+        // The shared helper nests the emit INSIDE the throttle gate: the
+        // `should_send_resync_request` check comes BEFORE the emit, which comes
+        // BEFORE the throttled `else` branch. An emit outside the gate would
+        // re-open the #4251 storm.
+        let helper = fn_body("async fn send_queue_full_resync_request(");
+        let gate = helper
+            .find(".should_send_resync_request(")
+            .expect("helper must gate on should_send_resync_request (rate limit, #4251)");
+        let emit = helper
+            .find("InterestMessage::ResyncRequest")
+            .expect("helper must emit InterestMessage::ResyncRequest (heal, #4857)");
+        let gate_else = helper
+            .find("} else {")
+            .expect("helper must have a throttled `else` branch");
+        assert!(
+            gate < emit && emit < gate_else,
+            "the ResyncRequest emit MUST be nested INSIDE the \
+             `if should_send_resync_request {{ .. }}` gate (before the throttled \
+             `else`), so an unthrottled emission cannot re-open the #4251 storm"
+        );
+    }
+
+    /// Drain the event-loop notification channel (non-blocking) and return the
+    /// targets of every `ResyncRequest(key)` emitted since the last drain.
+    fn drain_resync_targets(
+        rx: &mut crate::node::EventLoopNotificationsReceiver,
+        key: ContractKey,
+    ) -> Vec<SocketAddr> {
+        let mut targets = Vec::new();
+        while let Ok(ev) = rx.notifications_receiver.try_recv() {
+            if let Either::Right(NodeEvent::SendInterestMessage {
+                target,
+                message: InterestMessage::ResyncRequest { key: k },
+            }) = ev
+            {
+                if k == key {
+                    targets.push(target);
+                }
+            }
+        }
+        targets
+    }
+
+    /// Build a minimal real OpManager wired to a contract-handler stand-in that
+    /// answers every `UpdateQuery` with `ContractQueueFull` (the silent drop a
+    /// saturated receiver hits under load) and every `GetQuery` with "no state".
+    /// Returns the op_manager, the event-loop notification receiver (to observe
+    /// emitted `ResyncRequest`s), and a keep-alive guard holding the handler task
+    /// plus the channel halves that must outlive the op_manager. Mirrors
+    /// `op_state_manager.rs::build_reroot_test_op_manager`; shared by the #4857
+    /// queue-full behavioral tests for the non-streaming and streaming paths.
+    async fn build_queue_full_test_node(
+        id: &str,
+    ) -> (
+        Arc<OpManager>,
+        crate::node::EventLoopNotificationsReceiver,
+        Box<dyn std::any::Any>,
+    ) {
+        // Distinct `id` per caller: `ConfigArgs::build` derives a Local-mode data
+        // directory from it, so two concurrently-running tests sharing an id race
+        // on that directory (flaky "No such file or directory").
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        let self_addr: SocketAddr = "127.0.0.1:12000".parse().unwrap();
+        op_manager.ring.connection_manager.set_own_addr(self_addr);
+
+        let handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+                        key: None,
+                        response: Ok(StoreResponse {
+                            state: None,
+                            contract: None,
+                        }),
+                    },
+                    ContractHandlerEvent::UpdateQuery { .. } => {
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Err(crate::contract::ExecutorError::other(
+                                crate::contract::ContractQueueFull,
+                            )),
+                            state_changed: false,
+                        }
+                    }
+                    other => panic!("unexpected handler event in stand-in: {other:?}"),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let guard: Box<dyn std::any::Any> =
+            Box::new((handler, result_router_rx, task_monitor, wait_for_event));
+        (op_manager, notification_rx, guard)
+    }
+
+    /// Issue #4857 behavioral reproduction (non-streaming delta path): when an
+    /// inbound broadcast delta is dropped with `ContractQueueFull`,
+    /// `drive_relay_broadcast_to` MUST emit a `ResyncRequest` back to the sender
+    /// so it clears its poisoned summary cache and re-sends the dropped change —
+    /// and that emission MUST be rate-limited so a burst of drops does not
+    /// re-open the #4251 storm.
+    ///
+    /// On `origin/main` this test FAILS: the queue-full arm suppresses the
+    /// ResyncRequest entirely, so `first` is empty (the divergence is silent and
+    /// permanent). With the fix, the first drop emits exactly one ResyncRequest
+    /// and the immediate second drop is throttled.
+    ///
+    /// The drop is injected at the contract-handler seam (a stand-in handler
+    /// answers every `UpdateQuery` with `ContractQueueFull`) rather than by
+    /// saturating the real 100-slot fair queue, which is non-deterministic.
+    #[tokio::test]
+    async fn queue_full_broadcast_emits_throttled_resync_request() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-delta").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12100".parse().unwrap();
+
+        // First broadcast delta → dropped queue-full → MUST emit a ResyncRequest.
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "a queue-full drop MUST emit exactly one ResyncRequest to the sender \
+             so it clears its poisoned summary and re-sends (heals #4857)"
+        );
+
+        // Second broadcast with DIFFERENT delta bytes (so it is not a dedup hit)
+        // within the throttle window → still queue-full, but ResyncRequest is
+        // throttled (bounds the #4251 amplification).
+        let r2 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![4, 5, 6]),
+            Vec::new(),
+            sender_addr,
+        )
+        .await;
+        assert!(
+            r2.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "second broadcast should still hit queue-full, got {r2:?}"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "a second queue-full drop within the throttle window MUST NOT emit \
+             another ResyncRequest (bounds #4251 amplification)"
+        );
+    }
+
+    /// Issue #4857 behavioral reproduction (STREAMING full-state path): the
+    /// large-room case the round-2 review flagged. A delivered streaming
+    /// full-state broadcast caches the peer summary, so a `ContractQueueFull`
+    /// drop here poisons the sender identically to the delta path — and the
+    /// streaming Err arm previously had NO resync branch. `apply_streaming_broadcast`
+    /// (steps 4-9 of `drive_relay_broadcast_to_streaming`) MUST now emit the same
+    /// throttled `ResyncRequest`.
+    ///
+    /// On `origin/main` (and on the round-1 fix, which only patched the
+    /// non-streaming driver) this FAILS: `first` is empty. With the round-2 fix
+    /// the first drop emits one ResyncRequest and the second is throttled.
+    #[tokio::test]
+    async fn queue_full_streaming_broadcast_emits_throttled_resync_request() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-streaming").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([9u8; 32]),
+            CodeHash::new([10u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12200".parse().unwrap();
+
+        // First streaming full-state → dropped queue-full → MUST emit a ResyncRequest.
+        let r1 = apply_streaming_broadcast(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            vec![1, 2, 3],
+            Vec::new(),
+            sender_addr,
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "a queue-full streaming full-state drop MUST emit exactly one \
+             ResyncRequest (heals #4857 on the streaming path)"
+        );
+
+        // Second streaming full-state with DIFFERENT bytes (not a dedup hit)
+        // within the throttle window → still queue-full, ResyncRequest throttled.
+        let r2 = apply_streaming_broadcast(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            vec![4, 5, 6],
+            Vec::new(),
+            sender_addr,
+        )
+        .await;
+        assert!(
+            r2.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "second streaming broadcast should still hit queue-full, got {r2:?}"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "a second streaming queue-full drop within the throttle window MUST \
+             NOT emit another ResyncRequest (bounds #4251 amplification)"
         );
     }
 
@@ -2681,8 +3081,8 @@ mod tests {
     fn broadcast_to_streaming_classifies_failures() {
         let src = include_str!("op_ctx_task.rs");
         let start = src
-            .find("async fn drive_relay_broadcast_to_streaming(")
-            .expect("drive_relay_broadcast_to_streaming not found");
+            .find("async fn apply_streaming_broadcast(")
+            .expect("apply_streaming_broadcast not found");
         let after = &src[start + 1..];
         let end = after
             .find("\nasync fn ")
@@ -2692,17 +3092,17 @@ mod tests {
 
         assert!(
             driver_src.contains("log_broadcast_to_streaming_failure"),
-            "drive_relay_broadcast_to_streaming must call \
+            "apply_streaming_broadcast must call \
              log_broadcast_to_streaming_failure for failure classification"
         );
         assert!(
             driver_src.contains("try_auto_fetch_contract"),
-            "drive_relay_broadcast_to_streaming must call try_auto_fetch_contract \
+            "apply_streaming_broadcast must call try_auto_fetch_contract \
              on real (non-benign) failures for self-heal"
         );
         assert!(
             driver_src.contains("send_summary_back_on_rejection"),
-            "drive_relay_broadcast_to_streaming must spawn \
+            "apply_streaming_broadcast must spawn \
              send_summary_back_on_rejection on is_invalid_update_rejection"
         );
     }
@@ -2714,8 +3114,8 @@ mod tests {
     fn broadcast_to_streaming_spawns_proactive_summary() {
         let src = include_str!("op_ctx_task.rs");
         let start = src
-            .find("async fn drive_relay_broadcast_to_streaming(")
-            .expect("drive_relay_broadcast_to_streaming not found");
+            .find("async fn apply_streaming_broadcast(")
+            .expect("apply_streaming_broadcast not found");
         let after = &src[start + 1..];
         let end = after
             .find("\nasync fn ")
@@ -2724,7 +3124,7 @@ mod tests {
         let driver_src = &src[start..start + 1 + end];
         assert!(
             driver_src.contains("send_proactive_summary_notification"),
-            "drive_relay_broadcast_to_streaming must spawn \
+            "apply_streaming_broadcast must spawn \
              send_proactive_summary_notification on successful state change"
         );
     }
@@ -2764,7 +3164,7 @@ mod tests {
         assert!(
             src.contains("pub(crate) fn log_broadcast_to_streaming_failure("),
             "log_broadcast_to_streaming_failure must remain pub(crate) — \
-             reused by drive_relay_broadcast_to_streaming"
+             reused by apply_streaming_broadcast"
         );
     }
 

@@ -46,6 +46,7 @@ use freenet_stdlib::prelude::{ContractKey, StateDelta, StateSummary};
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -85,6 +86,30 @@ use crate::config::GlobalRng;
 
 /// Maximum number of entries in the delta memoization cache.
 const DELTA_CACHE_SIZE: usize = 1024;
+
+/// Minimum interval between queue-full `ResyncRequest`s to the same peer for
+/// the same contract (issue #4857).
+///
+/// A `ContractQueueFull` broadcast drop is silent: the receiver never applied
+/// the delta, but the SENDER cached its own summary as ours on send-Ok
+/// (`broadcast_queue.rs::record_delivery_to_interest`), so it believes we are
+/// current and will never re-send the dropped change. Left unhealed, a
+/// rarely-changing field diverges permanently until the ~5-min InterestSync
+/// heartbeat happens to correct it. Emitting a `ResyncRequest` makes the sender
+/// clear its cached summary of us and re-send full state — but issue #4251
+/// showed that one request per dropped delta amplifies into a full-state storm
+/// onto the same saturated queue. This interval bounds that amplification to at
+/// most one request per (contract, peer) window while still healing far faster
+/// than the heartbeat backstop.
+const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Bound on the number of (contract, peer) entries in the queue-full
+/// `ResyncRequest` throttle. The key is influenced by remote peers (any peer
+/// can broadcast any contract to us), so it MUST be bounded — see the
+/// per-key-collection rule in `.claude/rules/code-style.md`. LRU eviction fails
+/// open: forgetting an entry merely permits one extra healing `ResyncRequest`,
+/// which is safe.
+const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
 
 /// Timeout for contract handler queries in the broadcast path (summary and
 /// delta computation). Much shorter than the default 300s to prevent spawned
@@ -320,6 +345,12 @@ pub struct InterestManager<T: TimeSource> {
     /// the removal after the deadline passes. If the peer reconnects before the
     /// deadline, the entry is removed from this map and interests are preserved.
     pending_removals: DashMap<PeerKey, Instant>,
+
+    /// Rate-limit gate for queue-full `ResyncRequest`s, keyed by
+    /// (contract, target peer address). Bounded LRU so remote peers cannot grow
+    /// it without bound. See [`InterestManager::should_send_resync_request`] and
+    /// issue #4857.
+    resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), Instant>>,
 }
 
 impl<T: TimeSource + Sync> InterestManager<T> {
@@ -340,6 +371,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             resync_requests_received: AtomicU64::new(0),
             summary_notify_timestamps: DashMap::new(),
             pending_removals: DashMap::new(),
+            resync_request_throttle: Mutex::new(LruCache::new(
+                NonZeroUsize::new(RESYNC_THROTTLE_CACHE_SIZE)
+                    .expect("RESYNC_THROTTLE_CACHE_SIZE must be > 0"),
+            )),
         }
     }
 
@@ -558,6 +593,31 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         } else {
             false
         }
+    }
+
+    /// Rate-limit gate for queue-full `ResyncRequest`s to `target` for
+    /// `contract`. Returns `true` (and records the send) when at least
+    /// [`RESYNC_REQUEST_MIN_INTERVAL`] has elapsed since the last such request
+    /// for this (contract, target) pair, or when none was ever sent.
+    ///
+    /// Issue #4857: a `ContractQueueFull` broadcast drop is silent — the
+    /// receiver never applied the delta, but the SENDER cached its own summary
+    /// as ours on send-Ok, so it believes we are current and will never re-send
+    /// the dropped change. A `ResyncRequest` makes the sender clear that cached
+    /// summary and re-send full state. Issue #4251 suppressed the request
+    /// entirely because one-per-dropped-delta amplifies into a full-state storm;
+    /// this gate keeps the healing signal but bounds it to one per window.
+    pub fn should_send_resync_request(&self, contract: &ContractKey, target: SocketAddr) -> bool {
+        let now = self.time_source.now();
+        let key = (*contract, target);
+        let mut throttle = self.resync_request_throttle.lock();
+        if let Some(&last) = throttle.get(&key) {
+            if now.duration_since(last) < RESYNC_REQUEST_MIN_INTERVAL {
+                return false;
+            }
+        }
+        throttle.put(key, now);
+        true
     }
 
     /// Remove all interests for a peer (called on peer disconnect).
@@ -1564,6 +1624,55 @@ mod tests {
         let retrieved = manager.get_peer_summary(&contract, &peer);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().as_ref(), summary.as_ref());
+    }
+
+    /// Issue #4857: `should_send_resync_request` must emit at most one
+    /// `ResyncRequest` per (contract, peer) per `RESYNC_REQUEST_MIN_INTERVAL`.
+    /// The first drop heals immediately; a burst of further drops within the
+    /// window is throttled (bounding the #4251 amplification); after the window
+    /// elapses a fresh request is allowed again.
+    #[test]
+    fn should_send_resync_request_rate_limits_per_contract_peer() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        // First drop for this (contract, peer) → allowed (immediate heal).
+        assert!(
+            manager.should_send_resync_request(&contract, addr),
+            "first ResyncRequest for a fresh (contract, peer) must be allowed"
+        );
+        // Immediate repeat within the window → throttled.
+        assert!(
+            !manager.should_send_resync_request(&contract, addr),
+            "a second ResyncRequest within RESYNC_REQUEST_MIN_INTERVAL must be throttled"
+        );
+
+        // A DIFFERENT peer for the same contract is an independent bucket.
+        let other_addr: SocketAddr = "127.0.0.1:5002".parse().unwrap();
+        assert!(
+            manager.should_send_resync_request(&contract, other_addr),
+            "a distinct peer must not share the first peer's throttle bucket"
+        );
+        // A DIFFERENT contract for the same peer is also independent.
+        let other_contract = make_contract_key(2);
+        assert!(
+            manager.should_send_resync_request(&other_contract, addr),
+            "a distinct contract must not share the first contract's throttle bucket"
+        );
+
+        // Just before the interval elapses → still throttled.
+        time.advance_time(RESYNC_REQUEST_MIN_INTERVAL - Duration::from_millis(1));
+        assert!(
+            !manager.should_send_resync_request(&contract, addr),
+            "ResyncRequest must stay throttled until the full interval elapses"
+        );
+        // After the interval elapses → allowed again.
+        time.advance_time(Duration::from_millis(2));
+        assert!(
+            manager.should_send_resync_request(&contract, addr),
+            "ResyncRequest must be allowed again once RESYNC_REQUEST_MIN_INTERVAL has elapsed"
+        );
     }
 
     #[test]
