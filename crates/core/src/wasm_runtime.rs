@@ -36,7 +36,7 @@ pub(crate) use module_cache::{
 // the re-export isn't an unused import under `-D warnings` in release.
 #[cfg(test)]
 pub(crate) use module_cache::{
-    MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
+    MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES, budget_for_ram,
 };
 pub(crate) use native_api::{
     DELEGATE_SUBSCRIPTIONS, DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,

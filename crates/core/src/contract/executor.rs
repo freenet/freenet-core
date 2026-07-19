@@ -1731,12 +1731,19 @@ mod tests {
         const MAX_POOL_SIZE: usize = 16;
         let summary_aggregate = MAX_POOL_SIZE * SUMMARY_CACHE_MAX_BYTES; // <= 512 MiB
         let delta_aggregate = MAX_POOL_SIZE * DELTA_CACHE_MAX_BYTES; // <= 1 GiB
-        // Shared module cache ceiling (single, not per-worker).
-        let module_ceiling = crate::wasm_runtime::MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES; // 1.5 GiB
-        let total = summary_aggregate + delta_aggregate + module_ceiling;
-        // Keep total cache commitment under half the gateway limit (7600 MiB, i.e.
-        // ~7.42 GiB / ~7.97 GB; 7_600 * 1024 * 1024 is 7600 MiB, not 7.6 GiB).
+        // Reference gateway RAM (7600 MiB ≈ 7.42 GiB; 7_600 * 1024 * 1024 is
+        // 7600 MiB, not 7.6 GiB).
         let gateway_limit: usize = 7_600 * 1024 * 1024;
+        // Shared module cache ceiling (single, not per-worker), sized to the RAM
+        // this gateway actually has — NOT the absolute MAX clamp. The 4 GiB MAX
+        // only binds on hosts with >32 GiB RAM; on a 7.6 GiB gateway the
+        // `total_ram / 8` divisor binds at ~950 MiB, so using the MAX here would
+        // model an impossible 4 GiB module cache on a 7.6 GiB box. (MAX-clamp
+        // aggregate safety on a >32 GiB host is guarded separately by
+        // `module_cache::tests::max_clamp_combined_ceiling_is_safe_at_binding_host`.)
+        let module_ceiling = crate::wasm_runtime::budget_for_ram(gateway_limit);
+        let total = summary_aggregate + delta_aggregate + module_ceiling;
+        // Keep total cache commitment under half the gateway RAM.
         assert!(
             total <= gateway_limit / 2,
             "worst-case cache aggregate {total} (summary {summary_aggregate} + delta \

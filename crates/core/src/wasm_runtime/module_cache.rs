@@ -1192,7 +1192,13 @@ pub fn default_module_cache_budget_bytes() -> usize {
 /// small-box / large-box boundary behavior is unit-testable without depending on
 /// the test host's real RAM. Returns the contract-cache byte budget for a host
 /// with `total_ram` bytes of physical RAM.
-fn budget_for_ram(total_ram: usize) -> usize {
+///
+/// `pub(crate)` so callers reasoning about aggregate cache commitment on a
+/// *specific* host size (e.g. `executor::tests::cache_byte_budgets_are_aggregate_safe`)
+/// can ask for the module budget that host actually gets — the RAM-scaled
+/// divisor value, NOT the absolute [`MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES`]
+/// clamp (which only binds on hosts with >32 GiB RAM).
+pub(crate) fn budget_for_ram(total_ram: usize) -> usize {
     (total_ram / DEFAULT_MODULE_CACHE_RAM_DIVISOR).clamp(
         MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
         MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
