@@ -3132,7 +3132,9 @@ async fn handle_interest_sync_message(
                 .await
             {
                 Ok(ContractHandlerEvent::UpdateResponse {
-                    new_value: Ok(_), ..
+                    new_value: Ok(_),
+                    state_changed: true,
+                    ..
                 }) => {
                     // NOTE (#4861): deliberately do NOT reset the merge-failure
                     // backoff here. A full-state resync apply "succeeds" (even
@@ -3152,8 +3154,13 @@ async fn handle_interest_sync_message(
                     // BUT this CHANGED apply advances the state, which
                     // invalidates the failed-payload MEMO's premise (a delta that
                     // failed against the old state may be valid against the new
-                    // one) — clear ONLY the memo (#4864 round-4 P2). This is NOT a
-                    // backoff reset: no cooldown channel is touched, so the
+                    // one) — clear ONLY the memo (#4864 round-4 P2). Gated on
+                    // `state_changed: true` (#4864 round-5 item 8): the executor
+                    // returns `UpdateResponse { state_changed: false }` for a
+                    // redundant no-op apply (CurrentWon / NoChange-with-fetch),
+                    // and invalidating on THOSE would needlessly re-admit
+                    // known-bad payloads without a real state advance. This is NOT
+                    // a backoff reset: no cooldown channel is touched, so the
                     // strictly-delta-only no-reset doctrine and the
                     // `resync_apply_does_not_reset_merge_backoff` pin (which
                     // forbids a backoff reset from any node.rs site) both still
@@ -3171,9 +3178,21 @@ async fn handle_interest_sync_message(
                         "ResyncResponse state applied successfully"
                     );
                 }
-                Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
-                    // As above (#4861): a no-change resync apply is not a
-                    // convergence signal, so it must not reset the backoff.
+                Ok(ContractHandlerEvent::UpdateResponse {
+                    new_value: Ok(_),
+                    state_changed: false,
+                    ..
+                })
+                | Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+                    // A no-op resync apply (CurrentWon / NoChange — the executor
+                    // returns either `UpdateResponse { state_changed: false }` or
+                    // `UpdateNoChange`) did NOT advance the state. As above
+                    // (#4861) it is not a convergence signal, so it must not reset
+                    // the backoff — AND it is not a memo-invalidation either
+                    // (#4864 round-5 item 8): the failed-payload memo's premise
+                    // still holds when the state did not change, so
+                    // `invalidate_payload_memo` is deliberately NOT called here,
+                    // and the log field is honestly `changed = false`.
                     tracing::info!(
                         from = %source,
                         contract = %key,
@@ -4178,6 +4197,156 @@ mod tests {
             "#4864: bogus keys must NOT occupy global per-contract limiter slots \
              (the pre-limiter existence check must reject them first)"
         );
+    }
+
+    /// #4864 round-5 item 5 — POSITIVE CONTROL twin of
+    /// `resync_request_for_bogus_keys_does_not_consume_limiter_slots`.
+    ///
+    /// The bogus-keys test proves the existence gate REJECTS absent contracts
+    /// (both limiter maps stay EMPTY). On its own that stays green even if
+    /// `contract_state_present_async` regressed to ALWAYS-false — a gate that
+    /// rejects *everything* would also leave the maps empty. This twin removes
+    /// that blind spot: a `ResyncRequest` for a contract we DO hold must PASS
+    /// the gate, so a limiter slot IS consumed (`len() >= 1`), and — because
+    /// the stand-in handler answers the post-gate state/summary fetches — a
+    /// full `ResyncResponse` comes back.
+    ///
+    /// Together the pair proves the gate DISCRIMINATES (bogus → `len() == 0`,
+    /// held → `len() >= 1`), not merely that it always-rejects or always-accepts.
+    ///
+    /// redb-gated for the same reason as the twin: only the redb backend has
+    /// the cheap synchronous existence check, and an empty/unset store would
+    /// make the precondition unrepresentable.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn resync_request_for_held_contract_passes_gate_and_responds() {
+        use crate::contract::{ContractHandlerEvent, StoreResponse};
+        use freenet_stdlib::prelude::{StateSummary, WrappedState};
+
+        // Build a real OpManager (identical harness to the bogus-keys twin),
+        // but this time WITH a stand-in contract handler: the held path reaches
+        // `get_contract_state` / `get_contract_summary` after the gate, which
+        // round-trip through the contract-handling channel, so an unanswered
+        // channel would hang the test.
+        let config_args = crate::config::ConfigArgs {
+            id: Some("resync-held-4864".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr("127.0.0.1:14100".parse().unwrap());
+
+        // The one contract we DO hold.
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([200u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([201u8; 32]),
+        );
+
+        // Store its state into the hosting store BEFORE handing the store to
+        // the ring, so `contract_state_present_async(&key)` (the redb sync
+        // point lookup on the STATE table — the same table `store_state_sync`
+        // writes and `get_state_size` reads) returns true.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .expect("storage");
+        storage
+            .store_state_sync(&key, WrappedState::new(vec![9u8, 9, 9]))
+            .expect("store held state");
+        op_manager.ring.set_hosting_storage(storage);
+
+        // Precondition: the sync redb probe (what the async gate delegates to
+        // under redb) sees the state we just stored.
+        assert!(
+            op_manager.ring.contract_state_present(&key),
+            "precondition: the held contract's state must be present in the store"
+        );
+
+        // Stand-in contract handler: answers the post-gate GET (full state) and
+        // GET-summary so the responder can build a ResyncResponse. Owns the
+        // receiver for the whole test.
+        let handler_key = key;
+        let _handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+                        key: Some(handler_key),
+                        response: Ok(StoreResponse {
+                            state: Some(WrappedState::new(vec![9u8, 9, 9])),
+                            contract: None,
+                        }),
+                    },
+                    ContractHandlerEvent::GetSummaryQuery { key } => {
+                        ContractHandlerEvent::GetSummaryResponse {
+                            key,
+                            summary: Ok(StateSummary::from(vec![7u8, 7, 7])),
+                        }
+                    }
+                    other => {
+                        panic!("unexpected handler event in held-contract stand-in: {other:?}")
+                    }
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let source: SocketAddr = "127.0.0.1:15100".parse().unwrap();
+        let response = handle_interest_sync_message(
+            &op_manager,
+            source,
+            crate::message::InterestMessage::ResyncRequest { key },
+        )
+        .await;
+
+        // PRIMARY assertion (the exact regression this guards): the gate PASSED,
+        // so a limiter slot WAS consumed — impossible if the existence check had
+        // regressed to always-reject.
+        assert!(
+            op_manager.ring.resync_response_limiter.len() >= 1,
+            "#4864: a ResyncRequest for a HELD contract must PASS the existence \
+             gate and consume a per-(peer, contract) limiter slot (contrast the \
+             bogus-keys twin, which asserts len() == 0)"
+        );
+        assert!(
+            op_manager.ring.resync_response_global_limiter.len() >= 1,
+            "#4864: a ResyncRequest for a HELD contract must PASS the existence \
+             gate and consume a global per-contract limiter slot"
+        );
+
+        // Stronger check: with the state + summary answered, a full ResyncResponse
+        // for the held key is produced (the whole happy path, not just the gate).
+        match response {
+            Some(crate::message::InterestMessage::ResyncResponse { key: got, .. }) => {
+                assert_eq!(got, key, "ResyncResponse must be for the held contract");
+            }
+            other => panic!("expected Some(ResyncResponse) for a held contract, got {other:?}"),
+        }
     }
 
     // Superseded: Old addr-only equality (same_addr_different_keys → equal) was replaced
@@ -5849,6 +6018,41 @@ mod tests {
                  resync-apply (or any node.rs) reset would defeat the #4861 \
                  fork-oscillation containment. Reset belongs only in the broadcast \
                  drivers on a genuine merge success."
+            );
+        }
+
+        /// Pin (#4864 round-5 item 6): the CHANGED ResyncResponse apply arm MUST
+        /// call `invalidate_payload_memo` (presence — the no-reset pin above only
+        /// asserts ABSENCE of a reset), and it must live in the `state_changed:
+        /// true` sub-arm so a no-op apply does NOT invalidate the memo (item 8).
+        /// Dropping the call silently widens the memo staleness corner to the full
+        /// 10-min TTL.
+        #[test]
+        fn resync_changed_apply_invalidates_payload_memo() {
+            // Window-bound to the ResyncResponse apply arm so the far-away test
+            // literals below cannot satisfy the needles (self-reference guard).
+            let start = SOURCE
+                .find(concat!("InterestMessage::Resync", "Response {"))
+                .expect("ResyncResponse arm not found");
+            let arm = &SOURCE[start..(start + 6000).min(SOURCE.len())];
+            let invalidate = concat!("invalidate_", "payload_memo(");
+            // Match the PATTERN form (trailing comma) so a prose mention of
+            // `state_changed: false` in the changed:true arm's comment is not
+            // mistaken for the false sub-arm (self-reference guard).
+            let changed_true = arm
+                .find("state_changed: true,")
+                .expect("state_changed:true sub-arm not found");
+            let invalidate_pos = arm.find(invalidate).expect(
+                "the CHANGED ResyncResponse apply arm must call invalidate_payload_memo \
+                 (#4864 round-5 item 6)",
+            );
+            let changed_false = arm
+                .find("state_changed: false,")
+                .expect("state_changed:false sub-arm not found");
+            assert!(
+                changed_true < invalidate_pos && invalidate_pos < changed_false,
+                "invalidate_payload_memo must live in the state_changed:true sub-arm \
+                 so a no-op apply (state_changed:false) does NOT invalidate the memo"
             );
         }
     }
