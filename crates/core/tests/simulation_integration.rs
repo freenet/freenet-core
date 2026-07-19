@@ -16014,24 +16014,34 @@ fn test_every_hop_fanout_bounded_by_degree_not_holder_count() {
 /// Falsifier (c): WASM `summarize_state` calls scale with the contract
 /// STATE-CHANGE rate, NOT with hosted-set size or fan-out width.
 ///
-/// This is the #4440 summarize-storm falsifier for every-hop placement. The
+/// This is the every-hop-placement guard that per-peer summarize load stays
+/// proportional to the contract STATE-CHANGE rate, not to fan-out width. The
 /// `summarize_wasm_calls` counter increments ONLY on the summary-cache SLOW path
-/// (a real WASM `summarize_state` at `bridged_summarize_contract_state`), so a
-/// broken or removed cache re-arms the storm and blows the per-peer bound below.
+/// (a real WASM `summarize_state` at `bridged_summarize_contract_state`).
 ///
-/// ## Claim under test (#4440 summarize-storm, every-hop variant)
+/// ## What this test guards (and what it does NOT — see #4732 review)
 ///
-/// When a peer broadcasts an UPDATE to its co-host targets, the broadcast path
-/// (`broadcast_to_single_peer` → `get_contract_summary` →
-/// `bridged_summarize_contract_state`) needs that peer's OWN summary to compute a
-/// per-target delta. The summary is the SAME for every target in one state
-/// generation. WITHOUT a cache, the peer runs WASM `summarize_state` once PER
-/// TARGET PER UPDATE — so a peer fanning K updates to W co-host targets runs it
-/// `~K × W` times. WITH the state-hash-keyed summary cache, the W targets of one
-/// generation all hit the cache, so the peer runs `summarize_state` `~K` times
-/// (one slow-path miss per new state generation), INDEPENDENT of its fan-out
-/// width W. That per-peer decoupling of summarize-count from fan-out width is the
-/// invariant this test guards.
+/// In the `#[cfg(feature = "simulation_tests")]` fan-out path
+/// (`broadcast_state_to_peers`), the source computes its OWN summary via
+/// `get_contract_summary` → `bridged_summarize_contract_state` exactly ONCE per
+/// broadcast emission, BEFORE the per-target loop (the per-target loop only reads
+/// each peer's cached summary via `get_peer_summary`). So per broadcast the
+/// counter rises by at most one, INDEPENDENT of fan-out width W. This test
+/// therefore guards that per-peer summarize scales with a peer's broadcast-emission
+/// count (≈ the state-change rate K at the source), NOT with W: a regression that
+/// moved the source summary INSIDE the per-target loop on this path (matching the
+/// PRODUCTION `broadcast_to_single_peer` shape, which summarizes per target) would
+/// push per-peer summarize toward `K × W` and blow the bounds below.
+///
+/// It does NOT, by itself, falsify removal of the state-hash summary cache: the
+/// once-per-broadcast structure of this sim path already keeps summarize ≈ once
+/// per emission regardless of the cache, so here `total_summarize` tracks the
+/// broadcast-emission count (observed ≈ 91), not the per-target broadcast count
+/// (observed 510). The state-hash summary cache itself is directly falsified by
+/// the `summarize_unchanged_skips_state_load` / `delta_unchanged_skips_state_load`
+/// unit tests in `contract::executor::pool_tests::summarize_delta_cache_tests`
+/// (remove the cache → an unchanged-state re-summarize reloads state and those
+/// asserts fail).
 ///
 /// ## Why `use_mock_wasm = true` (NOT the CRDT emulation)
 ///
@@ -16058,19 +16068,22 @@ fn test_every_hop_fanout_bounded_by_degree_not_holder_count() {
 ///   * **NON-VACUITY** — `total_summarize >= K/2` and the per-target UPDATE
 ///     broadcast count `>= K × N`, proving the slow path and a wide fan-out really
 ///     ran (else the low count would be trivially true).
-///   * **PER-PEER FLAT-vs-FANOUT (the core #4440 discriminator)** — the busiest
+///   * **PER-PEER FLAT-vs-FANOUT (the core discriminator)** — the busiest
 ///     peer's `max_summarize <= K + SLACK`: it summarizes ~once per state
-///     generation, NOT once per (generation × target). A re-armed storm would push
-///     the busiest peer to `K × W` (its fan-out width), far above this bound.
-///   * **AGGREGATE CACHE EFFECTIVENESS** — `total_summarize` is far below the
-///     total per-target UPDATE broadcast count (`< half`). Without the cache each
-///     per-target broadcast would miss (`total ≈ per-target-broadcasts`); the cache
-///     collapses all targets of a generation onto one summarize.
+///     generation, NOT once per (generation × target). A per-target-summarize
+///     regression on the fan-out path would push the busiest peer to `K × W` (its
+///     fan-out width), far above this bound.
+///   * **SUMMARIZE ≪ PER-TARGET BROADCASTS** — `total_summarize` is far below the
+///     total per-target UPDATE broadcast count (`< half`; observed 91 vs 510).
+///     This gap is the once-per-broadcast fan-out factor: the source summarizes
+///     once per emission, then reuses that summary for every target. A path that
+///     summarized per target would collapse the gap toward `total ≈
+///     per-target-broadcasts`.
 ///
 /// Note: the InterestSync 5-minute heartbeat barely fires in a ~330s virtual sim,
-/// so this test exercises the cache through the UPDATE broadcast summary path
-/// (`broadcast_to_single_peer`), which fires per-target and is exactly where
-/// every-hop overlap load concentrates — not through the heartbeat.
+/// so this test exercises the summary path through the UPDATE broadcast fan-out
+/// (`broadcast_state_to_peers`, the simulation_tests path — which summarizes once
+/// per emission), not through the heartbeat.
 #[test_log::test]
 fn test_every_hop_summarize_calls_flat_vs_fanout() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
@@ -16203,35 +16216,38 @@ fn test_every_hop_summarize_calls_flat_vs_fanout() {
          exercised, so the bounds below would be vacuous."
     );
 
-    // PER-PEER FLAT-vs-FANOUT — the core #4440 discriminator. The busiest single
-    // peer summarizes ~once per new state generation (≈ K), NOT once per
+    // PER-PEER FLAT-vs-FANOUT — the core discriminator. The busiest single peer
+    // summarizes ~once per new state generation (≈ K), NOT once per
     // (generation × co-host target). It is bounded by the STATE-CHANGE rate K,
-    // independent of that peer's fan-out width. A re-armed storm (cache broken)
-    // would push the busiest peer to K × W (its co-host fan-out), far above this.
+    // independent of that peer's fan-out width, because this sim fan-out path
+    // (`broadcast_state_to_peers`) summarizes once per emission, before the
+    // per-target loop. A per-target-summarize regression on this path would push
+    // the busiest peer to K × W (its co-host fan-out), far above this bound.
     // Observed max ≈ K + 1 (the +1 is the bootstrap PUT/GET summary); the slack
     // covers bootstrap plus a small apply/re-summarize margin.
     const PER_PEER_SLACK: u64 = 8;
     let per_peer_bound = K as u64 + PER_PEER_SLACK; // 20
     assert!(
         max_summarize <= per_peer_bound,
-        "#4440 SUMMARIZE STORM: the busiest peer ran WASM summarize {max_summarize} \
+        "SUMMARIZE FAN-OUT REGRESSION: the busiest peer ran WASM summarize {max_summarize} \
          times, exceeding the per-peer bound {per_peer_bound} (K={K} + slack={PER_PEER_SLACK}). \
          Per-peer summarize must scale with the state-change rate K, NOT with the \
-         peer's co-host fan-out width — a count near K × fan-out means the summary \
-         cache is not collapsing a generation's per-target summaries."
+         peer's co-host fan-out width — a count near K × fan-out means the fan-out \
+         path is summarizing per target instead of once per emission."
     );
 
-    // AGGREGATE CACHE EFFECTIVENESS: total summarize is far below the total
-    // per-target UPDATE broadcast count. Without the cache, each per-target
-    // broadcast misses (total ≈ update_broadcast_targets); the cache collapses all
-    // targets of one generation onto a single summarize, so total falls well below
-    // half of the per-target broadcast count.
+    // SUMMARIZE ≪ PER-TARGET BROADCASTS: total summarize is far below the total
+    // per-target UPDATE broadcast count. The source summarizes once per emission
+    // and reuses that summary for every target, so total ≈ broadcast-emission
+    // count, well below the per-target broadcast count. A path that summarized per
+    // target (production `broadcast_to_single_peer` shape, without the cache) would
+    // drive total ≈ update_broadcast_targets.
     assert!(
         total_summarize * 2 < update_broadcast_targets as u64,
-        "#4440 SUMMARIZE STORM: total WASM summarize calls {total_summarize} is not \
+        "SUMMARIZE FAN-OUT REGRESSION: total WASM summarize calls {total_summarize} is not \
          below half the per-target UPDATE broadcast count {update_broadcast_targets} \
-         — the summary cache is not collapsing per-target summaries within a state \
-         generation (without the cache these would be roughly equal)."
+         — the fan-out path is summarizing per target instead of once per emission \
+         (per-target summarize would make these roughly equal)."
     );
 
     tracing::info!(
