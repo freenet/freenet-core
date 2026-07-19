@@ -127,13 +127,13 @@ pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_B
 pub mod interest;
 mod live_tx;
 mod location;
+pub(crate) mod merge_backoff;
 pub(crate) mod peer_cache;
 mod peer_connection_backoff;
 mod peer_key_location;
 mod placement_migration_metrics;
-pub mod topology_registry;
-pub(crate) mod merge_backoff;
 pub(crate) mod resync_rate_limit;
+pub mod topology_registry;
 pub(crate) mod update_rate_limit;
 
 // GET auto-subscribe (`AUTO_SUBSCRIBE_ON_GET`) was REMOVED in piece E of the

@@ -203,10 +203,7 @@ impl MergeBackoff {
         Self::with_max(time_source, MAX_TRACKED_CONTRACTS)
     }
 
-    pub fn with_max(
-        time_source: Arc<dyn TimeSource + Send + Sync>,
-        max_tracked: usize,
-    ) -> Self {
+    pub fn with_max(time_source: Arc<dyn TimeSource + Send + Sync>, max_tracked: usize) -> Self {
         Self {
             entries: DashMap::new(),
             size: AtomicUsize::new(0),
@@ -228,7 +225,11 @@ impl MergeBackoff {
             return MergeDecision::Allow;
         };
         entry.prune_payloads(now);
-        if entry.failed_payloads.iter().any(|(h, _)| *h == payload_hash) {
+        if entry
+            .failed_payloads
+            .iter()
+            .any(|(h, _)| *h == payload_hash)
+        {
             self.suppressed_total.fetch_add(1, Ordering::Relaxed);
             return MergeDecision::KnownFailedPayload;
         }
@@ -289,7 +290,11 @@ impl MergeBackoff {
 
         // Memoize the failing payload (dedup + bounded + TTL-pruned).
         entry.prune_payloads(now);
-        if !entry.failed_payloads.iter().any(|(h, _)| *h == payload_hash) {
+        if !entry
+            .failed_payloads
+            .iter()
+            .any(|(h, _)| *h == payload_hash)
+        {
             if entry.failed_payloads.len() >= MAX_FAILED_PAYLOADS_PER_CONTRACT {
                 entry.failed_payloads.pop_front();
             }
@@ -406,7 +411,11 @@ mod tests {
         assert!(!b.check(&c, 2).is_allowed());
         b.record_success(&c);
         assert_eq!(b.check(&c, 2), MergeDecision::Allow);
-        assert_eq!(b.check(&c, 1), MergeDecision::Allow, "memoized payload cleared too");
+        assert_eq!(
+            b.check(&c, 1),
+            MergeDecision::Allow,
+            "memoized payload cleared too"
+        );
         assert_eq!(b.len(), 0);
     }
 
@@ -498,7 +507,9 @@ mod tests {
             let c = mk_contract(seed_byte);
             b.record_failure(&c, MergeFailureClass::Invalid, 1);
             let entry = b.entries.get(&c).unwrap();
-            let cooldown = entry.next_allowed.saturating_duration_since(entry.last_failure);
+            let cooldown = entry
+                .next_allowed
+                .saturating_duration_since(entry.last_failure);
             assert!(
                 cooldown >= Duration::from_secs(24) && cooldown <= Duration::from_secs(36),
                 "first-failure cooldown {cooldown:?} must be 30s ±20%"
@@ -516,7 +527,9 @@ mod tests {
             b.record_failure(&c, MergeFailureClass::Invalid, i);
         }
         let entry = b.entries.get(&c).unwrap();
-        let cooldown = entry.next_allowed.saturating_duration_since(entry.last_failure);
+        let cooldown = entry
+            .next_allowed
+            .saturating_duration_since(entry.last_failure);
         // Capped at 30 min, +20% jitter ceiling = 36 min.
         assert!(
             cooldown <= INVALID_CAP.mul_f64(1.2),

@@ -206,7 +206,12 @@ pub(crate) type ResyncResponseLimiter = TokenBucketLimiter<(SocketAddr, Contract
 pub(crate) fn new_emit_limiter(
     time_source: Arc<dyn TimeSource + Send + Sync>,
 ) -> ResyncEmitLimiter {
-    TokenBucketLimiter::new(time_source, EMIT_BURST, EMIT_REFILL_INTERVAL, MAX_TRACKED_KEYS)
+    TokenBucketLimiter::new(
+        time_source,
+        EMIT_BURST,
+        EMIT_REFILL_INTERVAL,
+        MAX_TRACKED_KEYS,
+    )
 }
 
 /// Build the responder-side limiter with the tuned defaults.

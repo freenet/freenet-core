@@ -1302,7 +1302,11 @@ async fn drive_relay_broadcast_to(
                 // sender summary-clear too — it is part of the resync handshake,
                 // so clearing it without emitting would just force the sender to
                 // full-state us on the next interest cycle.
-                if op_manager.ring.resync_emit_limiter.check_and_record(*key.id()) {
+                if op_manager
+                    .ring
+                    .resync_emit_limiter
+                    .check_and_record(*key.id())
+                {
                     tracing::warn!(
                         tx = %incoming_tx,
                         contract = %key,
@@ -2004,7 +2008,11 @@ async fn apply_streaming_broadcast(
     // always full state (`is_delta = false`) and never emit a ResyncRequest, so
     // only the merge-skip applies. Cleared the instant a merge succeeds (below).
     let stream_payload_hash = crate::ring::merge_backoff::merge_payload_hash(false, &state_bytes);
-    match op_manager.ring.merge_backoff.check(key.id(), stream_payload_hash) {
+    match op_manager
+        .ring
+        .merge_backoff
+        .check(key.id(), stream_payload_hash)
+    {
         crate::ring::merge_backoff::MergeDecision::Allow => {}
         decision => {
             crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
@@ -2616,8 +2624,10 @@ mod tests {
     #[test]
     fn broadcast_to_resync_emit_is_rate_limited() {
         let driver_src = broadcast_to_driver_src();
+        // Match the field name (fmt-stable) rather than the full method call,
+        // which rustfmt may break across lines.
         let gate_pos = driver_src
-            .find("resync_emit_limiter.check_and_record(")
+            .find("resync_emit_limiter")
             .expect("ResyncRequest emit must be gated by resync_emit_limiter");
         let summary_clear_pos = driver_src
             .find("update_peer_summary(&key, &sender_key, None)")
@@ -2652,8 +2662,11 @@ mod tests {
             .unwrap_or(after.len());
         let driver_src = &src[start..start + 1 + end];
 
+        // Match the args (fmt-stable) rather than `merge_backoff.check(`, which
+        // rustfmt breaks across lines here (the longer `stream_payload_hash`
+        // pushes the chain over the chain-width limit).
         let backoff_pos = driver_src
-            .find("merge_backoff.check(")
+            .find(".check(key.id(), stream_payload_hash)")
             .expect("streaming driver missing merge_backoff.check gate");
         let merge_pos = driver_src
             .find("super::update_contract(")
@@ -2667,7 +2680,8 @@ mod tests {
             "streaming driver must clear the backoff on a successful merge"
         );
         assert!(
-            driver_src.contains(".record_failure(") && driver_src.contains("is_contract_exec_rejection()"),
+            driver_src.contains(".record_failure(")
+                && driver_src.contains("is_contract_exec_rejection()"),
             "streaming driver must record gated failures like the non-streaming driver"
         );
     }

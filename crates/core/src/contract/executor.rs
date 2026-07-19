@@ -2054,8 +2054,10 @@ mod tests {
                     .into();
             // The UPDATE merge path constructs the ExecutorError with
             // op = Some(Upsert(key)), routing through update_exec_error.
-            let err =
-                ExecutorError::execution(contract_err, Some(super::super::InnerOpError::Upsert(key)));
+            let err = ExecutorError::execution(
+                contract_err,
+                Some(super::super::InnerOpError::Upsert(key)),
+            );
             assert!(
                 err.is_wasm_timeout(),
                 "MaxComputeTimeExceeded on the Upsert path MUST classify as a wasm timeout"

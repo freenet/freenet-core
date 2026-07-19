@@ -1939,7 +1939,10 @@ mod tests {
             "preemption must surface as a Trap::Interrupt, got: {err:?}"
         );
         assert!(
-            matches!(classify_runtime_error(false, &mut store, err), WasmError::Timeout),
+            matches!(
+                classify_runtime_error(false, &mut store, err),
+                WasmError::Timeout
+            ),
             "epoch-deadline trap must classify as WasmError::Timeout"
         );
     }
