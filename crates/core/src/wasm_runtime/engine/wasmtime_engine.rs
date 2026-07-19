@@ -449,7 +449,11 @@ fn detect_stale_epoch_ticker() {
     }
     // Stale: emit at most ~once/60s (compare-and-swap so exactly one thread wins).
     let last_warn = EPOCH_TICKER_STALE_WARNED_MS.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(last_warn) >= 60_000
+    // `last_warn == 0` is the zero-init sentinel ("never warned"), NOT a real
+    // warning at base-epoch 0: allow the FIRST warn unconditionally, else an
+    // early ticker death is silently suppressed until now_ms reaches 60_000.
+    let should_warn = last_warn == 0 || now_ms.saturating_sub(last_warn) >= 60_000;
+    if should_warn
         && EPOCH_TICKER_STALE_WARNED_MS
             .compare_exchange(last_warn, now_ms, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
