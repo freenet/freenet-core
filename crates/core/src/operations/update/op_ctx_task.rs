@@ -174,6 +174,17 @@ async fn drive_client_update(
 ) -> Result<DriverOutcome, OpError> {
     let sender_addr = op_manager.ring.connection_manager.peer_addr()?;
 
+    // Whether this client update is a pure DELTA — the only convergence-proving
+    // merge, per the strictly-delta-only backoff-reset rule (#4861). Captured
+    // before `update_data` is moved into `update_contract` below; used to clear
+    // the merge-failure backoff when a local client's delta recovers a contract
+    // (#4864 review P2). A client full-state (State) update just replaces state
+    // and proves nothing, so it does NOT reset.
+    let is_delta_update = matches!(
+        &update_data,
+        UpdateData::Delta(_) | UpdateData::RelatedDelta { .. }
+    );
+
     // --- Find target peer (proximity cache → ring routing) ---
     // Mirrors request_update's target selection at update.rs:1871-1995.
 
@@ -284,7 +295,15 @@ async fn drive_client_update(
             )
             .await
             {
-                Ok(execution) => execution,
+                Ok(execution) => {
+                    // A successful client-local DELTA merge proves the contract's
+                    // merge works now — clear any merge-failure backoff so inbound
+                    // broadcasts resume (#4864 review P2, delta-only).
+                    if is_delta_update {
+                        op_manager.ring.merge_backoff.record_success(key.id());
+                    }
+                    execution
+                }
                 Err(err) if err.is_missing_contract_parameters() => {
                     tracing::error!(
                         tx = %client_tx,
@@ -372,7 +391,14 @@ async fn drive_client_update(
                 changed: _,
                 ..
             } = match local_apply {
-                Ok(execution) => execution,
+                Ok(execution) => {
+                    // Successful client-local DELTA merge on the remote-target
+                    // path clears the backoff too (#4864 review P2, delta-only).
+                    if is_delta_update {
+                        op_manager.ring.merge_backoff.record_success(key.id());
+                    }
+                    execution
+                }
                 Err(err) => {
                     // The wire format `UpdateMsg::RequestUpdate.value:
                     // WrappedState` carries a post-merge full state, so this
@@ -1211,6 +1237,12 @@ async fn drive_relay_broadcast_to(
     // WASM merge entirely and — critically — do NOT emit the ResyncRequest
     // amplification or clear the sender's cached summary. Complete exactly like
     // the dedup-skip path above. Cleared the instant a merge succeeds (below).
+    //
+    // The payload hash is computed EAGERLY even on the common Allow path (#4864
+    // review declined lazy-hash suggestion): a single ahash of the payload bytes
+    // is negligible next to the WASM merge it gates, and the hash is reused
+    // verbatim by `record_failure` in the error arm, so lazy computation would
+    // only duplicate the work on the failure path.
     let payload_hash = crate::ring::merge_backoff::merge_payload_hash(is_delta, &payload_bytes);
     match op_manager.ring.merge_backoff.check(key.id(), payload_hash) {
         crate::ring::merge_backoff::MergeDecision::Allow => {}
@@ -2725,6 +2757,33 @@ mod tests {
         );
     }
 
+    /// Pin (#4864 review P2): a successful client-local DELTA merge in
+    /// `drive_client_update` MUST reset the merge-failure backoff (so a contract
+    /// a local client recovers stops suppressing inbound broadcasts), gated
+    /// delta-only (a client full-state update proves nothing).
+    #[test]
+    fn client_local_delta_success_resets_backoff() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_client_update(")
+            .expect("drive_client_update not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        let body = &src[start..start + 1 + end];
+        let success = concat!("merge_backoff.record_", "success(");
+        assert!(
+            body.contains(success),
+            "drive_client_update must reset the backoff on a successful merge (#4864 P2)"
+        );
+        assert!(
+            body.contains("is_delta_update"),
+            "the client-local backoff reset must be gated delta-only (is_delta_update)"
+        );
+    }
+
     /// Pin: both relay drivers MUST gate on
     /// `active_relay_update_txs` to reject duplicate inbound
     /// messages for an in-flight tx (amplification guard).
@@ -3307,6 +3366,268 @@ mod tests {
             drain_resync_targets(&mut notification_rx, key).is_empty(),
             "a second streaming queue-full drop within the throttle window MUST \
              NOT emit another ResyncRequest (bounds #4251 amplification)"
+        );
+    }
+
+    /// A generic contract-exec rejection: `is_contract_exec_rejection() == true`
+    /// (recorded by the merge backoff as the Invalid class) but NOT
+    /// `is_invalid_update_rejection` (so the driver does not spawn summary-back)
+    /// and NOT a wasm timeout. Used by the behavioral backoff-gate tests.
+    #[cfg(test)]
+    fn exec_reject_err(key: ContractKey) -> crate::contract::ExecutorError {
+        crate::contract::ExecutorError::from(
+            freenet_stdlib::client_api::RequestError::ContractError(
+                freenet_stdlib::client_api::ContractError::update_exec_error(
+                    key,
+                    "contract merge failed (test poison)",
+                ),
+            ),
+        )
+    }
+
+    /// Like [`build_queue_full_test_node`], but the stand-in handler FAILS every
+    /// delta `UpdateQuery` with a generic contract-exec rejection (recorded by
+    /// the backoff) and SUCCEEDS every full-state `UpdateQuery`, while counting
+    /// the `UpdateQuery` events that reach it. `GetSummaryQuery` (from the
+    /// post-success proactive-summary spawn) is answered benignly. The counter
+    /// lets a test assert the backoff PREVENTS executor invocation (#4864 review
+    /// testing H1).
+    async fn build_exec_reject_test_node(
+        id: &str,
+    ) -> (
+        Arc<OpManager>,
+        crate::node::EventLoopNotificationsReceiver,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        Box<dyn std::any::Any>,
+    ) {
+        use std::sync::atomic::Ordering;
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        let self_addr: SocketAddr = "127.0.0.1:12000".parse().unwrap();
+        op_manager.ring.connection_manager.set_own_addr(self_addr);
+
+        let update_query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = update_query_count.clone();
+        let handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+                        key: None,
+                        response: Ok(StoreResponse {
+                            state: None,
+                            contract: None,
+                        }),
+                    },
+                    ContractHandlerEvent::GetSummaryQuery { key } => {
+                        ContractHandlerEvent::GetSummaryResponse {
+                            key,
+                            summary: Ok(StateSummary::from(Vec::new())),
+                        }
+                    }
+                    ContractHandlerEvent::UpdateQuery { key, data, .. } => {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        let is_delta = matches!(
+                            &data,
+                            UpdateData::Delta(_) | UpdateData::RelatedDelta { .. }
+                        );
+                        if is_delta {
+                            ContractHandlerEvent::UpdateResponse {
+                                new_value: Err(exec_reject_err(key)),
+                                state_changed: false,
+                            }
+                        } else {
+                            ContractHandlerEvent::UpdateResponse {
+                                new_value: Ok(WrappedState::from(vec![1u8, 2, 3])),
+                                state_changed: true,
+                            }
+                        }
+                    }
+                    other => {
+                        panic!("unexpected handler event in exec-reject stand-in: {other:?}")
+                    }
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let guard: Box<dyn std::any::Any> =
+            Box::new((handler, result_router_rx, task_monitor, wait_for_event));
+        (op_manager, notification_rx, update_query_count, guard)
+    }
+
+    /// #4864 review (testing H1): the load-bearing #4861 behavior — the backoff
+    /// PREVENTS executor invocation in the REAL driver. After the (N=3) Invalid
+    /// threshold trips, the next broadcast's merge is SKIPPED: no additional
+    /// `UpdateQuery` reaches the handler, the suppression metric is bumped, and
+    /// no `ResyncRequest` is emitted while suppressed.
+    #[tokio::test]
+    async fn backoff_gate_skips_merge_after_invalid_threshold_trips() {
+        use std::sync::atomic::Ordering;
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, update_queries, _guard) =
+            build_exec_reject_test_node("backoff-gate-4864").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([21u8; 32]),
+            CodeHash::new([22u8; 32]),
+        );
+        let sender: SocketAddr = "127.0.0.1:12200".parse().unwrap();
+
+        // Three consecutive delta failures (distinct bytes so none is a dedup
+        // hit) trip the Invalid threshold; each runs the merge → 1 UpdateQuery.
+        for bytes in [vec![1u8], vec![2u8], vec![3u8]] {
+            let r = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(bytes),
+                Vec::new(),
+                sender,
+            )
+            .await;
+            assert!(r.is_err(), "each poison delta must fail the merge");
+            let _ = drain_resync_targets(&mut notification_rx, key); // failure path may emit
+        }
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            3,
+            "3 failing merges reached the executor"
+        );
+        let suppressed_before = crate::config::GlobalTestMetrics::merges_suppressed_by_backoff();
+
+        // The 4th broadcast: the backoff has tripped → the merge is SKIPPED.
+        let r4 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![4u8]),
+            Vec::new(),
+            sender,
+        )
+        .await;
+        assert!(
+            r4.is_ok(),
+            "a suppressed broadcast completes Ok (like a dedup skip)"
+        );
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            3,
+            "the suppressed merge MUST NOT reach the executor (no 4th UpdateQuery)"
+        );
+        assert!(
+            crate::config::GlobalTestMetrics::merges_suppressed_by_backoff() > suppressed_before,
+            "the suppressed merge MUST bump merges_suppressed_by_backoff"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "no ResyncRequest may be emitted while the merge is suppressed"
+        );
+    }
+
+    /// #4864 review (testing #2): a full-state success does NOT reset the backoff
+    /// (strictly delta-only). Two delta failures + a full-state success leave the
+    /// consecutive count intact, so a 3rd delta failure still trips (proving no
+    /// reset) and the following delta is suppressed.
+    #[tokio::test]
+    async fn full_state_success_does_not_reset_backoff() {
+        use std::sync::atomic::Ordering;
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, update_queries, _guard) =
+            build_exec_reject_test_node("backoff-fullstate-noreset-4864").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([31u8; 32]),
+            CodeHash::new([32u8; 32]),
+        );
+        let sender: SocketAddr = "127.0.0.1:12300".parse().unwrap();
+
+        // Two delta failures (count = 2, below the trip threshold).
+        for bytes in [vec![1u8], vec![2u8]] {
+            let _ = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(bytes),
+                Vec::new(),
+                sender,
+            )
+            .await;
+            let _ = drain_resync_targets(&mut notification_rx, key);
+        }
+        // A full-state broadcast SUCCEEDS via the stand-in — but must NOT reset
+        // the consecutive count (strictly delta-only reset).
+        let ok = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::FullState(vec![9, 9, 9]),
+            Vec::new(),
+            sender,
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "full-state merge should succeed via the stand-in"
+        );
+        let _ = drain_resync_targets(&mut notification_rx, key);
+
+        // A 3rd delta failure now trips (count 2 → 3), proving the success did
+        // NOT reset it to 0 (else the count would only reach 1 here).
+        let _ = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![3u8]),
+            Vec::new(),
+            sender,
+        )
+        .await;
+        let _ = drain_resync_targets(&mut notification_rx, key);
+        let queries_after_trip = update_queries.load(Ordering::Relaxed);
+
+        // The following delta is SUPPRESSED (merge skipped) — the backoff tripped
+        // across the full-state success, so the count was never reset.
+        let r = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![4u8]),
+            Vec::new(),
+            sender,
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            queries_after_trip,
+            "the backoff tripped across the full-state success (no reset) — the \
+             following delta merge is skipped"
         );
     }
 
