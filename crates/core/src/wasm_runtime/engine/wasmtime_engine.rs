@@ -146,8 +146,8 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use wasmtime::{
-    Cache, CacheConfig, Caller, Config, Engine, Error as WasmtimeError, Instance, Linker, Module,
-    OptLevel, ResourceLimiter, Store,
+    Cache, CacheConfig, Caller, Config, Engine, EngineWeak, Error as WasmtimeError, Instance,
+    Linker, Module, OptLevel, ResourceLimiter, Store,
 };
 
 use super::{InstanceHandle, WasmEngine, WasmError};
@@ -316,6 +316,109 @@ const STORE_REFRESH_THRESHOLD: u64 = 500;
 /// should never fire under normal operation.
 const STORE_MAX_AGE: Duration = Duration::from_secs(4 * 3600);
 
+/// Period between global epoch increments (#4861).
+///
+/// Wasmtime's wall-clock timeout (`execute_wasm_blocking`) can only `abort()`
+/// the *tokio task* wrapping a contract call; it cannot stop synchronous WASM
+/// already running on the blocking thread, so a runaway guest (an infinite
+/// loop, a pathological merge) keeps burning a whole thread arbitrarily long
+/// after "WASM execution timed out". With `enable_metering = false` (the
+/// production default) there is no fuel to run out either. Epoch interruption
+/// is the mechanism that actually preempts the guest: wasmtime inserts an epoch
+/// check at every loop backedge and function entry, so once the engine's epoch
+/// passes a store's armed deadline the guest traps at the next check.
+///
+/// A single background thread increments the epoch of every live engine every
+/// `EPOCH_TICK_PERIOD`. Combined with a per-execution deadline of
+/// `ceil(max_execution_seconds / EPOCH_TICK_PERIOD)` ticks (see
+/// [`epoch_deadline_ticks`]) this bounds a runaway guest to roughly
+/// `max_execution_seconds` (+ up to one tick of slack) rather than unbounded.
+const EPOCH_TICK_PERIOD: Duration = Duration::from_millis(100);
+
+/// Registry of live engines the epoch ticker drives.
+///
+/// Holds `EngineWeak` (not `Engine`) so a dropped engine is reclaimed: the
+/// ticker prunes any weak ref that no longer upgrades on its next pass, and the
+/// registry never keeps an otherwise-dead engine alive.
+fn epoch_engine_registry() -> &'static Mutex<Vec<EngineWeak>> {
+    static REG: OnceLock<Mutex<Vec<EngineWeak>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register `engine` with the global epoch ticker, starting the ticker thread
+/// on first use. Called once per freshly-created backend engine (in
+/// [`WasmtimeEngine::create_engine`]); clones sharing the same backend
+/// (`new_with_shared_backend`) share the one registered weak ref, since
+/// `increment_epoch` on a shared `Engine` covers all its stores.
+fn register_engine_for_epoch(engine: &Engine) {
+    epoch_engine_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(engine.weak());
+    start_epoch_ticker();
+}
+
+/// Lazily start the single process-wide epoch ticker thread.
+fn start_epoch_ticker() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let spawn = std::thread::Builder::new()
+            .name("wasm-epoch-ticker".to_string())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(EPOCH_TICK_PERIOD);
+                    let mut reg = epoch_engine_registry()
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    // Increment every live engine's epoch; drop dead weak refs.
+                    reg.retain(|weak| match weak.upgrade() {
+                        Some(engine) => {
+                            engine.increment_epoch();
+                            true
+                        }
+                        None => false,
+                    });
+                }
+            });
+        if let Err(e) = spawn {
+            // Extremely unlikely (thread-spawn failure). Without the ticker the
+            // epoch deadline never advances, so timeouts fall back to the
+            // wall-clock poll in `execute_wasm_blocking` (the pre-#4861
+            // behavior) — degraded, not broken.
+            tracing::error!("failed to spawn wasm-epoch-ticker thread: {e}");
+        }
+    });
+}
+
+/// Number of epoch ticks that make up one execution deadline: the store traps
+/// after this many [`Engine::increment_epoch`] calls (~`EPOCH_TICK_PERIOD`
+/// each). `ceil(max_execution_seconds / tick)`, floored at 1 so a tiny
+/// configured timeout still gets at least one tick before tripping.
+fn epoch_deadline_ticks(max_execution_seconds: f64) -> u64 {
+    let tick_secs = EPOCH_TICK_PERIOD.as_secs_f64();
+    let ticks = (max_execution_seconds / tick_secs).ceil();
+    (ticks as u64).max(1)
+}
+
+/// Arm `store`'s epoch deadline for ONE guest execution.
+///
+/// Must be called before every call that runs guest (wasm) code. With epoch
+/// interruption enabled a store traps the instant the current engine epoch has
+/// reached its deadline, and the deadline is relative to the epoch at arm time —
+/// so an un-re-armed store inherits a stale (already-elapsed) deadline and the
+/// guest traps immediately. `epoch_deadline_trap()` selects trap-on-deadline
+/// (NOT `epoch_deadline_async_yield_and_update`): a runaway guest is killed, not
+/// paused-and-resumed.
+///
+/// Only GUEST code is interrupted — wasmtime's epoch checks live at wasm loop
+/// backedges and function entries. A blocking HOST-function call in progress is
+/// never cut off mid-flight; the trap can only fire once control returns to
+/// guest code. So a slow host call completes normally.
+fn arm_epoch_deadline(store: &mut Store<HostState>, ticks: u64) {
+    store.set_epoch_deadline(ticks);
+    store.epoch_deadline_trap();
+}
+
 /// Wasmtime 27.x backend implementation.
 pub(crate) struct WasmtimeEngine {
     /// The wasmtime Engine (shared, Arc-wrapped internally).
@@ -334,6 +437,12 @@ pub(crate) struct WasmtimeEngine {
     enabled_metering: bool,
     /// Max fuel for each execution (computed from max_execution_seconds).
     max_fuel: u64,
+    /// Epoch-deadline ticks armed before each guest execution (#4861). Computed
+    /// once from `max_execution_seconds` (see [`epoch_deadline_ticks`]); the
+    /// store traps after this many global epoch increments if the guest hasn't
+    /// returned. This is the real preemption backstop behind the wall-clock
+    /// timeout — see [`EPOCH_TICK_PERIOD`].
+    epoch_deadline_ticks: u64,
     /// Instances created in the current Store; reset on `replace_store`.
     /// See [`STORE_REFRESH_THRESHOLD`].
     lifetime_instances: u64,
@@ -424,11 +533,15 @@ impl WasmEngine for WasmtimeEngine {
         Self::register_host_functions(&mut linker)?;
 
         // Create the store with HostState
+        let epoch_deadline_ticks = epoch_deadline_ticks(config.max_execution_seconds);
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         store.limiter(|state| state); // Enable ResourceLimiter
         if enabled_metering {
             store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
         }
+        // Arm the initial deadline + select trap behavior; every guest call
+        // re-arms it (see `arm_epoch_deadline`).
+        arm_epoch_deadline(&mut store, epoch_deadline_ticks);
 
         // Host memory sharing is not yet implemented in the wasmtime backend.
         // Fail explicitly rather than silently degrading.
@@ -448,6 +561,7 @@ impl WasmEngine for WasmtimeEngine {
             max_execution_seconds: config.max_execution_seconds,
             enabled_metering,
             max_fuel,
+            epoch_deadline_ticks,
             lifetime_instances: 0,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
@@ -522,6 +636,11 @@ impl WasmEngine for WasmtimeEngine {
                 .set_fuel(self.max_fuel)
                 .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
         }
+
+        // Arm the epoch deadline before instantiation runs any guest start
+        // function (#4861); the store is reused across calls so a stale deadline
+        // would otherwise trap here.
+        arm_epoch_deadline(store, self.epoch_deadline_ticks);
 
         // Instantiate the module using the pre-configured linker
         // CRITICAL: Must use instantiate_async() because async_support(true) is enabled
@@ -607,6 +726,7 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<u32, i64>(&mut *store, "__frnt__initiate_buffer")
             .map_err(|e| WasmError::Export(e.to_string()))?;
+        arm_epoch_deadline(store, self.epoch_deadline_ticks);
         // CRITICAL: Must use call_async() because async_support(true) is enabled
         block_on_async(func.call_async(&mut *store, size))
             .map_err(|e| WasmError::Runtime(e.to_string()))
@@ -614,6 +734,7 @@ impl WasmEngine for WasmtimeEngine {
 
     fn call_void(&mut self, handle: &InstanceHandle, name: &str) -> Result<(), WasmError> {
         let enabled_metering = self.enabled_metering;
+        let epoch_ticks = self.epoch_deadline_ticks;
         let store = self
             .store
             .as_mut()
@@ -625,6 +746,7 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<(), ()>(&mut *store, name)
             .map_err(|e| WasmError::Export(e.to_string()))?;
+        arm_epoch_deadline(store, epoch_ticks);
         // Use call_async because async_support(true) is enabled in the engine Config
         block_on_async(func.call_async(&mut *store, ()))
             .map_err(|e| classify_runtime_error(enabled_metering, store, e))
@@ -639,6 +761,7 @@ impl WasmEngine for WasmtimeEngine {
         c: i64,
     ) -> Result<i64, WasmError> {
         let enabled_metering = self.enabled_metering;
+        let epoch_ticks = self.epoch_deadline_ticks;
         let store = self
             .store
             .as_mut()
@@ -650,6 +773,7 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<(i64, i64, i64), i64>(&mut *store, name)
             .map_err(|e| WasmError::Export(e.to_string()))?;
+        arm_epoch_deadline(store, epoch_ticks);
         // Use call_async because async_support(true) is enabled in the engine Config
         block_on_async(func.call_async(&mut *store, (a, b, c)))
             .map_err(|e| classify_runtime_error(enabled_metering, store, e))
@@ -683,6 +807,7 @@ impl WasmEngine for WasmtimeEngine {
             .get_typed_func::<(i64, i64, i64), i64>(&mut *store, name)
             .map_err(|e| WasmError::Export(e.to_string()))?;
 
+        arm_epoch_deadline(store, self.epoch_deadline_ticks);
         // Call the async-aware function using block_on_async
         let result = block_on_async(func.call_async(&mut *store, (a, b, c)));
         result.map_err(|e| classify_runtime_error(self.enabled_metering, store, e))
@@ -719,6 +844,11 @@ impl WasmEngine for WasmtimeEngine {
                 return Err(WasmError::Export(e.to_string()));
             }
         };
+
+        // Arm the epoch deadline before the guest runs on the blocking thread
+        // (#4861). The wall-clock poll below is a backstop; the epoch trap is
+        // what actually stops a runaway synchronous guest.
+        arm_epoch_deadline(&mut store, self.epoch_deadline_ticks);
 
         let result = execute_wasm_blocking(
             move || {
@@ -782,6 +912,12 @@ impl WasmEngine for WasmtimeEngine {
                 return Err(WasmError::Export(e.to_string()));
             }
         };
+
+        // Arm the epoch deadline before the guest runs on the blocking thread
+        // (#4861). This is the primary contract merge/validate path — the wall-
+        // clock poll below only aborts the tokio task, so the epoch trap is what
+        // actually stops a runaway synchronous guest that ignores the timeout.
+        arm_epoch_deadline(&mut store, self.epoch_deadline_ticks);
 
         let result = execute_wasm_blocking(
             move || {
@@ -899,11 +1035,13 @@ impl WasmtimeEngine {
         let mut linker = Linker::new(&backend);
         Self::register_host_functions(&mut linker)?;
 
+        let epoch_deadline_ticks = epoch_deadline_ticks(config.max_execution_seconds);
         let mut store = Store::new(&backend, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         store.limiter(|state| state);
         if enabled_metering {
             store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
         }
+        arm_epoch_deadline(&mut store, epoch_deadline_ticks);
 
         if host_mem {
             return Err(anyhow::anyhow!(
@@ -922,6 +1060,7 @@ impl WasmtimeEngine {
             max_execution_seconds: config.max_execution_seconds,
             enabled_metering,
             max_fuel,
+            epoch_deadline_ticks,
             lifetime_instances: 0,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
@@ -936,6 +1075,16 @@ impl WasmtimeEngine {
         if config.enable_metering {
             wasmtime_config.consume_fuel(true);
         }
+
+        // Enable epoch-based interruption unconditionally (#4861). This is the
+        // only mechanism that actually preempts a synchronous runaway guest: the
+        // wall-clock timeout can only abort the wrapping tokio task, and metering
+        // (fuel) is off by default. Each store arms a per-execution deadline (see
+        // `arm_epoch_deadline`) and a background thread advances the epoch (see
+        // `register_engine_for_epoch` below / `EPOCH_TICK_PERIOD`). Note: this is
+        // part of the engine's compile-cache key, so enabling it recompiles
+        // cached modules once on upgrade.
+        wasmtime_config.epoch_interruption(true);
 
         // Set memory limits via config
         // async_stack_size must exceed max_wasm_stack
@@ -1056,6 +1205,11 @@ impl WasmtimeEngine {
         let engine =
             Engine::new(&wasmtime_config).map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
+        // Drive this engine's epoch from the global ticker so armed store
+        // deadlines actually elapse (#4861). Registered once per fresh backend
+        // engine; `new_with_shared_backend` reuses the already-registered one.
+        register_engine_for_epoch(&engine);
+
         Ok((engine, max_fuel, config.enable_metering))
     }
 
@@ -1086,6 +1240,10 @@ impl WasmtimeEngine {
                 tracing::error!("Failed to set fuel on replacement store: {e}");
             }
         }
+        // Re-arm the epoch deadline on the fresh store; every guest call re-arms
+        // again, but arming here keeps the invariant "a live store always has a
+        // future deadline" (an un-armed epoch store traps immediately).
+        arm_epoch_deadline(&mut store, self.epoch_deadline_ticks);
         self.instances.clear();
         self.store = Some(store);
         self.lifetime_instances = 0;
@@ -1492,6 +1650,19 @@ fn classify_runtime_error(
     store: &mut Store<HostState>,
     error: WasmtimeError,
 ) -> WasmError {
+    // An epoch-deadline trap (`Trap::Interrupt`) is our execution-timeout
+    // mechanism firing (#4861): the guest ran past the armed deadline and
+    // wasmtime interrupted it at an epoch check. Classify it as a timeout (not a
+    // generic runtime error) so it flows to `ContractExecError::
+    // MaxComputeTimeExceeded` exactly like the wall-clock `BlockingResult::
+    // Timeout` path, keeping the "timed out" classification consistent. Checked
+    // first because it is a timeout regardless of whether metering is on.
+    if let Some(trap) = error.downcast_ref::<wasmtime::Trap>() {
+        if matches!(trap, wasmtime::Trap::Interrupt) {
+            tracing::warn!("WASM execution timed out (epoch deadline exceeded)");
+            return WasmError::Timeout;
+        }
+    }
     if enabled_metering {
         // Check if we ran out of fuel
         if let Ok(remaining) = store.get_fuel() {
@@ -1700,6 +1871,77 @@ mod tests {
         let handle = engine.create_instance(&module, 0, 1024).unwrap();
         engine.drop_instance(&handle);
         assert!(engine.module_compiled_size(&module) > 0);
+    }
+
+    /// WAT for a contract-shaped export that never returns — an infinite loop.
+    /// Signature `(i64,i64,i64)->i64` matches `call_3i64_blocking`'s typed call;
+    /// `unreachable` after the loop satisfies the result type regardless of the
+    /// loop's reachability analysis.
+    const INFINITE_LOOP_WAT: &str = r#"
+        (module
+          (func (export "spin") (param i64 i64 i64) (result i64)
+            (loop $l (br $l))
+            unreachable))
+    "#;
+
+    /// REGRESSION (#4861): epoch-based preemption must actually STOP a runaway
+    /// (infinite-loop) guest.
+    ///
+    /// With metering off (the production default) there is no fuel to exhaust,
+    /// and the wall-clock "timeout" in `execute_wasm_blocking` only aborts the
+    /// *tokio task* wrapping the call — the synchronous guest keeps burning its
+    /// blocking thread forever. Epoch interruption is the only thing that
+    /// preempts it. This test runs the infinite loop with **no wall-clock
+    /// wrapper at all**, so the ONLY thing that can make the call return is the
+    /// global epoch ticker tripping the store's armed deadline. If preemption
+    /// regresses, the call never returns and the test hangs (harness timeout =
+    /// failure).
+    #[test]
+    fn epoch_preemption_stops_infinite_loop() {
+        // create_backend_engine enables epoch_interruption AND registers the
+        // engine with the global epoch ticker (100ms period). Metering off.
+        let config = RuntimeConfig {
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let engine = WasmtimeEngine::create_backend_engine(&config).unwrap();
+        let module = Module::new(&engine, INFINITE_LOOP_WAT.as_bytes())
+            .expect("infinite-loop WAT must compile");
+
+        let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        store.limiter(|s| s);
+        // Short deadline (2 ticks ≈ 200ms) so the test is fast; trap-on-deadline.
+        arm_epoch_deadline(&mut store, 2);
+
+        let instance = block_on_async(Linker::new(&engine).instantiate_async(&mut store, &module))
+            .expect("instantiation must succeed");
+        let func = instance
+            .get_typed_func::<(i64, i64, i64), i64>(&mut store, "spin")
+            .expect("spin export must exist");
+
+        let start = std::time::Instant::now();
+        let result = block_on_async(func.call_async(&mut store, (0, 0, 0)));
+        let elapsed = start.elapsed();
+
+        let err = result
+            .expect_err("infinite loop must be preempted by the epoch deadline, not run forever");
+        // Bounded return proves the guest was actually stopped (generous 5s
+        // ceiling = ~200ms deadline + ticker phase + CI slack).
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "epoch preemption took too long ({elapsed:?}) — guest was not stopped promptly"
+        );
+        // The trap must be the epoch interrupt, and classify as a timeout so it
+        // flows to ContractExecError::MaxComputeTimeExceeded.
+        assert!(
+            err.downcast_ref::<wasmtime::Trap>()
+                .is_some_and(|t| matches!(t, wasmtime::Trap::Interrupt)),
+            "preemption must surface as a Trap::Interrupt, got: {err:?}"
+        );
+        assert!(
+            matches!(classify_runtime_error(false, &mut store, err), WasmError::Timeout),
+            "epoch-deadline trap must classify as WasmError::Timeout"
+        );
     }
 
     /// REGRESSION (issue #4441 fix-up): with `offload_compilation = true` on a
