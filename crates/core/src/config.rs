@@ -177,7 +177,7 @@ pub struct ConfigArgs {
     /// until it fits. Bounding by bytes (not entry count) stops a node hosting
     /// many contracts from thrashing the cache and recompiling on every access
     /// (issue #4441). When unset, the default scales with system RAM
-    /// (`clamp(total_ram / 8, 64 MiB, 1.5 GiB)`); set this to override.
+    /// (`clamp(total_ram / 8, 64 MiB, 4 GiB)`); set this to override.
     #[arg(long, env = "FREENET_MODULE_CACHE_BUDGET_BYTES")]
     pub module_cache_budget_bytes: Option<usize>,
 

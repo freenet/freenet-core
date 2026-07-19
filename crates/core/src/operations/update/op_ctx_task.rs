@@ -3939,6 +3939,95 @@ mod tests {
         );
     }
 
+    /// #4864 round-4 (item 9): a memoized payload replayed through the REAL
+    /// `drive_relay_broadcast_to` by a SECOND sender is hard-skipped — the merge
+    /// never reaches the executor, that sender's Invalid channel never trips (its
+    /// OWN novel delta still merges), and no ResyncRequest is emitted. Seed the
+    /// memo directly with THREE DISTINCT payloads (so each replay is a genuine
+    /// memo hit rather than a `BroadcastDedupCache` hit — the dedup cache is
+    /// content-addressed too, so an identical replay would be swallowed by dedup
+    /// before reaching the backoff gate).
+    #[tokio::test]
+    async fn memoized_payload_replay_from_second_sender_is_hard_skipped() {
+        use std::sync::atomic::Ordering;
+        crate::config::GlobalTestMetrics::reset();
+        let (op_manager, mut notification_rx, update_queries, _guard) =
+            build_exec_reject_test_node("memo-replay-4864").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([83u8; 32]),
+            CodeHash::new([84u8; 32]),
+        );
+        let sender_a: SocketAddr = "127.0.0.1:13300".parse().unwrap();
+        let sender_b: SocketAddr = "127.0.0.1:13400".parse().unwrap();
+
+        // Seed the contract-wide memo with three distinct poison delta payloads
+        // (as if sender A had already failed them). record_failure memoizes each.
+        let poisons = [vec![91u8], vec![92u8], vec![93u8]];
+        for p in &poisons {
+            let h = crate::ring::merge_backoff::merge_payload_hash(true, p);
+            op_manager.ring.merge_backoff.record_failure(
+                key.id(),
+                sender_a,
+                crate::ring::merge_backoff::MergeFailureClass::Invalid,
+                h,
+            );
+        }
+
+        // Sender B replays each memoized payload: each is a hard memo skip.
+        for p in &poisons {
+            let r = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                key,
+                DeltaOrFullState::Delta(p.clone()),
+                Vec::new(),
+                sender_b,
+            )
+            .await;
+            assert!(
+                r.is_ok(),
+                "a memoized-payload skip completes Ok (like a dedup skip)"
+            );
+        }
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            0,
+            "B's replays of memoized payloads MUST NOT reach the executor"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::merges_suppressed_by_backoff(),
+            poisons.len() as u64,
+            "each replay must be a memo skip (bumps merges_suppressed_by_backoff), \
+             not a dedup skip"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "a memo skip must NOT emit a ResyncRequest"
+        );
+
+        // B's channel never tripped — its OWN novel delta still reaches the merge.
+        let novel = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![94u8]),
+            Vec::new(),
+            sender_b,
+        )
+        .await;
+        let _ = drain_resync_targets(&mut notification_rx, key);
+        assert!(
+            novel.is_err(),
+            "B's novel delta reaches the merge (fails via stand-in)"
+        );
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            1,
+            "B's novel delta MUST reach the executor — the memo skips never advanced \
+             B's channel"
+        );
+    }
+
     /// #4864 review item 6: a successful client-local DELTA driven through the
     /// REAL `drive_client_update` clears the CONTRACT-WIDE side (Timeout + memo)
     /// via `record_success_local`, but must NOT clear a remote sender's Invalid

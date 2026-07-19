@@ -192,12 +192,18 @@ const MAX_FAILED_PAYLOADS_PER_CONTRACT: usize = 32;
 /// Hard cap on tracked keys per map. At ~200 bytes/entry, 16 384 ≈ 3 MB. Bounds
 /// the worst case where an attacker chooses fresh contract ids or sender ports.
 pub(crate) const MAX_TRACKED_CONTRACTS: usize = 16_384;
-/// Idle-entry cleanup grace period. An entry past its cooldown is retained until
-/// it has been idle (no new failure) this long, preserving the failure counter
-/// across consecutive failure→cooldown→retry cycles. Aligned with the longest
-/// cooldown ([`TIMEOUT_CAP`]) so a contract still in a long cooldown is never
-/// dropped early.
-const CLEANUP_AGE: Duration = TIMEOUT_CAP;
+/// Idle-entry cleanup grace for the per-sender `Invalid` map (#4864 round-4 M3).
+/// An entry past its cooldown is retained until idle (no new failure) this long,
+/// preserving the failure counter across a failure→cooldown→retry cycle. Scaled
+/// to the longest Invalid cooldown ([`INVALID_CAP`], 30 min) rather than the
+/// contract-map's 2h grace — that shrinks the port-flood fill-persistence window
+/// ~4x (a peer churning fresh source ports can occupy an `Invalid` slot for at
+/// most this long past its last failure) while still spanning any Invalid cooldown.
+const INVALID_CLEANUP_AGE: Duration = INVALID_CAP;
+/// Idle-entry cleanup grace for the contract-wide map. Aligned with the longest
+/// cooldown ([`TIMEOUT_CAP`], 2h) so a contract still in a long Timeout cooldown
+/// is never dropped early.
+const CONTRACT_CLEANUP_AGE: Duration = TIMEOUT_CAP;
 
 /// Compute the memoization/dedup hash for a broadcast payload. Mirrors
 /// [`crate::operations::update::BroadcastDedupCache`]: includes the `is_delta`
@@ -331,8 +337,8 @@ impl Cooldown {
         now >= self.next_allowed
     }
 
-    fn idle(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_failure) > CLEANUP_AGE
+    fn idle(&self, now: Instant, grace: Duration) -> bool {
+        now.saturating_duration_since(self.last_failure) > grace
     }
 }
 
@@ -417,14 +423,15 @@ impl MergeBackoff {
     /// Decide whether a merge for `contract` presented by `sender` with the given
     /// payload should run.
     ///
-    /// Suppression kicks in ONLY once the relevant channel has failed at least
-    /// `class.trip_threshold()` times consecutively without an intervening
-    /// success (#4864 review M1): the presenting sender's `Invalid` channel, or
-    /// the contract's `Timeout` channel. `KnownFailedPayload` (contract-wide,
-    /// content-addressed) takes precedence over `InBackoff`, but only once the
-    /// contract is quarantined for this sender (sender Invalid tripped OR
-    /// contract Timeout tripped) so a benign first reject is never suppressed.
-    /// Bumps `suppressed_total` on any non-`Allow` outcome.
+    /// Cooldown suppression (`InBackoff`) kicks in ONLY once the relevant channel
+    /// has failed at least `class.trip_threshold()` times consecutively without
+    /// an intervening success (#4864 review M1): the presenting sender's
+    /// `Invalid` channel, or the contract's `Timeout` channel. `KnownFailedPayload`
+    /// (contract-wide, content-addressed) is a HARD skip with NO trip gate — an
+    /// exact payload that already failed is skipped for ANY sender the instant it
+    /// is memoized (execution is deterministic, so the same bytes fail
+    /// identically for everyone), and it takes precedence over `InBackoff`. Bumps
+    /// `suppressed_total` on any non-`Allow` outcome.
     ///
     /// Reads the two maps sequentially and never holds both shard guards at once
     /// (no cross-map lock order); the tiny TOCTOU window against a concurrent
@@ -621,14 +628,16 @@ impl MergeBackoff {
     }
 
     /// Drop entries whose cooldown has elapsed AND that have been idle longer
-    /// than [`CLEANUP_AGE`]; prune per-entry expired payload memos. Call from the
-    /// Ring reaper. Bounds memory as idle contracts/senders roll off.
+    /// than the per-map grace ([`INVALID_CLEANUP_AGE`] for the Invalid map,
+    /// [`CONTRACT_CLEANUP_AGE`] for the contract map); prune per-entry expired
+    /// payload memos. Call from the Ring reaper. Bounds memory as idle
+    /// contracts/senders roll off.
     pub fn cleanup_expired(&self) {
         let now = self.time_source.now();
 
         let mut removed_invalid = 0usize;
         self.invalid_by_sender.retain(|_, cd| {
-            if cd.past_cooldown(now) && cd.idle(now) {
+            if cd.past_cooldown(now) && cd.idle(now, INVALID_CLEANUP_AGE) {
                 removed_invalid += 1;
                 return false;
             }
@@ -643,7 +652,7 @@ impl MergeBackoff {
         self.contract.retain(|_, cs| {
             cs.prune_payloads(now);
             let past_cooldown = cs.timeout.past_cooldown(now);
-            let idle = now.saturating_duration_since(cs.last_touch) > CLEANUP_AGE;
+            let idle = now.saturating_duration_since(cs.last_touch) > CONTRACT_CLEANUP_AGE;
             if past_cooldown && cs.failed_payloads.is_empty() && idle {
                 removed_contract += 1;
                 return false;
@@ -1153,25 +1162,39 @@ mod tests {
         );
     }
 
+    /// #4864 round-4 M3: the per-sender `Invalid` map uses a SHORTER idle grace
+    /// ([`INVALID_CLEANUP_AGE`], 30 min) than the contract map
+    /// ([`CONTRACT_CLEANUP_AGE`], 2 h), so a port-flood's `Invalid` slots roll off
+    /// ~4x sooner while the contract-wide entry keeps its longer grace.
     #[test]
-    fn cleanup_removes_idle_expired_entries() {
+    fn cleanup_uses_per_class_idle_grace() {
         let (b, ts) = mk();
         let c = mk_contract(1);
         let s = mk_addr(10);
         b.record_failure(&c, s, MergeFailureClass::Invalid, 1);
         assert_eq!(b.invalid_len(), 1);
         assert_eq!(b.contract_len(), 1);
-        ts.advance_time(CLEANUP_AGE + Duration::from_secs(1));
+        // Past the SHORTER Invalid grace: the per-sender channel is swept, but the
+        // contract entry (longer grace) is retained.
+        ts.advance_time(INVALID_CLEANUP_AGE + Duration::from_secs(1));
         b.cleanup_expired();
         assert_eq!(
             b.invalid_len(),
             0,
-            "idle expired sender channel must be swept"
+            "idle Invalid channel must be swept after INVALID_CLEANUP_AGE"
         );
         assert_eq!(
             b.contract_len(),
+            1,
+            "contract entry keeps the longer CONTRACT_CLEANUP_AGE grace"
+        );
+        // Past the contract grace too: the contract entry is swept.
+        ts.advance_time(CONTRACT_CLEANUP_AGE);
+        b.cleanup_expired();
+        assert_eq!(
+            b.contract_len(),
             0,
-            "idle expired contract entry must be swept"
+            "idle contract entry must be swept after CONTRACT_CLEANUP_AGE"
         );
         assert_eq!(b.invalid_size.load(Ordering::Relaxed), 0);
         assert_eq!(b.contract_size.load(Ordering::Relaxed), 0);
