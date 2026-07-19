@@ -2073,7 +2073,16 @@ async fn apply_streaming_broadcast(
         ..
     } = match update_result {
         Ok(exec) => {
-            op_manager.ring.merge_backoff.record_success(key.id());
+            // Strictly delta-only reset (#4861): a streaming full-state broadcast
+            // merge is mechanically the SAME operation as a ResyncResponse apply
+            // (a WASM merge of an incoming FULL STATE), so the fork-oscillation
+            // trap applies identically — a large forked contract would oscillate
+            // via streaming full states and reset its own backoff on every flip,
+            // so the backoff would never trip. Only a clean DELTA apply proves the
+            // receiver shared the sender's base (genuine convergence). Streaming
+            // is always full state, so it NEVER resets the backoff here; a
+            // recovered contract's entry simply ages out via the reaper if
+            // failures stop.
             exec
         }
         Err(err) => {
@@ -2667,15 +2676,18 @@ mod tests {
         );
     }
 
-    /// Pin (#4861): the streaming full-state driver must carry the same
+    /// Pin (#4861): the streaming full-state merge path must carry the same
     /// backoff gate + record wiring (a poison contract must be quarantined on
-    /// the streaming path too).
+    /// the streaming path too). The streaming merge logic lives in
+    /// `apply_streaming_broadcast` (steps 4-9), which
+    /// `drive_relay_broadcast_to_streaming` delegates to after assembling the
+    /// stream — scrape that function, not the thin transport wrapper.
     #[test]
     fn broadcast_to_streaming_has_backoff_wiring() {
         let src = include_str!("op_ctx_task.rs");
         let start = src
-            .find("async fn drive_relay_broadcast_to_streaming(")
-            .expect("streaming driver not found");
+            .find("async fn apply_streaming_broadcast(")
+            .expect("apply_streaming_broadcast (streaming merge path) not found");
         let after = &src[start + 1..];
         let end = after
             .find("\nasync fn ")
@@ -2688,22 +2700,28 @@ mod tests {
         // pushes the chain over the chain-width limit).
         let backoff_pos = driver_src
             .find(".check(key.id(), stream_payload_hash)")
-            .expect("streaming driver missing merge_backoff.check gate");
+            .expect("streaming merge path missing merge_backoff.check gate");
         let merge_pos = driver_src
             .find("super::update_contract(")
-            .expect("streaming driver missing update_contract");
+            .expect("streaming merge path missing update_contract");
         assert!(
             backoff_pos < merge_pos,
-            "streaming driver's merge_backoff.check MUST run before update_contract"
+            "streaming merge_backoff.check MUST run before update_contract"
         );
+        // Strictly delta-only reset (#4861): streaming is always full state, and
+        // a full-state merge is the same fork-flippable operation as a resync
+        // apply, so the streaming path must NOT reset the backoff. (Assemble
+        // the needle so this literal is not a self-referential match.)
+        let record_success = concat!("record_", "success(");
         assert!(
-            driver_src.contains("merge_backoff.record_success("),
-            "streaming driver must clear the backoff on a successful merge"
+            !driver_src.contains(record_success),
+            "streaming path must NOT reset the backoff — a full-state merge is \
+             not convergence evidence (only a clean DELTA apply is). See #4861."
         );
         assert!(
             driver_src.contains(".record_failure(")
                 && driver_src.contains("is_contract_exec_rejection()"),
-            "streaming driver must record gated failures like the non-streaming driver"
+            "streaming path must record gated failures like the non-streaming driver"
         );
     }
 
