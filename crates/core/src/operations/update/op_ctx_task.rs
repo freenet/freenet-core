@@ -1099,7 +1099,7 @@ async fn drive_relay_request_update(
 /// Issue #4251 suppressed this entirely because one request per dropped delta
 /// amplifies into a full-state storm onto the same saturated queue (~40
 /// ResyncRequests/sec on a hot contract). The rate limit
-/// (`InterestManager::should_send_resync_request`) bounds that to at most one
+/// (`InterestManager::begin_resync_request`) bounds that to at most one
 /// request per (contract, sender) per `RESYNC_REQUEST_MIN_INTERVAL`.
 ///
 /// Shared by both broadcast drivers (`drive_relay_broadcast_to` and
@@ -1114,15 +1114,17 @@ async fn send_queue_full_resync_request(
     sender_addr: SocketAddr,
     incoming_tx: Transaction,
 ) {
-    // PEEK the per-(contract, sender)/30s throttle WITHOUT recording (#4864
-    // round-5 item 9). This heal is double-gated (this per-sender throttle AND the
-    // global emit cap below); recording the window here and then being suppressed
-    // by the global cap would burn the 30s window with no emit, blocking this
-    // (contract, sender) from retrying for up to 30s after the global cap's tokens
-    // refill. The window is recorded ONLY when the emit actually happens (below).
+    // RESERVE the per-(contract, sender)/30s throttle window atomically (#4864
+    // round-6 item 2). `begin` checks AND records under the throttle's own lock,
+    // so two concurrent queue-full callbacks for the same (contract, sender)
+    // cannot both pass this gate and go on to both consume the global burst +
+    // emit duplicates inside the window. If the global cap then rejects, we
+    // `cancel` the reservation below (releasing the window) — preserving the
+    // round-5 improvement that a globally-suppressed emit does not burn the 30s
+    // window.
     if !op_manager
         .interest_manager
-        .peek_should_send_resync_request(&key, sender_addr)
+        .begin_resync_request(&key, sender_addr)
     {
         // Per-(contract, sender)/30s throttle (existing #4857 bound).
         tracing::debug!(
@@ -1142,13 +1144,16 @@ async fn send_queue_full_resync_request(
     // emission. (This is NOT a mirror of the delta-failure path — that path is
     // global-cap-only, with no per-sender throttle. The global suppression records
     // the same `record_resync_request_suppressed` metric node.rs does.) On
-    // suppression, the per-sender window is NOT recorded (see the peek above), so
+    // suppression, CANCEL the reservation so the per-sender window is released and
     // the sender retries as soon as global tokens refill.
     if !op_manager
         .ring
         .resync_emit_limiter
         .check_and_record(*key.id())
     {
+        op_manager
+            .interest_manager
+            .cancel_resync_request(&key, sender_addr);
         crate::config::GlobalTestMetrics::record_resync_request_suppressed();
         tracing::debug!(
             tx = %incoming_tx,
@@ -1160,10 +1165,7 @@ async fn send_queue_full_resync_request(
         return;
     }
 
-    // Both gates passed → NOW record the per-sender throttle window and emit.
-    op_manager
-        .interest_manager
-        .record_resync_request_sent(&key, sender_addr);
+    // Both gates passed → the reservation stands (already recorded by `begin`).
     tracing::info!(
         tx = %incoming_tx,
         contract = %key,
@@ -3116,7 +3118,7 @@ mod tests {
     /// emit it unthrottled (full-state storm, #4251). Both route through the
     /// shared `send_queue_full_resync_request` helper, which gates the
     /// `InterestMessage::ResyncRequest` emit behind BOTH the per-(contract, sender)
-    /// `should_send_resync_request` throttle AND the global per-contract
+    /// `begin_resync_request` throttle AND the global per-contract
     /// `resync_emit_limiter` cap (each a `!gate { return; }` guard before the
     /// emit). Auto-fetch stays suppressed on each driver's queue-full arm.
     #[test]
@@ -3192,12 +3194,14 @@ mod tests {
         // sender) throttle AND the global per-contract emit cap (#4251/#4857 +
         // #4864 round-4). Each is a `!gate { return; }` guard that precedes the
         // emit, so an unthrottled emission cannot re-open the #4251 storm. The
-        // per-sender throttle is PEEKED (not recorded) until the emit, and its
-        // window is recorded ONLY at the emit (#4864 round-5 item 9), so a
-        // global-cap suppression does not burn the window.
+        // per-sender throttle is RESERVED atomically (`begin`, records under the
+        // lock) then RELEASED (`cancel`) if the global cap rejects (#4864 round-6
+        // item 2), so concurrent callbacks can't both pass and a globally
+        // suppressed emit does not burn the window.
         let helper = fn_body("async fn send_queue_full_resync_request(");
-        let per_sender = helper.find(".peek_should_send_resync_request(").expect(
-            "helper must PEEK the per-sender throttle without recording (#4864 round-5 item 9)",
+        let per_sender = helper.find(".begin_resync_request(").expect(
+            "helper must RESERVE the per-sender throttle atomically via \
+             begin_resync_request (#4864 round-6 item 2)",
         );
         let global_cap = helper.find("resync_emit_limiter").expect(
             "helper must ALSO gate on the global per-contract emit cap \
@@ -3206,20 +3210,21 @@ mod tests {
         let emit = helper
             .find("InterestMessage::ResyncRequest")
             .expect("helper must emit InterestMessage::ResyncRequest (heal, #4857)");
-        let record = helper.find(".record_resync_request_sent(").expect(
-            "helper must record the per-sender throttle window (only on emit, #4864 round-5)",
+        let cancel = helper.find(".cancel_resync_request(").expect(
+            "helper must CANCEL the reservation when the global cap rejects, so the \
+             window is released (#4864 round-6 item 2)",
         );
         assert!(
             per_sender < emit && global_cap < emit,
             "the ResyncRequest emit ({emit}) MUST come AFTER both the per-sender \
-             throttle peek ({per_sender}) and the global emit cap ({global_cap}), so \
-             an unthrottled emission cannot re-open the #4251 storm"
+             throttle reservation ({per_sender}) and the global emit cap ({global_cap}), \
+             so an unthrottled emission cannot re-open the #4251 storm"
         );
         assert!(
-            global_cap < record && record < emit,
-            "the per-sender window record ({record}) MUST come AFTER the global cap \
-             ({global_cap}) and before/at the emit ({emit}) — recording earlier \
-             would burn the 30s window on a global-cap suppression (#4864 round-5 item 9)"
+            per_sender < global_cap && global_cap < cancel && cancel < emit,
+            "the cancel ({cancel}) MUST be in the global-cap reject branch — after the \
+             reservation ({per_sender}) and the global cap ({global_cap}), before the \
+             emit ({emit}) — so a global-cap suppression releases the window (#4864 round-6)"
         );
     }
 
@@ -3970,7 +3975,7 @@ mod tests {
              per-contract emit cap (resync_emit_limiter) (#4864 round-4)"
         );
         assert!(
-            body.contains("should_send_resync_request"),
+            body.contains("begin_resync_request"),
             "and keep the per-(contract, sender) throttle"
         );
     }
