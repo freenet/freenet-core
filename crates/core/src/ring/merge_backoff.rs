@@ -347,9 +347,15 @@ impl MergeBackoff {
     }
 
     fn apply_failure(entry: &mut Entry, class: MergeFailureClass, payload_hash: u64, now: Instant) {
-        // Escalate class upward only (Timeout dominates Invalid).
+        // Escalate class upward only (Timeout dominates Invalid). On escalation,
+        // restart the consecutive count at the NEW class's pre-trip point so the
+        // first cooldown after escalating is that class's BASE, not base shifted
+        // by the pre-escalation failures (review O1: Invalid,Invalid,Timeout must
+        // yield TIMEOUT_BASE=120s, not 480s — the old class's history says
+        // nothing about how far the new class has escalated).
         if class.rank() > entry.class.rank() {
             entry.class = class;
+            entry.consecutive_failures = class.trip_threshold().saturating_sub(1);
         }
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         entry.last_failure = now;
@@ -581,6 +587,35 @@ mod tests {
             b.check(&c, 2),
             MergeDecision::InBackoff,
             "a single timeout (full ~5s CPU burn) must trip immediately"
+        );
+    }
+
+    /// Review O1 (#4864): escalating Invalid→Timeout must restart the cooldown
+    /// exponent at the NEW class's base. Two pre-escalation Invalid failures
+    /// followed by a Timeout must yield the first Timeout cooldown at
+    /// TIMEOUT_BASE (120s, jitter window [96s, 144s]) — NOT
+    /// `TIMEOUT_BASE * 2^2 = 480s` from counting the Invalid history.
+    #[test]
+    fn class_escalation_restarts_cooldown_at_new_class_base() {
+        let (b, ts) = mk();
+        let c = mk_contract(1);
+        b.record_failure(&c, MergeFailureClass::Invalid, 1);
+        b.record_failure(&c, MergeFailureClass::Invalid, 2);
+        b.record_failure(&c, MergeFailureClass::Timeout, 3);
+        assert_eq!(
+            b.check(&c, 4),
+            MergeDecision::InBackoff,
+            "timeout trips immediately even mid-Invalid-sequence"
+        );
+        // 145s > TIMEOUT_BASE(120s) * 1.2 max jitter: a base-cooldown entry has
+        // elapsed. If the exponent had counted the two Invalid failures
+        // (480s * [0.8, 1.2] = [384s, 576s]) this would still be InBackoff.
+        ts.advance_time(Duration::from_secs(145));
+        assert_eq!(
+            b.check(&c, 5),
+            MergeDecision::Allow,
+            "first post-escalation cooldown must be the Timeout BASE, not \
+             base << pre-escalation failures"
         );
     }
 
