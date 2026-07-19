@@ -66,7 +66,11 @@ impl RunningInstance {
         req_bytes: usize,
     ) -> RuntimeResult<Self> {
         let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let handle = engine.create_instance(module, id, req_bytes)?;
+        // Route the guest-entry call through classify_result so an epoch interrupt
+        // during a runaway module start function normalizes to
+        // MaxComputeTimeExceeded (Timeout class), not the generic "execution
+        // timeout" that is_wasm_timeout misses (#4864 round-5).
+        let handle = super::classify_result(engine.create_instance(module, id, req_bytes))?;
 
         // Record memory address and size for host function pointer arithmetic
         let (ptr, size) = engine.memory_info(&handle)?;
@@ -534,7 +538,9 @@ impl Runtime {
         T: AsRef<[u8]>,
     {
         let data = data.as_ref();
-        let builder_ptr = self.engine.initiate_buffer(handle, data.len() as u32)?;
+        // classify_result: a guest-entry epoch interrupt → Timeout class (#4864 round-5).
+        let builder_ptr =
+            super::classify_result(self.engine.initiate_buffer(handle, data.len() as u32))?;
         let linear_mem = self.linear_mem(handle)?;
         // SAFETY: `builder_ptr` is returned by the WASM allocator and points to a valid
         // `BufferBuilder` within the instance's linear memory described by `linear_mem`.
@@ -551,7 +557,9 @@ impl Runtime {
         handle: &InstanceHandle,
         capacity: usize,
     ) -> RuntimeResult<BufferMut<'_>> {
-        let builder_ptr = self.engine.initiate_buffer(handle, capacity as u32)?;
+        // classify_result: a guest-entry epoch interrupt → Timeout class (#4864 round-5).
+        let builder_ptr =
+            super::classify_result(self.engine.initiate_buffer(handle, capacity as u32))?;
         let linear_mem = self.linear_mem(handle)?;
         // SAFETY: `builder_ptr` is returned by the WASM allocator and points to a valid
         // `BufferBuilder` within the instance's linear memory described by `linear_mem`.

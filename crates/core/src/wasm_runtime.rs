@@ -17,7 +17,9 @@ mod state_store;
 #[cfg(all(test, feature = "wasmtime-backend"))]
 mod tests;
 
-pub(crate) use contract::{ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge};
+pub(crate) use contract::{
+    ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge, classify_result,
+};
 pub use contract_store::{ContractStore, SharedContractIndex};
 pub(crate) use delegate::DelegateRuntimeInterface;
 pub use delegate_store::DelegateStore;

@@ -324,8 +324,23 @@ impl ContractRuntimeInterface for super::Runtime {
     }
 }
 
-/// Convert a WasmError from the engine into the appropriate RuntimeResult error.
-fn classify_result(result: Result<i64, WasmError>) -> RuntimeResult<i64> {
+/// Convert a `WasmError` from the engine into the canonical [`RuntimeResult`]
+/// error. Timeout and out-of-gas get their dedicated [`ContractExecError`]
+/// representations; everything else keeps the generic conversion.
+///
+/// Generic over the success type so it can normalize BOTH the merge/validate
+/// `i64` returns AND the guest-entry setup calls (`create_instance` →
+/// `InstanceHandle`, `initiate_buffer` → `i64`). Routing the guest-entry calls
+/// through here is load-bearing (#4864 round-5): an epoch interrupt during a
+/// runaway module start function / allocator surfaces as [`WasmError::Timeout`],
+/// and MUST normalize to [`ContractExecError::MaxComputeTimeExceeded`] — the same
+/// canonical representation the blocking merge path produces — so
+/// `ExecutorError::is_wasm_timeout` recognizes it and the merge-failure backoff
+/// picks the contract-wide Timeout class. The generic `WasmError` → `ContractError`
+/// conversion instead formats Timeout as "execution timeout", which
+/// `is_wasm_timeout` does NOT match, so the timeout would wrongly get the
+/// per-sender Invalid class.
+pub(crate) fn classify_result<T>(result: Result<T, WasmError>) -> RuntimeResult<T> {
     match result {
         Ok(value) => Ok(value),
         Err(WasmError::OutOfGas) => Err(ContractExecError::OutOfGas.into()),

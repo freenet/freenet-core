@@ -2071,6 +2071,64 @@ mod tests {
             );
         }
 
+        /// #4864 round-5 (Codex P1): a GUEST-ENTRY epoch interrupt (a runaway
+        /// module start function in `create_instance`, or the allocator in
+        /// `initiate_buffer`) surfaces as `WasmError::Timeout` at the engine layer
+        /// (the engine test `epoch_interrupt_during_instantiation_classifies_as_timeout`
+        /// asserts that). The runtime routes it through `classify_result`, which
+        /// normalizes it to the SAME `MaxComputeTimeExceeded` the blocking merge
+        /// path produces — so the resulting `ExecutorError::is_wasm_timeout()` is
+        /// true and the merge-failure backoff picks the contract-wide Timeout
+        /// class, not per-sender Invalid. Before the fix the guest-entry
+        /// `WasmError::Timeout` went through the generic conversion ("execution
+        /// timeout"), which `is_wasm_timeout` does NOT match.
+        #[test]
+        fn guest_entry_timeout_classifies_as_wasm_timeout() {
+            let key = test_fixtures::make_contract_key();
+            // The runtime's classify_result normalizes a guest-entry Timeout.
+            let contract_err = crate::wasm_runtime::classify_result::<i64>(Err(
+                crate::wasm_runtime::engine::WasmError::Timeout,
+            ))
+            .expect_err("a WasmError::Timeout must classify as an error");
+            let err = ExecutorError::execution(
+                contract_err,
+                Some(super::super::InnerOpError::Upsert(key)),
+            );
+            assert!(
+                err.is_wasm_timeout(),
+                "a guest-entry epoch-interrupt timeout, normalized by classify_result, \
+                 MUST classify as a wasm timeout (contract-wide Timeout backoff, not Invalid)"
+            );
+        }
+
+        /// Source-scrape pin (#4864 round-5): EVERY guest-entry engine call in the
+        /// runtime (`create_instance`, `initiate_buffer`) must be wrapped by
+        /// `classify_result`, so an epoch-interrupt Timeout normalizes to the
+        /// Timeout class. A future refactor that adds an unwrapped guest-entry
+        /// call would silently reintroduce the misclassification.
+        #[test]
+        fn guest_entry_calls_route_through_classify_result() {
+            let src = include_str!("../wasm_runtime/runtime.rs");
+            let create_calls = src.matches("engine.create_instance(").count();
+            let create_wrapped = src
+                .matches("classify_result(engine.create_instance(")
+                .count();
+            assert!(
+                create_calls > 0 && create_calls == create_wrapped,
+                "every engine.create_instance call in runtime.rs must be wrapped in \
+                 classify_result ({create_wrapped}/{create_calls} wrapped)"
+            );
+            let buffer_calls = src.matches("engine.initiate_buffer(").count();
+            let buffer_wrapped = src
+                .matches("classify_result(self.engine.initiate_buffer(")
+                .count();
+            assert!(
+                buffer_calls > 0 && buffer_calls == buffer_wrapped,
+                "every initiate_buffer call in runtime.rs must be wrapped in \
+                 classify_result ({buffer_wrapped}/{buffer_calls} wrapped)"
+            );
+        }
+
         /// Pin (#4861 review): the DESERIALIZATION-poison class — a contract's
         /// `update_state` returning `ContractError::Deser` for a malformed
         /// circulating delta (the `FBFRDjxV…` production case) — MUST reach the
