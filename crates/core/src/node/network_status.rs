@@ -750,14 +750,36 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
 /// the matching outcome. Forgetting a call site silently rots the
 /// counter (issue #4009 / #4010 prior incidents). Current writers:
 ///
-/// - `node.rs::report_result` for legacy state-machine ops (PUT/GET/
-///   UPDATE/SUBSCRIBE that still flow through `OpManager.ops.*`).
-/// - `operations/get/op_ctx_task.rs` `Done` arm (client-initiated GET).
-/// - `operations/put/op_ctx_task.rs` `Done` arm (client-initiated PUT).
+/// - `operations/get/op_ctx_task.rs` `Done` arm (client-initiated GET;
+///   success flag from `host_result.is_ok()`), its `Exhausted` arm
+///   (records a failure — exhaustion publishes `NotFound`, having
+///   delivered no state), AND `deliver_outcome`'s `InfrastructureError`
+///   arm (records a failure — the `Unexpected`/`InfraError` terminal
+///   outcomes publish a synthesized client `Err`). GET cannot fold the
+///   success/exhaustion arms into an outcome-shape classifier the way
+///   PUT/UPDATE do: a dead-end publishes `Ok(HostResponse::…NotFound)`,
+///   so `matches!(Publish(Ok(_)))` would score it as a success (#4828).
+/// - `operations/put/op_ctx_task.rs::deliver_outcome` (client-initiated
+///   PUT; covers all `DriverOutcome` variants).
 /// - `operations/subscribe/op_ctx_task.rs::deliver_outcome` (client-
 ///   initiated SUBSCRIBE; covers all `DriverOutcome` variants).
 /// - `operations/update/op_ctx_task.rs::deliver_outcome` (client-
 ///   initiated UPDATE; covers all `DriverOutcome` variants).
+///
+/// `node.rs::report_result` is NOT a writer: the legacy `OpEnum` /
+/// mediator path is gone (see `crates/core/CLAUDE.md`), every op runs a
+/// task-per-tx driver, and its `Ok` branch has nothing left to report.
+/// It was listed here until #4828 — a stale entry on the very doc this
+/// section points auditors at.
+///
+/// Prefer the `deliver_outcome` funnel shape where the driver's outcome
+/// type can express failure: it is the one that did NOT rot. Recording
+/// in individual driver arms is how #4828 regrew #4009/#4010 on PUT —
+/// the success arms carried a hardcoded `true` and every failure arm was
+/// simply forgotten, making `op_stats.puts.1` unreachable. Each op's
+/// call site is pinned by a source-scrape test in its `op_ctx_task.rs`
+/// test module; those pins are the CI gate against the next migration
+/// silently dropping the call.
 ///
 /// Internal-only operations are intentionally NOT recorded; counting
 /// them would inflate the user-facing counter with background traffic
@@ -798,7 +820,30 @@ pub fn record_op_result(op_type: OpType, success: bool) {
     }
 }
 
-/// Record a broadcast update received via subscription streaming.
+/// Record a broadcast update that was received and actually changed local
+/// state.
+///
+/// # Required call sites
+///
+/// Manually-mirrored counter. BOTH broadcast-apply drivers in
+/// `operations/update/op_ctx_task.rs` must call this, each after its
+/// `if !changed` early-return (a no-op re-broadcast is not a received
+/// update):
+///
+/// - `drive_relay_broadcast_to` (`BroadcastTo` — every payload BELOW
+///   `streaming_threshold`, i.e. the ordinary small-delta case).
+/// - `drive_relay_broadcast_to_streaming` (`BroadcastToStreaming` —
+///   payloads at/above the threshold, default 64 KB).
+///
+/// Until #4828 only the streaming twin recorded, so ordinary small deltas
+/// — the normal River case — were invisible and an actively-receiving
+/// subscriber showed 0 (`server/home_page/cards.rs` renders
+/// `updates_received` as the ONLY UPDATE number for subscriber nodes).
+/// Pinned by `both_broadcast_drivers_record_update_received`.
+///
+/// Distinct from [`record_relayed_update`], which counts relayed UPDATE
+/// *requests* toward the key (`relayed_op_stats`) and deliberately does
+/// NOT count broadcast fan-out.
 pub fn record_update_received() {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
