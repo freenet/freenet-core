@@ -1234,7 +1234,7 @@ pub struct Config {
     /// ~1.25× this value. Bounds the cache by total compiled bytes rather than
     /// entry count, so a node hosting many contracts doesn't thrash (issue
     /// #4441). When unset, the default scales with system RAM
-    /// (`clamp(total_ram / 8, 64 MiB, 1.5 GiB)`) so a small VPS doesn't OOM and
+    /// (`clamp(total_ram / 8, 64 MiB, 4 GiB)`) so a small VPS doesn't OOM and
     /// a big gateway still caches a large working set.
     #[serde(
         default = "default_module_cache_budget_bytes",
@@ -1354,7 +1354,7 @@ const fn default_inactive_user_sweep_interval_secs() -> u64 {
 }
 
 /// Default contract-module cache byte budget, scaled to system RAM
-/// (`clamp(total_ram / 8, 64 MiB, 1.5 GiB)`).
+/// (`clamp(total_ram / 8, 64 MiB, 4 GiB)`).
 ///
 /// Resolves to [`crate::wasm_runtime::default_module_cache_budget_bytes`], the
 /// single source of truth, so the operator-facing default and the in-code

@@ -752,6 +752,13 @@ impl WasmEngine for WasmtimeEngine {
             // ran near the budget would leave set_id ~zero ticks and trap it
             // spuriously. Every guest entry must be immediately preceded by its
             // own arm (pinned by `every_guest_entry_is_preceded_by_arm_epoch_deadline`).
+            //
+            // Adversarial ceiling (#4864 round-5 item 10): giving set_id a FRESH
+            // budget is correct per-call, but it means create_instance's worst-case
+            // GUEST CPU is ~2x max_execution_seconds (a start function running just
+            // under budget, then set_id running a fresh full budget). That is
+            // bounded at EXACTLY 2 guest entries — the pin above enumerates every
+            // guest entry in this method, so the factor cannot silently grow.
             arm_epoch_deadline(store, self.epoch_deadline_ticks);
             block_on_async(typed_func.call_async(&mut *store, id)).map_err(|e| {
                 classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string()))
