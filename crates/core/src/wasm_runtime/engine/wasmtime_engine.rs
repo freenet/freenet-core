@@ -141,6 +141,7 @@
 //! We wrap with `block_on_async()` to maintain a synchronous interface for callers.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -335,6 +336,25 @@ const STORE_MAX_AGE: Duration = Duration::from_secs(4 * 3600);
 /// `max_execution_seconds` (+ up to one tick of slack) rather than unbounded.
 const EPOCH_TICK_PERIOD: Duration = Duration::from_millis(100);
 
+/// Process-start reference instant for the epoch-ticker heartbeat (#4864). Real
+/// wall clock on purpose: this measures a real background thread's liveness, not
+/// simulation time (consistent with the rest of this file's `Instant` usage).
+fn epoch_ticker_base() -> Instant {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+/// Milliseconds-since-[`epoch_ticker_base`] of the ticker's most recent loop
+/// iteration. `0` = the ticker has not completed an iteration yet.
+/// [`arm_epoch_deadline`] reads this to detect a DEAD ticker (#4864 review): if
+/// the ticker thread ever stops, epoch preemption is silently disabled, so a
+/// stale heartbeat must be loudly visible.
+static EPOCH_TICKER_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
+/// Total epoch-ticker iterations performed (observability metric).
+static EPOCH_TICKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Millis-since-base of the last emitted "ticker stale" ERROR (rate-limit).
+static EPOCH_TICKER_STALE_WARNED_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Registry of live engines the epoch ticker drives.
 ///
 /// Holds `EngineWeak` (not `Engine`) so a dropped engine is reclaimed: the
@@ -362,22 +382,43 @@ fn register_engine_for_epoch(engine: &Engine) {
 fn start_epoch_ticker() {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
+        // Pin the heartbeat origin before the thread starts.
+        let _ = epoch_ticker_base();
         let spawn = std::thread::Builder::new()
             .name("wasm-epoch-ticker".to_string())
             .spawn(|| {
                 loop {
                     std::thread::sleep(EPOCH_TICK_PERIOD);
-                    let mut reg = epoch_engine_registry()
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    // Increment every live engine's epoch; drop dead weak refs.
-                    reg.retain(|weak| match weak.upgrade() {
-                        Some(engine) => {
-                            engine.increment_epoch();
-                            true
-                        }
-                        None => false,
-                    });
+                    // Catch a transient panic in ONE iteration (#4864 review): a
+                    // panic escaping this loop would kill the thread and silently
+                    // disable epoch preemption for the whole process lifetime.
+                    // Log and keep ticking instead.
+                    let ticked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut reg = epoch_engine_registry()
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        // Increment every live engine's epoch; drop dead weak refs.
+                        reg.retain(|weak| match weak.upgrade() {
+                            Some(engine) => {
+                                engine.increment_epoch();
+                                true
+                            }
+                            None => false,
+                        });
+                    }));
+                    if ticked.is_err() {
+                        tracing::error!(
+                            "wasm-epoch-ticker iteration panicked; continuing (this \
+                             tick's epoch increments were skipped)"
+                        );
+                    }
+                    // Heartbeat + metric: the loop is alive (even a panicked
+                    // iteration means the thread survived catch_unwind).
+                    EPOCH_TICKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    EPOCH_TICKER_HEARTBEAT_MS.store(
+                        epoch_ticker_base().elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
                 }
             });
         if let Err(e) = spawn {
@@ -390,14 +431,55 @@ fn start_epoch_ticker() {
     });
 }
 
+/// Cheap per-arm liveness check for the epoch ticker (#4864 review). If the
+/// ticker has ticked before but its heartbeat is now far older than the tick
+/// period, the thread is dead and epoch preemption is silently disabled — emit a
+/// rate-limited ERROR so the degradation is loudly visible. (Execution still
+/// falls back to the wall-clock poll in `execute_wasm_blocking`, so this is
+/// degraded, not broken.)
+fn detect_stale_epoch_ticker() {
+    let heartbeat = EPOCH_TICKER_HEARTBEAT_MS.load(Ordering::Relaxed);
+    if heartbeat == 0 {
+        return; // ticker has not completed a first iteration yet — not "stale"
+    }
+    let now_ms = epoch_ticker_base().elapsed().as_millis() as u64;
+    let stale_after_ms = 10 * EPOCH_TICK_PERIOD.as_millis() as u64;
+    if now_ms.saturating_sub(heartbeat) <= stale_after_ms {
+        return; // healthy
+    }
+    // Stale: emit at most ~once/60s (compare-and-swap so exactly one thread wins).
+    let last_warn = EPOCH_TICKER_STALE_WARNED_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_warn) >= 60_000
+        && EPOCH_TICKER_STALE_WARNED_MS
+            .compare_exchange(last_warn, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::error!(
+            heartbeat_age_ms = now_ms.saturating_sub(heartbeat),
+            ticks_total = EPOCH_TICKS_TOTAL.load(Ordering::Relaxed),
+            "wasm-epoch-ticker appears DEAD — epoch preemption disabled; runaway \
+             guest timeouts now fall back to the wall-clock poll only"
+        );
+    }
+}
+
 /// Number of epoch ticks that make up one execution deadline: the store traps
 /// after this many [`Engine::increment_epoch`] calls (~`EPOCH_TICK_PERIOD`
-/// each). `ceil(max_execution_seconds / tick)`, floored at 1 so a tiny
-/// configured timeout still gets at least one tick before tripping.
+/// each). `ceil(max_execution_seconds / tick) + 1`, floored at 1 tick before the
+/// margin so a tiny configured timeout still gets at least one tick.
+///
+/// The `+ 1` is a phase-safety margin (#4864 review): the global ticker runs
+/// free and is NOT synchronized with arming, so the first increment after a
+/// deadline is armed can land anywhere in `[0, EPOCH_TICK_PERIOD)`. Without the
+/// margin a `ceil`-computed N-tick deadline could trap up to one whole tick
+/// EARLY (≈4.9s for a 5.0s budget), nondeterministically killing a guest that
+/// legitimately finishes in `[T - tick, T]`. The margin shifts the enforced
+/// window from `[T - tick, T]` to `[T, T + tick]` — never early, at most one
+/// tick (~100 ms) late.
 fn epoch_deadline_ticks(max_execution_seconds: f64) -> u64 {
     let tick_secs = EPOCH_TICK_PERIOD.as_secs_f64();
     let ticks = (max_execution_seconds / tick_secs).ceil();
-    (ticks as u64).max(1)
+    (ticks as u64).max(1) + 1
 }
 
 /// Arm `store`'s epoch deadline for ONE guest execution.
@@ -417,6 +499,8 @@ fn epoch_deadline_ticks(max_execution_seconds: f64) -> u64 {
 fn arm_epoch_deadline(store: &mut Store<HostState>, ticks: u64) {
     store.set_epoch_deadline(ticks);
     store.epoch_deadline_trap();
+    // Piggyback a cheap dead-ticker health check on this already-per-call site.
+    detect_stale_epoch_ticker();
 }
 
 /// Wasmtime 27.x backend implementation.
@@ -644,8 +728,12 @@ impl WasmEngine for WasmtimeEngine {
 
         // Instantiate the module using the pre-configured linker
         // CRITICAL: Must use instantiate_async() because async_support(true) is enabled
-        let instance = block_on_async(self.linker.instantiate_async(&mut *store, module))
-            .map_err(|e| WasmError::Instantiation(e.to_string()))?;
+        // An epoch interrupt here (a runaway module start function) is classified
+        // as a timeout, not Instantiation (#4864 review); other errors keep it.
+        let instance =
+            block_on_async(self.linker.instantiate_async(&mut *store, module)).map_err(|e| {
+                classify_guest_entry_error(e, |e| WasmError::Instantiation(e.to_string()))
+            })?;
 
         // Call __frnt_set_id to set the instance ID (used for MEM_ADDR lookup)
         // CRITICAL: Must use call_async() because async_support(true) is enabled
@@ -653,8 +741,9 @@ impl WasmEngine for WasmtimeEngine {
             let typed_func = set_id_func
                 .typed::<i64, ()>(&*store)
                 .map_err(|e| WasmError::Export(e.to_string()))?;
-            block_on_async(typed_func.call_async(&mut *store, id))
-                .map_err(|e| WasmError::Runtime(e.to_string()))?;
+            block_on_async(typed_func.call_async(&mut *store, id)).map_err(|e| {
+                classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string()))
+            })?;
         }
 
         // Note: MEM_ADDR insertion is handled by RunningInstance::new in runtime.rs
@@ -728,8 +817,10 @@ impl WasmEngine for WasmtimeEngine {
             .map_err(|e| WasmError::Export(e.to_string()))?;
         arm_epoch_deadline(store, self.epoch_deadline_ticks);
         // CRITICAL: Must use call_async() because async_support(true) is enabled
+        // An epoch interrupt here (a runaway allocator) is classified as a
+        // timeout, not a generic Runtime error (#4864 review).
         block_on_async(func.call_async(&mut *store, size))
-            .map_err(|e| WasmError::Runtime(e.to_string()))
+            .map_err(|e| classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string())))
     }
 
     fn call_void(&mut self, handle: &InstanceHandle, name: &str) -> Result<(), WasmError> {
@@ -1644,24 +1735,49 @@ fn block_on_async<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
+/// True if `error` carries wasmtime's epoch-deadline interrupt trap
+/// (`Trap::Interrupt`) — our execution-timeout mechanism firing (#4861): the
+/// guest ran past its armed deadline and wasmtime interrupted it at an epoch
+/// check.
+fn is_epoch_interrupt(error: &WasmtimeError) -> bool {
+    error
+        .downcast_ref::<wasmtime::Trap>()
+        .is_some_and(|t| matches!(t, wasmtime::Trap::Interrupt))
+}
+
+/// Map an error from a GUEST-ENTRY call — instantiation (module start
+/// function), `__frnt_set_id`, or `__frnt__initiate_buffer` — to a
+/// [`WasmError`], routing an epoch-deadline interrupt to [`WasmError::Timeout`]
+/// (#4864 review). Without this, a runaway guest during the init/allocator phase
+/// would surface as `Instantiation`/`Runtime` — neither `is_wasm_timeout` (wrong
+/// merge-backoff cooldown class) nor even `is_contract_exec_rejection` (not
+/// recorded at all). Non-interrupt errors keep their original category via
+/// `otherwise`, preserving the existing error text.
+fn classify_guest_entry_error(
+    error: WasmtimeError,
+    otherwise: impl FnOnce(WasmtimeError) -> WasmError,
+) -> WasmError {
+    if is_epoch_interrupt(&error) {
+        tracing::warn!("WASM execution timed out (epoch deadline exceeded during guest entry)");
+        return WasmError::Timeout;
+    }
+    otherwise(error)
+}
+
 /// Classify a wasmtime Error, checking fuel status.
 fn classify_runtime_error(
     enabled_metering: bool,
     store: &mut Store<HostState>,
     error: WasmtimeError,
 ) -> WasmError {
-    // An epoch-deadline trap (`Trap::Interrupt`) is our execution-timeout
-    // mechanism firing (#4861): the guest ran past the armed deadline and
-    // wasmtime interrupted it at an epoch check. Classify it as a timeout (not a
-    // generic runtime error) so it flows to `ContractExecError::
-    // MaxComputeTimeExceeded` exactly like the wall-clock `BlockingResult::
-    // Timeout` path, keeping the "timed out" classification consistent. Checked
-    // first because it is a timeout regardless of whether metering is on.
-    if let Some(trap) = error.downcast_ref::<wasmtime::Trap>() {
-        if matches!(trap, wasmtime::Trap::Interrupt) {
-            tracing::warn!("WASM execution timed out (epoch deadline exceeded)");
-            return WasmError::Timeout;
-        }
+    // An epoch-deadline interrupt is our execution timeout (#4861). Classify it
+    // as a timeout (not a generic runtime error) so it flows to
+    // `ContractExecError::MaxComputeTimeExceeded` exactly like the wall-clock
+    // `BlockingResult::Timeout` path. Checked first because it is a timeout
+    // regardless of whether metering is on.
+    if is_epoch_interrupt(&error) {
+        tracing::warn!("WASM execution timed out (epoch deadline exceeded)");
+        return WasmError::Timeout;
     }
     if enabled_metering {
         // Check if we ran out of fuel
@@ -1945,6 +2061,128 @@ mod tests {
             ),
             "epoch-deadline trap must classify as WasmError::Timeout"
         );
+    }
+
+    /// #4864 review (fix 3): `epoch_deadline_ticks` = `ceil(secs / 100ms) + 1`,
+    /// the `+ 1` a phase-safety margin so a free-running ticker never traps a
+    /// guest EARLY. Boundary cases.
+    #[test]
+    fn epoch_deadline_ticks_has_phase_margin() {
+        // EPOCH_TICK_PERIOD is 100ms.
+        assert_eq!(epoch_deadline_ticks(5.0), 51, "5.0s → ceil(50)+1");
+        assert_eq!(epoch_deadline_ticks(0.05), 2, "0.05s → ceil(0.5)=1, +1");
+        assert_eq!(
+            epoch_deadline_ticks(0.1),
+            2,
+            "0.1s → ceil(1)=1, +1 (exact multiple)"
+        );
+        assert_eq!(epoch_deadline_ticks(0.0), 2, "degenerate 0 → floor 1, +1");
+        assert_eq!(epoch_deadline_ticks(1.0), 11, "1.0s → ceil(10)+1");
+        // A larger budget never gets fewer ticks.
+        assert!(epoch_deadline_ticks(10.0) > epoch_deadline_ticks(5.0));
+        // The margin is exactly one tick above the naive ceil for a whole-second
+        // budget (the case the review flagged for [4.9s, 5.0s] finishers).
+        assert_eq!(epoch_deadline_ticks(5.0) - 1, 50);
+    }
+
+    /// WAT whose module START function loops forever — exercises an epoch
+    /// interrupt during the INSTANTIATION guest-entry phase.
+    const START_LOOP_WAT: &str = r#"
+        (module
+          (func $spin (loop (br 0)))
+          (start $spin))
+    "#;
+
+    /// REGRESSION (#4864 review, fix 4): an epoch interrupt during a guest-entry
+    /// phase — here a runaway module START function during `instantiate_async` —
+    /// must classify as `WasmError::Timeout`, NOT `Instantiation`. Otherwise the
+    /// merge backoff records the wrong cooldown class (or nothing at all).
+    #[test]
+    fn epoch_interrupt_during_instantiation_classifies_as_timeout() {
+        // Short budget so the test is fast: ceil(0.2/0.1)+1 = 3 ticks (~300ms).
+        let config = RuntimeConfig {
+            max_execution_seconds: 0.2,
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).expect("engine creation");
+        let module = engine
+            .compile(START_LOOP_WAT.as_bytes())
+            .expect("compile start-loop module");
+
+        let start = std::time::Instant::now();
+        // create_instance runs the start function via instantiate_async; the
+        // global epoch ticker preempts it once the armed 3-tick deadline elapses.
+        let result = engine.create_instance(&module, 1, 0);
+        let elapsed = start.elapsed();
+
+        // `InstanceHandle` is not Debug, so match rather than `{result:?}`.
+        match &result {
+            Err(WasmError::Timeout) => {}
+            Err(other) => panic!(
+                "runaway module start function must classify as WasmError::Timeout, got {other:?}"
+            ),
+            Ok(_) => {
+                panic!("runaway module start function must time out, but instantiation succeeded")
+            }
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "instantiation-phase preemption should be prompt; took {elapsed:?}"
+        );
+    }
+
+    /// Source-scrape pin (#4864 review, fix 8): every guest-entry call site
+    /// (`instantiate_async` / `call_async`) MUST be preceded by an
+    /// `arm_epoch_deadline` in the same function, so a future refactor cannot
+    /// silently re-open the unbounded-runaway-guest hole by adding a guest-entry
+    /// path without arming the epoch deadline.
+    #[test]
+    fn every_guest_entry_is_preceded_by_arm_epoch_deadline() {
+        let src = include_str!("wasmtime_engine.rs");
+        // The engine methods that run guest code (exclude test bodies + the
+        // helper defs). Each must contain `arm_epoch_deadline` before its first
+        // guest-entry `block_on_async(...call_async/instantiate_async)`.
+        for fn_name in [
+            "fn create_instance(",
+            "fn initiate_buffer(",
+            "fn call_void(",
+            "fn call_3i64(",
+            "fn call_3i64_async_imports(",
+            "fn call_2i64_blocking(",
+            "fn call_3i64_blocking(",
+        ] {
+            let start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("guest-entry method `{fn_name}` not found"));
+            let after = &src[start..];
+            let end = after
+                .find("\n    fn ")
+                .or_else(|| after.find("\n    pub(crate) fn "))
+                .unwrap_or(after.len());
+            let body = &after[..end];
+            let arm_pos = body.find("arm_epoch_deadline").unwrap_or_else(|| {
+                panic!("`{fn_name}` runs guest code but never calls arm_epoch_deadline (#4864)")
+            });
+            // The guest-entry call in these methods is a block_on_async of a
+            // `.call_async(` / `.instantiate_async(`. Match the method-call
+            // syntax (leading dot + open paren) so a prose mention of
+            // "call_async" in a doc comment is not treated as the entry site.
+            // Take the EARLIEST of the two so arm must precede whichever guest
+            // entry comes first in the body.
+            let entry_pos = [body.find(".call_async("), body.find(".instantiate_async(")]
+                .into_iter()
+                .flatten()
+                .min();
+            if let Some(entry_pos) = entry_pos {
+                assert!(
+                    arm_pos < entry_pos,
+                    "`{fn_name}`: arm_epoch_deadline ({arm_pos}) must precede the \
+                     guest-entry call ({entry_pos}) — else the guest runs with a \
+                     stale/unset deadline"
+                );
+            }
+        }
     }
 
     /// REGRESSION (issue #4441 fix-up): with `offload_compilation = true` on a
