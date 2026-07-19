@@ -515,6 +515,16 @@ pub struct ControlledSimulationResult {
     /// to/from the crashed node was subsequently blocked. `0` when no crash was
     /// scheduled. See #4642 piece F.
     pub crash_packets_dropped: u64,
+    /// Per-peer count of WASM `summarize_state` invocations (summary-cache
+    /// SLOW-path misses) captured at the end of the run, keyed by socket
+    /// address. Captured here (before the `SimNetwork` is dropped, which clears
+    /// the registry) so the every-hop-placement summarize-storm falsifier can
+    /// assert this stays flat as the hosted set / neighbor overlap grows. A
+    /// cache hit does NOT increment, so a working cache keeps this proportional
+    /// to the state-change rate, not to hosted-set size. See
+    /// `crate::ring::topology_registry::record_summarize_wasm_call` (#4440, spec
+    /// step 8).
+    pub summarize_wasm_calls: HashMap<std::net::SocketAddr, u64>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -686,6 +696,33 @@ impl ControlledSimulationResult {
     /// tests); `0` when no crash was scheduled. See #4642 piece F.
     pub fn crash_packets_dropped(&self) -> u64 {
         self.crash_packets_dropped
+    }
+
+    /// WASM `summarize_state` invocations (summary-cache misses) recorded for
+    /// the peer at `addr`. `0` if the peer ran none. See #4440 / spec step 8.
+    pub fn summarize_wasm_calls_for(&self, addr: &std::net::SocketAddr) -> u64 {
+        self.summarize_wasm_calls.get(addr).copied().unwrap_or(0)
+    }
+
+    /// Total WASM `summarize_state` invocations across every peer in the run.
+    ///
+    /// This is the every-hop summarize-storm falsifier's primary signal: it must
+    /// stay proportional to the contract STATE-CHANGE count, NOT to hosted-set
+    /// size or neighbor overlap. If it grows with the number of shared hosted
+    /// contracts × neighbors, the state-hash summary cache is not covering
+    /// every-hop load and the #4440 storm has re-armed.
+    pub fn total_summarize_wasm_calls(&self) -> u64 {
+        self.summarize_wasm_calls.values().copied().sum()
+    }
+
+    /// The single peer's peak WASM-summarize count — the worst per-node
+    /// summarize load any peer bore during the run.
+    pub fn max_summarize_wasm_calls(&self) -> u64 {
+        self.summarize_wasm_calls
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -5107,6 +5144,12 @@ impl SimNetwork {
         let renewal_metrics =
             crate::ring::topology_registry::get_all_renewal_metrics(&network_name);
 
+        // Capture WASM-summarize counts BEFORE self drops (Drop clears the
+        // registry), same lifetime constraint as the renewal metrics above. The
+        // every-hop summarize-storm falsifier reads these after the run returns.
+        let summarize_wasm_calls =
+            crate::ring::topology_registry::get_all_summarize_wasm_calls(&network_name);
+
         // Capture the crash-drop count BEFORE self drops (Drop clears the fault
         // injector via `set_fault_injector(None)`). `> 0` proves a scripted
         // `CrashNode` actually blocked traffic — the discriminating signal for
@@ -5129,6 +5172,7 @@ impl SimNetwork {
             node_rings,
             renewal_metrics,
             crash_packets_dropped,
+            summarize_wasm_calls,
         }
     }
 
@@ -6209,7 +6253,8 @@ impl Drop for SimNetwork {
     fn drop(&mut self) {
         use crate::node::network_bridge::set_fault_injector;
         use crate::ring::topology_registry::{
-            clear_current_network_name, clear_renewal_metrics, clear_topology_snapshots,
+            clear_current_network_name, clear_renewal_metrics, clear_summarize_metrics,
+            clear_topology_snapshots,
         };
         use crate::transport::in_memory_socket::{
             clear_network_address_mappings, remove_network_socket_registry,
@@ -6221,6 +6266,7 @@ impl Drop for SimNetwork {
         unregister_network_time_source(&self.name);
         clear_topology_snapshots(&self.name);
         clear_renewal_metrics(&self.name);
+        clear_summarize_metrics(&self.name);
         remove_network_socket_registry(&self.name);
         clear_network_address_mappings(&self.name);
 

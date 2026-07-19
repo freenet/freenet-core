@@ -1271,6 +1271,23 @@ where
                 })
             })?;
 
+        // Summarize-storm falsifier (spec step 8 / #4440): count the actual WASM
+        // `summarize_state` invocation — the SLOW-path miss the state-hash cache
+        // above exists to elide. A cache HIT (the fast path near the top of this
+        // fn) does NOT reach here, so this counter measures exactly the expensive
+        // work whose per-heartbeat × per-neighbor multiplication was the storm.
+        // Under the working cache it scales with the STATE-CHANGE rate, not with
+        // hosted-set size or neighbor overlap — every-hop placement's "summarize
+        // load stays flat vs hosted-set size" invariant. No-op outside a sim (the
+        // record fn reads the sim-only network-name thread-local). This runs on
+        // the contract-handling loop thread, not a spawn_blocking closure, so the
+        // thread-local is set.
+        if let Some(op_manager) = &self.op_manager {
+            if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+                crate::ring::topology_registry::record_summarize_wasm_call(own_addr);
+            }
+        }
+
         let summary = self
             .runtime
             .summarize_state(&key, &params, &state)
