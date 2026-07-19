@@ -49,6 +49,26 @@
 //! more expensive to re-attempt than a merge that returns a rejection quickly.
 //! A timeout escalates the entry's class to `Timeout` and never downgrades.
 //!
+//! ## Trip threshold (why a single Invalid failure does not suppress)
+//!
+//! The two classes also differ in HOW MANY consecutive failures (with no
+//! intervening success) must accrue before the FIRST cooldown suppresses:
+//! `Invalid` requires [`INVALID_TRIP_THRESHOLD`] (3), `Timeout` requires
+//! [`TIMEOUT_TRIP_THRESHOLD`] (1). The discriminator is whether the failure is
+//! *cheap and interleaves with successes* or *consecutive-without-success*:
+//!
+//! - A benign stale-version `InvalidUpdate` reject (#3914) is cheap and normal —
+//!   a busy contract hits it on every re-broadcast the 60s dedup missed, always
+//!   interleaved with the successful newer-version merges. Tripping at 1 would
+//!   blackout the contract for 30s, during which NO merge runs so no success can
+//!   land to clear it (success starvation) — escalating a healthy contract.
+//!   Requiring 3 *consecutive* failures means a benign reject (which a success
+//!   always interrupts) never trips.
+//! - A poison / fork contract fails consecutively with zero clean deltas, so it
+//!   reaches 3 and trips (the fork storm at ~2 failures/min trips in ~90s).
+//! - A `Timeout` is a full ~5s CPU burn every time; one is enough, so it trips
+//!   at 1.
+//!
 //! ## Bounded growth
 //!
 //! Modeled on [`crate::ring::update_rate_limit::UpdateRateLimiter`]: a
@@ -90,6 +110,22 @@ const INVALID_CAP: Duration = Duration::from_secs(30 * 60);
 const TIMEOUT_BASE: Duration = Duration::from_secs(120);
 /// Cap for `Timeout`-class cooldown (2h).
 const TIMEOUT_CAP: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Consecutive `Invalid`-class failures (with NO intervening success) required
+/// before the FIRST cooldown suppresses merges (#4864 review M1). Trip-at-1
+/// would blackout a healthy busy contract on a single benign stale-version
+/// `InvalidUpdate` reject (#3914: production hits these on every re-broadcast
+/// missed by the 60s dedup): during the 30s blackout no merge runs, so no
+/// success can land to clear the entry (success starvation), risking escalation
+/// of a non-poison contract. A benign reject interleaves with successes, so it
+/// never reaches 3 consecutive; a genuine poison/fork contract fails
+/// consecutively and trips. The fork storm (~2 failures/min, zero clean deltas)
+/// still trips within ~90s.
+const INVALID_TRIP_THRESHOLD: u32 = 3;
+/// Consecutive `Timeout`-class failures required before suppression. One is
+/// enough: every timeout is a full ~5s CPU burn on the single contract thread,
+/// so there is no cheap-interleaved-with-success case to tolerate.
+const TIMEOUT_TRIP_THRESHOLD: u32 = 1;
 
 /// How long a failed `(is_delta, bytes)` payload hash is remembered (10 min).
 const FAILED_PAYLOAD_TTL: Duration = Duration::from_secs(10 * 60);
@@ -149,6 +185,16 @@ impl MergeFailureClass {
         match self {
             MergeFailureClass::Invalid => 0,
             MergeFailureClass::Timeout => 1,
+        }
+    }
+
+    /// Consecutive-failures-without-success required before this class starts
+    /// suppressing merges. See [`INVALID_TRIP_THRESHOLD`] /
+    /// [`TIMEOUT_TRIP_THRESHOLD`].
+    fn trip_threshold(self) -> u32 {
+        match self {
+            MergeFailureClass::Invalid => INVALID_TRIP_THRESHOLD,
+            MergeFailureClass::Timeout => TIMEOUT_TRIP_THRESHOLD,
         }
     }
 }
@@ -227,8 +273,13 @@ impl MergeBackoff {
 
     /// Decide whether a merge for `contract` with the given payload should run.
     ///
-    /// `KnownFailedPayload` takes precedence over `InBackoff` (a specific failed
-    /// payload is skipped even once the cooldown elapses). Bumps
+    /// Suppression (both `InBackoff` and `KnownFailedPayload`) kicks in ONLY once
+    /// the contract has failed at least `class.trip_threshold()` times
+    /// consecutively without an intervening success (#4864 review M1): a healthy
+    /// busy contract that gets one benign stale-version `InvalidUpdate` reject
+    /// must not be blacked out (the blackout would starve the success that clears
+    /// it). `KnownFailedPayload` takes precedence over `InBackoff` (a specific
+    /// failed payload is skipped even once the cooldown elapses). Bumps
     /// `suppressed_total` on any non-`Allow` outcome. Does NOT create an entry
     /// for an untracked contract (the common Allow path is a single shard read).
     pub fn check(&self, contract: &ContractInstanceId, payload_hash: u64) -> MergeDecision {
@@ -237,6 +288,12 @@ impl MergeBackoff {
             return MergeDecision::Allow;
         };
         entry.prune_payloads(now);
+        // Below the class's trip threshold, always run the merge — the entry is
+        // still counting failures but not yet "poison". A success (record_success)
+        // clears it before it ever trips, which is exactly the benign case.
+        if entry.consecutive_failures < entry.class.trip_threshold() {
+            return MergeDecision::Allow;
+        }
         if entry
             .failed_payloads
             .iter()
@@ -314,13 +371,18 @@ impl MergeBackoff {
         }
     }
 
-    /// `base * 2^(failures-1)`, capped, with ±20% jitter (seeded `GlobalRng`, so
-    /// reproducible under simulation). Mirrors `ExponentialBackoff` + the
-    /// code-style jitter rule.
+    /// `base * 2^(failures - trip_threshold)`, capped, with ±20% jitter (seeded
+    /// `GlobalRng`, so reproducible under simulation). The exponent is measured
+    /// from the TRIP point, so the FIRST suppressing cooldown (at
+    /// `failures == trip_threshold`) is the base, then escalates as before
+    /// (#4864 review M1). `saturating_sub` floors the pre-trip failures at the
+    /// base too — those cooldowns are never consulted (see `check`).
     fn cooldown_for(class: MergeFailureClass, consecutive_failures: u32) -> Duration {
         let base = class.base();
         let cap = class.cap();
-        let exponent = consecutive_failures.saturating_sub(1).min(20);
+        let exponent = consecutive_failures
+            .saturating_sub(class.trip_threshold())
+            .min(20);
         let raw = base.saturating_mul(1u32 << exponent.min(30));
         let capped = raw.min(cap);
         let jitter: f64 = GlobalRng::random_range(0.8_f64..=1.2_f64);
@@ -366,14 +428,21 @@ impl MergeBackoff {
         self.suppressed_total.load(Ordering::Relaxed)
     }
 
-    /// Number of contracts currently in an active cooldown window (gauge).
-    /// Scans the map (bounded by [`MAX_TRACKED_CONTRACTS`]).
+    /// Number of contracts currently SUPPRESSING merges (gauge). Counts only
+    /// entries that `check` would actually suppress: past the class trip
+    /// threshold AND inside the cooldown window (an entry still accumulating its
+    /// first `trip_threshold - 1` failures is not yet quarantined). Scans the map
+    /// (bounded by [`MAX_TRACKED_CONTRACTS`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn contracts_in_backoff(&self) -> usize {
         let now = self.time_source.now();
         self.entries
             .iter()
-            .filter(|e| now < e.value().next_allowed)
+            .filter(|e| {
+                let entry = e.value();
+                entry.consecutive_failures >= entry.class.trip_threshold()
+                    && now < entry.next_allowed
+            })
             .count()
     }
 
@@ -405,21 +474,62 @@ mod tests {
         assert_eq!(b.len(), 0, "check must not create an entry");
     }
 
+    /// #4864 review M1 test (b): sustained consecutive Invalid failures (no
+    /// successes) do NOT suppress on failures 1-2, then trip at the 3rd.
     #[test]
-    fn failure_puts_contract_in_backoff() {
+    fn invalid_trips_only_after_three_consecutive_failures() {
+        let (b, _ts) = mk();
+        let c = mk_contract(1);
+        // Failures 1 and 2 are counted but do NOT suppress.
+        b.record_failure(&c, MergeFailureClass::Invalid, 1);
+        assert_eq!(
+            b.check(&c, 2),
+            MergeDecision::Allow,
+            "failure 1 must not suppress"
+        );
+        b.record_failure(&c, MergeFailureClass::Invalid, 3);
+        assert_eq!(
+            b.check(&c, 4),
+            MergeDecision::Allow,
+            "failure 2 must not suppress"
+        );
+        // The 3rd consecutive failure trips the Invalid threshold.
+        b.record_failure(&c, MergeFailureClass::Invalid, 5);
+        assert_eq!(b.check(&c, 6), MergeDecision::InBackoff, "failure 3 trips");
+        assert_eq!(b.suppressed_total(), 1);
+    }
+
+    /// #4864 review M1 test (a): two Invalid failures followed by a success are
+    /// never suppressed, and the entry (and its consecutive counter) is cleared.
+    #[test]
+    fn invalid_two_failures_then_success_never_suppressed() {
         let (b, _ts) = mk();
         let c = mk_contract(1);
         b.record_failure(&c, MergeFailureClass::Invalid, 1);
-        // A DIFFERENT payload during cooldown is InBackoff (time-based skip).
-        assert_eq!(b.check(&c, 2), MergeDecision::InBackoff);
-        assert_eq!(b.suppressed_total(), 1);
+        assert!(b.check(&c, 2).is_allowed());
+        b.record_failure(&c, MergeFailureClass::Invalid, 3);
+        assert!(b.check(&c, 4).is_allowed());
+        // A success interrupts the run — the benign-reject case.
+        b.record_success(&c);
+        assert_eq!(b.len(), 0, "success clears the entry (counter reset)");
+        assert_eq!(b.suppressed_total(), 0, "nothing was ever suppressed");
+        // A fresh failure now starts the count from 1 (no lingering escalation).
+        b.record_failure(&c, MergeFailureClass::Invalid, 5);
+        assert_eq!(
+            b.check(&c, 6),
+            MergeDecision::Allow,
+            "post-success failure 1 must not suppress"
+        );
     }
 
     #[test]
     fn success_clears_backoff() {
         let (b, _ts) = mk();
         let c = mk_contract(1);
-        b.record_failure(&c, MergeFailureClass::Invalid, 1);
+        // Trip the Invalid threshold (3 consecutive).
+        for h in [1u64, 3, 5] {
+            b.record_failure(&c, MergeFailureClass::Invalid, h);
+        }
         assert!(!b.check(&c, 2).is_allowed());
         b.record_success(&c);
         assert_eq!(b.check(&c, 2), MergeDecision::Allow);
@@ -435,8 +545,11 @@ mod tests {
     fn known_failed_payload_skipped_even_after_cooldown() {
         let (b, ts) = mk();
         let c = mk_contract(1);
-        b.record_failure(&c, MergeFailureClass::Invalid, 99);
-        // Advance well past the Invalid cooldown (base 30s + jitter) so the
+        // Trip the threshold with the SAME payload three times (consecutive).
+        for _ in 0..3 {
+            b.record_failure(&c, MergeFailureClass::Invalid, 99);
+        }
+        // Advance well past the Invalid first cooldown (base 30s + jitter) so the
         // time-based InBackoff no longer applies.
         ts.advance_time(Duration::from_secs(60));
         // The specific failed payload is still skipped (memoization) ...
@@ -449,11 +562,26 @@ mod tests {
     fn known_failed_payload_expires_after_ttl() {
         let (b, ts) = mk();
         let c = mk_contract(1);
-        b.record_failure(&c, MergeFailureClass::Invalid, 99);
+        for _ in 0..3 {
+            b.record_failure(&c, MergeFailureClass::Invalid, 99);
+        }
         ts.advance_time(FAILED_PAYLOAD_TTL + Duration::from_secs(1));
         // Past the memo TTL the payload is no longer KnownFailedPayload; the
         // cooldown is also long past, so it's Allow.
         assert_eq!(b.check(&c, 99), MergeDecision::Allow);
+    }
+
+    /// #4864 review M1 test (c): a Timeout trips at the FIRST failure.
+    #[test]
+    fn timeout_still_trips_at_first_failure() {
+        let (b, _ts) = mk();
+        let c = mk_contract(1);
+        b.record_failure(&c, MergeFailureClass::Timeout, 1);
+        assert_eq!(
+            b.check(&c, 2),
+            MergeDecision::InBackoff,
+            "a single timeout (full ~5s CPU burn) must trip immediately"
+        );
     }
 
     #[test]
@@ -461,7 +589,11 @@ mod tests {
         let (b, ts) = mk();
         let invalid = mk_contract(1);
         let timeout = mk_contract(2);
-        b.record_failure(&invalid, MergeFailureClass::Invalid, 1);
+        // Trip invalid with 3 consecutive failures → first cooldown = base 30s.
+        for h in [1u64, 2, 3] {
+            b.record_failure(&invalid, MergeFailureClass::Invalid, h);
+        }
+        // Trip timeout with 1 failure → cooldown = base 120s.
         b.record_failure(&timeout, MergeFailureClass::Timeout, 1);
 
         // After 60s (> Invalid base 30s+jitter, < Timeout base 120s), the
@@ -494,20 +626,28 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_escalates_with_consecutive_failures() {
+    fn cooldown_escalates_after_trip() {
         let (b, ts) = mk();
         let c = mk_contract(1);
-        // First failure: ~30s cooldown. Let it elapse.
-        b.record_failure(&c, MergeFailureClass::Invalid, 1);
-        ts.advance_time(Duration::from_secs(40));
-        assert_eq!(b.check(&c, 2), MergeDecision::Allow);
-        // Second failure: ~60s cooldown (base * 2). 40s is NOT enough now.
-        b.record_failure(&c, MergeFailureClass::Invalid, 3);
+        // Trip the Invalid threshold (3 consecutive) → FIRST cooldown = base ~30s.
+        for h in [1u64, 2, 3] {
+            b.record_failure(&c, MergeFailureClass::Invalid, h);
+        }
+        // Let the ~30s first cooldown elapse.
         ts.advance_time(Duration::from_secs(40));
         assert_eq!(
-            b.check(&c, 4),
+            b.check(&c, 10),
+            MergeDecision::Allow,
+            "first (base) cooldown should have elapsed by 40s"
+        );
+        // A 4th consecutive failure escalates to ~60s (base * 2). 40s is NOT
+        // enough now — escalation continues past the trip, as before.
+        b.record_failure(&c, MergeFailureClass::Invalid, 4);
+        ts.advance_time(Duration::from_secs(40));
+        assert_eq!(
+            b.check(&c, 11),
             MergeDecision::InBackoff,
-            "second consecutive failure must escalate the cooldown past 40s"
+            "post-trip failure must escalate the cooldown past 40s"
         );
     }
 
@@ -618,41 +758,58 @@ mod tests {
         // loop would never be contained.
         let (b, ts) = mk();
         let c = mk_contract(1);
-        let fork_a_delta = 0xAAAA;
-        let fork_b_delta = 0xBBBB;
-
-        // Cycle 1: a fork-B delta fails to apply against fork-A state.
-        b.record_failure(&c, MergeFailureClass::Invalid, fork_b_delta);
-        // ... a resync flips us to fork B (NO record_success — that's the fix).
-        // Cycle 2: a fork-A delta now fails against fork-B state. Let the first
-        // (~30s) cooldown lapse so this models a genuine later re-attempt.
+        // Three alternating fork deltas (distinct payloads), 40s apart, each
+        // failing against the current fork, with a resync flip between them that
+        // does NOT reset the backoff. Advance BETWEEN failures only — not after
+        // the 3rd — so the check lands inside the first (~30s) cooldown.
+        b.record_failure(&c, MergeFailureClass::Invalid, 0xAAAA);
         ts.advance_time(Duration::from_secs(40));
-        b.record_failure(&c, MergeFailureClass::Invalid, fork_a_delta);
-
-        // Two consecutive failures without a reset ⇒ escalated (~60s) cooldown.
-        // 40s later a fresh (non-memoized) delta is still suppressed, proving the
-        // count escalated past a single-failure 30s cooldown rather than resetting
-        // each cycle.
+        // ... resync flips to the other fork (NO record_success — the fix).
+        b.record_failure(&c, MergeFailureClass::Invalid, 0xBBBB);
         ts.advance_time(Duration::from_secs(40));
+        b.record_failure(&c, MergeFailureClass::Invalid, 0xCCCC);
+
+        // Three consecutive failures without a reset trip the Invalid threshold;
+        // a fresh (non-memoized) delta is now suppressed — proving the count
+        // accumulated across cycles rather than resetting on each resync/flip.
         assert_eq!(
-            b.check(&c, 0xCCCC),
+            b.check(&c, 0xDDDD),
             MergeDecision::InBackoff,
-            "alternating fork deltas must escalate the backoff (no resync reset)"
+            "alternating fork deltas must trip the backoff (no resync reset)"
         );
     }
 
     #[test]
     fn contracts_in_backoff_gauge() {
         let (b, ts) = mk();
-        b.record_failure(&mk_contract(1), MergeFailureClass::Invalid, 1);
+        // Trip the Invalid contract (3 consecutive) and the Timeout contract (1).
+        for h in [1u64, 2, 3] {
+            b.record_failure(&mk_contract(1), MergeFailureClass::Invalid, h);
+        }
         b.record_failure(&mk_contract(2), MergeFailureClass::Timeout, 1);
         assert_eq!(b.contracts_in_backoff(), 2);
-        // Advance past the Invalid cooldown only.
+        // Advance past the Invalid first cooldown (~30s) only.
         ts.advance_time(Duration::from_secs(60));
         assert_eq!(
             b.contracts_in_backoff(),
             1,
             "only the still-cooling Timeout contract should count"
         );
+    }
+
+    /// The gauge must NOT count a contract still below its trip threshold (a
+    /// pre-trip entry has a `next_allowed` set but `check` would still Allow).
+    #[test]
+    fn contracts_in_backoff_gauge_excludes_pre_trip_entries() {
+        let (b, _ts) = mk();
+        let c = mk_contract(1);
+        b.record_failure(&c, MergeFailureClass::Invalid, 1);
+        b.record_failure(&c, MergeFailureClass::Invalid, 2);
+        // 2 < 3: not yet suppressing, so the gauge must not count it.
+        assert_eq!(b.contracts_in_backoff(), 0);
+        assert!(b.check(&c, 3).is_allowed());
+        // The 3rd failure trips it.
+        b.record_failure(&c, MergeFailureClass::Invalid, 3);
+        assert_eq!(b.contracts_in_backoff(), 1);
     }
 }
