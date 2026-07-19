@@ -1103,9 +1103,11 @@ const DELTA_CACHE_MIN_BYTES: usize = 8 * 1024 * 1024;
 /// Upper clamp for the delta-cache byte budget (64 MiB). Matches PR #4794's
 /// ceiling. Per-executor × up to 16 pool workers → ≤ 1 GiB aggregate delta-cache
 /// RAM. Combined with the summary cache (≤ 512 MiB aggregate) and the shared
-/// module cache (≤ 1.5 GiB) the total cache commitment stays a safe fraction of a
-/// production gateway's memory (≈ 3 GiB worst case, well under the 7600 MiB (= 7.42 GiB)
-/// gateway limit). NOTE: this budget is PER-EXECUTOR; aggregate RAM is
+/// module cache (RAM/8, absolute max 4 GiB — but the divisor binds well below
+/// that on typical gateways: ~950 MiB on a 7.6 GiB box) the total cache
+/// commitment stays a safe fraction of a production gateway's memory (see
+/// `cache_byte_budgets_are_aggregate_safe`, which models the RAM-scaled budget
+/// rather than the absolute max). NOTE: this budget is PER-EXECUTOR; aggregate RAM is
 /// `pool_size × (summary_budget + delta_budget)`, not a single node-wide figure.
 /// `pool_size` tracks CPU count (core count), so a RAM-scaled per-executor budget
 /// is multiplied by cores: on an exotic high-core/low-RAM box the aggregate is a

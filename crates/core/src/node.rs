@@ -4080,7 +4080,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // TODO(#4864 round-5): sqlite bogus-key flood test — blocked by the crate
+    // TODO(#4869): sqlite bogus-key flood test — blocked by the crate
     // having NO compilable SQLite-only feature combination. The round-5 fix
     // added an async SQLite EXISTS probe (`contract_state_present_async` →
     // `get_state_size`) so bogus ResyncRequests are rejected before consuming a
