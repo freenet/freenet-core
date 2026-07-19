@@ -1214,7 +1214,8 @@ async fn drive_relay_broadcast_to(
     let payload_hash = crate::ring::merge_backoff::merge_payload_hash(is_delta, &payload_bytes);
     match op_manager.ring.merge_backoff.check(key.id(), payload_hash) {
         crate::ring::merge_backoff::MergeDecision::Allow => {}
-        decision => {
+        decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
+        | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
             crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
             tracing::debug!(
                 tx = %incoming_tx,
@@ -2014,7 +2015,8 @@ async fn apply_streaming_broadcast(
         .check(key.id(), stream_payload_hash)
     {
         crate::ring::merge_backoff::MergeDecision::Allow => {}
-        decision => {
+        decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
+        | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
             crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
             tracing::debug!(
                 tx = %incoming_tx,
