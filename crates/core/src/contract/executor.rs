@@ -2220,6 +2220,124 @@ mod tests {
             );
         }
 
+        /// #4864 round-7 (Codex P1): a validation-phase WASM error (a runaway
+        /// `validate_state` that blows the deadline, or a queue-saturation
+        /// scheduler timeout) MUST classify exactly like a merge-phase error. The
+        /// UPDATE-path validation helpers previously wrapped these with `op = None`,
+        /// which routes a `WasmError`/`ContractExecError` to `ExecutorError::other`
+        /// (`Either::Right`) — so `is_contract_exec_rejection`, `is_wasm_timeout`,
+        /// and `is_scheduler_timeout` all returned false and the UPDATE driver
+        /// recorded NOTHING, letting a contract whose runaway half is
+        /// `validate_state` burn the full budget per broadcast without ever backing
+        /// off. With `op = Some(Upsert(key))` (the fix) the SAME error routes
+        /// through `update_exec_error` and classifies.
+        #[test]
+        fn validation_phase_exec_errors_with_upsert_op_classify() {
+            use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+            let key = test_fixtures::make_contract_key();
+            let mk = |exec: ContractExecError| -> ContractError {
+                RuntimeInnerError::ContractExecError(exec).into()
+            };
+
+            // FIXED wrapper (op = Some(Upsert(key))): a runaway validate_state that
+            // blew the deadline classifies as a real wasm timeout, and stays a
+            // contract-exec rejection (contract present ⇒ no auto-fetch).
+            let timeout_fixed = ExecutorError::execution(
+                mk(ContractExecError::MaxComputeTimeExceeded),
+                Some(super::super::InnerOpError::Upsert(key)),
+            );
+            assert!(
+                timeout_fixed.is_wasm_timeout(),
+                "validation-phase MaxComputeTimeExceeded on the Upsert path MUST be a wasm timeout"
+            );
+            assert!(timeout_fixed.is_contract_exec_rejection());
+
+            // A queue-saturation scheduler timeout during validation classifies as
+            // the transient scheduler class (excluded from the backoff), NOT a real
+            // timeout — same as the merge-phase scheduler timeout.
+            let sched_fixed = ExecutorError::execution(
+                mk(ContractExecError::SchedulerOverloaded),
+                Some(super::super::InnerOpError::Upsert(key)),
+            );
+            assert!(
+                sched_fixed.is_scheduler_timeout(),
+                "validation-phase SchedulerOverloaded on the Upsert path MUST be a scheduler timeout"
+            );
+            assert!(!sched_fixed.is_wasm_timeout());
+            assert!(sched_fixed.is_contract_exec_rejection());
+
+            // The bug the fix closes: with op = None the SAME error escapes every
+            // classification predicate, so the driver records nothing.
+            let timeout_bug =
+                ExecutorError::execution(mk(ContractExecError::MaxComputeTimeExceeded), None);
+            assert!(
+                !timeout_bug.is_wasm_timeout() && !timeout_bug.is_contract_exec_rejection(),
+                "op = None escapes classification — the pre-fix behavior this closes"
+            );
+        }
+
+        /// Source-scrape pin (#4864 round-7 Codex P1): the UPDATE-path validation
+        /// helpers must classify `validate_state` failures with
+        /// `Some(InnerOpError::Upsert(*key))`, never `op = None`. A regression to
+        /// `None` would silently make the driver record nothing for a contract
+        /// whose runaway half is `validate_state`. Paired with the behavioral test
+        /// above, which pins that the Upsert form actually classifies.
+        #[test]
+        fn update_path_validation_sites_pass_upsert_op_not_none() {
+            // (source, fn-signature-needle) for each validation helper.
+            let cases: [(&str, &str); 2] = [
+                (
+                    include_str!("executor/runtime/executor_impl.rs"),
+                    "async fn fetch_related_for_validation(",
+                ),
+                (
+                    include_str!("executor/runtime/contract_ops.rs"),
+                    "async fn fetch_related_for_validation_network(",
+                ),
+            ];
+            for (src, sig) in cases {
+                let start = src
+                    .find(sig)
+                    .unwrap_or_else(|| panic!("validation helper `{sig}` not found"));
+                // Bound the body at the NEXT method in the impl block (any
+                // visibility), so the negative assertion below can't overrun into a
+                // different function that legitimately uses `execution(e, None)`.
+                let rest = &src[start + sig.len()..];
+                let end = [
+                    "\n    fn ",
+                    "\n    async fn ",
+                    "\n    pub(super) fn ",
+                    "\n    pub(super) async fn ",
+                    "\n    pub(crate) fn ",
+                    "\n    pub(crate) async fn ",
+                    "\n    pub(in crate::contract::executor) async fn ",
+                ]
+                .iter()
+                .filter_map(|needle| rest.find(needle))
+                .min()
+                .map(|i| start + sig.len() + i)
+                .unwrap_or(src.len());
+                let body = &src[start..end];
+
+                assert!(
+                    body.contains("validate_state"),
+                    "`{sig}` must call validate_state (scrape anchor)"
+                );
+                assert!(
+                    body.contains("Some(InnerOpError::Upsert(*key))"),
+                    "`{sig}` must classify validate_state failures with \
+                     Some(InnerOpError::Upsert(*key)) (#4864 round-7), so a \
+                     validation-phase timeout reaches the merge-failure backoff"
+                );
+                assert!(
+                    !body.contains("execution(e, None)"),
+                    "`{sig}` must NOT wrap a validate_state failure with op = None — \
+                     that escapes classification and the UPDATE driver records \
+                     nothing (#4864 round-7)"
+                );
+            }
+        }
+
         /// Pin (#4861 review): the DESERIALIZATION-poison class — a contract's
         /// `update_state` returning `ContractError::Deser` for a malformed
         /// circulating delta (the `FBFRDjxV…` production case) — MUST reach the

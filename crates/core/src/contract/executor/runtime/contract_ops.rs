@@ -645,15 +645,25 @@ impl Executor<Runtime> {
         initial_related: &RelatedContracts<'_>,
         already_fetched_contract: Option<&ContractContainer>,
     ) -> Result<ValidateResult, ExecutorError> {
+        // #4864 round-7 (Codex P1): classify validation-phase WASM errors with
+        // `op = Some(Upsert(*key))` so a runaway/timed-out `validate_state` on the
+        // UPDATE path (this helper serves `get_updated_state`) routes through
+        // `update_exec_error` and reaches the merge-failure backoff, exactly like
+        // a merge-phase error. `op = None` escaped classification entirely. `key`
+        // is in scope; the fix is trivially correct. This helper is also used by
+        // the local re-PUT merge in `perform_contract_put`, where the same change
+        // is strictly more accurate (a validation exec error means the contract IS
+        // present, so `is_contract_exec_rejection` should be true and no auto-fetch
+        // should fire).
         let result = match already_fetched_contract {
             Some(contract) => self
                 .runtime
                 .validate_state_with_contract(key, params, state, initial_related, contract)
-                .map_err(|e| ExecutorError::execution(e, None))?,
+                .map_err(|e| ExecutorError::execution(e, Some(InnerOpError::Upsert(*key))))?,
             None => self
                 .runtime
                 .validate_state(key, params, state, initial_related)
-                .map_err(|e| ExecutorError::execution(e, None))?,
+                .map_err(|e| ExecutorError::execution(e, Some(InnerOpError::Upsert(*key))))?,
         };
 
         let requested_ids = match result {
@@ -754,15 +764,17 @@ impl Executor<Runtime> {
         }
 
         let populated_related = RelatedContracts::from(related_map);
+        // #4864 round-7: classify the second-round validation error too (see the
+        // first `validate_state` match above for the rationale).
         let retry_result = match already_fetched_contract {
             Some(contract) => self
                 .runtime
                 .validate_state_with_contract(key, params, state, &populated_related, contract)
-                .map_err(|e| ExecutorError::execution(e, None))?,
+                .map_err(|e| ExecutorError::execution(e, Some(InnerOpError::Upsert(*key))))?,
             None => self
                 .runtime
                 .validate_state(key, params, state, &populated_related)
-                .map_err(|e| ExecutorError::execution(e, None))?,
+                .map_err(|e| ExecutorError::execution(e, Some(InnerOpError::Upsert(*key))))?,
         };
 
         if let ValidateResult::RequestRelated(_) = &retry_result {
