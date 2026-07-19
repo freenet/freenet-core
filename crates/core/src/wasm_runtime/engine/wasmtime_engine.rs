@@ -141,7 +141,7 @@
 //! We wrap with `block_on_async()` to maintain a synchronous interface for callers.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -983,6 +983,10 @@ impl WasmEngine for WasmtimeEngine {
                 self.recover_store();
                 Err(WasmError::Timeout)
             }
+            BlockingResult::QueuedTimeout => {
+                self.recover_store();
+                Err(WasmError::SchedulerOverloaded)
+            }
             BlockingResult::Panic(err) => {
                 self.recover_store();
                 Err(WasmError::Other(err))
@@ -1051,6 +1055,10 @@ impl WasmEngine for WasmtimeEngine {
             BlockingResult::Timeout => {
                 self.recover_store();
                 Err(WasmError::Timeout)
+            }
+            BlockingResult::QueuedTimeout => {
+                self.recover_store();
+                Err(WasmError::SchedulerOverloaded)
             }
             BlockingResult::Panic(err) => {
                 self.recover_store();
@@ -1820,7 +1828,17 @@ type WasmResult = (Result<i64, WasmtimeError>, Store<HostState>);
 enum BlockingResult {
     Ok(i64, Store<HostState>),
     WasmError(WasmtimeError, Store<HostState>),
+    /// Wall-clock deadline fired while the guest was RUNNING (`started == true`)
+    /// — a real, contract-intrinsic timeout backing up the epoch trap. The
+    /// store is unrecoverable (the aborted task/thread still owns it), so the
+    /// caller recovers a fresh store like the other timeout arms.
     Timeout,
+    /// Wall-clock deadline fired while the closure was still QUEUED on a
+    /// saturated blocking pool (`started == false`) — the guest never ran
+    /// (#4864 round-6). Transient load, NOT a contract fault; the caller maps
+    /// it to [`WasmError::SchedulerOverloaded`] and recovers the store as with
+    /// `Timeout`.
+    QueuedTimeout,
     Panic(anyhow::Error),
 }
 
@@ -1830,6 +1848,19 @@ where
 {
     let timeout = Duration::from_secs_f64(max_execution_seconds);
     let start = std::time::Instant::now();
+
+    // #4864 round-6: distinguish a guest that RAN and blew the wall-clock
+    // deadline (a real, contract-intrinsic timeout — the epoch backstop) from a
+    // closure that never got off the blocking-pool queue (a transient scheduler
+    // overload the guest never entered). The wrapped closure's FIRST act flips
+    // `started`, so a wall-clock fire with `started == false` means the guest
+    // never ran and the failure must NOT be charged to the contract.
+    let started = Arc::new(AtomicBool::new(false));
+    let started_for_guest = Arc::clone(&started);
+    let f = move || {
+        started_for_guest.store(true, Ordering::SeqCst);
+        f()
+    };
 
     // `block_in_place` (in the multi-thread arm below) is only legal on a
     // multi-threaded runtime; it PANICS on a current_thread runtime. Route a
@@ -1864,13 +1895,27 @@ where
                 }
 
                 if start.elapsed() >= timeout {
+                    task_handle.abort();
+                    // #4864 round-6: only a guest that actually STARTED is a real
+                    // (contract-intrinsic) timeout. A closure still queued on a
+                    // saturated blocking pool never ran, so classify it as a
+                    // transient scheduler overload instead of quarantining the
+                    // contract.
+                    if started.load(Ordering::SeqCst) {
+                        tracing::warn!(
+                            timeout_secs = max_execution_seconds,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "WASM execution timed out (guest running; epoch backstop)"
+                        );
+                        return BlockingResult::Timeout;
+                    }
                     tracing::warn!(
                         timeout_secs = max_execution_seconds,
                         elapsed_ms = start.elapsed().as_millis(),
-                        "WASM execution timed out"
+                        "WASM execution timed out while QUEUED (guest never started; \
+                         blocking-pool saturation) — treated as transient, contract not quarantined"
                     );
-                    task_handle.abort();
-                    return BlockingResult::Timeout;
+                    return BlockingResult::QueuedTimeout;
                 }
 
                 std::thread::sleep(Duration::from_millis(10));
@@ -1912,12 +1957,26 @@ where
                 }
 
                 if start.elapsed() >= timeout {
+                    // #4864 round-6: same started-flag classification as the
+                    // multi-thread arm. The detached thread is left to finish
+                    // and drop the store on its own (as before); only the
+                    // RESULT classification differs by whether the guest ran.
+                    if started.load(Ordering::SeqCst) {
+                        tracing::warn!(
+                            timeout_secs = max_execution_seconds,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "WASM execution timed out (guest running; epoch backstop, no tokio runtime)"
+                        );
+                        return BlockingResult::Timeout;
+                    }
                     tracing::warn!(
                         timeout_secs = max_execution_seconds,
                         elapsed_ms = start.elapsed().as_millis(),
-                        "WASM execution timed out (no tokio runtime)"
+                        "WASM execution timed out while QUEUED (guest never started; \
+                         blocking-pool saturation, no tokio runtime) — treated as transient, \
+                         contract not quarantined"
                     );
-                    return BlockingResult::Timeout;
+                    return BlockingResult::QueuedTimeout;
                 }
 
                 std::thread::sleep(Duration::from_millis(10));

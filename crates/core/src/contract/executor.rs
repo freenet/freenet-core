@@ -462,6 +462,43 @@ impl ExecutorError {
         }
     }
 
+    /// Returns true ONLY when the contract's WASM merge/validate call never ran
+    /// because it sat QUEUED on a saturated blocking pool past the wall-clock
+    /// deadline — the #4864 round-6 scheduler-overload case, where the guest
+    /// never entered execution (distinct from a runaway guest that DID run and
+    /// blew the deadline, which stays a real `is_wasm_timeout`). The engine
+    /// classifies it as `WasmError::SchedulerOverloaded` →
+    /// `ContractExecError::SchedulerOverloaded` → `update_exec_error`, whose
+    /// cause is "execution error: The operation was queued too long on a
+    /// saturated execution pool and never ran".
+    ///
+    /// Used by the per-contract merge-failure backoff record site to EXCLUDE a
+    /// scheduler timeout (exactly like `is_contract_queue_full`): the guest
+    /// never executed, so the failure is transient load, not a contract fault,
+    /// and quarantining the contract for a delta it never applied would be
+    /// wrong. Because the guest never ran, this is deliberately DISJOINT from
+    /// `is_wasm_timeout` — a scheduler timeout must NOT pick the Timeout-class
+    /// quarantine that a genuine runaway merge earns.
+    ///
+    /// String-matched (not a typed downcast) for the same reason as
+    /// `is_wasm_timeout`: the error must KEEP its `Update{cause}`
+    /// representation so `is_contract_exec_rejection` still returns true (the
+    /// contract IS present locally ⇒ no auto-fetch), and a client-local UPDATE
+    /// still surfaces a typed `ContractError::Update`. The message is defined
+    /// in this crate (`ContractExecError::SchedulerOverloaded`), so the string
+    /// is stable.
+    pub fn is_scheduler_timeout(&self) -> bool {
+        match &self.inner {
+            Either::Left(req_err) => matches!(
+                req_err.as_ref(),
+                RequestError::ContractError(StdContractError::Update { cause, .. })
+                    if cause.starts_with("execution error:")
+                        && cause.contains("queued too long on a saturated execution pool")
+            ),
+            Either::Right(_) => false,
+        }
+    }
+
     /// Returns true if this error is the typed `ContractQueueFull` marker.
     ///
     /// Produced by:
@@ -2068,6 +2105,58 @@ mod tests {
             assert!(
                 err.is_wasm_timeout(),
                 "MaxComputeTimeExceeded on the Upsert path MUST classify as a wasm timeout"
+            );
+        }
+
+        /// #4864 round-6: a SCHEDULER timeout (the merge closure sat queued on a
+        /// saturated blocking pool past the deadline and the guest NEVER ran)
+        /// must be a distinct classification from a real compute-time timeout.
+        /// It flows `ContractExecError::SchedulerOverloaded` → `update_exec_error`
+        /// (op = Some(Upsert(key))), so it carries the "execution error:" prefix
+        /// and stays a contract-exec rejection (contract IS present ⇒ no
+        /// auto-fetch), yet the op_ctx_task record site excludes it from the
+        /// merge-failure backoff via `!err.is_scheduler_timeout()`. Crucially it
+        /// is DISJOINT from `is_wasm_timeout`: the guest never executed, so it
+        /// must NOT earn the Timeout-class quarantine a runaway merge does.
+        #[test]
+        fn test_scheduler_timeout_is_distinct_transient_classification() {
+            use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+            let key = test_fixtures::make_contract_key();
+            let contract_err: ContractError =
+                RuntimeInnerError::ContractExecError(ContractExecError::SchedulerOverloaded).into();
+            let err = ExecutorError::execution(
+                contract_err,
+                Some(super::super::InnerOpError::Upsert(key)),
+            );
+            assert!(
+                err.is_scheduler_timeout(),
+                "SchedulerOverloaded on the Upsert path MUST classify as a scheduler timeout"
+            );
+            assert!(
+                !err.is_wasm_timeout(),
+                "a scheduler timeout MUST be disjoint from a real wasm timeout — the \
+                 guest never ran, so it must not pick the Timeout-class quarantine"
+            );
+            assert!(
+                err.is_contract_exec_rejection(),
+                "a scheduler timeout IS an exec rejection (contract present ⇒ no auto-fetch); \
+                 the backoff record site excludes it via the && !is_scheduler_timeout() gate"
+            );
+
+            // The two are disjoint from the OTHER side too: a genuine
+            // MaxComputeTimeExceeded (guest ran and blew the deadline) is a real
+            // wasm timeout and is NOT a scheduler timeout.
+            let real_timeout = ExecutorError::request(StdContractError::update_exec_error(
+                key,
+                "The operation exceeded the maximum allowed compute time",
+            ));
+            assert!(
+                real_timeout.is_wasm_timeout(),
+                "a real compute-time timeout stays a wasm timeout"
+            );
+            assert!(
+                !real_timeout.is_scheduler_timeout(),
+                "a real compute-time timeout MUST NOT be misclassified as a scheduler timeout"
             );
         }
 

@@ -153,6 +153,16 @@ pub enum ContractExecError {
 
     #[error("The operation exceeded the maximum allowed compute time")]
     MaxComputeTimeExceeded,
+
+    /// The operation never ran: it sat queued on a saturated execution pool
+    /// past the wall-clock deadline and the guest never started (#4864
+    /// round-6). Distinct from [`ContractExecError::MaxComputeTimeExceeded`]
+    /// (a guest that DID run and blew the deadline). The message string is
+    /// load-bearing — `ExecutorError::is_scheduler_timeout` matches on the
+    /// "queued too long on a saturated execution pool" phrase after it flows
+    /// through `update_exec_error`.
+    #[error("The operation was queued too long on a saturated execution pool and never ran")]
+    SchedulerOverloaded,
 }
 
 pub struct RuntimeConfig {

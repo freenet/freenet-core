@@ -345,6 +345,11 @@ pub(crate) fn classify_result<T>(result: Result<T, WasmError>) -> RuntimeResult<
         Ok(value) => Ok(value),
         Err(WasmError::OutOfGas) => Err(ContractExecError::OutOfGas.into()),
         Err(WasmError::Timeout) => Err(ContractExecError::MaxComputeTimeExceeded.into()),
+        // #4864 round-6: a scheduler-overload timeout (guest never ran, blocking-
+        // pool saturation) maps to its own transient variant. The op_ctx_task
+        // record site excludes it from the merge-failure backoff, so it is NOT
+        // quarantined contract-wide the way a real Timeout is.
+        Err(WasmError::SchedulerOverloaded) => Err(ContractExecError::SchedulerOverloaded.into()),
         Err(e) => Err(e.into()),
     }
 }

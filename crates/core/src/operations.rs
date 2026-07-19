@@ -192,6 +192,16 @@ impl OpError {
     pub fn is_wasm_timeout(&self) -> bool {
         matches!(self, Self::ExecutorError(e) if e.is_wasm_timeout())
     }
+
+    /// Returns true ONLY when the contract's WASM merge/validate never ran
+    /// because it sat queued on a saturated blocking pool past the deadline
+    /// (#4864 round-6). The broadcast drivers' record sites EXCLUDE it from the
+    /// merge-failure backoff (like queue-full) and route it through the
+    /// transient resync heal, since the guest never applied the delta. Disjoint
+    /// from `is_wasm_timeout`. See `ExecutorError::is_scheduler_timeout`.
+    pub fn is_scheduler_timeout(&self) -> bool {
+        matches!(self, Self::ExecutorError(e) if e.is_scheduler_timeout())
+    }
 }
 
 impl<T> From<SendError<T>> for OpError {

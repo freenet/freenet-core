@@ -1360,7 +1360,12 @@ async fn drive_relay_broadcast_to(
             // excludes queue-full (transient load) and missing-contract failures
             // (healed by the auto-fetch below) — backing either off would be
             // wrong. A timeout gets the longer Timeout-class cooldown.
-            if err.is_contract_exec_rejection() {
+            //
+            // #4864 round-6: a SCHEDULER timeout (guest never ran, blocking-pool
+            // saturation) IS an exec rejection by cause-prefix, but the guest
+            // never executed the delta, so it must NOT be quarantined — exclude
+            // it here exactly like queue-full.
+            if err.is_contract_exec_rejection() && !err.is_scheduler_timeout() {
                 let class = if err.is_wasm_timeout() {
                     crate::ring::merge_backoff::MergeFailureClass::Timeout
                 } else {
@@ -1399,7 +1404,13 @@ async fn drive_relay_broadcast_to(
             // sender to resend full state onto the same saturated queue, and
             // auto-fetch enqueues a GET right back onto it. Skip both; still
             // surface the error to the caller for telemetry.
-            let queue_full = err.is_contract_queue_full();
+            //
+            // #4864 round-6: a scheduler timeout (guest never ran, blocking-pool
+            // saturation) is the SAME transient/load class — the delta was never
+            // applied and we still hold the contract — so it takes the identical
+            // heal path (resync, no auto-fetch). Keep the name `queue_full` so
+            // the downstream branch logic is untouched.
+            let queue_full = err.is_contract_queue_full() || err.is_scheduler_timeout();
 
             if is_delta && !queue_full {
                 // Delta application failed → send ResyncRequest. Mirrors
@@ -2198,8 +2209,10 @@ async fn apply_streaming_broadcast(
         Err(err) => {
             // Record poison-contract merge failures for the backoff (#4861),
             // same classification as the non-streaming driver: only genuine
-            // contract-exec rejections, timeout → longer cooldown.
-            if err.is_contract_exec_rejection() {
+            // contract-exec rejections, timeout → longer cooldown. #4864 round-6:
+            // exclude a scheduler timeout (guest never ran) just like the
+            // non-streaming driver — it must not quarantine the contract.
+            if err.is_contract_exec_rejection() && !err.is_scheduler_timeout() {
                 let class = if err.is_wasm_timeout() {
                     crate::ring::merge_backoff::MergeFailureClass::Timeout
                 } else {
@@ -2212,6 +2225,14 @@ async fn apply_streaming_broadcast(
                     stream_payload_hash,
                 );
             }
+
+            // #4864 round-6: a scheduler timeout (guest never ran, blocking-pool
+            // saturation) is the SAME transient/load class as queue-full — heal
+            // via ResyncRequest, no auto-fetch (we still hold the contract).
+            // `log_broadcast_to_streaming_failure` already returns false for it
+            // (it is an exec rejection), so the auto-fetch branch stays
+            // suppressed; keep the name `queue_full` so the heal arm is untouched.
+            let queue_full = err.is_contract_queue_full() || err.is_scheduler_timeout();
 
             // Classify failure: real failure → self-heal via
             // try_auto_fetch_contract; benign stale-version rejection →
@@ -2237,7 +2258,7 @@ async fn apply_streaming_broadcast(
                     )
                     .await;
                 });
-            } else if err.is_contract_queue_full() {
+            } else if queue_full {
                 // Issue #4857 on the STREAMING full-state path: identical
                 // poisoning to the non-streaming driver. A delivered streaming
                 // full-state broadcast caches the peer summary
@@ -2742,15 +2763,30 @@ mod tests {
         let record_pos = driver_src
             .find(".record_failure(")
             .expect("merge_backoff.record_failure missing in BroadcastTo driver");
-        // The record_failure must be inside an is_contract_exec_rejection guard.
+        // The record_failure must be inside an is_contract_exec_rejection guard
+        // that ALSO excludes scheduler timeouts (#4864 round-6): a scheduler
+        // timeout is an exec rejection by cause-prefix but the guest never ran,
+        // so it must not create a backoff entry.
         let guard_pos = driver_src
-            .find("if err.is_contract_exec_rejection() {")
-            .expect("record_failure must be gated on is_contract_exec_rejection");
+            .find("if err.is_contract_exec_rejection() && !err.is_scheduler_timeout() {")
+            .expect(
+                "record_failure must be gated on \
+                 is_contract_exec_rejection() && !err.is_scheduler_timeout()",
+            );
         assert!(
             guard_pos < record_pos,
             "merge_backoff.record_failure MUST be gated on \
              is_contract_exec_rejection() so queue-full and missing-contract \
              failures do NOT create a backoff entry (#4861)"
+        );
+        // #4864 round-6: the same guard must exclude a scheduler timeout via
+        // !err.is_scheduler_timeout() — the guest-never-ran case takes the
+        // transient (queue-full-style) path, never the contract quarantine.
+        assert!(
+            driver_src.contains("!err.is_scheduler_timeout()"),
+            "the record gate MUST exclude scheduler timeouts via \
+             !err.is_scheduler_timeout() (#4864 round-6): a queued-never-ran \
+             merge must not quarantine the contract"
         );
         assert!(
             driver_src.contains("is_wasm_timeout()"),
@@ -3149,10 +3185,16 @@ mod tests {
         };
 
         // Non-streaming driver delegates to the helper and does NOT auto-fetch.
+        // #4864 round-6: the `queue_full` local now also folds in a scheduler
+        // timeout (transient load, same heal path), so the classification is
+        // `is_contract_queue_full() || is_scheduler_timeout()`.
         let ns = fn_body("async fn drive_relay_broadcast_to(");
         assert!(
-            ns.contains("let queue_full = err.is_contract_queue_full();"),
-            "drive_relay_broadcast_to must still classify queue-full (#4251)"
+            ns.contains(
+                "let queue_full = err.is_contract_queue_full() || err.is_scheduler_timeout();"
+            ),
+            "drive_relay_broadcast_to must still classify queue-full and fold in \
+             scheduler timeouts (#4251, #4864 round-6)"
         );
         let ns_arm = queue_full_arm(ns, "} else if queue_full {");
         assert!(
@@ -3177,8 +3219,17 @@ mod tests {
              apply_streaming_broadcast — otherwise the streaming apply/heal logic \
              is unreachable"
         );
+        // #4864 round-6: the streaming heal arm is now gated on the same
+        // `queue_full` local (queue-full OR scheduler timeout).
         let st = fn_body("async fn apply_streaming_broadcast(");
-        let st_arm = queue_full_arm(st, "} else if err.is_contract_queue_full() {");
+        assert!(
+            st.contains(
+                "let queue_full = err.is_contract_queue_full() || err.is_scheduler_timeout();"
+            ),
+            "apply_streaming_broadcast must classify queue-full and fold in \
+             scheduler timeouts (#4251, #4864 round-6)"
+        );
+        let st_arm = queue_full_arm(st, "} else if queue_full {");
         assert!(
             st_arm.contains("send_queue_full_resync_request("),
             "apply_streaming_broadcast queue-full arm MUST delegate to \
