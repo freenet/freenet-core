@@ -3254,9 +3254,12 @@ mod tests {
             "helper must RESERVE the per-sender throttle atomically via \
              begin_resync_request (#4864 round-6 item 2)",
         );
-        let global_cap = helper.find("resync_emit_limiter").expect(
+        // Anchor on the CALL, not the bare identifier — a comment earlier in the
+        // helper mentions `resync_emit_limiter` before the real gate (#4864 round-6
+        // item 6c).
+        let global_cap = helper.find(".check_and_record(*key.id())").expect(
             "helper must ALSO gate on the global per-contract emit cap \
-             (resync_emit_limiter, #4864 round-4)",
+             (resync_emit_limiter.check_and_record, #4864 round-4)",
         );
         let emit = helper
             .find("InterestMessage::ResyncRequest")
@@ -4395,12 +4398,18 @@ mod tests {
             !client.contains("record_success_local(key.id(), true)"),
             "drive_client_update must NOT hardcode `true` for the changed flag"
         );
-        // The relay broadcast success arm passes result.changed.
+        // The relay broadcast success arm passes result.changed AS THE ARGUMENT of
+        // record_success_from_sender (anchored to the call, not a loose match on
+        // the whole body — #4864 round-6 item 6a).
         let relay = broadcast_to_driver_src();
+        let call = relay.find(".record_success_from_sender(").expect(
+            "drive_relay_broadcast_to must clear the backoff via record_success_from_sender",
+        );
+        let call_args = &relay[call..(call + 160).min(relay.len())];
         assert!(
-            relay.contains("result.changed"),
-            "drive_relay_broadcast_to must pass the REAL result.changed to \
-             record_success_from_sender, not a literal `true` (#4864 round-5 item 4)"
+            call_args.contains("result.changed"),
+            "record_success_from_sender must be passed the REAL result.changed \
+             (found in its arg list), not a literal `true` (#4864 round-5 item 4)"
         );
     }
 
@@ -4417,15 +4426,38 @@ mod tests {
         let changed_gate = st
             .find("if exec.changed")
             .expect("streaming Ok arm must gate on `if exec.changed`");
+        // Brace-match the `if exec.changed { ... }` block so we assert containment,
+        // not just relative order (#4864 round-6 item 6b).
+        let open_brace = changed_gate
+            + st[changed_gate..]
+                .find('{')
+                .expect("if exec.changed block must have a body");
+        let mut depth = 0usize;
+        let mut close_brace = None;
+        for (i, ch) in st[open_brace..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_brace = Some(open_brace + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close_brace = close_brace.expect("if exec.changed block must be balanced");
         let invalidate = concat!("invalidate_", "payload_memo(");
         let inv_pos = st.find(invalidate).expect(
             "the CHANGED streaming full-state apply must call invalidate_payload_memo \
              (#4864 round-5 item 6)",
         );
         assert!(
-            changed_gate < inv_pos,
-            "invalidate_payload_memo must be inside the `if exec.changed` gate so a \
-             no-op streaming apply does not invalidate the memo"
+            open_brace < inv_pos && inv_pos < close_brace,
+            "invalidate_payload_memo ({inv_pos}) must be INSIDE the `if exec.changed \
+             {{ .. }}` block ({open_brace}..{close_brace}) so a no-op streaming apply \
+             does not invalidate the memo"
         );
     }
 
