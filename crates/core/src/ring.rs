@@ -3530,6 +3530,16 @@ impl Ring {
         self.hosting_manager.contract_state_present(contract)
     }
 
+    /// Async existence probe (redb sync fast-path + real SQLite EXISTS probe) —
+    /// see [`hosting::HostingManager::contract_state_present_async`]. Used by the
+    /// ResyncResponse responder so the pre-limiter existence gate is backend-
+    /// agnostic (#4864 round-5 P1).
+    pub(crate) async fn contract_state_present_async(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager
+            .contract_state_present_async(contract)
+            .await
+    }
+
     /// Whether at least one LOCAL WebSocket client is currently subscribed to
     /// `contract` (real local demand, distinct from downstream peer
     /// subscribers). Used by the reconcile input-builder (keystone step-2,

@@ -2178,6 +2178,49 @@ impl HostingManager {
         true
     }
 
+    /// Async existence probe for the ResyncResponse responder (#4864 round-5 P1).
+    /// The sync [`Self::contract_state_present`] only has a redb fast-path, so on
+    /// a SQLite build (`--no-default-features --features sqlite`) it returns
+    /// `true` for every key — reopening the responder limiter-map key-flood hole
+    /// there. This async variant keeps the redb SYNC fast-path (a cheap point
+    /// lookup, no `.await`) and adds a REAL SQLite existence probe via the async
+    /// `get_state_size` (`SELECT LENGTH(state) … WHERE contract = ?`), so a bogus
+    /// key is rejected before it can consume a limiter slot on EITHER backend.
+    /// Conservative on error / no-storage: returns `true` (assume present) so a
+    /// genuinely-hosted contract is never wrongly refused a resync response.
+    pub(crate) async fn contract_state_present_async(&self, key: &ContractKey) -> bool {
+        #[cfg(feature = "redb")]
+        {
+            // redb: the synchronous point lookup is already cheap — no await.
+            self.contract_state_present(key)
+        }
+        #[cfg(all(feature = "sqlite", not(feature = "redb")))]
+        {
+            // Clone the pool handle out of the (sync parking_lot) guard so the
+            // `.await` below never holds a lock across an await point.
+            let storage = self.storage.read().as_ref().cloned();
+            match storage {
+                Some(storage) => match storage.get_state_size(key).await {
+                    Ok(size) => size.is_some(),
+                    Err(e) => {
+                        tracing::debug!(
+                            contract = %key,
+                            error = %e,
+                            "sqlite state-presence check failed; assuming present"
+                        );
+                        true
+                    }
+                },
+                None => true,
+            }
+        }
+        #[cfg(not(any(feature = "redb", feature = "sqlite")))]
+        {
+            let _ = key;
+            true
+        }
+    }
+
     /// The composed #4610 gate: summarize / broadcast a contract's state ONLY
     /// when we host or actively serve it AND we actually hold its state:
     /// `(is_hosting_contract || contract_in_use) && contract_state_present`.

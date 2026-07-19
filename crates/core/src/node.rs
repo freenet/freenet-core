@@ -2954,12 +2954,15 @@ async fn handle_interest_sync_message(
             // existence check, so a peer spraying bogus contract keys could
             // exhaust the strictly-capped limiter maps and then DENY new legit
             // (peer, contract) keys (fail-closed → no response). A cheap
-            // synchronous redb point-lookup for state presence — the same probe
-            // the interest-sync gates use — rejects unknown contracts before they
-            // can touch a limiter slot. (A known contract whose state we can no
-            // longer fetch a moment later still bails at get_contract_state below,
-            // but only after passing this gate plus the rate limits.)
-            if !op_manager.ring.contract_state_present(&key) {
+            // state-presence probe rejects unknown contracts before they can touch
+            // a limiter slot. The ASYNC variant (#4864 round-5) keeps the redb
+            // synchronous point-lookup fast-path AND adds a real SQLite EXISTS
+            // probe, so the gate is backend-agnostic (the sync probe was a no-op
+            // on sqlite builds, reopening the hole there). (A known contract whose
+            // state we can no longer fetch a moment later still bails at
+            // get_contract_state below, but only after passing this gate plus the
+            // rate limits.)
+            if !op_manager.ring.contract_state_present_async(&key).await {
                 tracing::debug!(
                     from = %source,
                     contract = %key,
@@ -4057,6 +4060,22 @@ mod tests {
         let result = NodeConfig::parse_socket_addr(&addr).await;
         assert!(result.is_err());
     }
+
+    // TODO(#4864 round-5): sqlite bogus-key flood test — blocked by the crate
+    // having NO compilable SQLite-only feature combination. The round-5 fix
+    // added an async SQLite EXISTS probe (`contract_state_present_async` →
+    // `get_state_size`) so bogus ResyncRequests are rejected before consuming a
+    // limiter slot on a SQLite build too, but that path cannot be exercised in a
+    // test: `cargo build/test -p freenet --no-default-features --features
+    // sqlite,...` fails to compile (~52 lib errors / ~99 lib-test errors). The
+    // SQLite `Pool` backend (crates/core/src/contract/storages/sqlite.rs) has
+    // drifted behind `ReDb` and is missing ~15 methods the rest of the crate
+    // calls (get_state_sync / store_state_sync / update_state_sync,
+    // contract_blob_lock, {load_all,store,remove}_{contract,delegate,secrets,
+    // user_secrets}_index). A SQLite mirror of the redb test below can only be
+    // added once the SQLite backend is repaired (out of scope here: this change
+    // was restricted to node.rs and may not touch sqlite.rs). The redb test
+    // below covers the redb backend's synchronous fast-path.
 
     /// #4864 round-4 P1: a peer spraying `ResyncRequest`s for contracts we do
     /// NOT hold must not be able to exhaust the strictly-capped resync-response
@@ -5763,10 +5782,12 @@ mod tests {
         #[test]
         fn resync_request_handler_rate_limits_response() {
             let arm = resync_request_arm();
-            // (1) cheap existence check BEFORE either limiter.
-            let exists_pos = arm.find("contract_state_present(&key)").expect(
+            // (1) cheap existence check BEFORE either limiter (async so the probe
+            // is backend-agnostic: redb sync fast-path + real SQLite EXISTS,
+            // #4864 round-5).
+            let exists_pos = arm.find("contract_state_present_async(&key)").expect(
                 "ResyncRequest handler must do a cheap state-presence check BEFORE \
-                 the rate limiters (#4864 round-4)",
+                 the rate limiters (#4864 round-4/round-5)",
             );
             let gate_pos = arm.find("resync_response_limiter").expect(
                 "ResyncRequest handler must rate-limit the response via \
