@@ -1114,9 +1114,15 @@ async fn send_queue_full_resync_request(
     sender_addr: SocketAddr,
     incoming_tx: Transaction,
 ) {
+    // PEEK the per-(contract, sender)/30s throttle WITHOUT recording (#4864
+    // round-5 item 9). This heal is double-gated (this per-sender throttle AND the
+    // global emit cap below); recording the window here and then being suppressed
+    // by the global cap would burn the 30s window with no emit, blocking this
+    // (contract, sender) from retrying for up to 30s after the global cap's tokens
+    // refill. The window is recorded ONLY when the emit actually happens (below).
     if !op_manager
         .interest_manager
-        .should_send_resync_request(&key, sender_addr)
+        .peek_should_send_resync_request(&key, sender_addr)
     {
         // Per-(contract, sender)/30s throttle (existing #4857 bound).
         tracing::debug!(
@@ -1133,8 +1139,11 @@ async fn send_queue_full_resync_request(
     // #4857 queue-full heal path previously bypassed it, so a saturated contract
     // with many senders still emitted per-(contract, sender)/30s. Routing it
     // through resync_emit_limiter bounds the contract's TOTAL queue-full resync
-    // emission the same way the delta-failure path is (node.rs mirrors this with
-    // record_resync_request_suppressed on global-cap suppression).
+    // emission. (This is NOT a mirror of the delta-failure path — that path is
+    // global-cap-only, with no per-sender throttle. The global suppression records
+    // the same `record_resync_request_suppressed` metric node.rs does.) On
+    // suppression, the per-sender window is NOT recorded (see the peek above), so
+    // the sender retries as soon as global tokens refill.
     if !op_manager
         .ring
         .resync_emit_limiter
@@ -1151,6 +1160,10 @@ async fn send_queue_full_resync_request(
         return;
     }
 
+    // Both gates passed → NOW record the per-sender throttle window and emit.
+    op_manager
+        .interest_manager
+        .record_resync_request_sent(&key, sender_addr);
     tracing::info!(
         tx = %incoming_tx,
         contract = %key,
@@ -3178,11 +3191,14 @@ mod tests {
         // The shared helper gates the single emit behind BOTH the per-(contract,
         // sender) throttle AND the global per-contract emit cap (#4251/#4857 +
         // #4864 round-4). Each is a `!gate { return; }` guard that precedes the
-        // emit, so an unthrottled emission cannot re-open the #4251 storm.
+        // emit, so an unthrottled emission cannot re-open the #4251 storm. The
+        // per-sender throttle is PEEKED (not recorded) until the emit, and its
+        // window is recorded ONLY at the emit (#4864 round-5 item 9), so a
+        // global-cap suppression does not burn the window.
         let helper = fn_body("async fn send_queue_full_resync_request(");
-        let per_sender = helper
-            .find(".should_send_resync_request(")
-            .expect("helper must gate on should_send_resync_request (rate limit, #4251)");
+        let per_sender = helper.find(".peek_should_send_resync_request(").expect(
+            "helper must PEEK the per-sender throttle without recording (#4864 round-5 item 9)",
+        );
         let global_cap = helper.find("resync_emit_limiter").expect(
             "helper must ALSO gate on the global per-contract emit cap \
              (resync_emit_limiter, #4864 round-4)",
@@ -3190,11 +3206,20 @@ mod tests {
         let emit = helper
             .find("InterestMessage::ResyncRequest")
             .expect("helper must emit InterestMessage::ResyncRequest (heal, #4857)");
+        let record = helper.find(".record_resync_request_sent(").expect(
+            "helper must record the per-sender throttle window (only on emit, #4864 round-5)",
+        );
         assert!(
             per_sender < emit && global_cap < emit,
             "the ResyncRequest emit ({emit}) MUST come AFTER both the per-sender \
-             throttle ({per_sender}) and the global emit cap ({global_cap}), so an \
-             unthrottled emission cannot re-open the #4251 storm"
+             throttle peek ({per_sender}) and the global emit cap ({global_cap}), so \
+             an unthrottled emission cannot re-open the #4251 storm"
+        );
+        assert!(
+            global_cap < record && record < emit,
+            "the per-sender window record ({record}) MUST come AFTER the global cap \
+             ({global_cap}) and before/at the emit ({emit}) — recording earlier \
+             would burn the 30s window on a global-cap suppression (#4864 round-5 item 9)"
         );
     }
 
@@ -3470,8 +3495,13 @@ mod tests {
         ExecReject,
         /// Fail with `ContractQueueFull` (NOT recorded — transient load).
         QueueFull,
-        /// Succeed (state changed) — used to exercise a clean DELTA merge.
+        /// Succeed with `state_changed: true` — a clean DELTA merge that advanced
+        /// state.
         Success,
+        /// Succeed with `state_changed: false` — a NO-OP delta merge (e.g. an
+        /// idempotent re-apply). The state did NOT advance, so the contract-side
+        /// backoff clear must NOT fire (#4864 round-5 item 4).
+        SuccessNoChange,
     }
 
     /// Build a node whose stand-in contract handler resolves every DELTA
@@ -3560,6 +3590,12 @@ mod tests {
                                     new_value: Ok(WrappedState::from(vec![1u8, 2, 3])),
                                     state_changed: true,
                                 },
+                                DeltaOutcome::SuccessNoChange => {
+                                    ContractHandlerEvent::UpdateResponse {
+                                        new_value: Ok(WrappedState::from(vec![1u8, 2, 3])),
+                                        state_changed: false,
+                                    }
+                                }
                             }
                         } else {
                             ContractHandlerEvent::UpdateResponse {
@@ -4192,6 +4228,148 @@ mod tests {
                 .check(key.id(), remote_sender, 0x99),
             crate::ring::merge_backoff::MergeDecision::InBackoff,
             "a client FULL-STATE success must NOT clear a remote sender's Invalid channel"
+        );
+    }
+
+    /// #4864 round-5 item 4: a successful client-local DELTA that did NOT advance
+    /// state (`state_changed == false`, e.g. an idempotent re-apply) driven
+    /// through the REAL `drive_client_update` must NOT clear the contract-side
+    /// backoff — `record_success_local` is gated `changed`, so a no-op success is
+    /// not a state-generation signal. This closes the round-4 no-op-wipe bug end
+    /// to end (previously not drivable: no harness variant returned Ok with
+    /// `state_changed: false`).
+    #[tokio::test]
+    async fn client_local_no_op_delta_success_does_not_clear_contract_side() {
+        let (op_manager, _notification_rx, _update_queries, _guard) = build_broadcast_test_node(
+            "backoff-client-nochange-4864",
+            DeltaOutcome::SuccessNoChange,
+        )
+        .await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([65u8; 32]),
+            CodeHash::new([66u8; 32]),
+        );
+        op_manager
+            .ring
+            .host_contract(key, 100, crate::ring::AccessType::Put);
+
+        let remote_sender: SocketAddr = "127.0.0.1:15300".parse().unwrap();
+        let probe_sender: SocketAddr = "127.0.0.1:15400".parse().unwrap();
+
+        // Seed a contract-wide Timeout + a remote sender's tripped Invalid channel.
+        op_manager.ring.merge_backoff.record_failure(
+            key.id(),
+            remote_sender,
+            crate::ring::merge_backoff::MergeFailureClass::Timeout,
+            0x01,
+        );
+        for h in [0x11u64, 0x12, 0x13] {
+            op_manager.ring.merge_backoff.record_failure(
+                key.id(),
+                remote_sender,
+                crate::ring::merge_backoff::MergeFailureClass::Invalid,
+                h,
+            );
+        }
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "seeded contract-wide Timeout should suppress before the client update"
+        );
+
+        // Drive a client-local DELTA (is_delta_update == true) that SUCCEEDS with
+        // state_changed == false via the stand-in.
+        let outcome = drive_client_update(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            UpdateData::Delta(StateDelta::from(vec![7u8, 7, 7])),
+            RelatedContracts::default(),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "no-op client-local delta should succeed via the stand-in: {outcome:?}"
+        );
+
+        // The contract-side backoff is NOT cleared (the state did not advance): the
+        // probe is still suppressed by the contract-wide Timeout.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "a no-op (changed=false) client delta success must NOT clear the \
+             contract-wide Timeout (record_success_local is gated on changed)"
+        );
+        // ... and the remote sender's Invalid channel is likewise untouched.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), remote_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "a no-op client delta success must NOT clear a remote sender's Invalid channel"
+        );
+    }
+
+    /// Pin (#4864 round-5 item 4): the three success call sites must pass the REAL
+    /// `changed` field, not a literal `true` — a literal would re-introduce the
+    /// round-4 no-op-wipe bug (wiping the contract-side Timeout/memo on every
+    /// no-op merge) while passing every other test.
+    #[test]
+    fn success_sites_pass_real_changed_flag_not_a_literal() {
+        let src = include_str!("op_ctx_task.rs");
+        // Both drive_client_update success arms pass execution.changed.
+        let client = extract_fn_body(src, "async fn drive_client_update(");
+        let client_calls = client
+            .matches("record_success_local(key.id(), execution.changed)")
+            .count();
+        assert!(
+            client_calls >= 2,
+            "both drive_client_update success arms must pass the REAL \
+             execution.changed to record_success_local (found {client_calls}, \
+             expected >= 2) — not a literal `true` (#4864 round-5 item 4)"
+        );
+        assert!(
+            !client.contains("record_success_local(key.id(), true)"),
+            "drive_client_update must NOT hardcode `true` for the changed flag"
+        );
+        // The relay broadcast success arm passes result.changed.
+        let relay = broadcast_to_driver_src();
+        assert!(
+            relay.contains("result.changed"),
+            "drive_relay_broadcast_to must pass the REAL result.changed to \
+             record_success_from_sender, not a literal `true` (#4864 round-5 item 4)"
+        );
+    }
+
+    /// Pin (#4864 round-5 item 6): the CHANGED streaming full-state apply arm MUST
+    /// call `invalidate_payload_memo` inside the `if exec.changed` gate — same
+    /// reason as the node.rs resync-apply site: a state-advancing full-state apply
+    /// invalidates the memo's premise. Dropping it silently widens the staleness
+    /// corner to the full 10-min TTL. (The streaming path still must NOT reset the
+    /// backoff — covered by `broadcast_to_streaming_has_backoff_wiring`.)
+    #[test]
+    fn streaming_changed_apply_invalidates_payload_memo() {
+        let src = include_str!("op_ctx_task.rs");
+        let st = extract_fn_body(src, "async fn apply_streaming_broadcast(");
+        let changed_gate = st
+            .find("if exec.changed")
+            .expect("streaming Ok arm must gate on `if exec.changed`");
+        let invalidate = concat!("invalidate_", "payload_memo(");
+        let inv_pos = st.find(invalidate).expect(
+            "the CHANGED streaming full-state apply must call invalidate_payload_memo \
+             (#4864 round-5 item 6)",
+        );
+        assert!(
+            changed_gate < inv_pos,
+            "invalidate_payload_memo must be inside the `if exec.changed` gate so a \
+             no-op streaming apply does not invalidate the memo"
         );
     }
 

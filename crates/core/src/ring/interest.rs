@@ -620,6 +620,43 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         true
     }
 
+    /// PEEK the per-(contract, target) resync-request throttle WITHOUT recording a
+    /// send: returns true when a send would be ALLOWED (the
+    /// [`RESYNC_REQUEST_MIN_INTERVAL`] window has elapsed, or none was ever sent).
+    ///
+    /// Pair with [`Self::record_resync_request_sent`], which starts the window
+    /// ONLY once the send actually happens (#4864 round-5 item 9). The queue-full
+    /// heal is double-gated (this per-sender throttle AND the global per-contract
+    /// emit cap); the combined check-AND-record `should_send_resync_request` would
+    /// burn the 30s window for a send the global cap then suppressed, blocking
+    /// this (contract, target) from retrying for up to 30s after the global cap's
+    /// tokens refill.
+    pub fn peek_should_send_resync_request(
+        &self,
+        contract: &ContractKey,
+        target: SocketAddr,
+    ) -> bool {
+        let now = self.time_source.now();
+        let key = (*contract, target);
+        let mut throttle = self.resync_request_throttle.lock();
+        // `get` bumps LRU recency but records no send timestamp.
+        match throttle.get(&key) {
+            Some(&last) => now.duration_since(last) >= RESYNC_REQUEST_MIN_INTERVAL,
+            None => true,
+        }
+    }
+
+    /// Record that a resync request was actually SENT for (contract, target),
+    /// starting a fresh [`RESYNC_REQUEST_MIN_INTERVAL`] throttle window. Call only
+    /// AFTER the send passes every gate and is emitted (#4864 round-5 item 9); see
+    /// [`Self::peek_should_send_resync_request`].
+    pub fn record_resync_request_sent(&self, contract: &ContractKey, target: SocketAddr) {
+        let now = self.time_source.now();
+        self.resync_request_throttle
+            .lock()
+            .put((*contract, target), now);
+    }
+
     /// Remove all interests for a peer (called on peer disconnect).
     ///
     /// Uses the reverse index for O(1) lookup instead of O(contracts) scan.
