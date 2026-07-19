@@ -4111,6 +4111,90 @@ mod tests {
         );
     }
 
+    /// #4864 round-4 addendum (CI rule-review): the client-path mirror of
+    /// `full_state_success_does_not_reset_backoff`. A successful client-local
+    /// FULL-STATE update (`is_delta_update == false`) driven through the REAL
+    /// `drive_client_update` must NOT reset the backoff — `record_success_local`
+    /// is gated `is_delta_update`, and a full-state apply is fork-flippable so it
+    /// proves nothing about convergence. Closes the bot warning that the
+    /// delta-only gating was source-scrape-only. (With round-4 item 1 the
+    /// contract-side clear also needs `changed`, but the `is_delta` gate fires
+    /// first, so this holds regardless of `changed`.)
+    #[tokio::test]
+    async fn client_local_full_state_success_does_not_reset_backoff() {
+        let (op_manager, _notification_rx, _update_queries, _guard) =
+            build_broadcast_test_node("backoff-client-fullstate-4864", DeltaOutcome::Success).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([63u8; 32]),
+            CodeHash::new([64u8; 32]),
+        );
+        op_manager
+            .ring
+            .host_contract(key, 100, crate::ring::AccessType::Put);
+
+        let remote_sender: SocketAddr = "127.0.0.1:15100".parse().unwrap();
+        let probe_sender: SocketAddr = "127.0.0.1:15200".parse().unwrap();
+
+        // Seed a contract-wide Timeout + a remote sender's tripped Invalid channel.
+        op_manager.ring.merge_backoff.record_failure(
+            key.id(),
+            remote_sender,
+            crate::ring::merge_backoff::MergeFailureClass::Timeout,
+            0x01,
+        );
+        for h in [0x11u64, 0x12, 0x13] {
+            op_manager.ring.merge_backoff.record_failure(
+                key.id(),
+                remote_sender,
+                crate::ring::merge_backoff::MergeFailureClass::Invalid,
+                h,
+            );
+        }
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "seeded contract-wide Timeout should suppress before the client update"
+        );
+
+        // Drive a successful client-local FULL-STATE update (is_delta_update=false).
+        let outcome = drive_client_update(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            UpdateData::State(State::from(vec![9u8, 9, 9])),
+            RelatedContracts::default(),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "client-local full-state update should succeed via the stand-in: {outcome:?}"
+        );
+
+        // The backoff is NOT reset: the contract-wide Timeout still suppresses the
+        // probe (a full-state apply is not convergence evidence, delta-only reset).
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), probe_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "a client FULL-STATE success must NOT clear the contract-wide Timeout \
+             (record_success_local is gated is_delta_update)"
+        );
+        // ... and the remote sender's Invalid channel is likewise untouched.
+        assert_eq!(
+            op_manager
+                .ring
+                .merge_backoff
+                .check(key.id(), remote_sender, 0x99),
+            crate::ring::merge_backoff::MergeDecision::InBackoff,
+            "a client FULL-STATE success must NOT clear a remote sender's Invalid channel"
+        );
+    }
+
     /// Issue #4251 follow-up: the four `run_relay_*` driver wrappers each
     /// log at WARN when the inner driver returns an error. PR #4253 gated
     /// the amplification side effects (auto-fetch, ResyncRequest) on
