@@ -3707,6 +3707,80 @@ mod tests {
         assert!(clear < reload, "must clear the token before reloading");
     }
 
+    /// The hosted "Move to my peer" migration (#4592) must default to a
+    /// ONE-CLICK open against the user's local peer, keeping copy-the-URL only
+    /// as a SECONDARY fallback. Before this, the only affordance was a link the
+    /// user had to hand-copy and paste into another browser — friction for the
+    /// exact action we want them to take. This pins the whole primary/secondary
+    /// contract so a refactor can't silently regress it back to copy-only.
+    #[test]
+    fn hosted_bar_migration_defaults_to_one_click_open_4592() {
+        // (a) A PRIMARY "open on my peer" control that opens the peer import
+        // page in a new browsing context (so the hosted tab is left intact).
+        assert!(
+            HOSTED_BAR_HTML.contains("id=\"fnmigrateopen\""),
+            "hosted bar must expose a primary 'open on my peer' control (#4592)"
+        );
+        let open_idx = HOSTED_BAR_HTML
+            .find("id=\"fnmigrateopen\"")
+            .expect("primary open control present");
+        // The control is an anchor with target=_blank in the SAME element, so a
+        // plain click (or cmd/middle-click into another profile) opens the peer
+        // import page directly — the "direct link" the friction complaint asked
+        // for. Assert the target belongs to this control (nearby), not anywhere.
+        let target_idx = HOSTED_BAR_HTML
+            .find("target=\"_blank\"")
+            .expect("the primary open control must target a new browsing context");
+        assert!(
+            target_idx > open_idx && target_idx - open_idx < 120,
+            "target=_blank must be on the primary open control's own element"
+        );
+
+        // (b) The mint handler performs the one-click open: it opens a tab and
+        // navigates it to the freshly minted LOCAL peer import link, instead of
+        // only revealing a box to copy. Both the open and the loopback import
+        // path must be present in the migrate handler.
+        let mint = HOSTED_BAR_JS
+            .find("getElementById('fnmigrate')")
+            .expect("Move-to-my-peer button must have a click handler");
+        assert!(
+            HOSTED_BAR_JS[mint..].contains("window.open("),
+            "the migration default must open the peer import page directly \
+             (one-click), not merely surface a link to copy"
+        );
+        // Reverse-tabnabbing hardening: the freshly-opened tab must have its
+        // window.opener severed so the destination peer page can't navigate the
+        // hosted tab back to a spoofed origin. Set synchronously while the tab is
+        // still about:blank; it survives the later peerWin.location navigation.
+        assert!(
+            HOSTED_BAR_JS[mint..].contains("peerWin.opener = null"),
+            "the one-click open must sever window.opener to prevent \
+             reverse tabnabbing"
+        );
+        assert!(
+            HOSTED_BAR_JS.contains("/hosted/import?source="),
+            "the one-click open must target the local peer's import page"
+        );
+        // The handler sets the primary control's href too, so the fallback link
+        // (used when the pop-up is blocked) points at the same minted link.
+        assert!(
+            HOSTED_BAR_JS.contains("migrateOpen.href = link"),
+            "the primary open control's href must be set to the minted link"
+        );
+
+        // (c) Copy-the-URL remains available as the SECONDARY option (kept for a
+        // peer on a different computer/browser/profile) — never removed.
+        assert!(
+            HOSTED_BAR_HTML.contains("id=\"fnmigratecopy\"")
+                && HOSTED_BAR_HTML.contains("id=\"fnmigratelink\""),
+            "copy-the-URL must remain available as a secondary fallback"
+        );
+        assert!(
+            HOSTED_BAR_JS.contains("getElementById('fnmigratecopy')"),
+            "the secondary copy-link control must stay wired to clipboard copy"
+        );
+    }
+
     /// Non-hosted mode must NEVER reach the fail-closed path: the bridge is
     /// called with one argument, so `hostedMode` is undefined and the whole
     /// hostedNoToken branch is inert — the app loads and connects over http
