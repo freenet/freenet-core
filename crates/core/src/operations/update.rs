@@ -1221,18 +1221,13 @@ mod tests {
         }
 
         fn scheduler_timeout_failure() -> ExecutorError {
-            // Mirrors the production cause: ContractExecError::SchedulerOverloaded
-            // via update_exec_error → "execution error: The operation was queued
-            // too long on a saturated execution pool and never ran". The guest
-            // never ran, so this is transient load, not a contract fault, yet it
-            // KEEPS the "execution error:" prefix (contract present ⇒ no
-            // auto-fetch). Matches is_scheduler_timeout.
-            let req: RequestError = StdContractError::update_exec_error(
-                make_contract_key(1),
-                "The operation was queued too long on a saturated execution pool and never ran",
-            )
-            .into();
-            req.into()
+            // Build via the HOST path (#4864 round-9): a real scheduler-overload
+            // timeout carries the unforgeable typed provenance
+            // (classify_result → ContractExecError::SchedulerOverloaded → execution),
+            // which is what is_scheduler_timeout now keys on. A plain
+            // update_exec_error string would NOT classify — that is exactly the
+            // contract-forge case the typing rejects.
+            ExecutorError::test_host_scheduler_timeout(make_contract_key(1))
         }
 
         #[test]

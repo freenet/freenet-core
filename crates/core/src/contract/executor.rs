@@ -243,6 +243,37 @@ impl std::error::Error for DeferRelatedFetch {}
 pub struct ExecutorError {
     inner: Either<Box<RequestError>, anyhow::Error>,
     fatal: bool,
+    /// Typed provenance for a HOST-originated execution timeout (#4864 round-9).
+    /// Set ONLY by [`ExecutorError::execution`] when it sees a
+    /// `ContractExecError::{MaxComputeTimeExceeded, SchedulerOverloaded}` — the
+    /// two variants the host's `classify_result` (wasm_runtime/contract.rs) alone
+    /// constructs from a `WasmError`, NEVER a contract via its own return text.
+    ///
+    /// This is the security-critical fix: `is_wasm_timeout` / `is_scheduler_timeout`
+    /// gate on THIS field, not on the `Update{cause}` substring. `update_exec_error`
+    /// flattens the typed variant into a cause string ("… maximum allowed compute
+    /// time …"), and a malicious `update_state`/`validate_state` can RETURN a
+    /// rejection whose text contains that same phrase — which would otherwise be
+    /// misclassified as a real host timeout and earn the contract-wide, trip-at-one
+    /// Timeout quarantine, suppressing honest peers for up to 2h. The typed field
+    /// is unforgeable through contract return text.
+    host_timeout: Option<HostTimeoutClass>,
+}
+
+/// Provenance class for a host-originated execution timeout (#4864 round-9). See
+/// [`ExecutorError::host_timeout`]. Constructed only on the `classify_result` →
+/// `ContractExecError` → `ExecutorError::execution` path, so a contract cannot
+/// forge either class by returning text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostTimeoutClass {
+    /// The guest RAN and exceeded its compute deadline (`WasmError::Timeout` →
+    /// `ContractExecError::MaxComputeTimeExceeded`). A real, contract-intrinsic
+    /// timeout — earns the Timeout-class merge-failure backoff.
+    ComputeExceeded,
+    /// The guest NEVER ran — it sat queued on a saturated blocking pool past the
+    /// deadline (`WasmError::SchedulerOverloaded`). Transient load, not a contract
+    /// fault — EXCLUDED from the backoff.
+    SchedulerOverloaded,
 }
 
 enum InnerOpError {
@@ -257,6 +288,7 @@ impl ExecutorError {
         Self {
             inner: Either::Right(error.into()),
             fatal: false,
+            host_timeout: None,
         }
     }
 
@@ -265,6 +297,7 @@ impl ExecutorError {
         Self {
             inner: Either::Right(anyhow::anyhow!("internal error")),
             fatal: false,
+            host_timeout: None,
         }
     }
 
@@ -272,10 +305,46 @@ impl ExecutorError {
         Self {
             inner: Either::Left(Box::new(error.into())),
             fatal: false,
+            host_timeout: None,
         }
     }
 
     fn execution(
+        outer_error: crate::wasm_runtime::ContractError,
+        op: Option<InnerOpError>,
+    ) -> Self {
+        use crate::wasm_runtime::{ContractExecError, RuntimeInnerError};
+        // TYPED PROVENANCE (#4864 round-9): capture the host timeout class from
+        // the TYPED `ContractExecError` variant BEFORE `update_exec_error` flattens
+        // it into a contract-forgeable string cause. These two variants originate
+        // ONLY from the host `classify_result` (wasm_runtime/contract.rs), so a
+        // contract cannot set this field by returning text. Op-INDEPENDENT: a
+        // timeout is a host timeout whether or not the op maps it to `Update`.
+        // `matches!` (not a wildcard `match`) so a new ContractExecError variant
+        // stays a compile-clean "not a host timeout" without a catch-all arm.
+        let host_timeout = if matches!(
+            outer_error.deref(),
+            RuntimeInnerError::ContractExecError(ContractExecError::MaxComputeTimeExceeded)
+        ) {
+            Some(HostTimeoutClass::ComputeExceeded)
+        } else if matches!(
+            outer_error.deref(),
+            RuntimeInnerError::ContractExecError(ContractExecError::SchedulerOverloaded)
+        ) {
+            Some(HostTimeoutClass::SchedulerOverloaded)
+        } else {
+            None
+        };
+        let mut err = Self::execution_classified(outer_error, op);
+        err.host_timeout = host_timeout;
+        err
+    }
+
+    /// The op-based routing half of [`ExecutorError::execution`] (produces the
+    /// `Update{cause}` request error / delegate error / `other`). The typed
+    /// `host_timeout` provenance is stamped by the `execution` wrapper above; keep
+    /// them separate so the string cause never becomes the timeout signal.
+    fn execution_classified(
         outer_error: crate::wasm_runtime::ContractError,
         op: Option<InnerOpError>,
     ) -> Self {
@@ -426,77 +495,53 @@ impl ExecutorError {
         }
     }
 
-    /// Returns true ONLY when the contract's WASM merge/validate exceeded the
-    /// execution time limit — the #4861 poison-contract case where every apply
+    /// Returns true ONLY when the contract's WASM merge/validate ran and exceeded
+    /// the execution time limit — the #4861 poison-contract case where every apply
     /// runs past `max_execution_seconds`. Both the wall-clock timeout and the
     /// epoch-deadline interrupt (#4861) converge on `WasmError::Timeout` →
-    /// `ContractExecError::MaxComputeTimeExceeded` → `update_exec_error`, whose
-    /// cause is "execution error: The operation exceeded the maximum allowed
-    /// compute time".
+    /// `ContractExecError::MaxComputeTimeExceeded` in the host `classify_result`.
     ///
     /// Used by the per-contract merge-failure backoff (#4861) to select the
     /// longer *Timeout*-class cooldown: a runaway merge is far more expensive to
     /// re-attempt than a cheap `InvalidUpdate` rejection, so a contract that
-    /// times out should be quarantined harder than one that merely rejects a
-    /// stale delta. Narrow by design — matched on the same stable
-    /// "execution error:" prefix as `is_invalid_update_rejection`, so out-of-gas,
-    /// traps, and other exec errors return false and keep the base
-    /// (Invalid-class) cooldown.
+    /// times out is quarantined harder (contract-wide, trip-at-ONE) than one that
+    /// merely rejects a stale delta.
     ///
-    /// String-matched (not a typed downcast like `is_contract_queue_full`)
-    /// deliberately: the timeout must KEEP its `Update{cause}` representation so
-    /// `is_contract_exec_rejection` still returns true for it (a timeout means
-    /// the contract IS present locally, so no auto-fetch), and so a client-local
-    /// UPDATE timeout still surfaces a typed `ContractError::Update` to the
-    /// client. The compute-time message is defined in this crate
-    /// (`ContractExecError::MaxComputeTimeExceeded`), so the string is stable.
+    /// TYPED PROVENANCE (#4864 round-9): gated on the unforgeable
+    /// [`ExecutorError::host_timeout`] field, NOT on the `Update{cause}` substring.
+    /// The earlier substring form (`cause.contains("maximum allowed compute time")`)
+    /// was contract-controllable: a malicious `update_state`/`validate_state` can
+    /// RETURN a rejection whose text contains that phrase, and `update_exec_error`
+    /// embeds it into the same cause — so the substring form would have let a
+    /// contract forge the harsh Timeout-class quarantine and suppress honest peers
+    /// for up to 2h. The typed field is set only by the host classification path.
+    /// Op-independent (a timeout is a host timeout even when the op leaves it on
+    /// the `other`/`Either::Right` path); `is_contract_exec_rejection` still keys
+    /// off the `Update{cause}` string for the (harmless-if-forged) auto-fetch gate.
     pub fn is_wasm_timeout(&self) -> bool {
-        match &self.inner {
-            Either::Left(req_err) => matches!(
-                req_err.as_ref(),
-                RequestError::ContractError(StdContractError::Update { cause, .. })
-                    if cause.starts_with("execution error:")
-                        && cause.contains("maximum allowed compute time")
-            ),
-            Either::Right(_) => false,
-        }
+        self.host_timeout == Some(HostTimeoutClass::ComputeExceeded)
     }
 
     /// Returns true ONLY when the contract's WASM merge/validate call never ran
     /// because it sat QUEUED on a saturated blocking pool past the wall-clock
     /// deadline — the #4864 round-6 scheduler-overload case, where the guest
     /// never entered execution (distinct from a runaway guest that DID run and
-    /// blew the deadline, which stays a real `is_wasm_timeout`). The engine
-    /// classifies it as `WasmError::SchedulerOverloaded` →
-    /// `ContractExecError::SchedulerOverloaded` → `update_exec_error`, whose
-    /// cause is "execution error: The operation was queued too long on a
-    /// saturated execution pool and never ran".
+    /// blew the deadline, which is `is_wasm_timeout`). The engine classifies it as
+    /// `WasmError::SchedulerOverloaded` → `ContractExecError::SchedulerOverloaded`
+    /// in the host `classify_result`.
     ///
     /// Used by the per-contract merge-failure backoff record site to EXCLUDE a
-    /// scheduler timeout (exactly like `is_contract_queue_full`): the guest
-    /// never executed, so the failure is transient load, not a contract fault,
-    /// and quarantining the contract for a delta it never applied would be
-    /// wrong. Because the guest never ran, this is deliberately DISJOINT from
-    /// `is_wasm_timeout` — a scheduler timeout must NOT pick the Timeout-class
-    /// quarantine that a genuine runaway merge earns.
+    /// scheduler timeout (exactly like `is_contract_queue_full`): the guest never
+    /// executed, so the failure is transient load, not a contract fault, and
+    /// quarantining the contract for a delta it never applied would be wrong.
+    /// Deliberately DISJOINT from `is_wasm_timeout`.
     ///
-    /// String-matched (not a typed downcast) for the same reason as
-    /// `is_wasm_timeout`: the error must KEEP its `Update{cause}`
-    /// representation so `is_contract_exec_rejection` still returns true (the
-    /// contract IS present locally ⇒ no auto-fetch), and a client-local UPDATE
-    /// still surfaces a typed `ContractError::Update`. The message is defined
-    /// in this crate (`ContractExecError::SchedulerOverloaded`), so the string
-    /// is stable.
+    /// TYPED PROVENANCE (#4864 round-9): like `is_wasm_timeout`, gated on the
+    /// unforgeable [`ExecutorError::host_timeout`] field rather than the
+    /// contract-controllable cause substring, so a contract cannot forge the
+    /// scheduler class either.
     pub fn is_scheduler_timeout(&self) -> bool {
-        match &self.inner {
-            Either::Left(req_err) => matches!(
-                req_err.as_ref(),
-                RequestError::ContractError(StdContractError::Update { cause, .. })
-                    if cause.starts_with("execution error:")
-                        && cause.contains("queued too long on a saturated execution pool")
-            ),
-            Either::Right(_) => false,
-        }
+        self.host_timeout == Some(HostTimeoutClass::SchedulerOverloaded)
     }
 
     /// Returns true if this error is the typed `ContractQueueFull` marker.
@@ -569,6 +614,7 @@ impl ExecutorError {
         Self {
             inner: Either::Right(anyhow::Error::new(DeferRelatedFetch { missing })),
             fatal: false,
+            host_timeout: None,
         }
     }
 
@@ -582,11 +628,13 @@ impl ExecutorError {
                 Err(err) => Err(Self {
                     inner: Either::Right(err),
                     fatal: self.fatal,
+                    host_timeout: self.host_timeout,
                 }),
             },
             inner @ Either::Left(_) => Err(Self {
                 inner,
                 fatal: self.fatal,
+                host_timeout: self.host_timeout,
             }),
         }
     }
@@ -614,6 +662,31 @@ impl ExecutorError {
             Either::Right(_) => unreachable!("called unwrap_request on a non-request error"),
         }
     }
+
+    /// Test-only faithful constructor for a HOST compute-time timeout (#4864
+    /// round-9): mirrors the production path
+    /// (`classify_result` → `ContractExecError::MaxComputeTimeExceeded` →
+    /// `execution`), so the typed `host_timeout` provenance is set exactly as in
+    /// production. Lets tests in OTHER modules build a real timeout that
+    /// `is_wasm_timeout()` recognizes — a plain `update_exec_error(..)` string
+    /// does NOT (that is precisely the contract-forge case the typing rejects).
+    #[cfg(test)]
+    pub(crate) fn test_host_compute_timeout(key: ContractKey) -> Self {
+        use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+        let ce: ContractError =
+            RuntimeInnerError::ContractExecError(ContractExecError::MaxComputeTimeExceeded).into();
+        Self::execution(ce, Some(InnerOpError::Upsert(key)))
+    }
+
+    /// Test-only faithful constructor for a HOST scheduler-overload timeout
+    /// (#4864 round-9). See [`ExecutorError::test_host_compute_timeout`].
+    #[cfg(test)]
+    pub(crate) fn test_host_scheduler_timeout(key: ContractKey) -> Self {
+        use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+        let ce: ContractError =
+            RuntimeInnerError::ContractExecError(ContractExecError::SchedulerOverloaded).into();
+        Self::execution(ce, Some(InnerOpError::Upsert(key)))
+    }
 }
 
 impl From<RequestError> for ExecutorError {
@@ -621,6 +694,7 @@ impl From<RequestError> for ExecutorError {
         Self {
             inner: Either::Left(Box::new(value)),
             fatal: false,
+            host_timeout: None,
         }
     }
 }
@@ -639,6 +713,7 @@ impl From<Box<RequestError>> for ExecutorError {
         Self {
             inner: Either::Left(value),
             fatal: false,
+            host_timeout: None,
         }
     }
 }
@@ -2054,7 +2129,6 @@ mod tests {
             let contract_err: ContractError =
                 RuntimeInnerError::ContractExecError(ContractExecError::MaxComputeTimeExceeded)
                     .into();
-            // op: None simulates validate_state() path where the bug manifested
             let err = ExecutorError::execution(contract_err, None);
             assert!(
                 !err.is_fatal(),
@@ -2068,27 +2142,50 @@ mod tests {
         // ONLY the compute-time-exceeded case, distinct from OOG / invalid
         // update / queue-full, all of which flow through similar wrappers.
 
+        /// #4864 round-9 (Codex P1, the load-bearing fix): a contract CANNOT forge
+        /// the Timeout classification by RETURNING a rejection whose cause text
+        /// contains "maximum allowed compute time". `is_wasm_timeout` now gates on
+        /// the unforgeable host-provenance marker, not the `Update{cause}` string.
+        /// Only a HOST-originated timeout (classify_result → MaxComputeTimeExceeded
+        /// → execution) is a wasm timeout; a contract-supplied string that happens
+        /// to contain the phrase is NOT (else it could earn the contract-wide,
+        /// trip-at-one, up-to-2h Timeout quarantine and suppress honest peers).
         #[test]
-        fn test_wasm_timeout_true_for_max_compute_time_update_error() {
+        fn contract_cannot_forge_wasm_timeout_via_cause_string() {
             let key = test_fixtures::make_contract_key();
-            // Exact representation the UPDATE merge path produces on a timeout
-            // (both wall-clock and epoch-deadline converge here).
-            let err = ExecutorError::request(StdContractError::update_exec_error(
+
+            // FORGED: a contract-returned rejection whose text contains the
+            // compute-time phrase (this is exactly what a malicious update_state
+            // could produce through update_exec_error). MUST NOT be a wasm timeout.
+            let forged = ExecutorError::request(StdContractError::update_exec_error(
                 key,
-                "The operation exceeded the maximum allowed compute time",
+                "rejected: your update mentioned the maximum allowed compute time, nice try",
             ));
             assert!(
-                err.is_wasm_timeout(),
-                "max-compute-time update error MUST be recognized as a wasm timeout"
+                !forged.is_wasm_timeout(),
+                "a contract-forged cause string MUST NOT classify as a host wasm timeout \
+                 (#4864 round-9) — otherwise a contract could self-inflict the harsh \
+                 Timeout-class quarantine on honest peers"
             );
-            // A timeout keeps its exec-rejection classification (contract IS
-            // present ⇒ auto-fetch must stay suppressed) ...
             assert!(
-                err.is_contract_exec_rejection(),
-                "a timeout is a contract-exec rejection (auto-fetch stays gated)"
+                !forged.is_scheduler_timeout(),
+                "nor forge the scheduler-timeout class"
             );
-            // ... and is NOT a benign invalid-update rejection.
-            assert!(!err.is_invalid_update_rejection());
+            // It is still a contract-exec rejection (the string gate is harmless —
+            // it only suppresses auto-fetch, correct for a contract that IS present)
+            // and not a benign invalid-update rejection.
+            assert!(forged.is_contract_exec_rejection());
+            assert!(!forged.is_invalid_update_rejection());
+
+            // HOST-originated: the real timeout the merge path produces. This IS a
+            // wasm timeout, and keeps its exec-rejection classification.
+            let real = ExecutorError::test_host_compute_timeout(key);
+            assert!(
+                real.is_wasm_timeout(),
+                "a host-originated MaxComputeTimeExceeded MUST classify as a wasm timeout"
+            );
+            assert!(real.is_contract_exec_rejection());
+            assert!(!real.is_invalid_update_rejection());
         }
 
         #[test]
@@ -2147,11 +2244,10 @@ mod tests {
 
             // The two are disjoint from the OTHER side too: a genuine
             // MaxComputeTimeExceeded (guest ran and blew the deadline) is a real
-            // wasm timeout and is NOT a scheduler timeout.
-            let real_timeout = ExecutorError::request(StdContractError::update_exec_error(
-                key,
-                "The operation exceeded the maximum allowed compute time",
-            ));
+            // wasm timeout and is NOT a scheduler timeout. Built via the HOST path
+            // (#4864 round-9) — a plain update_exec_error string would no longer
+            // classify, by design.
+            let real_timeout = ExecutorError::test_host_compute_timeout(key);
             assert!(
                 real_timeout.is_wasm_timeout(),
                 "a real compute-time timeout stays a wasm timeout"
@@ -2266,13 +2362,25 @@ mod tests {
             assert!(!sched_fixed.is_wasm_timeout());
             assert!(sched_fixed.is_contract_exec_rejection());
 
-            // The bug the fix closes: with op = None the SAME error escapes every
-            // classification predicate, so the driver records nothing.
+            // The bug the round-7 fix closes: with op = None the error stays on the
+            // `other`/Either::Right path, so it is NOT a contract-exec rejection →
+            // the backoff RECORD gate (is_contract_exec_rejection && !is_scheduler_
+            // timeout) skips it. THAT is why the validation sites must pass Upsert.
             let timeout_bug =
                 ExecutorError::execution(mk(ContractExecError::MaxComputeTimeExceeded), None);
             assert!(
-                !timeout_bug.is_wasm_timeout() && !timeout_bug.is_contract_exec_rejection(),
-                "op = None escapes classification — the pre-fix behavior this closes"
+                !timeout_bug.is_contract_exec_rejection(),
+                "op = None leaves the error off the Update path, so the backoff record \
+                 gate (is_contract_exec_rejection) skips it — the reason validation \
+                 must pass Upsert"
+            );
+            // Post-#4864-round-9, is_wasm_timeout is HOST-provenance and
+            // op-INDEPENDENT, so the typed timeout class is set even for op=None.
+            // (That alone does not make the driver record — the exec-rejection gate
+            // does, and it needs the Upsert path above.)
+            assert!(
+                timeout_bug.is_wasm_timeout(),
+                "is_wasm_timeout is host-provenance (op-independent) post round-9"
             );
         }
 
