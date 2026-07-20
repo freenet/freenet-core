@@ -127,10 +127,12 @@ pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_B
 pub mod interest;
 mod live_tx;
 mod location;
+pub(crate) mod merge_backoff;
 pub(crate) mod peer_cache;
 mod peer_connection_backoff;
 mod peer_key_location;
 mod placement_migration_metrics;
+pub(crate) mod resync_rate_limit;
 pub mod topology_registry;
 pub(crate) mod update_rate_limit;
 
@@ -212,6 +214,37 @@ pub(crate) struct Ring {
     /// `crate::ring::update_rate_limit` and `docs/design/contract-hardening.md`
     /// Phase 2.
     pub(crate) update_rate_limiter: Arc<update_rate_limit::UpdateRateLimiter>,
+    /// Per-contract merge-failure backoff (#4861). Quarantines "poison"
+    /// contracts whose WASM merges reliably fail/time out: while a contract is
+    /// in its exponential cooldown the UPDATE broadcast drivers skip the merge
+    /// (and its `ResyncRequest` amplification) entirely, so it costs O(1) per
+    /// inbound broadcast instead of O(WASM merge). Cleared the instant a merge
+    /// succeeds. See `crate::ring::merge_backoff`.
+    pub(crate) merge_backoff: Arc<merge_backoff::MergeBackoff>,
+    /// Per-contract cap on how often THIS node emits a `ResyncRequest` (#4861).
+    /// Bounds the full-state resync amplification independently of the merge
+    /// outcome. See `crate::ring::resync_rate_limit`.
+    pub(crate) resync_emit_limiter: Arc<resync_rate_limit::ResyncEmitLimiter>,
+    /// Per-`(peer, contract)` cap on how often this node answers a given peer's
+    /// `ResyncRequest` with a full-state `ResyncResponse` (#4861). The
+    /// mixed-version-rollout guard: a not-yet-upgraded peer that still emits
+    /// unlimited `ResyncRequest`s cannot make an upgraded peer full-state-reply
+    /// in a loop. See `crate::ring::resync_rate_limit`.
+    pub(crate) resync_response_limiter: Arc<resync_rate_limit::ResyncResponseLimiter>,
+    /// GLOBAL per-contract cap on `ResyncResponse` emission, aggregated across
+    /// ALL requesters (#4861). Per-(peer, contract) limiting alone is
+    /// insufficient — production saw ~45 distinct requester IPs drive ~9,733
+    /// full-state responses/day for one forked contract. Checked AFTER the
+    /// per-peer limit. See `crate::ring::resync_rate_limit`.
+    pub(crate) resync_response_global_limiter: Arc<resync_rate_limit::ResyncResponseGlobalLimiter>,
+    /// Correlation map for outstanding `ResyncRequest`s WE emitted (#4864
+    /// round-8, Codex P1). The `ResyncResponse` apply path runs a full-state WASM
+    /// merge that is deliberately NOT backoff-gated, so without correlation it is
+    /// an unmetered DoS surface — a peer could stream/replay unsolicited responses
+    /// bypassing every emitter-side gate. The receive arm require-and-consumes a
+    /// matching `(contract, source)` entry BEFORE applying; consume-on-first-match
+    /// kills replay. See `crate::ring::resync_rate_limit::OutstandingResyncRequests`.
+    pub(crate) outstanding_resync_requests: Arc<resync_rate_limit::OutstandingResyncRequests>,
     /// Per-contract ban list. Populated by the governance reaper on
     /// `BanTriggered` / `BanLifted` transitions; consulted at the
     /// inbound dispatch site to drop wire requests for banned
@@ -601,6 +634,17 @@ impl Ring {
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
                 time_source.clone(),
             )),
+            merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
+            resync_emit_limiter: Arc::new(resync_rate_limit::new_emit_limiter(time_source.clone())),
+            resync_response_limiter: Arc::new(resync_rate_limit::new_response_limiter(
+                time_source.clone(),
+            )),
+            resync_response_global_limiter: Arc::new(
+                resync_rate_limit::new_response_global_limiter(time_source.clone()),
+            ),
+            outstanding_resync_requests: Arc::new(
+                resync_rate_limit::new_outstanding_resync_requests(time_source.clone()),
+            ),
             contract_ban_list: Arc::new(contract_ban_list::ContractBanList::new(
                 time_source.clone(),
             )),
@@ -1269,6 +1313,24 @@ impl Ring {
             // bounded; CLEANUP_AGE is 5 minutes so this drops entries
             // for pairs that haven't tried an UPDATE since then.
             ring.update_rate_limiter.cleanup();
+
+            // Sweep idle merge-failure backoff entries (#4861) on the same
+            // cadence. Drops entries for contracts past their cooldown that
+            // haven't failed a merge recently; a poison contract still in
+            // cooldown is preserved.
+            ring.merge_backoff.cleanup_expired();
+
+            // Sweep recovered/idle resync rate-limiter buckets (#4861) so the
+            // per-contract emit and per-(peer, contract) responder maps stay
+            // bounded.
+            ring.resync_emit_limiter.cleanup();
+            ring.resync_response_limiter.cleanup();
+            ring.resync_response_global_limiter.cleanup();
+
+            // Reap outstanding-ResyncRequest correlation entries past their TTL
+            // (#4864 round-8) so a burst of requests whose responses never arrive
+            // cannot pin the map past OUTSTANDING_RESYNC_TTL.
+            ring.outstanding_resync_requests.cleanup();
 
             // Phase 7 ban-list maintenance. Defense-in-depth — the
             // BanLifted decisions below explicitly unban, but if any
@@ -3482,6 +3544,16 @@ impl Ring {
     /// read correctly rather than mistaken for a real anomaly.
     pub(crate) fn contract_state_present(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.contract_state_present(contract)
+    }
+
+    /// Async existence probe (redb sync fast-path + real SQLite EXISTS probe) —
+    /// see [`hosting::HostingManager::contract_state_present_async`]. Used by the
+    /// ResyncResponse responder so the pre-limiter existence gate is backend-
+    /// agnostic (#4864 round-5 P1).
+    pub(crate) async fn contract_state_present_async(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager
+            .contract_state_present_async(contract)
+            .await
     }
 
     /// Whether at least one LOCAL WebSocket client is currently subscribed to

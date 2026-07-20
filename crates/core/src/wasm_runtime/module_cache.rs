@@ -1097,38 +1097,37 @@ pub(crate) fn migration_admission_recovered_now(
 /// contracts. Below this the cache would thrash on a normal node.
 pub const MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// Upper clamp for the default contract-module cache budget (1.5 GiB).
+/// Upper clamp for the default contract-module cache budget (4 GiB).
 ///
 /// Two competing pressures set this ceiling:
 ///
 /// - **Too low → large gateways thrash.** A production gateway hosts hundreds
-///   of contracts and, post-#4404 placement migration, also carries a sizeable
-///   *interest* set on contracts it doesn't hold (the #4441 incident saw ~85
-///   such phantom-interest contracts on technic). At the measured ~1.5 MiB per
-///   compiled module, the previous 384 MiB ceiling held only ~256 modules — so
-///   the cache permanently evicts-and-recompiles a working set it can't fit,
-///   pinning the single-threaded contract loop. nova (125 GiB RAM) is the
-///   canonical case: `total_ram / 8` is ~15 GiB, so the *only* thing capping
-///   its default cache was this clamp, and 384 MiB was well below its working
-///   set. 1.5 GiB holds ~1000 modules at the measured size — comfortably above
-///   a healthy gateway's hot set — and matches the ceiling of the RAM-scaled
-///   hosted-*state* budget (`ring::MAX_DEFAULT_HOSTING_BUDGET_BYTES`, 1 GiB):
-///   a node allowed ~1 GiB of contract state should be able to cache the
-///   corresponding compiled code.
-/// - **Too high → wasted memory on huge hosts.** Past ~1000 resident modules
-///   the working-set benefit flattens while absolute memory cost keeps rising.
-///   Without a ceiling, `total_ram / 8` would default a 125 GiB box to a
-///   ~15 GiB compiled-module cache it can't benefit from. The clamp keeps the
-///   default a bounded, defensible commitment.
+///   to thousands of contracts and, post-#4404 placement migration, also
+///   carries a sizeable *interest* set on contracts it doesn't hold (the #4441
+///   incident saw ~85 such phantom-interest contracts on technic). At the
+///   measured ~1.5 MiB per compiled module, the previous 384 MiB ceiling held
+///   only ~256 modules and 1.5 GiB (#4481) held ~1000 — but a busy production
+///   gateway can carry far more: a ~2652-contract gateway needs ~4 GiB and
+///   thrashed at the 1.5 GiB ceiling (~7 evict-and-recompiles/min), each
+///   recompile pinning the single-threaded contract loop (#4861). nova
+///   (125 GiB RAM) is the canonical case: `total_ram / 8` is ~15 GiB, so the
+///   *only* thing capping its default cache is this clamp. 4 GiB holds ~2650
+///   modules at the measured size — enough for the busy-gateway working set
+///   observed in #4861 — and stays a small fraction of such a gateway's RAM.
+/// - **Too high → wasted memory on huge hosts.** Past the resident working set
+///   the benefit flattens while absolute memory cost keeps rising. Without a
+///   ceiling, `total_ram / 8` would default a 125 GiB box to a ~15 GiB
+///   compiled-module cache it can't benefit from. The clamp keeps the default a
+///   bounded, defensible commitment.
 ///
 /// This clamp only binds on hosts with more than
-/// `MAX * DEFAULT_MODULE_CACHE_RAM_DIVISOR` (= 12 GiB) of RAM; below that the
+/// `MAX * DEFAULT_MODULE_CACHE_RAM_DIVISOR` (= 32 GiB) of RAM; below that the
 /// `total_ram / 8` divisor binds first, so raising this ceiling does **not**
 /// change the default on small/medium hosts (see
 /// `default_module_cache_budget_bytes`). Operators who truly need more raise it
 /// explicitly via the config override below (the explicit override is
 /// unclamped).
-pub const MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES: usize = 1536 * 1024 * 1024;
+pub const MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES: usize = 4096 * 1024 * 1024;
 
 /// Fraction of total system RAM used to size the default contract cache budget.
 ///
@@ -1166,15 +1165,15 @@ const FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
 ///
 /// Returns `clamp(total_ram / DEFAULT_MODULE_CACHE_RAM_DIVISOR,
 /// MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES)`
-/// (currently `clamp(total_ram / 8, 64 MiB, 1.5 GiB)`). The same fix for issue
+/// (currently `clamp(total_ram / 8, 64 MiB, 4 GiB)`). The same fix for issue
 /// #4441 (a node hosting >1024 contracts thrashed/OOM'd the old count cap) must
 /// not itself OOM a small box: the `total_ram / 8` divisor — not the absolute
 /// MAX clamp — is the small-box protection, and giving the delegate cache only a
 /// fraction (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`) keeps the COMBINED default
-/// ceiling safe on small hosts. The MAX clamp only binds on large hosts (>12 GiB
+/// ceiling safe on small hosts. The MAX clamp only binds on large hosts (>32 GiB
 /// RAM); it exists to stop the divisor from handing a huge box a cache far
 /// larger than any useful working set, not to protect small boxes. See
-/// `MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES` for why 1.5 GiB.
+/// `MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES` for why 4 GiB.
 ///
 /// The explicit `--module-cache-budget-bytes` flag /
 /// `FREENET_MODULE_CACHE_BUDGET_BYTES` env / `module-cache-budget-bytes` config
@@ -1193,7 +1192,13 @@ pub fn default_module_cache_budget_bytes() -> usize {
 /// small-box / large-box boundary behavior is unit-testable without depending on
 /// the test host's real RAM. Returns the contract-cache byte budget for a host
 /// with `total_ram` bytes of physical RAM.
-fn budget_for_ram(total_ram: usize) -> usize {
+///
+/// `pub(crate)` so callers reasoning about aggregate cache commitment on a
+/// *specific* host size (e.g. `executor::tests::cache_byte_budgets_are_aggregate_safe`)
+/// can ask for the module budget that host actually gets — the RAM-scaled
+/// divisor value, NOT the absolute [`MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES`]
+/// clamp (which only binds on hosts with >32 GiB RAM).
+pub(crate) fn budget_for_ram(total_ram: usize) -> usize {
     (total_ram / DEFAULT_MODULE_CACHE_RAM_DIVISOR).clamp(
         MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
         MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
@@ -1204,8 +1209,8 @@ fn budget_for_ram(total_ram: usize) -> usize {
 ///
 /// This is the **minimum** of the host's physical RAM and any cgroup memory
 /// limit applied to the process. Using the cgroup limit matters because raising
-/// the cache clamp to 1.5 GiB would otherwise let a node inside a small
-/// container (say a 2 GiB limit on a 128 GiB host) default to a ~1.5 GiB cache
+/// the cache clamp to 4 GiB would otherwise let a node inside a small
+/// container (say a 2 GiB limit on a 128 GiB host) default to a multi-GiB cache
 /// sized from the *host* total and OOM the container. Taking the min means a
 /// constrained container gets a budget scaled to its real limit, while a host
 /// systemd service (the production gateways) sees no cgroup limit and uses
@@ -1612,9 +1617,10 @@ mod tests {
     /// sizes where the divisor (not the MAX clamp) binds.
     #[test]
     fn combined_default_ceiling_is_safe_on_small_box() {
-        // RAM sizes from a tiny 512 MiB VPS up to 12 GiB — the largest host at
-        // which the divisor still binds below the MAX clamp.
-        for total_ram_gib_eighths in 1..=96u64 {
+        // RAM sizes from a tiny 512 MiB VPS up to 32 GiB — the largest host at
+        // which the divisor still binds below the MAX clamp (MAX × divisor =
+        // 4 GiB × 8 = 32 GiB).
+        for total_ram_gib_eighths in 1..=256u64 {
             // step in 1/8-GiB increments so we cover sub-GiB hosts too.
             let total_ram = (total_ram_gib_eighths as usize) * (128 * 1024 * 1024);
             let contract = budget_for_ram(total_ram);
@@ -1702,11 +1708,11 @@ mod tests {
     /// its working set (hundreds of hosted contracts plus the post-#4404
     /// phantom-interest set) fits without permanent evict-and-recompile thrash.
     ///
-    /// At `total_ram / 8`, any host with >12 GiB RAM lands on the MAX clamp, so
+    /// At `total_ram / 8`, any host with >32 GiB RAM lands on the MAX clamp, so
     /// the budget equals the MAX. This test pins that the MAX is high enough to
-    /// hold a realistic gateway working set (~1000 modules at the measured
-    /// ~1.5 MiB) and is strictly larger than the pre-fix 384 MiB that caused the
-    /// thrash.
+    /// hold a realistic busy-gateway working set (~2650 modules at the measured
+    /// ~1.5 MiB, per the #4861 2652-contract gateway) and is strictly larger
+    /// than the pre-fix 384 MiB that caused the thrash.
     #[test]
     fn large_gateway_default_exceeds_old_clamp() {
         const OLD_MAX: usize = 384 * 1024 * 1024;
@@ -1726,9 +1732,10 @@ mod tests {
         );
         let modules_held = budget / MEASURED_MODULE_SIZE;
         assert!(
-            modules_held >= 900,
-            "the default ceiling must hold a realistic gateway working set \
-             (~1000 modules at ~1.5 MiB each); holds {modules_held}"
+            modules_held >= 2000,
+            "the default ceiling must hold a realistic busy-gateway working set \
+             (~2650 modules at ~1.5 MiB each, per the #4861 2652-contract \
+             gateway); holds {modules_held}"
         );
     }
 
@@ -1970,11 +1977,11 @@ mod tests {
         assert_eq!(occupancy_pct(1_500, 1_000), Some(150));
     }
 
-    /// A fully-occupied 1.5 GiB budget must not overflow `total * 100`.
+    /// A fully-occupied max-budget cache must not overflow `total * 100`.
     #[test]
     fn occupancy_pct_handles_gib_scale_without_overflow() {
-        // `1.5 GiB * 100` is ~1.6e11, well within u64; assert no overflow panic.
-        let budget = 1_536u64 * 1024 * 1024;
+        // `4 GiB * 100` is ~4.3e11, well within u64; assert no overflow panic.
+        let budget = 4_096u64 * 1024 * 1024;
         assert_eq!(occupancy_pct(budget, budget), Some(100));
         // Cleanly-divisible large budget to assert the 90% boundary exactly
         // (avoids integer-truncation noise from a non-divisible GiB budget).

@@ -17,7 +17,9 @@ mod state_store;
 #[cfg(all(test, feature = "wasmtime-backend"))]
 mod tests;
 
-pub(crate) use contract::{ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge};
+pub(crate) use contract::{
+    ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge, classify_result,
+};
 pub use contract_store::{ContractStore, SharedContractIndex};
 pub(crate) use delegate::DelegateRuntimeInterface;
 pub use delegate_store::DelegateStore;
@@ -36,7 +38,7 @@ pub(crate) use module_cache::{
 // the re-export isn't an unused import under `-D warnings` in release.
 #[cfg(test)]
 pub(crate) use module_cache::{
-    MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
+    MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES, budget_for_ram,
 };
 pub(crate) use native_api::{
     DELEGATE_SUBSCRIPTIONS, DelegateContextCache, SharedDelegateCounter, SharedInheritedOrigins,

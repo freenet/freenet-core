@@ -1908,7 +1908,18 @@ where
         let result = self
             .runtime
             .validate_state(key, params, state, initial_related)
-            .map_err(|e| ExecutorError::execution(e, None))?;
+            // #4864 round-7 (Codex P1): a validation-phase WASM error (a runaway
+            // `validate_state` that blows the deadline, or a queue-saturation
+            // scheduler timeout) must classify exactly like a merge-phase error.
+            // With `op = Some(Upsert(*key))` it routes through `update_exec_error`
+            // → `Update{cause: "execution error: ..."}`, so `is_wasm_timeout` /
+            // `is_scheduler_timeout` / `is_contract_exec_rejection` all match and
+            // the UPDATE driver records the backoff. `op = None` would route it to
+            // `ExecutorError::other` and the driver would record NOTHING, letting a
+            // contract whose runaway half is `validate_state` burn the full budget
+            // per broadcast without ever backing off. `key` is in scope here, so
+            // the fix is trivially correct.
+            .map_err(|e| ExecutorError::execution(e, Some(InnerOpError::Upsert(*key))))?;
 
         let requested_ids = match result {
             ValidateResult::Valid | ValidateResult::Invalid => return Ok(result),
@@ -2096,7 +2107,9 @@ where
         let retry_result = self
             .runtime
             .validate_state(key, params, state, &populated_related)
-            .map_err(|e| ExecutorError::execution(e, None))?;
+            // #4864 round-7: classify the second-round validation error too (see
+            // the first `validate_state` call above for the rationale).
+            .map_err(|e| ExecutorError::execution(e, Some(InnerOpError::Upsert(*key))))?;
 
         // If the contract requests more related contracts, that's depth>1 — reject
         if let ValidateResult::RequestRelated(_) = &retry_result {

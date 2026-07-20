@@ -66,7 +66,11 @@ impl RunningInstance {
         req_bytes: usize,
     ) -> RuntimeResult<Self> {
         let id = INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let handle = engine.create_instance(module, id, req_bytes)?;
+        // Route the guest-entry call through classify_result so an epoch interrupt
+        // during a runaway module start function normalizes to
+        // MaxComputeTimeExceeded (Timeout class), not the generic "execution
+        // timeout" that is_wasm_timeout misses (#4864 round-5).
+        let handle = super::classify_result(engine.create_instance(module, id, req_bytes))?;
 
         // Record memory address and size for host function pointer arithmetic
         let (ptr, size) = engine.memory_info(&handle)?;
@@ -149,6 +153,24 @@ pub enum ContractExecError {
 
     #[error("The operation exceeded the maximum allowed compute time")]
     MaxComputeTimeExceeded,
+
+    /// The operation never ran: it sat queued on a saturated execution pool
+    /// past the wall-clock deadline and the guest never started (#4864
+    /// round-6). Distinct from [`ContractExecError::MaxComputeTimeExceeded`]
+    /// (a guest that DID run and blew the deadline).
+    ///
+    /// Classification is by TYPED PROVENANCE, NOT this string (#4864 round-9):
+    /// `ExecutorError::is_scheduler_timeout` reads the `host_timeout` field that
+    /// `ExecutorError::execution` sets ONLY when it sees this typed variant — which
+    /// the host `classify_result` alone constructs. The message string is NOT the
+    /// classification gate; it only supplies the cause text for the "execution
+    /// error:" prefix and logging. Do NOT delete the `host_timeout` field and fall
+    /// back to matching this phrase: a contract can RETURN a rejection whose text
+    /// contains it, which would reintroduce the exact forge vector round-9 closed
+    /// (a contract self-inflicting the scheduler/timeout quarantine class on honest
+    /// peers). See `ExecutorError::host_timeout` in `contract/executor.rs`.
+    #[error("The operation was queued too long on a saturated execution pool and never ran")]
+    SchedulerOverloaded,
 }
 
 pub struct RuntimeConfig {
@@ -534,7 +556,9 @@ impl Runtime {
         T: AsRef<[u8]>,
     {
         let data = data.as_ref();
-        let builder_ptr = self.engine.initiate_buffer(handle, data.len() as u32)?;
+        // classify_result: a guest-entry epoch interrupt → Timeout class (#4864 round-5).
+        let builder_ptr =
+            super::classify_result(self.engine.initiate_buffer(handle, data.len() as u32))?;
         let linear_mem = self.linear_mem(handle)?;
         // SAFETY: `builder_ptr` is returned by the WASM allocator and points to a valid
         // `BufferBuilder` within the instance's linear memory described by `linear_mem`.
@@ -551,7 +575,9 @@ impl Runtime {
         handle: &InstanceHandle,
         capacity: usize,
     ) -> RuntimeResult<BufferMut<'_>> {
-        let builder_ptr = self.engine.initiate_buffer(handle, capacity as u32)?;
+        // classify_result: a guest-entry epoch interrupt → Timeout class (#4864 round-5).
+        let builder_ptr =
+            super::classify_result(self.engine.initiate_buffer(handle, capacity as u32))?;
         let linear_mem = self.linear_mem(handle)?;
         // SAFETY: `builder_ptr` is returned by the WASM allocator and points to a valid
         // `BufferBuilder` within the instance's linear memory described by `linear_mem`.

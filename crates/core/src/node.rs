@@ -2949,6 +2949,69 @@ async fn handle_interest_sync_message(
             op_manager.interest_manager.record_resync_request_received();
             crate::config::GlobalTestMetrics::record_resync_request();
 
+            // CHEAP existence check BEFORE the rate limiters (#4864 round-4 P1).
+            // Both limiter buckets allocate a slot (vacant-at-capacity) BEFORE any
+            // existence check, so a peer spraying bogus contract keys could
+            // exhaust the strictly-capped limiter maps and then DENY new legit
+            // (peer, contract) keys (fail-closed → no response). A cheap
+            // state-presence probe rejects unknown contracts before they can touch
+            // a limiter slot. The ASYNC variant (#4864 round-5) keeps the redb
+            // synchronous point-lookup fast-path AND adds a real SQLite EXISTS
+            // probe, so the gate is backend-agnostic (the sync probe was a no-op
+            // on sqlite builds, reopening the hole there). (A known contract whose
+            // state we can no longer fetch a moment later still bails at
+            // get_contract_state below, but only after passing this gate plus the
+            // rate limits.)
+            if !op_manager.ring.contract_state_present_async(&key).await {
+                tracing::debug!(
+                    from = %source,
+                    contract = %key,
+                    event = "resync_response_no_state",
+                    "ResyncRequest for a contract we have no state for — not responding (pre-limiter existence check)"
+                );
+                return None;
+            }
+
+            // Rate-limit the full-state response per (peer, contract) (#4861).
+            // This is the mixed-version-rollout guard: a not-yet-upgraded peer
+            // that still emits unlimited ResyncRequests must not be able to make
+            // this (upgraded) node full-state-reply in a loop. When suppressed,
+            // simply don't respond — the requester will retry later.
+            if !op_manager
+                .ring
+                .resync_response_limiter
+                .check_and_record((source, *key.id()))
+            {
+                crate::config::GlobalTestMetrics::record_resync_response_suppressed_per_peer();
+                tracing::debug!(
+                    from = %source,
+                    contract = %key,
+                    event = "resync_response_suppressed",
+                    "ResyncResponse suppressed by per-(peer, contract) rate limit"
+                );
+                return None;
+            }
+
+            // GLOBAL per-contract cap, checked AFTER the per-peer limit (#4861).
+            // Per-(peer, contract) alone is insufficient: production saw ~45
+            // distinct requester IPs drive ~9,733 full-state responses/day for
+            // one forked contract. This bounds a single contract's total
+            // resync-response cost (~12/min) regardless of requester count.
+            if !op_manager
+                .ring
+                .resync_response_global_limiter
+                .check_and_record(*key.id())
+            {
+                crate::config::GlobalTestMetrics::record_resync_response_suppressed_global();
+                tracing::debug!(
+                    from = %source,
+                    contract = %key,
+                    event = "resync_response_suppressed_global",
+                    "ResyncResponse suppressed by global per-contract rate limit"
+                );
+                return None;
+            }
+
             // Clear cached summary for this peer
             let peer_key = get_peer_key_from_addr(op_manager, source);
             if let Some(ref pk) = peer_key {
@@ -3046,7 +3109,43 @@ async fn handle_interest_sync_message(
                 "Received ResyncResponse with full state"
             );
 
-            // Apply the full state using an update
+            // #4864 round-8 (Codex P1): CORRELATE with an outstanding ResyncRequest
+            // WE sent to this peer for this contract, BEFORE touching the contract
+            // handler. The apply below runs a full-state WASM merge that is
+            // deliberately NOT backoff-gated, so an unsolicited or replayed
+            // ResyncResponse would burn up to a full WASM budget per message,
+            // bypassing every emitter-side gate (those only bound OUR requests).
+            // `consume` require-and-consumes a matching (contract, source) entry;
+            // consume-on-first-match makes replay dead, and a stale (TTL-expired)
+            // or absent entry drops the response without running WASM. Mixed-version
+            // safe: an old peer only ever answers OUR request, so a legit response
+            // always has an entry unless it raced the 60s TTL (anti-entropy heals
+            // that corner).
+            if !op_manager
+                .ring
+                .outstanding_resync_requests
+                .consume(*key.id(), source)
+            {
+                crate::config::GlobalTestMetrics::record_resync_response_unsolicited();
+                tracing::debug!(
+                    from = %source,
+                    contract = %key,
+                    event = "resync_response_unsolicited",
+                    "ResyncResponse with no matching outstanding request — dropping \
+                     without applying (unsolicited, replayed, or TTL-expired)"
+                );
+                return None;
+            }
+
+            // Apply the full state using an update.
+            //
+            // This full-state WASM merge is deliberately NOT gated by the
+            // merge-failure backoff (#4861): unlike the broadcast drivers, the
+            // resync path is already double-bounded — the emitter-side per- and
+            // per-(peer,contract) + global rate limits throttle how often
+            // ResyncRequests (and thus these responses) are produced at all, and
+            // epoch preemption caps the cost of each individual merge. Gating it
+            // here would also risk suppressing a genuine heal.
             let state = freenet_stdlib::prelude::State::from(state_bytes.clone());
             let update_data = freenet_stdlib::prelude::UpdateData::State(state);
 
@@ -3061,8 +3160,44 @@ async fn handle_interest_sync_message(
                 .await
             {
                 Ok(ContractHandlerEvent::UpdateResponse {
-                    new_value: Ok(_), ..
+                    new_value: Ok(_),
+                    state_changed: true,
+                    ..
                 }) => {
+                    // NOTE (#4861): deliberately do NOT reset the merge-failure
+                    // backoff here. A full-state resync apply "succeeds" (even
+                    // with changed=true) merely by REPLACING the local state — it
+                    // proves nothing about convergence. In the observed semantic
+                    // fork-oscillation poison class, two stable divergent states
+                    // reject each other's deltas and every resync apply just
+                    // flips the node to the other fork (~1 cycle/min forever); if
+                    // that reset the backoff, the backoff would never trip and the
+                    // storm would continue. The backoff is reset ONLY by a
+                    // genuine successful DELTA merge in the broadcast driver —
+                    // full-state merges (streaming broadcast included) never
+                    // reset, since they carry the same fork-flip ambiguity. See
+                    // the source-scrape pin
+                    // `resync_apply_does_not_reset_merge_backoff`.
+                    //
+                    // BUT this CHANGED apply advances the state, which
+                    // invalidates the failed-payload MEMO's premise (a delta that
+                    // failed against the old state may be valid against the new
+                    // one) — clear ONLY the memo (#4864 round-4 P2). Gated on
+                    // `state_changed: true` (#4864 round-5 item 8): the executor
+                    // returns `UpdateResponse { state_changed: false }` for a
+                    // redundant no-op apply (CurrentWon / NoChange-with-fetch),
+                    // and invalidating on THOSE would needlessly re-admit
+                    // known-bad payloads without a real state advance. This is NOT
+                    // a backoff reset: no cooldown channel is touched, so the
+                    // strictly-delta-only no-reset doctrine and the
+                    // `resync_apply_does_not_reset_merge_backoff` pin (which
+                    // forbids a backoff reset from any node.rs site) both still
+                    // hold — `invalidate_payload_memo` is a distinct method that
+                    // clears only the memo, never a cooldown.
+                    op_manager
+                        .ring
+                        .merge_backoff
+                        .invalidate_payload_memo(key.id());
                     tracing::info!(
                         from = %source,
                         contract = %key,
@@ -3071,7 +3206,21 @@ async fn handle_interest_sync_message(
                         "ResyncResponse state applied successfully"
                     );
                 }
-                Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+                Ok(ContractHandlerEvent::UpdateResponse {
+                    new_value: Ok(_),
+                    state_changed: false,
+                    ..
+                })
+                | Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+                    // A no-op resync apply (CurrentWon / NoChange — the executor
+                    // returns either `UpdateResponse { state_changed: false }` or
+                    // `UpdateNoChange`) did NOT advance the state. As above
+                    // (#4861) it is not a convergence signal, so it must not reset
+                    // the backoff — AND it is not a memo-invalidation either
+                    // (#4864 round-5 item 8): the failed-payload memo's premise
+                    // still holds when the state did not change, so
+                    // `invalidate_payload_memo` is deliberately NOT called here,
+                    // and the log field is honestly `changed = false`.
                     tracing::info!(
                         from = %source,
                         contract = %key,
@@ -3957,6 +4106,602 @@ mod tests {
         let addr = Address::Hostname("localhost:not_a_port".to_string());
         let result = NodeConfig::parse_socket_addr(&addr).await;
         assert!(result.is_err());
+    }
+
+    // TODO(#4869): sqlite bogus-key flood test — blocked by the crate
+    // having NO compilable SQLite-only feature combination. The round-5 fix
+    // added an async SQLite EXISTS probe (`contract_state_present_async` →
+    // `get_state_size`) so bogus ResyncRequests are rejected before consuming a
+    // limiter slot on a SQLite build too, but that path cannot be exercised in a
+    // test: `cargo build/test -p freenet --no-default-features --features
+    // sqlite,...` fails to compile (~52 lib errors / ~99 lib-test errors). The
+    // SQLite `Pool` backend (crates/core/src/contract/storages/sqlite.rs) has
+    // drifted behind `ReDb` and is missing ~15 methods the rest of the crate
+    // calls (get_state_sync / store_state_sync / update_state_sync,
+    // contract_blob_lock, {load_all,store,remove}_{contract,delegate,secrets,
+    // user_secrets}_index). A SQLite mirror of the redb test below can only be
+    // added once the SQLite backend is repaired (out of scope here: this change
+    // was restricted to node.rs and may not touch sqlite.rs). The redb test
+    // below covers the redb backend's synchronous fast-path.
+
+    /// #4864 round-4 P1: a peer spraying `ResyncRequest`s for contracts we do
+    /// NOT hold must not be able to exhaust the strictly-capped resync-response
+    /// limiter maps. Both limiters allocate a bucket slot (vacant-at-capacity)
+    /// the moment `check_and_record` runs, so if the existence check did not
+    /// precede them, N distinct bogus keys would occupy N slots and then start
+    /// DENYING new legit `(peer, contract)` keys (fail-closed → no response for
+    /// contracts we actually host).
+    ///
+    /// The `ResyncRequest` arm now does a cheap synchronous redb state-presence
+    /// point lookup BEFORE either limiter and bails on absence, so bogus keys
+    /// never touch a limiter slot. This test fires 50 distinct bogus keys and
+    /// asserts (a) every response is `None`, and (b) both limiter maps stay
+    /// EMPTY — proving the pre-limiter existence gate holds.
+    ///
+    /// Requires a real (empty) redb hosting store: with NO storage handle,
+    /// `contract_state_present` conservatively returns `true` for every key
+    /// (see `hosting.rs::contract_state_present`), which would let the requests
+    /// through and populate the limiters, making the test vacuous. Gated on the
+    /// `redb` feature (a default feature; runs under `--features testing`) for
+    /// the same reason the #4612 store test is: only the redb backend has the
+    /// cheap synchronous existence check.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn resync_request_for_bogus_keys_does_not_consume_limiter_slots() {
+        // Build a real OpManager (mirrors `build_broadcast_test_node` in
+        // operations/update/op_ctx_task.rs; no contract-handler spawn needed
+        // because the existence check returns before any handler interaction).
+        let config_args = crate::config::ConfigArgs {
+            id: Some("resync-bogus-4864".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr("127.0.0.1:14000".parse().unwrap());
+
+        // Attach an EMPTY redb hosting store so `contract_state_present`
+        // returns false for unknown keys (a fresh store creates the STATE
+        // table but holds no state). Keep `dir` alive for the whole test so
+        // the temp directory is not removed while the store is open.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .expect("storage");
+        op_manager.ring.set_hosting_storage(storage);
+
+        let source: SocketAddr = "127.0.0.1:15000".parse().unwrap();
+        for i in 0u8..50 {
+            // Distinct bogus key per iteration; none of these are stored.
+            let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                freenet_stdlib::prelude::ContractInstanceId::new([i; 32]),
+                freenet_stdlib::prelude::CodeHash::new([i; 32]),
+            );
+            let response = handle_interest_sync_message(
+                &op_manager,
+                source,
+                crate::message::InterestMessage::ResyncRequest { key },
+            )
+            .await;
+            assert!(
+                response.is_none(),
+                "ResyncRequest for a contract with no stored state (bogus key {i}) \
+                 must produce no response"
+            );
+        }
+
+        assert_eq!(
+            op_manager.ring.resync_response_limiter.len(),
+            0,
+            "#4864: bogus keys must NOT occupy per-(peer, contract) limiter slots \
+             (the pre-limiter existence check must reject them first)"
+        );
+        assert_eq!(
+            op_manager.ring.resync_response_global_limiter.len(),
+            0,
+            "#4864: bogus keys must NOT occupy global per-contract limiter slots \
+             (the pre-limiter existence check must reject them first)"
+        );
+    }
+
+    /// #4864 round-5 item 5 — POSITIVE CONTROL twin of
+    /// `resync_request_for_bogus_keys_does_not_consume_limiter_slots`.
+    ///
+    /// The bogus-keys test proves the existence gate REJECTS absent contracts
+    /// (both limiter maps stay EMPTY). On its own that stays green even if
+    /// `contract_state_present_async` regressed to ALWAYS-false — a gate that
+    /// rejects *everything* would also leave the maps empty. This twin removes
+    /// that blind spot: a `ResyncRequest` for a contract we DO hold must PASS
+    /// the gate, so a limiter slot IS consumed (`len() >= 1`), and — because
+    /// the stand-in handler answers the post-gate state/summary fetches — a
+    /// full `ResyncResponse` comes back.
+    ///
+    /// Together the pair proves the gate DISCRIMINATES (bogus → `len() == 0`,
+    /// held → `len() >= 1`), not merely that it always-rejects or always-accepts.
+    ///
+    /// redb-gated for the same reason as the twin: only the redb backend has
+    /// the cheap synchronous existence check, and an empty/unset store would
+    /// make the precondition unrepresentable.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn resync_request_for_held_contract_passes_gate_and_responds() {
+        use crate::contract::{ContractHandlerEvent, StoreResponse};
+        use freenet_stdlib::prelude::{StateSummary, WrappedState};
+
+        // Build a real OpManager (identical harness to the bogus-keys twin),
+        // but this time WITH a stand-in contract handler: the held path reaches
+        // `get_contract_state` / `get_contract_summary` after the gate, which
+        // round-trip through the contract-handling channel, so an unanswered
+        // channel would hang the test.
+        let config_args = crate::config::ConfigArgs {
+            id: Some("resync-held-4864".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr("127.0.0.1:14100".parse().unwrap());
+
+        // The one contract we DO hold.
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([200u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([201u8; 32]),
+        );
+
+        // Store its state into the hosting store BEFORE handing the store to
+        // the ring, so `contract_state_present_async(&key)` (the redb sync
+        // point lookup on the STATE table — the same table `store_state_sync`
+        // writes and `get_state_size` reads) returns true.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .expect("storage");
+        storage
+            .store_state_sync(&key, WrappedState::new(vec![9u8, 9, 9]))
+            .expect("store held state");
+        op_manager.ring.set_hosting_storage(storage);
+
+        // Precondition: the sync redb probe (what the async gate delegates to
+        // under redb) sees the state we just stored.
+        assert!(
+            op_manager.ring.contract_state_present(&key),
+            "precondition: the held contract's state must be present in the store"
+        );
+
+        // Stand-in contract handler: answers the post-gate GET (full state) and
+        // GET-summary so the responder can build a ResyncResponse. Owns the
+        // receiver for the whole test.
+        let handler_key = key;
+        let _handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+                        key: Some(handler_key),
+                        response: Ok(StoreResponse {
+                            state: Some(WrappedState::new(vec![9u8, 9, 9])),
+                            contract: None,
+                        }),
+                    },
+                    ContractHandlerEvent::GetSummaryQuery { key } => {
+                        ContractHandlerEvent::GetSummaryResponse {
+                            key,
+                            summary: Ok(StateSummary::from(vec![7u8, 7, 7])),
+                        }
+                    }
+                    other => {
+                        panic!("unexpected handler event in held-contract stand-in: {other:?}")
+                    }
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let source: SocketAddr = "127.0.0.1:15100".parse().unwrap();
+        let response = handle_interest_sync_message(
+            &op_manager,
+            source,
+            crate::message::InterestMessage::ResyncRequest { key },
+        )
+        .await;
+
+        // PRIMARY assertion (the exact regression this guards): the gate PASSED,
+        // so a limiter slot WAS consumed — impossible if the existence check had
+        // regressed to always-reject.
+        assert!(
+            op_manager.ring.resync_response_limiter.len() >= 1,
+            "#4864: a ResyncRequest for a HELD contract must PASS the existence \
+             gate and consume a per-(peer, contract) limiter slot (contrast the \
+             bogus-keys twin, which asserts len() == 0)"
+        );
+        assert!(
+            op_manager.ring.resync_response_global_limiter.len() >= 1,
+            "#4864: a ResyncRequest for a HELD contract must PASS the existence \
+             gate and consume a global per-contract limiter slot"
+        );
+
+        // Stronger check: with the state + summary answered, a full ResyncResponse
+        // for the held key is produced (the whole happy path, not just the gate).
+        match response {
+            Some(crate::message::InterestMessage::ResyncResponse { key: got, .. }) => {
+                assert_eq!(got, key, "ResyncResponse must be for the held contract");
+            }
+            other => panic!("expected Some(ResyncResponse) for a held contract, got {other:?}"),
+        }
+    }
+
+    /// #4864 round-8 (Codex P1): an UNSOLICITED `ResyncResponse` — one with NO
+    /// matching outstanding `ResyncRequest` we recorded for that
+    /// `(contract, source)` — MUST be dropped by the correlation gate BEFORE any
+    /// state is applied. This is the SECURITY property: the resync apply runs a
+    /// full-state WASM merge that is deliberately NOT backoff-gated, so without
+    /// the gate a peer could spray unsolicited full-state responses and burn a
+    /// full WASM merge budget per message, bypassing every emitter-side rate
+    /// limit (those only bound OUR requests). The gate
+    /// (`outstanding_resync_requests.consume(..)`) runs before
+    /// `notify_contract_handler(ContractHandlerEvent::UpdateQuery { .. })`, so an
+    /// unsolicited response never reaches the contract handler at all.
+    ///
+    /// Asserts: (a) the handler returns `None`; (b) NO `UpdateQuery` ever reached
+    /// the (stand-in) contract handler — the WASM-apply path was never entered;
+    /// (c) the unsolicited-drop metric incremented exactly once.
+    #[tokio::test]
+    async fn resync_response_unsolicited_is_dropped_without_applying() {
+        use crate::contract::ContractHandlerEvent;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build a real OpManager (same harness as
+        // resync_request_for_held_contract_passes_gate_and_responds).
+        let config_args = crate::config::ConfigArgs {
+            id: Some("resync-resp-unsolicited-4864".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr("127.0.0.1:14200".parse().unwrap());
+
+        // Stand-in contract handler: flips `update_query_seen` to true if it EVER
+        // receives an UpdateQuery (proof the WASM-apply path was entered),
+        // answering it so nothing hangs. For this test it must NEVER fire — any
+        // event reaching the handler is the regression this guards against.
+        let update_query_seen = std::sync::Arc::new(AtomicBool::new(false));
+        let handler_flag = update_query_seen.clone();
+        let _handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::UpdateQuery { .. } => {
+                        handler_flag.store(true, Ordering::SeqCst);
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(freenet_stdlib::prelude::WrappedState::new(vec![
+                                1u8, 2, 3,
+                            ])),
+                            state_changed: true,
+                        }
+                    }
+                    other => panic!(
+                        "an unsolicited ResyncResponse must not reach the contract \
+                         handler, got: {other:?}"
+                    ),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([202u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([203u8; 32]),
+        );
+        let source: SocketAddr = "127.0.0.1:15200".parse().unwrap();
+
+        // NO outstanding entry seeded → the response is unsolicited.
+        assert_eq!(
+            op_manager.ring.outstanding_resync_requests.len(),
+            0,
+            "precondition: no outstanding ResyncRequest recorded for this (contract, source)"
+        );
+
+        crate::config::GlobalTestMetrics::reset();
+
+        let response = handle_interest_sync_message(
+            &op_manager,
+            source,
+            crate::message::InterestMessage::ResyncResponse {
+                key,
+                state_bytes: vec![1u8, 2, 3],
+                summary_bytes: vec![4u8, 5, 6],
+            },
+        )
+        .await;
+
+        // Give the (should-be-idle) handler task a scheduling window: if the gate
+        // had wrongly forwarded an UpdateQuery, it would surface now. (The arm
+        // AWAITS the handler round-trip, so a leak would already have set the flag
+        // before the call above returned; this is belt-and-suspenders.)
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            response.is_none(),
+            "an unsolicited ResyncResponse must produce no reply"
+        );
+        assert!(
+            !update_query_seen.load(Ordering::SeqCst),
+            "SECURITY (#4864 round-8): the correlation gate must drop the unsolicited \
+             ResyncResponse BEFORE any UpdateQuery / WASM apply — the contract handler \
+             must never see it"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::resync_responses_unsolicited(),
+            1,
+            "the unsolicited-drop must be counted exactly once (#4864 round-8)"
+        );
+    }
+
+    /// #4864 round-8 (Codex P1): a SOLICITED `ResyncResponse` — one that matches
+    /// an outstanding `ResyncRequest` we recorded — passes the correlation gate
+    /// and IS applied (reaches the contract handler's `UpdateQuery`). Crucially
+    /// the gate `consume`s the entry on first match, so an identical REPLAY of the
+    /// same response finds nothing and is dropped WITHOUT a second apply — replay
+    /// is dead.
+    ///
+    /// Asserts (first call): the `UpdateQuery` reached the handler (applied), and
+    /// the outstanding entry was consumed (`len() == 0`), and the unsolicited-drop
+    /// metric stayed 0. (Replay call): returns `None`, NO second `UpdateQuery`, and
+    /// the unsolicited-drop metric incremented to 1.
+    #[tokio::test]
+    async fn resync_response_solicited_applies_then_replay_is_suppressed() {
+        use crate::contract::ContractHandlerEvent;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build a real OpManager (same harness as
+        // resync_request_for_held_contract_passes_gate_and_responds).
+        let config_args = crate::config::ConfigArgs {
+            id: Some("resync-resp-solicited-4864".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr("127.0.0.1:14300".parse().unwrap());
+
+        // Stand-in contract handler: answers UpdateQuery with a SUCCESSFUL,
+        // state-changed merge (mirrors the ResyncResponse arm's
+        // `UpdateResponse { new_value: Ok(_), state_changed: true, .. }` match)
+        // and records that the apply was reached.
+        let update_query_seen = std::sync::Arc::new(AtomicBool::new(false));
+        let handler_flag = update_query_seen.clone();
+        let _handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::UpdateQuery { .. } => {
+                        handler_flag.store(true, Ordering::SeqCst);
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(freenet_stdlib::prelude::WrappedState::new(vec![
+                                9u8, 8, 7,
+                            ])),
+                            state_changed: true,
+                        }
+                    }
+                    other => {
+                        panic!("unexpected handler event in solicited-resync stand-in: {other:?}")
+                    }
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([204u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([205u8; 32]),
+        );
+        let source: SocketAddr = "127.0.0.1:15300".parse().unwrap();
+
+        // Seed the outstanding entry: WE sent a ResyncRequest to `source` for
+        // `key`, so the incoming response is solicited.
+        op_manager
+            .ring
+            .outstanding_resync_requests
+            .record(*key.id(), source);
+        assert_eq!(
+            op_manager.ring.outstanding_resync_requests.len(),
+            1,
+            "precondition: exactly one outstanding ResyncRequest recorded"
+        );
+
+        crate::config::GlobalTestMetrics::reset();
+
+        // FIRST delivery: solicited → passes the gate → applied.
+        let resp1 = handle_interest_sync_message(
+            &op_manager,
+            source,
+            crate::message::InterestMessage::ResyncResponse {
+                key,
+                state_bytes: vec![1u8, 2, 3],
+                summary_bytes: vec![4u8, 5, 6],
+            },
+        )
+        .await;
+        assert!(
+            resp1.is_none(),
+            "a ResyncResponse never produces a reply (it applies locally)"
+        );
+        assert!(
+            update_query_seen.load(Ordering::SeqCst),
+            "a solicited ResyncResponse must be applied (reach the UpdateQuery apply)"
+        );
+        assert_eq!(
+            op_manager.ring.outstanding_resync_requests.len(),
+            0,
+            "the correlation gate must CONSUME the outstanding entry on apply (#4864 round-8)"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::resync_responses_unsolicited(),
+            0,
+            "a solicited response must NOT be counted as unsolicited"
+        );
+
+        // REPLAY: byte-identical response. The entry was already consumed, so the
+        // gate finds nothing and drops it — no second apply.
+        update_query_seen.store(false, Ordering::SeqCst);
+        let resp2 = handle_interest_sync_message(
+            &op_manager,
+            source,
+            crate::message::InterestMessage::ResyncResponse {
+                key,
+                state_bytes: vec![1u8, 2, 3],
+                summary_bytes: vec![4u8, 5, 6],
+            },
+        )
+        .await;
+
+        // Window for a wrongly-forwarded UpdateQuery to surface (belt-and-suspenders;
+        // a real leak would have set the flag before the awaited call returned).
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            resp2.is_none(),
+            "a replayed ResyncResponse must produce no reply"
+        );
+        assert!(
+            !update_query_seen.load(Ordering::SeqCst),
+            "SECURITY (#4864 round-8): a replayed ResyncResponse must NOT reach a second \
+             UpdateQuery apply — consume-on-first-match makes replay dead"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::resync_responses_unsolicited(),
+            1,
+            "the replayed response must be counted as an unsolicited drop (#4864 round-8)"
+        );
+    }
+
+    /// #4864 round-8 (Codex P1) source-scrape pin: the `ResyncResponse` receive
+    /// arm MUST require-and-consume an outstanding `ResyncRequest`
+    /// (`outstanding_resync_requests.consume(..)`) BEFORE it applies the state via
+    /// `ContractHandlerEvent::UpdateQuery`. If the consume ever moves after (or is
+    /// downgraded to a non-consuming peek), an unsolicited or replayed
+    /// ResyncResponse would reach the un-backoff-gated full-state WASM merge —
+    /// exactly the DoS surface the behavioral tests above guard against.
+    #[test]
+    fn resync_response_arm_consumes_outstanding_before_apply() {
+        let src = include_str!("node.rs");
+        let arm = src
+            .find(r#"event = "resync_response_received""#)
+            .expect("ResyncResponse receive anchor not found");
+        let region = &src[arm..];
+        let consume = region.find("outstanding_resync_requests").expect(
+            "ResyncResponse arm must correlate via outstanding_resync_requests (#4864 round-8)",
+        );
+        let apply = region
+            .find("ContractHandlerEvent::UpdateQuery")
+            .expect("ResyncResponse arm must apply via UpdateQuery");
+        assert!(
+            consume < apply,
+            "outstanding_resync_requests.consume MUST run BEFORE the UpdateQuery apply so an \
+             unsolicited/replayed ResyncResponse never reaches WASM (#4864 round-8)"
+        );
+        assert!(
+            region[consume..(consume + 120).min(region.len())].contains(".consume("),
+            "the correlation must be a require-and-consume (.consume), not a peek"
+        );
     }
 
     // Superseded: Old addr-only equality (same_addr_different_keys → equal) was replaced
@@ -5549,6 +6294,130 @@ mod tests {
                 "ResyncRequest handler must clear the cached summary with \
                  `update_peer_summary(&key, pk, None)` (the `None` clears it). \
                  Caching a summary here instead would defeat the #4145 backstop."
+            );
+        }
+
+        /// Pin (#4861 + #4864 round-4): the responder MUST, in order, (1) do a
+        /// cheap state-presence check, (2) rate-limit per (peer, contract), (3)
+        /// apply the global per-contract cap, and only then (4) do the expensive
+        /// state/summary fetch. The existence check gating FIRST is the #4864
+        /// round-4 fix — otherwise a peer spraying bogus keys exhausts the capped
+        /// limiter maps and denies legit (peer, contract) keys.
+        #[test]
+        fn resync_request_handler_rate_limits_response() {
+            let arm = resync_request_arm();
+            // (1) cheap existence check BEFORE either limiter (async so the probe
+            // is backend-agnostic: redb sync fast-path + real SQLite EXISTS,
+            // #4864 round-5).
+            let exists_pos = arm.find("contract_state_present_async(&key)").expect(
+                "ResyncRequest handler must do a cheap state-presence check BEFORE \
+                 the rate limiters (#4864 round-4/round-5)",
+            );
+            let gate_pos = arm.find("resync_response_limiter").expect(
+                "ResyncRequest handler must rate-limit the response via \
+                 resync_response_limiter (#4861)",
+            );
+            let state_fetch_pos = arm
+                .find("get_contract_state(op_manager, &key)")
+                .expect("state fetch not found in ResyncRequest arm");
+            assert!(
+                gate_pos < state_fetch_pos,
+                "the responder rate-limit gate ({gate_pos}) must run BEFORE the \
+                 state fetch ({state_fetch_pos}) so a suppressed request pays no \
+                 fetch/summary cost"
+            );
+            // The GLOBAL per-contract cap must also gate, after the per-peer
+            // limit and before the state fetch (#4861).
+            let global_pos = arm.find("resync_response_global_limiter").expect(
+                "ResyncRequest handler must also apply the GLOBAL per-contract \
+                 response cap (#4861)",
+            );
+            assert!(
+                exists_pos < gate_pos,
+                "the cheap existence check ({exists_pos}) must run BEFORE the \
+                 per-peer limiter ({gate_pos}) so a bogus contract never consumes \
+                 a limiter slot (#4864 round-4)"
+            );
+            assert!(
+                gate_pos < global_pos && global_pos < state_fetch_pos,
+                "global cap ({global_pos}) must be checked after the per-peer \
+                 limit ({gate_pos}) and before the state fetch ({state_fetch_pos})"
+            );
+            assert!(
+                arm.contains("record_resync_response_suppressed_per_peer()")
+                    && arm.contains("record_resync_response_suppressed_global()"),
+                "each suppressed branch must record its own (per-peer vs global) \
+                 resync-response-suppressed metric (#4864 review)"
+            );
+        }
+
+        /// Pin (#4861): NO code path in node.rs may reset the merge-failure
+        /// backoff. In particular the ResyncResponse APPLY arm must not — a
+        /// full-state resync apply "succeeds" by replacing local state even in
+        /// the semantic fork-oscillation poison class (it just flips the node to
+        /// the other fork), so resetting here would make the backoff never trip
+        /// and let the ~1-cycle/min storm continue. The backoff is reset ONLY by
+        /// a genuine successful DELTA merge in the UPDATE broadcast driver
+        /// (`operations/update/op_ctx_task.rs`) — full-state merges, streaming
+        /// broadcast included, never reset because they carry the same
+        /// fork-flip ambiguity as a resync apply.
+        #[test]
+        fn resync_apply_does_not_reset_merge_backoff() {
+            // Assemble the needle from parts so the contiguous call string never
+            // appears verbatim in this file — otherwise `.contains(<literal>)`
+            // would match its OWN argument via `include_str!` (self-reference).
+            let needle = concat!("merge_backoff", ".record_success");
+            assert!(
+                !SOURCE.contains(needle),
+                "node.rs must NOT reset the merge backoff anywhere — a \
+                 resync-apply (or any node.rs) reset would defeat the #4861 \
+                 fork-oscillation containment. Reset belongs only in the broadcast \
+                 drivers on a genuine merge success."
+            );
+        }
+
+        /// Pin (#4864 round-5 item 6): the CHANGED ResyncResponse apply arm MUST
+        /// call `invalidate_payload_memo` (presence — the no-reset pin above only
+        /// asserts ABSENCE of a reset), and it must live in the `state_changed:
+        /// true` sub-arm so a no-op apply does NOT invalidate the memo (item 8).
+        /// Dropping the call silently widens the memo staleness corner to the full
+        /// 10-min TTL.
+        #[test]
+        fn resync_changed_apply_invalidates_payload_memo() {
+            // Window-bound to the ResyncResponse RECEIVE-and-apply arm so the
+            // far-away test literals below cannot satisfy the needles
+            // (self-reference guard). Anchored on the receive-log event (assembled
+            // via concat so this literal isn't self-matched) rather than the first
+            // `InterestMessage::ResyncResponse {` — that matched the SEND-side
+            // construction in the ResyncRequest arm, and the #4864 round-8 consume
+            // gate inserted between the receive log and the apply pushed the
+            // sub-arm markers past the old fixed window.
+            let start = SOURCE
+                .find(concat!("event = \"resync_response_", "received\""))
+                .expect("ResyncResponse receive arm not found");
+            // Window widened to 8000 (#4864 round-9 addendum): after the round-8
+            // consume gate the margin to `state_changed: false,` was only ~125
+            // bytes, so the next addition to the arm would push it past the bound
+            // and fail with a misleading "sub-arm not found".
+            let arm = &SOURCE[start..(start + 8000).min(SOURCE.len())];
+            let invalidate = concat!("invalidate_", "payload_memo(");
+            // Match the PATTERN form (trailing comma) so a prose mention of
+            // `state_changed: false` in the changed:true arm's comment is not
+            // mistaken for the false sub-arm (self-reference guard).
+            let changed_true = arm
+                .find("state_changed: true,")
+                .expect("state_changed:true sub-arm not found");
+            let invalidate_pos = arm.find(invalidate).expect(
+                "the CHANGED ResyncResponse apply arm must call invalidate_payload_memo \
+                 (#4864 round-5 item 6)",
+            );
+            let changed_false = arm
+                .find("state_changed: false,")
+                .expect("state_changed:false sub-arm not found");
+            assert!(
+                changed_true < invalidate_pos && invalidate_pos < changed_false,
+                "invalidate_payload_memo must live in the state_changed:true sub-arm \
+                 so a no-op apply (state_changed:false) does NOT invalidate the memo"
             );
         }
     }

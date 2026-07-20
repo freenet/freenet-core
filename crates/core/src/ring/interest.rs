@@ -348,7 +348,7 @@ pub struct InterestManager<T: TimeSource> {
 
     /// Rate-limit gate for queue-full `ResyncRequest`s, keyed by
     /// (contract, target peer address). Bounded LRU so remote peers cannot grow
-    /// it without bound. See [`InterestManager::should_send_resync_request`] and
+    /// it without bound. See [`InterestManager::begin_resync_request`] and
     /// issue #4857.
     resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), Instant>>,
 }
@@ -595,19 +595,29 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
     }
 
-    /// Rate-limit gate for queue-full `ResyncRequest`s to `target` for
-    /// `contract`. Returns `true` (and records the send) when at least
-    /// [`RESYNC_REQUEST_MIN_INTERVAL`] has elapsed since the last such request
-    /// for this (contract, target) pair, or when none was ever sent.
+    /// RESERVE the per-(contract, target) queue-full `ResyncRequest` throttle
+    /// window: atomically checks AND records the send under the throttle's own
+    /// lock, returning `true` when at least [`RESYNC_REQUEST_MIN_INTERVAL`] has
+    /// elapsed since the last such request (or none was ever sent), `false`
+    /// otherwise.
     ///
-    /// Issue #4857: a `ContractQueueFull` broadcast drop is silent — the
-    /// receiver never applied the delta, but the SENDER cached its own summary
-    /// as ours on send-Ok, so it believes we are current and will never re-send
-    /// the dropped change. A `ResyncRequest` makes the sender clear that cached
-    /// summary and re-send full state. Issue #4251 suppressed the request
-    /// entirely because one-per-dropped-delta amplifies into a full-state storm;
-    /// this gate keeps the healing signal but bounds it to one per window.
-    pub fn should_send_resync_request(&self, contract: &ContractKey, target: SocketAddr) -> bool {
+    /// The `begin`/[`Self::cancel_resync_request`] reservation-commit pair
+    /// restores atomicity under the double-gate (#4864 round-6 item 2): recording
+    /// under the lock means two concurrent queue-full callbacks for the same
+    /// (contract, target) cannot both pass, so they cannot both consume the global
+    /// burst and emit duplicates inside the window. If a later gate (the global
+    /// per-contract emit cap) then rejects, the caller `cancel`s the reservation
+    /// so the window is released — preserving the round-5 improvement that a
+    /// globally-suppressed emit does not burn the 30s window.
+    ///
+    /// Issue #4857: a `ContractQueueFull` broadcast drop is silent — the receiver
+    /// never applied the delta, but the SENDER cached its own summary as ours on
+    /// send-Ok, so it believes we are current and will never re-send the dropped
+    /// change. A `ResyncRequest` makes the sender clear that cached summary and
+    /// re-send full state. Issue #4251 suppressed the request entirely because
+    /// one-per-dropped-delta amplifies into a full-state storm; this gate keeps
+    /// the healing signal but bounds it to one per window.
+    pub fn begin_resync_request(&self, contract: &ContractKey, target: SocketAddr) -> bool {
         let now = self.time_source.now();
         let key = (*contract, target);
         let mut throttle = self.resync_request_throttle.lock();
@@ -618,6 +628,18 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
         throttle.put(key, now);
         true
+    }
+
+    /// Cancel a reservation made by [`Self::begin_resync_request`]: removes the
+    /// just-recorded throttle window for (contract, target) so the sender can
+    /// retry as soon as the OTHER gate (the global emit cap) refills, rather than
+    /// waiting out the full [`RESYNC_REQUEST_MIN_INTERVAL`] (#4864 round-6 item 2).
+    /// Call only after a `begin` that returned `true` whose send was then rejected
+    /// downstream.
+    pub fn cancel_resync_request(&self, contract: &ContractKey, target: SocketAddr) {
+        self.resync_request_throttle
+            .lock()
+            .pop(&(*contract, target));
     }
 
     /// Remove all interests for a peer (called on peer disconnect).
@@ -1626,52 +1648,90 @@ mod tests {
         assert_eq!(retrieved.unwrap().as_ref(), summary.as_ref());
     }
 
-    /// Issue #4857: `should_send_resync_request` must emit at most one
+    /// Issue #4857: `begin_resync_request` must emit at most one
     /// `ResyncRequest` per (contract, peer) per `RESYNC_REQUEST_MIN_INTERVAL`.
     /// The first drop heals immediately; a burst of further drops within the
     /// window is throttled (bounding the #4251 amplification); after the window
     /// elapses a fresh request is allowed again.
     #[test]
-    fn should_send_resync_request_rate_limits_per_contract_peer() {
+    fn begin_resync_request_rate_limits_per_contract_peer() {
         let (manager, time) = make_manager();
         let contract = make_contract_key(1);
         let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
         // First drop for this (contract, peer) → allowed (immediate heal).
         assert!(
-            manager.should_send_resync_request(&contract, addr),
+            manager.begin_resync_request(&contract, addr),
             "first ResyncRequest for a fresh (contract, peer) must be allowed"
         );
         // Immediate repeat within the window → throttled.
         assert!(
-            !manager.should_send_resync_request(&contract, addr),
+            !manager.begin_resync_request(&contract, addr),
             "a second ResyncRequest within RESYNC_REQUEST_MIN_INTERVAL must be throttled"
         );
 
         // A DIFFERENT peer for the same contract is an independent bucket.
         let other_addr: SocketAddr = "127.0.0.1:5002".parse().unwrap();
         assert!(
-            manager.should_send_resync_request(&contract, other_addr),
+            manager.begin_resync_request(&contract, other_addr),
             "a distinct peer must not share the first peer's throttle bucket"
         );
         // A DIFFERENT contract for the same peer is also independent.
         let other_contract = make_contract_key(2);
         assert!(
-            manager.should_send_resync_request(&other_contract, addr),
+            manager.begin_resync_request(&other_contract, addr),
             "a distinct contract must not share the first contract's throttle bucket"
         );
 
         // Just before the interval elapses → still throttled.
         time.advance_time(RESYNC_REQUEST_MIN_INTERVAL - Duration::from_millis(1));
         assert!(
-            !manager.should_send_resync_request(&contract, addr),
+            !manager.begin_resync_request(&contract, addr),
             "ResyncRequest must stay throttled until the full interval elapses"
         );
         // After the interval elapses → allowed again.
         time.advance_time(Duration::from_millis(2));
         assert!(
-            manager.should_send_resync_request(&contract, addr),
+            manager.begin_resync_request(&contract, addr),
             "ResyncRequest must be allowed again once RESYNC_REQUEST_MIN_INTERVAL has elapsed"
+        );
+    }
+
+    /// #4864 round-6 item 2: the begin/cancel reservation-commit semantics.
+    /// `begin` reserves the window (records under the lock); `cancel` releases it
+    /// (so a downstream rejection does not burn the 30s window); `begin` without a
+    /// `cancel` holds the window (a second immediate begin is rejected).
+    #[test]
+    fn begin_cancel_resync_request_reservation_semantics() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let addr: SocketAddr = "127.0.0.1:5003".parse().unwrap();
+
+        // begin reserves; cancel releases → a subsequent begin succeeds immediately
+        // (the window was NOT burned).
+        assert!(
+            manager.begin_resync_request(&contract, addr),
+            "first begin reserves"
+        );
+        manager.cancel_resync_request(&contract, addr);
+        assert!(
+            manager.begin_resync_request(&contract, addr),
+            "begin after cancel must succeed — cancel releases the reserved window"
+        );
+
+        // This last begin was NOT cancelled → the window is held: an immediate
+        // second begin is rejected (the reservation stands, as after a real emit).
+        assert!(
+            !manager.begin_resync_request(&contract, addr),
+            "a begin without a matching cancel must hold the 30s window (second begin rejected)"
+        );
+
+        // cancel is idempotent-safe on an absent bucket (no panic) and, once the
+        // interval elapses, begin is allowed again.
+        time.advance_time(RESYNC_REQUEST_MIN_INTERVAL);
+        assert!(
+            manager.begin_resync_request(&contract, addr),
+            "begin allowed once RESYNC_REQUEST_MIN_INTERVAL elapses"
         );
     }
 

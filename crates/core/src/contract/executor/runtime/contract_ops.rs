@@ -72,6 +72,9 @@ impl Executor<Runtime> {
                     &new_state,
                     &related_contracts,
                     None,
+                    // Re-PUT into an existing contract returns an UpdateResponse
+                    // (this branch), so classify a validation failure as Update.
+                    ValidationOpKind::Update,
                 )
                 .await?;
             if validate_result != ValidateResult::Valid {
@@ -297,6 +300,9 @@ impl Executor<Runtime> {
                 &new_state,
                 &RelatedContracts::default(),
                 None,
+                // Local UPDATE path — classify a validation failure as Update
+                // (keeps the merge-failure backoff classification).
+                ValidationOpKind::Update,
             )
             .await?;
 
@@ -437,6 +443,10 @@ impl Executor<Runtime> {
                 &state,
                 &related_contracts,
                 Some(&contract_for_validation),
+                // Fresh PUT (verify_and_store_contract) returns a PutResponse, so a
+                // validation failure must surface as a Put variant, not Update
+                // (#4864 round-9 item 4).
+                ValidationOpKind::Put,
             )
             .await
             .inspect_err(|_| {
@@ -644,16 +654,27 @@ impl Executor<Runtime> {
         state: &WrappedState,
         initial_related: &RelatedContracts<'_>,
         already_fetched_contract: Option<&ContractContainer>,
+        // #4864 round-9 item 4: which op this validation is running for, so a
+        // validate_state exec failure classifies as the RIGHT client error —
+        // `Update` for the UPDATE / re-PUT callers, `Put` for the fresh-PUT
+        // `verify_and_store_contract` path (PutResponse semantics).
+        validation_op: ValidationOpKind,
     ) -> Result<ValidateResult, ExecutorError> {
+        // #4864 round-7 (Codex P1): classify validation-phase WASM errors (route
+        // through execution so a runaway/timed-out `validate_state` reaches the
+        // merge-failure backoff and carries the typed timeout provenance).
+        // Round-9 item 4: the op KIND is now caller-supplied (Update vs Put) rather
+        // than hardcoded Upsert, so a fresh PUT's validation error surfaces as a
+        // Put variant instead of masquerading as an UPDATE error.
         let result = match already_fetched_contract {
             Some(contract) => self
                 .runtime
                 .validate_state_with_contract(key, params, state, initial_related, contract)
-                .map_err(|e| ExecutorError::execution(e, None))?,
+                .map_err(|e| ExecutorError::execution(e, Some(validation_op.op_for(*key))))?,
             None => self
                 .runtime
                 .validate_state(key, params, state, initial_related)
-                .map_err(|e| ExecutorError::execution(e, None))?,
+                .map_err(|e| ExecutorError::execution(e, Some(validation_op.op_for(*key))))?,
         };
 
         let requested_ids = match result {
@@ -754,15 +775,17 @@ impl Executor<Runtime> {
         }
 
         let populated_related = RelatedContracts::from(related_map);
+        // #4864 round-7/9: classify the second-round validation error too, with the
+        // caller-supplied op kind (see the first `validate_state` match above).
         let retry_result = match already_fetched_contract {
             Some(contract) => self
                 .runtime
                 .validate_state_with_contract(key, params, state, &populated_related, contract)
-                .map_err(|e| ExecutorError::execution(e, None))?,
+                .map_err(|e| ExecutorError::execution(e, Some(validation_op.op_for(*key))))?,
             None => self
                 .runtime
                 .validate_state(key, params, state, &populated_related)
-                .map_err(|e| ExecutorError::execution(e, None))?,
+                .map_err(|e| ExecutorError::execution(e, Some(validation_op.op_for(*key))))?,
         };
 
         if let ValidateResult::RequestRelated(_) = &retry_result {

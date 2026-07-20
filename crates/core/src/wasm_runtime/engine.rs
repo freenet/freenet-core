@@ -84,6 +84,14 @@ pub(crate) enum WasmError {
     #[error("execution timeout")]
     Timeout,
 
+    /// The execution never ran because it sat queued on a saturated blocking
+    /// pool past the wall-clock deadline (#4864 round-6). Distinct from
+    /// [`WasmError::Timeout`]: the guest never started, so this is a transient
+    /// load condition, NOT a contract-intrinsic timeout, and callers treat it
+    /// like queue-full backpressure (no per-contract quarantine).
+    #[error("scheduler overloaded")]
+    SchedulerOverloaded,
+
     /// Catch-all for backend-specific errors.
     #[error(transparent)]
     Other(anyhow::Error),

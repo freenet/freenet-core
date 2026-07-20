@@ -177,7 +177,7 @@ pub struct ConfigArgs {
     /// until it fits. Bounding by bytes (not entry count) stops a node hosting
     /// many contracts from thrashing the cache and recompiling on every access
     /// (issue #4441). When unset, the default scales with system RAM
-    /// (`clamp(total_ram / 8, 64 MiB, 1.5 GiB)`); set this to override.
+    /// (`clamp(total_ram / 8, 64 MiB, 4 GiB)`); set this to override.
     #[arg(long, env = "FREENET_MODULE_CACHE_BUDGET_BYTES")]
     pub module_cache_budget_bytes: Option<usize>,
 
@@ -543,8 +543,28 @@ impl ConfigArgs {
                 .get_or_insert(cfg.per_user_inactive_ttl_secs);
             self.inactive_user_sweep_interval_secs
                 .get_or_insert(cfg.inactive_user_sweep_interval_secs);
-            self.module_cache_budget_bytes
-                .get_or_insert(cfg.module_cache_budget_bytes);
+            // #4864 upgrade migration: an existing node whose config.toml was
+            // auto-written on a >12 GiB box carries the OLD auto-derived clamp
+            // `module-cache-budget-bytes = 1610612736` (1.5 GiB, the previous
+            // MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, which only ever appeared as
+            // an auto-derived value on boxes with >12 GiB RAM). A plain
+            // get_or_insert would merge that stale 1.5 GiB back and pin the node
+            // to it forever, so the exact large gateways this change targets
+            // would NEVER see the new 4 GiB default. That exact value is the only
+            // distinguishable "this was auto-derived, not operator-chosen" signal
+            // we have, so treat it as auto: skip the merge, leave self None, and
+            // let build() RE-DERIVE it via default_module_cache_budget_bytes()
+            // below (yielding 4 GiB on a large box). CLI/env explicit values are
+            // parsed into `self` BEFORE this file merge, so they still win. Any
+            // OTHER persisted value is an explicit operator choice and is
+            // preserved unchanged. Accepted, release-notes-worthy edge: an
+            // operator who EXPLICITLY set exactly 1.5 GiB is indistinguishable
+            // from the old auto-default and will be re-derived.
+            const OLD_AUTO_MODULE_CACHE_BUDGET_SENTINEL: usize = 1_610_612_736;
+            if cfg.module_cache_budget_bytes != OLD_AUTO_MODULE_CACHE_BUDGET_SENTINEL {
+                self.module_cache_budget_bytes
+                    .get_or_insert(cfg.module_cache_budget_bytes);
+            }
             self.shutdown_drain_secs
                 .get_or_insert(cfg.shutdown_drain_secs);
             self.max_blocking_threads
@@ -1214,7 +1234,7 @@ pub struct Config {
     /// ~1.25× this value. Bounds the cache by total compiled bytes rather than
     /// entry count, so a node hosting many contracts doesn't thrash (issue
     /// #4441). When unset, the default scales with system RAM
-    /// (`clamp(total_ram / 8, 64 MiB, 1.5 GiB)`) so a small VPS doesn't OOM and
+    /// (`clamp(total_ram / 8, 64 MiB, 4 GiB)`) so a small VPS doesn't OOM and
     /// a big gateway still caches a large working set.
     #[serde(
         default = "default_module_cache_budget_bytes",
@@ -1334,7 +1354,7 @@ const fn default_inactive_user_sweep_interval_secs() -> u64 {
 }
 
 /// Default contract-module cache byte budget, scaled to system RAM
-/// (`clamp(total_ram / 8, 64 MiB, 1.5 GiB)`).
+/// (`clamp(total_ram / 8, 64 MiB, 4 GiB)`).
 ///
 /// Resolves to [`crate::wasm_runtime::default_module_cache_budget_bytes`], the
 /// single source of truth, so the operator-facing default and the in-code
@@ -3421,6 +3441,17 @@ std::thread_local! {
     // `StateDelta` ships via `ProbeReconcile`).
     static GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // UPDATE broadcast merges skipped by the per-contract merge-failure backoff
+    // (poison-contract quarantine, #4861).
+    static GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // ResyncRequest emissions / ResyncResponse sends suppressed by the resync
+    // rate limiters (#4861). Response suppression is split by which limiter
+    // fired: the per-(peer, contract) limit vs the global per-contract cap
+    // (#4864 review — indistinguishable in telemetry when shared).
+    static GLOBAL_RESYNC_REQUESTS_SUPPRESSED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_RESYNC_RESPONSES_SUPPRESSED_PER_PEER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_RESYNC_RESPONSES_UNSOLICITED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Global test metrics for tracking events across the simulation network.
@@ -3464,6 +3495,11 @@ impl GlobalTestMetrics {
         GLOBAL_PUT_PROBE_NEW_CONTRACT_BYTES.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES.with(|c| c.set(0));
+        GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF.with(|c| c.set(0));
+        GLOBAL_RESYNC_REQUESTS_SUPPRESSED.with(|c| c.set(0));
+        GLOBAL_RESYNC_RESPONSES_SUPPRESSED_PER_PEER.with(|c| c.set(0));
+        GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL.with(|c| c.set(0));
+        GLOBAL_RESYNC_RESPONSES_UNSOLICITED.with(|c| c.set(0));
     }
 
     /// Records that a ResyncRequest was received.
@@ -3475,6 +3511,73 @@ impl GlobalTestMetrics {
     /// Returns the total number of ResyncRequests received since last reset.
     pub fn resync_requests() -> u64 {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.get())
+    }
+
+    /// Records that an UPDATE broadcast merge was skipped by the per-contract
+    /// merge-failure backoff (poison-contract quarantine, #4861).
+    pub fn record_merge_suppressed_by_backoff() {
+        GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Returns the number of merges skipped by the merge-failure backoff since
+    /// last reset.
+    pub fn merges_suppressed_by_backoff() -> u64 {
+        GLOBAL_MERGES_SUPPRESSED_BY_BACKOFF.with(|c| c.get())
+    }
+
+    /// Records that a `ResyncRequest` emission was suppressed by the per-contract
+    /// resync emit rate limiter (#4861).
+    pub fn record_resync_request_suppressed() {
+        GLOBAL_RESYNC_REQUESTS_SUPPRESSED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Returns the number of ResyncRequest emissions suppressed since last reset.
+    pub fn resync_requests_suppressed() -> u64 {
+        GLOBAL_RESYNC_REQUESTS_SUPPRESSED.with(|c| c.get())
+    }
+
+    /// Records a `ResyncResponse` send suppressed by the per-(peer, contract)
+    /// responder rate limiter (#4861).
+    pub fn record_resync_response_suppressed_per_peer() {
+        GLOBAL_RESYNC_RESPONSES_SUPPRESSED_PER_PEER.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records a `ResyncResponse` send suppressed by the GLOBAL per-contract
+    /// responder cap (#4861 / #4864 review — separate counter so the two
+    /// limiters are distinguishable in telemetry).
+    pub fn record_resync_response_suppressed_global() {
+        GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Returns ResyncResponse sends suppressed by the per-(peer, contract)
+    /// limiter since last reset.
+    pub fn resync_responses_suppressed_per_peer() -> u64 {
+        GLOBAL_RESYNC_RESPONSES_SUPPRESSED_PER_PEER.with(|c| c.get())
+    }
+
+    /// Returns ResyncResponse sends suppressed by the global per-contract cap
+    /// since last reset.
+    pub fn resync_responses_suppressed_global() -> u64 {
+        GLOBAL_RESYNC_RESPONSES_SUPPRESSED_GLOBAL.with(|c| c.get())
+    }
+
+    /// Records a received `ResyncResponse` DROPPED because it had no matching
+    /// outstanding `ResyncRequest` — unsolicited or replayed, or TTL-expired
+    /// (#4864 round-8, Codex P1). The apply is refused before any WASM runs.
+    pub fn record_resync_response_unsolicited() {
+        GLOBAL_RESYNC_RESPONSES_UNSOLICITED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Returns the number of unsolicited/replayed ResyncResponses dropped since
+    /// last reset.
+    pub fn resync_responses_unsolicited() -> u64 {
+        GLOBAL_RESYNC_RESPONSES_UNSOLICITED.with(|c| c.get())
+    }
+
+    /// Returns total ResyncResponse sends suppressed (per-peer + global) since
+    /// last reset.
+    pub fn resync_responses_suppressed() -> u64 {
+        Self::resync_responses_suppressed_per_peer() + Self::resync_responses_suppressed_global()
     }
 
     /// Records that a delta was sent in a state change broadcast.
@@ -4848,6 +4951,81 @@ mod tests {
         assert_eq!(
             iface_tx_enabled, seed.telemetry.iface_tx_enabled,
             "iface_tx_enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn module_cache_budget_old_auto_sentinel_re_derives_but_explicit_values_persist() {
+        // #4864: an existing node whose config.toml was auto-written on a >12 GiB
+        // box carries the OLD auto-derived 1.5 GiB clamp
+        // (module-cache-budget-bytes = 1_610_612_736, the previous
+        // MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES). build()'s merge must treat that
+        // exact sentinel as "auto" and RE-DERIVE the current default (so large
+        // gateways pick up the new 4 GiB clamp instead of staying pinned to
+        // 1.5 GiB forever), while PRESERVING any other persisted value (a genuine
+        // operator choice) and DERIVING when the field is absent.
+
+        // Resolve the freshly-derived default the SAME way the production default
+        // fn does, so the assertions are host-independent (no hard-coded number).
+        // On a box where the derived default happens to equal the sentinel (exactly
+        // 12 GiB RAM) case 1 still holds: re-derivation is a no-op there.
+        let derived_default = crate::wasm_runtime::default_module_cache_budget_bytes();
+
+        // Seed config.toml with `module-cache-budget-bytes = seed` (or omit the key
+        // when `seed` is None), rebuild from clap-bare args, and return the resolved
+        // value. Mirrors all_persisted_config_fields_round_trip_through_build: a base
+        // build creates the on-disk secret files + a valid full Config to serialize.
+        async fn rebuilt_budget(seed: Option<usize>) -> usize {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let mut base = clap_bare_args(temp_dir.path()).build().await.unwrap();
+            let toml_str = match seed {
+                Some(v) => {
+                    base.module_cache_budget_bytes = v;
+                    toml::to_string(&base).unwrap()
+                }
+                None => {
+                    // Drop the field so build() sees it as absent and the serde
+                    // default fills it — exercises the "absent -> derive" path.
+                    // The key is a top-level scalar, so removing its single line
+                    // keeps the TOML valid.
+                    toml::to_string(&base)
+                        .unwrap()
+                        .lines()
+                        .filter(|l| !l.trim_start().starts_with("module-cache-budget-bytes"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            };
+            std::fs::write(temp_dir.path().join("config.toml"), toml_str).unwrap();
+            clap_bare_args(temp_dir.path())
+                .build()
+                .await
+                .unwrap()
+                .module_cache_budget_bytes
+        }
+
+        // 1. Exact old-auto sentinel -> RE-DERIVED to the fresh default (NOT the
+        //    stale 1.5 GiB value).
+        let from_sentinel = rebuilt_budget(Some(1_610_612_736)).await;
+        assert_eq!(
+            from_sentinel, derived_default,
+            "the old auto-derived 1.5 GiB sentinel must re-derive to the fresh \
+             default, not stay pinned at 1_610_612_736"
+        );
+
+        // 2. Some other explicit persisted value -> preserved exactly.
+        let explicit = 777_000_000usize;
+        let from_explicit = rebuilt_budget(Some(explicit)).await;
+        assert_eq!(
+            from_explicit, explicit,
+            "an explicit non-sentinel operator value must round-trip unchanged"
+        );
+
+        // 3. Field absent from config.toml -> resolves to the derived default.
+        let from_absent = rebuilt_budget(None).await;
+        assert_eq!(
+            from_absent, derived_default,
+            "an absent field must resolve to the derived default"
         );
     }
 
