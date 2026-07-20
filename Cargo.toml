@@ -28,7 +28,7 @@ pav_regression = "0.7.0"
 renegade-ml = "0.3.3"
 pin-project = "1"
 thiserror = "2"
-ulid = { version = "1.1", features = ["serde"] }
+ulid = { version = "3.0", features = ["serde"] }
 zeroize = { version = "1.8", features = ["derive", "serde"] }
 
 # Async/networking
