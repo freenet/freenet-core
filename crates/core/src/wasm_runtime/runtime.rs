@@ -157,10 +157,18 @@ pub enum ContractExecError {
     /// The operation never ran: it sat queued on a saturated execution pool
     /// past the wall-clock deadline and the guest never started (#4864
     /// round-6). Distinct from [`ContractExecError::MaxComputeTimeExceeded`]
-    /// (a guest that DID run and blew the deadline). The message string is
-    /// load-bearing — `ExecutorError::is_scheduler_timeout` matches on the
-    /// "queued too long on a saturated execution pool" phrase after it flows
-    /// through `update_exec_error`.
+    /// (a guest that DID run and blew the deadline).
+    ///
+    /// Classification is by TYPED PROVENANCE, NOT this string (#4864 round-9):
+    /// `ExecutorError::is_scheduler_timeout` reads the `host_timeout` field that
+    /// `ExecutorError::execution` sets ONLY when it sees this typed variant — which
+    /// the host `classify_result` alone constructs. The message string is NOT the
+    /// classification gate; it only supplies the cause text for the "execution
+    /// error:" prefix and logging. Do NOT delete the `host_timeout` field and fall
+    /// back to matching this phrase: a contract can RETURN a rejection whose text
+    /// contains it, which would reintroduce the exact forge vector round-9 closed
+    /// (a contract self-inflicting the scheduler/timeout quarantine class on honest
+    /// peers). See `ExecutorError::host_timeout` in `contract/executor.rs`.
     #[error("The operation was queued too long on a saturated execution pool and never ran")]
     SchedulerOverloaded,
 }
