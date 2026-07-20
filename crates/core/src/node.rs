@@ -6395,7 +6395,11 @@ mod tests {
             let start = SOURCE
                 .find(concat!("event = \"resync_response_", "received\""))
                 .expect("ResyncResponse receive arm not found");
-            let arm = &SOURCE[start..(start + 6000).min(SOURCE.len())];
+            // Window widened to 8000 (#4864 round-9 addendum): after the round-8
+            // consume gate the margin to `state_changed: false,` was only ~125
+            // bytes, so the next addition to the arm would push it past the bound
+            // and fail with a misleading "sub-arm not found".
+            let arm = &SOURCE[start..(start + 8000).min(SOURCE.len())];
             let invalidate = concat!("invalidate_", "payload_memo(");
             // Match the PATTERN form (trailing comma) so a prose mention of
             // `state_changed: false` in the changed:true arm's comment is not
