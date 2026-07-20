@@ -277,8 +277,34 @@ enum HostTimeoutClass {
 }
 
 enum InnerOpError {
+    /// UPDATE / re-PUT merge: a contract-exec failure surfaces as
+    /// `StdContractError::Update{cause}` (so `is_contract_exec_rejection` matches
+    /// and the client sees an UpdateResponse-shaped error).
     Upsert(ContractKey),
+    /// Fresh PUT (#4864 round-9 item 4): a contract-exec failure surfaces as
+    /// `StdContractError::Put{cause}` so a fresh PUT's validation error keeps
+    /// PutResponse semantics instead of masquerading as an UPDATE error.
+    Put(ContractKey),
     Delegate(DelegateKey),
+}
+
+/// Which op a shared validation helper is running for (#4864 round-9 item 4), so
+/// it can classify a `validate_state` exec failure as the RIGHT client error:
+/// `Update` for the UPDATE / re-PUT callers (keeps the merge-backoff
+/// classification), `Put` for the fresh-PUT `verify_and_store_contract` path.
+#[derive(Clone, Copy)]
+pub(crate) enum ValidationOpKind {
+    Update,
+    Put,
+}
+
+impl ValidationOpKind {
+    fn op_for(self, key: ContractKey) -> InnerOpError {
+        match self {
+            ValidationOpKind::Update => InnerOpError::Upsert(key),
+            ValidationOpKind::Put => InnerOpError::Put(key),
+        }
+    }
 }
 
 impl std::error::Error for ExecutorError {}
@@ -352,8 +378,23 @@ impl ExecutorError {
         let error = outer_error.deref();
 
         if let RuntimeInnerError::ContractExecError(e) = error {
-            if let Some(InnerOpError::Upsert(key)) = &op {
-                return ExecutorError::request(StdContractError::update_exec_error(*key, e));
+            match &op {
+                Some(InnerOpError::Upsert(key)) => {
+                    return ExecutorError::request(StdContractError::update_exec_error(*key, e));
+                }
+                // #4864 round-9 item 4: fresh PUT → Put{cause}, same
+                // "execution error:" prefix as update_exec_error so log-severity /
+                // is_wasm_timeout provenance behave identically, but a Put variant
+                // for PutResponse semantics (is_contract_exec_rejection matches only
+                // Update, so a fresh-PUT exec failure correctly does NOT look like
+                // an UPDATE-side auto-fetchable rejection).
+                Some(InnerOpError::Put(key)) => {
+                    return ExecutorError::request(StdContractError::Put {
+                        key: *key,
+                        cause: format!("execution error: {e}").into(),
+                    });
+                }
+                _ => {}
             }
         }
 
@@ -382,6 +423,14 @@ impl ExecutorError {
             match op {
                 Some(InnerOpError::Upsert(key)) => {
                     return ExecutorError::request(StdContractError::update_exec_error(key, e));
+                }
+                // #4864 round-9 item 4: fresh PUT → Put{cause} (see the
+                // ContractExecError branch above for rationale).
+                Some(InnerOpError::Put(key)) => {
+                    return ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: format!("execution error: {e}").into(),
+                    });
                 }
                 _ => return ExecutorError::other(anyhow::anyhow!("execution error: {e}")),
             }
@@ -2384,26 +2433,73 @@ mod tests {
             );
         }
 
-        /// Source-scrape pin (#4864 round-7 Codex P1): the UPDATE-path validation
-        /// helpers must classify `validate_state` failures with
-        /// `Some(InnerOpError::Upsert(*key))`, never `op = None`. A regression to
-        /// `None` would silently make the driver record nothing for a contract
-        /// whose runaway half is `validate_state`. Paired with the behavioral test
-        /// above, which pins that the Upsert form actually classifies.
+        /// #4864 round-9 item 4: a shared validation helper serves both UPDATE and
+        /// fresh-PUT callers. A fresh PUT's validate_state exec failure must surface
+        /// as a `Put` variant (PutResponse semantics), NOT an `Update` — while an
+        /// UPDATE's stays `Update` and keeps its is_wasm_timeout classification. The
+        /// host-timeout provenance is set for BOTH (op-independent, round-9 item 1).
         #[test]
-        fn update_path_validation_sites_pass_upsert_op_not_none() {
-            // (source, fn-signature-needle) for each validation helper.
-            let cases: [(&str, &str); 2] = [
+        fn put_op_validation_error_is_put_variant_update_op_is_update() {
+            use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+            let key = test_fixtures::make_contract_key();
+            let mk = || -> ContractError {
+                RuntimeInnerError::ContractExecError(ContractExecError::MaxComputeTimeExceeded)
+                    .into()
+            };
+
+            // Fresh PUT op → Put variant. NOT a contract-exec rejection (which matches
+            // only Update), so a fresh PUT does not look like an UPDATE-side
+            // auto-fetchable rejection. Host-timeout provenance still classifies.
+            let put_err =
+                ExecutorError::execution(mk(), Some(super::super::InnerOpError::Put(key)));
+            assert!(
+                put_err.is_wasm_timeout(),
+                "host-timeout provenance classifies even on the Put op"
+            );
+            assert!(
+                !put_err.is_contract_exec_rejection(),
+                "a Put variant is NOT an UPDATE-side exec rejection"
+            );
+            match put_err.unwrap_request() {
+                RequestError::ContractError(StdContractError::Put { .. }) => {}
+                other => panic!("fresh-PUT validation error must be a Put variant, got {other:?}"),
+            }
+
+            // UPDATE op → Update variant, is_contract_exec_rejection true, timeout true.
+            let upd_err =
+                ExecutorError::execution(mk(), Some(super::super::InnerOpError::Upsert(key)));
+            assert!(upd_err.is_wasm_timeout());
+            assert!(upd_err.is_contract_exec_rejection());
+            match upd_err.unwrap_request() {
+                RequestError::ContractError(StdContractError::Update { .. }) => {}
+                other => panic!("UPDATE validation error must be an Update variant, got {other:?}"),
+            }
+        }
+
+        /// Source-scrape pin (#4864 round-7 Codex P1, updated round-9 item 4): the
+        /// UPDATE-path validation helpers must CLASSIFY `validate_state` failures
+        /// (never `op = None`, which would make the driver record nothing for a
+        /// contract whose runaway half is `validate_state`). The base
+        /// `fetch_related_for_validation` still hardcodes the Upsert op; the shared
+        /// `fetch_related_for_validation_network` now classifies via the
+        /// caller-supplied op kind (`validation_op.op_for`) so a fresh PUT gets a
+        /// `Put` variant — but STILL never `op = None`.
+        #[test]
+        fn update_path_validation_sites_classify_never_op_none() {
+            // (source, fn-signature-needle, expected-classification-needle).
+            let cases: [(&str, &str, &str); 2] = [
                 (
                     include_str!("executor/runtime/executor_impl.rs"),
                     "async fn fetch_related_for_validation(",
+                    "Some(InnerOpError::Upsert(*key))",
                 ),
                 (
                     include_str!("executor/runtime/contract_ops.rs"),
                     "async fn fetch_related_for_validation_network(",
+                    "Some(validation_op.op_for(*key))",
                 ),
             ];
-            for (src, sig) in cases {
+            for (src, sig, expected) in cases {
                 let start = src
                     .find(sig)
                     .unwrap_or_else(|| panic!("validation helper `{sig}` not found"));
@@ -2432,10 +2528,10 @@ mod tests {
                     "`{sig}` must call validate_state (scrape anchor)"
                 );
                 assert!(
-                    body.contains("Some(InnerOpError::Upsert(*key))"),
-                    "`{sig}` must classify validate_state failures with \
-                     Some(InnerOpError::Upsert(*key)) (#4864 round-7), so a \
-                     validation-phase timeout reaches the merge-failure backoff"
+                    body.contains(expected),
+                    "`{sig}` must classify validate_state failures via `{expected}` \
+                     so a validation-phase timeout reaches the merge-failure backoff \
+                     (#4864 round-7/9)"
                 );
                 assert!(
                     !body.contains("execution(e, None)"),
@@ -2444,6 +2540,32 @@ mod tests {
                      nothing (#4864 round-7)"
                 );
             }
+        }
+
+        /// #4864 round-9 item 4 pin: the fresh-PUT path
+        /// (`verify_and_store_contract`) must validate with `ValidationOpKind::Put`
+        /// so its validation error keeps PutResponse semantics (a Put variant), not
+        /// Update. A regression to Update would mislabel a fresh PUT's validation
+        /// failure as an UPDATE error.
+        #[test]
+        fn fresh_put_validation_uses_put_op_kind() {
+            let src = include_str!("executor/runtime/contract_ops.rs");
+            let start = src
+                .find("async fn verify_and_store_contract(")
+                .expect("verify_and_store_contract not found");
+            let rest = &src[start + 1..];
+            let end = rest
+                .find("\n    async fn ")
+                .or_else(|| rest.find("\n    fn "))
+                .map(|i| i + 1)
+                .unwrap_or(rest.len());
+            let body = &src[start..start + 1 + end];
+            assert!(
+                body.contains("ValidationOpKind::Put"),
+                "verify_and_store_contract (fresh PUT) must validate with \
+                 ValidationOpKind::Put — a fresh PUT's validation error must be a Put \
+                 variant, not Update (#4864 round-9 item 4)"
+            );
         }
 
         /// Pin (#4861 review): the DESERIALIZATION-poison class — a contract's

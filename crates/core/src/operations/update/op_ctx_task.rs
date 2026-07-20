@@ -307,6 +307,16 @@ async fn drive_client_update(
                             .ring
                             .merge_backoff
                             .record_success_local(key.id(), execution.changed);
+                    } else if execution.changed {
+                        // #4864 round-9 item 3: a CHANGED client FULL-STATE apply
+                        // advances the state, invalidating the failed-payload MEMO's
+                        // premise — clear ONLY the memo (mirrors the relay + streaming
+                        // + resync paths). NOT a backoff reset (fork-flip no-reset
+                        // doctrine holds); gated on execution.changed.
+                        op_manager
+                            .ring
+                            .merge_backoff
+                            .invalidate_payload_memo(key.id());
                     }
                     execution
                 }
@@ -408,6 +418,15 @@ async fn drive_client_update(
                             .ring
                             .merge_backoff
                             .record_success_local(key.id(), execution.changed);
+                    } else if execution.changed {
+                        // #4864 round-9 item 3: a CHANGED client FULL-STATE apply on
+                        // the remote-target path invalidates the failed-payload MEMO
+                        // premise — clear ONLY the memo (mirrors the other paths).
+                        // NOT a backoff reset; gated on execution.changed.
+                        op_manager
+                            .ring
+                            .merge_backoff
+                            .invalidate_payload_memo(key.id());
                     }
                     execution
                 }
@@ -1357,6 +1376,23 @@ async fn drive_relay_broadcast_to(
                     sender_addr,
                     result.changed,
                 );
+            } else if result.changed {
+                // #4864 round-9 item 3: a CHANGED FULL-STATE broadcast apply
+                // advances the state, which invalidates the failed-payload MEMO's
+                // premise (a delta that failed against the OLD state may be valid
+                // against the NEW one). Mirror the streaming Ok arm and the
+                // resync-apply path in node.rs: clear ONLY the memo. This is NOT a
+                // backoff reset — no cooldown channel is touched — so the fork-flip
+                // no-reset doctrine still holds (a full-state merge carries the same
+                // fork ambiguity). Gated on result.changed so a no-op full-state
+                // apply does not needlessly re-admit known-bad payloads. Without
+                // this, a payload that failed against old state stayed
+                // KnownFailedPayload for up to FAILED_PAYLOAD_TTL (10min) after the
+                // full state advanced it — the non-streaming relay's omission.
+                op_manager
+                    .ring
+                    .merge_backoff
+                    .invalidate_payload_memo(key.id());
             }
             result
         }
@@ -4525,6 +4561,64 @@ mod tests {
              {{ .. }}` block ({open_brace}..{close_brace}) so a no-op streaming apply \
              does not invalidate the memo"
         );
+    }
+
+    /// #4864 round-9 item 3: the NON-streaming CHANGED full-state success arms
+    /// (relay `drive_relay_broadcast_to` + client `drive_client_update`) MUST also
+    /// invalidate the failed-payload memo (memo only, NO backoff reset), so a
+    /// payload that failed against old state doesn't stay KnownFailedPayload for up
+    /// to FAILED_PAYLOAD_TTL after a full state advances it — the omission the
+    /// streaming and resync-apply paths did NOT have. Mirror of
+    /// `streaming_changed_apply_invalidates_payload_memo` for the other two drivers.
+    #[test]
+    fn nonstreaming_changed_fullstate_success_invalidates_payload_memo() {
+        let src = include_str!("op_ctx_task.rs");
+        let invalidate = concat!("invalidate_", "payload_memo(");
+        for (fn_needle, changed_expr) in [
+            (
+                "async fn drive_relay_broadcast_to(",
+                "else if result.changed",
+            ),
+            ("async fn drive_client_update(", "else if execution.changed"),
+        ] {
+            let body = extract_fn_body(src, fn_needle);
+            let gate = body.find(changed_expr).unwrap_or_else(|| {
+                panic!(
+                    "`{fn_needle}` must have an `{changed_expr}` full-state success arm \
+                     (#4864 round-9 item 3)"
+                )
+            });
+            // Brace-match the else-if block; the memo invalidation must be INSIDE it
+            // (so a NO-op full-state apply does not invalidate the memo).
+            let open_brace = gate
+                + body[gate..]
+                    .find('{')
+                    .expect("else-if block must have a body");
+            let mut depth = 0usize;
+            let mut close = None;
+            for (i, ch) in body[open_brace..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open_brace + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close.expect("else-if block must be balanced");
+            let inv = body
+                .find(invalidate)
+                .unwrap_or_else(|| panic!("`{fn_needle}` must call invalidate_payload_memo"));
+            assert!(
+                open_brace < inv && inv < close,
+                "`{fn_needle}`: invalidate_payload_memo must be INSIDE the \
+                 `{changed_expr}` full-state block (memo-only, gated on changed)"
+            );
+        }
     }
 
     /// Issue #4251 follow-up: the four `run_relay_*` driver wrappers each
