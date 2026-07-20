@@ -3318,6 +3318,110 @@ mod tests {
         );
     }
 
+    /// Pins the shell's peer-restart recovery, which is driven AUTONOMOUSLY by
+    /// the node's trusted stale-token close code (PR #4781, server-4401 design).
+    /// On a node restart the shell's in-memory auth token is invalidated; the
+    /// node answers the reconnecting WebSocket with application close code 4401
+    /// (`AUTH_TOKEN_INVALID_CLOSE_CODE`) and closes it. The shell — which owns
+    /// the WS and the token — sees that close and re-fetches THIS shell HTML
+    /// (minting a fresh token) with a cache-busting top-level `location.replace`.
+    /// The shell does NOT depend on the sandboxed app asking (the old, spoofable
+    /// `type:'reload'` message path is removed).
+    #[test]
+    fn bridge_js_reloads_shell_on_auth_token_invalid_close() {
+        assert!(
+            SHELL_BRIDGE_JS.contains("code === 4401 && !clientClosed"),
+            "shell must recover on the node's trusted stale-token close code (4401)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("if (isTrustedStaleTokenClose(e.code, ws._clientClosed))"),
+            "recovery must trigger on a SERVER-initiated 4401 close only"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("triggerRecoveryReload()"),
+            "the 4401 close must drive the autonomous recovery reload"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("location.replace(decision.url)"),
+            "recovery must be a cache-busting top-level navigation (location.replace)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("_freload"),
+            "recovery must cache-bust so a stale cached shell (dead token) can't loop"
+        );
+        // The untrusted, spoofable iframe-initiated reload path must be GONE.
+        assert!(
+            !SHELL_BRIDGE_JS.contains("msg.type === 'reload'"),
+            "the iframe-initiated reload trigger must be removed (recovery is \
+             driven by the node's trusted close code, not the app's say-so)"
+        );
+    }
+
+    /// Drift pin: the JS recovery guard hardcodes the literal `4401`, but the
+    /// SERVER side that emits the close frame uses the Rust constant
+    /// `AUTH_TOKEN_INVALID_CLOSE_CODE` as its single source of truth. Nothing
+    /// but this test ties the two together, so a future change to the constant
+    /// would silently break shell recovery (the node would close with a new
+    /// code the JS no longer recognizes). This assertion FAILS if they drift.
+    #[test]
+    fn bridge_js_close_code_matches_rust_constant() {
+        use crate::client_events::websocket::AUTH_TOKEN_INVALID_CLOSE_CODE;
+        assert!(
+            SHELL_BRIDGE_JS.contains(&format!(
+                "code === {AUTH_TOKEN_INVALID_CLOSE_CODE} && !clientClosed"
+            )),
+            "shell_bridge.js must gate recovery on the server's \
+             AUTH_TOKEN_INVALID_CLOSE_CODE ({AUTH_TOKEN_INVALID_CLOSE_CODE}); the JS literal \
+             drifted from the Rust constant"
+        );
+    }
+
+    /// Pins the two safeguards on the recovery reload (PR #4781 review, MAJOR #2):
+    /// (1) it is UNFORGEABLE — a sandboxed contract cannot manufacture the 4401
+    /// trigger by asking the shell to close its own socket, because the close
+    /// proxy marks iframe-initiated closes (`_clientClosed`) and clamps any
+    /// app-range (4000-4999) code the iframe requests; and (2) the reload cap is
+    /// FAIL-CLOSED and storage-independent — it lives in the `_freload` URL param
+    /// (not writable by the contract, always present even in private mode), so a
+    /// loop is bounded even when sessionStorage is unavailable.
+    #[test]
+    fn bridge_js_recovery_reload_is_unforgeable_and_bounded() {
+        // Unforgeable: iframe-requested closes are marked (`_clientClosed`) so the
+        // trusted-close decision rejects them, AND their app-range codes are
+        // clamped so 4401 can't even surface to onclose.
+        assert!(
+            SHELL_BRIDGE_JS.contains("ws._clientClosed = true"),
+            "the close proxy must mark iframe-initiated closes so 4401 isn't trusted from them"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("function isTrustedStaleTokenClose(")
+                && SHELL_BRIDGE_JS.contains("code === 4401 && !clientClosed"),
+            "recovery must only trust a server-initiated 4401 close (not iframe-initiated)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("function clampProxiedCloseCode(")
+                && SHELL_BRIDGE_JS.contains("code >= 4000 && code <= 4999"),
+            "the close proxy must clamp app-range close codes the iframe requests"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("ws.close(clampProxiedCloseCode(msg.code), msg.reason)"),
+            "the close proxy must apply the clamp to the iframe-requested code"
+        );
+        // Fail-closed, storage-independent cap keyed on the top-document URL.
+        assert!(
+            SHELL_BRIDGE_JS.contains("function reloadUrlCapDecision("),
+            "the reload cap must be computed from the URL (storage-independent, fail-closed)"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("reloadUrlCapDecision(location.href, Date.now())"),
+            "recovery must consult the URL-param cap before reloading"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("count >= MAX"),
+            "the URL cap must refuse once the per-window reload count is reached"
+        );
+    }
+
     /// Pins that the per-user-token machinery is wired through the bridge JS
     /// itself (not just the page wrapper): the WS-open handler must append the
     /// `userToken` query param to the real WebSocket URL when a token is set,

@@ -20,6 +20,17 @@ const MAX_WARNED_TOKENS: usize = 1000;
 /// that is no longer valid (e.g., after node restart).
 pub const AUTH_TOKEN_INVALID_ERROR: &str = "AUTH_TOKEN_INVALID";
 
+/// WebSocket application close code the node uses to tell the shell that the
+/// presented auth token is stale (e.g. a node restart wiped the in-memory token
+/// map). This is the shell's TRUSTED stale-token signal: it rides the close
+/// frame of a socket the shell itself opened to the node, so — unlike the error
+/// message BODY, which a contract's own `GetResponse` state could echo verbatim
+/// — a sandboxed contract cannot forge it. The shell watches for exactly this
+/// code on a server-initiated close to trigger an autonomous recovery reload
+/// (see `shell_bridge.js`). 4401 is in the WebSocket private-use application
+/// range (4000-4999) and deliberately mirrors HTTP 401 Unauthorized.
+pub const AUTH_TOKEN_INVALID_CLOSE_CODE: u16 = 4401;
+
 /// Interval for sending WebSocket ping frames to keep connection alive.
 /// Idle TCP connections may be closed by the OS, browser, or intermediate
 /// proxies after extended periods of inactivity. 30 seconds is a safe
@@ -101,7 +112,7 @@ use axum::{
     Extension, Router,
     extract::{
         Query, WebSocketUpgrade,
-        ws::{Message, WebSocket},
+        ws::{CloseFrame, Message, WebSocket},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -1319,7 +1330,17 @@ async fn websocket_interface(
         // "missing message origin". The client handles AUTH_TOKEN_INVALID by reloading
         // the page to get a fresh token, so closing is the correct behavior.
         notify_disconnect(&request_sender, client_id, &auth_token, api_version).await;
-        if let Err(e) = server_sink.send(Message::Close(None)).await {
+        // Close with the trusted application code (not a bare close) so the shell
+        // can distinguish a stale-token rejection from any other disconnect and
+        // recover autonomously — see AUTH_TOKEN_INVALID_CLOSE_CODE. The serialized
+        // error above is still sent first (unchanged) for clients that decode it.
+        if let Err(e) = server_sink
+            .send(Message::Close(Some(CloseFrame {
+                code: AUTH_TOKEN_INVALID_CLOSE_CODE,
+                reason: AUTH_TOKEN_INVALID_ERROR.into(),
+            })))
+            .await
+        {
             tracing::debug!(error = %e, "Failed to send WebSocket close frame after auth error");
         }
         return Ok(());
@@ -2656,6 +2677,92 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "empty userToken over a remote hosted connection must be Local (200), not rejected"
+        );
+    }
+
+    /// End-to-end wire check (PR #4781): a connection that presents a
+    /// stale/invalid auth token is closed with the trusted application close
+    /// code `AUTH_TOKEN_INVALID_CLOSE_CODE` (4401). This is the shell's
+    /// UNFORGEABLE stale-token signal — it rides the close frame of a socket the
+    /// node itself closes, not the message BODY (which a contract's own
+    /// `GetResponse` state could echo, the spoof the earlier byte-scan design
+    /// allowed). The shell watches for exactly this code to recover autonomously.
+    #[tokio::test]
+    async fn invalid_auth_token_closes_with_4401_code() {
+        use axum::{Extension, Router, response::IntoResponse, routing::get};
+        use std::time::Duration;
+
+        // Fake node backend: answer every NewConnection with a fresh id so
+        // `new_client_connection` resolves and `websocket_interface` reaches the
+        // `token_is_invalid` close path.
+        let (req_tx, mut req_rx) = mpsc::channel::<ClientConnection>(4);
+        tokio::spawn(async move {
+            while let Some(conn) = req_rx.recv().await {
+                if let ClientConnection::NewConnection { callbacks, .. } = conn {
+                    let _ = callbacks.send(HostCallbackResult::NewId {
+                        id: ClientId::next(),
+                    });
+                }
+            }
+        });
+
+        async fn ws_handler(
+            ws: WebSocketUpgrade,
+            Extension(rs): Extension<WebSocketRequest>,
+        ) -> impl IntoResponse {
+            ws.on_upgrade(move |socket| async move {
+                // `token_is_invalid = true` drives the stale-token close path.
+                let _ = websocket_interface(
+                    rs,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    EncodingProtocol::Native,
+                    ApiVersion::V1,
+                    socket,
+                )
+                .await;
+            })
+        }
+
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .layer(Extension(WebSocketRequest(req_tx)));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (mut client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+
+        // The node sends the serialized error frame first, then the close frame;
+        // skip anything that is not a Close and read the close code.
+        let observed_close_code = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = client.next().await {
+                match frame.expect("ws frame") {
+                    tokio_tungstenite::tungstenite::Message::Close(Some(cf)) => {
+                        return Some(u16::from(cf.code));
+                    }
+                    tokio_tungstenite::tungstenite::Message::Close(None) => return None,
+                    _ => continue,
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for the close frame");
+
+        assert_eq!(
+            observed_close_code,
+            Some(AUTH_TOKEN_INVALID_CLOSE_CODE),
+            "an invalid auth token must close the socket with the trusted 4401 code"
         );
     }
 
