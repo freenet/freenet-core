@@ -9402,12 +9402,18 @@ async fn test_connection_growth_plateau_diagnostic() {
 /// Creates a 100-node network, PUTs a contract from a gateway, waits for the
 /// ring to form, then has every node GET the same contract. It logs detailed
 /// statistics (success rate, latency p50/p90/p99, failure modes, dispatch
-/// accounting) AND asserts three hard floors:
-/// - `success_rate >= 0.90` — GETs that reach the network succeed;
+/// accounting) AND asserts these floors on the CLIENT-VISIBLE outcomes (one
+/// per client GET op), each computed over the SCHEDULED total (NUM_NODES):
 /// - `nodes_with_state >= 90/100` — retrievability: nodes end up holding the
-///   contract (the primary, non-gameable measure — see the inline rationale);
-/// - `network_successes >= N` — a meaningful number of GETs traversed the
-///   network (hop >= 1), so success isn't all local cache hits.
+///   contract (the PRIMARY, non-gameable measure — see the inline rationale);
+/// - client hard-failure rate <= 5% — `timeout_exhausted` terminals PLUS
+///   scheduled GETs that emitted NO terminal at all (InfraError/Unexpected),
+///   kept strict since retrievability cannot see this class;
+/// - client NotFound rate <= 10% — the routing dead-end class; with the
+///   nearest-neighbor lattice active this is ~0 (measured 0/100), so 10%
+///   trips on a wholesale dead-end regression without flaking;
+/// - client `network_successes >= 30` — a meaningful number of GETs traversed
+///   the network (forward `hop_count >= 1`), so success isn't all local hits.
 ///
 /// GETs are fired only AFTER a join-convergence barrier
 /// (`wait_for_join_convergence_before_ops`), so the metric reflects GET
@@ -9430,6 +9436,22 @@ fn test_get_reliability_diagnostic() {
 
     GlobalTestMetrics::reset();
     setup_deterministic_state(SEED);
+
+    // Force-activate the nearest-neighbor ring lattice (#4760) at this test's
+    // max_connections=12. In production the lattice self-arms only at
+    // max_connections >= 25 (NN_LATTICE_MIN_MAX_CONNECTIONS), but that floor is
+    // a sim-baseline-preservation gate, NOT a routing requirement — the lattice
+    // is exactly the production nearest-neighbor connectivity mechanism that
+    // eliminates GET routing dead-ends, and dead-ends here are a
+    // nearest-neighbor problem it fixes directly. `set_nn_lattice_enabled(true)`
+    // both enables the flag AND force-activates below the floor; the guard
+    // restores the production defaults (flag ON, floor re-armed) on drop, even
+    // on a panic. Mirrors `nn_run_topology`. The override is thread-local and
+    // `create_runtime()` is current-thread, so this must run on the same thread
+    // that later drives `run_controlled_simulation` (the test thread) and the
+    // guard must live at function scope so it is not dropped before the sim runs.
+    freenet::dev_tool::set_nn_lattice_enabled(true);
+    let _nn_guard = NnLatticeTestGuard;
 
     let rt = create_runtime();
 
@@ -9456,11 +9478,17 @@ fn test_get_reliability_diagnostic() {
         // scheduled GET originates from a joined node and the number reflects
         // routing/findability. NOTE: placement migration (SubscribeHint) stays
         // OFF — it is a deliberately-disabled anti-pattern, not a findability
-        // mechanism (see #4601/#4640). At this test's max_connections=12,
-        // findability is provided by ordinary small-world (Kleinberg) routing
-        // over the formed ring plus gateway fallback; the nearest-neighbor ring
-        // lattice (#4760) is gated off below max_connections=25
-        // (NN_LATTICE_MIN_MAX_CONNECTIONS) and does NOT apply at this scale.
+        // mechanism (see #4601/#4640). Findability here is provided by ordinary
+        // small-world (Kleinberg) routing over the formed ring plus gateway
+        // fallback AND by the nearest-neighbor ring lattice (#4760), which we
+        // FORCE-ACTIVATE above via the test-only `set_nn_lattice_enabled(true)`
+        // override. The lattice is the production nearest-neighbor connectivity
+        // mechanism that eliminates GET routing dead-ends by making each peer
+        // acquire its closest ring neighbors. Its production >= 25
+        // max_connections floor (NN_LATTICE_MIN_MAX_CONNECTIONS) is a
+        // sim-baseline-preservation gate, not a routing requirement, so the test
+        // exercises the real mechanism at max_connections=12 rather than leaving
+        // GETs to dead-end for lack of nearest-neighbor edges.
         sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(900));
         // Against an already-formed ring a GET completes in ~1ms, so the default
         // 3s inter-op settle would spend 100*3s = 300s of virtual time (and the
@@ -9533,9 +9561,16 @@ fn test_get_reliability_diagnostic() {
     // attempt (relay-direct + loopback-Response registration) and counts
     // multi-hop outcomes once per hop traversed.
     let rt = create_runtime();
-    let (summary, dispatched_nodes) = rt.block_on(async {
+    let (summary, client_summary, dispatched_nodes) = rt.block_on(async {
         let logs = logs_handle.lock().await;
         let summary = freenet::tracing::summarize_get_outcomes_per_tx(&logs);
+        // CLIENT-VISIBLE outcomes: one entry per client GET OPERATION (from
+        // GetEvent::ClientTerminal), not per wire attempt. The per-tx summary
+        // above overcounts relay-hop dead-ends — a failed attempt of an
+        // ultimately-successful GET registers a NotFound on the wire — so the
+        // client measure is the true client-SLA number (#4852 P2). Compute BOTH
+        // so the run can compare per-tx vs client-visible.
+        let client_summary = freenet::tracing::summarize_client_get_outcomes(&logs);
 
         // Dispatched-vs-scheduled accounting (#4361): the client driver's
         // loopback Request is registered at the originating node with
@@ -9550,7 +9585,7 @@ fn test_get_reliability_diagnostic() {
             .map(|log| log.peer_id.clone())
             .collect();
 
-        (summary, dispatched_nodes.len())
+        (summary, client_summary, dispatched_nodes.len())
     });
 
     let (successes, not_found, failures, timeouts) = (
@@ -9561,6 +9596,19 @@ fn test_get_reliability_diagnostic() {
     );
     let network_successes = summary.network_successes;
     let total_outcomes = summary.total();
+
+    // CLIENT-VISIBLE GET outcome values (one per client op; see #4852 P2).
+    let client_total = client_summary.total();
+    let client_successes = client_summary.successes;
+    let client_network_successes = client_summary.network_successes;
+    let client_local_successes = client_summary.local_successes;
+    let client_not_found = client_summary.not_found;
+    let client_timeout_exhausted = client_summary.timeout_exhausted;
+    let client_success_rate = if client_total > 0 {
+        client_successes as f64 / client_total as f64
+    } else {
+        0.0
+    };
 
     // Compute latency percentiles for successful GETs
     // (success_elapsed_ms is pre-sorted ascending).
@@ -9655,6 +9703,18 @@ fn test_get_reliability_diagnostic() {
         timeouts
     );
     tracing::info!(
+        "CLIENT GET outcomes (per client op): {} total — {} success \
+         ({} network, {} local), {} not_found, {} timeout_exhausted; \
+         client success rate {:.1}%",
+        client_total,
+        client_successes,
+        client_network_successes,
+        client_local_successes,
+        client_not_found,
+        client_timeout_exhausted,
+        client_success_rate * 100.0
+    );
+    tracing::info!(
         "GET success rate: {:.1}% ({}/{})",
         success_rate * 100.0,
         successes,
@@ -9729,19 +9789,109 @@ fn test_get_reliability_diagnostic() {
         "Only {} GET outcome transactions — too few for meaningful analysis",
         total_outcomes
     );
-    // GET success-rate floor: of the GETs that reached the network, essentially
-    // all must succeed. The measured run reaches 100%. 0.90 leaves headroom
-    // while still catching a routing regression. See #3570 for context.
-    assert!(
-        success_rate >= 0.90,
-        "GET success rate {:.1}% below 0.90 floor. \
-         {} succeeded, {} not_found, {} failures, {} timeouts out of {} total.",
-        success_rate * 100.0,
-        successes,
-        not_found,
+    // GET reliability is gated on CLIENT-VISIBLE outcomes — one entry per
+    // client GET OPERATION (from GetEvent::ClientTerminal), NOT per wire
+    // attempt. The per-tx summary overcounts relay-hop dead-ends: a failed
+    // attempt of an ultimately-successful GET registers a NotFound on the wire,
+    // inflating the per-tx NotFound rate above the true client SLA (#4852 P2).
+    // We KEEP the per-tx failure-class rates COMPUTED + LOGGED below for
+    // comparison, but DELIBERATELY do NOT assert on them anymore — the
+    // client-visible numbers are the gate.
+    let per_tx_hard_failures = failures + timeouts;
+    let per_tx_hard_failure_rate = if total_outcomes > 0 {
+        per_tx_hard_failures as f64 / total_outcomes as f64
+    } else {
+        0.0
+    };
+    let per_tx_not_found_rate = if total_outcomes > 0 {
+        not_found as f64 / total_outcomes as f64
+    } else {
+        0.0
+    };
+    tracing::info!(
+        "Per-tx failure classes (diagnostic only, NOT asserted — they overcount \
+         relay-hop dead-ends): hard-failure {:.1}% ({} failures + {} timeouts), \
+         NotFound {:.1}% ({} of {})",
+        per_tx_hard_failure_rate * 100.0,
         failures,
         timeouts,
+        per_tx_not_found_rate * 100.0,
+        not_found,
         total_outcomes
+    );
+
+    // CLIENT-VISIBLE gates are computed over the SCHEDULED GET total, NOT over
+    // `client_total`. Every regular node schedules exactly one GET (the loop
+    // above pushes one `SimOperation::Get` per real node over
+    // NUM_GATEWAYS..NUM_GATEWAYS+NUM_NODES), so `scheduled == NUM_NODES`. This
+    // denominator matters because a scheduled GET that hard-fails via
+    // `RetryLoopOutcome::Unexpected` / `InfraError` (or never dispatches) emits
+    // NO `ClientTerminal` at all, so it is ABSENT from `client_total` and from
+    // every rate taken over it. Dividing by `client_total` would let those
+    // client-visible failures silently vanish from the denominator — up to 30
+    // of them could slip through the old `client_total >= 70% * NUM_NODES`
+    // sanity floor. Dividing by `scheduled` and counting the terminal-less GETs
+    // as failures (`missing_terminals`) closes that gap (Codex P1). That old
+    // 70%-of-nodes sanity floor is now SUBSUMED: `missing_terminals` is exactly
+    // the shortfall it used to merely warn about, and it is now charged into the
+    // hard-failure gate below instead.
+    let scheduled = NUM_NODES as u64;
+    let missing_terminals = scheduled.saturating_sub(client_total);
+
+    // CLIENT hard-failure ceiling — STRICT (<= 5%), over the SCHEDULED total.
+    // A client GET whose retry budget burned on timeouts / unroutable attempts
+    // WITHOUT a definitive NotFound (`client_timeout_exhausted`), PLUS every
+    // scheduled GET that produced NO client terminal at all (`missing_terminals`
+    // — the InfraError / Unexpected / never-dispatched failures the terminal
+    // tallies literally cannot see), is a genuine client-visible completion
+    // defect that retrievability CANNOT catch (the node may still end up caching
+    // the contract), so it must stay near zero (Codex P1).
+    let client_hard_failures = client_timeout_exhausted + missing_terminals;
+    let client_hard_failure_rate = client_hard_failures as f64 / scheduled as f64;
+    assert!(
+        client_hard_failure_rate <= 0.05,
+        "Client GET hard-failure rate {:.1}% ({} timeout_exhausted + {} missing terminals \
+         of {} scheduled) exceeds the 5% ceiling. Missing terminals are the \
+         InfraError/Unexpected/never-dispatched client failures that emit no ClientTerminal, \
+         so they are invisible to `client_total` and to the terminal tallies — and \
+         retrievability cannot catch this class either, so it must stay near zero. \
+         client_successes={}, client_total={} (#4852 P1).",
+        client_hard_failure_rate * 100.0,
+        client_timeout_exhausted,
+        missing_terminals,
+        scheduled,
+        client_successes,
+        client_total
+    );
+
+    // CLIENT NotFound ceiling — over the SCHEDULED total (same denominator as
+    // the hard-failure gate, so a terminal-less failure cannot inflate one gate
+    // by shrinking the other's base). A client NotFound is a routing dead-end (a
+    // GET reached a peer with no strictly-closer neighbor). Force-activating the
+    // nearest-neighbor lattice (above) gives every peer its ring-closest
+    // neighbors and eliminates these dead-ends structurally: the first CI run
+    // with the lattice on measured 0/100 client NotFounds (down from 13/79 ≈
+    // 16.5% without it). The 10% ceiling is well above that structural ~0% and
+    // above the invariants' accepted ~5-9% near-miss floor, so it does not flake
+    // on turmoil/machine jitter, while still tripping on a wholesale dead-end
+    // regression (e.g. the lattice silently disabling would send this back
+    // toward the ~16.5% it was). This is the client-VISIBLE outcome (one per
+    // client op, sub-ops excluded); the per-tx metric over-counted relay-hop
+    // dead-ends. Retrievability (below) is the non-gameable backstop.
+    let client_not_found_rate = client_not_found as f64 / scheduled as f64;
+    assert!(
+        client_not_found_rate <= 0.10,
+        "Client GET NotFound rate {:.1}% ({} of {} scheduled) exceeds the 10% findability \
+         floor. With the nearest-neighbor lattice active this should be ~0 (measured 0/100 \
+         on CI); a rate this high means routing is dead-ending — peers are not acquiring \
+         their ring-closest neighbors. client_successes={}, client_timeout_exhausted={}, \
+         client_total={} (#4852/#4760).",
+        client_not_found_rate * 100.0,
+        client_not_found,
+        scheduled,
+        client_successes,
+        client_timeout_exhausted,
+        client_total
     );
     // RETRIEVABILITY floor — the primary success metric (#4361/#4362).
     //
@@ -9783,24 +9933,26 @@ fn test_get_reliability_diagnostic() {
         success_rate * 100.0
     );
     // Network-traversal floor (#4361): before this assertion existed, every
-    // "success" in the failing runs was a local cache hit (hop_count == 0)
+    // "success" in the failing runs was a local cache hit (attempts == 0)
     // on a node that already held the contract — multi-hop GET was never
     // exercised at all. This also guards the one gap in the retrievability
     // metric above: `nodes_with_state` counts a node whether it obtained the
     // contract over the network OR via relay-path caching, so on its own a high
     // count could in principle be reached with few client GETs actually
-    // completing. Requiring a substantial number of *successful, network-
-    // traversing* GETs closes that: broad routing must have happened, not just
-    // storage population. Measured run: 65/65 network-traversed; floor 30 leaves
-    // ~2x headroom for turmoil non-determinism while still asserting real
-    // routing (6x the previous catastrophic-only floor of 5).
+    // completing. Requiring a number of client GET operations that actually
+    // routed (`attempts >= 1`) closes that: broad routing must have happened,
+    // not just storage population. This now gates on the CLIENT-visible
+    // network-success count (per client op) rather than the per-tx count. The
+    // lattice run measured 73/100 client GETs routing over the network (27 were
+    // local-cache hits). Floor at 30 leaves ~2.4x margin below that so a benign
+    // network/local split shift does not flake, while still asserting that broad
+    // routing happened, not just storage population (#4852/#4361).
     assert!(
-        network_successes >= 30,
-        "Only {} of {} successful GETs traversed the network (hop_count >= 1) \
+        client_network_successes >= 30,
+        "Only {} client GET operations traversed the network (attempts >= 1) \
          — too few client GETs actually routed; the success/retrievability \
-         metrics may be measuring local availability, not routing (#4361)",
-        network_successes,
-        successes
+         metrics may be measuring local availability, not routing (#4852/#4361)",
+        client_network_successes
     );
 
     // StateVerifier anomaly check
