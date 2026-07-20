@@ -793,63 +793,55 @@ impl WasmEngine for WasmtimeEngine {
         id: i64,
         req_bytes: usize,
     ) -> Result<InstanceHandle, WasmError> {
+        {
+            let store = self
+                .store
+                .as_mut()
+                .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
+
+            // Reset fuel if metering is enabled. (Pre-guest-entry; no arena
+            // residue if this fails, so no recovery needed on this early return.)
+            if self.enabled_metering {
+                store
+                    .set_fuel(self.max_fuel)
+                    .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+            }
+        }
+
+        // The guest-entry half (instantiate + __frnt_set_id + ensure_memory) is
+        // factored out so we can RECOVER THE STORE on ANY guest-entry
+        // timeout/error before returning (#4864 round-9 item 2). Previously an
+        // epoch interrupt during __frnt_set_id returned via `?` AFTER the module
+        // was instantiated but BEFORE `instances.insert` / `lifetime_instances += 1`,
+        // so the store-refresh accounting never counted it: wasmtime's Store arena
+        // retained the dropped instance's allocation, and repeated init timeouts
+        // across fresh contract ids accumulated untracked arena memory that never
+        // triggered a count-based refresh.
+        let epoch_ticks = self.epoch_deadline_ticks;
         let store = self
             .store
             .as_mut()
             .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-
-        // Reset fuel if metering is enabled
-        if self.enabled_metering {
-            store
-                .set_fuel(self.max_fuel)
-                .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
-        }
-
-        // Arm the epoch deadline before instantiation runs any guest start
-        // function (#4861); the store is reused across calls so a stale deadline
-        // would otherwise trap here.
-        arm_epoch_deadline(store, self.epoch_deadline_ticks);
-
-        // Instantiate the module using the pre-configured linker
-        // CRITICAL: Must use instantiate_async() because async_support(true) is enabled
-        // An epoch interrupt here (a runaway module start function) is classified
-        // as a timeout, not Instantiation (#4864 review); other errors keep it.
-        let instance =
-            block_on_async(self.linker.instantiate_async(&mut *store, module)).map_err(|e| {
-                classify_guest_entry_error(e, |e| WasmError::Instantiation(e.to_string()))
-            })?;
-
-        // Call __frnt_set_id to set the instance ID (used for MEM_ADDR lookup)
-        // CRITICAL: Must use call_async() because async_support(true) is enabled
-        if let Some(set_id_func) = instance.get_func(&mut *store, "__frnt_set_id") {
-            let typed_func = set_id_func
-                .typed::<i64, ()>(&*store)
-                .map_err(|e| WasmError::Export(e.to_string()))?;
-            // Re-arm the epoch deadline before this SECOND guest call (#4864
-            // round-4 P2). The store is reused across calls, so without re-arming
-            // __frnt_set_id would inherit whatever ticks REMAIN from the
-            // instantiation deadline armed above — a module whose start function
-            // ran near the budget would leave set_id ~zero ticks and trap it
-            // spuriously. Every guest entry must be immediately preceded by its
-            // own arm (pinned by `every_guest_entry_is_preceded_by_arm_epoch_deadline`).
-            //
-            // Adversarial ceiling (#4864 round-5 item 10): giving set_id a FRESH
-            // budget is correct per-call, but it means create_instance's worst-case
-            // GUEST CPU is ~2x max_execution_seconds (a start function running just
-            // under budget, then set_id running a fresh full budget). That is
-            // bounded at EXACTLY 2 guest entries — the pin above enumerates every
-            // guest entry in this method, so the factor cannot silently grow.
-            arm_epoch_deadline(store, self.epoch_deadline_ticks);
-            block_on_async(typed_func.call_async(&mut *store, id)).map_err(|e| {
-                classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string()))
-            })?;
-        }
+        let instance = match Self::instantiate_and_init(
+            store,
+            &self.linker,
+            module,
+            id,
+            req_bytes,
+            epoch_ticks,
+        ) {
+            Ok(instance) => instance,
+            Err(e) => {
+                // The `store` borrow above ends with `match`, so recover_store
+                // (which reborrows &mut self) is free to replace the store and
+                // drop the failed instance's arena residue.
+                self.recover_store();
+                return Err(e);
+            }
+        };
 
         // Note: MEM_ADDR insertion is handled by RunningInstance::new in runtime.rs
         // which has the correct contract key. Do NOT insert here with a default key.
-
-        // Ensure sufficient memory for the request
-        Self::ensure_memory(store, &instance, req_bytes)?;
 
         self.instances.insert(id, instance);
         self.lifetime_instances += 1;
@@ -1421,6 +1413,66 @@ impl WasmtimeEngine {
         register_engine_for_epoch(&engine);
 
         Ok((engine, max_fuel, config.enable_metering))
+    }
+
+    /// Instantiate `module`, run its `__frnt_set_id`, and ensure request memory —
+    /// the guest-entry half of [`create_instance`], factored out so the caller can
+    /// RECOVER THE STORE on any guest-entry timeout/error before returning (#4864
+    /// round-9 item 2). Every guest entry here is immediately preceded by its own
+    /// `arm_epoch_deadline` (pinned by
+    /// `every_guest_entry_is_preceded_by_arm_epoch_deadline`, which now scrapes
+    /// this method).
+    fn instantiate_and_init(
+        store: &mut Store<HostState>,
+        linker: &Linker<HostState>,
+        module: &Module,
+        id: i64,
+        req_bytes: usize,
+        epoch_deadline_ticks: u64,
+    ) -> Result<Instance, WasmError> {
+        // Arm the epoch deadline before instantiation runs any guest start
+        // function (#4861); the store is reused across calls so a stale deadline
+        // would otherwise trap here.
+        arm_epoch_deadline(store, epoch_deadline_ticks);
+
+        // Instantiate the module using the pre-configured linker.
+        // CRITICAL: Must use instantiate_async() because async_support(true) is enabled.
+        // An epoch interrupt here (a runaway module start function) is classified
+        // as a timeout, not Instantiation (#4864 review); other errors keep it.
+        let instance =
+            block_on_async(linker.instantiate_async(&mut *store, module)).map_err(|e| {
+                classify_guest_entry_error(e, |e| WasmError::Instantiation(e.to_string()))
+            })?;
+
+        // Call __frnt_set_id to set the instance ID (used for MEM_ADDR lookup).
+        // CRITICAL: Must use call_async() because async_support(true) is enabled.
+        if let Some(set_id_func) = instance.get_func(&mut *store, "__frnt_set_id") {
+            let typed_func = set_id_func
+                .typed::<i64, ()>(&*store)
+                .map_err(|e| WasmError::Export(e.to_string()))?;
+            // Re-arm the epoch deadline before this SECOND guest call (#4864
+            // round-4 P2). The store is reused across calls, so without re-arming
+            // __frnt_set_id would inherit whatever ticks REMAIN from the
+            // instantiation deadline armed above — a module whose start function
+            // ran near the budget would leave set_id ~zero ticks and trap it
+            // spuriously.
+            //
+            // Adversarial ceiling (#4864 round-5 item 10): giving set_id a FRESH
+            // budget is correct per-call, but it means create_instance's worst-case
+            // GUEST CPU is ~2x max_execution_seconds (a start function running just
+            // under budget, then set_id running a fresh full budget). That is
+            // bounded at EXACTLY 2 guest entries — the pin enumerates every guest
+            // entry here, so the factor cannot silently grow.
+            arm_epoch_deadline(store, epoch_deadline_ticks);
+            block_on_async(typed_func.call_async(&mut *store, id)).map_err(|e| {
+                classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string()))
+            })?;
+        }
+
+        // Ensure sufficient memory for the request.
+        Self::ensure_memory(store, &instance, req_bytes)?;
+
+        Ok(instance)
     }
 
     /// Recover the engine after a timeout or panic that consumed the store.
@@ -2487,7 +2539,10 @@ mod tests {
     fn every_guest_entry_is_preceded_by_arm_epoch_deadline() {
         let src = include_str!("wasmtime_engine.rs");
         for fn_name in [
-            "fn create_instance(",
+            // #4864 round-9 item 2: create_instance's guest entries moved into
+            // instantiate_and_init so the store can be recovered on a guest-entry
+            // timeout; scrape the new home of those entries.
+            "fn instantiate_and_init(",
             "fn initiate_buffer(",
             "fn call_void(",
             "fn call_3i64(",
@@ -2540,6 +2595,42 @@ mod tests {
                 prev = entry_pos;
             }
         }
+    }
+
+    /// #4864 round-9 item 2 pin: `create_instance` MUST recover the store on a
+    /// guest-entry (instantiate / `__frnt_set_id`) failure. Without it, a timeout
+    /// that returns before `instances.insert` / `lifetime_instances += 1` leaves
+    /// the failed instance's allocation in the wasmtime Store arena uncounted, so
+    /// repeated init timeouts across fresh contract ids accumulate untracked arena
+    /// memory that never triggers a count-based refresh.
+    #[test]
+    fn create_instance_recovers_store_on_guest_entry_failure() {
+        let src = include_str!("wasmtime_engine.rs");
+        let start = src
+            .find("fn create_instance(")
+            .expect("create_instance not found");
+        let after = &src[start..];
+        let end = after[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let body = &after[..end];
+
+        let call = body
+            .find("Self::instantiate_and_init(")
+            .expect("create_instance must delegate guest entry to instantiate_and_init");
+        let recover = body.find("self.recover_store();").expect(
+            "create_instance must recover the store on a guest-entry failure \
+             (#4864 round-9 item 2)",
+        );
+        assert!(
+            call < recover,
+            "recover_store must be in the instantiate_and_init error path (after the call)"
+        );
+        assert!(
+            body[recover..(recover + 120).min(body.len())].contains("return Err(e)"),
+            "the recovery arm must still return the guest-entry error (not swallow it)"
+        );
     }
 
     /// #4864 round-7 (Codex P1): the wall-clock backstop must bound queue wait and
