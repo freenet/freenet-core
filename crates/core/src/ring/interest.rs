@@ -48,7 +48,8 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -101,7 +102,11 @@ const DELTA_CACHE_SIZE: usize = 1024;
 /// onto the same saturated queue. This interval bounds that amplification to at
 /// most one request per (contract, peer) window while still healing far faster
 /// than the heartbeat backstop.
-const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
+///
+/// `pub(crate)` so the UPDATE queue-full retry (#4857 P2) can size its own
+/// tokio-clock liveness backstop to exactly one reservation window — see
+/// `operations::update::op_ctx_task::resend_queue_full_resync_request`.
+pub(crate) const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Bound on the number of (contract, peer) entries in the queue-full
 /// `ResyncRequest` throttle. The key is influenced by remote peers (any peer
@@ -110,6 +115,33 @@ const RESYNC_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// open: forgetting an entry merely permits one extra healing `ResyncRequest`,
 /// which is safe.
 const RESYNC_THROTTLE_CACHE_SIZE: usize = 4096;
+
+/// Node-wide cap on concurrently-outstanding queue-full-resync retry tasks
+/// (#4862 P1). The per-(contract, peer) throttle above is a bounded LRU; under
+/// saturation plus key churn (a peer cycling through more than
+/// [`RESYNC_THROTTLE_CACHE_SIZE`] contracts) the LRU can EVICT still-active
+/// reservations, so a revisited key re-grants and spawns ANOTHER retry task —
+/// unbounded overlapping tasks that also defeat the per-window send cap. This
+/// node-wide cap bounds the aggregate retry-task count (and thus timer wakeups
+/// and the full-state `ResyncResponse` fan-out those retries induce) regardless
+/// of LRU churn. At cap the immediate `ResyncRequest` still sends; only the
+/// best-effort retry is skipped. See
+/// [`InterestManager::try_reserve_resync_retry_slot`].
+pub(crate) const MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES: usize = 256;
+
+/// RAII reservation for one outstanding queue-full-resync retry task (#4862 P1).
+///
+/// Held by the spawned retry task; its `Drop` decrements the node's
+/// outstanding-retry counter, so the slot is freed when the task completes,
+/// is dropped, or panics. Obtain via
+/// [`InterestManager::try_reserve_resync_retry_slot`].
+pub(crate) struct ResyncRetrySlot(Arc<AtomicUsize>);
+
+impl Drop for ResyncRetrySlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Timeout for contract handler queries in the broadcast path (summary and
 /// delta computation). Much shorter than the default 300s to prevent spawned
@@ -351,6 +383,15 @@ pub struct InterestManager<T: TimeSource> {
     /// it without bound. See [`InterestManager::begin_resync_request`] and
     /// issue #4857.
     resync_request_throttle: Mutex<LruCache<(ContractKey, SocketAddr), Instant>>,
+
+    /// Count of concurrently-outstanding queue-full-resync retry tasks (#4862 P1).
+    /// Bounds aggregate retry tasks node-wide, independent of the throttle LRU
+    /// (which can evict active reservations under key churn). See
+    /// [`InterestManager::try_reserve_resync_retry_slot`] and
+    /// [`MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES`]. `Arc` so a slot guard can
+    /// outlive the borrow (it is moved into the spawned retry task and
+    /// decrements the count on drop).
+    resync_retry_slots: Arc<AtomicUsize>,
 }
 
 impl<T: TimeSource + Sync> InterestManager<T> {
@@ -371,6 +412,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             resync_requests_received: AtomicU64::new(0),
             summary_notify_timestamps: DashMap::new(),
             pending_removals: DashMap::new(),
+            resync_retry_slots: Arc::new(AtomicUsize::new(0)),
             resync_request_throttle: Mutex::new(LruCache::new(
                 NonZeroUsize::new(RESYNC_THROTTLE_CACHE_SIZE)
                     .expect("RESYNC_THROTTLE_CACHE_SIZE must be > 0"),
@@ -597,9 +639,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
 
     /// RESERVE the per-(contract, target) queue-full `ResyncRequest` throttle
     /// window: atomically checks AND records the send under the throttle's own
-    /// lock, returning `true` when at least [`RESYNC_REQUEST_MIN_INTERVAL`] has
-    /// elapsed since the last such request (or none was ever sent), `false`
-    /// otherwise.
+    /// lock. Returns `Some(deadline)` — where `deadline` is the instant this
+    /// reservation window closes (`now + RESYNC_REQUEST_MIN_INTERVAL`) on the
+    /// manager's `TimeSource` — when at least [`RESYNC_REQUEST_MIN_INTERVAL`]
+    /// has elapsed since the last such request (or none was ever sent), or
+    /// `None` when still throttled.
     ///
     /// The `begin`/[`Self::cancel_resync_request`] reservation-commit pair
     /// restores atomicity under the double-gate (#4864 round-6 item 2): recording
@@ -610,6 +654,13 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// so the window is released — preserving the round-5 improvement that a
     /// globally-suppressed emit does not burn the 30s window.
     ///
+    /// The returned deadline lets a caller that performs a bounded retry burst
+    /// (the UPDATE queue-full path, #4857/#4862 P2) anchor every retry to THIS
+    /// reservation window on the SAME clock the throttle stamped it with, so a
+    /// burst can never spill into or overlap the next reservation — keeping the
+    /// #4251 steady-state cap rigorous even if the caller's first dispatch
+    /// blocked for a large fraction of the window before retrying.
+    ///
     /// Issue #4857: a `ContractQueueFull` broadcast drop is silent — the receiver
     /// never applied the delta, but the SENDER cached its own summary as ours on
     /// send-Ok, so it believes we are current and will never re-send the dropped
@@ -617,17 +668,55 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// re-send full state. Issue #4251 suppressed the request entirely because
     /// one-per-dropped-delta amplifies into a full-state storm; this gate keeps
     /// the healing signal but bounds it to one per window.
-    pub fn begin_resync_request(&self, contract: &ContractKey, target: SocketAddr) -> bool {
+    pub fn begin_resync_request(
+        &self,
+        contract: &ContractKey,
+        target: SocketAddr,
+    ) -> Option<Instant> {
         let now = self.time_source.now();
         let key = (*contract, target);
         let mut throttle = self.resync_request_throttle.lock();
         if let Some(&last) = throttle.get(&key) {
             if now.duration_since(last) < RESYNC_REQUEST_MIN_INTERVAL {
-                return false;
+                return None;
             }
         }
         throttle.put(key, now);
-        true
+        Some(now + RESYNC_REQUEST_MIN_INTERVAL)
+    }
+
+    /// Try to reserve a slot for a queue-full-resync retry task (#4862 P1).
+    ///
+    /// Returns a [`ResyncRetrySlot`] guard (which frees the slot on drop) when
+    /// fewer than [`MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES`] retry tasks are
+    /// currently outstanding, or `None` when at cap. This bounds the aggregate
+    /// number of concurrent retry tasks node-wide even when the per-(contract,
+    /// peer) throttle LRU evicts active reservations under key churn (which would
+    /// otherwise let each revisited key spawn another task without bound). When
+    /// `None`, the caller skips the retry only — the immediate `ResyncRequest`
+    /// still sends. Hard cap (CAS loop): never exceeds the maximum.
+    pub(crate) fn try_reserve_resync_retry_slot(&self) -> Option<ResyncRetrySlot> {
+        let mut cur = self.resync_retry_slots.load(Ordering::Relaxed);
+        loop {
+            if cur >= MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES {
+                return None;
+            }
+            match self.resync_retry_slots.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(ResyncRetrySlot(self.resync_retry_slots.clone())),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Current number of outstanding queue-full-resync retry tasks (#4862 P1).
+    #[cfg(test)]
+    pub(crate) fn outstanding_resync_retries(&self) -> usize {
+        self.resync_retry_slots.load(Ordering::Relaxed)
     }
 
     /// Cancel a reservation made by [`Self::begin_resync_request`]: removes the
@@ -1650,49 +1739,60 @@ mod tests {
 
     /// Issue #4857: `begin_resync_request` must emit at most one
     /// `ResyncRequest` per (contract, peer) per `RESYNC_REQUEST_MIN_INTERVAL`.
-    /// The first drop heals immediately; a burst of further drops within the
-    /// window is throttled (bounding the #4251 amplification); after the window
-    /// elapses a fresh request is allowed again.
+    /// The first drop heals immediately (returning `Some(deadline)`); a burst of
+    /// further drops within the window is throttled (`None`, bounding the #4251
+    /// amplification); after the window elapses a fresh request is allowed
+    /// again. The returned deadline is the reservation window close
+    /// (`now + RESYNC_REQUEST_MIN_INTERVAL`) on the manager's clock (#4857 P2).
     #[test]
     fn begin_resync_request_rate_limits_per_contract_peer() {
         let (manager, time) = make_manager();
         let contract = make_contract_key(1);
         let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
 
-        // First drop for this (contract, peer) → allowed (immediate heal).
-        assert!(
-            manager.begin_resync_request(&contract, addr),
-            "first ResyncRequest for a fresh (contract, peer) must be allowed"
+        // First drop for this (contract, peer) → allowed (immediate heal), and
+        // the returned deadline is exactly now + RESYNC_REQUEST_MIN_INTERVAL.
+        let deadline = manager
+            .begin_resync_request(&contract, addr)
+            .expect("first ResyncRequest for a fresh (contract, peer) must be allowed");
+        assert_eq!(
+            deadline,
+            manager.now() + RESYNC_REQUEST_MIN_INTERVAL,
+            "reservation deadline must be now + RESYNC_REQUEST_MIN_INTERVAL (#4857 P2)"
         );
         // Immediate repeat within the window → throttled.
         assert!(
-            !manager.begin_resync_request(&contract, addr),
+            manager.begin_resync_request(&contract, addr).is_none(),
             "a second ResyncRequest within RESYNC_REQUEST_MIN_INTERVAL must be throttled"
         );
 
         // A DIFFERENT peer for the same contract is an independent bucket.
         let other_addr: SocketAddr = "127.0.0.1:5002".parse().unwrap();
         assert!(
-            manager.begin_resync_request(&contract, other_addr),
+            manager
+                .begin_resync_request(&contract, other_addr)
+                .is_some(),
             "a distinct peer must not share the first peer's throttle bucket"
         );
         // A DIFFERENT contract for the same peer is also independent.
         let other_contract = make_contract_key(2);
         assert!(
-            manager.begin_resync_request(&other_contract, addr),
+            manager
+                .begin_resync_request(&other_contract, addr)
+                .is_some(),
             "a distinct contract must not share the first contract's throttle bucket"
         );
 
         // Just before the interval elapses → still throttled.
         time.advance_time(RESYNC_REQUEST_MIN_INTERVAL - Duration::from_millis(1));
         assert!(
-            !manager.begin_resync_request(&contract, addr),
+            manager.begin_resync_request(&contract, addr).is_none(),
             "ResyncRequest must stay throttled until the full interval elapses"
         );
         // After the interval elapses → allowed again.
         time.advance_time(Duration::from_millis(2));
         assert!(
-            manager.begin_resync_request(&contract, addr),
+            manager.begin_resync_request(&contract, addr).is_some(),
             "ResyncRequest must be allowed again once RESYNC_REQUEST_MIN_INTERVAL has elapsed"
         );
     }
@@ -1710,19 +1810,19 @@ mod tests {
         // begin reserves; cancel releases → a subsequent begin succeeds immediately
         // (the window was NOT burned).
         assert!(
-            manager.begin_resync_request(&contract, addr),
+            manager.begin_resync_request(&contract, addr).is_some(),
             "first begin reserves"
         );
         manager.cancel_resync_request(&contract, addr);
         assert!(
-            manager.begin_resync_request(&contract, addr),
+            manager.begin_resync_request(&contract, addr).is_some(),
             "begin after cancel must succeed — cancel releases the reserved window"
         );
 
         // This last begin was NOT cancelled → the window is held: an immediate
         // second begin is rejected (the reservation stands, as after a real emit).
         assert!(
-            !manager.begin_resync_request(&contract, addr),
+            manager.begin_resync_request(&contract, addr).is_none(),
             "a begin without a matching cancel must hold the 30s window (second begin rejected)"
         );
 
@@ -1730,7 +1830,7 @@ mod tests {
         // interval elapses, begin is allowed again.
         time.advance_time(RESYNC_REQUEST_MIN_INTERVAL);
         assert!(
-            manager.begin_resync_request(&contract, addr),
+            manager.begin_resync_request(&contract, addr).is_some(),
             "begin allowed once RESYNC_REQUEST_MIN_INTERVAL elapses"
         );
     }
