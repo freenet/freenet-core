@@ -12,18 +12,22 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use either::Either;
 use freenet_stdlib::client_api::{ContractResponse, ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
 use crate::client_events::HostResult;
-use crate::config::GlobalExecutor;
+use crate::config::{GlobalExecutor, GlobalRng};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{DeltaOrFullState, InterestMessage, NetMessage, NodeEvent, Transaction};
 use crate::node::OpManager;
 use crate::operations::OpError;
 use crate::operations::bootstrap::bootstrap_gateway_target;
+use crate::ring::interest::RESYNC_REQUEST_MIN_INTERVAL;
 use crate::ring::{PeerKeyLocation, RingError};
 use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
 
@@ -1133,18 +1137,17 @@ async fn send_queue_full_resync_request(
     sender_addr: SocketAddr,
     incoming_tx: Transaction,
 ) {
-    // RESERVE the per-(contract, sender)/30s throttle window atomically (#4864
-    // round-6 item 2). `begin` checks AND records under the throttle's own lock,
-    // so two concurrent queue-full callbacks for the same (contract, sender)
-    // cannot both pass this gate and go on to both consume the global burst +
-    // emit duplicates inside the window. If the global cap then rejects, we
-    // `cancel` the reservation below (releasing the window) — preserving the
-    // round-5 improvement that a globally-suppressed emit does not burn the 30s
-    // window.
-    if !op_manager
+    // Gate 1 — per-(contract, sender)/30s throttle (#4857/#4862 + #4864 round-6).
+    // RESERVE the window atomically (`begin` checks AND records under the
+    // throttle's own lock) and return the reservation deadline on the throttle's
+    // OWN clock (the #4862 retry anchors to it). Two concurrent queue-full
+    // callbacks for the same (contract, sender) cannot both pass. If the global
+    // cap below then rejects, we `cancel` the reservation so the window is
+    // released (not burned).
+    let Some(reservation_deadline) = op_manager
         .interest_manager
         .begin_resync_request(&key, sender_addr)
-    {
+    else {
         // Per-(contract, sender)/30s throttle (existing #4857 bound).
         tracing::debug!(
             tx = %incoming_tx,
@@ -1154,7 +1157,7 @@ async fn send_queue_full_resync_request(
             "UPDATE relay: queue-full ResyncRequest throttled (rate limit) to avoid amplification"
         );
         return;
-    }
+    };
 
     // ALSO subject to the GLOBAL per-contract emit cap (#4864 round-4 P1): the
     // #4857 queue-full heal path previously bypassed it, so a saturated contract
@@ -1193,13 +1196,56 @@ async fn send_queue_full_resync_request(
         reason = "queue_full",
         "UPDATE relay: sending rate-limited ResyncRequest after queue-full drop (#4857)"
     );
-    // #4864 round-8: record the outstanding request so the matching ResyncResponse
+    // #4862 (P2): the immediate ResyncRequest below rides a LOSSY path
+    // (`notify_node_event` → event loop → `P2pBridge::try_send`), which can drop
+    // it under the SAME backpressure that caused the queue-full drop. If dropped,
+    // the sender never clears its poisoned summary and a one-off change diverges
+    // until the ~5-min heartbeat. Schedule a BOUNDED trailing re-dispatch so the
+    // resync gets more chances to land — well before the heartbeat.
+    //
+    // Spawn CONCURRENTLY, BEFORE the blocking immediate enqueue below (#4862 P2):
+    // `notify_node_event(...).await` can consume up to NOTIFICATION_SEND_TIMEOUT
+    // (30s) under backpressure; spawning after it would let the task start with
+    // the window already gone (`now >= reservation_deadline`) and do nothing. The
+    // first attempt is a jittered delay out (never t=0), so it does not duplicate
+    // the immediate send, and it stays anchored to `reservation_deadline` (the
+    // throttle's own clock) so it can NEVER spill into a new reservation. The
+    // retries re-deliver the ONE already-authorized emit, so they do NOT
+    // re-consult the per-sender throttle or the global emit cap and do NOT
+    // re-record the outstanding request (a redundant response for an
+    // already-consumed record is correctly dropped by #4864 before WASM).
+    //
+    // #4862 P1: gate the spawn on a node-wide retry-task slot so the throttle LRU
+    // evicting active reservations under key churn cannot spawn unbounded
+    // overlapping tasks. At cap ONLY the retry is skipped; the immediate send
+    // below still fires. Fire-and-forget; the slot guard frees on completion.
+    if let Some(slot) = op_manager.interest_manager.try_reserve_resync_retry_slot() {
+        let op_mgr = op_manager.clone();
+        GlobalExecutor::spawn(async move {
+            let _slot = slot; // frees the node-wide retry slot on task exit
+            resend_queue_full_resync_request(
+                &op_mgr,
+                key,
+                sender_addr,
+                incoming_tx,
+                reservation_deadline,
+            )
+            .await;
+        });
+    }
+
+    // #4864 round-8: record the outstanding request (immediately before the emit
+    // so the round-8 pin's proximity check holds) so the matching ResyncResponse
     // from this peer is authorized ONCE at the receive arm; an unsolicited or
-    // replayed response finds no entry and is dropped without running WASM.
+    // replayed response finds no entry and is dropped without running WASM. The
+    // #4862 trailing retry above re-sends the SAME request and relies on THIS one
+    // record — see `resend_queue_full_resync_request`.
     op_manager
         .ring
         .outstanding_resync_requests
         .record(*key.id(), sender_addr);
+
+    // Immediate (first) ResyncRequest — blocking best-effort enqueue.
     if let Err(e) = op_manager
         .notify_node_event(NodeEvent::SendInterestMessage {
             target: sender_addr,
@@ -1212,6 +1258,197 @@ async fn send_queue_full_resync_request(
             error = %e,
             "UPDATE relay: failed to send queue-full ResyncRequest"
         );
+    }
+}
+
+/// Maximum ADDITIONAL trailing re-dispatch attempts for a queue-full
+/// `ResyncRequest` after the immediate one (#4857 P2). Kept small so the whole
+/// retry burst for a single drop stays far below the #4251 storm: one
+/// reservation (see [`crate::ring::InterestManager::begin_resync_request`])
+/// dispatches at most `1 + QUEUE_FULL_RESYNC_MAX_RETRIES` ResyncRequests per
+/// (contract, peer) per `RESYNC_REQUEST_MIN_INTERVAL` (30s).
+const QUEUE_FULL_RESYNC_MAX_RETRIES: u32 = 2;
+
+/// Base inter-attempt delay for queue-full `ResyncRequest` retries (#4857 P2).
+///
+/// Linear backoff: the `attempt`-th retry waits ~`attempt * BASE` (±20%
+/// jitter), MEASURED ON THE THROTTLE'S CLOCK (see `resend_queue_full_resync_request`).
+/// The worst-case total span (`sum_{n=1..=MAX} n * BASE * 1.2` = 3 · 2s · 1.2 =
+/// 7.2s for the current constants) stays comfortably under
+/// `RESYNC_REQUEST_MIN_INTERVAL` (30s); the retry is ALSO hard-stopped at the
+/// reservation deadline regardless of span, so it can never spill into the next
+/// reservation. Pinned by `resync_retry_span_stays_within_throttle_window`.
+const QUEUE_FULL_RESYNC_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+
+/// Poll granularity for the injected-clock retry wait (#4857 P2).
+///
+/// The util `TimeSource` the throttle uses exposes only `now()` — no sleep — so
+/// `resend_queue_full_resync_request` waits by polling `interest_manager.now()`
+/// in bounded `tokio` increments until the injected clock reaches the attempt's
+/// target (or the reservation deadline). Small enough that a retry fires
+/// promptly once the clock reaches its target; large enough that wakeups stay
+/// negligible (a ~2s delay ⇒ ~20 polls, and the burst is throttle-bounded to
+/// one per (contract, peer) per 30s). Under an injected mock clock the wait
+/// advances only as the sim advances that clock, and `tokio` auto-advance
+/// interleaves this poll timer with the sim's own timers (bounded wakeups).
+const QUEUE_FULL_RESYNC_RETRY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Jittered delay before the `attempt`-th queue-full `ResyncRequest` retry
+/// (#4857 P2).
+///
+/// Linear backoff (`attempt * BASE`) with ±20% jitter via [`GlobalRng`]
+/// (deterministic under the simulation harness), so a load spike that drops
+/// broadcasts to MANY (contract, peer) pairs at once does not produce a
+/// synchronised retry wave onto the just-recovering bridge. Pure fn so the
+/// bounds are unit-testable without a runtime.
+fn jittered_resync_retry_delay(attempt: u32) -> Duration {
+    // Sample in [0.8, 1.2): at least the ±20% the retry/backoff rule mandates.
+    let factor: f64 = GlobalRng::random_range(0.8..1.2);
+    QUEUE_FULL_RESYNC_RETRY_BASE_DELAY.mul_f64(attempt as f64 * factor)
+}
+
+/// Trailing best-effort re-dispatch of a queue-full `ResyncRequest` (#4857 P2).
+///
+/// Runs as a short-lived fire-and-forget task spawned by
+/// [`send_queue_full_resync_request`] AFTER its immediate ResyncRequest, and
+/// ONLY when the throttle reservation was granted. It re-dispatches the same
+/// ResyncRequest up to [`QUEUE_FULL_RESYNC_MAX_RETRIES`] times with jittered
+/// backoff so a resync dropped by the lossy event-loop → `P2pBridge::try_send`
+/// path still heals the divergence before the ~5-min heartbeat.
+///
+/// Anchored to the reservation window (#4857 P2, review P2-A/P2-B):
+/// `reservation_deadline` is the instant the throttle's window closes, on the
+/// SAME clock the throttle stamped it with (`interest_manager.now()` — the
+/// injected `hosting_time_source_override` in sims, the wall clock in prod).
+/// Both the inter-attempt delay and the stop condition are driven by that
+/// clock: each attempt waits until the injected clock reaches its jittered
+/// target, and the WHOLE task bails the moment the injected clock reaches
+/// `reservation_deadline`. So a burst can never cross into a new reservation —
+/// even if the caller's blocking `notify_node_event(...).await` consumed most
+/// of the window before this task was spawned — and sims that advance the
+/// injected clock see deterministic pacing. The util `TimeSource` has no sleep
+/// primitive, so the wait polls `now()` in bounded `tokio` increments
+/// ([`QUEUE_FULL_RESYNC_RETRY_POLL_INTERVAL`]).
+///
+/// DST liveness backstop: the injected deadline is PRIMARY, but a decoupled
+/// injected clock (`hosting_time_source_override`) that FREEZES before its
+/// deadline would leave the injected gates never firing and this poll spinning
+/// forever. So the task is ALSO floored at one reservation interval of tokio
+/// time (`RESYNC_REQUEST_MIN_INTERVAL` from `started`). In production the two
+/// clocks coincide and the injected stop fires first, so the floor is a no-op;
+/// it only takes effect when the injected clock stalls.
+///
+/// Storm bound (#4251 / #4864 cap): this fn RE-DELIVERS the one already-authorized
+/// emit — it deliberately does NOT call `begin_resync_request` (no new
+/// reservation), does NOT consume a `resync_emit_limiter` token (no new global
+/// emit), and does NOT re-record `outstanding_resync_requests` (the initial
+/// record authorizes the eventual response once; a redundant response is dropped
+/// by #4864 before WASM). All its sends belong to the single reservation already
+/// granted by the caller. Combined with the deadline stop, steady-state stays
+/// capped at one reservation (≤ `1 + MAX` sends) per (contract, peer) per window.
+///
+/// Uses the NON-blocking `try_notify_node_event` (bounded-channel rule): a
+/// dropped retry is covered by the next attempt or the heartbeat backstop, and
+/// blocking would keep the task alive up to `NOTIFICATION_SEND_TIMEOUT` (30s).
+///
+/// do NOT add a `begin_resync_request`/`resync_emit_limiter` call here, do NOT
+/// switch to a blocking `notify_node_event`, and do NOT drive the delay/deadline
+/// off a clock other than `interest_manager.now()` — see #4251/#4857/#4864.
+async fn resend_queue_full_resync_request(
+    op_manager: &OpManager,
+    key: ContractKey,
+    sender_addr: SocketAddr,
+    incoming_tx: Transaction,
+    reservation_deadline: Instant,
+) {
+    // Tokio-clock liveness backstop (DST safety). The injected `reservation_deadline`
+    // below is the PRIMARY stop, but if the injected clock is a DECOUPLED
+    // `hosting_time_source_override` that FREEZES before its deadline, the
+    // injected gates would never fire and this poll would spin forever (a
+    // `start_paused` test hangs; a real sim leaks a task per drop). tokio's clock
+    // always advances (or `start_paused` auto-advances), so cap the whole task at
+    // one reservation interval of tokio time as a floor. In production the two
+    // clocks coincide and the injected deadline — captured at reservation stamp,
+    // strictly before `started` — always fires first, so this floor is a no-op.
+    let started = tokio::time::Instant::now();
+    for attempt in 1..=QUEUE_FULL_RESYNC_MAX_RETRIES {
+        // Target wake time for THIS attempt, on the throttle's own clock, CLAMPED
+        // into the remaining reservation window (#4862 P2). A fixed
+        // `now + jittered_delay` could already be past `reservation_deadline` when
+        // the initial enqueue consumed most of the window — then the deadline
+        // check below returns with ZERO retries, exactly failing to heal the
+        // backpressure case. Clamping the delay to at most half the remaining
+        // window keeps the target strictly inside `[now, reservation_deadline)`,
+        // so a retry still fires (and the geometric shrink lets later attempts
+        // fit too). No-op in the common full-window case (jittered delay wins).
+        let now = op_manager.interest_manager.now();
+        let remaining = reservation_deadline.saturating_duration_since(now);
+        let delay = jittered_resync_retry_delay(attempt).min(remaining / 2);
+        let target = now + delay;
+
+        // Wait until the injected clock reaches `target`, bailing the instant it
+        // reaches the reservation deadline (P2-A). Interruptible-sleep note:
+        // this is an unmonitored fire-and-forget task (mirrors the step-6
+        // proactive-summary spawn) holding no locks or channel receivers; each
+        // poll sleep is cancel-safe, and the whole task is hard-bounded by BOTH
+        // the injected reservation deadline and the tokio backstop, so a runtime
+        // shutdown drops it cleanly.
+        loop {
+            let now = op_manager.interest_manager.now();
+            // PRIMARY stop: injected reservation window closed (P2-A/P2-B).
+            if now >= reservation_deadline {
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    attempt,
+                    event = "queue_full_resync_retry_window_elapsed",
+                    "UPDATE relay: reservation window elapsed, stopping queue-full \
+                     ResyncRequest retries (#4857 P2)"
+                );
+                return;
+            }
+            if now >= target {
+                break;
+            }
+            // FLOOR: never depend solely on the injected clock — if it froze
+            // before its deadline, bail after one reservation interval of tokio
+            // time so the task can't spin. (No-op in prod; injected stop above
+            // fires first when the injected clock advances normally.)
+            if started.elapsed() >= RESYNC_REQUEST_MIN_INTERVAL {
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    attempt,
+                    event = "queue_full_resync_retry_backstop",
+                    "UPDATE relay: tokio liveness backstop elapsed (injected clock \
+                     stalled), stopping queue-full ResyncRequest retries (#4857 P2)"
+                );
+                return;
+            }
+            tokio::time::sleep(QUEUE_FULL_RESYNC_RETRY_POLL_INTERVAL).await;
+        }
+
+        match op_manager.try_notify_node_event(NodeEvent::SendInterestMessage {
+            target: sender_addr,
+            message: InterestMessage::ResyncRequest { key },
+        }) {
+            Ok(()) => tracing::debug!(
+                tx = %incoming_tx,
+                contract = %key,
+                target = %sender_addr,
+                attempt,
+                event = "queue_full_resync_retry_sent",
+                "UPDATE relay: re-dispatched queue-full ResyncRequest (#4857 P2)"
+            ),
+            Err(e) => tracing::debug!(
+                tx = %incoming_tx,
+                contract = %key,
+                error = %e,
+                attempt,
+                event = "queue_full_resync_retry_dropped",
+                "UPDATE relay: queue-full ResyncRequest retry dropped (heartbeat backstops)"
+            ),
+        }
     }
 }
 
@@ -3395,6 +3632,22 @@ mod tests {
         crate::node::EventLoopNotificationsReceiver,
         Box<dyn std::any::Any>,
     ) {
+        build_queue_full_test_node_with_clock(id, None).await
+    }
+
+    /// As [`build_queue_full_test_node`], but injects `override_clock` as the
+    /// node's `hosting_time_source_override` — the SAME clock the `InterestManager`
+    /// throttle uses (see `op_state_manager.rs`). A `SharedMockTimeSource` here
+    /// lets a test DECOUPLE the throttle's clock from tokio's, exercising the
+    /// #4857 P2 retry's injected-clock pacing and DST liveness backstop.
+    async fn build_queue_full_test_node_with_clock(
+        id: &str,
+        override_clock: Option<crate::util::time_source::DynTimeSource>,
+    ) -> (
+        Arc<OpManager>,
+        crate::node::EventLoopNotificationsReceiver,
+        Box<dyn std::any::Any>,
+    ) {
         // Distinct `id` per caller: `ConfigArgs::build` derives a Local-mode data
         // directory from it, so two concurrently-running tests sharing an id race
         // on that directory (flaky "No such file or directory").
@@ -3403,10 +3656,12 @@ mod tests {
             mode: Some(crate::contract::OperationMode::Local),
             ..Default::default()
         };
-        let node_config =
+        let mut node_config =
             crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
                 .await
                 .expect("build NodeConfig");
+        // Decouple the throttle/hosting clock from tokio when a test asks for it.
+        node_config.hosting_time_source_override = override_clock;
         let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
         let (ops_ch_channel, mut ch_channel, wait_for_event) =
             crate::contract::contract_handler_channel();
@@ -3475,6 +3730,11 @@ mod tests {
     /// The drop is injected at the contract-handler seam (a stand-in handler
     /// answers every `UpdateQuery` with `ContractQueueFull`) rather than by
     /// saturating the real 100-slot fair queue, which is non-deterministic.
+    ///
+    /// Note (#4857 P2): each drop also spawns a trailing-retry task, but its
+    /// first re-dispatch is a jittered ~1.6-2.4s away on the throttle's clock —
+    /// far beyond this synchronous, non-`start_paused` test's wall-clock window
+    /// — so the immediate/throttled emit counts asserted here are unaffected.
     #[tokio::test]
     async fn queue_full_broadcast_emits_throttled_resync_request() {
         let (op_manager, mut notification_rx, _guard) =
@@ -3544,6 +3804,11 @@ mod tests {
     /// On `origin/main` (and on the round-1 fix, which only patched the
     /// non-streaming driver) this FAILS: `first` is empty. With the round-2 fix
     /// the first drop emits one ResyncRequest and the second is throttled.
+    ///
+    /// Note (#4857 P2): as in the delta test, the trailing-retry task's first
+    /// re-dispatch is ~1.6-2.4s out on the throttle's clock, well beyond this
+    /// synchronous non-`start_paused` test's window, so the counts asserted here
+    /// are unaffected.
     #[tokio::test]
     async fn queue_full_streaming_broadcast_emits_throttled_resync_request() {
         let (op_manager, mut notification_rx, _guard) =
@@ -4125,10 +4390,34 @@ mod tests {
         let prod_end = src.find("\nmod tests {").unwrap_or(src.len());
         let prod = &src[..prod_end];
 
+        // EXEMPT the #4862 queue-full RETRY (`resend_queue_full_resync_request`).
+        // It RE-DELIVERS an emit whose `outstanding_resync_requests.record(...)`
+        // was ALREADY made by `send_queue_full_resync_request` (the initial). It
+        // deliberately does NOT re-record, because re-recording would re-authorize
+        // a REDUNDANT `ResyncResponse` — the opposite of round-8's drop-the-
+        // redundant intent (and would re-run the full-state WASM merge the record
+        // exists to bound). In the bridge-drop case the initial record is still
+        // outstanding when the retry's response arrives (so it IS authorized);
+        // once that record is consumed, a further retry's response is correctly
+        // dropped. So the retry's re-send is legitimately un-recorded — skip it.
+        let retry_start = prod
+            .find("async fn resend_queue_full_resync_request(")
+            .expect("resend_queue_full_resync_request (the #4862 retry) not found");
+        let retry_end = retry_start
+            + 1
+            + prod[retry_start + 1..]
+                .find("\nasync fn ")
+                .unwrap_or(prod.len() - retry_start - 1);
+
         let mut emits = 0usize;
         let mut cursor = 0usize;
         while let Some(rel) = prod[cursor..].find("message: InterestMessage::ResyncRequest") {
             let pos = cursor + rel;
+            cursor = pos + 1;
+            // Skip the exempt retry re-delivery (see above).
+            if (retry_start..retry_end).contains(&pos) {
+                continue;
+            }
             emits += 1;
             // Look back a bounded window for the record call that authorizes the
             // ResyncResponse this emit will provoke (fmt-robust: match the field
@@ -4140,7 +4429,6 @@ mod tests {
                  outstanding_resync_requests.record(...) within 600 bytes — the \
                  receive arm would drop its response as unsolicited (#4864 round-8)"
             );
-            cursor = pos + 1;
         }
         assert!(
             emits >= 2,
@@ -4631,6 +4919,526 @@ mod tests {
                 "`{fn_needle}`: invalidate_payload_memo must be INSIDE the \
                  `{changed_expr}` full-state block (memo-only, gated on changed)"
             );
+        }
+    }
+
+    /// Issue #4857 (P2): the immediate queue-full `ResyncRequest` rides a lossy
+    /// path (event loop → `P2pBridge::try_send`) and can be dropped under the
+    /// same backpressure that caused the queue-full drop. If it is, the sender
+    /// never clears its poisoned summary and a one-off change diverges until the
+    /// ~5-min heartbeat. `send_queue_full_resync_request` therefore schedules a
+    /// BOUNDED trailing retry that re-dispatches the ResyncRequest within the
+    /// single reserved throttle window.
+    ///
+    /// This test drives ONE queue-full drop, then advances virtual time (which,
+    /// with no injected clock override, IS the throttle's clock) and asserts the
+    /// trailing retry re-emits exactly `QUEUE_FULL_RESYNC_MAX_RETRIES` additional
+    /// ResyncRequests (all to the original sender) — proving the resync heals
+    /// without waiting on the heartbeat, even though no further broadcast occurs
+    /// (the rarely-changing-field case). Time advances stay under the 30s
+    /// reservation deadline so the deadline gate does not trip here (the
+    /// deadline-stop behavior is covered by
+    /// `queue_full_resync_retry_stops_after_reservation_deadline`).
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_redispatches_within_reservation() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-retry").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([9u8; 32]),
+            CodeHash::new([10u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12300".parse().unwrap();
+
+        // One queue-full drop → immediate ResyncRequest + a spawned trailing
+        // retry task. No second broadcast is issued (the rarely-changing field
+        // case), so the only way further ResyncRequests appear is the retry.
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "the immediate (pre-retry) ResyncRequest must fire exactly once"
+        );
+
+        // Let the spawned retry task run through its bounded, jittered waits.
+        // The retry paces on the throttle's clock via a `now()`-poll, so advance
+        // the (paused) clock in small steps and yield between them to let the
+        // poll loop make progress; drain after each. 40 × 500ms = 20s total,
+        // safely under the 30s reservation deadline, and we stop as soon as both
+        // retries have fired. The extra rounds after that prove the retry does
+        // NOT keep emitting past the bound.
+        let mut retries = Vec::new();
+        for _ in 0..40 {
+            if retries.len() >= QUEUE_FULL_RESYNC_MAX_RETRIES as usize {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            retries.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+
+        assert_eq!(
+            retries.len(),
+            QUEUE_FULL_RESYNC_MAX_RETRIES as usize,
+            "the trailing retry must re-dispatch the ResyncRequest exactly \
+             QUEUE_FULL_RESYNC_MAX_RETRIES times within the single reservation, \
+             so a bridge-dropped resync heals before the ~5-min heartbeat — and \
+             must NOT exceed that bound (storm bound #4251)"
+        );
+        assert!(
+            retries.iter().all(|t| *t == sender_addr),
+            "every retry ResyncRequest must target the original sender, got {retries:?}"
+        );
+    }
+
+    /// Issue #4857 (P2, review P2-A): the trailing retry burst is anchored to
+    /// the reservation deadline on the throttle's OWN clock. If the injected
+    /// clock crosses that deadline before a retry's target is reached, the retry
+    /// task MUST stop — never dispatching into a fresh reservation window. This
+    /// makes the #4251 `1 + MAX`-per-window bound rigorous even when the caller's
+    /// blocking `notify_node_event(...).await` consumed most of the window.
+    ///
+    /// Here the (paused) clock — which, with no override, IS the throttle's
+    /// clock — is advanced PAST the 30s `RESYNC_REQUEST_MIN_INTERVAL` before any
+    /// retry's jittered target elapses, so the deadline gate fires first and
+    /// NO retry is emitted.
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_stops_after_reservation_deadline() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-deadline").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([11u8; 32]),
+            CodeHash::new([12u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12400".parse().unwrap();
+
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "the immediate (pre-retry) ResyncRequest must fire exactly once"
+        );
+
+        // Let the retry task reach its first poll wait, then jump the clock PAST
+        // the 30s reservation deadline (RESYNC_REQUEST_MIN_INTERVAL, interest.rs).
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(35)).await;
+        // Give the task several scheduling turns to observe the elapsed deadline
+        // and return without dispatching.
+        let mut retries = Vec::new();
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+            retries.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+
+        assert!(
+            retries.is_empty(),
+            "once the injected clock passes the reservation deadline, the retry \
+             MUST stop and emit no further ResyncRequests (P2-A), got {retries:?}"
+        );
+    }
+
+    /// Issue #4857 (P2, DST backstop): the retry gates on the injected throttle
+    /// clock, but that clock may be a DECOUPLED `hosting_time_source_override`
+    /// (`SharedMockTimeSource`) that a sim FREEZES before the reservation
+    /// deadline. If termination depended SOLELY on the injected clock, the poll
+    /// would spin forever (a `start_paused` test hangs; a real sim leaks a task
+    /// per drop). The tokio-clock liveness backstop must terminate the task
+    /// regardless.
+    ///
+    /// This test injects a mock clock, FREEZES it (never advances it) below the
+    /// deadline, then lets ONLY tokio time advance (`start_paused` auto-advance).
+    /// It asserts (a) the retry task TERMINATES within a bounded tokio budget —
+    /// a spin would make the `timeout` fail instead of hanging — and (b) NO
+    /// retry dispatches (the frozen injected clock never crosses a target).
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_terminates_when_injected_clock_frozen() {
+        let (op_manager, mut notification_rx, _guard) = build_queue_full_test_node_with_clock(
+            "queue-full-resync-4857-frozen-clock",
+            Some(
+                Arc::new(crate::util::time_source::SharedMockTimeSource::new())
+                    as crate::util::time_source::DynTimeSource,
+            ),
+        )
+        .await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([13u8; 32]),
+            CodeHash::new([14u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12500".parse().unwrap();
+
+        // Deadline FAR in the injected-clock future: the mock is frozen at ~0,
+        // so `now >= target` and `now >= reservation_deadline` never hold and
+        // only the tokio backstop can stop the task.
+        let reservation_deadline = op_manager.interest_manager.now() + Duration::from_secs(30);
+
+        let op_mgr = op_manager.clone();
+        let handle = tokio::spawn(async move {
+            resend_queue_full_resync_request(
+                &op_mgr,
+                key,
+                sender_addr,
+                Transaction::new::<UpdateMsg>(),
+                reservation_deadline,
+            )
+            .await;
+        });
+
+        // The mock clock stays FROZEN. Under `start_paused`, tokio auto-advances
+        // while everything is parked, driving the poll's sleeps and — via the
+        // backstop — the ~30s tokio floor. `timeout` converts a spin into a
+        // failure rather than an indefinite hang.
+        let terminated = tokio::time::timeout(Duration::from_secs(300), handle).await;
+        assert!(
+            terminated.is_ok(),
+            "the retry task MUST terminate via the tokio liveness backstop when \
+             the injected clock is frozen — a spin would hang here (DST safety, \
+             #4857 P2)"
+        );
+        terminated.unwrap().expect("retry task must not panic");
+
+        assert!(
+            drain_resync_targets(&mut notification_rx, key).is_empty(),
+            "a frozen injected clock never crosses a retry target, so no retry \
+             ResyncRequest should dispatch"
+        );
+    }
+
+    /// Issue #4862 (P1): the node-wide retry-task cap bounds outstanding retry
+    /// tasks even when the throttle LRU evicts active reservations under key
+    /// churn. Reserving up to the cap succeeds; the next reservation is refused
+    /// (so `send_queue_full_resync_request` skips the spawn — the immediate
+    /// ResyncRequest still sends); freeing a slot re-admits exactly one. The
+    /// outstanding count never exceeds the cap (hard CAS cap). Uses a per-node
+    /// OpManager so the count is isolated from other tests.
+    #[tokio::test]
+    async fn queue_full_resync_retry_slot_cap_bounds_outstanding_tasks() {
+        let (op_manager, _rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-cap").await;
+        let im = &op_manager.interest_manager;
+        let cap = crate::ring::interest::MAX_OUTSTANDING_QUEUE_FULL_RESYNC_RETRIES;
+
+        // Reserve up to the cap — simulating `cap` outstanding retry tasks that
+        // LRU churn would have spawned. Every reservation within the cap succeeds.
+        let mut slots = Vec::new();
+        for i in 0..cap {
+            let slot = im
+                .try_reserve_resync_retry_slot()
+                .unwrap_or_else(|| panic!("reservation {i} within the cap must succeed"));
+            slots.push(slot);
+        }
+        assert_eq!(
+            im.outstanding_resync_retries(),
+            cap,
+            "outstanding count must reach exactly the cap"
+        );
+
+        // At cap: a further reservation is refused (the caller skips the spawn;
+        // the immediate ResyncRequest is unaffected), and the count does NOT grow.
+        assert!(
+            im.try_reserve_resync_retry_slot().is_none(),
+            "at cap, a further retry-slot reservation MUST be refused (#4862 P1)"
+        );
+        assert_eq!(
+            im.outstanding_resync_retries(),
+            cap,
+            "a refused reservation must not increment the count (hard cap)"
+        );
+
+        // Freeing one slot re-admits exactly one.
+        slots.pop();
+        assert_eq!(
+            im.outstanding_resync_retries(),
+            cap - 1,
+            "dropping a slot guard must free it"
+        );
+        let readmit = im.try_reserve_resync_retry_slot();
+        assert!(
+            readmit.is_some(),
+            "a freed slot must re-admit exactly one reservation"
+        );
+        assert_eq!(
+            im.outstanding_resync_retries(),
+            cap,
+            "re-admission returns the count to the cap"
+        );
+
+        drop(slots);
+        drop(readmit);
+        assert_eq!(
+            im.outstanding_resync_retries(),
+            0,
+            "every slot guard frees its slot on drop"
+        );
+    }
+
+    /// Issue #4862 (P2): when the initial (blocking) enqueue consumes most of the
+    /// reservation window, a fixed `now + jittered_delay` first target would
+    /// already be PAST the deadline → the retry would return with ZERO attempts,
+    /// failing to heal the exact backpressure case. The clamp pulls the first
+    /// target into the remaining window so ≥1 retry still dispatches within
+    /// `[now, reservation_deadline)`.
+    ///
+    /// Simulated by calling the retry with a deadline only 500ms out (well below
+    /// a jittered attempt-1 delay of ~1.6-2.4s) and asserting a retry fires
+    /// before it — without the clamp, none would.
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_fires_within_a_short_remaining_window() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4857-shortwindow").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([15u8; 32]),
+            CodeHash::new([16u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12600".parse().unwrap();
+
+        // Deadline only 500ms out — much less than jittered_resync_retry_delay(1)
+        // (~1.6-2.4s), so a fixed first target would exceed it.
+        let reservation_deadline = op_manager.interest_manager.now() + Duration::from_millis(500);
+        let op_mgr = op_manager.clone();
+        let handle = tokio::spawn(async move {
+            resend_queue_full_resync_request(
+                &op_mgr,
+                key,
+                sender_addr,
+                Transaction::new::<UpdateMsg>(),
+                reservation_deadline,
+            )
+            .await;
+        });
+
+        // Advance up to the deadline in small steps; a clamped retry must fire.
+        let mut fired = Vec::new();
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+            fired.extend(drain_resync_targets(&mut notification_rx, key));
+            if !fired.is_empty() {
+                break;
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        assert!(
+            !fired.is_empty(),
+            "with a short remaining window the clamp must still fire ≥1 retry \
+             within [now, reservation_deadline) (#4862 P2), got none"
+        );
+        assert!(
+            fired.iter().all(|t| *t == sender_addr),
+            "retry must target the original sender, got {fired:?}"
+        );
+    }
+
+    /// Issue #4857 (P2) storm-bound pin: the trailing retry must (1) be spawned
+    /// only AFTER both rate-limit gates pass (the per-sender `begin_resync_request`
+    /// reservation and the global `resync_emit_limiter` emit cap), never on a
+    /// throttled/suppressed drop, and (2) create NO new reservation and stay
+    /// bounded, so the #4251 steady-state cap (≤ `1 + QUEUE_FULL_RESYNC_MAX_RETRIES`
+    /// ResyncRequests per (contract, peer) per 30s window) is preserved.
+    #[test]
+    fn queue_full_resync_retry_is_bounded_and_reservation_scoped() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_body = |name: &str| -> &str {
+            let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
+            let after = &src[start + 1..];
+            let end = after
+                .find("\nasync fn ")
+                .or_else(|| after.find("\n#[cfg(test)]"))
+                .unwrap_or(after.len());
+            &src[start..start + 1 + end]
+        };
+
+        // (1) The retry is scheduled only AFTER both rate-limit gates pass — the
+        // per-(contract, sender) throttle reservation (`begin_resync_request`) and
+        // the global per-contract emit cap (`resync_emit_limiter`, #4864) — so it
+        // never runs on a throttled or globally-suppressed drop.
+        let helper = fn_body("async fn send_queue_full_resync_request(");
+        let gate = helper
+            .find(".begin_resync_request(")
+            .expect("helper must gate on begin_resync_request (per-sender throttle, #4251)");
+        let global_cap = helper
+            .find("resync_emit_limiter")
+            .expect("helper must gate on the global per-contract emit cap (#4864)");
+        let spawn = helper
+            .find("resend_queue_full_resync_request(")
+            .expect("helper must schedule the trailing retry (heal #4857 P2)");
+        assert!(
+            gate < spawn && global_cap < spawn,
+            "the trailing-retry spawn MUST come AFTER both the begin_resync_request \
+             reservation and the global emit-cap gate, so retries only run within a \
+             granted, globally-authorized reservation (never on a throttled or \
+             suppressed drop)"
+        );
+        assert!(
+            helper.contains("GlobalExecutor::spawn("),
+            "the trailing retry must be a spawned background task"
+        );
+
+        // (1a) The retry spawn is gated on a node-wide slot (#4862 P1) so LRU
+        // churn cannot spawn unbounded overlapping retry tasks, and the slot is
+        // moved INTO the task (freed on completion via its Drop guard).
+        let reserve = helper.find("try_reserve_resync_retry_slot(").expect(
+            "retry spawn must be gated on interest_manager.try_reserve_resync_retry_slot() (#4862 P1)",
+        );
+        assert!(
+            reserve < spawn,
+            "the slot reservation must gate the spawn (P1): a spawn without a slot \
+             would defeat the node-wide retry-task cap"
+        );
+        assert!(
+            helper.contains("let _slot = slot;"),
+            "the retry slot guard must be moved into the spawned task so it frees \
+             on task completion (#4862 P1)"
+        );
+
+        // (1b) The retry is spawned CONCURRENTLY, BEFORE the blocking immediate
+        // enqueue (#4862 P2), so its timer runs DURING a backpressured send —
+        // otherwise a send that consumed the whole window would leave the task
+        // starting past the deadline with zero retries.
+        let immediate_send = helper
+            .find(".notify_node_event(")
+            .expect("helper must perform the immediate (blocking) ResyncRequest enqueue");
+        assert!(
+            spawn < immediate_send,
+            "the retry spawn MUST come BEFORE the blocking .notify_node_event() \
+             immediate send (#4862 P2), so the retry timer runs during a \
+             backpressured enqueue"
+        );
+
+        // The helper passes the reservation deadline into the retry so the burst
+        // is anchored to THIS reservation window (review P2-A).
+        assert!(
+            helper.contains("reservation_deadline"),
+            "the helper must thread the reservation deadline from \
+             begin_resync_request into the retry (anchor to the window, P2-A)"
+        );
+
+        // (2) The retry body RE-DELIVERS the one already-authorized emit: it must
+        // NOT re-consult the per-sender throttle (begin_resync_request), the
+        // global emit cap (resync_emit_limiter), or re-record the outstanding
+        // request (outstanding_resync_requests) — so it creates no new reservation
+        // and consumes no extra global token (storm bound #4251 / #4864 cap).
+        let retry = fn_body("async fn resend_queue_full_resync_request(");
+        assert!(
+            !retry.contains("begin_resync_request")
+                && !retry.contains("resync_emit_limiter")
+                && !retry.contains("outstanding_resync_requests"),
+            "resend_queue_full_resync_request must NOT re-consult the throttle, the \
+             global emit cap, or re-record the outstanding request — its sends \
+             belong to the caller's single granted reservation (storm bound \
+             #4251 / #4864 cap)"
+        );
+        assert!(
+            retry.contains("in 1..=QUEUE_FULL_RESYNC_MAX_RETRIES"),
+            "the retry loop must be bounded by QUEUE_FULL_RESYNC_MAX_RETRIES"
+        );
+        assert!(
+            retry.contains("try_notify_node_event"),
+            "retries must use the NON-blocking try_notify_node_event \
+             (bounded-channel rule; blocking would pin the task up to 30s)"
+        );
+        // (3) Both the delay pacing and the stop condition are driven by the
+        // throttle's OWN clock (`interest_manager.now()`), not tokio's or a
+        // fresh wall clock, so sims that advance the injected clock are
+        // deterministic and the burst can never cross the reservation window
+        // (review P2-A/P2-B).
+        assert!(
+            retry.contains("interest_manager.now()"),
+            "the retry must pace + gate on interest_manager.now() (the throttle's \
+             injected clock), not tokio's independent clock (P2-B)"
+        );
+        assert!(
+            retry.contains("reservation_deadline"),
+            "the retry must stop once interest_manager.now() reaches the \
+             reservation deadline (P2-A)"
+        );
+        // (4) A tokio-clock liveness backstop floors the task at one reservation
+        // interval so a DECOUPLED injected clock that freezes before its deadline
+        // cannot make the poll spin forever (DST safety). The injected deadline
+        // above stays primary; this is purely an additional floor.
+        assert!(
+            retry.contains("started.elapsed()") && retry.contains("RESYNC_REQUEST_MIN_INTERVAL"),
+            "the retry must have a tokio-clock liveness backstop \
+             (started.elapsed() >= RESYNC_REQUEST_MIN_INTERVAL) so a frozen \
+             injected clock cannot make it spin — while keeping the injected \
+             reservation deadline as the primary stop"
+        );
+    }
+
+    /// Issue #4857 (P2): the whole trailing-retry burst, measured from
+    /// task-start on the throttle's clock, comfortably fits inside the single
+    /// 30s `RESYNC_REQUEST_MIN_INTERVAL` reservation. This is a belt-and-braces
+    /// check: the retry is ALSO hard-stopped at the reservation deadline (see
+    /// `queue_full_resync_retry_stops_after_reservation_deadline`), so it can
+    /// never spill into the next reservation even if this span check regressed.
+    /// Pins the worst-case span against the constants.
+    #[test]
+    fn resync_retry_span_stays_within_throttle_window() {
+        // Worst case = sum_{n=1..=MAX} n * BASE * 1.2 (largest jitter factor).
+        let max = QUEUE_FULL_RESYNC_MAX_RETRIES as u64;
+        let triangular = max * (max + 1) / 2; // sum of 1..=MAX
+        let worst_case = QUEUE_FULL_RESYNC_RETRY_BASE_DELAY.mul_f64(triangular as f64 * 1.2);
+        // RESYNC_REQUEST_MIN_INTERVAL is 30s (crate::ring::interest.rs); kept
+        // private there, so pin the literal here with a cross-reference.
+        assert!(
+            worst_case < Duration::from_secs(30),
+            "worst-case retry span {worst_case:?} must stay under the 30s \
+             RESYNC_REQUEST_MIN_INTERVAL reservation window (interest.rs)"
+        );
+    }
+
+    /// Issue #4857 (P2): the jittered retry delay must stay within the ±20%
+    /// band around `attempt * QUEUE_FULL_RESYNC_RETRY_BASE_DELAY` the
+    /// retry/backoff rule mandates — never below 0.8× (spin-loop guard) and
+    /// strictly below 1.2× (half-open `random_range`). Sampled across many
+    /// seeds so a bad jitter formula can't slip through on one lucky seed.
+    #[test]
+    fn jittered_resync_retry_delay_stays_within_bounds() {
+        for attempt in 1..=QUEUE_FULL_RESYNC_MAX_RETRIES {
+            let lo = QUEUE_FULL_RESYNC_RETRY_BASE_DELAY.mul_f64(attempt as f64 * 0.8);
+            let hi = QUEUE_FULL_RESYNC_RETRY_BASE_DELAY.mul_f64(attempt as f64 * 1.2);
+            for seed in 0..128u64 {
+                let _guard = GlobalRng::seed_guard(seed);
+                for _ in 0..16 {
+                    let d = jittered_resync_retry_delay(attempt);
+                    assert!(
+                        d >= lo,
+                        "delay {d:?} below 0.8× for attempt {attempt} (seed {seed})"
+                    );
+                    assert!(
+                        d < hi,
+                        "delay {d:?} at/above 1.2× for attempt {attempt} (seed {seed})"
+                    );
+                }
+            }
         }
     }
 
