@@ -4089,6 +4089,53 @@ mod tests {
         );
     }
 
+    /// Source-scrape pin (HQk7 fork investigation): the `ResyncResponse` arm
+    /// must apply the received full state through the contract handler's
+    /// `UpdateQuery` merge path — i.e. through the contract's own
+    /// `validate_state`/`update_state` — and never via a direct store. The
+    /// executor-side pins (`full_state_version_gate_pins` in
+    /// `executor_impl.rs`) guard the upsert body; this pin guards the
+    /// likelier regression site, the resync arm itself, where a future
+    /// "optimization" could bypass the merge with a blind state write and
+    /// silently disable a well-behaved contract's version gate (the
+    /// lower-version-overwrites-higher failure class).
+    #[test]
+    fn resync_response_arm_applies_via_update_query_not_blind_store() {
+        let src = include_str!("node.rs");
+
+        let handler_start = src
+            .find("async fn handle_interest_sync_message(")
+            .expect("handle_interest_sync_message not found");
+        // Scope to the apply segment of the ResyncResponse arm: from the
+        // received-log marker (unique to the arm) to the applied-log marker.
+        // The correlation gate, UpdateData construction, and contract-handler
+        // dispatch all live between the two.
+        let recv_off = src[handler_start..]
+            .find("event = \"resync_response_received\"")
+            .expect("resync_response_received marker not found");
+        let applied_off = src[handler_start..]
+            .find("event = \"resync_applied\"")
+            .expect("resync_applied marker not found");
+        let apply_segment = &src[handler_start + recv_off..handler_start + applied_off];
+
+        assert!(
+            apply_segment.contains("UpdateData::State("),
+            "the resync full state must be wrapped as UpdateData::State"
+        );
+        assert!(
+            apply_segment.contains("ContractHandlerEvent::UpdateQuery"),
+            "the resync apply must route through notify_contract_handler \
+             (ContractHandlerEvent::UpdateQuery) so the contract's own \
+             validate_state/update_state judge the incoming state"
+        );
+        assert!(
+            !apply_segment.contains("PutQuery") && !apply_segment.contains(".store("),
+            "the resync arm must NOT install state via PutQuery or a direct \
+             store — that would bypass the contract's version acceptance for \
+             already-held contracts"
+        );
+    }
+
     /// Regression pin for the D2 `is_upstream` clobber in the `ChangeInterests`
     /// interest-sync arm.
     ///

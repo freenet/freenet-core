@@ -30,22 +30,35 @@
 //!
 //! ## Mechanism
 //!
-//! Two signals arm the memo, both counted per contract:
+//! Two signals strike against a contract:
 //!
 //! 1. **Resync-after-our-delta** (sender-side observation): a `ResyncRequest`
 //!    arrives from a peer we sent a delta to for that contract within the
 //!    attribution window ([`DELTA_ATTRIBUTION_WINDOW`]). A receiver that
 //!    fails a delta apply immediately ResyncRequests the delta's sender
 //!    (`operations/update/op_ctx_task.rs`), so this is the wire-visible form
-//!    of the receiver's `delta_apply_failed`.
+//!    of the receiver's `delta_apply_failed`. The wire signal is AMBIGUOUS,
+//!    however: a receiver also ResyncRequests after a queue-full drop
+//!    (#4857) or a Timeout-class WASM failure — pure LOAD, indistinguishable
+//!    at the sender. Resync strikes therefore only count toward arming once
+//!    they have come from **at least two DISTINCT peer addresses**: two
+//!    independent receivers bouncing our deltas is strong evidence the
+//!    CONTRACT rejects deltas, while any number of resyncs from a single
+//!    peer says only that that one peer is overloaded (or malicious — this
+//!    also closes the single-peer false-arm vector, since attribution is
+//!    per-`(contract, peer)` and one address can never arm alone).
 //! 2. **Local delta-apply failure** (receiver-side observation): our own WASM
 //!    apply of a received delta failed with an `Invalid`-class contract
 //!    rejection. We fan the same contract out to *our* downstreams, so what
-//!    we just learned applies to our own delta sends too.
+//!    we just learned applies to our own delta sends too. This is genuine
+//!    per-node evidence (the contract itself rejected the delta on OUR
+//!    executor), so it counts contract-wide with no corroboration
+//!    requirement.
 //!
-//! [`INCOMPAT_TRIP_THRESHOLD`] consecutive failure signals (with no
-//! intervening successful delta apply) arm the memo for
-//! [`DELTA_INCOMPAT_TTL`]. Trip-at-1 would flip a healthy contract to
+//! The memo arms for [`DELTA_INCOMPAT_TTL`] when the EFFECTIVE strike count
+//! — local strikes plus (resync strikes if corroborated by ≥2 distinct
+//! peers, else 0) — reaches [`INCOMPAT_TRIP_THRESHOLD`], with no intervening
+//! successful delta apply. Trip-at-1 would flip a healthy contract to
 //! full-state fan-out on a single benign stale-version rejection (the same
 //! rationale as `merge_backoff::INVALID_TRIP_THRESHOLD`); a delta-incapable
 //! contract fails every delta from every peer, so it trips within one or two
@@ -97,8 +110,12 @@ pub(crate) const DELTA_INCOMPAT_TTL: Duration = Duration::from_secs(10 * 60);
 /// plus queueing; 60s matches `resync_rate_limit::OUTSTANDING_RESYNC_TTL`.
 pub(crate) const DELTA_ATTRIBUTION_WINDOW: Duration = Duration::from_secs(60);
 
-/// Consecutive failure signals (no intervening successful delta apply)
-/// required to arm the memo. See module docs for the trip-at-1 rationale.
+/// EFFECTIVE strikes (no intervening successful delta apply) required to arm
+/// the memo: local strikes plus resync strikes, the latter counting only once
+/// corroborated by ≥2 distinct peers (see module docs). The strike that
+/// brings the effective count to this value arms — the check runs uniformly
+/// on every strike (including the very first), so a value of 1 means
+/// trip-at-1, not trip-at-2.
 pub(crate) const INCOMPAT_TRIP_THRESHOLD: u32 = 3;
 
 /// Hard cap on tracked contracts. At ~64 bytes/entry ≈ 0.5 MB worst case.
@@ -112,13 +129,51 @@ pub(crate) const MAX_TRACKED_DELTA_SENDS: usize = 16_384;
 const CONTRACT_CLEANUP_AGE: Duration = Duration::from_secs(20 * 60);
 
 struct ContractEntry {
-    /// Consecutive failure signals since the last successful delta apply.
-    consecutive_failures: u32,
+    /// Strikes from OUR OWN failed delta applies (`Invalid`-class contract
+    /// rejections) since the last successful delta apply. Genuine per-node
+    /// evidence: counts contract-wide with no corroboration requirement.
+    local_strikes: u32,
+    /// Strikes from attributed `ResyncRequest`s since the last successful
+    /// delta apply. Wire-ambiguous evidence (also fires on receiver
+    /// queue-full/timeout, i.e. pure load): only counts toward arming once
+    /// `multi_peer_resync` is set.
+    resync_strikes: u32,
+    /// The first peer address that contributed a resync strike; used to
+    /// detect the second DISTINCT address.
+    first_resync_peer: Option<SocketAddr>,
+    /// Set once resync strikes have come from ≥2 distinct peer addresses —
+    /// the corroboration that upgrades them from "one peer is overloaded or
+    /// lying" to "the contract rejects deltas".
+    multi_peer_resync: bool,
     /// While `Some(t)` with `t > now`, deltas for this contract are
     /// suppressed in favor of full state.
     armed_until: Option<Instant>,
     /// Last failure signal, for idle cleanup.
     last_event: Instant,
+}
+
+impl ContractEntry {
+    fn new(now: Instant) -> Self {
+        Self {
+            local_strikes: 0,
+            resync_strikes: 0,
+            first_resync_peer: None,
+            multi_peer_resync: false,
+            armed_until: None,
+            last_event: now,
+        }
+    }
+
+    /// Strikes that count toward arming: local strikes always; resync
+    /// strikes only once corroborated by ≥2 distinct peers.
+    fn effective_strikes(&self) -> u32 {
+        let resync = if self.multi_peer_resync {
+            self.resync_strikes
+        } else {
+            0
+        };
+        self.local_strikes.saturating_add(resync)
+    }
 }
 
 /// Sender-side "this contract can't take deltas" memo. See module docs.
@@ -187,43 +242,63 @@ impl DeltaIncompat {
             // Stale attribution — not evidence about the delta we sent.
             return false;
         }
-        self.note_failure(contract, now);
+        self.note_failure(contract, now, Some(peer));
         true
     }
 
     /// Our own WASM apply of a RECEIVED delta for `contract` failed with an
     /// `Invalid`-class contract rejection (the receiver-side form of the same
-    /// signal; see module docs).
+    /// signal; see module docs). Counts contract-wide — genuine per-node
+    /// evidence, no distinct-peer corroboration required.
     pub fn note_delta_apply_failed(&self, contract: ContractInstanceId) {
         let now = self.time_source.now();
-        self.note_failure(contract, now);
+        self.note_failure(contract, now, None);
     }
 
-    fn note_failure(&self, contract: ContractInstanceId, now: Instant) {
+    /// Apply one strike. `resync_peer` is `Some` for the wire-ambiguous
+    /// resync-after-delta signal (counted only once ≥2 distinct peers have
+    /// contributed; see module docs) and `None` for a local delta-apply
+    /// failure (always counted). The arm check runs uniformly on every
+    /// strike — including the one that creates the entry — so the threshold
+    /// constant means exactly "arm at N effective strikes".
+    fn note_failure(
+        &self,
+        contract: ContractInstanceId,
+        now: Instant,
+        resync_peer: Option<SocketAddr>,
+    ) {
         let mut armed = false;
-        match self.contracts.entry(contract) {
-            dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                let entry = e.get_mut();
-                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-                entry.last_event = now;
-                if entry.consecutive_failures >= INCOMPAT_TRIP_THRESHOLD {
-                    let was_armed = matches!(entry.armed_until, Some(until) if until > now);
-                    entry.armed_until = Some(now + DELTA_INCOMPAT_TTL);
-                    armed = !was_armed;
+        {
+            let mut entry = match self.contracts.entry(contract) {
+                dashmap::mapref::entry::Entry::Occupied(e) => e.into_ref(),
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    // Strict cap: at capacity, skip (no suppression for the
+                    // new contract, but no unbounded growth either).
+                    if self.contracts_size.load(Ordering::Relaxed) >= MAX_TRACKED_CONTRACTS {
+                        return;
+                    }
+                    self.contracts_size.fetch_add(1, Ordering::Relaxed);
+                    e.insert(ContractEntry::new(now))
+                }
+            };
+            match resync_peer {
+                Some(peer) => {
+                    entry.resync_strikes = entry.resync_strikes.saturating_add(1);
+                    match entry.first_resync_peer {
+                        None => entry.first_resync_peer = Some(peer),
+                        Some(first) if first != peer => entry.multi_peer_resync = true,
+                        Some(_) => {}
+                    }
+                }
+                None => {
+                    entry.local_strikes = entry.local_strikes.saturating_add(1);
                 }
             }
-            dashmap::mapref::entry::Entry::Vacant(e) => {
-                // Strict cap: at capacity, skip (no suppression for the new
-                // contract, but no unbounded growth either).
-                if self.contracts_size.load(Ordering::Relaxed) >= MAX_TRACKED_CONTRACTS {
-                    return;
-                }
-                e.insert(ContractEntry {
-                    consecutive_failures: 1,
-                    armed_until: None,
-                    last_event: now,
-                });
-                self.contracts_size.fetch_add(1, Ordering::Relaxed);
+            entry.last_event = now;
+            if entry.effective_strikes() >= INCOMPAT_TRIP_THRESHOLD {
+                let was_armed = matches!(entry.armed_until, Some(until) if until > now);
+                entry.armed_until = Some(now + DELTA_INCOMPAT_TTL);
+                armed = !was_armed;
             }
         }
         if armed {
@@ -321,8 +396,9 @@ mod tests {
         (ts, memo)
     }
 
-    /// The core Bug-2 repro: repeated resync-after-delta signals arm the
-    /// memo, after which delta sends are suppressed (full-state fallback).
+    /// The core Bug-2 repro: repeated resync-after-delta signals from
+    /// DISTINCT peers arm the memo, after which delta sends are suppressed
+    /// (full-state fallback).
     #[test]
     fn resync_after_delta_arms_after_threshold() {
         let (_ts, memo) = setup();
@@ -340,8 +416,45 @@ mod tests {
         }
         assert!(
             memo.suppress_deltas(&c),
-            "after {INCOMPAT_TRIP_THRESHOLD} attributed resyncs the sender must \
-             fall back to full-state sends"
+            "after {INCOMPAT_TRIP_THRESHOLD} attributed resyncs from distinct \
+             peers the sender must fall back to full-state sends"
+        );
+        assert_eq!(memo.armed_total(), 1);
+    }
+
+    /// Single-peer resync strikes must NEVER arm — the wire ResyncRequest is
+    /// ambiguous (queue-full drops and Timeout-class WASM failures fire it
+    /// too, i.e. pure load), so one overloaded or malicious peer bouncing
+    /// our deltas is not evidence about the CONTRACT. A second DISTINCT peer
+    /// corroborating is, and arms.
+    #[test]
+    fn single_peer_resyncs_do_not_arm_but_two_distinct_peers_do() {
+        let (_ts, memo) = setup();
+        let c = contract(11);
+        let lone = peer(4300);
+        // Far past the threshold, all from ONE peer: never arms.
+        for i in 0..(INCOMPAT_TRIP_THRESHOLD * 3) {
+            memo.record_delta_sent(c, lone);
+            assert!(
+                memo.note_resync_request(c, lone),
+                "attributed resync must still be consumed/counted (i={i})"
+            );
+            assert!(
+                !memo.suppress_deltas(&c),
+                "resync strikes from a single peer must NOT arm (i={i}) — \
+                 one peer bouncing deltas is load/malice, not contract evidence"
+            );
+        }
+        assert_eq!(memo.armed_total(), 0);
+
+        // One strike from a second DISTINCT peer corroborates: the whole
+        // resync strike count now applies and the memo arms.
+        let second = peer(4301);
+        memo.record_delta_sent(c, second);
+        assert!(memo.note_resync_request(c, second));
+        assert!(
+            memo.suppress_deltas(&c),
+            "a second distinct peer must corroborate the resync strikes and arm"
         );
         assert_eq!(memo.armed_total(), 1);
     }

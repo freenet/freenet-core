@@ -805,6 +805,23 @@ async fn try_summary_first_put(
         }
     }
 
+    // Delta-incompat gate (HQk7 resync loop): if the contract is armed as
+    // delta-incapable, the ProbeReconcile delta below is doomed at the
+    // holder ("Invalid update"). Fall through to the full-state driver
+    // instead — the same recovery the delta-computation-failure arm uses.
+    // See `crate::ring::delta_incompat`.
+    if op_manager.ring.delta_incompat.suppress_deltas(key.id()) {
+        tracing::debug!(
+            tx = %client_tx,
+            contract = %key,
+            event = "delta_suppressed_incompat",
+            phase = "summary_first_delta_suppressed",
+            "PUT summary-first: contract is in delta-incompat backoff; \
+             falling through to full-state driver"
+        );
+        return SummaryFirstOutcome::FallThrough;
+    }
+
     let our_state_size = merged_value.size();
     let delta = match op_manager
         .interest_manager
@@ -4265,6 +4282,41 @@ mod tests {
 
     fn dummy_key() -> ContractKey {
         ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
+    }
+
+    /// Source-scrape pin (HQk7 resync loop): the summary-first PUT path must
+    /// consult the delta-incompat memo BEFORE computing the ProbeReconcile
+    /// delta and fall through to the full-state driver for an armed
+    /// contract. Without the gate this path keeps sending doomed deltas to a
+    /// delta-incapable holder (bounded per-PUT, no loop — but every one is a
+    /// wasted WASM delta computation plus a guaranteed "Invalid update" at
+    /// the holder). See `crate::ring::delta_incompat`.
+    #[test]
+    fn summary_first_put_gates_delta_on_incompat_memo() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_start = src
+            .find("async fn try_summary_first_put(")
+            .expect("try_summary_first_put not found");
+        let after = &src[fn_start..];
+        let fn_end = after.find("\nasync fn ").unwrap_or(after.len());
+        let body = &after[..fn_end];
+
+        let gate_pos = body
+            .find(".suppress_deltas(")
+            .expect("try_summary_first_put must consult the delta-incompat memo");
+        let delta_pos = body
+            .find(".compute_delta(")
+            .expect("ProbeReconcile compute_delta call not found");
+        assert!(
+            gate_pos < delta_pos,
+            "the delta-incompat gate must run BEFORE compute_delta \
+             (gate {gate_pos} < compute_delta {delta_pos})"
+        );
+        let fallthrough = &body[gate_pos..delta_pos];
+        assert!(
+            fallthrough.contains("SummaryFirstOutcome::FallThrough"),
+            "an armed contract must fall through to the full-state driver"
+        );
     }
 
     fn dummy_tx() -> Transaction {
