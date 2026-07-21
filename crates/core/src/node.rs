@@ -4087,6 +4087,22 @@ mod tests {
              (memo {memo_pos} < limiter {limiter_pos}) — a suppressed response \
              is still a valid delta-incompatibility signal"
         );
+        // Also lock memo-before-broken-gate: B's `is_contract_broken → return
+        // None` egress gate sits between the memo and the limiters, and the
+        // arming's own comment requires it run "before the broken-contract
+        // egress gate". Without this assertion a future edit could move the
+        // arming after the gate (silently dropping the signal for broken
+        // contracts) and still pass the memo-before-limiter check above.
+        let broken_pos = req_arm
+            .find("is_contract_broken")
+            .expect("the ResyncRequest arm must gate on the broken-contract egress check (B)");
+        assert!(
+            memo_pos < broken_pos,
+            "note_resync_request must run BEFORE the broken-contract egress gate \
+             (memo {memo_pos} < broken {broken_pos}) — the delta-incompatibility \
+             signal is valid even when the full-state response is suppressed for a \
+             broken contract"
+        );
     }
 
     /// Source-scrape pin (HQk7 fork investigation): the `ResyncResponse` arm

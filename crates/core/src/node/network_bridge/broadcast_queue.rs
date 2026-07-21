@@ -1530,6 +1530,27 @@ mod tests {
             body.contains("_ if deltas_suppressed => ("),
             "suppression must short-circuit the payload match to FullState"
         );
+        // The guard arm must be FIRST in the payload match: Rust evaluates
+        // arms in order, so `_ if deltas_suppressed` has to precede the
+        // `(Some(ours), Some(theirs))` compute_delta arm — otherwise a
+        // suppressed contract with both summaries present would compute and
+        // send the doomed delta (or, post-#4901, hit the Ok(None) converged
+        // skip) instead of forcing full state. The `.suppress_deltas(` call
+        // above precedes the match regardless, so only this arm-ordering
+        // assertion catches a reordering regression.
+        let guard_arm = body
+            .find("_ if deltas_suppressed => (")
+            .expect("guard arm not found");
+        let compute_arm = body
+            .find("(Some(ours), Some(theirs)) => {")
+            .expect("compute_delta arm `(Some(ours), Some(theirs))` not found");
+        assert!(
+            guard_arm < compute_arm,
+            "the `_ if deltas_suppressed` guard arm must come BEFORE the \
+             `(Some(ours), Some(theirs))` compute_delta arm (guard {guard_arm} \
+             < compute {compute_arm}) — a suppressed delta-incapable contract \
+             must never reach compute_delta"
+        );
 
         // 2. Delivered delta sends must be recorded for ResyncRequest
         //    attribution, gated on sent_delta (full-state sends must NOT
