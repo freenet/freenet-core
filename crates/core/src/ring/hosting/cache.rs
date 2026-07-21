@@ -1732,8 +1732,9 @@ impl<T: TimeSource> HostingCache<T> {
     ///
     /// Per axis, when `total_rate > floor`, the candidates are the hosted
     /// contracts satisfying [`cost_eviction_candidate`] (zero local
-    /// subscriptions AND zero downstream subscribers AND attributed rate
-    /// > 0) whose rate exceeds [`COST_SHARE_THRESHOLD`] × `total_rate`.
+    /// subscriptions AND zero downstream subscribers AND strictly positive
+    /// attributed rate) whose rate exceeds [`COST_SHARE_THRESHOLD`] ×
+    /// `total_rate`.
     /// Candidates are shed in DESCENDING attributed-rate order (contract-key
     /// bytes as a deterministic tiebreak); the deficit is covered exactly when
     /// no remaining zero-demand contract holds more than the threshold share
