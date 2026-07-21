@@ -1403,6 +1403,10 @@ pub enum BanReasonSnapshot {
     AutoMad,
     /// Operator-driven via the CLI / config flag (#4274).
     Operator,
+    /// Durable quarantine: escalated by the broken-invariants tracker
+    /// after repeated non-idempotency detections (broadcast-echo storm
+    /// shape). See `ring::broken_invariants`.
+    NonIdempotent,
 }
 
 /// Snapshot of the governance system's state, mirrored from

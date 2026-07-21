@@ -3059,6 +3059,26 @@ async fn handle_interest_sync_message(
             op_manager.interest_manager.record_resync_request_received();
             crate::config::GlobalTestMetrics::record_resync_request();
 
+            // Egress gate (broken invariants): a contract flagged as
+            // violating CRDT idempotency must not have its full state
+            // served to peers. The executor already suppresses commit +
+            // BroadcastStateChange for a flagged contract, but a
+            // ResyncResponse from this node would still hand the
+            // problematic state to the requester, re-seeding the
+            // non-idempotent broadcast echo the flag exists to quarantine
+            // (#4279 storm shape). Suppress the response; the requester's
+            // retry lands on an unflagged peer or waits out the TTL. See
+            // `crate::ring::broken_invariants`.
+            if op_manager.ring.is_contract_broken(&key) {
+                tracing::debug!(
+                    from = %source,
+                    contract = %key,
+                    event = "resync_response_suppressed_broken_contract",
+                    "ResyncRequest for contract flagged as broken — not serving full state"
+                );
+                return None;
+            }
+
             // CHEAP existence check BEFORE the rate limiters (#4864 round-4 P1).
             // Both limiter buckets allocate a slot (vacant-at-capacity) BEFORE any
             // existence check, so a peer spraying bogus contract keys could

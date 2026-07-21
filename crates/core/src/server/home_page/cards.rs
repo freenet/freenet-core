@@ -1376,6 +1376,9 @@ pub fn build_ban_list_card(snap: &Option<network_status::NetworkStatusSnapshot>)
                 // in practice only the operator path produces live entries.
                 network_status::BanReasonSnapshot::AutoMad => "auto (legacy governance, dormant)",
                 network_status::BanReasonSnapshot::Operator => "operator",
+                network_status::BanReasonSnapshot::NonIdempotent => {
+                    "non-idempotent (CRDT violation quarantine)"
+                }
             };
             let remaining = if e.expires_in_secs == 0 {
                 "lifting".to_string()

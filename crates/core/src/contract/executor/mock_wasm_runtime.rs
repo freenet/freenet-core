@@ -51,6 +51,13 @@ pub(crate) enum UpdateOverride {
     /// Used by tests to verify the idempotency probe fires on a real-
     /// world-shaped failure mode.
     NonIdempotent(std::sync::Arc<std::sync::atomic::AtomicU64>),
+    /// Models the #4295 false-positive shape: a correct, logically-
+    /// idempotent contract whose serialization is non-canonical
+    /// (HashMap/HashSet iteration order). Every call returns the logical
+    /// input state's bytes ROTATED left by one — byte-different from the
+    /// input but the same byte MULTISET — so the detectors must classify
+    /// it as benign flutter, NOT a violation.
+    ReorderBytes,
 }
 
 /// A lightweight mock runtime at the `ContractRuntimeInterface` level that lets
@@ -186,6 +193,31 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                     // production rather than growing unboundedly.
                     let tail_start = logical.len().min(8);
                     out.extend_from_slice(&logical[tail_start..]);
+                    return Ok(UpdateModification::valid(out.into()));
+                }
+                UpdateOverride::ReorderBytes => {
+                    // Same logical-input precedence as the other overrides,
+                    // then rotate: byte-different output, identical byte
+                    // multiset (the #4295 serialization-flutter shape).
+                    let mut out = update_data
+                        .iter()
+                        .find_map(|u| match u {
+                            UpdateData::State(s) => Some(s.as_ref().to_vec()),
+                            UpdateData::Delta(d) => Some(d.as_ref().to_vec()),
+                            UpdateData::StateAndDelta { state, .. } => {
+                                Some(state.as_ref().to_vec())
+                            }
+                            UpdateData::RelatedState { .. }
+                            | UpdateData::RelatedDelta { .. }
+                            | UpdateData::RelatedStateAndDelta { .. } => None,
+                            // `UpdateData` is `#[non_exhaustive]`; fall
+                            // through to the `_state` fallback.
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| _state.as_ref().to_vec());
+                    if !out.is_empty() {
+                        out.rotate_left(1);
+                    }
                     return Ok(UpdateModification::valid(out.into()));
                 }
             }

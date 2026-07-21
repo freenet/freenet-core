@@ -1114,18 +1114,27 @@ impl ReDb {
 
     /// Persist a broken-invariant flag for the given contract instance.
     /// `kind_byte` is the single-byte encoding produced by
-    /// `BrokenInvariant::to_byte`. Repeated calls overwrite — the tracker's
-    /// in-memory layer suppresses redundant writes for already-flagged
-    /// contracts, but we don't depend on that here.
+    /// `BrokenInvariant::to_byte`; `escalations` is the tracker's durable
+    /// re-flag escalation count (see `ring::broken_invariants` — at
+    /// `ESCALATIONS_FOR_BAN` the contract is fed to the ban list, and the
+    /// count must survive restarts so a re-hydrated node re-arms the ban).
+    /// Row format: `[kind_byte, escalations_u32_le…]` (5 bytes). Repeated
+    /// calls overwrite — the tracker's in-memory layer bounds write
+    /// frequency (one write per flag episode), but we don't depend on
+    /// that here.
     pub fn store_broken_invariant(
         &self,
         instance_id: &ContractInstanceId,
         kind_byte: u8,
+        escalations: u32,
     ) -> Result<(), redb::Error> {
+        let mut value = [0u8; 5];
+        value[0] = kind_byte;
+        value[1..5].copy_from_slice(&escalations.to_le_bytes());
         let txn = self.begin_write()?;
         {
             let mut tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
-            tbl.insert(instance_id.as_ref(), &[kind_byte][..])?;
+            tbl.insert(instance_id.as_ref(), &value[..])?;
         }
         Self::commit_guarded(txn)
     }
@@ -1146,11 +1155,20 @@ impl ReDb {
         Self::commit_guarded(txn)
     }
 
-    /// Load all persisted broken-invariant flags. Malformed rows (wrong
+    /// Load all persisted broken-invariant flags as
+    /// `(instance_id, kind_byte, escalations)`. Malformed rows (wrong
     /// key length, wrong value length) are skipped with a warning rather
     /// than failing the entire load — a corrupted entry should not block
     /// startup, and the worst case is we lose a flag and re-detect it.
-    pub fn load_all_broken_invariants(&self) -> Result<Vec<(ContractInstanceId, u8)>, redb::Error> {
+    ///
+    /// Accepts both row formats: the legacy pre-escalation single-byte
+    /// `[kind_byte]` row (loaded with `escalations = 0`) and the current
+    /// 5-byte `[kind_byte, escalations_u32_le…]` row, so an upgrade over
+    /// an existing database keeps its flags.
+    #[allow(clippy::type_complexity)]
+    pub fn load_all_broken_invariants(
+        &self,
+    ) -> Result<Vec<(ContractInstanceId, u8, u32)>, redb::Error> {
         self.read_guarded(|txn| {
             let tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
 
@@ -1168,14 +1186,25 @@ impl ReDb {
                     }
                 };
                 let v = value.value();
-                if v.len() != 1 {
-                    tracing::warn!(
-                        len = v.len(),
-                        "Skipping malformed broken-invariants row (value length)"
-                    );
-                    continue;
-                }
-                result.push((ContractInstanceId::new(key_bytes), v[0]));
+                let (kind_byte, escalations) = match v.len() {
+                    // Legacy pre-escalation row: kind only.
+                    1 => (v[0], 0u32),
+                    // Current row: kind + escalation count.
+                    5 => {
+                        let esc = u32::from_le_bytes(
+                            v[1..5].try_into().expect("slice length checked above"),
+                        );
+                        (v[0], esc)
+                    }
+                    _ => {
+                        tracing::warn!(
+                            len = v.len(),
+                            "Skipping malformed broken-invariants row (value length)"
+                        );
+                        continue;
+                    }
+                };
+                result.push((ContractInstanceId::new(key_bytes), kind_byte, escalations));
             }
             Ok(result)
         })
@@ -1467,11 +1496,13 @@ mod tests {
         let id_a = fake_instance_id(0xA1);
         let id_b = fake_instance_id(0xB2);
 
-        // Initial open + write.
+        // Initial open + write. Distinct escalation counts so the
+        // round-trip proves the count column survives too (the durable-
+        // quarantine re-ban at startup depends on it).
         {
             let db = ReDb::new(temp_dir.path()).await.unwrap();
-            db.store_broken_invariant(&id_a, 0).expect("store id_a");
-            db.store_broken_invariant(&id_b, 0).expect("store id_b");
+            db.store_broken_invariant(&id_a, 0, 0).expect("store id_a");
+            db.store_broken_invariant(&id_b, 0, 3).expect("store id_b");
         }
 
         // Reopen. The exact instance must come back through
@@ -1480,14 +1511,45 @@ mod tests {
         // to hydrate the in-memory flag map.
         let db = ReDb::new(temp_dir.path()).await.unwrap();
         let mut loaded = db.load_all_broken_invariants().expect("load");
-        loaded.sort_by_key(|(id, _)| id.as_bytes().to_vec());
+        loaded.sort_by_key(|(id, _, _)| id.as_bytes().to_vec());
 
-        let mut expected = vec![(id_a, 0u8), (id_b, 0u8)];
-        expected.sort_by_key(|(id, _)| id.as_bytes().to_vec());
+        let mut expected = vec![(id_a, 0u8, 0u32), (id_b, 0u8, 3u32)];
+        expected.sort_by_key(|(id, _, _)| id.as_bytes().to_vec());
 
         assert_eq!(
             loaded, expected,
-            "broken-invariants table must survive close-and-reopen exactly"
+            "broken-invariants table must survive close-and-reopen exactly \
+             (including the escalation count)"
+        );
+    }
+
+    /// A legacy pre-escalation row (single `[kind_byte]` value, written by
+    /// releases before the durable-quarantine escalation counter) must
+    /// still load — with `escalations = 0` — so an upgrade over an
+    /// existing database keeps its flags instead of dropping them as
+    /// malformed.
+    #[tokio::test]
+    async fn broken_invariants_legacy_single_byte_row_loads_with_zero_escalations() {
+        let temp_dir = TempDir::new().unwrap();
+        let id = fake_instance_id(0x5C);
+
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        // Write a raw legacy-format row directly to the table, bypassing
+        // the current 5-byte writer.
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut tbl = txn.open_table(BROKEN_INVARIANTS_TABLE).unwrap();
+                tbl.insert(id.as_ref(), &[0u8][..]).unwrap();
+            }
+            ReDb::commit_guarded(txn).unwrap();
+        }
+
+        let loaded = db.load_all_broken_invariants().expect("load");
+        assert_eq!(
+            loaded,
+            vec![(id, 0u8, 0u32)],
+            "legacy 1-byte rows must load with escalations = 0, not be skipped"
         );
     }
 
@@ -1502,7 +1564,7 @@ mod tests {
 
         {
             let db = ReDb::new(temp_dir.path()).await.unwrap();
-            db.store_broken_invariant(&id, 0).unwrap();
+            db.store_broken_invariant(&id, 0, 0).unwrap();
             assert_eq!(db.load_all_broken_invariants().unwrap().len(), 1);
             db.remove_broken_invariant(&id).unwrap();
             assert!(db.load_all_broken_invariants().unwrap().is_empty());
@@ -1525,13 +1587,17 @@ mod tests {
         let db = ReDb::new(temp_dir.path()).await.unwrap();
         let id = fake_instance_id(0x77);
 
-        db.store_broken_invariant(&id, 0).unwrap();
-        db.store_broken_invariant(&id, 0).unwrap();
-        db.store_broken_invariant(&id, 0).unwrap();
+        db.store_broken_invariant(&id, 0, 0).unwrap();
+        db.store_broken_invariant(&id, 0, 1).unwrap();
+        db.store_broken_invariant(&id, 0, 2).unwrap();
 
         let rows = db.load_all_broken_invariants().unwrap();
         assert_eq!(rows.len(), 1, "repeated stores must collapse to one row");
         assert_eq!(rows[0].0, id);
+        assert_eq!(
+            rows[0].2, 2,
+            "the latest escalation count must win the upsert"
+        );
     }
 
     /// Malformed value-length rows must be skipped (not panic, not abort

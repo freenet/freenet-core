@@ -730,6 +730,12 @@ where
         // dedup cache missed an already-current state.  See issue #4151.
         if let Some(ref full_incoming) = incoming_full_state {
             if full_incoming.as_ref() == current_state.as_ref() {
+                // Deterministic (zero-sampling) idempotency check on the
+                // identical-input case, cooldown-bounded — see the method's
+                // rustdoc. Runs BEFORE the NoChange fast-path return so a
+                // non-idempotent contract is flagged on the first identical
+                // re-push instead of waiting for the 1/32 sampled probe.
+                self.probe_identical_input_idempotency(&key, &params, &current_state);
                 tracing::debug!(
                     contract = %key,
                     state_size = current_state.size(),
@@ -1647,6 +1653,117 @@ where
                 .ring
                 .record_broken_invariant(*key, crate::ring::BrokenInvariant::NonIdempotent);
         }
+    }
+
+    /// Deterministic identical-input idempotency check — the zero-sampling
+    /// complement to [`Self::maybe_probe_idempotency`].
+    ///
+    /// Precondition (enforced by the caller): the incoming full-`State`
+    /// payload is byte-identical to the stored state, so the #4151 fast
+    /// path in `bridged_upsert_contract_state` is about to return
+    /// `NoChange` without invoking WASM. For a CORRECT contract,
+    /// `update_state(S, State(S))` must be a no-op (CvRDT lattice join:
+    /// `S ⊔ S = S`). If re-merging the current state into itself produces
+    /// a state whose byte MULTISET differs, the contract is PROVEN
+    /// non-idempotent — no sampling, and no staleness ambiguity, because
+    /// both merge inputs are the same bytes. This is the self-echo shape
+    /// of the production broadcast storm (a junk contract that mutates on
+    /// every apply — #4251/#4279); the sampled probe only catches it at
+    /// 1/32 per merge, which across many co-hosts leaves the echo alive.
+    ///
+    /// Cost control: the #4151 short-circuit exists precisely because
+    /// identical re-pushes are the DOMINANT dedup-miss case, so re-running
+    /// the merge on EVERY one would reintroduce the per-push WASM cost
+    /// that fix removed. Instead the check claims a per-contract cooldown
+    /// slot (`Ring::try_claim_identity_probe`,
+    /// `IDENTITY_PROBE_COOLDOWN` = 60 s): detection stays DETERMINISTIC —
+    /// a violating contract is caught on the first identical apply after
+    /// each cooldown, not probabilistically — while a healthy contract
+    /// pays at most one extra merge per cooldown window.
+    ///
+    /// The #4295 reorder exemption applies unchanged: byte-different but
+    /// same-multiset output (serialization-order flutter) is NOT a
+    /// violation. A merge error is inconclusive, not a positive signal —
+    /// a correct contract may legitimately REJECT a same-version push
+    /// (`InvalidUpdateWithInfo`, the #4151 log-spam case).
+    fn probe_identical_input_idempotency(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        current_state: &WrappedState,
+    ) {
+        let Some(op_manager) = self.op_manager.clone() else {
+            // No ring wired (mock/local harness without an OpManager):
+            // nothing to flag against.
+            return;
+        };
+        if op_manager.ring.is_contract_broken(key) {
+            // Already flagged; the NoChange fast path is itself the
+            // suppression. Nothing new to learn.
+            return;
+        }
+        if !op_manager.ring.try_claim_identity_probe(key) {
+            return; // within cooldown — bounded cost
+        }
+
+        let updates = [UpdateData::State(State::from(
+            current_state.as_ref().to_vec(),
+        ))];
+        let probe_result = self
+            .runtime
+            .update_state(key, parameters, current_state, &updates);
+        let modification = match probe_result {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::debug!(
+                    contract = %key,
+                    error = %err,
+                    event = "identity_probe_error",
+                    "Identical-input idempotency probe failed to execute \
+                     (e.g. same-version push rejected); inconclusive, not flagging"
+                );
+                return;
+            }
+        };
+        let UpdateModification {
+            new_state: probe_state,
+            ..
+        } = modification;
+        let Some(probe_state) = probe_state else {
+            // No state output (e.g. contract returned only `requires(...)`).
+            // Inconclusive — bail.
+            return;
+        };
+        let probe_state = WrappedState::new(probe_state.into_bytes());
+
+        if probe_state.as_ref() == current_state.as_ref() {
+            // Definitively idempotent on its own state.
+            return;
+        }
+        if byte_multiset_eq(current_state.as_ref(), probe_state.as_ref()) {
+            tracing::debug!(
+                contract = %key,
+                size = current_state.size(),
+                event = "identity_probe_byte_flutter_ignored",
+                "Identical-input probe saw byte-different but same-multiset \
+                 re-application (serialization reordering); benign, not a violation"
+            );
+            return;
+        }
+
+        tracing::warn!(
+            contract = %key,
+            state_size = current_state.size(),
+            probe_size = probe_state.size(),
+            event = "non_idempotent_identity_merge_detected",
+            "Contract violates update_state idempotency on its OWN current \
+             state (identical-input merge changed the byte multiset) — \
+             deterministic proof, no sampling. Flagging contract; commit, \
+             broadcast, and full-state egress will be suppressed."
+        );
+        op_manager
+            .ring
+            .record_broken_invariant(*key, crate::ring::BrokenInvariant::NonIdempotent);
     }
 
     /// Persist an updated contract state via `state_store.update`.

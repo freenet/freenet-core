@@ -4224,6 +4224,7 @@ impl Ring {
         let map_reason = |r: BanReason| match r {
             BanReason::AutoMad => ns::BanReasonSnapshot::AutoMad,
             BanReason::Operator => ns::BanReasonSnapshot::Operator,
+            BanReason::NonIdempotent => ns::BanReasonSnapshot::NonIdempotent,
         };
 
         let mut entries: Vec<ns::BanListEntry> = self
@@ -4274,19 +4275,37 @@ impl Ring {
         self.broken_invariants.is_broken(contract.id())
     }
 
-    /// Mark `contract` as broken with `kind`. Idempotent. See
-    /// [`broken_invariants`] module docs.
+    /// Mark `contract` as broken with `kind`. Idempotent for an already-
+    /// active flag; a fresh detection episode also feeds the durable-
+    /// quarantine escalation ledger, which bans the contract (via
+    /// [`contract_ban_list`]) after repeated re-detections. See
+    /// [`broken_invariants`] module docs for the thresholds.
     pub(crate) fn record_broken_invariant(&self, contract: ContractKey, kind: BrokenInvariant) {
-        self.broken_invariants.record(*contract.id(), kind);
+        self.broken_invariants
+            .record_and_escalate(&self.contract_ban_list, *contract.id(), kind);
+    }
+
+    /// Claim a slot for the deterministic identical-input idempotency probe
+    /// (`Executor::probe_identical_input_idempotency`). Bounded to one
+    /// probe per contract per `IDENTITY_PROBE_COOLDOWN`.
+    pub(crate) fn try_claim_identity_probe(&self, contract: &ContractKey) -> bool {
+        self.broken_invariants
+            .try_claim_identity_probe(contract.id())
     }
 
     /// Wire persistent storage for the broken-invariants tracker. Called
-    /// once at executor wiring time.
+    /// once at executor wiring time. After hydration, re-arms durable-
+    /// quarantine bans for contracts whose persisted escalation count had
+    /// already crossed the ban threshold — the ban list itself is
+    /// in-memory only, so without this a restart would lift the quarantine
+    /// until the contract re-escalated from the wire.
     pub(crate) fn set_broken_invariants_storage(
         &self,
         storage: crate::contract::storages::Storage,
     ) {
         self.broken_invariants.set_storage(storage);
+        self.broken_invariants
+            .reban_offenders(&self.contract_ban_list);
     }
 
     /// Report a per-contract resource sample to the topology meter.

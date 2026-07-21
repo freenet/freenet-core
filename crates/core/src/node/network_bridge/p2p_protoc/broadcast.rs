@@ -525,6 +525,22 @@ impl P2pConnManager {
         new_state: freenet_stdlib::prelude::WrappedState,
         target_addr: std::net::SocketAddr,
     ) {
+        // Egress gate (broken invariants): the Summaries-mismatch heal
+        // must not push full state for a contract flagged as violating
+        // CRDT idempotency — every heal would re-seed the broadcast echo
+        // on the target peer while the executor is suppressing local
+        // commits/broadcasts for exactly that contract (#4279 storm
+        // shape). See `crate::ring::broken_invariants`.
+        if op_manager.ring.is_contract_broken(&key) {
+            tracing::debug!(
+                contract = %key,
+                peer = %target_addr,
+                event = "sync_state_suppressed_broken_contract",
+                "SyncStateToPeer suppressed for contract flagged as broken"
+            );
+            return;
+        }
+
         let target = op_manager
             .ring
             .connection_manager
