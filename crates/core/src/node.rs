@@ -3059,6 +3059,22 @@ async fn handle_interest_sync_message(
             op_manager.interest_manager.record_resync_request_received();
             crate::config::GlobalTestMetrics::record_resync_request();
 
+            // Delta-incompatibility signal (HQk7 resync loop): a ResyncRequest
+            // arriving shortly after WE delivered a delta to this peer for
+            // this contract means our delta failed to apply there. Count it
+            // toward the sender-side "this contract can't take deltas" memo so
+            // the broadcast path falls back to full-state sends instead of
+            // recomputing doomed deltas. Runs BEFORE the rate limiters AND
+            // before the broken-contract egress gate below — the signal is
+            // valid even when the full-state response is suppressed (a broken
+            // contract that also can't take deltas still wants full-state
+            // fallback recorded for the peers we DO serve). See
+            // `crate::ring::delta_incompat`.
+            op_manager
+                .ring
+                .delta_incompat
+                .note_resync_request(*key.id(), source);
+
             // Egress gate (broken invariants): a contract flagged as
             // violating CRDT idempotency must not have its full state
             // served to peers. The executor already suppresses commit +
@@ -4030,6 +4046,46 @@ mod tests {
             "the Summaries arm must ration WASM probes through \
              plan_staleness_probe (MAX_STALENESS_PROBES_PER_SUMMARIES cap) — \
              an uncapped probe per contract is a DoS amplification surface"
+        );
+    }
+
+    /// Source-scrape pin (HQk7 resync loop): the `ResyncRequest` arm must feed
+    /// the sender-side delta-incompatibility memo (`note_resync_request`)
+    /// BEFORE the response rate limiters run. A ResyncRequest arriving shortly
+    /// after we delivered a delta to that peer is the wire-visible form of the
+    /// peer's `delta_apply_failed`; it is a valid incompatibility signal even
+    /// when the full-state response itself is suppressed by the #4861
+    /// limiters, so gating it behind them would starve the memo exactly during
+    /// the storm it exists to stop. See `crate::ring::delta_incompat`.
+    #[test]
+    fn resync_request_arm_feeds_delta_incompat_memo_before_limiters() {
+        let src = include_str!("node.rs");
+
+        let handler_start = src
+            .find("async fn handle_interest_sync_message(")
+            .expect("handle_interest_sync_message not found");
+        // Scope to the `ResyncRequest` arm = its match start .. the
+        // `ResyncResponse` arm, so the assertions can't false-pass on
+        // unrelated code elsewhere in the handler.
+        let req_off = src[handler_start..]
+            .find("InterestMessage::ResyncRequest { key }")
+            .expect("ResyncRequest arm not found");
+        let resp_off = src[handler_start..]
+            .find("InterestMessage::ResyncResponse {")
+            .expect("ResyncResponse arm not found");
+        let req_arm = &src[handler_start + req_off..handler_start + resp_off];
+
+        let memo_pos = req_arm
+            .find(".note_resync_request(")
+            .expect("the ResyncRequest arm must feed the delta-incompat memo");
+        let limiter_pos = req_arm
+            .find("resync_response_limiter")
+            .expect("per-(peer, contract) response limiter not found in ResyncRequest arm");
+        assert!(
+            memo_pos < limiter_pos,
+            "note_resync_request must run BEFORE the response rate limiters \
+             (memo {memo_pos} < limiter {limiter_pos}) — a suppressed response \
+             is still a valid delta-incompatibility signal"
         );
     }
 

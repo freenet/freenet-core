@@ -2621,3 +2621,105 @@ where
         Ok(())
     }
 }
+
+/// Source-scrape pins for the full-state version-gate invariant
+/// (HQk7 fork investigation).
+///
+/// Production observed a fork-oscillation storm where a contract's stored
+/// state flip-flopped between two divergent full states (2180 ↔ 1952 bytes)
+/// on every resync apply. The investigation verified that the CORE side is
+/// correct: every full-state install over EXISTING state routes through the
+/// contract's own `update_state` (via `attempt_state_update`), so a contract
+/// WITH a version gate keeps its higher-version state — the observed flips
+/// were the contract itself accepting both forks (its `update_state` predates
+/// the version gate). These pins keep that invariant true: a future refactor
+/// must not add a blind `state_store` write for the resync/upsert path that
+/// would bypass a well-behaved contract's version acceptance.
+#[cfg(test)]
+mod full_state_version_gate_pins {
+    /// Slice `bridged_upsert_contract_state_inner`'s body (its signature to
+    /// the next method's signature).
+    fn upsert_body() -> &'static str {
+        let src = include_str!("executor_impl.rs");
+        let start = src
+            .find("pub(in crate::contract::executor) async fn bridged_upsert_contract_state_inner(")
+            .expect("bridged_upsert_contract_state_inner not found");
+        let after = &src[start..];
+        let end = after
+            .find("pub(in crate::contract::executor) async fn bridged_summarize_contract_state(")
+            .expect("next method after bridged_upsert_contract_state_inner not found");
+        &after[..end]
+    }
+
+    /// A full state over EXISTING state must reach the contract's
+    /// `update_state` (the contract's version acceptance is the ONLY version
+    /// oracle core has), and the only WASM-merge bypass writing an initial
+    /// state must be gated on the contract being NEW.
+    #[test]
+    fn full_state_over_existing_state_runs_contract_update_state() {
+        let body = upsert_body();
+
+        // The incoming full state becomes an UpdateData::State merge input…
+        let updates_pos = body
+            .find("vec![UpdateData::State(incoming_state.clone().into())]")
+            .expect("full state must be wrapped as UpdateData::State for the WASM merge");
+        // …consumed by attempt_state_update (which invokes update_state).
+        let merge_pos = body
+            .find(".attempt_state_update(&params, &current_state, &key, &updates)")
+            .expect("bridged upsert must merge via attempt_state_update");
+        assert!(
+            updates_pos < merge_pos,
+            "the full-state update input must feed attempt_state_update \
+             (updates {updates_pos} < merge {merge_pos})"
+        );
+
+        // The direct initial-state store must be inside the is_new_contract
+        // branch: the gate check must precede the single `.store(` call.
+        let is_new_pos = body
+            .find("if is_new_contract {")
+            .expect("is_new_contract gate not found");
+        let store_pos = body
+            .find(".store(key, state_to_store, params.clone())")
+            .expect("initial-state store call not found");
+        assert!(
+            is_new_pos < store_pos,
+            "the direct state_store write must be gated on is_new_contract \
+             (gate {is_new_pos} < store {store_pos}) — a blind store for an \
+             existing contract would bypass the contract's version gate \
+             (the HQk7 fork-oscillation failure class)"
+        );
+        assert_eq!(
+            body.matches(".store(key,").count(),
+            1,
+            "exactly one direct state_store.store call is allowed in the \
+             upsert path (the is_new_contract initial install)"
+        );
+    }
+
+    /// The corrupted-state recovery path (the ONE branch that replaces
+    /// existing state without a successful WASM merge) must stay gated on the
+    /// LOCAL state failing `validate_state` (#3109). Without that gate, a
+    /// merge rejection of a stale incoming full state would "recover" by
+    /// installing it — exactly the lower-version-overwrites-higher bypass
+    /// this module pins against.
+    #[test]
+    fn corrupted_state_recovery_requires_invalid_local_state() {
+        let body = upsert_body();
+
+        let local_valid_pos = body
+            .find("let local_valid = self")
+            .expect("recovery path must validate the LOCAL state (#3109)");
+        let keep_local_pos = body
+            .find("if local_valid {")
+            .expect("recovery must return the merge error when local state is valid");
+        let recovery_pos = body
+            .find("recovery_performed = true;")
+            .expect("corrupted-state recovery marker not found");
+        assert!(
+            local_valid_pos < keep_local_pos && keep_local_pos < recovery_pos,
+            "recovery ordering must be: validate local ({local_valid_pos}) < \
+             keep-local-when-valid ({keep_local_pos}) < recovery ({recovery_pos}) — \
+             recovery may only replace state the contract itself calls invalid"
+        );
+    }
+}

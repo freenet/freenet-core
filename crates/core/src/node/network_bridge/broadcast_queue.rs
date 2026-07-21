@@ -788,8 +788,28 @@ pub(super) async fn broadcast_to_single_peer(
         }
     }
 
+    // Sender-side delta-incompatibility memo (the HQk7 resync loop): a
+    // contract that repeatedly rejects deltas (its `update_state` only
+    // accepts full states) turns every delta send into
+    // delta → "Invalid update" → ResyncRequest → full-state resync → repeat.
+    // While the memo is armed, skip the delta computation entirely and send
+    // full state directly. See `crate::ring::delta_incompat`.
+    let deltas_suppressed = op_manager.ring.delta_incompat.suppress_deltas(key.id());
+    if deltas_suppressed {
+        tracing::debug!(
+            contract = %key,
+            peer = %peer_addr,
+            event = "delta_suppressed_incompat",
+            "Contract is in delta-incompat backoff — sending full state instead of a delta"
+        );
+    }
+
     // Compute delta if we have their summary
     let (payload, sent_delta) = match (&our_summary, &their_summary) {
+        _ if deltas_suppressed => (
+            DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+            false,
+        ),
         (Some(ours), Some(theirs)) => {
             match op_manager
                 .interest_manager
@@ -1006,6 +1026,17 @@ pub(super) async fn broadcast_to_single_peer(
         // successful enqueue is the terminal state we can observe, so delivery
         // tracks the send result (unchanged pre-#4235 behavior for this path).
         if res.is_ok() {
+            // Delta-incompat attribution (HQk7 resync loop): remember that we
+            // just delivered a DELTA to this peer so a prompt `ResyncRequest`
+            // from it can be attributed to the delta failing to apply (deltas
+            // only ever take this inline path — streaming is full-state-only).
+            // See `crate::ring::delta_incompat`.
+            if sent_delta {
+                op_manager
+                    .ring
+                    .delta_incompat
+                    .record_delta_sent(*key.id(), peer_addr);
+            }
             // Record telemetry, refresh peer interest, and cache the peer
             // summary — see `record_delivery_to_interest`. The streaming branch
             // applies the same gate via `record_streaming_delivery` (#4235);
@@ -1455,6 +1486,65 @@ mod tests {
             "broadcast_to_single_peer must gate on should_broadcast_contract BEFORE \
              calling get_contract_summary (#4473) — otherwise the summarize storm \
              fires for every phantom contract before the gate can skip it"
+        );
+    }
+
+    /// Source-scrape pin (HQk7 resync loop): `broadcast_to_single_peer` must
+    /// consult the sender-side delta-incompatibility memo BEFORE computing a
+    /// delta, and must record every delivered delta send for ResyncRequest
+    /// attribution. If the gate is dropped (or moved after `compute_delta`),
+    /// a delta-incapable contract goes back to
+    /// delta → "Invalid update" → ResyncRequest → full-state resync → repeat
+    /// (3,102 delta_apply_failed events for one contract in a 2h production
+    /// window); if the attribution recording is dropped, the memo's
+    /// sender-side arm signal (`note_resync_request`) can never fire.
+    /// See `crate::ring::delta_incompat`.
+    #[test]
+    fn broadcast_to_single_peer_gates_deltas_on_incompat_memo() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer not found");
+        let body = &after[..fn_end];
+
+        // 1. The memo gate must run BEFORE the delta computation and map
+        //    suppression to a full-state payload.
+        let gate_pos = body
+            .find(".suppress_deltas(")
+            .expect("broadcast_to_single_peer must consult the delta-incompat memo");
+        let delta_pos = body
+            .find(".compute_delta(")
+            .expect("compute_delta call not found");
+        assert!(
+            gate_pos < delta_pos,
+            "the delta-incompat gate must be consulted BEFORE compute_delta \
+             (gate {gate_pos} < compute_delta {delta_pos}) — otherwise the \
+             doomed delta is still computed and sent"
+        );
+        assert!(
+            body.contains("_ if deltas_suppressed => ("),
+            "suppression must short-circuit the payload match to FullState"
+        );
+
+        // 2. Delivered delta sends must be recorded for ResyncRequest
+        //    attribution, gated on sent_delta (full-state sends must NOT
+        //    create attributions — a resync after a full-state send says
+        //    nothing about delta compatibility).
+        let record_pos = body
+            .find(".record_delta_sent(")
+            .expect("broadcast_to_single_peer must record delivered delta sends");
+        let sent_delta_gate = body
+            .find("if sent_delta {")
+            .expect("record_delta_sent must be gated on sent_delta");
+        assert!(
+            sent_delta_gate < record_pos,
+            "record_delta_sent must sit inside the `if sent_delta` gate \
+             (gate {sent_delta_gate} < record {record_pos})"
         );
     }
 
