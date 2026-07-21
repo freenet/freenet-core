@@ -153,6 +153,168 @@ pub(super) fn should_broadcast_contract(op_manager: &Arc<OpManager>, key: &Contr
     op_manager.ring.should_summarize_or_broadcast(key)
 }
 
+/// Decision for one (contract, peer) fan-out send, derived WITHOUT any WASM
+/// call — a byte comparison plus the shared in-memory delta cache. See
+/// [`plan_fanout_send`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FanoutSendPlan {
+    /// The peer already has our state: byte-identical summaries, or a cached
+    /// EMPTY delta proving logical convergence despite differing summary
+    /// bytes. Nothing to send.
+    Skip,
+    /// The peer needs our state: a cached NON-EMPTY delta (genuine
+    /// divergence), or byte-differing summaries with no semantic verdict
+    /// available and no probe budget left (the conservative pre-#4894
+    /// fallback — never silently skip a possible real divergence).
+    Send,
+    /// Byte-differing summaries, no cached verdict, probe budget remaining:
+    /// the caller should run the bounded WASM `get_state_delta` probe
+    /// ([`InterestManager::peer_summary_has_pending_state`]) and decide from
+    /// its verdict. Callers without an async context must treat this as
+    /// `Send` (conservative).
+    ///
+    /// [`InterestManager::peer_summary_has_pending_state`]:
+    /// crate::ring::interest::InterestManager::peer_summary_has_pending_state
+    Probe,
+}
+
+/// The two summaries a fan-out send decision compares, bundled with NAMED
+/// fields so call sites cannot positionally transpose them.
+///
+/// The underlying probe API takes the pair POSITIONALLY in the OPPOSITE order
+/// to how the fan-out naturally reads
+/// (`peer_summary_has_pending_state(.., their_summary, our_summary)`,
+/// interest.rs), and so does the delta cache
+/// (`cached_staleness_verdict(key, theirs, ours)`). A transposed positional
+/// call site would compile, pass every unit test and source-scrape pin, and
+/// compute `delta(our_state vs our OWN summary)` — always empty — wrongly
+/// skipping nearly every broadcast (a network-wide update blackout). Bundling
+/// the pair is the `.claude/rules/bug-prevention-patterns.md` "paired fields
+/// that must co-occur — bundle in a sub-struct" fix shape: the only
+/// positional-order decisions left live INSIDE [`plan_fanout_send`] /
+/// [`fanout_send_needed`], directly next to the APIs they map onto, and every
+/// call site names the fields (`SummaryPair { ours, theirs }`), so a swap
+/// requires explicitly writing `ours: theirs, theirs: ours`.
+#[derive(Clone, Copy)]
+pub(super) struct SummaryPair<'a> {
+    /// OUR current summary for the contract (the sender's local state).
+    pub ours: &'a freenet_stdlib::prelude::StateSummary<'static>,
+    /// The PEER's cached summary (what we believe the receiver holds).
+    pub theirs: &'a freenet_stdlib::prelude::StateSummary<'static>,
+}
+
+/// Cache-only layer of the fan-out's semantic staleness decision (#4894's
+/// fan-out counterpart).
+///
+/// The live broadcast fan-out used to skip a peer only when its cached summary
+/// was BYTE-identical to ours. That is wrong for the same reason the
+/// InterestSync `Summaries` byte-compare was wrong (#4894 / #4857 secondary
+/// finding): a contract whose `summarize_state` serializes
+/// non-deterministically (HashMap/HashSet iteration order, per-process
+/// `RandomState`) yields different summary bytes for the SAME logical state on
+/// different peers. The byte compare then never skips, `compute_delta` either
+/// returns an empty delta (which the pre-fix arm "fell back" from by sending
+/// FULL STATE) or is refused outright by the `is_delta_efficient` gate on
+/// big-summary contracts — so a fully-converged pair re-flooded full state on
+/// every heartbeat-driven sync and every fan-out (the nondeterministic-summary
+/// heal storm; e.g. the `Eumk9HNQ` contract that "healed" hard while its state
+/// never changed).
+///
+/// This helper reuses the #4894 machinery: byte-equal summaries short-circuit
+/// to [`FanoutSendPlan::Skip`]; byte-differing summaries consult the shared
+/// delta cache ([`InterestManager::cached_staleness_verdict`]) under the same
+/// probe rationing (`plan_staleness_probe`, budget mirroring
+/// `MAX_STALENESS_PROBES_PER_SUMMARIES`). Pure/sync so it is unit-testable
+/// with a bare [`InterestManager`]; the async probe half lives in
+/// [`fanout_send_needed`].
+///
+/// Convergence safety: identical to #4894 — the skip set is a strict SUBSET of
+/// the pre-fix byte-compare skip set plus exactly those pairs whose
+/// contract-computed delta is EMPTY (copies that already hold our state, for
+/// which the removed send would have transferred nothing). A genuinely
+/// diverged pair yields a non-empty delta and still sends; an unavailable
+/// verdict falls back to the conservative byte-differ ⇒ send behavior.
+///
+/// [`InterestManager`]: crate::ring::interest::InterestManager
+/// [`InterestManager::cached_staleness_verdict`]:
+/// crate::ring::interest::InterestManager::cached_staleness_verdict
+pub(super) fn plan_fanout_send<T: crate::util::time_source::TimeSource + Sync>(
+    interest_manager: &crate::ring::interest::InterestManager<T>,
+    key: &ContractKey,
+    summaries: SummaryPair<'_>,
+    probes_used: usize,
+) -> FanoutSendPlan {
+    use crate::node::{StalenessProbeAction, plan_staleness_probe};
+
+    let SummaryPair { ours, theirs } = summaries;
+
+    // Byte-identical summaries are trivially converged (the pre-existing skip).
+    if ours.as_ref() == theirs.as_ref() {
+        return FanoutSendPlan::Skip;
+    }
+    // Bytes differ: ask the shared delta cache before trusting the bytes.
+    // Cache key order matches `compute_delta` / the Summaries arm:
+    // (contract, THEIR summary, OUR summary). This is one of the two
+    // positional mappings `SummaryPair` exists to confine here.
+    let cached = interest_manager.cached_staleness_verdict(key, theirs.as_ref(), ours.as_ref());
+    match plan_staleness_probe(cached, probes_used) {
+        StalenessProbeAction::UseCached(true) => FanoutSendPlan::Send,
+        StalenessProbeAction::UseCached(false) => FanoutSendPlan::Skip,
+        StalenessProbeAction::RunProbe => FanoutSendPlan::Probe,
+        // Budget spent: conservative pre-fix behavior (differing bytes ⇒
+        // send). Re-evaluated on the next fan-out once the cache warms.
+        StalenessProbeAction::BudgetExhaustedFallBack => FanoutSendPlan::Send,
+    }
+}
+
+/// Full semantic staleness decision for one (contract, peer) fan-out send:
+/// [`plan_fanout_send`] plus the bounded WASM `get_state_delta` probe on a
+/// cache miss. Returns `true` when the peer needs our state (send), `false`
+/// when it is converged (skip).
+///
+/// `probes_used` is the per-fan-out-invocation probe budget counter (mirrors
+/// the `Summaries` handler's per-message `MAX_STALENESS_PROBES_PER_SUMMARIES`
+/// budget in node.rs): only cache MISSES that reach the WASM probe consume it.
+/// The production per-peer queue task calls this once per (contract, peer)
+/// entry — at most ONE probe per invocation, trivially within budget, and
+/// bounded overall by the same queue/semaphore caps that already bound
+/// `compute_delta` WASM work per entry. The sim-inline fan-out shares one
+/// counter across all targets of a fan-out, capping the WASM probes a single
+/// fan-out pass can issue. Probe results land in the shared delta cache, so
+/// repeated fan-outs for an unchanged pair cost no further WASM.
+///
+/// Note the probe deliberately bypasses the [`is_delta_efficient`] wire gate
+/// (see `peer_summary_has_pending_state`): staleness detection wants the
+/// semantic answer even for big-summary contracts, because the alternative it
+/// replaces is a spurious FULL-STATE send on every fan-out — strictly more
+/// expensive than one delta computation.
+///
+/// [`is_delta_efficient`]: crate::ring::interest::is_delta_efficient
+pub(super) async fn fanout_send_needed(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    summaries: SummaryPair<'_>,
+    probes_used: &mut usize,
+) -> bool {
+    match plan_fanout_send(&op_manager.interest_manager, key, summaries, *probes_used) {
+        FanoutSendPlan::Send => true,
+        FanoutSendPlan::Skip => false,
+        FanoutSendPlan::Probe => {
+            *probes_used += 1;
+            let SummaryPair { ours, theirs } = summaries;
+            // The probe API takes the pair positionally as (their, our) — the
+            // other mapping `SummaryPair` exists to confine here. Transposing
+            // these would compute delta(our state vs our OWN summary) =
+            // always empty = wrongful skip of every broadcast.
+            let verdict = op_manager
+                .interest_manager
+                .peer_summary_has_pending_state(op_manager, key, theirs, ours)
+                .await;
+            crate::ring::interest::summary_indicates_stale_peer(ours, theirs, verdict)
+        }
+    }
+}
+
 // The `BroadcastQueue` struct (constants, types, impl) is only used in the
 // production `p2p_protoc` path. Under `simulation_tests` the code routes
 // through `broadcast_to_single_peer` directly (see p2p_protoc.rs), so the
@@ -596,13 +758,31 @@ pub(super) async fn broadcast_to_single_peer(
         .interest_manager
         .get_peer_summary(&key, &peer_key);
 
-    // Skip if summaries are equal (no change to send)
+    // Semantic skip (#4894's fan-out counterpart). Byte-identical summaries
+    // skip as before; byte-DIFFERING summaries are no longer trusted as proof
+    // of divergence — a contract whose summary serializes
+    // non-deterministically yields different bytes for the SAME logical
+    // state, and re-sending full state for such a converged pair on every
+    // fan-out is the nondeterministic-summary heal storm. `fanout_send_needed`
+    // asks the shared delta cache / the contract itself (bounded probe)
+    // whether the peer actually lacks state we hold.
     if let (Some(ours), Some(theirs)) = (&our_summary, &their_summary) {
-        if ours.as_ref() == theirs.as_ref() {
+        // Per-invocation probe budget: one (contract, peer) pair per call, so
+        // at most one WASM probe per queue entry (see `fanout_send_needed`).
+        let mut staleness_probes_used = 0usize;
+        if !fanout_send_needed(
+            op_manager,
+            &key,
+            SummaryPair { ours, theirs },
+            &mut staleness_probes_used,
+        )
+        .await
+        {
             tracing::trace!(
                 contract = %key,
                 peer = %peer_addr,
-                "Skipping broadcast - peer already has our state"
+                "Skipping broadcast - peer already has our state (byte-equal \
+                 or logically converged summaries)"
             );
             return;
         }
@@ -618,14 +798,19 @@ pub(super) async fn broadcast_to_single_peer(
             {
                 Ok(Some(delta)) => (DeltaOrFullState::Delta(delta.as_ref().to_vec()), true),
                 Ok(None) => {
-                    tracing::debug!(
+                    // The contract computed an EMPTY delta against the peer's
+                    // summary: the peer is logically converged despite the
+                    // byte-differing summaries. The pre-fix arm "fell back" to
+                    // sending FULL STATE here, which is what re-flooded a
+                    // converged-but-nondeterministic-summary contract on every
+                    // fan-out (the heal storm). Nothing to send — skip.
+                    tracing::trace!(
                         contract = %key,
-                        "Delta computation returned no change, sending full state"
+                        peer = %peer_addr,
+                        "Skipping broadcast - contract reported empty delta \
+                         (peer converged)"
                     );
-                    (
-                        DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
-                        false,
-                    )
+                    return;
                 }
                 Err(err) => {
                     tracing::debug!(
@@ -860,7 +1045,9 @@ pub(super) async fn broadcast_to_single_peer(
 mod tests {
     use std::time::Duration;
 
-    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey, StateSummary};
+    use freenet_stdlib::prelude::{
+        CodeHash, ContractInstanceId, ContractKey, StateDelta, StateSummary,
+    };
 
     use crate::ring::PeerKey;
     use crate::ring::interest::InterestManager;
@@ -868,7 +1055,8 @@ mod tests {
     use crate::util::time_source::SharedMockTimeSource;
 
     use super::{
-        BroadcastStreamMetrics, record_streaming_delivery, streaming_completion_delivered,
+        BroadcastStreamMetrics, FanoutSendPlan, SummaryPair, plan_fanout_send,
+        record_streaming_delivery, streaming_completion_delivered,
     };
 
     /// `BroadcastStreamMetrics` counts every attempt and, separately, only the
@@ -1318,6 +1506,312 @@ mod tests {
             failure_calls, 2,
             "exactly the two early-failure exits must record record_attempt(false) \
              (got {failure_calls}); the third exit records record_attempt(delivered)"
+        );
+    }
+
+    // ---- Semantic fan-out skip (#4894's fan-out counterpart / the ----------
+    // ---- nondeterministic-summary heal storm) ------------------------------
+    //
+    // The live broadcast fan-out used to skip a peer only on BYTE-identical
+    // summaries. A contract whose summary serializes non-deterministically
+    // (HashMap/HashSet order) yields different bytes for the SAME logical
+    // state across peers, so the byte compare never skipped; the delta path
+    // then either returned an empty delta (which the pre-fix arm answered by
+    // sending FULL STATE) or was refused by the `is_delta_efficient` gate on
+    // big-summary contracts — so a fully-converged pair re-flooded full state
+    // on every fan-out (contracts like `Eumk9HNQ` healing hard while their
+    // state never changed). These tests exercise the cache-only decision core
+    // `plan_fanout_send`; the wiring is pinned by
+    // `fanout_path_uses_semantic_delta_skip_pin`.
+
+    fn make_manager() -> InterestManager<SharedMockTimeSource> {
+        InterestManager::new(SharedMockTimeSource::new())
+    }
+
+    /// Reproducing test (mirrors #4894's
+    /// `nondeterministic_summary_does_not_flag_converged_peer_stale`): two
+    /// peers with the SAME logical state but byte-differing summaries must NOT
+    /// be re-sent full state by the fan-out once the contract has said the
+    /// pair is converged (empty delta).
+    #[test]
+    fn nondeterministic_converged_summaries_skip_fanout_resend() {
+        let manager = make_manager();
+        let contract = make_contract_key(50);
+
+        // Two summaries of the SAME logical state that serialize to DIFFERENT
+        // bytes (models cross-peer HashMap/HashSet iteration-order divergence).
+        let ours = StateSummary::from(vec![1u8, 2, 3]);
+        let theirs = StateSummary::from(vec![3u8, 2, 1]);
+        assert_ne!(
+            ours.as_ref(),
+            theirs.as_ref(),
+            "precondition: summaries differ byte-wise (the pre-fix byte-compare \
+             would NOT skip, and the delta path fell back to full state)"
+        );
+
+        // The contract, asked for the delta of our state against their
+        // summary, returned EMPTY: logically converged. Model it exactly as
+        // production does — via the shared delta cache.
+        manager.cache_delta(
+            &contract,
+            theirs.as_ref(),
+            ours.as_ref(),
+            StateDelta::from(Vec::<u8>::new()),
+        );
+
+        // FIX: the fan-out must SKIP this peer — no full-state re-flood.
+        assert_eq!(
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                0
+            ),
+            FanoutSendPlan::Skip,
+            "a converged-but-byte-differing pair must be skipped by the fan-out \
+             (pre-fix: full state was re-sent on every fan-out — the heal storm)"
+        );
+    }
+
+    /// Convergence safety: a genuinely diverged pair (non-empty delta) must
+    /// STILL be sent/healed — the fix only removes spurious re-sends.
+    #[test]
+    fn genuinely_diverged_summaries_still_send() {
+        let manager = make_manager();
+        let contract = make_contract_key(51);
+
+        let ours = StateSummary::from(vec![9u8, 9, 9]);
+        let theirs = StateSummary::from(vec![1u8]);
+
+        manager.cache_delta(
+            &contract,
+            theirs.as_ref(),
+            ours.as_ref(),
+            StateDelta::from(vec![42u8]),
+        );
+
+        assert_eq!(
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                0
+            ),
+            FanoutSendPlan::Send,
+            "a genuine divergence (non-empty delta) must still be sent"
+        );
+    }
+
+    /// Byte-identical summaries skip WITHOUT consulting the cache or spending
+    /// probe budget — even a (stale, cross-contract-polluted) cached non-empty
+    /// delta for the same byte pair must not force a send.
+    #[test]
+    fn byte_equal_summaries_skip_before_cache_lookup() {
+        let manager = make_manager();
+        let contract = make_contract_key(52);
+
+        let ours = StateSummary::from(vec![7u8, 7, 7]);
+        let theirs = StateSummary::from(vec![7u8, 7, 7]);
+
+        // Poison the cache for this (equal-bytes) pair: the byte-equal
+        // short-circuit must win regardless.
+        manager.cache_delta(
+            &contract,
+            theirs.as_ref(),
+            ours.as_ref(),
+            StateDelta::from(vec![1u8]),
+        );
+
+        assert_eq!(
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                0
+            ),
+            FanoutSendPlan::Skip,
+            "byte-identical summaries are trivially converged; the byte-equal \
+             short-circuit must precede any delta-cache verdict"
+        );
+    }
+
+    /// Per-invocation probe cap (mirrors the `Summaries` handler's
+    /// `MAX_STALENESS_PROBES_PER_SUMMARIES` budget): a cache MISS probes only
+    /// while budget remains; once exhausted the plan falls back to the
+    /// conservative byte-differ ⇒ send behavior instead of probing — never to
+    /// a silent skip.
+    #[test]
+    fn probe_budget_gates_wasm_probe_and_falls_back_to_send() {
+        use crate::node::MAX_STALENESS_PROBES_PER_SUMMARIES;
+
+        let manager = make_manager();
+        let contract = make_contract_key(53);
+
+        let ours = StateSummary::from(vec![1u8, 2, 3]);
+        let theirs = StateSummary::from(vec![3u8, 2, 1]);
+
+        // No cached verdict, budget available → probe the contract.
+        assert_eq!(
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                0
+            ),
+            FanoutSendPlan::Probe,
+            "a cache miss within budget must run the bounded WASM probe"
+        );
+        assert_eq!(
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                MAX_STALENESS_PROBES_PER_SUMMARIES - 1
+            ),
+            FanoutSendPlan::Probe,
+            "the last budget slot is still spendable"
+        );
+
+        // Budget exhausted → conservative SEND (byte-differ fallback), no probe.
+        assert_eq!(
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                MAX_STALENESS_PROBES_PER_SUMMARIES
+            ),
+            FanoutSendPlan::Send,
+            "an exhausted probe budget must fall back to the conservative \
+             byte-differ ⇒ send behavior, never a silent skip"
+        );
+
+        // A cache HIT is free: it answers even with the budget exhausted.
+        manager.cache_delta(
+            &contract,
+            theirs.as_ref(),
+            ours.as_ref(),
+            StateDelta::from(Vec::<u8>::new()),
+        );
+        assert_eq!(
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                MAX_STALENESS_PROBES_PER_SUMMARIES * 10
+            ),
+            FanoutSendPlan::Skip,
+            "cache hits never consume budget and still answer (converged ⇒ skip)"
+        );
+    }
+
+    /// Source-scrape pin: the fan-out path must decide the per-peer send
+    /// SEMANTICALLY — routing through `fanout_send_needed` (the
+    /// `plan_fanout_send` cache layer + the bounded
+    /// `peer_summary_has_pending_state` contract probe +
+    /// `summary_indicates_stale_peer` policy) — and the `compute_delta`
+    /// `Ok(None)` (empty delta = converged) arm must SKIP, not fall back to
+    /// full state. Mirrors node.rs's
+    /// `summaries_arm_uses_semantic_staleness_probe_pin`: the data-layer unit
+    /// tests above stay green even if `broadcast_to_single_peer` is reverted
+    /// to a bare byte compare + full-state fallback (re-opening the
+    /// nondeterministic-summary heal storm), so this pins the WIRING.
+    #[test]
+    fn fanout_path_uses_semantic_delta_skip_pin() {
+        let src = include_str!("broadcast_queue.rs");
+
+        // --- broadcast_to_single_peer wiring ---
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer (start of tests module) not found");
+        let body = &after[..fn_end];
+
+        assert!(
+            body.contains("fanout_send_needed("),
+            "broadcast_to_single_peer must route the per-peer skip decision \
+             through fanout_send_needed — a bare summary byte comparison \
+             re-opens the nondeterministic-summary heal storm"
+        );
+
+        // The Ok(None) arm (contract returned empty delta = converged) must
+        // SKIP (return), never construct a FullState payload.
+        let ok_none_off = body
+            .find("Ok(None) =>")
+            .expect("compute_delta Ok(None) arm not found in broadcast_to_single_peer");
+        let err_off = body[ok_none_off..]
+            .find("Err(err) =>")
+            .expect("compute_delta Err arm not found after Ok(None) arm");
+        let ok_none_arm = &body[ok_none_off..ok_none_off + err_off];
+        assert!(
+            !ok_none_arm.contains("FullState"),
+            "the Ok(None) (empty delta = converged) arm must NOT fall back to \
+             sending full state — that re-flood on every fan-out IS the heal \
+             storm. Arm body:\n{ok_none_arm}"
+        );
+        assert!(
+            ok_none_arm.contains("return;"),
+            "the Ok(None) (empty delta = converged) arm must skip the send \
+             entirely (return). Arm body:\n{ok_none_arm}"
+        );
+
+        // --- helper internals: the semantic machinery is actually consulted ---
+        let helpers_start = src
+            .find("pub(super) fn plan_fanout_send")
+            .expect("plan_fanout_send not found");
+        let helpers_end = src
+            .find("// The `BroadcastQueue` struct (constants, types, impl)")
+            .expect("queue module comment anchor not found");
+        assert!(
+            helpers_start < helpers_end,
+            "plan_fanout_send / fanout_send_needed must be defined before the \
+             queue module"
+        );
+        let helpers = &src[helpers_start..helpers_end];
+        assert!(
+            helpers.contains("plan_staleness_probe"),
+            "plan_fanout_send must ration WASM probes through \
+             plan_staleness_probe (the MAX_STALENESS_PROBES_PER_SUMMARIES cap)"
+        );
+        assert!(
+            helpers.contains("cached_staleness_verdict"),
+            "plan_fanout_send must consult the shared delta cache \
+             (cached_staleness_verdict) before trusting summary bytes"
+        );
+        assert!(
+            helpers.contains("peer_summary_has_pending_state"),
+            "fanout_send_needed must resolve cache misses via the bounded \
+             contract delta probe (peer_summary_has_pending_state)"
+        );
+        assert!(
+            helpers.contains("summary_indicates_stale_peer"),
+            "fanout_send_needed must decide from the probe verdict via \
+             summary_indicates_stale_peer (semantic policy), not inline byte \
+             inequality"
         );
     }
 }
