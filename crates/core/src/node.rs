@@ -2695,10 +2695,41 @@ async fn handle_interest_sync_message(
                             }
                         }
 
-                        let is_stale = our_summary
-                            .as_ref()
-                            .zip(their_summary.as_ref())
-                            .is_some_and(|(ours, theirs)| ours.as_ref() != theirs.as_ref());
+                        // Semantic staleness (#4857 secondary finding / the
+                        // 2.56M `summarize_contract_state` storm). A raw byte
+                        // comparison of summaries is WRONG: a contract whose
+                        // summary serializes non-deterministically (HashMap /
+                        // HashSet order) yields different summary bytes for the
+                        // SAME logical state across peers, so a byte compare
+                        // flags a converged peer stale and fires a full-state
+                        // heal every heartbeat. Only pay the (bounded, cached)
+                        // contract delta probe when the summaries actually
+                        // differ byte-wise; ask the contract itself whether we
+                        // hold state the peer lacks. See
+                        // `summary_indicates_stale_peer`.
+                        let is_stale = match (our_summary.as_ref(), their_summary.as_ref()) {
+                            (Some(ours), Some(theirs)) => {
+                                let delta_verdict = if ours.as_ref() == theirs.as_ref() {
+                                    // Byte-identical => converged; skip the probe.
+                                    None
+                                } else {
+                                    op_manager
+                                        .interest_manager
+                                        .peer_summary_has_pending_state(
+                                            op_manager, &contract, theirs, ours,
+                                        )
+                                        .await
+                                };
+                                crate::ring::interest::summary_indicates_stale_peer(
+                                    ours,
+                                    theirs,
+                                    delta_verdict,
+                                )
+                            }
+                            // One side has no summary => no basis to heal
+                            // (unchanged from the prior `.zip()` semantics).
+                            _ => false,
+                        };
 
                         op_manager.interest_manager.update_peer_summary(
                             &contract,
