@@ -633,8 +633,7 @@ impl P2pConnManager {
                 if !super::super::broadcast_queue::fanout_send_needed(
                     op_manager,
                     &key,
-                    ours,
-                    theirs,
+                    super::super::broadcast_queue::SummaryPair { ours, theirs },
                     &mut staleness_probes_used,
                 )
                 .await

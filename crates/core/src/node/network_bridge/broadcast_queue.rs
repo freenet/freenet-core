@@ -178,6 +178,31 @@ pub(super) enum FanoutSendPlan {
     Probe,
 }
 
+/// The two summaries a fan-out send decision compares, bundled with NAMED
+/// fields so call sites cannot positionally transpose them.
+///
+/// The underlying probe API takes the pair POSITIONALLY in the OPPOSITE order
+/// to how the fan-out naturally reads
+/// (`peer_summary_has_pending_state(.., their_summary, our_summary)`,
+/// interest.rs), and so does the delta cache
+/// (`cached_staleness_verdict(key, theirs, ours)`). A transposed positional
+/// call site would compile, pass every unit test and source-scrape pin, and
+/// compute `delta(our_state vs our OWN summary)` — always empty — wrongly
+/// skipping nearly every broadcast (a network-wide update blackout). Bundling
+/// the pair is the `.claude/rules/bug-prevention-patterns.md` "paired fields
+/// that must co-occur — bundle in a sub-struct" fix shape: the only
+/// positional-order decisions left live INSIDE [`plan_fanout_send`] /
+/// [`fanout_send_needed`], directly next to the APIs they map onto, and every
+/// call site names the fields (`SummaryPair { ours, theirs }`), so a swap
+/// requires explicitly writing `ours: theirs, theirs: ours`.
+#[derive(Clone, Copy)]
+pub(super) struct SummaryPair<'a> {
+    /// OUR current summary for the contract (the sender's local state).
+    pub ours: &'a freenet_stdlib::prelude::StateSummary<'static>,
+    /// The PEER's cached summary (what we believe the receiver holds).
+    pub theirs: &'a freenet_stdlib::prelude::StateSummary<'static>,
+}
+
 /// Cache-only layer of the fan-out's semantic staleness decision (#4894's
 /// fan-out counterpart).
 ///
@@ -216,24 +241,22 @@ pub(super) enum FanoutSendPlan {
 pub(super) fn plan_fanout_send<T: crate::util::time_source::TimeSource + Sync>(
     interest_manager: &crate::ring::interest::InterestManager<T>,
     key: &ContractKey,
-    our_summary: &freenet_stdlib::prelude::StateSummary<'static>,
-    their_summary: &freenet_stdlib::prelude::StateSummary<'static>,
+    summaries: SummaryPair<'_>,
     probes_used: usize,
 ) -> FanoutSendPlan {
     use crate::node::{StalenessProbeAction, plan_staleness_probe};
 
+    let SummaryPair { ours, theirs } = summaries;
+
     // Byte-identical summaries are trivially converged (the pre-existing skip).
-    if our_summary.as_ref() == their_summary.as_ref() {
+    if ours.as_ref() == theirs.as_ref() {
         return FanoutSendPlan::Skip;
     }
     // Bytes differ: ask the shared delta cache before trusting the bytes.
     // Cache key order matches `compute_delta` / the Summaries arm:
-    // (contract, THEIR summary, OUR summary).
-    let cached = interest_manager.cached_staleness_verdict(
-        key,
-        their_summary.as_ref(),
-        our_summary.as_ref(),
-    );
+    // (contract, THEIR summary, OUR summary). This is one of the two
+    // positional mappings `SummaryPair` exists to confine here.
+    let cached = interest_manager.cached_staleness_verdict(key, theirs.as_ref(), ours.as_ref());
     match plan_staleness_probe(cached, probes_used) {
         StalenessProbeAction::UseCached(true) => FanoutSendPlan::Send,
         StalenessProbeAction::UseCached(false) => FanoutSendPlan::Skip,
@@ -270,26 +293,24 @@ pub(super) fn plan_fanout_send<T: crate::util::time_source::TimeSource + Sync>(
 pub(super) async fn fanout_send_needed(
     op_manager: &OpManager,
     key: &ContractKey,
-    our_summary: &freenet_stdlib::prelude::StateSummary<'static>,
-    their_summary: &freenet_stdlib::prelude::StateSummary<'static>,
+    summaries: SummaryPair<'_>,
     probes_used: &mut usize,
 ) -> bool {
-    match plan_fanout_send(
-        &op_manager.interest_manager,
-        key,
-        our_summary,
-        their_summary,
-        *probes_used,
-    ) {
+    match plan_fanout_send(&op_manager.interest_manager, key, summaries, *probes_used) {
         FanoutSendPlan::Send => true,
         FanoutSendPlan::Skip => false,
         FanoutSendPlan::Probe => {
             *probes_used += 1;
+            let SummaryPair { ours, theirs } = summaries;
+            // The probe API takes the pair positionally as (their, our) — the
+            // other mapping `SummaryPair` exists to confine here. Transposing
+            // these would compute delta(our state vs our OWN summary) =
+            // always empty = wrongful skip of every broadcast.
             let verdict = op_manager
                 .interest_manager
-                .peer_summary_has_pending_state(op_manager, key, their_summary, our_summary)
+                .peer_summary_has_pending_state(op_manager, key, theirs, ours)
                 .await;
-            crate::ring::interest::summary_indicates_stale_peer(our_summary, their_summary, verdict)
+            crate::ring::interest::summary_indicates_stale_peer(ours, theirs, verdict)
         }
     }
 }
@@ -749,7 +770,14 @@ pub(super) async fn broadcast_to_single_peer(
         // Per-invocation probe budget: one (contract, peer) pair per call, so
         // at most one WASM probe per queue entry (see `fanout_send_needed`).
         let mut staleness_probes_used = 0usize;
-        if !fanout_send_needed(op_manager, &key, ours, theirs, &mut staleness_probes_used).await {
+        if !fanout_send_needed(
+            op_manager,
+            &key,
+            SummaryPair { ours, theirs },
+            &mut staleness_probes_used,
+        )
+        .await
+        {
             tracing::trace!(
                 contract = %key,
                 peer = %peer_addr,
@@ -1027,8 +1055,8 @@ mod tests {
     use crate::util::time_source::SharedMockTimeSource;
 
     use super::{
-        BroadcastStreamMetrics, FanoutSendPlan, plan_fanout_send, record_streaming_delivery,
-        streaming_completion_delivered,
+        BroadcastStreamMetrics, FanoutSendPlan, SummaryPair, plan_fanout_send,
+        record_streaming_delivery, streaming_completion_delivered,
     };
 
     /// `BroadcastStreamMetrics` counts every attempt and, separately, only the
@@ -1533,7 +1561,15 @@ mod tests {
 
         // FIX: the fan-out must SKIP this peer — no full-state re-flood.
         assert_eq!(
-            plan_fanout_send(&manager, &contract, &ours, &theirs, 0),
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                0
+            ),
             FanoutSendPlan::Skip,
             "a converged-but-byte-differing pair must be skipped by the fan-out \
              (pre-fix: full state was re-sent on every fan-out — the heal storm)"
@@ -1558,7 +1594,15 @@ mod tests {
         );
 
         assert_eq!(
-            plan_fanout_send(&manager, &contract, &ours, &theirs, 0),
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                0
+            ),
             FanoutSendPlan::Send,
             "a genuine divergence (non-empty delta) must still be sent"
         );
@@ -1585,7 +1629,15 @@ mod tests {
         );
 
         assert_eq!(
-            plan_fanout_send(&manager, &contract, &ours, &theirs, 0),
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                0
+            ),
             FanoutSendPlan::Skip,
             "byte-identical summaries are trivially converged; the byte-equal \
              short-circuit must precede any delta-cache verdict"
@@ -1609,7 +1661,15 @@ mod tests {
 
         // No cached verdict, budget available → probe the contract.
         assert_eq!(
-            plan_fanout_send(&manager, &contract, &ours, &theirs, 0),
+            plan_fanout_send(
+                &manager,
+                &contract,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
+                0
+            ),
             FanoutSendPlan::Probe,
             "a cache miss within budget must run the bounded WASM probe"
         );
@@ -1617,8 +1677,10 @@ mod tests {
             plan_fanout_send(
                 &manager,
                 &contract,
-                &ours,
-                &theirs,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
                 MAX_STALENESS_PROBES_PER_SUMMARIES - 1
             ),
             FanoutSendPlan::Probe,
@@ -1630,8 +1692,10 @@ mod tests {
             plan_fanout_send(
                 &manager,
                 &contract,
-                &ours,
-                &theirs,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
                 MAX_STALENESS_PROBES_PER_SUMMARIES
             ),
             FanoutSendPlan::Send,
@@ -1650,8 +1714,10 @@ mod tests {
             plan_fanout_send(
                 &manager,
                 &contract,
-                &ours,
-                &theirs,
+                SummaryPair {
+                    ours: &ours,
+                    theirs: &theirs
+                },
                 MAX_STALENESS_PROBES_PER_SUMMARIES * 10
             ),
             FanoutSendPlan::Skip,
