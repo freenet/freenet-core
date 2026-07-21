@@ -54,12 +54,89 @@ jobs:
           # under bash), so it's portable across the matrix.
           UA="freenet-core binstall-smoke-test (https://github.com/freenet/freenet-core)"
           for crate in freenet fdev; do
-            version=$(curl -sSf -H "User-Agent: $UA" \
-              "https://crates.io/api/v1/crates/${crate}" \
-              | jq -er '.crate.max_stable_version')
+            json=$(curl -sSf -H "User-Agent: $UA" \
+              "https://crates.io/api/v1/crates/${crate}")
+            version=$(echo "$json" | jq -er '.crate.max_stable_version')
             echo "Latest ${crate}: ${version}"
             echo "${crate}=${version}" >> "$GITHUB_OUTPUT"
+            # Also capture when the freenet version landed on crates.io, so the
+            # readiness guard below can tell an in-progress release (crate just
+            # published, GitHub release not un-drafted yet) from a genuinely
+            # stuck one. Both freenet and fdev binaries ship in the single
+            # `v{freenet_version}` GitHub release, so the freenet timestamp is
+            # the one that matters.
+            if [ "$crate" = "freenet" ]; then
+              published_at=$(echo "$json" \
+                | jq -er --arg v "$version" \
+                    '.versions[] | select(.num == $v) | .created_at')
+              echo "freenet_published_at=${published_at}" >> "$GITHUB_OUTPUT"
+            fi
           done
+
+      # The release pipeline publishes to crates.io FIRST (release.yml
+      # `publish_crates`), then creates the GitHub release as a *draft*, and
+      # cross-compile.yml attaches the binaries and only un-drafts it at the
+      # very end (`gh release edit --draft=false`) ~30 min later. For that
+      # whole cross-compile window crates.io reports the new version as latest
+      # while the GitHub release binaries are still a draft binstall can't see,
+      # so `cargo binstall` (compile fallback disabled) correctly fails. That is
+      # a release *in progress*, not the permanent breakage this smoke test
+      # exists to catch (assets that never attached / a release stuck in draft).
+      # If the nightly cron happens to run inside that window it hard-fails and
+      # pages the dev + River rooms with a false alarm (run 29805611911,
+      # 2026-07-21: v0.2.103 draft 05:51Z, published 06:20Z, nightly ran 05:59Z).
+      # So gate the binstall assertion on the release actually being published;
+      # skip (green, defer to the next nightly) while it is mid-publish, and
+      # only fail if it has been unpublished long enough to be genuinely stuck.
+      - name: Verify release is published (skip if mid-publish)
+        id: release_ready
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.versions.outputs.freenet }}"
+          # Minutes an unpublished release may lag crates.io before we treat it
+          # as broken rather than in progress. Cross-compile realistically
+          # finishes well under this; a real stuck release is still caught here
+          # once it ages past the threshold, and always by the next nightly.
+          STALE_MIN=90
+          now=$(date -u +%s)
+
+          release_json=$(gh release view "$TAG" \
+            --repo "${{ github.repository }}" \
+            --json isDraft,createdAt 2>/dev/null) || release_json=""
+
+          if [ -z "$release_json" ]; then
+            # crates.io has the version but no GitHub release tag exists yet
+            # (the brief gap before the draft release is created).
+            pub="${{ steps.versions.outputs.freenet_published_at }}"
+            pub_epoch=$(date -u -d "$pub" +%s 2>/dev/null || echo 0)
+            age_min=$(( (now - pub_epoch) / 60 ))
+            if [ "$pub_epoch" -ne 0 ] && [ "$age_min" -gt "$STALE_MIN" ]; then
+              echo "::error::freenet ${{ steps.versions.outputs.freenet }} has been on crates.io for ${age_min} min but no GitHub release $TAG exists."
+              exit 1
+            fi
+            echo "::notice::No GitHub release $TAG yet (crates.io publish just landed; release in progress). Skipping binstall assertion — next nightly re-checks."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$(echo "$release_json" | jq -r '.isDraft')" = "true" ]; then
+            created=$(echo "$release_json" | jq -r '.createdAt')
+            created_epoch=$(date -u -d "$created" +%s 2>/dev/null || echo 0)
+            age_min=$(( (now - created_epoch) / 60 ))
+            if [ "$created_epoch" -ne 0 ] && [ "$age_min" -gt "$STALE_MIN" ]; then
+              echo "::error::Release $TAG has been a draft for ${age_min} min (> ${STALE_MIN}); binaries never published."
+              exit 1
+            fi
+            echo "::notice::Release $TAG is a draft created ${age_min} min ago — release in progress. Skipping binstall assertion — next nightly re-checks."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Release $TAG is published; proceeding with binstall assertions."
+          echo "skip=false" >> "$GITHUB_OUTPUT"
 
       # `--strategies crate-meta-data` restricts binstall to ONLY the GitHub
       # release asset named by the crate's binstall metadata. Without it, the
@@ -77,6 +154,7 @@ jobs:
       # binstall auto-detects GITHUB_TOKEN/GH_TOKEN and switches to the
       # 5000 req/hr authenticated limit. See run 28280841654 (2026-06-27).
       - name: Install freenet via cargo binstall
+        if: steps.release_ready.outputs.skip != 'true'
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -86,6 +164,7 @@ jobs:
             "freenet@${{ steps.versions.outputs.freenet }}"
 
       - name: Install fdev via cargo binstall
+        if: steps.release_ready.outputs.skip != 'true'
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -95,6 +174,7 @@ jobs:
             "fdev@${{ steps.versions.outputs.fdev }}"
 
       - name: Assert binaries respond to --version
+        if: steps.release_ready.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
