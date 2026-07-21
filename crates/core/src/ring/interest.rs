@@ -86,6 +86,14 @@ use crate::config::GlobalExecutor;
 use crate::config::GlobalRng;
 
 /// Maximum number of entries in the delta memoization cache.
+///
+// TODO(fast-follow): size this by hosted×neighbors rather than a flat 1024, so
+// the interest-heartbeat staleness probes (`peer_summary_has_pending_state`)
+// and broadcast deltas keep their working set cached across cycles on
+// large-hosted-set peers. Deferred: the per-message probe budget
+// (`MAX_STALENESS_PROBES_PER_SUMMARIES`) already bounds the cold-cache
+// worst-case load, and summaries are memoized outside WASM so byte keys stay
+// stable while state is unchanged.
 const DELTA_CACHE_SIZE: usize = 1024;
 
 /// Minimum interval between queue-full `ResyncRequest`s to the same peer for
@@ -312,6 +320,54 @@ pub fn is_delta_efficient(summary_size: usize, state_size: usize) -> bool {
         return false;
     }
     summary_size * 2 < state_size
+}
+
+/// Decide whether a peer that reported `their_summary` is stale relative to our
+/// `our_summary` — i.e. whether the InterestSync heartbeat should heal it with
+/// our state.
+///
+/// A raw byte comparison of the two summaries is WRONG on its own: a contract
+/// whose `summarize_state` serializes a `HashMap`/`HashSet` (non-deterministic
+/// iteration order, per-process `RandomState`) produces DIFFERENT summary bytes
+/// for the SAME logical state on different peers. Byte-inequality then flags a
+/// fully-converged peer stale and fires a full-state heal on every ~5-min
+/// heartbeat — the 2.56M rate-limited `summarize_contract_state` storm observed
+/// on the 0.2.102 gateway (freenet/freenet-core#4857 secondary finding). The
+/// core cannot canonicalize the opaque summary bytes itself (it does not know
+/// the contract's encoding), so it delegates the judgement to the contract via
+/// its own `get_state_delta` — surfaced here as `delta_indicates_change`:
+///
+/// - `Some(true)`: our state holds data the peer's summary lacks (a non-empty
+///   delta), so the peer is genuinely stale — heal it.
+/// - `Some(false)`: the contract's delta is empty, so the peer is logically
+///   converged despite differing summary bytes — NOT stale.
+/// - `None`: no semantic verdict is available (the delta probe was unavailable
+///   or timed out), so fall back to the raw byte comparison, i.e. the
+///   conservative pre-fix behaviour, so a genuine divergence is never skipped.
+///
+/// Convergence safety: the returned "stale" set is a strict subset of the
+/// pre-fix byte-compare set. The only peers this newly treats as NOT stale are
+/// those whose summary bytes differ yet whose contract-computed delta is empty —
+/// exactly the copies that already hold our state, for which the removed heal
+/// would have transferred nothing. Any real divergence still yields a non-empty
+/// delta (`Some(true)`) and heals, on this and every subsequent heartbeat.
+pub(crate) fn summary_indicates_stale_peer(
+    our_summary: &StateSummary<'static>,
+    their_summary: &StateSummary<'static>,
+    delta_indicates_change: Option<bool>,
+) -> bool {
+    // Byte-identical summaries are trivially converged. Equal bytes were never
+    // stale under the pre-fix logic either, so short-circuit before consulting
+    // any (potentially contract-buggy) delta verdict: identical bytes must
+    // never heal.
+    if our_summary.as_ref() == their_summary.as_ref() {
+        return false;
+    }
+    // Bytes differ. Trust the contract's semantic verdict when present (robust
+    // to non-deterministic summary serialization); otherwise preserve the
+    // conservative pre-fix behaviour (differing bytes => stale) so a real
+    // divergence is never silently missed.
+    delta_indicates_change.unwrap_or(true)
 }
 
 /// Manages interest tracking and delta computation for all contracts.
@@ -1433,6 +1489,139 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             }
             Ok(other) => Err(format!("Unexpected response to GetDeltaQuery: {:?}", other)),
             Err(e) => Err(format!("Error computing delta: {}", e)),
+        }
+    }
+
+    /// In-memory-only staleness verdict derived from the shared delta cache.
+    ///
+    /// Returns `Some(true)` if a cached delta for the `(their_summary,
+    /// our_summary)` pair is non-empty (the peer is missing state we hold),
+    /// `Some(false)` if it is empty (logically converged despite differing
+    /// summary bytes), or `None` if no delta is cached (the caller must fall
+    /// back to a contract round-trip via [`peer_summary_has_pending_state`]).
+    ///
+    /// This touches only the in-process LRU cache — never the contract handler
+    /// loop — so it is safe to call on the hot heartbeat path.
+    pub fn cached_staleness_verdict(
+        &self,
+        key: &ContractKey,
+        their_summary: &[u8],
+        our_summary: &[u8],
+    ) -> Option<bool> {
+        self.get_cached_delta(key, their_summary, our_summary)
+            .map(|delta| !delta.as_ref().is_empty())
+    }
+
+    /// Ask the contract whether our state holds anything the peer's summary
+    /// lacks — the semantic form of "is this peer stale?" used by the
+    /// InterestSync heartbeat in place of a raw summary byte comparison.
+    ///
+    /// Returns `Some(true)` when the contract's `get_state_delta` yields a
+    /// non-empty delta (genuine divergence), `Some(false)` when it is empty
+    /// (converged despite differing summary bytes — the non-deterministic
+    /// serialization case that drove the #4857 summarize storm), or `None`
+    /// when the delta could not be computed (caller falls back to the byte
+    /// comparison via [`summary_indicates_stale_peer`]).
+    ///
+    /// Unlike [`compute_delta`](Self::compute_delta) this deliberately does NOT
+    /// apply the wire-efficiency gate ([`is_delta_efficient`]): staleness
+    /// detection wants the semantic answer even for contracts where a delta
+    /// would be larger than full state, because the alternative it replaces is a
+    /// spurious FULL-STATE heal on every heartbeat — strictly more expensive
+    /// than one delta computation.
+    ///
+    /// Steady-state cost: the result rides the SAME delta cache as
+    /// `compute_delta` (keyed by contract + both summary hashes). Note that
+    /// outer cache is BYTE-keyed, so under non-deterministic summary
+    /// serialization it *can* miss even for an unchanged pair. The real reason
+    /// the per-heartbeat load stays flat is upstream of this cache: (a) contract
+    /// summaries are memoized OUTSIDE the WASM boundary keyed on a
+    /// state-change-detector hash (`bridged_summarize_contract_state`), so a
+    /// peer's `our_summary`/`their_summary` bytes are STABLE while state is
+    /// unchanged — which keeps this cache's byte key stable across heartbeats —
+    /// and (b) the executor-level delta cache is keyed on `state_hash`
+    /// (`bridged_get_contract_state_delta`), so even a byte-key miss here elides
+    /// the WASM call when the state has not changed. The per-message probe
+    /// budget (`MAX_STALENESS_PROBES_PER_SUMMARIES`) bounds the residual
+    /// cold-cache worst case. Net: a converged pair costs at most one WASM
+    /// `get_state_delta` per state change, not one per heartbeat.
+    ///
+    /// Convergence caveat: the `Some(false)` "converged" verdict is only as
+    /// correct as the contract's `get_state_delta` being a correct semilattice
+    /// diff (empty delta iff our state adds nothing over their summary). A
+    /// contract with a buggy diff could under-report divergence here exactly as
+    /// it already would on the broadcast delta-optimization path; this reuses
+    /// that same, pre-existing trust assumption rather than adding a new one.
+    pub async fn peer_summary_has_pending_state(
+        &self,
+        op_manager: &crate::node::OpManager,
+        key: &ContractKey,
+        their_summary: &StateSummary<'static>,
+        our_summary: &StateSummary<'static>,
+    ) -> Option<bool> {
+        use crate::contract::ContractHandlerEvent;
+
+        let their_bytes = their_summary.as_ref();
+        let our_bytes = our_summary.as_ref();
+
+        // Fast path: shared in-memory delta cache, no contract round-trip.
+        if let Some(verdict) = self.cached_staleness_verdict(key, their_bytes, our_bytes) {
+            return Some(verdict);
+        }
+
+        // Slow path: ask the contract for the delta of our state against their
+        // summary. `GetDeltaQuery` is the same event `compute_delta` uses, and
+        // we cache the result under the same key so both paths share it.
+        //
+        // Priority: this runs at the DEFAULT (NetworkRelay) priority that
+        // `notify_contract_handler_with_timeout` uses — deliberately NOT
+        // `Priority::Background`. A Background probe would be SHED first under
+        // contract-handler saturation, returning `None` → the caller falls back
+        // to the byte-compare, which flags the (converged-but-byte-differing)
+        // peer stale and fires a FULL-STATE heal — re-enabling the very storm
+        // this probe suppresses, exactly when the node is most loaded. The probe
+        // is strictly cheaper than the heal it prevents, so it must run even
+        // under load; the per-message `MAX_STALENESS_PROBES_PER_SUMMARIES` cap
+        // (not de-prioritization) is what bounds its cost.
+        match op_manager
+            .notify_contract_handler_with_timeout(
+                ContractHandlerEvent::GetDeltaQuery {
+                    key: *key,
+                    their_summary: their_summary.clone(),
+                },
+                BROADCAST_CH_TIMEOUT,
+            )
+            .await
+        {
+            Ok(ContractHandlerEvent::GetDeltaResponse { delta: Ok(d), .. }) => {
+                let has_change = !d.as_ref().is_empty();
+                self.cache_delta(key, their_bytes, our_bytes, d);
+                Some(has_change)
+            }
+            Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => {
+                tracing::debug!(
+                    contract = %key,
+                    error = %e,
+                    "Staleness delta probe failed — falling back to summary byte comparison"
+                );
+                None
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    contract = %key,
+                    response = ?other,
+                    "Unexpected response to GetDeltaQuery (staleness probe)"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::debug!(
+                    contract = %key,
+                    error = %e,
+                    "Error computing staleness delta probe — falling back to byte comparison"
+                );
+                None
+            }
         }
     }
 
@@ -3425,6 +3614,159 @@ mod tests {
              rounds: {:?}",
             ghosts.len(),
             &ghosts[..ghosts.len().min(10)]
+        );
+    }
+
+    // ---- Semantic staleness (#4857 secondary finding / summarize storm) ----
+    //
+    // The InterestSync heartbeat used to decide "is this peer stale?" with a
+    // raw byte comparison of `summarize_state` output. A contract whose summary
+    // serializes non-deterministically (HashMap/HashSet iteration order,
+    // per-process RandomState) produces DIFFERENT summary bytes for the SAME
+    // logical state across peers, so the byte compare flagged a fully-converged
+    // peer stale and fired a full-state heal every heartbeat — the 2.56M
+    // rate-limited `summarize_contract_state` storm observed on the 0.2.102
+    // gateway. The fix asks the CONTRACT (via its own `get_state_delta`,
+    // surfaced here through the shared delta cache / `cached_staleness_verdict`)
+    // whether we actually hold state the peer lacks.
+
+    #[test]
+    fn nondeterministic_summary_does_not_flag_converged_peer_stale() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+
+        // Two summaries of the SAME logical state that serialize to DIFFERENT
+        // bytes (models cross-peer HashMap/HashSet iteration-order divergence).
+        let ours = StateSummary::from(vec![1u8, 2, 3]);
+        let theirs = StateSummary::from(vec![3u8, 2, 1]);
+
+        // Precondition / reproduction: the pre-fix logic was exactly
+        // `is_stale = our_bytes != their_bytes`, which flags this converged
+        // peer stale and triggers the spurious heal.
+        assert_ne!(
+            ours.as_ref(),
+            theirs.as_ref(),
+            "precondition: summaries differ byte-wise (the false-stale trigger)"
+        );
+        assert!(
+            summary_indicates_stale_peer(&ours, &theirs, None),
+            "pre-fix byte comparison (no contract verdict) flags the converged \
+             peer stale — this is the storm we are reproducing"
+        );
+
+        // The contract, asked for the delta of our state against their summary,
+        // returns an EMPTY delta: logically converged despite differing bytes.
+        // Model it exactly as production does — via the shared delta cache the
+        // staleness oracle consults.
+        manager.cache_delta(
+            &contract,
+            theirs.as_ref(),
+            ours.as_ref(),
+            StateDelta::from(Vec::<u8>::new()),
+        );
+        let verdict = manager.cached_staleness_verdict(&contract, theirs.as_ref(), ours.as_ref());
+        assert_eq!(
+            verdict,
+            Some(false),
+            "an empty cached delta means the contract sees the peer as converged"
+        );
+
+        // FIX: byte-differing summaries + empty delta => NOT stale => no heal.
+        assert!(
+            !summary_indicates_stale_peer(&ours, &theirs, verdict),
+            "empty delta must suppress the spurious heal (fixes the storm)"
+        );
+    }
+
+    #[test]
+    fn genuinely_diverged_peer_is_still_flagged_stale() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(2);
+
+        let ours = StateSummary::from(vec![9u8, 9, 9]);
+        let theirs = StateSummary::from(vec![1u8]);
+
+        // Contract returns a NON-EMPTY delta: our state holds data theirs lacks.
+        manager.cache_delta(
+            &contract,
+            theirs.as_ref(),
+            ours.as_ref(),
+            StateDelta::from(vec![42u8]),
+        );
+        let verdict = manager.cached_staleness_verdict(&contract, theirs.as_ref(), ours.as_ref());
+        assert_eq!(
+            verdict,
+            Some(true),
+            "a non-empty delta is a real divergence"
+        );
+
+        // A genuine divergence must STILL heal — the fix only removes spurious
+        // heals, never a real one.
+        assert!(
+            summary_indicates_stale_peer(&ours, &theirs, verdict),
+            "genuine divergence must still be flagged stale and heal"
+        );
+    }
+
+    #[test]
+    fn identical_summaries_are_never_stale_without_probing() {
+        let ours = StateSummary::from(vec![7u8, 7, 7]);
+        let theirs = StateSummary::from(vec![7u8, 7, 7]);
+
+        // Byte-identical summaries are trivially converged; the decision is
+        // `false` regardless of (indeed, without needing) any delta verdict.
+        assert!(!summary_indicates_stale_peer(&ours, &theirs, None));
+        assert!(!summary_indicates_stale_peer(&ours, &theirs, Some(true)));
+    }
+
+    #[test]
+    fn missing_delta_verdict_falls_back_to_byte_comparison() {
+        let ours = StateSummary::from(vec![1u8, 2, 3]);
+        let theirs_differ = StateSummary::from(vec![3u8, 2, 1]);
+        let theirs_same = StateSummary::from(vec![1u8, 2, 3]);
+
+        // When no semantic verdict is available (probe failed/timed out), we
+        // preserve the conservative pre-fix behaviour: bytes differ => stale,
+        // bytes equal => not stale. This guarantees we never SILENTLY skip a
+        // real heal just because the delta probe was unavailable.
+        assert!(summary_indicates_stale_peer(&ours, &theirs_differ, None));
+        assert!(!summary_indicates_stale_peer(&ours, &theirs_same, None));
+    }
+
+    #[test]
+    fn cached_staleness_verdict_reports_absence_and_emptiness() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(3);
+        let ours = StateSummary::from(vec![5u8]);
+        let theirs = StateSummary::from(vec![6u8]);
+
+        // Not cached yet => no verdict (caller falls back to a contract probe).
+        assert_eq!(
+            manager.cached_staleness_verdict(&contract, theirs.as_ref(), ours.as_ref()),
+            None
+        );
+
+        // Empty delta => converged; non-empty => diverged.
+        manager.cache_delta(
+            &contract,
+            theirs.as_ref(),
+            ours.as_ref(),
+            StateDelta::from(Vec::<u8>::new()),
+        );
+        assert_eq!(
+            manager.cached_staleness_verdict(&contract, theirs.as_ref(), ours.as_ref()),
+            Some(false)
+        );
+
+        manager.cache_delta(
+            &contract,
+            theirs.as_ref(),
+            ours.as_ref(),
+            StateDelta::from(vec![1u8]),
+        );
+        assert_eq!(
+            manager.cached_staleness_verdict(&contract, theirs.as_ref(), ours.as_ref()),
+            Some(true)
         );
     }
 }
