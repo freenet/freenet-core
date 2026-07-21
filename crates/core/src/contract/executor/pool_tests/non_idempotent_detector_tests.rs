@@ -144,6 +144,86 @@ fn production_gate_sites_consult_is_contract_broken() {
     );
 }
 
+/// Source-grep pin for the full-state EGRESS gates: while a contract is
+/// flagged, the executor's own commit/broadcast suppression is not enough
+/// — three paths still pushed state off the node and kept the broadcast
+/// echo alive network-wide:
+///
+/// 1. `InterestMessage::ResyncRequest` handling in node.rs served a full
+///    `ResyncResponse`.
+/// 2. The Summaries-mismatch heal (`handle_sync_state_to_peer` in
+///    p2p_protoc/broadcast.rs) pushed full state to a "stale" peer.
+/// 3. `handle_broadcast_state_change` (same file) — the highest-
+///    amplification fan-out sink — is re-entered by re-emission paths
+///    that bypass the executor's emission gate (its own no-target retry
+///    re-emissions, the #4359 stashed-broadcast flush, pending flushes),
+///    re-seeding the echo after a flag lands.
+///
+/// All three must consult `is_contract_broken` BEFORE any state leaves
+/// the node. These are pinned by source scrape because driving the
+/// interest-sync handler / p2p bridge in a unit test requires the full
+/// node harness (the flag predicate itself is behavior-tested in
+/// `ring::broken_invariants::tests` and `identical_input_probe_tests`).
+#[test]
+fn egress_paths_gated_on_is_contract_broken() {
+    const NODE_RS: &str = include_str!("../../../node.rs");
+    const BROADCAST_RS: &str = include_str!("../../../node/network_bridge/p2p_protoc/broadcast.rs");
+
+    // --- ResyncRequest arm: gate must precede the state fetch/serve. ---
+    let arm_start = NODE_RS
+        .find("InterestMessage::ResyncRequest { key } =>")
+        .expect("node.rs must still have the ResyncRequest handler arm");
+    let arm = &NODE_RS[arm_start..];
+    let gate = arm
+        .find("is_contract_broken")
+        .expect("ResyncRequest arm must gate on is_contract_broken (broken-contract egress)");
+    let serve = arm
+        .find("get_contract_state(op_manager, &key)")
+        .expect("ResyncRequest arm must still fetch state to serve");
+    assert!(
+        gate < serve,
+        "the is_contract_broken gate (offset {gate}) must run BEFORE the \
+         ResyncResponse state fetch (offset {serve}) so a flagged node never \
+         serves full state"
+    );
+
+    // --- Broadcast fan-out: gate must precede target selection/send. ---
+    let bc_start = BROADCAST_RS
+        .find("fn handle_broadcast_state_change")
+        .expect("broadcast.rs must still have handle_broadcast_state_change");
+    let bc_body = &BROADCAST_RS[bc_start..];
+    let bc_gate = bc_body
+        .find("is_contract_broken")
+        .expect("handle_broadcast_state_change must gate on is_contract_broken");
+    let bc_send = bc_body
+        .find("get_broadcast_targets_update")
+        .expect("handle_broadcast_state_change must still select broadcast targets");
+    assert!(
+        bc_gate < bc_send,
+        "the is_contract_broken gate (offset {bc_gate}) must run BEFORE \
+         broadcast target selection (offset {bc_send}) so retry/stash/flush \
+         re-emissions cannot re-seed the echo for a flagged contract"
+    );
+
+    // --- SyncStateToPeer heal: gate must precede the enqueue/send. ---
+    let fn_start = BROADCAST_RS
+        .find("fn handle_sync_state_to_peer")
+        .expect("broadcast.rs must still have handle_sync_state_to_peer");
+    let body = &BROADCAST_RS[fn_start..];
+    let heal_gate = body
+        .find("is_contract_broken")
+        .expect("handle_sync_state_to_peer must gate on is_contract_broken");
+    let heal_send = body
+        .find("broadcast_queue.enqueue")
+        .expect("handle_sync_state_to_peer must still enqueue the heal send");
+    assert!(
+        heal_gate < heal_send,
+        "the is_contract_broken gate (offset {heal_gate}) must run BEFORE the \
+         SyncStateToPeer enqueue (offset {heal_send}) so a flagged node never \
+         heals peers with the problematic state"
+    );
+}
+
 /// A healthy fixture — `UpdateOverride` unwired — must produce byte-equal
 /// state on re-apply. This is the "no false positive" pin for the probe:
 /// a contract whose `update_state` is correctly idempotent must NOT be

@@ -5,8 +5,18 @@
 //! self-perpetuating broadcast storm: every peer's merge generates a new
 //! byte-different state, which propagates, which every peer re-merges.
 //!
-//! When the merge path's idempotency probe (in `Executor`) detects this on a
-//! sampled merge, it calls [`BrokenInvariantsTracker::record`] which:
+//! Two detectors in `Executor` feed this tracker: the sampled re-apply
+//! probe (`maybe_probe_idempotency`, 1/32 of pure-`State` merges) and the
+//! deterministic identical-input probe
+//! (`probe_identical_input_idempotency`): when an incoming full-`State`
+//! payload is byte-identical to the stored state, `update_state(S, State(S))`
+//! must reach a fixpoint by CvRDT lattice-join semantics, so a
+//! cooldown-bounded ([`IDENTITY_PROBE_COOLDOWN`]) re-apply sequence whose
+//! byte MULTISET keeps changing is deterministic proof of non-idempotency
+//! (no sampling; a contract that canonicalizes once and then stabilizes is
+//! NOT flagged).
+//!
+//! When a detector fires, it calls [`BrokenInvariantsTracker::record`] which:
 //!
 //! 1. Inserts the flag into an in-memory `DashMap` keyed on the contract
 //!    instance id, so subsequent same-process reads see it immediately.
@@ -14,9 +24,11 @@
 //!    survives node restarts (a known-broken contract should not re-engage
 //!    the storm just because the process bounced).
 //!
-//! Reads (via [`BrokenInvariantsTracker::is_broken`]) gate the broadcast-
-//! emission path so a flagged contract's state changes never leave the
-//! node.
+//! Reads (via [`BrokenInvariantsTracker::is_broken`]) gate the executor's
+//! commit + broadcast-emission paths AND the full-state egress paths
+//! (`ResyncResponse` in node.rs, `SyncStateToPeer` and the
+//! `handle_broadcast_state_change` fan-out in p2p_protoc/broadcast.rs) so a
+//! flagged contract's state never leaves the node.
 //!
 //! ## Why the flag is TTL-bounded, not permanent
 //!
@@ -78,6 +90,16 @@ use crate::util::time_source::TimeSource;
 /// a false positive recovers promptly rather than bricking the contract.
 pub(crate) const BROKEN_INVARIANT_TTL: Duration = Duration::from_secs(300);
 
+/// Per-contract cooldown for the deterministic identical-input idempotency
+/// probe (`Executor::probe_identical_input_idempotency`). The #4151
+/// identical-push fast path exists because byte-identical re-pushes are the
+/// dominant dedup-miss case; re-running the merge on EVERY one would
+/// reintroduce the WASM cost that fix removed. One probe per contract per
+/// cooldown keeps detection deterministic (a violating contract is caught
+/// on the first identical apply after each cooldown — no 1/32 sampling) at
+/// a bounded cost.
+pub(crate) const IDENTITY_PROBE_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// The kind of CRDT invariant a contract was observed to violate. Currently
 /// only one variant; future work may add violations like non-commutativity
 /// or non-determinism detection.
@@ -120,6 +142,11 @@ struct FlagEntry {
 /// in-memory only — this matches the pattern used by `HostingManager`.
 pub(crate) struct BrokenInvariantsTracker {
     flags: Arc<DashMap<ContractInstanceId, FlagEntry>>,
+    /// Last-claim timestamps for the deterministic identical-input probe
+    /// (see [`IDENTITY_PROBE_COOLDOWN`]). Swept by [`Self::cleanup`];
+    /// bounded in practice by the set of locally-stored contracts (a claim
+    /// requires an upsert against stored state).
+    identity_probe_claims: DashMap<ContractInstanceId, Instant>,
     // `RwLock<Option<Storage>>` (mirroring `HostingManager`) rather than a
     // `OnceLock` so the handle can be dropped on shutdown via `clear_storage`,
     // releasing its redb `Database` clone (issue #4401). None of the readers
@@ -133,8 +160,34 @@ impl BrokenInvariantsTracker {
     pub fn new(time_source: Arc<dyn TimeSource + Send + Sync>) -> Self {
         Self {
             flags: Arc::new(DashMap::new()),
+            identity_probe_claims: DashMap::new(),
             storage: parking_lot::RwLock::new(None),
             time_source,
+        }
+    }
+
+    /// Claim a slot for the deterministic identical-input idempotency probe
+    /// for `id`. Returns true (and stamps the claim) if no probe ran within
+    /// the last [`IDENTITY_PROBE_COOLDOWN`]; false while the cooldown is
+    /// pending. The claim is consumed regardless of the probe's outcome, so
+    /// an inconclusive probe (merge error, no state output) still waits out
+    /// the cooldown before re-trying.
+    pub fn try_claim_identity_probe(&self, id: &ContractInstanceId) -> bool {
+        use dashmap::mapref::entry::Entry;
+        let now = self.time_source.now();
+        match self.identity_probe_claims.entry(*id) {
+            Entry::Occupied(mut o) => {
+                if now.saturating_duration_since(*o.get()) >= IDENTITY_PROBE_COOLDOWN {
+                    *o.get_mut() = now;
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert(now);
+                true
+            }
         }
     }
 
@@ -258,6 +311,12 @@ impl BrokenInvariantsTracker {
                 self.remove_from_storage(&id);
             }
         }
+
+        // Identity-probe claims are pure cooldown stamps — drop any that
+        // have aged past the cooldown (they'd grant the next claim anyway),
+        // keeping the map bounded.
+        self.identity_probe_claims
+            .retain(|_, t| now.saturating_duration_since(*t) < IDENTITY_PROBE_COOLDOWN);
     }
 
     /// Best-effort removal of a flag's persisted row. Shared by `clear` and
@@ -464,6 +523,37 @@ mod tests {
             t.is_broken(&id),
             "re-recording must refresh the expiry window"
         );
+    }
+
+    /// The identity-probe claim is granted at most once per cooldown per
+    /// contract, independently per contract, and the claim map is swept
+    /// once stamps age past the cooldown (bounded-collection hygiene).
+    #[test]
+    fn identity_probe_claim_respects_cooldown() {
+        let (t, ts) = mk_tracker();
+        let a = fake_id(9);
+        let b = fake_id(10);
+
+        assert!(t.try_claim_identity_probe(&a), "first claim granted");
+        assert!(
+            !t.try_claim_identity_probe(&a),
+            "second claim within cooldown denied"
+        );
+        assert!(
+            t.try_claim_identity_probe(&b),
+            "unrelated contract unaffected"
+        );
+
+        ts.advance_time(IDENTITY_PROBE_COOLDOWN);
+        assert!(
+            t.try_claim_identity_probe(&a),
+            "claim granted again after the cooldown"
+        );
+
+        // Sweep drops stale stamps so the map stays bounded.
+        ts.advance_time(IDENTITY_PROBE_COOLDOWN);
+        t.cleanup();
+        assert!(t.identity_probe_claims.is_empty(), "stale claims swept");
     }
 
     #[test]

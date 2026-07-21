@@ -51,6 +51,23 @@ pub(crate) enum UpdateOverride {
     /// Used by tests to verify the idempotency probe fires on a real-
     /// world-shaped failure mode.
     NonIdempotent(std::sync::Arc<std::sync::atomic::AtomicU64>),
+    /// Models the #4295 false-positive shape: a correct, logically-
+    /// idempotent contract whose serialization is non-canonical
+    /// (HashMap/HashSet iteration order). Every call returns the logical
+    /// input state's bytes ROTATED left by one — byte-different from the
+    /// input but the same byte MULTISET — so the detectors must classify
+    /// it as benign flutter, NOT a violation.
+    ReorderBytes,
+    /// Models a correct CANONICALIZING contract (the F3 false-positive
+    /// shape for the identical-input probe): `update_state` normalizes a
+    /// raw state ONCE — here, by stripping leading `0xFF` marker bytes, a
+    /// genuine content (multiset) change — and is then STABLE: an input
+    /// already in canonical form (no leading `0xFF`) is returned
+    /// unchanged. The realistic scenario is a fresh PUT whose raw client
+    /// bytes were installed without running `update_state`; the first
+    /// merge canonicalizes, every later one is a fixpoint. The
+    /// identical-input probe must NOT flag this shape.
+    CanonicalizeOnce,
 }
 
 /// A lightweight mock runtime at the `ContractRuntimeInterface` level that lets
@@ -186,6 +203,59 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                     // production rather than growing unboundedly.
                     let tail_start = logical.len().min(8);
                     out.extend_from_slice(&logical[tail_start..]);
+                    return Ok(UpdateModification::valid(out.into()));
+                }
+                UpdateOverride::ReorderBytes => {
+                    // Same logical-input precedence as the other overrides,
+                    // then rotate: byte-different output, identical byte
+                    // multiset (the #4295 serialization-flutter shape).
+                    let mut out = update_data
+                        .iter()
+                        .find_map(|u| match u {
+                            UpdateData::State(s) => Some(s.as_ref().to_vec()),
+                            UpdateData::Delta(d) => Some(d.as_ref().to_vec()),
+                            UpdateData::StateAndDelta { state, .. } => {
+                                Some(state.as_ref().to_vec())
+                            }
+                            UpdateData::RelatedState { .. }
+                            | UpdateData::RelatedDelta { .. }
+                            | UpdateData::RelatedStateAndDelta { .. } => None,
+                            // `UpdateData` is `#[non_exhaustive]`; fall
+                            // through to the `_state` fallback.
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| _state.as_ref().to_vec());
+                    if !out.is_empty() {
+                        out.rotate_left(1);
+                    }
+                    return Ok(UpdateModification::valid(out.into()));
+                }
+                UpdateOverride::CanonicalizeOnce => {
+                    // Canonical form: leading 0xFF marker bytes stripped.
+                    // Non-canonical input → normalized output (a genuine
+                    // multiset change). Canonical input → returned
+                    // unchanged (fixpoint).
+                    let logical = update_data
+                        .iter()
+                        .find_map(|u| match u {
+                            UpdateData::State(s) => Some(s.as_ref().to_vec()),
+                            UpdateData::Delta(d) => Some(d.as_ref().to_vec()),
+                            UpdateData::StateAndDelta { state, .. } => {
+                                Some(state.as_ref().to_vec())
+                            }
+                            UpdateData::RelatedState { .. }
+                            | UpdateData::RelatedDelta { .. }
+                            | UpdateData::RelatedStateAndDelta { .. } => None,
+                            // `UpdateData` is `#[non_exhaustive]`; fall
+                            // through to the `_state` fallback.
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| _state.as_ref().to_vec());
+                    let canonical_start = logical
+                        .iter()
+                        .position(|b| *b != 0xFF)
+                        .unwrap_or(logical.len());
+                    let out = logical[canonical_start..].to_vec();
                     return Ok(UpdateModification::valid(out.into()));
                 }
             }

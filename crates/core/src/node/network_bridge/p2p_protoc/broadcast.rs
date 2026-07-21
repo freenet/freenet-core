@@ -225,6 +225,31 @@ impl P2pConnManager {
             return;
         }
 
+        // Egress gate (broken invariants): the executor already gates its
+        // own FRESH BroadcastStateChange emission on `is_contract_broken`,
+        // but this handler is also re-entered by paths that bypass that
+        // gate — the no-target retry re-emissions it schedules itself, the
+        // #4359 stashed fresh-contract flush, and pending-broadcast
+        // flushes. Any of those landing AFTER the flag was set would
+        // re-seed the non-idempotent broadcast echo through the
+        // highest-amplification fan-out sink on the node (#4279 storm
+        // shape). Gate here so every re-emission funnel is suppressed
+        // while the contract is flagged; the flag's TTL self-heals a
+        // false positive. See `crate::ring::broken_invariants`.
+        if op_manager.ring.is_contract_broken(&key) {
+            tracing::debug!(
+                contract = %key,
+                phase = "broadcast_state_change_broken_skip",
+                "skipping state-change broadcast for contract flagged as broken"
+            );
+            // Same bookkeeping cleanup rationale as the ban gate above: a
+            // flag landing mid-retry-cycle must not leave a stale
+            // retry/streak entry behind.
+            self.broadcast_retries.remove(&key);
+            self.broadcast_no_target_streak.remove(&key);
+            return;
+        }
+
         let self_addr = op_manager.ring.connection_manager.get_own_addr();
         let Some(self_addr) = self_addr else {
             tracing::warn!(
@@ -525,6 +550,22 @@ impl P2pConnManager {
         new_state: freenet_stdlib::prelude::WrappedState,
         target_addr: std::net::SocketAddr,
     ) {
+        // Egress gate (broken invariants): the Summaries-mismatch heal
+        // must not push full state for a contract flagged as violating
+        // CRDT idempotency — every heal would re-seed the broadcast echo
+        // on the target peer while the executor is suppressing local
+        // commits/broadcasts for exactly that contract (#4279 storm
+        // shape). See `crate::ring::broken_invariants`.
+        if op_manager.ring.is_contract_broken(&key) {
+            tracing::debug!(
+                contract = %key,
+                peer = %target_addr,
+                event = "sync_state_suppressed_broken_contract",
+                "SyncStateToPeer suppressed for contract flagged as broken"
+            );
+            return;
+        }
+
         let target = op_manager
             .ring
             .connection_manager

@@ -4280,6 +4280,14 @@ impl Ring {
         self.broken_invariants.record(*contract.id(), kind);
     }
 
+    /// Claim a slot for the deterministic identical-input idempotency probe
+    /// (`Executor::probe_identical_input_idempotency`). Bounded to one
+    /// probe per contract per `IDENTITY_PROBE_COOLDOWN`.
+    pub(crate) fn try_claim_identity_probe(&self, contract: &ContractKey) -> bool {
+        self.broken_invariants
+            .try_claim_identity_probe(contract.id())
+    }
+
     /// Wire persistent storage for the broken-invariants tracker. Called
     /// once at executor wiring time.
     pub(crate) fn set_broken_invariants_storage(
