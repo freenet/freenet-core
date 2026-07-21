@@ -4708,6 +4708,67 @@ mod tests {
         );
     }
 
+    /// Semantic fan-out skip pin — sim-inline counterpart of
+    /// `broadcast_queue::fanout_path_uses_semantic_delta_skip_pin` (#4894's
+    /// fan-out counterpart / the nondeterministic-summary heal storm).
+    ///
+    /// The sim-only `broadcast_state_to_peers` duplicates the production
+    /// per-peer send body, so it must mirror BOTH halves of the fix: the
+    /// per-peer skip decision routes through
+    /// `broadcast_queue::fanout_send_needed` (semantic staleness, not a bare
+    /// summary byte compare), and the `compute_delta` `Ok(None)` (empty delta
+    /// = converged) arm SKIPS instead of falling back to full state. Without
+    /// this pin the behavioral broadcast simulation tests would diverge from
+    /// production and silently regress the storm.
+    #[test]
+    fn broadcast_state_to_peers_uses_semantic_delta_skip() {
+        // Lives in the `broadcast` submodule after the p2p_protoc.rs split.
+        const SOURCE: &str = include_str!("p2p_protoc/broadcast.rs");
+
+        let fn_anchor = "async fn broadcast_state_to_peers(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("broadcast_state_to_peers renamed or removed");
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = [
+            after_header.find("\n    async fn "),
+            after_header.find("\n    pub(super) async fn "),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|p| fn_start + fn_anchor.len() + p)
+        .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        assert!(
+            body.contains("fanout_send_needed("),
+            "broadcast_state_to_peers must route the per-peer skip decision \
+             through broadcast_queue::fanout_send_needed — a bare summary byte \
+             comparison re-opens the nondeterministic-summary heal storm on \
+             the sim-inline fan-out path"
+        );
+
+        let ok_none_off = body
+            .find("Ok(None) =>")
+            .expect("compute_delta Ok(None) arm not found in broadcast_state_to_peers");
+        let err_off = body[ok_none_off..]
+            .find("Err(err) =>")
+            .expect("compute_delta Err arm not found after Ok(None) arm");
+        let ok_none_arm = &body[ok_none_off..ok_none_off + err_off];
+        assert!(
+            !ok_none_arm.contains("FullState"),
+            "the sim fan-out's Ok(None) (empty delta = converged) arm must NOT \
+             fall back to sending full state — mirror the production skip. Arm \
+             body:\n{ok_none_arm}"
+        );
+        assert!(
+            ok_none_arm.contains("continue;"),
+            "the sim fan-out's Ok(None) (empty delta = converged) arm must skip \
+             this peer (continue). Arm body:\n{ok_none_arm}"
+        );
+    }
+
     /// Phase 7 egress self-block pin (#4300). `handle_broadcast_state_change`
     /// MUST skip the fan-out for a banned contract — the egress
     /// `contract_ban_list.is_banned(key.id())` check must appear BEFORE

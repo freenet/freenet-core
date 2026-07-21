@@ -606,6 +606,12 @@ impl P2pConnManager {
         let mut send_success: usize = 0;
         let mut send_failed: usize = 0;
 
+        // Per-fan-out probe budget shared across all targets, mirroring the
+        // production `broadcast_to_single_peer` semantic skip and the
+        // `Summaries` handler's per-message MAX_STALENESS_PROBES_PER_SUMMARIES
+        // cap (see `broadcast_queue::fanout_send_needed`).
+        let mut staleness_probes_used = 0usize;
+
         for target in &target_result.targets {
             let Some(peer_addr) = target.socket_addr() else {
                 continue;
@@ -618,13 +624,26 @@ impl P2pConnManager {
                 .interest_manager
                 .get_peer_summary(&key, &peer_key);
 
-            // Skip if summaries are equal (no change to send)
+            // Semantic skip (#4894's fan-out counterpart): byte-equal
+            // summaries skip as before; byte-differing summaries consult the
+            // shared delta cache / a bounded contract probe so a
+            // converged-but-nondeterministic-summary pair does not re-flood
+            // full state. Mirrors production `broadcast_to_single_peer`.
             if let (Some(ours), Some(theirs)) = (&our_summary, &their_summary) {
-                if ours.as_ref() == theirs.as_ref() {
+                if !super::super::broadcast_queue::fanout_send_needed(
+                    op_manager,
+                    &key,
+                    ours,
+                    theirs,
+                    &mut staleness_probes_used,
+                )
+                .await
+                {
                     tracing::trace!(
                         contract = %key,
                         peer = %peer_addr,
-                        "Skipping broadcast - peer already has our state"
+                        "Skipping broadcast - peer already has our state \
+                         (byte-equal or logically converged summaries)"
                     );
                     skipped_summary_match += 1;
                     continue;
@@ -645,16 +664,19 @@ impl P2pConnManager {
                             true,
                         ),
                         Ok(None) => {
-                            tracing::debug!(
+                            // Empty delta = the peer is logically converged
+                            // despite byte-differing summaries. The pre-fix
+                            // arm sent FULL STATE here (the
+                            // nondeterministic-summary heal storm). Mirrors
+                            // production `broadcast_to_single_peer`: skip.
+                            tracing::trace!(
                                 contract = %key,
-                                "Delta computation returned no change, sending full state"
+                                peer = %peer_addr,
+                                "Skipping broadcast - contract reported empty \
+                                 delta (peer converged)"
                             );
-                            (
-                                crate::message::DeltaOrFullState::FullState(
-                                    new_state.as_ref().to_vec(),
-                                ),
-                                false,
-                            )
+                            skipped_summary_match += 1;
+                            continue;
                         }
                         Err(err) => {
                             tracing::debug!(
