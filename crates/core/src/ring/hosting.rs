@@ -3299,7 +3299,12 @@ mod tests {
     ///    (recency-aware candidacy);
     /// 5. a single large-state fan-out burst (5 MB × 30 targets, first report
     ///    seconds before the sweep) is NOT shed (sustained-pressure gate), so
-    ///    one burst can never mass-evict a large-state contract.
+    ///    one burst can never mass-evict a large-state contract;
+    /// 6. an OLD-first-sample contract whose only recent activity is a
+    ///    ~60-second flurry is NOT shed (#4903 review Fix 2: the sustained
+    ///    gate keys on the span of the recent samples, not the lifetime
+    ///    first-sample age — which is set once, never reset, and would
+    ///    otherwise admit any later burst on a long-known contract).
     #[tokio::test]
     async fn storm_frequency_profile_crosses_cost_trigger_through_real_meter() {
         use crate::topology::meter::{AttributionSource, Meter, ResourceType};
@@ -3310,6 +3315,7 @@ mod tests {
         let junk = make_contract_key(1);
         let read_hot = make_contract_key(2);
         let burst = make_contract_key(3);
+        let old_then_burst = make_contract_key(4);
 
         // 10 minutes of storm: one fan-out dispatch every 1.6s to 58 targets
         // of a 121-byte payload (the FX2j profile), for junk AND read_hot
@@ -3346,6 +3352,24 @@ mod tests {
             burst_bytes,
             now - Duration::from_secs(1),
         );
+        // OLD-first-sample contract (#4903 review Fix 2): one sample 10
+        // minutes before the sweep, then a ~60s buffer-saturating flurry just
+        // before it (120 samples at 0.5s cadence — the retained 100 span
+        // ~50s, far under the min_window/2 sustained bar).
+        meter.report(
+            &AttributionSource::Contract(*old_then_burst.id()),
+            ResourceType::BroadcastMessagesSent,
+            58.0,
+            t0,
+        );
+        for i in 0..120u64 {
+            meter.report(
+                &AttributionSource::Contract(*old_then_burst.id()),
+                ResourceType::BroadcastMessagesSent,
+                5.0,
+                t0 + Duration::from_secs(540) + Duration::from_millis(500 * i),
+            );
+        }
 
         // --- the real reads + the shared axis assembly. ---
         let cpu = meter.contract_cost_rates(
@@ -3386,9 +3410,18 @@ mod tests {
              under-read is back"
         );
         // The burst contract is in the TOTAL but excluded from candidacy
-        // (sustained gate: first report is 1s old).
+        // (sustained gate: its recent samples span ~0s).
         assert!(!msgs.1.contains_key(burst.id()));
         assert!(!fanout.1.contains_key(burst.id()));
+        // (6) The old-first-sample flurry is ALSO excluded from candidacy:
+        // its within-window samples span only ~50s. Under the pre-fix
+        // lifetime-first-sample-age gate (first report 10 min old — trivially
+        // "sustained") it would be a candidate here and this assertion fails.
+        assert!(
+            !msgs.1.contains_key(old_then_burst.id()),
+            "an old-first-sample contract's short flurry must not be a candidate \
+             (#4903 review Fix 2)"
+        );
 
         let axes = cache::build_cost_axes(cpu, fanout, msgs);
 
@@ -3401,6 +3434,7 @@ mod tests {
         manager.record_contract_access(junk, 121, AccessType::Put);
         manager.record_contract_access(read_hot, 121, AccessType::Put);
         manager.record_contract_access(burst, 5 * 1024 * 1024, AccessType::Put);
+        manager.record_contract_access(old_then_burst, 121, AccessType::Put);
         // The storm has run long past the cost window with no genuine access…
         clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
         // …but read_hot was genuinely GET-read just now.
@@ -3424,6 +3458,12 @@ mod tests {
         assert!(
             manager.is_hosting_contract(&burst),
             "a single large fan-out burst must not mass-evict (sustained gate)"
+        );
+        assert!(
+            manager.is_hosting_contract(&old_then_burst),
+            "an old-first-sample contract's ~60s flurry must not evict it \
+             (#4903 review Fix 2: sustained = recent-sample SPAN, not lifetime \
+             first-sample age)"
         );
     }
 

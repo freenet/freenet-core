@@ -840,7 +840,10 @@ pub(crate) fn victim_order(
 //
 // Candidacy is restricted to ZERO-DEMAND contracts in invariant 3's full
 // sense: `local_subs == 0 && downstream_subs == 0` AND no genuine GET/PUT
-// within the cost window AND `attributed_cost > 0`. A SUBSCRIBED contract is
+// within the cost window AND no local-client access within the reconciliation
+// renewal lease (`SUBSCRIPTION_LEASE_DURATION` — so the cost sweep never sheds
+// a contract the renewal loop still leases, including for one lease window
+// after a restart) AND `attributed_cost > 0`. A SUBSCRIBED contract is
 // NEVER a cost-eviction candidate, and neither is an actively-read one (the
 // never-subscribed-but-read River UI-container class) — the subscriber-
 // primary tiers of [`victim_order`] are not reordered by cost (cost breaks
@@ -952,9 +955,12 @@ pub(crate) fn build_cost_axes(
 
 /// The cost-eviction candidacy predicate: only a contract with ZERO demand
 /// may be shed by cost pressure, where zero demand means no local client
-/// subscriptions AND no downstream subscribers AND no genuine GET/PUT access
-/// within the cost window (`recently_accessed == false`) — matching invariant
-/// 3's demand definition, which includes reads. A subscribed contract is
+/// subscriptions AND no downstream subscribers AND no recent demand
+/// (`recently_accessed == false` — the caller passes true for a genuine
+/// GET/PUT within the cost window OR a local-client access within the
+/// reconciliation renewal lease; see [`HostingCache::evict_cost_pressure`]) —
+/// matching invariant 3's demand definition, which includes reads. A
+/// subscribed contract is
 /// NEVER a candidate, and neither is an actively-read/written one (the
 /// never-subscribed-but-read River UI-container class invariant 3 protects) —
 /// by construction, not by ranking — so cost pressure cannot reorder the
@@ -1838,7 +1844,9 @@ impl<T: TimeSource> HostingCache<T> {
     ///
     /// Per axis, when `total_rate > floor`, the candidates are the hosted
     /// contracts satisfying [`cost_eviction_candidate`] (zero local
-    /// subscriptions AND zero downstream subscribers AND strictly positive
+    /// subscriptions AND zero downstream subscribers AND no recent demand —
+    /// neither a genuine GET/PUT within the cost window nor a local-client
+    /// access within the reconciliation renewal lease — AND strictly positive
     /// attributed rate) whose rate exceeds [`COST_SHARE_THRESHOLD`] ×
     /// `total_rate`.
     /// Candidates are shed in DESCENDING attributed-rate order (contract-key
@@ -1852,12 +1860,13 @@ impl<T: TimeSource> HostingCache<T> {
     /// The subscriber-primary tiers are untouched by construction: a contract
     /// with ANY subscriber fails candidacy outright, so `was_in_use` is
     /// `false` for every returned victim and the caller's in-use teardown is
-    /// a no-op. Recency is neither read nor refreshed here (an UPDATE-storm
-    /// contract deliberately accrues no recency — cache.rs recency semantics
-    /// unchanged); the in-flight-op races this opens are the same ones the
-    /// periodic byte sweep already has, closed downstream by the
-    /// `write_generation` re-host guard and the `contract_in_use` re-check in
-    /// `RuntimePool::remove_contract`.
+    /// a no-op. Recency is READ here (the `last_genuine_access` /
+    /// `local_client_last_access` candidacy guards) but never REFRESHED (an
+    /// UPDATE-storm contract deliberately accrues no recency — cache.rs
+    /// recency-stamping semantics unchanged); the in-flight-op races this
+    /// opens are the same ones the periodic byte sweep already has, closed
+    /// downstream by the `write_generation` re-host guard and the
+    /// `contract_in_use` re-check in `RuntimePool::remove_contract`.
     ///
     /// `subscriber_counts(key)` is the caller's genuine-demand split, read
     /// once per candidate and captured atomically with the decision (same
@@ -1884,13 +1893,33 @@ impl<T: TimeSource> HostingCache<T> {
                 .filter_map(|(key, entry)| {
                     let rate = axis.rates.get(key.id()).copied().unwrap_or(0.0);
                     let (local, downstream) = subscriber_counts(key);
-                    // Genuine GET/PUT within the cost window = read-demand,
-                    // which invariant 3 counts as demand: not a candidate.
-                    // UPDATE churn never stamps `last_genuine_access`, so a
-                    // storm contract cannot protect itself.
+                    // Recent demand by the SAME definition the rest of the
+                    // system honors (review Fix 1 / invariant 3), so cost
+                    // eviction can never shed a contract reconciliation
+                    // still leases (an evict → re-lease churn loop):
+                    //
+                    // 1. A genuine GET/PUT within the cost window
+                    //    (`last_genuine_access`) — read/write demand.
+                    //    UPDATE churn never stamps it, so a storm contract
+                    //    cannot protect itself.
+                    // 2. A LOCAL-CLIENT access within the renewal lease
+                    //    (`local_client_last_access` <
+                    //    `SUBSCRIPTION_LEASE_DURATION`) — the exact signal
+                    //    `contracts_needing_renewal` branch 3 renews on.
+                    //    This covers both the 5–8-minute tail after a local
+                    //    access (the lease outlives the cost window) and the
+                    //    restart window: a reload stamps
+                    //    `local_client_last_access = now` for locally-
+                    //    accessed contracts while `last_genuine_access`
+                    //    restarts at `None`, so without this clause the cost
+                    //    sweep could evict a contract the reconcile loop was
+                    //    still renewing.
                     let recently_accessed = entry
                         .last_genuine_access
-                        .is_some_and(|at| now.saturating_duration_since(at) < COST_RATE_MIN_WINDOW);
+                        .is_some_and(|at| now.saturating_duration_since(at) < COST_RATE_MIN_WINDOW)
+                        || entry.local_client_last_access.is_some_and(|at| {
+                            now.saturating_duration_since(at) < super::SUBSCRIPTION_LEASE_DURATION
+                        });
                     (cost_eviction_candidate(local, downstream, rate, recently_accessed)
                         && rate > share_cutoff)
                         .then_some((*key, rate))
@@ -2301,6 +2330,154 @@ mod tests {
         let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].key, read_hot);
+    }
+
+    /// #4903 review Fix 1 (repeat-PUT facet), cache level: a repeat PUT to an
+    /// ALREADY-hosted contract refreshes `last_genuine_access`, so a
+    /// write-only publisher PUTting continuously is never a cost-eviction
+    /// candidate — and the protection still expires once the PUTs stop.
+    /// (The production wiring — `relay_put_store_locally` calling
+    /// `host_contract` outside its `!was_hosting` gate — is pinned by
+    /// `relay_put_store_locally_stamps_recency_on_repeat_put` in
+    /// `operations/put/op_ctx_task.rs`.)
+    #[test]
+    fn evict_cost_pressure_repeat_put_refreshes_protection() {
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let publisher = make_key(1);
+        cache.record_access(publisher, 121, AccessType::Put, 1, |_| (0, 0));
+        // Long past the cost window since first host…
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        // …but the publisher keeps PUTting (the refresh path: the entry is
+        // already hosted, so this is `record_access` on an existing entry).
+        cache.record_access(publisher, 121, AccessType::Put, 2, |_| (0, 0));
+
+        let axes = [cost_axis(100_000.0, 50_000.0, &[(&publisher, 90_000.0)])];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert!(
+            evicted.is_empty(),
+            "a repeat PUT is genuine client access (invariant 3) — the \
+             write-only publisher must not be cost-evicted into a churn loop"
+        );
+        assert!(cache.get(&publisher).is_some());
+
+        // Once the PUTs stop for a full cost window the protection lapses.
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].key, publisher);
+    }
+
+    /// #4903 review Fix 1 (local-lease facet): a local-client access within
+    /// the reconciliation renewal lease (`SUBSCRIPTION_LEASE_DURATION`, 8 min
+    /// — LONGER than the 5-min cost window) protects from cost eviction, so
+    /// the sweep can never shed a contract `contracts_needing_renewal` is
+    /// still renewing (the minutes-5-to-8 churn window).
+    #[test]
+    fn evict_cost_pressure_local_client_lease_protects() {
+        use crate::ring::hosting::SUBSCRIPTION_LEASE_DURATION;
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let local = make_key(1);
+        cache.record_access(local, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        // Local client touches it now (GET via the HTTP/WS gateway path).
+        cache.mark_local_client_access(&local);
+        // Advance PAST the cost window but WITHIN the renewal lease: the
+        // genuine-access stamp is stale, the local lease is not.
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        assert!(cache.has_recent_local_client_access(&local, SUBSCRIPTION_LEASE_DURATION));
+
+        let axes = [cost_axis(100_000.0, 50_000.0, &[(&local, 90_000.0)])];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert!(
+            evicted.is_empty(),
+            "a contract inside the local-client renewal lease must not be a \
+             cost victim (reconciliation still leases it — invariant 3)"
+        );
+
+        // Once the lease lapses too, the contract is shed.
+        clock.advance_time(SUBSCRIPTION_LEASE_DURATION);
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].key, local);
+    }
+
+    /// #4903 review Fix 1 (restart facet): a restart reload leaves
+    /// `last_genuine_access = None` but seeds `local_client_last_access = now`
+    /// for locally-accessed contracts (one renewal window to re-establish
+    /// subscriptions). Cost candidacy must honor that lease — without it the
+    /// sweep evicts a just-reloaded contract reconciliation is about to renew
+    /// (~2.5 min churn after every restart). A reloaded contract with NO
+    /// pre-restart local access gets no such grace.
+    #[test]
+    fn evict_cost_pressure_restart_local_lease_protects() {
+        use crate::ring::hosting::SUBSCRIPTION_LEASE_DURATION;
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let local = make_key(1);
+        let unloved = make_key(2);
+        cache.load_persisted_entry(
+            local,
+            121,
+            AccessType::Get,
+            Duration::from_secs(3600),
+            true, // locally accessed pre-restart → lease seeded at load
+        );
+        cache.load_persisted_entry(
+            unloved,
+            121,
+            AccessType::Put,
+            Duration::from_secs(3600),
+            false,
+        );
+        cache.finalize_loading();
+
+        let axes = [cost_axis(
+            100_000.0,
+            50_000.0,
+            &[(&local, 40_000.0), (&unloved, 40_000.0)],
+        )];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        let keys: Vec<ContractKey> = evicted.iter().map(|e| e.key).collect();
+        assert_eq!(
+            keys,
+            vec![unloved],
+            "post-restart: the locally-leased reload survives, the never-\
+             locally-accessed one is shed"
+        );
+        assert!(cache.get(&local).is_some());
+
+        // The restart grace is time-bounded: one renewal lease, then the
+        // reloaded contract competes like anything else.
+        clock.advance_time(SUBSCRIPTION_LEASE_DURATION + Duration::from_secs(1));
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].key, local);
+    }
+
+    /// Exact-25%-share boundary: a contract holding EXACTLY the threshold
+    /// share of the axis total is NOT shed (the share test is strict `>`);
+    /// epsilon above it IS.
+    #[test]
+    fn evict_cost_pressure_exact_share_boundary_not_shed() {
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let boundary = make_key(1);
+        cache.record_access(boundary, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+
+        // rate == 0.25 × total exactly: NOT an offender.
+        let at_threshold = [cost_axis(100_000.0, 50_000.0, &[(&boundary, 25_000.0)])];
+        assert!(
+            cache
+                .evict_cost_pressure(&|_: &ContractKey| (0, 0), &at_threshold)
+                .is_empty(),
+            "exactly the 25% share must NOT trigger (strict >)"
+        );
+        assert!(cache.get(&boundary).is_some());
+
+        // Strictly above the threshold: shed.
+        let above = [cost_axis(100_000.0, 50_000.0, &[(&boundary, 25_000.1)])];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &above);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].key, boundary);
     }
 
     /// A LOCAL client subscription protects exactly like a downstream one.

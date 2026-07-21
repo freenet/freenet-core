@@ -2381,9 +2381,11 @@ where
     }
 }
 
-/// Store a relayed PUT's contract locally: `put_contract` + (if not
-/// already hosting) `host_contract` + `announce_contract_hosted` +
-/// interest register/unregister + broadcast interest changes.
+/// Store a relayed PUT's contract locally: `put_contract` + `host_contract`
+/// (unconditional, so EVERY genuine PUT refreshes hosting recency —
+/// invariant 3 / #4903 review Fix 1) + (if not already hosting)
+/// `announce_contract_hosted` + interest register/unregister + broadcast
+/// interest changes.
 ///
 /// Shared between the non-streaming relay driver (`drive_relay_put`)
 /// and the streaming relay driver (`drive_relay_put_streaming`) so both
@@ -2487,11 +2489,23 @@ async fn relay_put_store_locally(
         }
     };
 
+    // EVERY genuine PUT stamps hosting recency — including a repeat PUT to a
+    // contract this peer already hosts (invariant 3: "a real GET or PUT resets
+    // recency", and this applies to BOTH the client-loopback and the relay-hop
+    // PUT, which share this store chokepoint). This call used to sit inside the
+    // `!was_hosting` gate below, so a write-only publisher re-PUTting an
+    // already-hosted contract was stamped once at first host and became a
+    // cost-eviction candidate `COST_RATE_MIN_WINDOW` later — an evict →
+    // re-host churn loop (#4903 review Fix 1). On the already-hosted path
+    // `record_access_with_demand` only refreshes recency/size/generation
+    // (returns `is_new = false`, evicts nothing), so the first-time-hosting
+    // side effects stay gated on `!was_hosting`.
+    let access_result =
+        op_manager
+            .ring
+            .host_contract(key, value.size() as u64, crate::ring::AccessType::Put);
+
     if !was_hosting {
-        let access_result =
-            op_manager
-                .ring
-                .host_contract(key, value.size() as u64, crate::ring::AccessType::Put);
         let evicted = access_result.evicted;
 
         // Sync the InterestManager for any subscribed contract the
@@ -6104,6 +6118,41 @@ mod tests {
             helper_src.contains("remove_evicted_in_use"),
             "helper MUST call interest_manager.remove_evicted_in_use to sync the \
              InterestManager after a subscribed eviction"
+        );
+    }
+
+    /// Pin (#4903 review Fix 1 / invariant 3): `relay_put_store_locally` MUST
+    /// call `ring.host_contract(.., AccessType::Put)` UNCONDITIONALLY — i.e.
+    /// BEFORE (outside) the `if !was_hosting` first-time-hosting gate — so a
+    /// repeat PUT to an already-hosted contract refreshes hosting recency
+    /// (`recency_seq` / `last_genuine_access`). This applies to BOTH the
+    /// client-loopback and the relay-hop PUT, which share this store
+    /// chokepoint. When the stamp was gated on `!was_hosting`, a write-only
+    /// publisher re-PUTting every few seconds was stamped once at first host
+    /// and became a cost-eviction candidate `COST_RATE_MIN_WINDOW` later —
+    /// an evict → re-host churn loop.
+    #[test]
+    fn relay_put_store_locally_stamps_recency_on_repeat_put() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn relay_put_store_locally(")
+            .expect("relay_put_store_locally not found");
+        let end = src[start..]
+            .find("\nasync fn relay_put_replicate_forward(")
+            .expect("relay_put_store_locally body end not found")
+            + start;
+        let body = &src[start..end];
+        let host_pos = body
+            .find(".host_contract(")
+            .expect("relay_put_store_locally must call ring.host_contract");
+        let gate_pos = body
+            .find("if !was_hosting")
+            .expect("first-time-hosting gate not found");
+        assert!(
+            host_pos < gate_pos,
+            "host_contract MUST run before (outside) the `if !was_hosting` gate \
+             so a repeat PUT refreshes hosting recency (invariant 3: a real PUT \
+             resets recency; #4903 review Fix 1)"
         );
     }
 

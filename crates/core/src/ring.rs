@@ -8371,6 +8371,135 @@ mod sleep_or_shutdown_tests {
     }
 }
 
+/// End-to-end seam test for cost-aware eviction (#4861 / #4903 review):
+/// drives the message axis through the REAL production reporter
+/// (`Ring::report_contract_resource_usage` → topology meter) and the REAL
+/// `Ring::sweep_expired_hosting()` (→ `hosting_cost_pressure_axes` →
+/// `HostingManager::sweep_expired_hosting_with_cost`) — the exact
+/// reporter → meter → axes → sweep chain the manager-level storm test
+/// (`storm_frequency_profile_crosses_cost_trigger_through_real_meter`)
+/// bypasses by assembling its axes by hand from a standalone `Meter`.
+#[cfg(test)]
+mod cost_pressure_seam_tests {
+    use std::time::Duration;
+
+    fn seam_key(seed: u8) -> freenet_stdlib::prelude::ContractKey {
+        freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([seed; 32]),
+            freenet_stdlib::prelude::CodeHash::new([seed.wrapping_add(1); 32]),
+        )
+    }
+
+    /// Runs under `start_paused` so `tokio::time::Instant` — the clock behind
+    /// BOTH the Ring's production `InstantTimeSrc` (meter timestamps, sweep
+    /// reads, hosting recency) and every background interval — is virtual and
+    /// advanced deterministically with `tokio::time::advance`. The Ring's
+    /// periodic background tasks (including the 60s hosting sweep, which runs
+    /// this same seam) fire during the advances; the assertions are therefore
+    /// on the FINAL hosting state, which is identical whether a background
+    /// sweep or the explicit call below sheds the storm contract.
+    #[tokio::test(start_paused = true)]
+    async fn zero_demand_storm_is_shed_through_real_reporter_and_sweep() {
+        use crate::topology::meter::ResourceType;
+
+        // --- a real OpManager (and thus a real Ring with its production
+        // InstantTimeSrc), mirroring the fixture in node.rs
+        // (`resync_request_for_bogus_keys_does_not_consume_limiter_slots`). ---
+        let config_args = crate::config::ConfigArgs {
+            id: Some("cost-seam-4903".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr("127.0.0.1:14100".parse().unwrap());
+        let ring = &op_manager.ring;
+
+        let junk = seam_key(1);
+        let subscribed = seam_key(2);
+        let read_hot = seam_key(3);
+
+        // Host all three through the production entry point (PUT seeds).
+        let _ = ring.host_contract(junk, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(subscribed, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(read_hot, 121, crate::ring::AccessType::Put);
+        assert!(ring.is_hosting_contract(&junk), "precondition: hosted");
+
+        // Age the PUT-seed recency stamps past the cost window, so only the
+        // demand signals added BELOW protect anything.
+        tokio::time::advance(super::hosting::COST_RATE_MIN_WINDOW + Duration::from_secs(1)).await;
+
+        // Demand: `subscribed` gains a downstream subscriber (lease outlives
+        // this test's remaining ~3 virtual minutes); `read_hot` is genuinely
+        // GET-read now (within the cost window of the final sweep).
+        assert!(ring.add_downstream_subscriber(
+            &subscribed,
+            crate::ring::interest::PeerKey(crate::transport::TransportPublicKey::from_bytes(
+                [9u8; 32]
+            )),
+        ));
+        let _ = ring.record_get_access(read_hot, 121);
+
+        // The FX2j storm profile, reported for ALL THREE contracts through
+        // the production reporter: one 58-target fan-out dispatch every 1.6s
+        // for ~3 minutes (~36 per-peer sends/s sustained). Equal rates prove
+        // protection comes from demand, not from a smaller cost share.
+        for _ in 0..110u32 {
+            for key in [&junk, &subscribed, &read_hot] {
+                ring.report_contract_resource_usage(
+                    *key.id(),
+                    ResourceType::BroadcastMessagesSent,
+                    58.0,
+                );
+            }
+            tokio::time::advance(Duration::from_millis(1600)).await;
+        }
+
+        // The REAL sweep (the same call the 60s background sweep task makes).
+        let _ = ring.sweep_expired_hosting();
+
+        assert!(
+            !ring.is_hosting_contract(&junk),
+            "the zero-demand storm contract must be shed through the real \
+             reporter → meter → hosting_cost_pressure_axes → sweep seam"
+        );
+        assert!(
+            ring.is_hosting_contract(&subscribed),
+            "a subscribed contract storming at the SAME rate must survive \
+             (candidacy, not ranking, protects it)"
+        );
+        assert!(
+            ring.is_hosting_contract(&read_hot),
+            "a recently-GET-read contract storming at the SAME rate must \
+             survive (reads are demand — invariant 3)"
+        );
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum RingError {
     #[error(transparent)]

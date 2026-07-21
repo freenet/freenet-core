@@ -161,27 +161,34 @@ impl Meter {
     /// Iterates the attribution meters, keeping only
     /// [`AttributionSource::Contract`] entries (peer/delegate bandwidth sources
     /// never participate in contract cost eviction), and reads each contract's
-    /// rate via [`RunningAverage::windowed_rate`]: sparse samples are diluted
-    /// over at least `min_window` (a lone burst cannot masquerade as a
-    /// sustained storm), while a saturated sample buffer divides by its actual
-    /// span so a sustained high-frequency storm's TRUE rate is representable
-    /// (the count-truncation under-read that hid the #4861 profile).
+    /// rate via [`RunningAverage::windowed_rate`]: only samples within the
+    /// last `min_window` participate (a source that stops reporting decays to
+    /// nothing instead of holding a stale rate — review Fix 3), sparse
+    /// samples are diluted over at least `min_window` (a lone burst cannot
+    /// masquerade as a sustained storm), while a fully-recent saturated
+    /// sample buffer divides by its actual span so a sustained high-frequency
+    /// storm's TRUE rate is representable (the count-truncation under-read
+    /// that hid the #4861 profile).
     ///
     /// Returns `(total_rate, per_contract_rate)` in axis units per second.
     /// EVERY positive-rate contract counts toward `total_rate` (the share
     /// denominator), but the per-contract map — the eviction CANDIDACY input —
-    /// contains only contracts whose reporting is SUSTAINED (first sample at
-    /// least `min_window / 2` old). A contract absent from the map has zero
-    /// attributed cost for candidacy purposes, so a single large fan-out
-    /// burst (first report moments ago) can never make its contract a cost
-    /// victim, no matter how big the burst.
+    /// contains only contracts whose reporting is SUSTAINED: the within-window
+    /// samples must SPAN at least `min_window / 2`
+    /// ([`crate::topology::running_average::WindowedRate::retained_span`]).
+    /// A contract absent from the map has zero attributed cost for candidacy
+    /// purposes, so a short burst — even a buffer-saturating one, and even on
+    /// a source whose FIRST-EVER sample is arbitrarily old (the lifetime
+    /// first-sample age was the review-Fix-2 hole: set once and never reset)
+    /// — can never make its contract a cost victim, no matter how big the
+    /// burst.
     pub(crate) fn contract_cost_rates(
         &self,
         resource: &ResourceType,
         at_time: Instant,
         min_window: Duration,
     ) -> (f64, std::collections::HashMap<ContractInstanceId, f64>) {
-        let sustained_min_age = min_window / 2;
+        let sustained_min_span = min_window / 2;
         let mut per_contract = std::collections::HashMap::new();
         let mut total = 0.0_f64;
         for entry in self.attribution_meters.iter() {
@@ -197,7 +204,7 @@ impl Meter {
             let per_second = windowed.rate.per_second();
             if per_second > 0.0 {
                 total += per_second;
-                if windowed.first_sample_age >= sustained_min_age {
+                if windowed.retained_span >= sustained_min_span {
                     per_contract.insert(*id, per_second);
                 }
             }
@@ -702,14 +709,16 @@ mod tests {
     }
 
     /// `contract_cost_rates` (cost-aware eviction, #4861) aggregates ONLY
-    /// Contract-attributed sources; sparse samples are amortized over the
-    /// minimum window (a lone burst cannot masquerade as a sustained storm);
-    /// a SATURATED sample buffer reads its true rate over its actual span
-    /// (the count-truncation fix — without it a sustained high-frequency
-    /// storm's rate is capped at samples×value/window and can hide under the
-    /// floor); and the per-contract candidacy map admits only SUSTAINED
-    /// sources (first sample at least half the window old) while every
-    /// positive rate still counts toward the total.
+    /// Contract-attributed sources; samples older than the minimum window are
+    /// ignored (a quiet source decays — review Fix 3); sparse samples are
+    /// amortized over the minimum window (a lone burst cannot masquerade as a
+    /// sustained storm); a fully-recent SATURATED sample buffer reads its
+    /// true rate over its actual span (the count-truncation fix — without it
+    /// a sustained high-frequency storm's rate is capped at
+    /// samples×value/window and can hide under the floor); and the
+    /// per-contract candidacy map admits only SUSTAINED sources (within-
+    /// window samples spanning at least half the window) while every positive
+    /// rate still counts toward the total.
     #[test]
     fn contract_cost_rates_aggregates_contract_sources_with_min_window() {
         let meter = Meter::new_with_window_size(100);
@@ -717,7 +726,8 @@ mod tests {
         let min_window = Duration::from_secs(300);
         let now = t0 + Duration::from_secs(600);
 
-        // Sustained sparse source: two 30_000µs samples over 10 minutes.
+        // Sparse source: two 30_000µs samples over 10 minutes. Only the
+        // second falls within the last `min_window` of the read.
         meter.report(
             &contract_source(1),
             ResourceType::ExecCpuMicros,
@@ -761,16 +771,22 @@ mod tests {
             meter.contract_cost_rates(&ResourceType::ExecCpuMicros, now, min_window);
         let id1 = ContractInstanceId::new([1u8; 32]);
         let id2 = ContractInstanceId::new([2u8; 32]);
-        // Sustained sparse source: 60_000µs over its 600s retained span.
-        assert!((cpu_rates[&id1] - 60_000.0 / 600.0).abs() < 1e-6);
+        // Sparse source: the t0 sample is older than the window and ignored
+        // (review Fix 3), leaving one within-window sample — diluted over the
+        // window (30_000/300s = 100/s) and NOT sustained (span 0), so it
+        // counts toward the total but is no candidacy entry.
+        assert!(
+            !cpu_rates.contains_key(&id1),
+            "a lone within-window sample must not be a candidate"
+        );
         // Burst source: counted in the TOTAL (diluted over min_window: 30M/300s
-        // = 100_000/s) but EXCLUDED from the candidacy map (first sample 1s
-        // old — not sustained), so one burst can never nominate a victim.
+        // = 100_000/s) but EXCLUDED from the candidacy map (recent samples
+        // span ~0s — not sustained), so one burst can never nominate a victim.
         assert!(
             !cpu_rates.contains_key(&id2),
             "burst must not be a candidate"
         );
-        let expected_total = 60_000.0 / 600.0 + 30_000_000.0 / 300.0;
+        let expected_total = 30_000.0 / 300.0 + 30_000_000.0 / 300.0;
         assert!((cpu_total - expected_total).abs() < 1e-6);
 
         // Saturated storm source: true rate over the RETAINED span (~158.4s),
@@ -784,6 +800,114 @@ mod tests {
             "saturated buffer must read the true storm rate (~36.6/s), got {rate3}/s"
         );
         assert!((msgs_total - rate3).abs() < 1e-9);
+    }
+
+    /// Review Fix 2 regression: an OLD first-ever sample must not admit a
+    /// later short burst into candidacy. Before the fix the sustained gate
+    /// keyed on the lifetime `first_sample_time` (set once, never reset), so
+    /// a contract that reported once long ago passed the gate forever and a
+    /// buffer-saturating 60-second flurry then read a high instantaneous
+    /// rate and became a cost-eviction candidate — "a single burst can never
+    /// make its contract a victim" was false for old-first-sample sources.
+    #[test]
+    fn contract_cost_rates_old_first_sample_then_burst_is_not_a_candidate() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+
+        // First-ever sample, 10 minutes before the read.
+        meter.report(
+            &contract_source(1),
+            ResourceType::BroadcastMessagesSent,
+            58.0,
+            t0,
+        );
+        // A 60-second buffer-saturating flurry just before the read: 120
+        // samples at 0.5s cadence (the buffer keeps the last 100, spanning
+        // ~49.5s — all recent, so the rate reads high).
+        let burst_start = t0 + Duration::from_secs(540);
+        for i in 0..120u64 {
+            meter.report(
+                &contract_source(1),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                burst_start + Duration::from_millis(500 * i),
+            );
+        }
+        let now = t0 + Duration::from_secs(601);
+
+        let (total, rates) =
+            meter.contract_cost_rates(&ResourceType::BroadcastMessagesSent, now, min_window);
+        let id1 = ContractInstanceId::new([1u8; 32]);
+        assert!(
+            !rates.contains_key(&id1),
+            "an old-first-sample source's short burst must NOT be a candidate \
+             (the recent samples span only ~50s, not min_window/2)"
+        );
+        assert!(
+            total > 0.0,
+            "the burst still counts toward the node total (share denominator)"
+        );
+    }
+
+    /// Review Fix 3 regression: a contract that stops reporting decays out of
+    /// the cost read within a bounded time (one `min_window` of silence) —
+    /// it leaves the candidacy map first (its recent samples no longer span
+    /// half the window) and then stops inflating the node total entirely,
+    /// instead of holding its stale storm rate for as long as the
+    /// count-bounded buffer retains old samples.
+    #[test]
+    fn contract_cost_rates_quiet_contract_decays_out_within_min_window() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+        let id1 = ContractInstanceId::new([1u8; 32]);
+
+        // The FX2j storm profile: 150 samples of 58 msgs at 1.6s cadence.
+        for i in 0..150u64 {
+            meter.report(
+                &contract_source(1),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                t0 + Duration::from_millis(1600 * i),
+            );
+        }
+        let storm_end = t0 + Duration::from_millis(1600 * 149);
+
+        // Live: a sustained candidate at its true rate.
+        let (live_total, live_rates) = meter.contract_cost_rates(
+            &ResourceType::BroadcastMessagesSent,
+            storm_end + Duration::from_secs(1),
+            min_window,
+        );
+        assert!(live_rates[&id1] > 30.0);
+        assert!(live_total > 30.0);
+
+        // After 180s of silence the within-window samples span under half
+        // the window: no longer a CANDIDATE (even though some rate remains
+        // in the total while recent samples linger).
+        let (_, stale_rates) = meter.contract_cost_rates(
+            &ResourceType::BroadcastMessagesSent,
+            storm_end + Duration::from_secs(180),
+            min_window,
+        );
+        assert!(
+            !stale_rates.contains_key(&id1),
+            "a quiet contract must drop out of candidacy as its recent span shrinks"
+        );
+
+        // After a full min_window of silence every sample is stale: the
+        // contract contributes NOTHING (no total inflation, no candidacy).
+        let (gone_total, gone_rates) = meter.contract_cost_rates(
+            &ResourceType::BroadcastMessagesSent,
+            storm_end + min_window + Duration::from_secs(1),
+            min_window,
+        );
+        assert!(gone_rates.is_empty());
+        assert_eq!(
+            gone_total, 0.0,
+            "a source quiet for min_window must stop inflating total_rate"
+        );
     }
 
     #[test]

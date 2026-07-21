@@ -4505,6 +4505,67 @@ mod tests {
         );
     }
 
+    /// Guard (#4903 review / invariant 3): the UPDATE and broadcast paths must
+    /// NEVER stamp hosting recency. "UPDATE churn never counts as genuine
+    /// access" is what keeps a zero-demand storm contract cost-evictable
+    /// (`hosting-invariants.md` invariant 3: a storm contract whose only
+    /// activity is its own UPDATE churn stays evictable) — a future refactor
+    /// that routes an UPDATE through `host_contract` / `record_get_access` /
+    /// `touch_hosting` / `mark_local_client_access` would make storms
+    /// self-protecting and silently disarm cost-pressure eviction. This pin
+    /// scans the PRODUCTION regions of the update op modules and the
+    /// broadcast queue for any recency-stamping call, with comment text
+    /// stripped so prose references stay legal.
+    #[test]
+    fn update_and_broadcast_paths_never_stamp_hosting_recency() {
+        // Strip line comments so documentation may mention the forbidden
+        // calls without tripping the pin; only real code counts.
+        fn code_only(src: &str) -> String {
+            src.lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let sources: [(&str, &str); 3] = [
+            (
+                "operations/update/op_ctx_task.rs",
+                include_str!("op_ctx_task.rs"),
+            ),
+            ("operations/update.rs", include_str!("../update.rs")),
+            (
+                "node/network_bridge/broadcast_queue.rs",
+                include_str!("../../node/network_bridge/broadcast_queue.rs"),
+            ),
+        ];
+        // Every entry point that stamps hosting recency (`recency_seq` /
+        // `last_genuine_access`) or the local-client renewal lease
+        // (`local_client_last_access`). Matched as method calls (leading dot)
+        // so type/fn definitions elsewhere don't count.
+        let forbidden = [
+            ".host_contract(",
+            ".record_get_access(",
+            ".touch_hosting(",
+            ".touch_with_demand(",
+            ".record_contract_access(",
+            ".record_access(",
+            ".record_access_with_demand(",
+            ".mark_local_client_access(",
+        ];
+        for (name, src) in sources {
+            let prod_end = src.find("\nmod tests {").unwrap_or(src.len());
+            let prod = code_only(&src[..prod_end]);
+            for needle in forbidden {
+                assert!(
+                    !prod.contains(needle),
+                    "{name} production code must not call `{needle}` — an UPDATE/\
+                     broadcast path stamping hosting recency would let a storm \
+                     contract protect itself from cost eviction (invariant 3)"
+                );
+            }
+        }
+    }
+
     /// #4864 round-4 (item 9): a memoized payload replayed through the REAL
     /// `drive_relay_broadcast_to` by a SECOND sender is hard-skipped — the merge
     /// never reaches the executor, that sender's Invalid channel never trips (its
