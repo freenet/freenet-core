@@ -3059,6 +3059,22 @@ async fn handle_interest_sync_message(
             op_manager.interest_manager.record_resync_request_received();
             crate::config::GlobalTestMetrics::record_resync_request();
 
+            // Delta-incompatibility signal (HQk7 resync loop): a ResyncRequest
+            // arriving shortly after WE delivered a delta to this peer for
+            // this contract means our delta failed to apply there. Count it
+            // toward the sender-side "this contract can't take deltas" memo so
+            // the broadcast path falls back to full-state sends instead of
+            // recomputing doomed deltas. Runs BEFORE the rate limiters AND
+            // before the broken-contract egress gate below — the signal is
+            // valid even when the full-state response is suppressed (a broken
+            // contract that also can't take deltas still wants full-state
+            // fallback recorded for the peers we DO serve). See
+            // `crate::ring::delta_incompat`.
+            op_manager
+                .ring
+                .delta_incompat
+                .note_resync_request(*key.id(), source);
+
             // Egress gate (broken invariants): a contract flagged as
             // violating CRDT idempotency must not have its full state
             // served to peers. The executor already suppresses commit +
@@ -4030,6 +4046,109 @@ mod tests {
             "the Summaries arm must ration WASM probes through \
              plan_staleness_probe (MAX_STALENESS_PROBES_PER_SUMMARIES cap) — \
              an uncapped probe per contract is a DoS amplification surface"
+        );
+    }
+
+    /// Source-scrape pin (HQk7 resync loop): the `ResyncRequest` arm must feed
+    /// the sender-side delta-incompatibility memo (`note_resync_request`)
+    /// BEFORE the response rate limiters run. A ResyncRequest arriving shortly
+    /// after we delivered a delta to that peer is the wire-visible form of the
+    /// peer's `delta_apply_failed`; it is a valid incompatibility signal even
+    /// when the full-state response itself is suppressed by the #4861
+    /// limiters, so gating it behind them would starve the memo exactly during
+    /// the storm it exists to stop. See `crate::ring::delta_incompat`.
+    #[test]
+    fn resync_request_arm_feeds_delta_incompat_memo_before_limiters() {
+        let src = include_str!("node.rs");
+
+        let handler_start = src
+            .find("async fn handle_interest_sync_message(")
+            .expect("handle_interest_sync_message not found");
+        // Scope to the `ResyncRequest` arm = its match start .. the
+        // `ResyncResponse` arm, so the assertions can't false-pass on
+        // unrelated code elsewhere in the handler.
+        let req_off = src[handler_start..]
+            .find("InterestMessage::ResyncRequest { key }")
+            .expect("ResyncRequest arm not found");
+        let resp_off = src[handler_start..]
+            .find("InterestMessage::ResyncResponse {")
+            .expect("ResyncResponse arm not found");
+        let req_arm = &src[handler_start + req_off..handler_start + resp_off];
+
+        let memo_pos = req_arm
+            .find(".note_resync_request(")
+            .expect("the ResyncRequest arm must feed the delta-incompat memo");
+        let limiter_pos = req_arm
+            .find("resync_response_limiter")
+            .expect("per-(peer, contract) response limiter not found in ResyncRequest arm");
+        assert!(
+            memo_pos < limiter_pos,
+            "note_resync_request must run BEFORE the response rate limiters \
+             (memo {memo_pos} < limiter {limiter_pos}) — a suppressed response \
+             is still a valid delta-incompatibility signal"
+        );
+        // Also lock memo-before-broken-gate: B's `is_contract_broken → return
+        // None` egress gate sits between the memo and the limiters, and the
+        // arming's own comment requires it run "before the broken-contract
+        // egress gate". Without this assertion a future edit could move the
+        // arming after the gate (silently dropping the signal for broken
+        // contracts) and still pass the memo-before-limiter check above.
+        let broken_pos = req_arm
+            .find("is_contract_broken")
+            .expect("the ResyncRequest arm must gate on the broken-contract egress check (B)");
+        assert!(
+            memo_pos < broken_pos,
+            "note_resync_request must run BEFORE the broken-contract egress gate \
+             (memo {memo_pos} < broken {broken_pos}) — the delta-incompatibility \
+             signal is valid even when the full-state response is suppressed for a \
+             broken contract"
+        );
+    }
+
+    /// Source-scrape pin (HQk7 fork investigation): the `ResyncResponse` arm
+    /// must apply the received full state through the contract handler's
+    /// `UpdateQuery` merge path — i.e. through the contract's own
+    /// `validate_state`/`update_state` — and never via a direct store. The
+    /// executor-side pins (`full_state_version_gate_pins` in
+    /// `executor_impl.rs`) guard the upsert body; this pin guards the
+    /// likelier regression site, the resync arm itself, where a future
+    /// "optimization" could bypass the merge with a blind state write and
+    /// silently disable a well-behaved contract's version gate (the
+    /// lower-version-overwrites-higher failure class).
+    #[test]
+    fn resync_response_arm_applies_via_update_query_not_blind_store() {
+        let src = include_str!("node.rs");
+
+        let handler_start = src
+            .find("async fn handle_interest_sync_message(")
+            .expect("handle_interest_sync_message not found");
+        // Scope to the apply segment of the ResyncResponse arm: from the
+        // received-log marker (unique to the arm) to the applied-log marker.
+        // The correlation gate, UpdateData construction, and contract-handler
+        // dispatch all live between the two.
+        let recv_off = src[handler_start..]
+            .find("event = \"resync_response_received\"")
+            .expect("resync_response_received marker not found");
+        let applied_off = src[handler_start..]
+            .find("event = \"resync_applied\"")
+            .expect("resync_applied marker not found");
+        let apply_segment = &src[handler_start + recv_off..handler_start + applied_off];
+
+        assert!(
+            apply_segment.contains("UpdateData::State("),
+            "the resync full state must be wrapped as UpdateData::State"
+        );
+        assert!(
+            apply_segment.contains("ContractHandlerEvent::UpdateQuery"),
+            "the resync apply must route through notify_contract_handler \
+             (ContractHandlerEvent::UpdateQuery) so the contract's own \
+             validate_state/update_state judge the incoming state"
+        );
+        assert!(
+            !apply_segment.contains("PutQuery") && !apply_segment.contains(".store("),
+            "the resync arm must NOT install state via PutQuery or a direct \
+             store — that would bypass the contract's version acceptance for \
+             already-held contracts"
         );
     }
 

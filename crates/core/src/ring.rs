@@ -84,6 +84,7 @@ mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
 pub(crate) mod contract_ban_list;
+pub(crate) mod delta_incompat;
 pub(crate) use connection_manager::ConnectionManager;
 // Nearest-neighbor ring lattice (successor+predecessor base edges).
 // `nn_lattice_active_for` is the full activation gate — the flag AND the
@@ -221,6 +222,12 @@ pub(crate) struct Ring {
     /// inbound broadcast instead of O(WASM merge). Cleared the instant a merge
     /// succeeds. See `crate::ring::merge_backoff`.
     pub(crate) merge_backoff: Arc<merge_backoff::MergeBackoff>,
+    /// SENDER-side memo of contracts whose deltas are known-doomed (the HQk7
+    /// resync loop). Armed by repeated resync-after-our-delta signals or local
+    /// `Invalid`-class delta-apply failures; while armed, the broadcast path
+    /// skips delta computation and sends full state. TTL-bounded, LRU-capped,
+    /// cleared by a successful delta apply. See `crate::ring::delta_incompat`.
+    pub(crate) delta_incompat: Arc<delta_incompat::DeltaIncompat>,
     /// Per-contract cap on how often THIS node emits a `ResyncRequest` (#4861).
     /// Bounds the full-state resync amplification independently of the merge
     /// outcome. See `crate::ring::resync_rate_limit`.
@@ -635,6 +642,7 @@ impl Ring {
                 time_source.clone(),
             )),
             merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
+            delta_incompat: Arc::new(delta_incompat::DeltaIncompat::new(time_source.clone())),
             resync_emit_limiter: Arc::new(resync_rate_limit::new_emit_limiter(time_source.clone())),
             resync_response_limiter: Arc::new(resync_rate_limit::new_response_limiter(
                 time_source.clone(),
@@ -1319,6 +1327,11 @@ impl Ring {
             // haven't failed a merge recently; a poison contract still in
             // cooldown is preserved.
             ring.merge_backoff.cleanup_expired();
+
+            // Sweep stale delta-send attributions and idle unarmed entries in
+            // the delta-incompatibility memo (HQk7 resync loop); an armed
+            // (unexpired) memo is preserved.
+            ring.delta_incompat.cleanup();
 
             // Sweep recovered/idle resync rate-limiter buckets (#4861) so the
             // per-contract emit and per-(peer, contract) responder maps stay

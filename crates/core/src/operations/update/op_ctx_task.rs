@@ -1613,6 +1613,16 @@ async fn drive_relay_broadcast_to(
                     sender_addr,
                     result.changed,
                 );
+                // Delta-incompat memo self-heal (HQk7 resync loop): a delta
+                // that applied cleanly proves the contract takes deltas, so
+                // drop the memo and its failure counter. Deliberately NOT
+                // gated on `result.changed` — a no-op delta apply still ran
+                // the contract's delta path successfully, which is the exact
+                // property the memo tracks. See `crate::ring::delta_incompat`.
+                op_manager
+                    .ring
+                    .delta_incompat
+                    .record_delta_success(key.id());
             } else if result.changed {
                 // #4864 round-9 item 3: a CHANGED FULL-STATE broadcast apply
                 // advances the state, which invalidates the failed-payload MEMO's
@@ -1657,6 +1667,20 @@ async fn drive_relay_broadcast_to(
                     class,
                     payload_hash,
                 );
+                // Delta-incompatibility signal (HQk7 resync loop): an
+                // `Invalid`-class DELTA rejection is the receiver-side form of
+                // "this contract can't take deltas". We fan the same contract
+                // out to our own downstreams, so count it toward the
+                // sender-side memo that switches our broadcasts to full state.
+                // Timeout-class failures are load, not incompatibility — and
+                // full-state merges say nothing about deltas — so both are
+                // excluded. See `crate::ring::delta_incompat`.
+                if is_delta && class == crate::ring::merge_backoff::MergeFailureClass::Invalid {
+                    op_manager
+                        .ring
+                        .delta_incompat
+                        .note_delta_apply_failed(*key.id());
+                }
             }
 
             // On benign stale-version rejection (not OOG/traps/validation
@@ -2996,6 +3020,50 @@ mod tests {
              when the WASM merge rejects — otherwise the sender's cached view \
              of us stays wrong and it keeps full-state-broadcasting identical \
              content"
+        );
+    }
+
+    /// Pin (HQk7 resync loop): the BroadcastTo driver must feed the
+    /// delta-incompatibility memo on BOTH edges — arm it on an
+    /// `Invalid`-class DELTA rejection (receiver-side signal that the
+    /// contract can't take deltas) and clear it on a successful delta apply
+    /// (self-heal). If either call is dropped, the sender-side full-state
+    /// fallback in `broadcast_to_single_peer` either never arms (the doomed
+    /// delta → ResyncRequest → full-state loop resumes) or never heals (a
+    /// recovered contract is stuck on full-state sends until TTL expiry).
+    /// See `crate::ring::delta_incompat`.
+    #[test]
+    fn broadcast_to_feeds_delta_incompat_memo() {
+        let driver_src = broadcast_to_driver_src();
+
+        // Arm: inside the exec-rejection failure classification, gated on
+        // is_delta AND the Invalid class (Timeout is load, not
+        // incompatibility; full-state merges say nothing about deltas).
+        let arm_pos = driver_src
+            .find(".note_delta_apply_failed(")
+            .expect("drive_relay_broadcast_to must arm the delta-incompat memo on delta failure");
+        assert!(
+            driver_src.contains(
+                "if is_delta && class == crate::ring::merge_backoff::MergeFailureClass::Invalid"
+            ),
+            "the delta-incompat arm must be gated on is_delta AND the Invalid \
+             failure class — arming on Timeout (load) or full-state failures \
+             would flip healthy contracts to full-state fan-out"
+        );
+
+        // Clear: inside the `if is_delta` success arm, next to the backoff
+        // reset (the same delta-only convergence signal).
+        let clear_pos = driver_src
+            .find(".record_delta_success(")
+            .expect("drive_relay_broadcast_to must clear the delta-incompat memo on delta success");
+        let is_delta_gate_pos = driver_src
+            .find("if is_delta {")
+            .expect("is_delta success gate not found");
+        assert!(
+            is_delta_gate_pos < clear_pos && clear_pos < arm_pos,
+            "record_delta_success must sit inside the `if is_delta` success arm \
+             (delta-only signal), before the failure classification \
+             (order: is_delta gate {is_delta_gate_pos} < clear {clear_pos} < arm {arm_pos})"
         );
     }
 
