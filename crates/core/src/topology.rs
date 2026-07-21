@@ -3045,7 +3045,8 @@ impl Limits {
             ResourceType::ExecCpuMicros
             | ResourceType::ExecFuelUnits
             | ResourceType::StateBytesWritten
-            | ResourceType::BroadcastFanoutCost => {
+            | ResourceType::BroadcastFanoutCost
+            | ResourceType::BroadcastMessagesSent => {
                 unreachable!(
                     "Limits::get called for non-bandwidth resource {:?} — \
                      these are tracked but not bandwidth-rate-limited",

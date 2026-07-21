@@ -61,11 +61,8 @@ pub use cache::{AccessType, EvictedInUseTeardown, RecordAccessResult};
 /// Cost-pressure eviction inputs + day-one calibration constants (cost-aware
 /// eviction, #4861). Re-exported so `Ring` (which reads the topology meter)
 /// can build the per-axis snapshots the sweep consumes; the policy constants
-/// live beside the decision in `cache.rs`.
-pub(crate) use cache::{
-    BROADCAST_FANOUT_PRESSURE_FLOOR_BYTES_PER_SEC, COST_RATE_MIN_WINDOW, CostAxisPressure,
-    EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
-};
+/// and the shared axis assembly live beside the decision in `cache.rs`.
+pub(crate) use cache::{COST_RATE_MIN_WINDOW, CostAxisPressure, build_cost_axes};
 /// Aggregate disk-budget sizing defaults + pure clamp math (#4683). Re-exported
 /// so `config` can resolve the persisted `hosting-disk-pct` / `max-hosting-disk`
 /// defaults and `ring`/`HostingManager` can size the eviction floor.
@@ -3224,17 +3221,24 @@ mod tests {
     /// gate is the subscriber, not the key.
     #[tokio::test]
     async fn cost_pressure_sweep_evicts_zero_subscriber_offender_not_subscribed() {
-        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
         let junk = make_contract_key(1);
         let hot_subscribed = make_contract_key(2);
         manager.record_contract_access(junk, 121, AccessType::Put);
         manager.record_contract_access(hot_subscribed, 121, AccessType::Put);
         manager.add_downstream_subscriber(&hot_subscribed, make_peer_key(10));
+        // Age the PUT-seed genuine-access stamps past the cost window: the
+        // storm has been running long past it with no genuine GET/PUT.
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
 
         let axes = vec![CostAxisPressure {
             axis: "exec_cpu_micros_per_sec",
             total_rate: 100_000.0,
-            floor: EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
+            floor: cache::EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
             rates: [(*junk.id(), 58_000.0), (*hot_subscribed.id(), 41_000.0)]
                 .into_iter()
                 .collect(),
@@ -3262,12 +3266,165 @@ mod tests {
         assert!(manager.is_hosting_contract(&hot_subscribed));
 
         // Protection follows the SUBSCRIBER: once the downstream subscriber
-        // leaves, the same high-cost contract becomes a candidate.
+        // leaves — and the termination grace window (the recency reset at
+        // subscription termination, invariant 3) has elapsed — the same
+        // high-cost contract becomes a candidate.
         manager.remove_downstream_subscriber(&hot_subscribed, &make_peer_key(10));
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
         let after_unsub = manager.sweep_expired_hosting_with_cost(&axes);
         let after_keys: Vec<ContractKey> = after_unsub.expired.iter().map(|(k, _)| *k).collect();
         assert_eq!(after_keys, vec![hot_subscribed]);
         assert!(!manager.is_hosting_contract(&hot_subscribed));
+    }
+
+    /// STORM-FREQUENCY integration test (#4861): drive the REAL production
+    /// storm profile — 121-byte payload, ~58 co-host targets, sustained
+    /// ~0.62 dispatches/s (~36 per-peer sends/s) for 10 minutes — through the
+    /// ACTUAL `Meter` (production 100-sample window, real count-truncation),
+    /// the real `contract_cost_rates` read, the shared `build_cost_axes`
+    /// assembly, and the real sweep. This is the test the synthetic-axes
+    /// tests above cannot substitute for: it proves the metering itself
+    /// registers the storm (the reviewers' finding was that byte-denominated
+    /// fanout reads ~4 KB/s vs a 131 KB/s floor — 30x under — and the
+    /// 100-sample window truncated the rate further, so the trigger would
+    /// NEVER fire for the real profile).
+    ///
+    /// Asserts, in order:
+    /// 1. the byte axis alone indeed CANNOT see the storm (the bug);
+    /// 2. the message-count axis reads the storm's TRUE ~36/s despite the
+    ///    saturated 100-sample buffer (the window fix — the old
+    ///    min-window-clamped math reads ~19/s and this assertion fails);
+    /// 3. the storm contract IS shed through the real sweep;
+    /// 4. an equally-storming but recently-GET-read contract is NOT shed
+    ///    (recency-aware candidacy);
+    /// 5. a single large-state fan-out burst (5 MB × 30 targets, first report
+    ///    seconds before the sweep) is NOT shed (sustained-pressure gate), so
+    ///    one burst can never mass-evict a large-state contract.
+    #[tokio::test]
+    async fn storm_frequency_profile_crosses_cost_trigger_through_real_meter() {
+        use crate::topology::meter::{AttributionSource, Meter, ResourceType};
+
+        // --- the real meter, production window size (TopologyManager::new). ---
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let junk = make_contract_key(1);
+        let read_hot = make_contract_key(2);
+        let burst = make_contract_key(3);
+
+        // 10 minutes of storm: one fan-out dispatch every 1.6s to 58 targets
+        // of a 121-byte payload (the FX2j profile), for junk AND read_hot
+        // (read_hot proves protection comes from recency, not a smaller cost).
+        for i in 0..375u64 {
+            let at = t0 + Duration::from_millis(1600 * i);
+            for id in [junk.id(), read_hot.id()] {
+                meter.report(
+                    &AttributionSource::Contract(*id),
+                    ResourceType::BroadcastMessagesSent,
+                    58.0,
+                    at,
+                );
+                meter.report(
+                    &AttributionSource::Contract(*id),
+                    ResourceType::BroadcastFanoutCost,
+                    121.0 * 58.0,
+                    at,
+                );
+            }
+        }
+        let now = t0 + Duration::from_secs(600);
+        // ONE large-state fan-out burst just before the sweep: 5 MB × 30.
+        let burst_bytes = 5.0 * 1024.0 * 1024.0 * 30.0;
+        meter.report(
+            &AttributionSource::Contract(*burst.id()),
+            ResourceType::BroadcastMessagesSent,
+            30.0,
+            now - Duration::from_secs(1),
+        );
+        meter.report(
+            &AttributionSource::Contract(*burst.id()),
+            ResourceType::BroadcastFanoutCost,
+            burst_bytes,
+            now - Duration::from_secs(1),
+        );
+
+        // --- the real reads + the shared axis assembly. ---
+        let cpu = meter.contract_cost_rates(
+            &ResourceType::ExecCpuMicros,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+        let fanout = meter.contract_cost_rates(
+            &ResourceType::BroadcastFanoutCost,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+        let msgs = meter.contract_cost_rates(
+            &ResourceType::BroadcastMessagesSent,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+
+        // (1) The byte axis alone cannot see the storm: the junk contract's
+        // byte rate is far below the byte floor (this is the production bug —
+        // ~4 KB/s vs 131 KB/s).
+        let junk_byte_rate = fanout.1.get(junk.id()).copied().unwrap_or(0.0);
+        assert!(
+            junk_byte_rate < cache::BROADCAST_FANOUT_PRESSURE_FLOOR_BYTES_PER_SEC / 20.0,
+            "precondition: the tiny-payload storm must be invisible to the \
+             byte axis (got {junk_byte_rate} B/s) — otherwise this test no \
+             longer reproduces the #4861 blind spot"
+        );
+        // (2) The message-count axis reads the TRUE sustained rate despite
+        // count-truncation: ~36/s. Under the pre-fix min-window-clamped math
+        // the saturated 100-sample buffer reads 100×58/300s ≈ 19/s and this
+        // fails.
+        let junk_msg_rate = msgs.1.get(junk.id()).copied().unwrap_or(0.0);
+        assert!(
+            junk_msg_rate > 30.0,
+            "saturated-buffer rate must reflect the true storm frequency \
+             (~36 msgs/s), got {junk_msg_rate}/s — the count-truncation \
+             under-read is back"
+        );
+        // The burst contract is in the TOTAL but excluded from candidacy
+        // (sustained gate: first report is 1s old).
+        assert!(!msgs.1.contains_key(burst.id()));
+        assert!(!fanout.1.contains_key(burst.id()));
+
+        let axes = cache::build_cost_axes(cpu, fanout, msgs);
+
+        // --- the real sweep over real hosted entries. ---
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        manager.record_contract_access(junk, 121, AccessType::Put);
+        manager.record_contract_access(read_hot, 121, AccessType::Put);
+        manager.record_contract_access(burst, 5 * 1024 * 1024, AccessType::Put);
+        // The storm has run long past the cost window with no genuine access…
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        // …but read_hot was genuinely GET-read just now.
+        manager.record_contract_access(read_hot, 121, AccessType::Get);
+
+        let result = manager.sweep_expired_hosting_with_cost(&axes);
+        let expired_keys: Vec<ContractKey> = result.expired.iter().map(|(k, _)| *k).collect();
+        // (3) the storm contract is shed; (4) the recently-read one is not;
+        // (5) the single-burst large-state contract is not.
+        assert_eq!(
+            expired_keys,
+            vec![junk],
+            "the sustained zero-demand storm contract must be the ONLY victim"
+        );
+        assert!(result.evicted_in_use_teardown.is_empty());
+        assert!(!manager.is_hosting_contract(&junk));
+        assert!(
+            manager.is_hosting_contract(&read_hot),
+            "an equally-storming but recently-read contract must survive"
+        );
+        assert!(
+            manager.is_hosting_contract(&burst),
+            "a single large fan-out burst must not mass-evict (sustained gate)"
+        );
     }
 
     /// The no-cost degradation path: `sweep_expired_hosting()` (no axes) is

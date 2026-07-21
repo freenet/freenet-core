@@ -484,18 +484,28 @@ impl P2pConnManager {
         );
 
         // Cost telemetry (cost-aware eviction, #4861): attribute the intended
-        // fan-out cost — payload bytes × target count — to the contract on the
-        // `BroadcastFanoutCost` meter axis. This is the dispatch point where
-        // the resolved target count is known, shared by the production
-        // (broadcast-queue) and simulation (inline) branches below. Feeds the
-        // hosting sweep's cost-pressure trigger so a zero-subscriber contract
-        // that dominates broadcast capacity becomes an eviction candidate.
-        // Deadlock-safe: `report_contract_resource_usage` takes a brief sync
-        // lock, no channels (see its rustdoc).
+        // fan-out cost to the contract at the dispatch point where the
+        // resolved target count is known, shared by the production
+        // (broadcast-queue) and simulation (inline) branches below. TWO axes:
+        // bytes (payload × targets — the uplink-volume dimension) AND message
+        // COUNT (one per target — the per-send overhead dimension). The count
+        // axis is the load-bearing storm signal: the #4861 profile (121-byte
+        // payload × ~58 targets at storm frequency) reads as a negligible
+        // byte rate while its per-message syscall/encryption/queue overhead
+        // dominates the node's real broadcast capacity. Feeds the hosting
+        // sweep's cost-pressure trigger so a zero-demand contract doing this
+        // becomes an eviction candidate. Deadlock-safe:
+        // `report_contract_resource_usage` takes a brief sync lock, no
+        // channels (see its rustdoc).
         op_manager.ring.report_contract_resource_usage(
             *key.id(),
             crate::topology::meter::ResourceType::BroadcastFanoutCost,
             new_state.size() as f64 * target_result.targets.len() as f64,
+        );
+        op_manager.ring.report_contract_resource_usage(
+            *key.id(),
+            crate::topology::meter::ResourceType::BroadcastMessagesSent,
+            target_result.targets.len() as f64,
         );
 
         // In production, enqueue each target into the broadcast queue.
@@ -602,14 +612,20 @@ impl P2pConnManager {
 
         // Cost telemetry (cost-aware eviction, #4861): a targeted stale-peer
         // heal burns the same broadcast capacity as one fan-out leg, so
-        // attribute payload × 1 to the contract on the same axis. A contract
-        // whose churning state drives constant resync heals (#4861's
-        // non-converging junk contract) accrues its real cost here even when
-        // the all-subscriber fan-out path is quiet.
+        // attribute payload × 1 (bytes) and one message (count) to the
+        // contract on the same axes. A contract whose churning state drives
+        // constant resync heals (#4861's non-converging junk contract)
+        // accrues its real cost here even when the all-subscriber fan-out
+        // path is quiet.
         op_manager.ring.report_contract_resource_usage(
             *key.id(),
             crate::topology::meter::ResourceType::BroadcastFanoutCost,
             new_state.size() as f64,
+        );
+        op_manager.ring.report_contract_resource_usage(
+            *key.id(),
+            crate::topology::meter::ResourceType::BroadcastMessagesSent,
+            1.0,
         );
 
         #[cfg(not(feature = "simulation_tests"))]
@@ -994,26 +1010,41 @@ mod broadcast_fanout_cost_pin_tests {
 
     /// Both dispatch sites — the all-subscriber fan-out
     /// (`handle_broadcast_state_change`) and the targeted stale-peer heal
-    /// (`handle_sync_state_to_peer`) — report `BroadcastFanoutCost`. If a
-    /// site is added or removed, update this count WITH a comment explaining
-    /// where the cost of that path is now attributed.
+    /// (`handle_sync_state_to_peer`) — report BOTH cost axes: fan-out BYTES
+    /// (payload × targets) and message COUNT (per-send overhead — the
+    /// load-bearing #4861 storm signal, since a tiny-payload storm is
+    /// invisible to the byte axis). If a site is added or removed, update
+    /// these counts WITH a comment explaining where the cost of that path is
+    /// now attributed.
     #[test]
     fn broadcast_dispatch_sites_report_fanout_cost() {
-        // Split needle so this test's own source lines never contain the
-        // contiguous token and cannot self-count.
-        let needle = concat!("ResourceType::", "Broadcast", "FanoutCost");
-        let report_sites = BROADCAST_SRC
-            .lines()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                !trimmed.starts_with("//") && trimmed.contains(needle)
-            })
-            .count();
+        // Split needles so this test's own source lines never contain the
+        // contiguous tokens and cannot self-count.
+        let count_sites = |needle: &str| {
+            BROADCAST_SRC
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("//") && trimmed.contains(needle)
+                })
+                .count()
+        };
+        let bytes_needle = concat!("ResourceType::", "Broadcast", "FanoutCost");
+        let msgs_needle = concat!("ResourceType::", "Broadcast", "MessagesSent");
         assert_eq!(
-            report_sites, 2,
+            count_sites(bytes_needle),
+            2,
             "expected exactly 2 BroadcastFanoutCost report sites in broadcast.rs \
              (fan-out dispatch + targeted stale-peer heal); a dropped report \
              silently blinds cost-pressure eviction (#4861)"
+        );
+        assert_eq!(
+            count_sites(msgs_needle),
+            2,
+            "expected exactly 2 BroadcastMessagesSent report sites in broadcast.rs \
+             (fan-out dispatch + targeted stale-peer heal); dropping the message-\
+             COUNT report re-opens the exact #4861 blind spot — a tiny-payload \
+             storm that the byte axis cannot see"
         );
     }
 }

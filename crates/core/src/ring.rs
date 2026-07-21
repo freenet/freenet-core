@@ -4447,7 +4447,7 @@ fn resource_weight(resource: crate::topology::meter::ResourceType) -> f64 {
     match resource {
         InboundBandwidthBytes | OutboundBandwidthBytes => 1.0,
         ExecCpuMicros | ExecFuelUnits => 1.0,
-        StateBytesWritten | BroadcastFanoutCost => 1.0,
+        StateBytesWritten | BroadcastFanoutCost | BroadcastMessagesSent => 1.0,
     }
 }
 
@@ -4648,11 +4648,16 @@ impl Ring {
 
     /// Build the per-axis attributed-cost snapshots for the hosting sweep's
     /// cost-pressure trigger (cost-aware eviction, #4861): per-contract
-    /// `ExecCpuMicros` and `BroadcastFanoutCost` rates plus their node totals,
-    /// read from the topology meter amortized over at least
-    /// [`hosting::COST_RATE_MIN_WINDOW`] (so a lone burst can't masquerade as
-    /// a sustained storm). The absolute floors and the scale-free share
-    /// threshold live beside the decision in `ring/hosting/cache.rs`.
+    /// `ExecCpuMicros`, `BroadcastFanoutCost` (bytes), and
+    /// `BroadcastMessagesSent` (per-send count — the load-bearing storm
+    /// signal) rates plus their node totals, read from the topology meter.
+    /// Sparse samples are amortized over at least
+    /// [`hosting::COST_RATE_MIN_WINDOW`] (a lone burst can't masquerade as a
+    /// sustained storm), a saturated sample buffer reads its true rate, and
+    /// candidacy is pre-filtered to sustained sources — see
+    /// `Meter::contract_cost_rates`. The floors, share threshold, and axis
+    /// assembly live beside the decision in `ring/hosting/cache.rs`
+    /// (`build_cost_axes`, shared with the storm-frequency integration test).
     ///
     /// Lock discipline: takes the topology read lock briefly and drops it
     /// before the caller takes the hosting-cache write lock — the two are
@@ -4661,31 +4666,23 @@ impl Ring {
         use crate::topology::meter::ResourceType;
         let now = self.time_source.now();
         let topo = self.connection_manager.topology_manager.read();
-        let (cpu_total, cpu_rates) = topo.contract_cost_rates(
+        let cpu = topo.contract_cost_rates(
             &ResourceType::ExecCpuMicros,
             now,
             hosting::COST_RATE_MIN_WINDOW,
         );
-        let (fanout_total, fanout_rates) = topo.contract_cost_rates(
+        let fanout_bytes = topo.contract_cost_rates(
             &ResourceType::BroadcastFanoutCost,
             now,
             hosting::COST_RATE_MIN_WINDOW,
         );
+        let messages = topo.contract_cost_rates(
+            &ResourceType::BroadcastMessagesSent,
+            now,
+            hosting::COST_RATE_MIN_WINDOW,
+        );
         drop(topo);
-        vec![
-            hosting::CostAxisPressure {
-                axis: "exec_cpu_micros_per_sec",
-                total_rate: cpu_total,
-                floor: hosting::EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
-                rates: cpu_rates,
-            },
-            hosting::CostAxisPressure {
-                axis: "broadcast_fanout_bytes_per_sec",
-                total_rate: fanout_total,
-                floor: hosting::BROADCAST_FANOUT_PRESSURE_FLOOR_BYTES_PER_SEC,
-                rates: fanout_rates,
-            },
-        ]
+        hosting::build_cost_axes(cpu, fanout_bytes, messages)
     }
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================

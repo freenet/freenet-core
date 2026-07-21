@@ -1604,9 +1604,31 @@ where
             return;
         }
 
+        // Cost telemetry (cost-aware eviction, #4861): the probe is a full
+        // extra WASM `update_state` invocation, and it fires precisely on the
+        // storm-relevant class (frequently-merging contracts — including
+        // non-idempotent ones). Attribute its elapsed on the same
+        // `ExecCpuMicros` axis as the main apply in `attempt_state_update`.
+        let probe_clock = self
+            .op_manager
+            .as_ref()
+            .map(|op_manager| op_manager.ring.time_source.clone());
+        let probe_started = probe_clock.as_ref().map(|clock| clock.now());
         let probe_result = self
             .runtime
             .update_state(key, parameters, post_merge_state, updates);
+        if let (Some(op_manager), Some(clock), Some(started)) = (
+            self.op_manager.as_ref(),
+            probe_clock.as_ref(),
+            probe_started,
+        ) {
+            let elapsed = clock.now().saturating_duration_since(started);
+            op_manager.ring.report_contract_resource_usage(
+                *key.id(),
+                crate::topology::meter::ResourceType::ExecCpuMicros,
+                elapsed.as_micros() as f64,
+            );
+        }
         let probe_outcome = match probe_result {
             Ok(modification) => modification,
             Err(err) => {

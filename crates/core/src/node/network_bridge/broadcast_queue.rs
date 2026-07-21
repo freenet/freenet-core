@@ -747,6 +747,29 @@ pub(super) async fn broadcast_to_single_peer(
 
     let peer_key = PeerKey::from(target.pub_key().clone());
 
+    // Cost telemetry (cost-aware eviction, #4861): the per-target
+    // summarize + delta computation below is send-time WASM work burned for
+    // EVERY peer send of this contract — for a high-frequency tiny-payload
+    // storm it is a dominant, previously-unmetered CPU cost. Time it via the
+    // ring's injected TimeSource and attribute it on the `ExecCpuMicros`
+    // axis (wall elapsed of the awaited computation; may include executor
+    // queueing, which is still work this contract's send triggered).
+    // Reported at BOTH exits (the summaries-equal skip and the payload
+    // completion) so skipped sends still account for the summary work they
+    // burned.
+    let cost_clock = op_manager.ring.time_source.clone();
+    let send_wasm_started = cost_clock.now();
+    let report_send_wasm_cost = |op_manager: &Arc<OpManager>| {
+        let elapsed = cost_clock
+            .now()
+            .saturating_duration_since(send_wasm_started);
+        op_manager.ring.report_contract_resource_usage(
+            *key.id(),
+            crate::topology::meter::ResourceType::ExecCpuMicros,
+            elapsed.as_micros() as f64,
+        );
+    };
+
     // Get our summary for delta computation
     let our_summary = op_manager
         .interest_manager
@@ -784,6 +807,7 @@ pub(super) async fn broadcast_to_single_peer(
                 "Skipping broadcast - peer already has our state (byte-equal \
                  or logically converged summaries)"
             );
+            report_send_wasm_cost(op_manager);
             return;
         }
     }
@@ -850,6 +874,8 @@ pub(super) async fn broadcast_to_single_peer(
             false,
         ),
     };
+    // Attribute the summarize + delta WASM burned for this send (#4861).
+    report_send_wasm_cost(op_manager);
 
     let payload_size = payload.size();
     let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
@@ -1923,6 +1949,45 @@ mod tests {
             "fanout_send_needed must decide from the probe verdict via \
              summary_indicates_stale_peer (semantic policy), not inline byte \
              inequality"
+        );
+    }
+
+    /// Source-scrape pin (cost-aware eviction, #4861): the per-target
+    /// summarize + delta computation in `broadcast_to_single_peer` is
+    /// send-time WASM burned for EVERY peer send — a dominant, otherwise-
+    /// unmetered CPU cost for a high-frequency tiny-payload storm. It must be
+    /// attributed on the `ExecCpuMicros` axis at BOTH exits (the summaries-
+    /// equal skip and the payload completion). Dropping a report silently
+    /// blinds the cost-pressure eviction trigger to send-time CPU while every
+    /// behavioral test stays green.
+    #[test]
+    fn broadcast_to_single_peer_reports_send_wasm_cost_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer (start of tests module) not found");
+        let body = &after[..fn_end];
+
+        // The reporting closure must exist and be invoked at both exits.
+        let report_invocations = body.matches("report_send_wasm_cost(op_manager)").count();
+        assert_eq!(
+            report_invocations, 2,
+            "broadcast_to_single_peer must invoke report_send_wasm_cost at both \
+             exits (summaries-equal skip + payload completion) — got \
+             {report_invocations}. A dropped report blinds cost-pressure \
+             eviction (#4861) to per-send WASM cost."
+        );
+        // And the closure must report on the ExecCpuMicros axis (split needle
+        // so this test cannot self-count).
+        let axis_needle = concat!("ResourceType::", "Exec", "CpuMicros");
+        assert!(
+            body.contains(axis_needle),
+            "report_send_wasm_cost must attribute on the ExecCpuMicros axis"
         );
     }
 }

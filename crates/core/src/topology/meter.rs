@@ -161,20 +161,27 @@ impl Meter {
     /// Iterates the attribution meters, keeping only
     /// [`AttributionSource::Contract`] entries (peer/delegate bandwidth sources
     /// never participate in contract cost eviction), and reads each contract's
-    /// rate amortized over at least `min_window` (see
-    /// [`RunningAverage::get_rate_with_min_window`]) so a one-off burst
-    /// reported moments before the read cannot masquerade as a sustained
-    /// storm. Zero-rate entries are omitted, so an entry in the returned map
-    /// means "this contract did attributable work in the retained sample
-    /// window".
+    /// rate via [`RunningAverage::windowed_rate`]: sparse samples are diluted
+    /// over at least `min_window` (a lone burst cannot masquerade as a
+    /// sustained storm), while a saturated sample buffer divides by its actual
+    /// span so a sustained high-frequency storm's TRUE rate is representable
+    /// (the count-truncation under-read that hid the #4861 profile).
     ///
     /// Returns `(total_rate, per_contract_rate)` in axis units per second.
+    /// EVERY positive-rate contract counts toward `total_rate` (the share
+    /// denominator), but the per-contract map — the eviction CANDIDACY input —
+    /// contains only contracts whose reporting is SUSTAINED (first sample at
+    /// least `min_window / 2` old). A contract absent from the map has zero
+    /// attributed cost for candidacy purposes, so a single large fan-out
+    /// burst (first report moments ago) can never make its contract a cost
+    /// victim, no matter how big the burst.
     pub(crate) fn contract_cost_rates(
         &self,
         resource: &ResourceType,
         at_time: Instant,
         min_window: Duration,
     ) -> (f64, std::collections::HashMap<ContractInstanceId, f64>) {
+        let sustained_min_age = min_window / 2;
         let mut per_contract = std::collections::HashMap::new();
         let mut total = 0.0_f64;
         for entry in self.attribution_meters.iter() {
@@ -184,13 +191,15 @@ impl Meter {
             let Some(avg) = entry.value().map.get(resource) else {
                 continue;
             };
-            let Some(rate) = avg.get_rate_with_min_window(at_time, min_window) else {
+            let Some(windowed) = avg.windowed_rate(at_time, min_window) else {
                 continue;
             };
-            let per_second = rate.per_second();
+            let per_second = windowed.rate.per_second();
             if per_second > 0.0 {
                 total += per_second;
-                per_contract.insert(*id, per_second);
+                if windowed.first_sample_age >= sustained_min_age {
+                    per_contract.insert(*id, per_second);
+                }
             }
         }
         (total, per_contract)
@@ -425,6 +434,7 @@ impl AttributionSource {
             (Peer(_), ExecFuelUnits) => false,
             (Peer(_), StateBytesWritten) => false,
             (Peer(_), BroadcastFanoutCost) => false,
+            (Peer(_), BroadcastMessagesSent) => false,
             // Delegate sources predate this PR; their existing usage
             // pattern is bandwidth-relevant for accounting purposes.
             (Delegate(_), InboundBandwidthBytes) => true,
@@ -433,6 +443,7 @@ impl AttributionSource {
             (Delegate(_), ExecFuelUnits) => false,
             (Delegate(_), StateBytesWritten) => false,
             (Delegate(_), BroadcastFanoutCost) => false,
+            (Delegate(_), BroadcastMessagesSent) => false,
             // Contract sources contribute the four contract-governance
             // resource types (CPU, fuel, state-bytes, fan-out cost) and
             // NEVER bandwidth — those are peer-attributed even when the
@@ -443,6 +454,7 @@ impl AttributionSource {
             (Contract(_), ExecFuelUnits) => true,
             (Contract(_), StateBytesWritten) => true,
             (Contract(_), BroadcastFanoutCost) => true,
+            (Contract(_), BroadcastMessagesSent) => true,
         }
     }
 }
@@ -491,6 +503,16 @@ pub(crate) enum ResourceType {
     ExecFuelUnits,
     StateBytesWritten,
     BroadcastFanoutCost,
+    /// Per-peer broadcast MESSAGES dispatched for a contract (count units,
+    /// one per target per fan-out, one per targeted stale-peer heal). Added
+    /// for cost-aware eviction (#4861): a tiny-payload contract fanning to
+    /// many co-hosts at a high message RATE burns per-send overhead
+    /// (syscall / encryption / queue work) that byte-denominated
+    /// [`Self::BroadcastFanoutCost`] cannot see — 121-byte messages at storm
+    /// frequency read as a negligible byte rate while dominating the node's
+    /// real broadcast capacity. This axis counts sends, so N tiny sends
+    /// register as N.
+    BroadcastMessagesSent,
 }
 
 impl ResourceType {
@@ -510,7 +532,7 @@ impl ResourceType {
     /// Every resource type the meter understands, including non-bandwidth
     /// resources added for contract governance.
     #[allow(dead_code)] // wired up incrementally by per-resource-type reporters
-    pub(crate) fn all_tracked() -> [ResourceType; 6] {
+    pub(crate) fn all_tracked() -> [ResourceType; 7] {
         [
             ResourceType::InboundBandwidthBytes,
             ResourceType::OutboundBandwidthBytes,
@@ -518,6 +540,7 @@ impl ResourceType {
             ResourceType::ExecFuelUnits,
             ResourceType::StateBytesWritten,
             ResourceType::BroadcastFanoutCost,
+            ResourceType::BroadcastMessagesSent,
         ]
     }
 }
@@ -679,18 +702,22 @@ mod tests {
     }
 
     /// `contract_cost_rates` (cost-aware eviction, #4861) aggregates ONLY
-    /// Contract-attributed sources, amortizes over the caller's minimum
-    /// window (so a lone burst cannot masquerade as a sustained storm), and
-    /// returns a total consistent with the per-contract map.
+    /// Contract-attributed sources; sparse samples are amortized over the
+    /// minimum window (a lone burst cannot masquerade as a sustained storm);
+    /// a SATURATED sample buffer reads its true rate over its actual span
+    /// (the count-truncation fix — without it a sustained high-frequency
+    /// storm's rate is capped at samples×value/window and can hide under the
+    /// floor); and the per-contract candidacy map admits only SUSTAINED
+    /// sources (first sample at least half the window old) while every
+    /// positive rate still counts toward the total.
     #[test]
     fn contract_cost_rates_aggregates_contract_sources_with_min_window() {
         let meter = Meter::new_with_window_size(100);
         let t0 = Instant::now();
         let min_window = Duration::from_secs(300);
+        let now = t0 + Duration::from_secs(600);
 
-        // Two contract sources doing sustained CPU work, one peer source
-        // (bandwidth) that must be excluded, and one contract source with
-        // work on a DIFFERENT axis only.
+        // Sustained sparse source: two 30_000µs samples over 10 minutes.
         meter.report(
             &contract_source(1),
             ResourceType::ExecCpuMicros,
@@ -701,57 +728,62 @@ mod tests {
             &contract_source(1),
             ResourceType::ExecCpuMicros,
             30_000.0,
-            t0 + Duration::from_secs(10),
+            t0 + Duration::from_secs(590),
         );
+        // Burst source: one huge sample 1s before the read.
         meter.report(
             &contract_source(2),
             ResourceType::ExecCpuMicros,
-            15_000.0,
-            t0 + Duration::from_secs(5),
+            30_000_000.0,
+            now - Duration::from_secs(1),
         );
+        // Peer (bandwidth) source: must be excluded entirely.
         meter.report(
             &AttributionSource::Peer(PeerKeyLocation::random()),
             ResourceType::InboundBandwidthBytes,
             999_999.0,
             t0,
         );
-        meter.report(
-            &contract_source(3),
-            ResourceType::BroadcastFanoutCost,
-            1_000_000.0,
-            t0,
-        );
+        // Saturated high-frequency source on a different axis: 150 samples of
+        // 58 messages at 1.6s cadence (storm profile). The ring keeps the last
+        // 100, spanning ~158.4s.
+        for i in 0..150u64 {
+            meter.report(
+                &contract_source(3),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                t0 + Duration::from_millis(1600 * i),
+            );
+        }
+        let msgs_now = t0 + Duration::from_millis(1600 * 149) + Duration::from_secs(1);
 
-        let (total, rates) = meter.contract_cost_rates(
-            &ResourceType::ExecCpuMicros,
-            t0 + Duration::from_secs(20),
-            min_window,
-        );
-
-        // Rates are amortized over the 300s minimum window, NOT the ~20s of
-        // real sample span (and never the 1s clamp): 60_000µs / 300s = 200/s.
+        let (cpu_total, cpu_rates) =
+            meter.contract_cost_rates(&ResourceType::ExecCpuMicros, now, min_window);
         let id1 = ContractInstanceId::new([1u8; 32]);
         let id2 = ContractInstanceId::new([2u8; 32]);
-        assert_eq!(rates.len(), 2, "peer + other-axis sources are excluded");
-        assert!((rates[&id1] - 200.0).abs() < 1e-9);
-        assert!((rates[&id2] - 50.0).abs() < 1e-9);
+        // Sustained sparse source: 60_000µs over its 600s retained span.
+        assert!((cpu_rates[&id1] - 60_000.0 / 600.0).abs() < 1e-6);
+        // Burst source: counted in the TOTAL (diluted over min_window: 30M/300s
+        // = 100_000/s) but EXCLUDED from the candidacy map (first sample 1s
+        // old — not sustained), so one burst can never nominate a victim.
         assert!(
-            (total - 250.0).abs() < 1e-9,
-            "total = sum of per-contract rates"
+            !cpu_rates.contains_key(&id2),
+            "burst must not be a candidate"
         );
+        let expected_total = 60_000.0 / 600.0 + 30_000_000.0 / 300.0;
+        assert!((cpu_total - expected_total).abs() < 1e-6);
 
-        // The other axis sees only its own source.
-        let (fan_total, fan_rates) = meter.contract_cost_rates(
-            &ResourceType::BroadcastFanoutCost,
-            t0 + Duration::from_secs(20),
-            min_window,
-        );
+        // Saturated storm source: true rate over the RETAINED span (~158.4s),
+        // NOT diluted to 100×58/300s ≈ 19.3/s. 100×58/158.4 ≈ 36.6/s.
+        let (msgs_total, msgs_rates) =
+            meter.contract_cost_rates(&ResourceType::BroadcastMessagesSent, msgs_now, min_window);
         let id3 = ContractInstanceId::new([3u8; 32]);
-        assert_eq!(fan_rates.len(), 1);
-        // Burst dilution: a single 1MB fan-out reads as 1MB/300s ≈ 3.4KB/s,
-        // not the 1MB/s the 1-second clamp would report.
-        assert!((fan_rates[&id3] - 1_000_000.0 / 300.0).abs() < 1e-6);
-        assert!((fan_total - fan_rates[&id3]).abs() < 1e-9);
+        let rate3 = msgs_rates[&id3];
+        assert!(
+            rate3 > 30.0,
+            "saturated buffer must read the true storm rate (~36.6/s), got {rate3}/s"
+        );
+        assert!((msgs_total - rate3).abs() < 1e-9);
     }
 
     #[test]

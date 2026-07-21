@@ -564,6 +564,21 @@ pub struct HostedContract {
     /// protected by being the most-recently-accessed without any `min_ttl` floor
     /// (dropped 2026-07-08).
     pub recency_seq: u64,
+    /// Wall-clock instant of this entry's most recent **genuine GET/PUT
+    /// access** — the same events that stamp [`Self::recency_seq`], recorded
+    /// as a TIME so the cost-pressure eviction candidacy (cost-aware
+    /// eviction, #4861) can ask "was this contract genuinely read or written
+    /// within the cost window?" (`recency_seq` is an ordering, not a clock,
+    /// so it cannot answer that). Stamped by GET/PUT in `record_access*`, by
+    /// `touch_with_demand` (local-serve GET), and at subscription TERMINATION
+    /// (`record_abandonment` — the recency clock starts there, invariant 3),
+    /// mirroring `recency_seq` exactly. NOT stamped by SUBSCRIBE, renewal, or
+    /// UPDATE traffic — a storm contract whose only activity is its own
+    /// update churn stays cost-evictable, while a genuinely-read zero-
+    /// subscriber contract (the River UI-container class invariant 3
+    /// protects) is not a cost candidate. `None` = never genuinely accessed
+    /// this run (SUBSCRIBE-only seeds, restart reloads).
+    pub last_genuine_access: Option<Instant>,
     /// Demand-ordered (Greedy-Dual) priority: `eviction_floor + predicted_demand` captured at the
     /// last read-demand refresh (or at insert). The over-budget walk evicts the
     /// entry with the lowest `keep_score` (ties broken by `last_accessed`). A
@@ -796,27 +811,44 @@ pub(crate) fn victim_order(
 // =============================================================================
 //
 // The byte budget above measures on-disk STATE bytes only, so a tiny contract
-// that burns the node's update-work capacity (WASM CPU on every apply,
-// broadcast fan-out on every commit) never creates eviction pressure: the
-// #4861 storm contract was 121 bytes of state holding ~58% of a gateway's
-// broadcast capacity with ZERO subscribers, and the byte-gated sweep never
-// ran. Cost pressure closes that gap: the periodic sweep additionally reads
-// the per-contract attributed cost rates from the topology meter
-// (`ExecCpuMicros`, `BroadcastFanoutCost`) and — when the node's total
-// update-work on an axis is above a modest absolute floor AND some
-// zero-demand contract holds more than [`COST_SHARE_THRESHOLD`] of it —
-// sheds that contract, even while comfortably under the byte budget.
+// that burns the node's update-work capacity (WASM CPU on every apply and
+// every per-target send, per-message overhead on every broadcast) never
+// creates eviction pressure: the #4861 storm contract was 121 bytes of state
+// holding ~58% of a gateway's broadcast capacity with ZERO subscribers, and
+// the byte-gated sweep never ran. Cost pressure closes that gap: the periodic
+// sweep additionally reads the per-contract attributed cost rates from the
+// topology meter — `ExecCpuMicros` (apply + probe + per-target
+// summarize/delta WASM), `BroadcastFanoutCost` (payload × targets, the
+// uplink-volume dimension), and `BroadcastMessagesSent` (per-peer send COUNT,
+// the per-send-overhead dimension and the load-bearing storm signal: a
+// tiny-payload high-frequency storm is invisible in bytes but reads its true
+// message rate here) — and, when the node's total update-work on an axis is
+// above a modest absolute floor AND some zero-demand contract holds more than
+// [`COST_SHARE_THRESHOLD`] of it, sheds that contract, even while comfortably
+// under the byte budget.
 //
 // The trigger is deliberately SCALE-FREE (a share of the node's own observed
 // work, not an absolute capacity number) so day one needs no per-hardware
 // calibration; the absolute floors only keep an idle node from evicting the
-// one contract that does any work at all. Candidacy is restricted to
-// `local_subs == 0 && downstream_subs == 0 && attributed_cost > 0`, so a
-// SUBSCRIBED contract is NEVER a cost-eviction candidate — the subscriber-
+// one contract that does any work at all. Two guards keep it honest:
+// SUSTAINED pressure (the meter read admits a contract into candidacy only
+// once its reporting is at least half the cost window old, so a single large
+// fan-out burst can never mass-evict — see `Meter::contract_cost_rates`) and
+// the saturated-buffer true-rate fix (a full sample ring divides by its
+// actual span, so a sustained high-frequency storm's real rate is
+// representable instead of being count-truncated below the floor).
+//
+// Candidacy is restricted to ZERO-DEMAND contracts in invariant 3's full
+// sense: `local_subs == 0 && downstream_subs == 0` AND no genuine GET/PUT
+// within the cost window AND `attributed_cost > 0`. A SUBSCRIBED contract is
+// NEVER a cost-eviction candidate, and neither is an actively-read one (the
+// never-subscribed-but-read River UI-container class) — the subscriber-
 // primary tiers of [`victim_order`] are not reordered by cost (cost breaks
 // ties only WITHIN the zero-demand tier), and the #4296 "River room evicted
 // for being popular" false positive is unreachable by construction, not
-// merely unlikely. See `.claude/rules/hosting-invariants.md` invariant 3.
+// merely unlikely. A storm contract stays evictable because its only
+// activity is its own UPDATE churn, which never counts as genuine access.
+// See `.claude/rules/hosting-invariants.md` invariant 3.
 
 /// Share of the node's total attributed update-work on one cost axis above
 /// which a single zero-demand contract is considered a cost offender. The
@@ -838,11 +870,27 @@ pub(crate) const EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC: f64 = 50_000.0;
 /// the scale-free share above is the primary signal.
 pub(crate) const BROADCAST_FANOUT_PRESSURE_FLOOR_BYTES_PER_SEC: f64 = 128.0 * 1024.0;
 
+/// Absolute floor for the node-total `BroadcastMessagesSent` rate (per-peer
+/// broadcast messages per second) below which the message-COUNT axis never
+/// triggers cost pressure.
+///
+/// This axis is the load-bearing storm signal (#4861): the observed
+/// production profile — a 121-byte contract fanning to ~58 co-hosts at
+/// ~36 per-peer sends/s, sustained — reads as only ~4 KB/s on the byte axis
+/// (~30x under its floor) while dominating the gateway's real broadcast
+/// capacity through per-send overhead (syscall/encryption/queue work +
+/// per-target summarize WASM). Counted as MESSAGES it reads as its true
+/// ~36/s, comfortably over this floor. Calibration: 10 msgs/s sustained
+/// across the 5-min window = 3000 sends of overhead — real load on any
+/// hardware — while a lightly-used legitimate contract (a chat room fanning
+/// a few updates a minute to a handful of peers) stays well under 1/s.
+pub(crate) const BROADCAST_MESSAGES_PRESSURE_FLOOR_PER_SEC: f64 = 10.0;
+
 /// Minimum averaging window for the cost-rate reads feeding the trigger.
 /// A lone burst (one big fan-out reported moments before the sweep) is
 /// amortized over at least this window instead of the meter's 1-second
 /// clamp, so only load SUSTAINED across the window registers as pressure.
-/// See `RunningAverage::get_rate_with_min_window`.
+/// See `RunningAverage::windowed_rate`.
 pub(crate) const COST_RATE_MIN_WINDOW: Duration = Duration::from_secs(300);
 
 /// Node-level attributed-cost snapshot for ONE cost axis, handed to the
@@ -858,22 +906,70 @@ pub(crate) struct CostAxisPressure {
     /// Absolute floor: at or below this total the axis never triggers.
     pub floor: f64,
     /// Per-contract attributed rates (axis units per second). Contracts
-    /// absent from the map have zero attributed cost.
+    /// absent from the map have zero attributed cost. Pre-filtered by the
+    /// meter read to SUSTAINED sources only (first sample at least half the
+    /// cost window old), so a single large burst is never a candidate; every
+    /// positive-rate contract still counts in [`Self::total_rate`].
     pub rates: std::collections::HashMap<freenet_stdlib::prelude::ContractInstanceId, f64>,
 }
 
+/// Assemble the three cost-pressure axes from `(total_rate, per_contract)`
+/// meter reads, binding each to its floor constant. Shared by
+/// `Ring::hosting_cost_pressure_axes` (production) and the storm-frequency
+/// integration test, so the test exercises the same axis assembly the sweep
+/// uses.
+pub(crate) type ContractCostRead = (
+    f64,
+    std::collections::HashMap<freenet_stdlib::prelude::ContractInstanceId, f64>,
+);
+
+pub(crate) fn build_cost_axes(
+    exec_cpu: ContractCostRead,
+    fanout_bytes: ContractCostRead,
+    messages: ContractCostRead,
+) -> Vec<CostAxisPressure> {
+    vec![
+        CostAxisPressure {
+            axis: "exec_cpu_micros_per_sec",
+            total_rate: exec_cpu.0,
+            floor: EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
+            rates: exec_cpu.1,
+        },
+        CostAxisPressure {
+            axis: "broadcast_fanout_bytes_per_sec",
+            total_rate: fanout_bytes.0,
+            floor: BROADCAST_FANOUT_PRESSURE_FLOOR_BYTES_PER_SEC,
+            rates: fanout_bytes.1,
+        },
+        CostAxisPressure {
+            axis: "broadcast_messages_per_sec",
+            total_rate: messages.0,
+            floor: BROADCAST_MESSAGES_PRESSURE_FLOOR_PER_SEC,
+            rates: messages.1,
+        },
+    ]
+}
+
 /// The cost-eviction candidacy predicate: only a contract with ZERO demand
-/// (no local client subscriptions AND no downstream subscribers) and strictly
-/// positive attributed cost may be shed by cost pressure. A subscribed
-/// contract is NEVER a candidate — by construction, not by ranking — so cost
-/// pressure cannot reorder the subscriber-primary tiers of [`victim_order`].
-/// NaN-safe: a NaN rate fails the `> 0.0` comparison and is not a candidate.
+/// may be shed by cost pressure, where zero demand means no local client
+/// subscriptions AND no downstream subscribers AND no genuine GET/PUT access
+/// within the cost window (`recently_accessed == false`) — matching invariant
+/// 3's demand definition, which includes reads. A subscribed contract is
+/// NEVER a candidate, and neither is an actively-read/written one (the
+/// never-subscribed-but-read River UI-container class invariant 3 protects) —
+/// by construction, not by ranking — so cost pressure cannot reorder the
+/// subscriber-primary tiers of [`victim_order`] and cannot touch read-hot
+/// contracts. A storm contract stays evictable because its only activity is
+/// its own UPDATE churn, which deliberately never counts as genuine access.
+/// The rate must also be strictly positive (cost pressure is not a generic
+/// zero-subscriber purge). NaN-safe: a NaN rate fails `> 0.0`.
 pub(crate) fn cost_eviction_candidate(
     local_subs: usize,
     downstream_subs: usize,
     attributed_rate: f64,
+    recently_accessed: bool,
 ) -> bool {
-    local_subs == 0 && downstream_subs == 0 && attributed_rate > 0.0
+    local_subs == 0 && downstream_subs == 0 && !recently_accessed && attributed_rate > 0.0
 }
 
 impl<T: TimeSource> HostingCache<T> {
@@ -1253,9 +1349,12 @@ impl<T: TimeSource> HostingCache<T> {
             existing.predicted_demand = predicted_demand;
 
             // A real GET or PUT refreshes the eviction recency key (a PUT is
-            // genuine client access; SUBSCRIBE/renewal does not).
+            // genuine client access; SUBSCRIBE/renewal does not). The
+            // wall-clock twin (`last_genuine_access`) feeds the cost-eviction
+            // recency guard (#4861).
             if resets_recency {
                 existing.recency_seq = seq;
+                existing.last_genuine_access = Some(now);
             }
 
             let observed_read_rate = if is_read {
@@ -1296,6 +1395,7 @@ impl<T: TimeSource> HostingCache<T> {
                 // at 0 (never client-accessed), so it sorts to evict first among
                 // zero-subscriber entries.
                 recency_seq: if resets_recency { seq } else { 0 },
+                last_genuine_access: resets_recency.then_some(now),
                 keep_score: self.eviction_floor + predicted_demand,
                 predicted_demand,
                 read_count: if is_read { 1 } else { 0 },
@@ -1436,8 +1536,10 @@ impl<T: TimeSource> HostingCache<T> {
             existing.last_accessed = now;
             existing.last_access_seq = seq;
             // A touch is a local-cache GET serve — a real GET read, so it
-            // refreshes the eviction recency key (unlike SUBSCRIBE/PUT/renewal).
+            // refreshes the eviction recency key (unlike SUBSCRIBE/renewal)
+            // and the wall-clock cost-eviction recency guard (#4861).
             existing.recency_seq = seq;
+            existing.last_genuine_access = Some(now);
             existing.read_count = existing.read_count.saturating_add(1);
             // A fresh touch is evidence of demand — clear any abandoned marker,
             // refresh the stored demand estimate to the caller's freshly-derived
@@ -1516,8 +1618,12 @@ impl<T: TimeSource> HostingCache<T> {
             existing.abandoned_at = Some(now);
             // Reset the recency clock at termination (see the doc above) so the
             // formerly-subscribed contract is not instantly evicted for an old
-            // last-read accrued while it sat in the subscription tier.
+            // last-read accrued while it sat in the subscription tier. The
+            // wall-clock twin gives the same grace against COST eviction
+            // (#4861): a just-unsubscribed contract gets one cost window
+            // before its update-work cost can make it a candidate.
             existing.recency_seq = seq;
+            existing.last_genuine_access = Some(now);
             // Strip demand credit (demoted telemetry only): drop keep_score to
             // the frontier.
             existing.keep_score = floor;
@@ -1764,6 +1870,7 @@ impl<T: TimeSource> HostingCache<T> {
     where
         G: Fn(&ContractKey) -> (usize, usize),
     {
+        let now = self.time_source.now();
         let mut evicted = Vec::new();
         for axis in axes {
             // NaN-safe: a NaN/zero/sub-floor total never triggers the axis.
@@ -1773,11 +1880,19 @@ impl<T: TimeSource> HostingCache<T> {
             let share_cutoff = COST_SHARE_THRESHOLD * axis.total_rate;
             let mut offenders: Vec<(ContractKey, f64)> = self
                 .contracts
-                .keys()
-                .filter_map(|key| {
+                .iter()
+                .filter_map(|(key, entry)| {
                     let rate = axis.rates.get(key.id()).copied().unwrap_or(0.0);
                     let (local, downstream) = subscriber_counts(key);
-                    (cost_eviction_candidate(local, downstream, rate) && rate > share_cutoff)
+                    // Genuine GET/PUT within the cost window = read-demand,
+                    // which invariant 3 counts as demand: not a candidate.
+                    // UPDATE churn never stamps `last_genuine_access`, so a
+                    // storm contract cannot protect itself.
+                    let recently_accessed = entry
+                        .last_genuine_access
+                        .is_some_and(|at| now.saturating_duration_since(at) < COST_RATE_MIN_WINDOW);
+                    (cost_eviction_candidate(local, downstream, rate, recently_accessed)
+                        && rate > share_cutoff)
                         .then_some((*key, rate))
                 })
                 .collect();
@@ -1881,6 +1996,10 @@ impl<T: TimeSource> HostingCache<T> {
             // entry). A live GET after restart re-stamps it to a true value. See
             // `finalize_loading`.
             recency_seq: 0,
+            // Same reasoning as `recency_seq`: persistence can't distinguish a
+            // genuine GET/PUT from a SUBSCRIBE, so a reload starts with no
+            // genuine-access claim; a live GET/PUT re-stamps it (#4861).
+            last_genuine_access: None,
             // Loaded entries start at the caller-supplied cold demand (the
             // distance prior when this peer's location is known at load, else
             // neutral). The first live read re-scores against the current prior.
@@ -2058,25 +2177,32 @@ mod tests {
     // Cost-pressure eviction (cost-aware eviction, #4861)
     // =========================================================================
 
-    /// The candidacy predicate: ONLY zero-demand (no local subscriptions, no
-    /// downstream subscribers) contracts with strictly positive attributed
-    /// cost are cost-eviction candidates. Any subscriber — local or
-    /// downstream — makes a contract non-candidate by construction.
+    /// The candidacy predicate: ONLY zero-demand contracts — no local
+    /// subscriptions, no downstream subscribers, AND no genuine GET/PUT
+    /// within the cost window (invariant 3 counts reads as demand) — with
+    /// strictly positive attributed cost are cost-eviction candidates. Any
+    /// subscriber OR recent genuine access makes a contract non-candidate by
+    /// construction.
     #[test]
     fn cost_eviction_candidate_requires_zero_demand_and_nonzero_cost() {
         // The one shape that qualifies.
-        assert!(cost_eviction_candidate(0, 0, 1.0));
+        assert!(cost_eviction_candidate(0, 0, 1.0, false));
         // A local client subscription protects, regardless of cost.
-        assert!(!cost_eviction_candidate(1, 0, f64::MAX));
+        assert!(!cost_eviction_candidate(1, 0, f64::MAX, false));
         // A downstream subscriber protects, regardless of cost.
-        assert!(!cost_eviction_candidate(0, 1, f64::MAX));
-        assert!(!cost_eviction_candidate(2, 3, 100.0));
+        assert!(!cost_eviction_candidate(0, 1, f64::MAX, false));
+        assert!(!cost_eviction_candidate(2, 3, 100.0, false));
+        // A genuine GET/PUT within the cost window protects, regardless of
+        // cost — the read-but-never-subscribed class (River UI container)
+        // invariant 3 says must be retained.
+        assert!(!cost_eviction_candidate(0, 0, f64::MAX, true));
+        assert!(!cost_eviction_candidate(1, 1, f64::MAX, true));
         // Zero-demand but no attributed cost: not a candidate (nothing to
         // shed — cost pressure must never become a generic zero-sub purge).
-        assert!(!cost_eviction_candidate(0, 0, 0.0));
+        assert!(!cost_eviction_candidate(0, 0, 0.0, false));
         // Negative / NaN rates (defensive: meter math) are not cost.
-        assert!(!cost_eviction_candidate(0, 0, -1.0));
-        assert!(!cost_eviction_candidate(0, 0, f64::NAN));
+        assert!(!cost_eviction_candidate(0, 0, -1.0, false));
+        assert!(!cost_eviction_candidate(0, 0, f64::NAN, false));
     }
 
     /// Helper: one cost axis with the given total/floor and per-contract
@@ -2097,7 +2223,7 @@ mod tests {
     /// it).
     #[test]
     fn evict_cost_pressure_sheds_zero_demand_offender_never_subscribed() {
-        let (mut cache, _ts) = make_cache(1024 * 1024);
+        let (mut cache, clock) = make_cache(1024 * 1024);
         let junk = make_key(1);
         let subscribed = make_key(2);
         let quiet = make_key(3);
@@ -2106,6 +2232,9 @@ mod tests {
         cache.record_access(subscribed, 121, AccessType::Put, 3, |_| (0, 0));
         cache.record_access(quiet, 121, AccessType::Put, 1, |_| (0, 0));
         assert!(cache.stats().current_bytes < cache.stats().budget_bytes);
+        // Age the PUT-seed genuine-access stamps past the cost window: the
+        // storm has run for a long time with no further genuine GET/PUT.
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
 
         // junk holds 58% of the axis total with zero subscribers; the
         // subscribed contract holds 40% with a downstream subscriber; quiet
@@ -2144,12 +2273,43 @@ mod tests {
         );
     }
 
+    /// A genuine GET/PUT within the cost window protects a ZERO-subscriber
+    /// contract from cost eviction (invariant 3: reads are demand — the
+    /// never-subscribed-but-read River UI-container class), and the
+    /// protection expires once the access ages past the window. UPDATE churn
+    /// gets no such protection: it never stamps `last_genuine_access`.
+    #[test]
+    fn evict_cost_pressure_recent_genuine_access_protects() {
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let read_hot = make_key(1);
+        cache.record_access(read_hot, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        // A genuine GET just now (the local-serve `touch` path — a real read).
+        cache.touch(&read_hot);
+
+        let axes = [cost_axis(100_000.0, 50_000.0, &[(&read_hot, 90_000.0)])];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert!(
+            evicted.is_empty(),
+            "a genuinely-read zero-subscriber contract must not be a cost victim"
+        );
+        assert!(cache.get(&read_hot).is_some());
+
+        // The same contract with the same cost IS shed once the read ages
+        // past the cost window — proving the gate is the recent access.
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].key, read_hot);
+    }
+
     /// A LOCAL client subscription protects exactly like a downstream one.
     #[test]
     fn evict_cost_pressure_local_subscription_protects() {
-        let (mut cache, _ts) = make_cache(1024 * 1024);
+        let (mut cache, clock) = make_cache(1024 * 1024);
         let hot = make_key(1);
         cache.record_access(hot, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
         let axes = [cost_axis(100_000.0, 50_000.0, &[(&hot, 90_000.0)])];
         let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (1, 0), &axes);
         assert!(
@@ -2163,9 +2323,10 @@ mod tests {
     /// work never cost-evicts, even at a 100% share.
     #[test]
     fn evict_cost_pressure_respects_absolute_floor() {
-        let (mut cache, _ts) = make_cache(1024 * 1024);
+        let (mut cache, clock) = make_cache(1024 * 1024);
         let only = make_key(1);
         cache.record_access(only, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
         // Total below the floor: the lone contract holds 100% of not-much.
         let axes = [cost_axis(10_000.0, 50_000.0, &[(&only, 10_000.0)])];
         let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
@@ -2187,11 +2348,12 @@ mod tests {
     /// none of which dominates are all retained.
     #[test]
     fn evict_cost_pressure_respects_share_threshold() {
-        let (mut cache, _ts) = make_cache(1024 * 1024);
+        let (mut cache, clock) = make_cache(1024 * 1024);
         let a = make_key(1);
         let b = make_key(2);
         cache.record_access(a, 121, AccessType::Put, 1, |_| (0, 0));
         cache.record_access(b, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
         // Each holds 20% — above the floor in total, but no single offender
         // exceeds the 25% share.
         let axes = [cost_axis(
@@ -2211,13 +2373,14 @@ mod tests {
     /// and a second axis naturally skips contracts already shed by the first.
     #[test]
     fn evict_cost_pressure_sheds_all_super_threshold_offenders_descending() {
-        let (mut cache, _ts) = make_cache(1024 * 1024);
+        let (mut cache, clock) = make_cache(1024 * 1024);
         let big = make_key(1);
         let bigger = make_key(2);
         let small = make_key(3);
         cache.record_access(big, 121, AccessType::Put, 1, |_| (0, 0));
         cache.record_access(bigger, 121, AccessType::Put, 2, |_| (0, 0));
         cache.record_access(small, 121, AccessType::Put, 3, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
         let axes = [
             cost_axis(
                 100_000.0,
