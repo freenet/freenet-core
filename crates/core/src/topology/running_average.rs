@@ -46,6 +46,32 @@ impl RunningAverage {
         let divisor = sample_duration.max(MINIMUM_TIME_WINDOW);
         Some(Rate::new(self.sum_samples, divisor))
     }
+
+    /// Like [`Self::get_rate_at_time`] but with a caller-supplied minimum
+    /// averaging window instead of the 1-second clamp.
+    ///
+    /// Used by the cost-pressure eviction trigger (cost-aware eviction,
+    /// #4861): `get_rate_at_time`'s 1-second minimum window means a single
+    /// large sample reported moments before a read produces an enormous
+    /// instantaneous rate (`value / 1s`). For an EVICTION decision that spike
+    /// would make a lone broadcast look like a sustained storm. Amortizing the
+    /// sample sum over at least `min_window` means only load actually
+    /// SUSTAINED across the window registers as a high rate; a one-off burst
+    /// is diluted by the window and decays as `now` advances past the oldest
+    /// retained sample.
+    pub(crate) fn get_rate_with_min_window(
+        &self,
+        now: Instant,
+        min_window: Duration,
+    ) -> Option<Rate> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let oldest_sample_time = self.samples.front().unwrap().0;
+        let sample_duration = now.saturating_duration_since(oldest_sample_time);
+        let divisor = sample_duration.max(min_window).max(Duration::from_secs(1));
+        Some(Rate::new(self.sum_samples, divisor))
+    }
 }
 
 #[cfg(test)]

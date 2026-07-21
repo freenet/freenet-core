@@ -1739,6 +1739,11 @@ impl Ring {
             // as the rework ships (AtCapacity now sheds subscribed as a last
             // resort). Same periodic cadence.
             snapshot.hosting_subscribed_evictions_total = Some(hosting.subscribed_evictions_total);
+            // Cost-pressure eviction falsifier (cost-aware eviction, #4861):
+            // zero-demand contracts shed because their attributed update-work
+            // (CPU / broadcast fan-out) dominated the node's total. Nonzero =
+            // the trigger is firing; runaway = floors/share miscalibrated.
+            snapshot.hosting_cost_evictions_total = Some(hosting.cost_evictions_total);
             // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
             // current count of contracts in-use via a downstream subscriber with
             // NO state on disk (contract_in_use && !contract_state_present). After
@@ -4632,7 +4637,55 @@ impl Ring {
     /// subscribers is eligible). The generation snapshot is carried through
     /// `EvictContract` so the deletion-time guard can detect a re-host race.
     pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
-        self.hosting_manager.sweep_expired_hosting()
+        // Cost-aware eviction (#4861): feed the sweep the node's attributed
+        // update-work cost so a zero-subscriber contract dominating CPU /
+        // broadcast capacity is shed even while UNDER the byte budget (the
+        // byte-gated sweep alone never fires for a tiny-state storm contract).
+        let cost_axes = self.hosting_cost_pressure_axes();
+        self.hosting_manager
+            .sweep_expired_hosting_with_cost(&cost_axes)
+    }
+
+    /// Build the per-axis attributed-cost snapshots for the hosting sweep's
+    /// cost-pressure trigger (cost-aware eviction, #4861): per-contract
+    /// `ExecCpuMicros` and `BroadcastFanoutCost` rates plus their node totals,
+    /// read from the topology meter amortized over at least
+    /// [`hosting::COST_RATE_MIN_WINDOW`] (so a lone burst can't masquerade as
+    /// a sustained storm). The absolute floors and the scale-free share
+    /// threshold live beside the decision in `ring/hosting/cache.rs`.
+    ///
+    /// Lock discipline: takes the topology read lock briefly and drops it
+    /// before the caller takes the hosting-cache write lock — the two are
+    /// never held together.
+    fn hosting_cost_pressure_axes(&self) -> Vec<hosting::CostAxisPressure> {
+        use crate::topology::meter::ResourceType;
+        let now = self.time_source.now();
+        let topo = self.connection_manager.topology_manager.read();
+        let (cpu_total, cpu_rates) = topo.contract_cost_rates(
+            &ResourceType::ExecCpuMicros,
+            now,
+            hosting::COST_RATE_MIN_WINDOW,
+        );
+        let (fanout_total, fanout_rates) = topo.contract_cost_rates(
+            &ResourceType::BroadcastFanoutCost,
+            now,
+            hosting::COST_RATE_MIN_WINDOW,
+        );
+        drop(topo);
+        vec![
+            hosting::CostAxisPressure {
+                axis: "exec_cpu_micros_per_sec",
+                total_rate: cpu_total,
+                floor: hosting::EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
+                rates: cpu_rates,
+            },
+            hosting::CostAxisPressure {
+                axis: "broadcast_fanout_bytes_per_sec",
+                total_rate: fanout_total,
+                floor: hosting::BROADCAST_FANOUT_PRESSURE_FLOOR_BYTES_PER_SEC,
+                rates: fanout_rates,
+            },
+        ]
     }
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================

@@ -316,6 +316,16 @@ pub(crate) struct HostingCacheStats {
     /// ships, so a rising differenced rate here is the signal to check whether
     /// budgets are too tight / demand is churning subscribed contracts.
     pub subscribed_evictions_total: u64,
+    /// Monotonic count of COST-PRESSURE evictions (cost-aware eviction,
+    /// #4861): zero-demand contracts shed because their attributed update-work
+    /// cost (WASM CPU / broadcast fan-out) dominated the node's total on a
+    /// cost axis, independently of the byte budget. Disjoint from
+    /// [`Self::budget_evictions_total`] (byte-budget-triggered evictions
+    /// only). The field falsifier for the cost trigger: a nonzero differenced
+    /// rate means the node is actively shedding cost offenders; a runaway rate
+    /// means the floors / share threshold are miscalibrated and churning cheap
+    /// contracts.
+    pub cost_evictions_total: u64,
 }
 
 /// Per-contract Greedy-Dual priority row for the local-peer dashboard.
@@ -732,6 +742,10 @@ pub struct HostingCache<T: TimeSource> {
     /// last-resort shed AND the Overflow valve). See
     /// [`HostingCacheStats::subscribed_evictions_total`].
     subscribed_evictions_total: u64,
+    /// Monotonic count of cost-pressure evictions (cost-aware eviction,
+    /// #4861). Only [`Self::evict_cost_pressure`] increments it. See
+    /// [`HostingCacheStats::cost_evictions_total`].
+    cost_evictions_total: u64,
     /// Time source for testability
     time_source: T,
 }
@@ -777,6 +791,91 @@ pub(crate) fn victim_order(
         .then_with(|| a_key.as_bytes().cmp(b_key.as_bytes()))
 }
 
+// =============================================================================
+// Cost-pressure eviction (cost-aware eviction, #4861)
+// =============================================================================
+//
+// The byte budget above measures on-disk STATE bytes only, so a tiny contract
+// that burns the node's update-work capacity (WASM CPU on every apply,
+// broadcast fan-out on every commit) never creates eviction pressure: the
+// #4861 storm contract was 121 bytes of state holding ~58% of a gateway's
+// broadcast capacity with ZERO subscribers, and the byte-gated sweep never
+// ran. Cost pressure closes that gap: the periodic sweep additionally reads
+// the per-contract attributed cost rates from the topology meter
+// (`ExecCpuMicros`, `BroadcastFanoutCost`) and — when the node's total
+// update-work on an axis is above a modest absolute floor AND some
+// zero-demand contract holds more than [`COST_SHARE_THRESHOLD`] of it —
+// sheds that contract, even while comfortably under the byte budget.
+//
+// The trigger is deliberately SCALE-FREE (a share of the node's own observed
+// work, not an absolute capacity number) so day one needs no per-hardware
+// calibration; the absolute floors only keep an idle node from evicting the
+// one contract that does any work at all. Candidacy is restricted to
+// `local_subs == 0 && downstream_subs == 0 && attributed_cost > 0`, so a
+// SUBSCRIBED contract is NEVER a cost-eviction candidate — the subscriber-
+// primary tiers of [`victim_order`] are not reordered by cost (cost breaks
+// ties only WITHIN the zero-demand tier), and the #4296 "River room evicted
+// for being popular" false positive is unreachable by construction, not
+// merely unlikely. See `.claude/rules/hosting-invariants.md` invariant 3.
+
+/// Share of the node's total attributed update-work on one cost axis above
+/// which a single zero-demand contract is considered a cost offender. The
+/// scale-free half of the cost-pressure trigger.
+pub(crate) const COST_SHARE_THRESHOLD: f64 = 0.25;
+
+/// Absolute floor for the node-total `ExecCpuMicros` rate (µs of WASM
+/// `update_state` execution per second) below which the CPU axis never
+/// triggers cost pressure. 50_000 µs/s = 5% of one core spent applying
+/// contract updates, sustained across the meter window — a node doing less
+/// update work than that is not under CPU pressure regardless of shares.
+/// Day-one calibration; the scale-free share above is the primary signal.
+pub(crate) const EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC: f64 = 50_000.0;
+
+/// Absolute floor for the node-total `BroadcastFanoutCost` rate (payload
+/// bytes × target count per second) below which the fan-out axis never
+/// triggers cost pressure. 128 KiB/s of intended fan-out egress (~1 Mbit/s)
+/// is a modest but real share of a small peer's uplink. Day-one calibration;
+/// the scale-free share above is the primary signal.
+pub(crate) const BROADCAST_FANOUT_PRESSURE_FLOOR_BYTES_PER_SEC: f64 = 128.0 * 1024.0;
+
+/// Minimum averaging window for the cost-rate reads feeding the trigger.
+/// A lone burst (one big fan-out reported moments before the sweep) is
+/// amortized over at least this window instead of the meter's 1-second
+/// clamp, so only load SUSTAINED across the window registers as pressure.
+/// See `RunningAverage::get_rate_with_min_window`.
+pub(crate) const COST_RATE_MIN_WINDOW: Duration = Duration::from_secs(300);
+
+/// Node-level attributed-cost snapshot for ONE cost axis, handed to the
+/// sweep by the caller (`Ring` reads the topology meter — see
+/// `Ring::hosting_cost_pressure_axes`; this module never touches the meter).
+#[derive(Debug, Clone)]
+pub(crate) struct CostAxisPressure {
+    /// Axis name for logs/telemetry (e.g. `"exec_cpu_micros_per_sec"`).
+    pub axis: &'static str,
+    /// Node-total attributed rate across ALL contracts (axis units per
+    /// second), the denominator of the share test.
+    pub total_rate: f64,
+    /// Absolute floor: at or below this total the axis never triggers.
+    pub floor: f64,
+    /// Per-contract attributed rates (axis units per second). Contracts
+    /// absent from the map have zero attributed cost.
+    pub rates: std::collections::HashMap<freenet_stdlib::prelude::ContractInstanceId, f64>,
+}
+
+/// The cost-eviction candidacy predicate: only a contract with ZERO demand
+/// (no local client subscriptions AND no downstream subscribers) and strictly
+/// positive attributed cost may be shed by cost pressure. A subscribed
+/// contract is NEVER a candidate — by construction, not by ranking — so cost
+/// pressure cannot reorder the subscriber-primary tiers of [`victim_order`].
+/// NaN-safe: a NaN rate fails the `> 0.0` comparison and is not a candidate.
+pub(crate) fn cost_eviction_candidate(
+    local_subs: usize,
+    downstream_subs: usize,
+    attributed_rate: f64,
+) -> bool {
+    local_subs == 0 && downstream_subs == 0 && attributed_rate > 0.0
+}
+
 impl<T: TimeSource> HostingCache<T> {
     /// Create a new hosting cache with the given byte budget.
     pub fn new(budget_bytes: u64, time_source: T) -> Self {
@@ -792,6 +891,7 @@ impl<T: TimeSource> HostingCache<T> {
             evicted_unread_age_secs_sum: 0,
             oom_valve_evictions_total: 0,
             subscribed_evictions_total: 0,
+            cost_evictions_total: 0,
             time_source,
         }
     }
@@ -1514,6 +1614,7 @@ impl<T: TimeSource> HostingCache<T> {
             contract_count: self.contracts.len() as u64,
             budget_evictions_total: self.budget_evictions_total,
             subscribed_evictions_total: self.subscribed_evictions_total,
+            cost_evictions_total: self.cost_evictions_total,
             evictions_of_recently_read_total: self.evictions_of_recently_read_total,
             evicted_unread_total: self.evicted_unread_total,
             evicted_unread_age_secs_sum: self.evicted_unread_age_secs_sum,
@@ -1621,6 +1722,101 @@ impl<T: TimeSource> HostingCache<T> {
         // subscriber-primary (fewest local, then fewest downstream, then
         // least-recent real GET/PUT). No `protected` key on the periodic sweep.
         self.evict_over_budget(&subscriber_counts, pressure, None)
+    }
+
+    /// Cost-pressure eviction (cost-aware eviction, #4861): shed zero-demand
+    /// contracts whose attributed update-work cost dominates the node's total
+    /// on a cost axis — even while UNDER the byte budget (this is what forces
+    /// the sweep to act when byte pressure never materializes; see the module
+    /// section "Cost-pressure eviction").
+    ///
+    /// Per axis, when `total_rate > floor`, the candidates are the hosted
+    /// contracts satisfying [`cost_eviction_candidate`] (zero local
+    /// subscriptions AND zero downstream subscribers AND attributed rate
+    /// > 0) whose rate exceeds [`COST_SHARE_THRESHOLD`] × `total_rate`.
+    /// Candidates are shed in DESCENDING attributed-rate order (contract-key
+    /// bytes as a deterministic tiebreak); the deficit is covered exactly when
+    /// no remaining zero-demand contract holds more than the threshold share
+    /// of the axis total, i.e. every super-threshold offender is shed. Shares
+    /// are computed against the PRE-eviction total, so the decision is a
+    /// single deterministic pass, not a feedback loop. A contract shed by an
+    /// earlier axis is naturally absent from later axes' candidate sets.
+    ///
+    /// The subscriber-primary tiers are untouched by construction: a contract
+    /// with ANY subscriber fails candidacy outright, so `was_in_use` is
+    /// `false` for every returned victim and the caller's in-use teardown is
+    /// a no-op. Recency is neither read nor refreshed here (an UPDATE-storm
+    /// contract deliberately accrues no recency — cache.rs recency semantics
+    /// unchanged); the in-flight-op races this opens are the same ones the
+    /// periodic byte sweep already has, closed downstream by the
+    /// `write_generation` re-host guard and the `contract_in_use` re-check in
+    /// `RuntimePool::remove_contract`.
+    ///
+    /// `subscriber_counts(key)` is the caller's genuine-demand split, read
+    /// once per candidate and captured atomically with the decision (same
+    /// discipline as [`Self::evict_over_budget`]).
+    pub fn evict_cost_pressure<G>(
+        &mut self,
+        subscriber_counts: &G,
+        axes: &[CostAxisPressure],
+    ) -> Vec<EvictedContract>
+    where
+        G: Fn(&ContractKey) -> (usize, usize),
+    {
+        let mut evicted = Vec::new();
+        for axis in axes {
+            // NaN-safe: a NaN/zero/sub-floor total never triggers the axis.
+            if axis.total_rate.is_nan() || axis.total_rate <= axis.floor {
+                continue;
+            }
+            let share_cutoff = COST_SHARE_THRESHOLD * axis.total_rate;
+            let mut offenders: Vec<(ContractKey, f64)> = self
+                .contracts
+                .keys()
+                .filter_map(|key| {
+                    let rate = axis.rates.get(key.id()).copied().unwrap_or(0.0);
+                    let (local, downstream) = subscriber_counts(key);
+                    (cost_eviction_candidate(local, downstream, rate) && rate > share_cutoff)
+                        .then_some((*key, rate))
+                })
+                .collect();
+            // Descending by attributed rate; key bytes break exact-rate ties
+            // deterministically.
+            offenders.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+            });
+            for (key, rate) in offenders {
+                if let Some(entry) = self.contracts.remove(&key) {
+                    self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
+                    self.cost_evictions_total = self.cost_evictions_total.saturating_add(1);
+                    // Operator-facing: this is the storm diagnosis surfacing in
+                    // the field. read_count is logged (not gated on) so the
+                    // field can tell whether cost eviction is hitting contracts
+                    // with genuine read demand.
+                    tracing::warn!(
+                        contract = %key,
+                        axis = axis.axis,
+                        attributed_rate = rate,
+                        node_total_rate = axis.total_rate,
+                        share = rate / axis.total_rate,
+                        read_count = entry.read_count,
+                        state_bytes = entry.size_bytes,
+                        "cost-pressure eviction: shedding zero-subscriber contract \
+                         dominating this node's attributed update-work (#4861)"
+                    );
+                    evicted.push(EvictedContract {
+                        key,
+                        write_generation: entry.write_generation,
+                        // Candidacy requires (local, downstream) == (0, 0) at
+                        // decision time, so the victim was NOT in use.
+                        was_in_use: false,
+                    });
+                }
+            }
+        }
+        evicted
     }
 
     /// Load a contract entry from persisted data during startup, using an
@@ -1855,6 +2051,193 @@ mod tests {
             victim_order((1, 1, 1, &k1), (1, 1, 1, &k1)),
             Ordering::Equal
         );
+    }
+
+    // =========================================================================
+    // Cost-pressure eviction (cost-aware eviction, #4861)
+    // =========================================================================
+
+    /// The candidacy predicate: ONLY zero-demand (no local subscriptions, no
+    /// downstream subscribers) contracts with strictly positive attributed
+    /// cost are cost-eviction candidates. Any subscriber — local or
+    /// downstream — makes a contract non-candidate by construction.
+    #[test]
+    fn cost_eviction_candidate_requires_zero_demand_and_nonzero_cost() {
+        // The one shape that qualifies.
+        assert!(cost_eviction_candidate(0, 0, 1.0));
+        // A local client subscription protects, regardless of cost.
+        assert!(!cost_eviction_candidate(1, 0, f64::MAX));
+        // A downstream subscriber protects, regardless of cost.
+        assert!(!cost_eviction_candidate(0, 1, f64::MAX));
+        assert!(!cost_eviction_candidate(2, 3, 100.0));
+        // Zero-demand but no attributed cost: not a candidate (nothing to
+        // shed — cost pressure must never become a generic zero-sub purge).
+        assert!(!cost_eviction_candidate(0, 0, 0.0));
+        // Negative / NaN rates (defensive: meter math) are not cost.
+        assert!(!cost_eviction_candidate(0, 0, -1.0));
+        assert!(!cost_eviction_candidate(0, 0, f64::NAN));
+    }
+
+    /// Helper: one cost axis with the given total/floor and per-contract
+    /// rates.
+    fn cost_axis(total_rate: f64, floor: f64, rates: &[(&ContractKey, f64)]) -> CostAxisPressure {
+        CostAxisPressure {
+            axis: "test_axis",
+            total_rate,
+            floor,
+            rates: rates.iter().map(|(k, r)| (*k.id(), *r)).collect(),
+        }
+    }
+
+    /// The discriminator at the cache level: under cost pressure — while
+    /// comfortably UNDER the byte budget — the zero-subscriber contract
+    /// dominating the axis is shed, while a SUBSCRIBED contract holding an
+    /// equally dominant share is untouched (candidacy, not ranking, protects
+    /// it).
+    #[test]
+    fn evict_cost_pressure_sheds_zero_demand_offender_never_subscribed() {
+        let (mut cache, _ts) = make_cache(1024 * 1024);
+        let junk = make_key(1);
+        let subscribed = make_key(2);
+        let quiet = make_key(3);
+        // Tiny states: byte budget is nowhere near exceeded (the #4861 shape).
+        cache.record_access(junk, 121, AccessType::Put, 7, |_| (0, 0));
+        cache.record_access(subscribed, 121, AccessType::Put, 3, |_| (0, 0));
+        cache.record_access(quiet, 121, AccessType::Put, 1, |_| (0, 0));
+        assert!(cache.stats().current_bytes < cache.stats().budget_bytes);
+
+        // junk holds 58% of the axis total with zero subscribers; the
+        // subscribed contract holds 40% with a downstream subscriber; quiet
+        // does no attributable work.
+        let axes = [cost_axis(
+            100_000.0,
+            50_000.0,
+            &[(&junk, 58_000.0), (&subscribed, 40_000.0)],
+        )];
+        let counts = |key: &ContractKey| if *key == subscribed { (0, 1) } else { (0, 0) };
+        let evicted = cache.evict_cost_pressure(&counts, &axes);
+
+        assert_eq!(evicted.len(), 1, "exactly the dominant zero-sub offender");
+        assert_eq!(evicted[0].key, junk);
+        assert_eq!(
+            evicted[0].write_generation, 7,
+            "generation snapshot travels with the eviction for the re-host guard"
+        );
+        assert!(
+            !evicted[0].was_in_use,
+            "cost victims are zero-demand by construction"
+        );
+        assert!(cache.get(&subscribed).is_some(), "subscribed survives");
+        assert!(cache.get(&quiet).is_some(), "no-cost contract survives");
+        assert!(cache.get(&junk).is_none());
+        let stats = cache.stats();
+        assert_eq!(stats.cost_evictions_total, 1);
+        assert_eq!(
+            stats.budget_evictions_total, 0,
+            "cost evictions must not masquerade as byte-budget evictions"
+        );
+        assert_eq!(
+            stats.current_bytes,
+            2 * 121,
+            "byte accounting reflects the shed entry"
+        );
+    }
+
+    /// A LOCAL client subscription protects exactly like a downstream one.
+    #[test]
+    fn evict_cost_pressure_local_subscription_protects() {
+        let (mut cache, _ts) = make_cache(1024 * 1024);
+        let hot = make_key(1);
+        cache.record_access(hot, 121, AccessType::Put, 1, |_| (0, 0));
+        let axes = [cost_axis(100_000.0, 50_000.0, &[(&hot, 90_000.0)])];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (1, 0), &axes);
+        assert!(
+            evicted.is_empty(),
+            "a locally-subscribed contract is never a cost victim"
+        );
+        assert!(cache.get(&hot).is_some());
+    }
+
+    /// The absolute floor gates the axis: a node doing little total update
+    /// work never cost-evicts, even at a 100% share.
+    #[test]
+    fn evict_cost_pressure_respects_absolute_floor() {
+        let (mut cache, _ts) = make_cache(1024 * 1024);
+        let only = make_key(1);
+        cache.record_access(only, 121, AccessType::Put, 1, |_| (0, 0));
+        // Total below the floor: the lone contract holds 100% of not-much.
+        let axes = [cost_axis(10_000.0, 50_000.0, &[(&only, 10_000.0)])];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert!(
+            evicted.is_empty(),
+            "sub-floor totals never trigger cost pressure"
+        );
+        // Exactly AT the floor also does not trigger (strict >).
+        let axes = [cost_axis(50_000.0, 50_000.0, &[(&only, 50_000.0)])];
+        assert!(
+            cache
+                .evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes)
+                .is_empty()
+        );
+        assert_eq!(cache.stats().cost_evictions_total, 0);
+    }
+
+    /// The share threshold gates candidacy: many small zero-sub contracts
+    /// none of which dominates are all retained.
+    #[test]
+    fn evict_cost_pressure_respects_share_threshold() {
+        let (mut cache, _ts) = make_cache(1024 * 1024);
+        let a = make_key(1);
+        let b = make_key(2);
+        cache.record_access(a, 121, AccessType::Put, 1, |_| (0, 0));
+        cache.record_access(b, 121, AccessType::Put, 1, |_| (0, 0));
+        // Each holds 20% — above the floor in total, but no single offender
+        // exceeds the 25% share.
+        let axes = [cost_axis(
+            100_000.0,
+            50_000.0,
+            &[(&a, 20_000.0), (&b, 20_000.0)],
+        )];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert!(
+            evicted.is_empty(),
+            "no single contract dominates → no eviction"
+        );
+    }
+
+    /// Multiple super-threshold offenders are shed in descending-rate order
+    /// (the deficit is covered when every super-threshold offender is gone),
+    /// and a second axis naturally skips contracts already shed by the first.
+    #[test]
+    fn evict_cost_pressure_sheds_all_super_threshold_offenders_descending() {
+        let (mut cache, _ts) = make_cache(1024 * 1024);
+        let big = make_key(1);
+        let bigger = make_key(2);
+        let small = make_key(3);
+        cache.record_access(big, 121, AccessType::Put, 1, |_| (0, 0));
+        cache.record_access(bigger, 121, AccessType::Put, 2, |_| (0, 0));
+        cache.record_access(small, 121, AccessType::Put, 3, |_| (0, 0));
+        let axes = [
+            cost_axis(
+                100_000.0,
+                50_000.0,
+                &[(&big, 30_000.0), (&bigger, 45_000.0), (&small, 10_000.0)],
+            ),
+            // Second axis where an already-shed contract also dominates: it
+            // is gone from the hosted set, so only itself would qualify and
+            // nothing double-evicts.
+            cost_axis(2_000_000.0, 131_072.0, &[(&bigger, 1_900_000.0)]),
+        ];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        let keys: Vec<ContractKey> = evicted.iter().map(|e| e.key).collect();
+        assert_eq!(
+            keys,
+            vec![bigger, big],
+            "descending attributed-rate order; sub-threshold contract retained; \
+             no double-eviction across axes"
+        );
+        assert!(cache.get(&small).is_some());
+        assert_eq!(cache.stats().cost_evictions_total, 2);
     }
 
     #[test]

@@ -155,6 +155,47 @@ impl Meter {
         rates
     }
 
+    /// Per-CONTRACT attributed usage rates for one cost axis, plus their sum,
+    /// for the cost-pressure eviction trigger (cost-aware eviction, #4861).
+    ///
+    /// Iterates the attribution meters, keeping only
+    /// [`AttributionSource::Contract`] entries (peer/delegate bandwidth sources
+    /// never participate in contract cost eviction), and reads each contract's
+    /// rate amortized over at least `min_window` (see
+    /// [`RunningAverage::get_rate_with_min_window`]) so a one-off burst
+    /// reported moments before the read cannot masquerade as a sustained
+    /// storm. Zero-rate entries are omitted, so an entry in the returned map
+    /// means "this contract did attributable work in the retained sample
+    /// window".
+    ///
+    /// Returns `(total_rate, per_contract_rate)` in axis units per second.
+    pub(crate) fn contract_cost_rates(
+        &self,
+        resource: &ResourceType,
+        at_time: Instant,
+        min_window: Duration,
+    ) -> (f64, std::collections::HashMap<ContractInstanceId, f64>) {
+        let mut per_contract = std::collections::HashMap::new();
+        let mut total = 0.0_f64;
+        for entry in self.attribution_meters.iter() {
+            let AttributionSource::Contract(id) = entry.key() else {
+                continue;
+            };
+            let Some(avg) = entry.value().map.get(resource) else {
+                continue;
+            };
+            let Some(rate) = avg.get_rate_with_min_window(at_time, min_window) else {
+                continue;
+            };
+            let per_second = rate.per_second();
+            if per_second > 0.0 {
+                total += per_second;
+                per_contract.insert(*id, per_second);
+            }
+        }
+        (total, per_contract)
+    }
+
     /// Estimates the usage rate for a given resource type based on existing data.
     ///
     /// This function calculates the estimated usage rate by taking the 50th percentile value (or another
@@ -635,6 +676,82 @@ mod tests {
             150.0
         );
         Ok(())
+    }
+
+    /// `contract_cost_rates` (cost-aware eviction, #4861) aggregates ONLY
+    /// Contract-attributed sources, amortizes over the caller's minimum
+    /// window (so a lone burst cannot masquerade as a sustained storm), and
+    /// returns a total consistent with the per-contract map.
+    #[test]
+    fn contract_cost_rates_aggregates_contract_sources_with_min_window() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+
+        // Two contract sources doing sustained CPU work, one peer source
+        // (bandwidth) that must be excluded, and one contract source with
+        // work on a DIFFERENT axis only.
+        meter.report(
+            &contract_source(1),
+            ResourceType::ExecCpuMicros,
+            30_000.0,
+            t0,
+        );
+        meter.report(
+            &contract_source(1),
+            ResourceType::ExecCpuMicros,
+            30_000.0,
+            t0 + Duration::from_secs(10),
+        );
+        meter.report(
+            &contract_source(2),
+            ResourceType::ExecCpuMicros,
+            15_000.0,
+            t0 + Duration::from_secs(5),
+        );
+        meter.report(
+            &AttributionSource::Peer(PeerKeyLocation::random()),
+            ResourceType::InboundBandwidthBytes,
+            999_999.0,
+            t0,
+        );
+        meter.report(
+            &contract_source(3),
+            ResourceType::BroadcastFanoutCost,
+            1_000_000.0,
+            t0,
+        );
+
+        let (total, rates) = meter.contract_cost_rates(
+            &ResourceType::ExecCpuMicros,
+            t0 + Duration::from_secs(20),
+            min_window,
+        );
+
+        // Rates are amortized over the 300s minimum window, NOT the ~20s of
+        // real sample span (and never the 1s clamp): 60_000µs / 300s = 200/s.
+        let id1 = ContractInstanceId::new([1u8; 32]);
+        let id2 = ContractInstanceId::new([2u8; 32]);
+        assert_eq!(rates.len(), 2, "peer + other-axis sources are excluded");
+        assert!((rates[&id1] - 200.0).abs() < 1e-9);
+        assert!((rates[&id2] - 50.0).abs() < 1e-9);
+        assert!(
+            (total - 250.0).abs() < 1e-9,
+            "total = sum of per-contract rates"
+        );
+
+        // The other axis sees only its own source.
+        let (fan_total, fan_rates) = meter.contract_cost_rates(
+            &ResourceType::BroadcastFanoutCost,
+            t0 + Duration::from_secs(20),
+            min_window,
+        );
+        let id3 = ContractInstanceId::new([3u8; 32]);
+        assert_eq!(fan_rates.len(), 1);
+        // Burst dilution: a single 1MB fan-out reads as 1MB/300s ≈ 3.4KB/s,
+        // not the 1MB/s the 1-second clamp would report.
+        assert!((fan_rates[&id3] - 1_000_000.0 / 300.0).abs() < 1e-6);
+        assert!((fan_total - fan_rates[&id3]).abs() < 1e-9);
     }
 
     #[test]

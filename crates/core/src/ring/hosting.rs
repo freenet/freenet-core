@@ -58,6 +58,14 @@ pub(crate) use cache::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use cache::default_hosting_budget_bytes;
 pub use cache::{AccessType, EvictedInUseTeardown, RecordAccessResult};
+/// Cost-pressure eviction inputs + day-one calibration constants (cost-aware
+/// eviction, #4861). Re-exported so `Ring` (which reads the topology meter)
+/// can build the per-axis snapshots the sweep consumes; the policy constants
+/// live beside the decision in `cache.rs`.
+pub(crate) use cache::{
+    BROADCAST_FANOUT_PRESSURE_FLOOR_BYTES_PER_SEC, COST_RATE_MIN_WINDOW, CostAxisPressure,
+    EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
+};
 /// Aggregate disk-budget sizing defaults + pure clamp math (#4683). Re-exported
 /// so `config` can resolve the persisted `hosting-disk-pct` / `max-hosting-disk`
 /// defaults and `ring`/`HostingManager` can size the eviction floor.
@@ -2460,14 +2468,51 @@ impl HostingManager {
     /// guard can detect a re-host race — plus, for any still-in-use victim shed
     /// as a last resort, the subscription state torn down so the caller can sync
     /// the `InterestManager` (PR #4734 Fix 1).
+    // No-axes convenience wrapper (the pure byte sweep). Production always
+    // goes through `Ring::sweep_expired_hosting`, which supplies the cost
+    // axes to `sweep_expired_hosting_with_cost`; this wrapper is retained for
+    // tests exercising the no-cost degradation path.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn sweep_expired_hosting(&self) -> HostingSweepResult {
+        self.sweep_expired_hosting_with_cost(&[])
+    }
+
+    /// [`Self::sweep_expired_hosting`] plus the cost-pressure decision
+    /// (cost-aware eviction, #4861): after the byte-budget sweep, shed
+    /// zero-demand contracts whose attributed update-work cost dominates the
+    /// node's total on a cost axis — even while UNDER the byte budget. The
+    /// caller (`Ring::sweep_expired_hosting`) builds `cost_axes` from the
+    /// topology meter; an empty slice degrades to the pure byte sweep. Both
+    /// phases run under ONE hosting-cache write guard so the combined
+    /// decision is atomic against concurrent accesses; cost victims flow
+    /// through the same teardown / metadata-cleanup / reclaim funnel as byte
+    /// victims (their `was_in_use` is `false` by construction, so the in-use
+    /// teardown is a no-op for them).
+    pub fn sweep_expired_hosting_with_cost(
+        &self,
+        cost_axes: &[cache::CostAxisPressure],
+    ) -> HostingSweepResult {
         // AtCapacity: the Overflow op-backstop-pierce trigger is intentionally
         // unwired in production (see cache::MemoryPressure). AtCapacity itself
         // CAN now shed a subscribed contract as a last resort — see below.
-        let evicted = self.hosting_cache.write().sweep_expired(
-            |key| self.local_and_downstream_counts(key),
-            cache::MemoryPressure::AtCapacity,
-        );
+        //
+        // `local_and_downstream_counts` reads only the subscription DashMaps —
+        // never `hosting_cache` — so calling it from inside the write guard
+        // does not re-enter the lock (same pattern as `record_contract_access`).
+        let evicted = {
+            let mut cache_guard = self.hosting_cache.write();
+            let mut evicted = cache_guard.sweep_expired(
+                |key| self.local_and_downstream_counts(key),
+                cache::MemoryPressure::AtCapacity,
+            );
+            if !cost_axes.is_empty() {
+                evicted.extend(cache_guard.evict_cost_pressure(
+                    &|key: &ContractKey| self.local_and_downstream_counts(key),
+                    cost_axes,
+                ));
+            }
+            evicted
+        };
 
         // Tear down subscription state for any still-in-use victim BEFORE the
         // caller reclaims it, so `contract_in_use` is false when the reclaim gate
@@ -3161,6 +3206,82 @@ mod tests {
 
         assert!(result.is_new);
         assert!(manager.is_subscribed(&contract));
+    }
+
+    /// THE cost-aware-eviction discriminator (#4861), at the manager level:
+    /// under cost pressure — with the byte budget nowhere near exceeded (the
+    /// exact shape of the production storm: a 121-byte zero-subscriber
+    /// contract holding ~58% of the gateway's broadcast capacity, never
+    /// evicted because the sweep was byte-gated) — the sweep sheds the
+    /// zero-subscriber cost offender, while a SUBSCRIBED contract holding an
+    /// equally dominant cost share is untouched. The victim flows through the
+    /// standard [`HostingSweepResult::expired`] funnel (the same list the
+    /// ring maintenance task feeds to `unregister_local_hosting` →
+    /// advertisement retraction and `reclaim_evicted_contract` → disk
+    /// reclamation), with no in-use teardown (cost victims are zero-demand by
+    /// construction). Removing the subscriber then flips the protection: the
+    /// same contract becomes evictable on the next cost sweep — proving the
+    /// gate is the subscriber, not the key.
+    #[tokio::test]
+    async fn cost_pressure_sweep_evicts_zero_subscriber_offender_not_subscribed() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let junk = make_contract_key(1);
+        let hot_subscribed = make_contract_key(2);
+        manager.record_contract_access(junk, 121, AccessType::Put);
+        manager.record_contract_access(hot_subscribed, 121, AccessType::Put);
+        manager.add_downstream_subscriber(&hot_subscribed, make_peer_key(10));
+
+        let axes = vec![CostAxisPressure {
+            axis: "exec_cpu_micros_per_sec",
+            total_rate: 100_000.0,
+            floor: EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC,
+            rates: [(*junk.id(), 58_000.0), (*hot_subscribed.id(), 41_000.0)]
+                .into_iter()
+                .collect(),
+        }];
+
+        let result = manager.sweep_expired_hosting_with_cost(&axes);
+        let expired_keys: Vec<ContractKey> = result.expired.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            expired_keys,
+            vec![junk],
+            "the zero-subscriber cost offender is shed; the subscribed \
+             contract is protected by candidacy, not ranking"
+        );
+        assert!(
+            result.evicted_in_use_teardown.is_empty(),
+            "cost victims are zero-demand — nothing to tear down"
+        );
+        assert!(!manager.is_hosting_contract(&junk));
+        assert!(manager.is_hosting_contract(&hot_subscribed));
+
+        // Idempotent under unchanged pressure: the offender is gone, the
+        // subscribed contract stays protected.
+        let again = manager.sweep_expired_hosting_with_cost(&axes);
+        assert!(again.expired.is_empty());
+        assert!(manager.is_hosting_contract(&hot_subscribed));
+
+        // Protection follows the SUBSCRIBER: once the downstream subscriber
+        // leaves, the same high-cost contract becomes a candidate.
+        manager.remove_downstream_subscriber(&hot_subscribed, &make_peer_key(10));
+        let after_unsub = manager.sweep_expired_hosting_with_cost(&axes);
+        let after_keys: Vec<ContractKey> = after_unsub.expired.iter().map(|(k, _)| *k).collect();
+        assert_eq!(after_keys, vec![hot_subscribed]);
+        assert!(!manager.is_hosting_contract(&hot_subscribed));
+    }
+
+    /// The no-cost degradation path: `sweep_expired_hosting()` (no axes) is
+    /// the pure byte sweep and never cost-evicts, so every pre-existing
+    /// caller is behaviorally unchanged.
+    #[tokio::test]
+    async fn sweep_without_cost_axes_never_cost_evicts() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let junk = make_contract_key(1);
+        manager.record_contract_access(junk, 121, AccessType::Put);
+        let result = manager.sweep_expired_hosting();
+        assert!(result.expired.is_empty());
+        assert!(manager.is_hosting_contract(&junk));
+        assert_eq!(manager.hosting_cache_stats().cost_evictions_total, 0);
     }
 
     /// `subscribed_keys_in` (the bounded connection-drop-shadow lookup, #4642)

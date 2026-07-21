@@ -265,6 +265,16 @@ pub(crate) struct RouterSnapshotInfo {
     /// Populated by `Ring` on the snapshot cadence. `None` until the ring is
     /// built. Per-node aggregate scalar.
     pub hosting_subscribed_evictions_total: Option<u64>,
+    /// Cost-pressure eviction falsifier (cost-aware eviction, #4861): monotonic
+    /// count of zero-demand contracts shed because their attributed update-work
+    /// cost (WASM CPU / broadcast fan-out) dominated the node's total on a cost
+    /// axis, independently of the byte budget. Disjoint from
+    /// `hosting_budget_evictions_total` (byte-budget-triggered only). A nonzero
+    /// differenced rate means the cost trigger is firing; a runaway rate means
+    /// the floors / share threshold are miscalibrated and churning cheap
+    /// contracts. Populated by `Ring` on the snapshot cadence. `None` until the
+    /// ring is built. Per-node aggregate scalar.
+    pub hosting_cost_evictions_total: Option<u64>,
     /// Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d): the count of
     /// contracts registered as in-use via a downstream subscriber whose state is
     /// NOT present on disk (`contract_in_use && !contract_state_present`). After
@@ -1344,6 +1354,7 @@ impl Router {
             hosting_disk_total_bytes: None,
             hosting_oom_valve_evictions_total: None,
             hosting_subscribed_evictions_total: None,
+            hosting_cost_evictions_total: None,
             phantom_in_use_contracts: None,
             // Terminal advertisement-consult counters (piece C, #4646),
             // populated by Ring from the network_status singleton on the

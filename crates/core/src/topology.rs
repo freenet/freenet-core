@@ -431,6 +431,22 @@ impl TopologyManager {
         self.meter.attributed_usage_rate(source, resource_type, now)
     }
 
+    /// Per-contract attributed cost rates + their sum for one cost axis,
+    /// amortized over at least `min_window`. Read by the hosting sweep's
+    /// cost-pressure trigger (cost-aware eviction, #4861); see
+    /// [`Meter::contract_cost_rates`].
+    pub(crate) fn contract_cost_rates(
+        &self,
+        resource: &ResourceType,
+        now: Instant,
+        min_window: std::time::Duration,
+    ) -> (
+        f64,
+        std::collections::HashMap<freenet_stdlib::prelude::ContractInstanceId, f64>,
+    ) {
+        self.meter.contract_cost_rates(resource, now, min_window)
+    }
+
     /// Determine whether to add or remove connections based on current connection
     /// count and resource usage.
     ///

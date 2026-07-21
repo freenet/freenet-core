@@ -483,6 +483,21 @@ impl P2pConnManager {
             target_result.interest_resolve_failed,
         );
 
+        // Cost telemetry (cost-aware eviction, #4861): attribute the intended
+        // fan-out cost — payload bytes × target count — to the contract on the
+        // `BroadcastFanoutCost` meter axis. This is the dispatch point where
+        // the resolved target count is known, shared by the production
+        // (broadcast-queue) and simulation (inline) branches below. Feeds the
+        // hosting sweep's cost-pressure trigger so a zero-subscriber contract
+        // that dominates broadcast capacity becomes an eviction candidate.
+        // Deadlock-safe: `report_contract_resource_usage` takes a brief sync
+        // lock, no channels (see its rustdoc).
+        op_manager.ring.report_contract_resource_usage(
+            *key.id(),
+            crate::topology::meter::ResourceType::BroadcastFanoutCost,
+            new_state.size() as f64 * target_result.targets.len() as f64,
+        );
+
         // In production, enqueue each target into the broadcast queue.
         // The queue worker handles delta computation and streaming with bounded
         // concurrency (default: 2 concurrent streams) to prevent uplink saturation.
@@ -583,6 +598,18 @@ impl P2pConnManager {
             contract = %key,
             peer = %target_addr,
             "SyncStateToPeer: sending state to stale peer"
+        );
+
+        // Cost telemetry (cost-aware eviction, #4861): a targeted stale-peer
+        // heal burns the same broadcast capacity as one fan-out leg, so
+        // attribute payload × 1 to the contract on the same axis. A contract
+        // whose churning state drives constant resync heals (#4861's
+        // non-converging junk contract) accrues its real cost here even when
+        // the all-subscriber fan-out path is quiet.
+        op_manager.ring.report_contract_resource_usage(
+            *key.id(),
+            crate::topology::meter::ResourceType::BroadcastFanoutCost,
+            new_state.size() as f64,
         );
 
         #[cfg(not(feature = "simulation_tests"))]
@@ -950,5 +977,43 @@ impl P2pConnManager {
         ) {
             bridge.log_register.register_events(Either::Left(log)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod broadcast_fanout_cost_pin_tests {
+    //! Source-scrape pin for the `BroadcastFanoutCost` reporter (cost-aware
+    //! eviction, #4861). The "Manually-mirrored telemetry counters" row in
+    //! `.claude/rules/bug-prevention-patterns.md` is the precedent: a refactor
+    //! of the broadcast dispatch that drops the cost report silently blinds
+    //! the cost-pressure eviction trigger — the exact cost-blind gap this
+    //! change closes — and no behavioral test catches it because the fan-out
+    //! still works. Pin the report at the source level so the drop trips CI.
+
+    const BROADCAST_SRC: &str = include_str!("broadcast.rs");
+
+    /// Both dispatch sites — the all-subscriber fan-out
+    /// (`handle_broadcast_state_change`) and the targeted stale-peer heal
+    /// (`handle_sync_state_to_peer`) — report `BroadcastFanoutCost`. If a
+    /// site is added or removed, update this count WITH a comment explaining
+    /// where the cost of that path is now attributed.
+    #[test]
+    fn broadcast_dispatch_sites_report_fanout_cost() {
+        // Split needle so this test's own source lines never contain the
+        // contiguous token and cannot self-count.
+        let needle = concat!("ResourceType::", "Broadcast", "FanoutCost");
+        let report_sites = BROADCAST_SRC
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && trimmed.contains(needle)
+            })
+            .count();
+        assert_eq!(
+            report_sites, 2,
+            "expected exactly 2 BroadcastFanoutCost report sites in broadcast.rs \
+             (fan-out dispatch + targeted stale-peer heal); a dropped report \
+             silently blinds cost-pressure eviction (#4861)"
+        );
     }
 }

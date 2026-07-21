@@ -2297,6 +2297,32 @@ mod state_write_attribution_pin_tests {
     }
 
     #[test]
+    fn attempt_state_update_reports_exec_cpu_micros() {
+        // Cost-aware eviction (#4861): the upsert/apply chokepoint
+        // (`attempt_state_update` in executor_impl.rs) MUST attribute the
+        // elapsed time of the blocking WASM `update_state` call to the
+        // contract on the `ExecCpuMicros` meter axis — the signal the hosting
+        // sweep's cost-pressure trigger reads. A refactor that drops the
+        // report silently re-opens the cost-blind-eviction gap (a
+        // zero-subscriber contract burning update CPU is never an eviction
+        // candidate) while every behavioral test stays green — the exact
+        // failure mode of the "Manually-mirrored telemetry counters" row in
+        // `.claude/rules/bug-prevention-patterns.md`.
+        //
+        // Split needle so this test's own source cannot self-count.
+        let needle = concat!("ResourceType::", "Exec", "CpuMicros");
+        let count = count_call_sites(RUNTIME_SRC, needle);
+        assert_eq!(
+            count, 1,
+            "expected exactly 1 ExecCpuMicros report site in the executor \
+             runtime sources (inside attempt_state_update); found {count}. \
+             If you added a WASM-execution chokepoint that burns \
+             attributable CPU, report it on the same axis and bump this \
+             expectation with a comment."
+        );
+    }
+
+    #[test]
     fn v2_delegate_callback_installers_invalidate_state_caches() {
         // V2 delegate state writes (put/update_contract_state_sync) bypass
         // `StateStore::{store,update}`, so both `state_write_callback` installers
