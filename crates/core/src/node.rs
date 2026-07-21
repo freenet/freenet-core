@@ -2202,6 +2202,51 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
     stale_contracts_len.min(MAX_STALE_SYNCS_PER_SUMMARIES)
 }
 
+/// Per-`Summaries`-message cap on semantic-staleness probes — the WASM
+/// `get_state_delta` calls the `Summaries` handler issues to decide, for a
+/// byte-differing summary, whether a peer is genuinely stale (#4857 secondary
+/// finding). Mirrors the sibling per-message WASM-fan-out caps
+/// (`MAX_STALE_SYNCS_PER_SUMMARIES = 32` here, `MAX_DELTA_COMPUTATIONS_PER_FANOUT`
+/// in the broadcast path) and the code-style rule that per-recipient WASM work
+/// MUST be bounded: without it a peer that sends crafted/novel summary bytes for
+/// every hosted contract would force unbounded `get_state_delta` execution on
+/// the serial contract-handling loop. 32 matches the burst-control family and
+/// sits far above the handful of genuinely-diverged contracts a healthy peer
+/// reports per exchange.
+const MAX_STALENESS_PROBES_PER_SUMMARIES: usize = 32;
+
+/// What to do about one byte-differing contract when deciding staleness in the
+/// `Summaries` handler, given the cheap in-memory cache lookup and how many
+/// probes this message has already spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StalenessProbeAction {
+    /// The shared delta cache already answered — use this verdict, no WASM,
+    /// no budget consumed. Cache hits are free, so they never count against
+    /// the probe budget (a healthy peer with a warm cache is fully evaluated).
+    UseCached(bool),
+    /// Cache miss with budget remaining — run the WASM `get_state_delta` probe
+    /// and count it against the per-message budget.
+    RunProbe,
+    /// Cache miss with the probe budget exhausted for this message — do NOT
+    /// probe; fall back to the conservative byte comparison (differing bytes =>
+    /// stale => heal, itself capped downstream by [`MAX_STALE_SYNCS_PER_SUMMARIES`]).
+    /// The contract is re-evaluated on the next heartbeat once the cache warms.
+    BudgetExhaustedFallBack,
+}
+
+/// Decide how to resolve staleness for one byte-differing contract, bounding the
+/// number of WASM probes per `Summaries` message to
+/// [`MAX_STALENESS_PROBES_PER_SUMMARIES`]. Only cache MISSES (which require WASM)
+/// consume the budget; cache hits are free and always answered. Pure so the cap
+/// is unit-testable (see `staleness_probe_cap`).
+fn plan_staleness_probe(cached: Option<bool>, probes_used: usize) -> StalenessProbeAction {
+    match cached {
+        Some(has_change) => StalenessProbeAction::UseCached(has_change),
+        None if probes_used < MAX_STALENESS_PROBES_PER_SUMMARIES => StalenessProbeAction::RunProbe,
+        None => StalenessProbeAction::BudgetExhaustedFallBack,
+    }
+}
+
 /// Maximum contract-module-cache occupancy (percent of budget) at which this
 /// node still accepts an inbound placement-migration `SubscribeHint` (#4534).
 ///
@@ -2674,6 +2719,12 @@ async fn handle_interest_sync_message(
                 Vec::new();
 
             if let Some(pk) = peer_key {
+                // Per-message budget for semantic-staleness WASM probes
+                // (`get_state_delta`), spent across ALL entries/contracts in
+                // this Summaries message. Bounds the DoS surface of a peer
+                // sending novel summary bytes for every hosted contract. See
+                // `MAX_STALENESS_PROBES_PER_SUMMARIES` / `plan_staleness_probe`.
+                let mut staleness_probes_used = 0usize;
                 for entry in entries {
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         if !op_manager.interest_manager.has_local_interest(&contract) {
@@ -2713,12 +2764,40 @@ async fn handle_interest_sync_message(
                                     // Byte-identical => converged; skip the probe.
                                     None
                                 } else {
-                                    op_manager
-                                        .interest_manager
-                                        .peer_summary_has_pending_state(
-                                            op_manager, &contract, theirs, ours,
-                                        )
-                                        .await
+                                    // Cheap in-memory cache lookup first (no WASM,
+                                    // no budget). Only a genuine cache MISS needs a
+                                    // WASM `get_state_delta`, so only misses are
+                                    // rationed by the per-message probe budget.
+                                    let cached =
+                                        op_manager.interest_manager.cached_staleness_verdict(
+                                            &contract,
+                                            theirs.as_ref(),
+                                            ours.as_ref(),
+                                        );
+                                    match plan_staleness_probe(cached, staleness_probes_used) {
+                                        StalenessProbeAction::UseCached(has_change) => {
+                                            Some(has_change)
+                                        }
+                                        StalenessProbeAction::RunProbe => {
+                                            staleness_probes_used += 1;
+                                            op_manager
+                                                .interest_manager
+                                                .peer_summary_has_pending_state(
+                                                    op_manager, &contract, theirs, ours,
+                                                )
+                                                .await
+                                        }
+                                        StalenessProbeAction::BudgetExhaustedFallBack => {
+                                            // Budget spent for this message: fall
+                                            // back to the conservative byte-compare
+                                            // (differing bytes => stale => heal,
+                                            // capped by MAX_STALE_SYNCS_PER_SUMMARIES).
+                                            // Re-evaluated next heartbeat once the
+                                            // cache warms. `None` => byte-compare in
+                                            // `summary_indicates_stale_peer`.
+                                            None
+                                        }
+                                    }
                                 };
                                 crate::ring::interest::summary_indicates_stale_peer(
                                     ours,
@@ -3880,6 +3959,57 @@ mod tests {
             gated_calls >= 3,
             "expected the 3 periodic interest-sync arms to call \
              summary_if_hosted_or_in_use, found {gated_calls}"
+        );
+    }
+
+    /// Pin: the `Summaries` interest-sync arm must decide staleness
+    /// SEMANTICALLY — routing through `peer_summary_has_pending_state` (the
+    /// contract `get_state_delta` probe) and `summary_indicates_stale_peer`
+    /// (the decision policy), under the per-message probe cap via
+    /// `plan_staleness_probe` — NOT a bare summary byte comparison (#4857
+    /// secondary finding / the summarize storm).
+    ///
+    /// The data-layer unit tests in `ring/interest.rs` exercise those helpers
+    /// directly, so they stay green even if this handler hunk is reverted to a
+    /// bare `ours != theirs` byte compare (re-opening the storm). This
+    /// source-scrape is the only guard on the handler WIRING — mirrors the
+    /// sibling `interest_sync_periodic_arms_summarize_only_hosted_or_in_use_pin`
+    /// and the #3791 targeted-heal source-scrape pins.
+    #[test]
+    fn summaries_arm_uses_semantic_staleness_probe_pin() {
+        let src = include_str!("node.rs");
+
+        let handler_start = src
+            .find("async fn handle_interest_sync_message(")
+            .expect("handle_interest_sync_message not found");
+        // Scope to the `Summaries` arm = its match start .. the next arm
+        // (`ChangeInterests`), so the assertions can't false-pass on unrelated
+        // code elsewhere in the handler.
+        let summaries_off = src[handler_start..]
+            .find("InterestMessage::Summaries { entries }")
+            .expect("Summaries arm not found");
+        let change_off = src[handler_start..]
+            .find("InterestMessage::ChangeInterests")
+            .expect("ChangeInterests arm not found");
+        let summaries_arm = &src[handler_start + summaries_off..handler_start + change_off];
+
+        assert!(
+            summaries_arm.contains("peer_summary_has_pending_state"),
+            "the Summaries arm must consult the contract delta probe \
+             (peer_summary_has_pending_state) to decide staleness — a bare \
+             summary byte comparison re-opens the #4857 summarize storm"
+        );
+        assert!(
+            summaries_arm.contains("summary_indicates_stale_peer"),
+            "the Summaries arm must decide staleness via \
+             summary_indicates_stale_peer (semantic policy), not inline byte \
+             inequality"
+        );
+        assert!(
+            summaries_arm.contains("plan_staleness_probe"),
+            "the Summaries arm must ration WASM probes through \
+             plan_staleness_probe (MAX_STALENESS_PROBES_PER_SUMMARIES cap) — \
+             an uncapped probe per contract is a DoS amplification surface"
         );
     }
 
@@ -6860,6 +6990,89 @@ mod tests {
                 "stale-sync rotation offset is no longer drawn from GlobalRng — \
                  a fixed/non-random rotation does not avoid starvation and \
                  breaks simulation determinism"
+            );
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Per-message cap on semantic-staleness WASM probes
+    // (`MAX_STALENESS_PROBES_PER_SUMMARIES`). A peer sending crafted/novel
+    // summary bytes for every hosted contract must not force unbounded
+    // `get_state_delta` execution on the serial contract loop (#4857
+    // secondary-finding DoS hardening). Cache hits are free and never
+    // consume the budget; only cache MISSES (which need WASM) are rationed,
+    // and the overflow falls back to the conservative byte comparison.
+    // ───────────────────────────────────────────────────────────
+    mod staleness_probe_cap {
+        use super::super::{
+            MAX_STALENESS_PROBES_PER_SUMMARIES, StalenessProbeAction, plan_staleness_probe,
+        };
+
+        #[test]
+        fn cache_hit_bypasses_budget() {
+            // A cache hit does no WASM, so it is answered even far past the cap.
+            assert_eq!(
+                plan_staleness_probe(Some(true), 0),
+                StalenessProbeAction::UseCached(true)
+            );
+            assert_eq!(
+                plan_staleness_probe(Some(false), MAX_STALENESS_PROBES_PER_SUMMARIES * 10),
+                StalenessProbeAction::UseCached(false)
+            );
+        }
+
+        #[test]
+        fn cache_miss_probes_until_budget_then_falls_back() {
+            // Under budget: run the WASM probe.
+            assert_eq!(
+                plan_staleness_probe(None, 0),
+                StalenessProbeAction::RunProbe
+            );
+            assert_eq!(
+                plan_staleness_probe(None, MAX_STALENESS_PROBES_PER_SUMMARIES - 1),
+                StalenessProbeAction::RunProbe
+            );
+            // At/over budget: stop probing, fall back to the byte comparison.
+            assert_eq!(
+                plan_staleness_probe(None, MAX_STALENESS_PROBES_PER_SUMMARIES),
+                StalenessProbeAction::BudgetExhaustedFallBack
+            );
+            assert_eq!(
+                plan_staleness_probe(None, MAX_STALENESS_PROBES_PER_SUMMARIES + 5),
+                StalenessProbeAction::BudgetExhaustedFallBack
+            );
+        }
+
+        /// Simulates the handler loop's counter over a run of byte-differing
+        /// cache-MISS contracts (the DoS shape: novel bytes for every contract)
+        /// and asserts WASM probes are hard-capped while the overflow falls back
+        /// to the conservative byte compare.
+        #[test]
+        fn probe_budget_caps_wasm_probes_per_message() {
+            let total_contracts = MAX_STALENESS_PROBES_PER_SUMMARIES * 3; // 96 > cap
+            let mut probes_used = 0usize;
+            let mut probed = 0usize;
+            let mut fell_back = 0usize;
+            for _ in 0..total_contracts {
+                match plan_staleness_probe(None, probes_used) {
+                    StalenessProbeAction::RunProbe => {
+                        probes_used += 1;
+                        probed += 1;
+                    }
+                    StalenessProbeAction::BudgetExhaustedFallBack => fell_back += 1,
+                    StalenessProbeAction::UseCached(_) => {
+                        unreachable!("every contract is a cache miss in this scenario")
+                    }
+                }
+            }
+            assert_eq!(
+                probed, MAX_STALENESS_PROBES_PER_SUMMARIES,
+                "WASM probes must be hard-capped at the per-message budget"
+            );
+            assert_eq!(
+                fell_back,
+                total_contracts - MAX_STALENESS_PROBES_PER_SUMMARIES,
+                "every over-budget contract must fall back to byte-compare"
             );
         }
     }

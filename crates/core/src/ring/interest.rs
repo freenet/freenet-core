@@ -86,6 +86,14 @@ use crate::config::GlobalExecutor;
 use crate::config::GlobalRng;
 
 /// Maximum number of entries in the delta memoization cache.
+///
+// TODO(fast-follow): size this by hosted×neighbors rather than a flat 1024, so
+// the interest-heartbeat staleness probes (`peer_summary_has_pending_state`)
+// and broadcast deltas keep their working set cached across cycles on
+// large-hosted-set peers. Deferred: the per-message probe budget
+// (`MAX_STALENESS_PROBES_PER_SUMMARIES`) already bounds the cold-cache
+// worst-case load, and summaries are memoized outside WASM so byte keys stay
+// stable while state is unchanged.
 const DELTA_CACHE_SIZE: usize = 1024;
 
 /// Minimum interval between queue-full `ResyncRequest`s to the same peer for
@@ -1520,11 +1528,30 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// detection wants the semantic answer even for contracts where a delta
     /// would be larger than full state, because the alternative it replaces is a
     /// spurious FULL-STATE heal on every heartbeat — strictly more expensive
-    /// than one delta computation. The result rides the SAME delta cache as
-    /// `compute_delta` (keyed by contract + both summary hashes, invalidated
-    /// whenever our state changes because that changes `our_summary`), so a
-    /// converged pair costs one contract round-trip and is then served from
-    /// cache — no per-heartbeat re-summarize storm.
+    /// than one delta computation.
+    ///
+    /// Steady-state cost: the result rides the SAME delta cache as
+    /// `compute_delta` (keyed by contract + both summary hashes). Note that
+    /// outer cache is BYTE-keyed, so under non-deterministic summary
+    /// serialization it *can* miss even for an unchanged pair. The real reason
+    /// the per-heartbeat load stays flat is upstream of this cache: (a) contract
+    /// summaries are memoized OUTSIDE the WASM boundary keyed on a
+    /// state-change-detector hash (`bridged_summarize_contract_state`), so a
+    /// peer's `our_summary`/`their_summary` bytes are STABLE while state is
+    /// unchanged — which keeps this cache's byte key stable across heartbeats —
+    /// and (b) the executor-level delta cache is keyed on `state_hash`
+    /// (`bridged_get_contract_state_delta`), so even a byte-key miss here elides
+    /// the WASM call when the state has not changed. The per-message probe
+    /// budget (`MAX_STALENESS_PROBES_PER_SUMMARIES`) bounds the residual
+    /// cold-cache worst case. Net: a converged pair costs at most one WASM
+    /// `get_state_delta` per state change, not one per heartbeat.
+    ///
+    /// Convergence caveat: the `Some(false)` "converged" verdict is only as
+    /// correct as the contract's `get_state_delta` being a correct semilattice
+    /// diff (empty delta iff our state adds nothing over their summary). A
+    /// contract with a buggy diff could under-report divergence here exactly as
+    /// it already would on the broadcast delta-optimization path; this reuses
+    /// that same, pre-existing trust assumption rather than adding a new one.
     pub async fn peer_summary_has_pending_state(
         &self,
         op_manager: &crate::node::OpManager,
@@ -1545,6 +1572,17 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // Slow path: ask the contract for the delta of our state against their
         // summary. `GetDeltaQuery` is the same event `compute_delta` uses, and
         // we cache the result under the same key so both paths share it.
+        //
+        // Priority: this runs at the DEFAULT (NetworkRelay) priority that
+        // `notify_contract_handler_with_timeout` uses — deliberately NOT
+        // `Priority::Background`. A Background probe would be SHED first under
+        // contract-handler saturation, returning `None` → the caller falls back
+        // to the byte-compare, which flags the (converged-but-byte-differing)
+        // peer stale and fires a FULL-STATE heal — re-enabling the very storm
+        // this probe suppresses, exactly when the node is most loaded. The probe
+        // is strictly cheaper than the heal it prevents, so it must run even
+        // under load; the per-message `MAX_STALENESS_PROBES_PER_SUMMARIES` cap
+        // (not de-prioritization) is what bounds its cost.
         match op_manager
             .notify_contract_handler_with_timeout(
                 ContractHandlerEvent::GetDeltaQuery {
