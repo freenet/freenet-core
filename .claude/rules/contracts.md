@@ -152,29 +152,31 @@ State merging rules:
     deterministic identical-input probe
     (`Executor::probe_identical_input_idempotency`): when an incoming
     full-State payload is byte-identical to the stored state,
-    `update_state(S, State(S))` must be a no-op, so a cooldown-bounded
-    re-merge that changes the byte MULTISET is deterministic proof (first
-    identical re-push after each cooldown flags — no sampling). Both flag a
-    violation only when the CONTENT changed (a counter/timestamp/signature
-    churned, an entry was added/removed), including the fixed-size byte-churn
-    shape of the #4251 incident. Neither flags a mere REORDERING of the
-    same bytes, because a correct contract with non-canonical serialization
-    (HashMap/HashSet iteration order) re-serializes the same logical state in
-    a different byte order (the #4295 false-positive case). Violators get
-    flagged in `Ring::broken_invariants`; while flagged, this node suppresses
-    commit, outbound `BroadcastStateChange`, AND full-state egress
-    (`ResyncResponse`, `SyncStateToPeer` heal). The flag is TTL-bounded
-    (`BROKEN_INVARIANT_TTL`, swept by the Ring reaper) so a false positive
-    self-heals instead of bricking the contract forever; a genuine violation
-    is re-detected after expiry. Repeated re-detections feed a durable
-    escalation ledger (persisted, survives restarts): N=5 flag episodes per
-    hour window = one escalation, M=3 escalations = a durable
-    `BanReason::NonIdempotent` entry on the contract ban list (24 h; wire
-    dispatch then drops the contract's PUT/GET/UPDATE/SUBSCRIBE), so a
-    genuinely non-idempotent contract is quarantined instead of merely
-    dampened — a one-off false positive never comes close to the threshold.
-    Residual false-negative: a content change that coincidentally preserves
-    the exact byte multiset evades detection (far narrower than a size-only
+    `update_state(S, State(S))` must reach a FIXPOINT, so a cooldown-bounded
+    re-apply sequence (up to `IDENTITY_PROBE_MAX_APPLIES` = 3 merges) whose
+    byte MULTISET keeps changing on EVERY step is deterministic proof (first
+    identical re-push after each cooldown flags — no sampling). A contract
+    that CANONICALIZES a raw state once (e.g. normalizing a fresh-PUT-
+    installed state on its first merge) and then stabilizes is NOT flagged.
+    Both detectors flag a violation only when the CONTENT changed (a
+    counter/timestamp/signature churned, an entry was added/removed),
+    including the fixed-size byte-churn shape of the #4251 incident.
+    Neither flags a mere REORDERING of the same bytes, because a correct
+    contract with non-canonical serialization (HashMap/HashSet iteration
+    order) re-serializes the same logical state in a different byte order
+    (the #4295 false-positive case). Violators get flagged in
+    `Ring::broken_invariants`; while flagged, this node suppresses commit,
+    outbound `BroadcastStateChange` (including the retry/stash/flush
+    re-emissions through `handle_broadcast_state_change`), AND full-state
+    egress (`ResyncResponse`, `SyncStateToPeer` heal). The flag is
+    TTL-bounded (`BROKEN_INVARIANT_TTL`, swept by the Ring reaper) so a
+    false positive self-heals instead of bricking the contract forever; a
+    genuine violation is re-detected after expiry (deterministically by the
+    identical-input probe when the echo re-pushes). There is deliberately NO
+    automatic escalation to the contract ban list: a durable ban needs an
+    aging/recovery story first (see PR #4902 review). Residual
+    false-negative: a content change that coincidentally preserves the
+    exact byte multiset evades detection (far narrower than a size-only
     check). See `ring::broken_invariants`, issue #4251 / PR #4279, and the
     #4295 soundness/TTL fix.
     Note: this invariant is NOT enforced for `UpdateData::Delta` inputs

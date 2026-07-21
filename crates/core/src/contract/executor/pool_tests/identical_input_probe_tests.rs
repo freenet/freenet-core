@@ -9,10 +9,13 @@
 //! per-node). Across many co-hosts somebody was always unflagged, so the
 //! echo survived. The identical-input probe closes the detection half:
 //! when an incoming full-`State` payload is byte-identical to the stored
-//! state, `update_state(S, State(S))` must be a no-op by CvRDT lattice
-//! semantics, so re-running the merge once per cooldown and seeing a
-//! byte-MULTISET change is deterministic proof — the FIRST identical
-//! re-push flags the contract, no sampling.
+//! state, `update_state(S, State(S))` must reach a FIXPOINT by CvRDT
+//! lattice semantics, so re-applying (cooldown-bounded, up to
+//! `IDENTITY_PROBE_MAX_APPLIES` times) and seeing the byte MULTISET
+//! change on EVERY step is deterministic proof — the FIRST identical
+//! re-push flags the contract, no sampling. A contract that
+//! canonicalizes a raw state once and then stabilizes is NOT flagged
+//! (the F3 false-positive fix).
 //!
 //! These tests drive `upsert_contract_state` through the production
 //! `bridged_upsert_contract_state` path via `Executor<MockWasmRuntime>`
@@ -20,10 +23,9 @@
 //! `disk_budget_gate_tests.rs`), so the `is_contract_broken` flag the
 //! probes set — and the commit suppression it gates — are the real ones.
 //!
-//! The escalation → durable-ban half of the quarantine is unit-tested
-//! with a mock clock in `ring::broken_invariants::tests` (driving the
-//! multi-hour episode windows through real time here would be absurd);
-//! the egress gates (ResyncResponse / SyncStateToPeer) are pinned in
+//! The probe cooldown is unit-tested with a mock clock in
+//! `ring::broken_invariants::tests`; the egress gates (ResyncResponse /
+//! SyncStateToPeer / handle_broadcast_state_change) are pinned in
 //! `non_idempotent_detector_tests.rs`.
 
 use either::Either;
@@ -232,6 +234,60 @@ async fn identical_input_reorder_only_is_not_flagged() {
         !op_manager.ring.is_contract_broken(&key),
         "a reordering-only re-merge (same byte multiset) is the #4295 \
          false-positive shape and must NOT be flagged"
+    );
+}
+
+/// The F3 canonicalization exemption: a correct contract whose
+/// `update_state` normalizes a raw (e.g. fresh-PUT-installed) state ONCE
+/// — a genuine multiset change — and then stabilizes at a fixpoint must
+/// NOT be flagged. Only a contract whose output NEVER stabilizes across
+/// the probe's re-apply sequence is a violation.
+#[tokio::test(flavor = "current_thread")]
+async fn identical_input_canonicalize_once_is_not_flagged() {
+    let (op_manager, _guards) = build_op_manager("nonidem-identity-canonicalize").await;
+    let contract = test_contract(b"canonicalize_identity_contract");
+    let key = contract.key();
+    // Raw, non-canonical state: leading 0xFF markers the contract strips
+    // on its first merge (a real content/multiset change), stable after.
+    let mut raw = vec![0xFFu8, 0xFF];
+    raw.extend(1u8..=16);
+    let state = WrappedState::new(raw);
+
+    let mut executor = build_executor(&op_manager).await;
+    executor
+        .mock_runtime_mut()
+        .update_overrides
+        .insert(*key.id(), UpdateOverride::CanonicalizeOnce);
+
+    // Initial PUT installs the RAW state directly (install path does not
+    // run update_state — exactly the scenario that makes the first
+    // re-apply a content change).
+    executor
+        .upsert_contract_state(
+            key,
+            Either::Left(state.clone()),
+            RelatedContracts::default(),
+            Some(contract.clone()),
+        )
+        .await
+        .expect("initial PUT");
+
+    // Identical re-push: the probe sees one canonicalization step, then a
+    // fixpoint — benign, must NOT flag.
+    let result = executor
+        .upsert_contract_state(
+            key,
+            Either::Left(state.clone()),
+            RelatedContracts::default(),
+            None,
+        )
+        .await
+        .expect("identical re-apply");
+    assert!(matches!(result, UpsertResult::NoChange));
+    assert!(
+        !op_manager.ring.is_contract_broken(&key),
+        "a canonicalize-once-then-stable contract must NOT be flagged by the \
+         identity probe (F3 false-positive fix)"
     );
 }
 

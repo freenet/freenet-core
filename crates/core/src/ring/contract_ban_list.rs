@@ -110,25 +110,6 @@ pub(crate) enum BanReason {
     /// for the follow-up PR that wires the operator-facing surface.
     #[allow(dead_code)]
     Operator,
-    /// Escalated by the broken-invariants tracker: the contract was
-    /// repeatedly detected violating `update_state` idempotency (the
-    /// self-sustaining broadcast-echo shape, #4251/#4279) — N re-flags
-    /// per window escalate, and M escalations land here. See
-    /// `crate::ring::broken_invariants` for the thresholds. A node-made
-    /// security decision: like [`BanReason::AutoMad`], it is never
-    /// evicted to make room for an operator ban and never downgraded by
-    /// an operator re-ban.
-    NonIdempotent,
-}
-
-impl BanReason {
-    /// True for reasons that represent a security decision the node made
-    /// itself (as opposed to operator input). Node-security bans take
-    /// precedence at capacity and are never downgraded to an evictable
-    /// `Operator` entry.
-    fn is_node_security(self) -> bool {
-        matches!(self, BanReason::AutoMad | BanReason::NonIdempotent)
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -237,12 +218,11 @@ impl ContractBanList {
     /// Idempotent for an already-banned contract: re-banning extends
     /// the expiry to whichever value is later (never shortens it). The
     /// stored reason is the *higher-priority* of the existing and
-    /// incoming reasons: node-security reasons ([`BanReason::AutoMad`],
-    /// [`BanReason::NonIdempotent`]) dominate [`BanReason::Operator`],
-    /// so once a contract has been auto-banned by the node's own
-    /// security logic, a later operator re-ban cannot downgrade it to an
-    /// evictable `Operator` entry. This path consumes no new slot and is
-    /// never capacity-rejected.
+    /// incoming reasons: [`BanReason::AutoMad`] dominates
+    /// [`BanReason::Operator`], so once a contract has been auto-banned
+    /// by the node's own security logic, a later operator re-ban cannot
+    /// downgrade it to an evictable `Operator` entry. This path consumes
+    /// no new slot and is never capacity-rejected.
     ///
     /// New-contract inserts are bounded by [`Self::max_banned`]
     /// (production: [`MAX_BANNED_CONTRACTS`]). A slot is reserved with
@@ -251,15 +231,14 @@ impl ContractBanList {
     /// overshoot the cap (the probe-then-insert race Phase 2's review
     /// caught — see [`Self::size`]).
     ///
-    /// **Priority when the list is full:** node-security
-    /// ([`BanReason::AutoMad`], [`BanReason::NonIdempotent`]) bans take
-    /// precedence over operator-driven ([`BanReason::Operator`]) bans.
-    /// If a node-security ban arrives at capacity, it evicts one
-    /// existing `Operator` entry to make room; if no `Operator` entry
-    /// exists (the list is entirely node-security-driven) the add is
-    /// rejected. An `Operator` ban at capacity is always rejected —
-    /// operator input must never displace a security decision the node
-    /// made itself.
+    /// **Priority when the list is full:** reaper-driven
+    /// ([`BanReason::AutoMad`]) bans take precedence over operator-
+    /// driven ([`BanReason::Operator`]) bans. If an `AutoMad` ban
+    /// arrives at capacity, it evicts one existing `Operator` entry to
+    /// make room; if no `Operator` entry exists (the list is entirely
+    /// reaper-driven) the add is rejected. An `Operator` ban at
+    /// capacity is always rejected — operator input must never displace
+    /// a security decision the node made itself.
     ///
     /// Returns a [`BanOutcome`] describing what happened.
     pub fn ban(
@@ -284,18 +263,16 @@ impl ContractBanList {
                     if expires_at > cur.expires_at {
                         cur.expires_at = expires_at;
                     }
-                    // Reason priority: node-security reasons (AutoMad,
-                    // NonIdempotent) dominate Operator. A node-made
-                    // security ban must never be downgraded to an
-                    // evictable Operator entry by a later operator
-                    // re-ban — that would let operator input (or an
-                    // attacker reaching the CLI) make a node-made
-                    // security decision displaceable under the eviction
-                    // rule below. Between two node-security reasons the
-                    // existing one is kept (stable; both are equally
-                    // protected).
-                    if reason.is_node_security() && !cur.reason.is_node_security() {
-                        cur.reason = reason;
+                    // Reason priority: AutoMad dominates Operator. A
+                    // reaper-driven (security) ban must never be
+                    // downgraded to an evictable Operator entry by a
+                    // later operator re-ban — that would let operator
+                    // input (or an attacker reaching the CLI) make a
+                    // node-made security decision displaceable under the
+                    // eviction rule below. Equivalently: the entry
+                    // becomes/stays AutoMad if either side is AutoMad.
+                    if matches!(reason, BanReason::AutoMad) {
+                        cur.reason = BanReason::AutoMad;
                     }
                     return BanOutcome::Updated;
                 }
@@ -316,17 +293,17 @@ impl ContractBanList {
                     self.size.fetch_sub(1, Ordering::Relaxed);
                     drop(e);
 
-                    // Node-security bans (AutoMad, NonIdempotent) take
-                    // precedence: try to evict one Operator entry to free
-                    // a slot, then re-attempt the insert from the top of
-                    // the loop. The guard is released above because
-                    // `evict_one_operator` walks every shard via `retain`
-                    // — holding a shard guard across it would deadlock.
-                    // The freed slot is NOT held between the eviction and
-                    // the re-attempt; another thread may grab it, in
-                    // which case the next iteration either evicts again
-                    // or falls through to CapacityExceeded.
-                    if reason.is_node_security() && self.evict_one_operator() {
+                    // Reaper-driven bans take precedence: try to evict
+                    // one Operator entry to free a slot, then re-attempt
+                    // the insert from the top of the loop. The guard is
+                    // released above because `evict_one_operator` walks
+                    // every shard via `retain` — holding a shard guard
+                    // across it would deadlock. The freed slot is NOT
+                    // held between the eviction and the re-attempt;
+                    // another thread may grab it, in which case the next
+                    // iteration either evicts again or falls through to
+                    // CapacityExceeded.
+                    if matches!(reason, BanReason::AutoMad) && self.evict_one_operator() {
                         continue;
                     }
 
@@ -641,64 +618,6 @@ mod tests {
             bl.entries.get(&contract).unwrap().reason,
             BanReason::AutoMad,
             "an operator re-ban must never downgrade a security (AutoMad) ban"
-        );
-    }
-
-    /// `NonIdempotent` (the broken-invariants durable quarantine) is a
-    /// node-security reason like `AutoMad`: it upgrades an existing
-    /// Operator entry and is never downgraded by an operator re-ban.
-    #[test]
-    fn non_idempotent_reason_dominates_operator_on_reban() {
-        let (bl, ts) = mk_ban_list();
-        let contract = mk_contract(3);
-        let now = ts.now();
-
-        bl.ban(contract, now + Duration::from_secs(60), BanReason::Operator);
-        bl.ban(
-            contract,
-            now + Duration::from_secs(60),
-            BanReason::NonIdempotent,
-        );
-        assert_eq!(
-            bl.entries.get(&contract).unwrap().reason,
-            BanReason::NonIdempotent,
-            "a NonIdempotent quarantine must upgrade an existing operator entry"
-        );
-
-        bl.ban(contract, now + Duration::from_secs(60), BanReason::Operator);
-        assert_eq!(
-            bl.entries.get(&contract).unwrap().reason,
-            BanReason::NonIdempotent,
-            "an operator re-ban must never downgrade a NonIdempotent quarantine"
-        );
-    }
-
-    /// At capacity, a `NonIdempotent` quarantine ban evicts an Operator
-    /// entry to make room (same node-security precedence as `AutoMad`) —
-    /// a full ban list must not shield the storm contract from the
-    /// quarantine.
-    #[test]
-    fn non_idempotent_ban_evicts_operator_entry_at_cap() {
-        let ts = SharedMockTimeSource::new();
-        let bl = ContractBanList::with_max(Arc::new(ts.clone()), 1);
-        let expiry = ts.now() + Duration::from_secs(60);
-
-        let operator_banned = mk_contract(1);
-        let storm_contract = mk_contract(2);
-
-        assert_eq!(
-            bl.ban(operator_banned, expiry, BanReason::Operator),
-            BanOutcome::Banned
-        );
-        assert_eq!(
-            bl.ban(storm_contract, expiry, BanReason::NonIdempotent),
-            BanOutcome::Banned,
-            "NonIdempotent must evict an Operator entry at capacity"
-        );
-        assert!(bl.is_banned(&storm_contract));
-        assert!(
-            !bl.is_banned(&operator_banned),
-            "the operator entry was the eviction victim"
         );
     }
 

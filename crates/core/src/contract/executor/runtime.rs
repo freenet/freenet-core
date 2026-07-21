@@ -39,6 +39,19 @@ const WASMTIME_CACHE_SIZE_SOFT_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 /// for simulation tests). See `Executor::maybe_probe_idempotency`.
 const IDEMPOTENCY_PROBE_PROBABILITY: f64 = 1.0 / 32.0;
 
+/// Maximum successive re-applies the deterministic identical-input probe
+/// (`Executor::probe_identical_input_idempotency`) runs while looking for a
+/// fixpoint. The contract is flagged only if EVERY one of these applies
+/// changes the byte multiset again (never stabilizes): one re-apply
+/// suffices for a healthy contract (immediate fixpoint), a legitimate
+/// canonicalizing contract stabilizes on the second, so requiring three
+/// successive content changes leaves generous room for one-shot
+/// normalization while still deterministically catching a contract that
+/// mutates on every apply. Cost is bounded by the per-contract
+/// `IDENTITY_PROBE_COOLDOWN` claim, and only a genuinely churning contract
+/// ever pays all three.
+const IDENTITY_PROBE_MAX_APPLIES: usize = 3;
+
 /// Returns true if `a` and `b` contain the same multiset of bytes — i.e. one
 /// is a reordering of the other — and false if their byte content differs.
 ///

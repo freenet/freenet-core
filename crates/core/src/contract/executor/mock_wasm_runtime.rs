@@ -58,6 +58,16 @@ pub(crate) enum UpdateOverride {
     /// input but the same byte MULTISET — so the detectors must classify
     /// it as benign flutter, NOT a violation.
     ReorderBytes,
+    /// Models a correct CANONICALIZING contract (the F3 false-positive
+    /// shape for the identical-input probe): `update_state` normalizes a
+    /// raw state ONCE — here, by stripping leading `0xFF` marker bytes, a
+    /// genuine content (multiset) change — and is then STABLE: an input
+    /// already in canonical form (no leading `0xFF`) is returned
+    /// unchanged. The realistic scenario is a fresh PUT whose raw client
+    /// bytes were installed without running `update_state`; the first
+    /// merge canonicalizes, every later one is a fixpoint. The
+    /// identical-input probe must NOT flag this shape.
+    CanonicalizeOnce,
 }
 
 /// A lightweight mock runtime at the `ContractRuntimeInterface` level that lets
@@ -218,6 +228,34 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                     if !out.is_empty() {
                         out.rotate_left(1);
                     }
+                    return Ok(UpdateModification::valid(out.into()));
+                }
+                UpdateOverride::CanonicalizeOnce => {
+                    // Canonical form: leading 0xFF marker bytes stripped.
+                    // Non-canonical input → normalized output (a genuine
+                    // multiset change). Canonical input → returned
+                    // unchanged (fixpoint).
+                    let logical = update_data
+                        .iter()
+                        .find_map(|u| match u {
+                            UpdateData::State(s) => Some(s.as_ref().to_vec()),
+                            UpdateData::Delta(d) => Some(d.as_ref().to_vec()),
+                            UpdateData::StateAndDelta { state, .. } => {
+                                Some(state.as_ref().to_vec())
+                            }
+                            UpdateData::RelatedState { .. }
+                            | UpdateData::RelatedDelta { .. }
+                            | UpdateData::RelatedStateAndDelta { .. } => None,
+                            // `UpdateData` is `#[non_exhaustive]`; fall
+                            // through to the `_state` fallback.
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| _state.as_ref().to_vec());
+                    let canonical_start = logical
+                        .iter()
+                        .position(|b| *b != 0xFF)
+                        .unwrap_or(logical.len());
+                    let out = logical[canonical_start..].to_vec();
                     return Ok(UpdateModification::valid(out.into()));
                 }
             }

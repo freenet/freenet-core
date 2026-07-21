@@ -144,20 +144,25 @@ fn production_gate_sites_consult_is_contract_broken() {
     );
 }
 
-/// Source-grep pin for the full-state EGRESS gates (durable-quarantine
-/// PR): while a contract is flagged, the executor's commit/broadcast
-/// suppression is not enough — two paths still pushed full state off the
-/// node and kept the broadcast echo alive network-wide:
+/// Source-grep pin for the full-state EGRESS gates: while a contract is
+/// flagged, the executor's own commit/broadcast suppression is not enough
+/// — three paths still pushed state off the node and kept the broadcast
+/// echo alive network-wide:
 ///
 /// 1. `InterestMessage::ResyncRequest` handling in node.rs served a full
 ///    `ResyncResponse`.
 /// 2. The Summaries-mismatch heal (`handle_sync_state_to_peer` in
 ///    p2p_protoc/broadcast.rs) pushed full state to a "stale" peer.
+/// 3. `handle_broadcast_state_change` (same file) — the highest-
+///    amplification fan-out sink — is re-entered by re-emission paths
+///    that bypass the executor's emission gate (its own no-target retry
+///    re-emissions, the #4359 stashed-broadcast flush, pending flushes),
+///    re-seeding the echo after a flag lands.
 ///
-/// Both must consult `is_contract_broken` BEFORE any state leaves the
-/// node. These are pinned by source scrape because driving the interest-
-/// sync handler / p2p bridge in a unit test requires the full node
-/// harness (the flag predicate itself is behavior-tested in
+/// All three must consult `is_contract_broken` BEFORE any state leaves
+/// the node. These are pinned by source scrape because driving the
+/// interest-sync handler / p2p bridge in a unit test requires the full
+/// node harness (the flag predicate itself is behavior-tested in
 /// `ring::broken_invariants::tests` and `identical_input_probe_tests`).
 #[test]
 fn egress_paths_gated_on_is_contract_broken() {
@@ -182,6 +187,24 @@ fn egress_paths_gated_on_is_contract_broken() {
          serves full state"
     );
 
+    // --- Broadcast fan-out: gate must precede target selection/send. ---
+    let bc_start = BROADCAST_RS
+        .find("fn handle_broadcast_state_change")
+        .expect("broadcast.rs must still have handle_broadcast_state_change");
+    let bc_body = &BROADCAST_RS[bc_start..];
+    let bc_gate = bc_body
+        .find("is_contract_broken")
+        .expect("handle_broadcast_state_change must gate on is_contract_broken");
+    let bc_send = bc_body
+        .find("get_broadcast_targets_update")
+        .expect("handle_broadcast_state_change must still select broadcast targets");
+    assert!(
+        bc_gate < bc_send,
+        "the is_contract_broken gate (offset {bc_gate}) must run BEFORE \
+         broadcast target selection (offset {bc_send}) so retry/stash/flush \
+         re-emissions cannot re-seed the echo for a flagged contract"
+    );
+
     // --- SyncStateToPeer heal: gate must precede the enqueue/send. ---
     let fn_start = BROADCAST_RS
         .find("fn handle_sync_state_to_peer")
@@ -198,53 +221,6 @@ fn egress_paths_gated_on_is_contract_broken() {
         "the is_contract_broken gate (offset {heal_gate}) must run BEFORE the \
          SyncStateToPeer enqueue (offset {heal_send}) so a flagged node never \
          heals peers with the problematic state"
-    );
-}
-
-/// Source-grep pin for the durable-quarantine wiring in ring.rs:
-/// `record_broken_invariant` must feed the escalation ledger (which bans
-/// at threshold), and storage hydration must re-arm bans for persisted
-/// offenders — the ban list itself is in-memory only, so dropping either
-/// call silently reverts the quarantine to the old dampen-only behavior.
-#[test]
-fn ring_wires_escalation_and_restart_reban() {
-    // NOTE: no `split_once("#[cfg(test)]")` truncation here — ring.rs has
-    // an early cfg(test) item (line ~125) long before the wiring under
-    // pin, so the truncated slice would miss it. Whole-file matching is
-    // sound for these strings: they only exist at the wiring sites.
-    const RING_RS: &str = include_str!("../../../ring.rs");
-    assert!(
-        RING_RS.contains("record_and_escalate("),
-        "Ring::record_broken_invariant must route through the tracker's \
-         record_and_escalate so repeated detections reach the ban list"
-    );
-    assert!(
-        RING_RS.contains("reban_offenders("),
-        "Ring::set_broken_invariants_storage must re-arm bans from the \
-         persisted escalation ledger after hydration (restart durability)"
-    );
-}
-
-/// Source-grep pin: the inbound wire-dispatch gates that make a ban
-/// actually DROP a contract's traffic. The escalation path's whole value
-/// rests on these existing sites (PUT / GET / UPDATE / SUBSCRIBE arms in
-/// node.rs) continuing to consult the ban list — the ban-list predicate
-/// itself is behavior-tested in `ring::contract_ban_list` and
-/// `ring::broken_invariants::tests::sustained_reflagging_escalates_to_durable_ban`.
-#[test]
-fn dispatch_sites_consult_contract_ban_list() {
-    // Whole-file matching (node.rs has an early cfg(test) item, so a
-    // split-at-first-cfg(test) slice would truncate before the dispatch
-    // arms). The matched string is receiver-qualified
-    // (`contract_ban_list.is_banned`), which test code does not use.
-    const NODE_RS: &str = include_str!("../../../node.rs");
-    let count = NODE_RS.matches("contract_ban_list.is_banned").count();
-    assert!(
-        count >= 4,
-        "expected at least 4 contract_ban_list.is_banned dispatch gates in \
-         node.rs (PUT/GET/UPDATE/SUBSCRIBE inbound arms); found {count}. A \
-         banned (quarantined) contract's requests must be dropped at the \
-         receive boundary"
     );
 }
 
