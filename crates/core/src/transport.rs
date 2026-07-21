@@ -761,11 +761,18 @@ mod tests {
 #[cfg(test)]
 mod version_discovery_tests {
     use super::*;
+    use serial_test::serial;
 
-    // These tests mutate global statics and must run sequentially.
-    // Use `cargo test -- --test-threads=1 version_discovery` if running standalone.
+    // These tests mutate the process-global version-discovery statics
+    // (`HIGHEST_SEEN_VERSION` et al.), so they MUST NOT run concurrently with
+    // each other — an interleaved `report_peer_version` from a sibling test
+    // corrupts another's `get_highest_seen_version` read. `#[serial(...)]`
+    // enforces that (the module comment previously only *asked* for
+    // `--test-threads=1`, which the default multi-threaded runner ignores,
+    // making these tests flaky in the full suite).
 
     #[test]
+    #[serial(version_discovery)]
     fn single_reporter_not_trusted() {
         reset_version_discovery();
         report_peer_version((0, 1, 153));
@@ -774,6 +781,7 @@ mod version_discovery_tests {
     }
 
     #[test]
+    #[serial(version_discovery)]
     fn two_reporters_trusted() {
         reset_version_discovery();
         report_peer_version((0, 1, 153));
@@ -782,6 +790,7 @@ mod version_discovery_tests {
     }
 
     #[test]
+    #[serial(version_discovery)]
     fn higher_version_resets_count() {
         reset_version_discovery();
         report_peer_version((0, 1, 153));
@@ -798,6 +807,7 @@ mod version_discovery_tests {
     }
 
     #[test]
+    #[serial(version_discovery)]
     fn major_minor_bumps_accepted() {
         reset_version_discovery();
         report_peer_version((1, 0, 0));
