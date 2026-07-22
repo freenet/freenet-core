@@ -3134,9 +3134,14 @@ const MIGRATE_LEGACY_DONE_PREFIX: &[u8] = b"\0freenet-migrate/done:";
 /// LEGACY generation-keyed in-progress marker prefix (0.3-era): MARKER_NS ++
 /// `wip:` ++ `<gen decimal>`. Source: freenet-migrate `delegate.rs` WIP_PREFIX.
 const MIGRATE_LEGACY_WIP_PREFIX: &[u8] = b"\0freenet-migrate/wip:";
-/// Upper bound on the `<gen decimal>` legacy suffix length (a generation counter
-/// fits well within a `u64`'s 20 decimal digits). Bounds the accepted key length
-/// so a client cannot pad a legacy-shaped key with an unbounded digit string.
+/// Upper bound on the `<gen decimal>` legacy suffix length. The crate writes a
+/// `u32` generation (confirmed against freenet-migrate 0.4.0 `import_secrets_once`:
+/// `generation.to_string()` where `generation: u32`), whose decimal form is at
+/// most 10 digits (`u32::MAX` = 4294967295). The `20` here is a deliberate SAFE
+/// SUPERSET (a `u64`'s worth of digits): it never rejects a legitimate crate
+/// marker (an 11–20-digit value can't be a valid `u32` gen anyway, and the crate
+/// ignores an unparseable gen), while still bounding the suffix so a client
+/// cannot pad a legacy-shaped key with an unbounded digit string.
 const MAX_LEGACY_GEN_DIGITS: usize = 20;
 
 /// The legal secret-key shapes under the reserved
@@ -3150,6 +3155,20 @@ const MAX_LEGACY_GEN_DIGITS: usize = 20;
 ///     followed by EXACTLY a 32-byte delegate key;
 ///   - legacy generation-keyed: `\0freenet-migrate/done:` / `…/wip:` followed by
 ///     a NON-EMPTY, ≤ [`MAX_LEGACY_GEN_DIGITS`] ASCII-decimal generation.
+///
+/// SHAPE-EVOLUTION LAW. This whitelist is deliberately an ENFORCEMENT list, not
+/// just documentation: it keeps the reserved namespace strictly protocol-defined
+/// (a foreign reserved key is refused rather than silently absorbed). The cost is
+/// a deploy-ordering obligation identical to the wire-variant law: any FUTURE
+/// marker shape (e.g. a hypothetical `\0freenet-migrate/v2/…`) MUST ship node-side
+/// acceptance HERE, in a RELEASED node, BEFORE any crate version writes it
+/// (crate publish → node merge → node release → only then the crate emits the new
+/// shape). If that ordering is ever violated, the failure mode is SAFE and LOUD,
+/// never silent: an old node rejects the unknown marker write with a store error,
+/// which degrades that one migration to a visible Incomplete-retry — the crate
+/// re-attempts once the node is upgraded — rather than diverging silently. Both
+/// repos byte-pin this matrix (`reserved_marker_shape_matrix_is_stable` here; the
+/// mirror crate-side), so any drift trips CI on both sides.
 fn is_legal_reserved_marker_key(raw: &[u8]) -> bool {
     // v1 per-predecessor markers: prefix + exactly a 32-byte delegate key.
     let v1 = (raw.len() == MIGRATE_MARKER_KEY_PREFIX.len() + 32
