@@ -1535,14 +1535,24 @@ async fn process_open_request(
                     freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(key) => {
                         crate::contract::delegate_app_registry::remove_delegate(key);
                     }
-                    // RegisterDelegate installs a delegate binary (admin op), not
-                    // an app conversation, so it registers no routing path. The
-                    // wildcard also absorbs future `#[non_exhaustive]` variants;
-                    // it exists ONLY to satisfy non_exhaustive (see
-                    // git-workflow.md) — new app-facing variants must be handled
-                    // explicitly above, not swept here.
+                    // RegisterDelegate and RegisterDelegateWithPredecessors both
+                    // INSTALL a delegate binary (admin ops), not an app
+                    // conversation, so neither registers a routing path — the
+                    // path is established by an ApplicationMessages request that
+                    // carries a notification channel (above), never by
+                    // registration. RegisterDelegateWithPredecessors additionally
+                    // triggers the node-side secret copy-forward (#4117), which
+                    // is likewise not an app-routing event. Both are listed
+                    // EXPLICITLY (not swept) per this match's contract that
+                    // app-facing variants must be handled above the wildcard; the
+                    // wildcard remains ONLY to satisfy `#[non_exhaustive]` for
+                    // genuinely future variants (see git-workflow.md).
                     #[allow(clippy::wildcard_enum_match_arm)]
-                    freenet_stdlib::client_api::DelegateRequest::RegisterDelegate { .. } | _ => {}
+                    freenet_stdlib::client_api::DelegateRequest::RegisterDelegate { .. }
+                    | freenet_stdlib::client_api::DelegateRequest::RegisterDelegateWithPredecessors {
+                        ..
+                    }
+                    | _ => {}
                 }
 
                 // Derive a short discriminant tag for the INFO logs, but only when INFO is

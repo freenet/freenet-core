@@ -152,13 +152,8 @@ muda = "0.19"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-# TODO(#4117): bump target is 0.8.4, which adds
-# `DelegateRequest::RegisterDelegateWithPredecessors` (stdlib PR #86). Until
-# 0.8.4 is published to crates.io, the `[patch.crates-io]` block at the bottom
-# of this file redirects to the local stdlib worktree. Before this PR leaves
-# draft / goes to review, DELETE that patch block (the version line below is
-# already the published target). See the stdlib-first release policy in
-# .claude/rules/git-workflow.md.
+# 0.8.4 adds `DelegateRequest::RegisterDelegateWithPredecessors` (stdlib PR #86),
+# consumed by the #4117 delegate secret copy-forward.
 freenet-stdlib = "0.8.4"
 
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
@@ -200,14 +195,3 @@ opt-level = 3
 # lto = true
 # codegen-units = 1
 # panic = "abort"
-
-# TEMPORARY (#4117) — DELETE BEFORE REVIEW/MERGE.
-# Redirects freenet-stdlib to the local worktree carrying
-# `DelegateRequest::RegisterDelegateWithPredecessors` until stdlib 0.8.4 is
-# published to crates.io (stdlib PR #86, branch feat/register-delegate-with-predecessors).
-# The version line above (`freenet-stdlib = "0.8.4"`) is already the published
-# target, so the flip-to-published step is simply removing this block. Per
-# .claude/rules/git-workflow.md this MUST NOT reach review — CI cannot resolve a
-# path dep on a fresh checkout.
-[patch.crates-io]
-freenet-stdlib = { path = "/home/ian/code/freenet/freenet-stdlib-reg-predecessors/rust" }
