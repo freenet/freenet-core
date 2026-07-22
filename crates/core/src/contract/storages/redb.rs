@@ -1907,6 +1907,77 @@ mod tests {
         DelegateKey::new([key_seed; 32], CodeHash::from(&[code_seed; 32]))
     }
 
+    /// #4117 H1: the delegate-origin record is FIRST-WRITER-WINS — the first
+    /// write wins and returns `true`, a later write is a no-op returning `false`,
+    /// and the read observes the ORIGINAL (a racing loser sees the winner's
+    /// record). A `None` first-writer records the Admin/None class.
+    #[tokio::test]
+    async fn delegate_origin_first_writer_wins() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let d = fake_delegate_key(0x33, 0x44);
+        assert!(db.get_delegate_origins(&d).unwrap().is_none());
+
+        let a = [0xA1u8; 32];
+        assert!(db.record_delegate_origin_first_writer(&d, Some(a)).unwrap());
+        // A later, different origin is a no-op (loser).
+        let b = [0xB2u8; 32];
+        assert!(!db.record_delegate_origin_first_writer(&d, Some(b)).unwrap());
+        let (has_none, origins) = db.get_delegate_origins(&d).unwrap().unwrap();
+        assert!(!has_none);
+        assert_eq!(origins, vec![a], "the read observes only the first origin");
+
+        // A None first-writer records the Admin/None class (never privileged).
+        let d2 = fake_delegate_key(0x55, 0x66);
+        assert!(db.record_delegate_origin_first_writer(&d2, None).unwrap());
+        assert!(
+            !db.record_delegate_origin_first_writer(&d2, Some(a))
+                .unwrap()
+        );
+        let (has_none2, origins2) = db.get_delegate_origins(&d2).unwrap().unwrap();
+        assert!(has_none2);
+        assert!(origins2.is_empty());
+    }
+
+    /// #4117 P2a: the reserved-marker-hash table is individually keyed,
+    /// idempotent, per-delegate isolated, and per-delegate CAPPED.
+    #[tokio::test]
+    async fn reserved_marker_hashes_capped_and_isolated() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let d = fake_delegate_key(0x77, 0x88);
+        let other = fake_delegate_key(0x99, 0xAA);
+
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        db.add_reserved_marker_hash(&d, &h1).unwrap();
+        db.add_reserved_marker_hash(&d, &h1).unwrap(); // idempotent
+        db.add_reserved_marker_hash(&d, &h2).unwrap();
+        db.add_reserved_marker_hash(&other, &[9u8; 32]).unwrap();
+
+        let mut got = db.get_reserved_marker_hashes(&d).unwrap();
+        got.sort();
+        assert_eq!(got, vec![h1, h2]);
+        assert_eq!(
+            db.get_reserved_marker_hashes(&other).unwrap(),
+            vec![[9u8; 32]],
+            "reserved hashes are per-delegate isolated"
+        );
+
+        // Cap: adding well past the per-delegate cap never exceeds it.
+        let cap = ReDb::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE;
+        for i in 0..(cap as u32 + 10) {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            db.add_reserved_marker_hash(&d, &h).unwrap();
+        }
+        assert_eq!(
+            db.get_reserved_marker_hashes(&d).unwrap().len(),
+            cap,
+            "per-delegate reserved-hash count is bounded at the cap"
+        );
+    }
+
     /// Full store → get → remove → load round trip for the per-user secrets
     /// index, exercising `store_user_secrets_index`, `get_user_secrets_index`,
     /// `remove_user_secrets_index` (otherwise uncalled in non-test builds),

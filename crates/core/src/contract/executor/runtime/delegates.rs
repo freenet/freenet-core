@@ -148,6 +148,24 @@ impl Executor<Runtime> {
     ) -> Result<DelegateKey, ExecutorError> {
         use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
         let key = delegate.key().clone();
+
+        // RECORD BEFORE REGISTER (#4117 P1, H1 first-writer gate). The immutable
+        // first-writer origin record is written (insert-if-absent) BEFORE the
+        // delegate is registered. If we registered first and the record write
+        // then failed (or crashed between), the delegate would be usable but
+        // RECORDLESS, and the next — possibly attacker — registration would claim
+        // the empty first-writer slot (stealing the victim's provenance).
+        // Recording first makes a crash between the two harmless (a record for an
+        // unregistered delegate gates nothing, and the same app's retry
+        // re-registers under its already-recorded origin). A record-write failure
+        // is surfaced (logged inside record_delegate_registration_origin) and
+        // leaves copy-forward fail-closed (no record ⇒ NoProvenance); the next
+        // registration retries the insert-if-absent.
+        let origin_bytes: Option<[u8; 32]> =
+            origin_contract.and_then(|c| c.as_bytes().try_into().ok());
+        self.runtime
+            .record_delegate_registration_origin(&key, origin_bytes);
+
         let arr = (&cipher).into();
         let cipher = XChaCha20Poly1305::new(arr);
         let nonce = nonce.into();
@@ -158,18 +176,7 @@ impl Executor<Runtime> {
                 .push(*contract);
         }
         match self.runtime.register_delegate(delegate, cipher, nonce) {
-            Ok(_) => {
-                // Durably record the registration origin for the H1 same-origin
-                // copy-forward gate (#4117): a future migration naming this
-                // delegate as a predecessor copies its Local secrets only to a
-                // successor registered from the SAME web-app origin (or the
-                // Admin/None class for a loopback/CLI registration).
-                let origin_bytes: Option<[u8; 32]> =
-                    origin_contract.and_then(|c| c.as_bytes().try_into().ok());
-                self.runtime
-                    .record_delegate_registration_origin(&key, origin_bytes);
-                Ok(key)
-            }
+            Ok(_) => Ok(key),
             Err(err) => {
                 tracing::warn!(
                     delegate_key = %key,
@@ -232,28 +239,30 @@ impl Executor<Runtime> {
                 predecessors,
             } => {
                 // Bound the client-controlled predecessor list BEFORE registering
-                // (#4117 P2b/M1). Dedupe silently (a repeat is pure waste — the
-                // migration is idempotent per pair), then REJECT the whole request
-                // if the deduped list still exceeds the cap: each predecessor
-                // drives synchronous marker/index/redb writes on the contract
-                // loop, so an unbounded list is an amplification vector, and
-                // silently truncating would strand older generations. The client
-                // splits an over-cap request.
-                let deduped = dedupe_predecessors(predecessors);
-                if deduped.len() > MAX_MIGRATION_PREDECESSORS {
+                // (#4117 P2b/M1). CHEAP EARLY LENGTH CHECK FIRST — reject an
+                // over-length request before ANY per-element work (dedupe / HashSet
+                // inserts), so a giant list can't burn the contract loop just to be
+                // rejected. Each predecessor drives synchronous marker/index/redb
+                // writes, so an unbounded list is an amplification vector, and
+                // silently truncating would strand older generations; the client
+                // splits an over-cap request (and should send no duplicates). Then
+                // dedupe silently (a repeat is pure waste — migration is idempotent
+                // per pair) the now-bounded list.
+                if predecessors.len() > MAX_MIGRATION_PREDECESSORS {
                     let key = delegate.key().clone();
                     tracing::warn!(
                         delegate_key = %key,
-                        predecessors = deduped.len(),
+                        predecessors = predecessors.len(),
                         cap = MAX_MIGRATION_PREDECESSORS,
                         "RegisterDelegateWithPredecessors rejected: too many predecessors (split the request)"
                     );
                     return Err(ExecutorError::other(anyhow::anyhow!(
                         "RegisterDelegateWithPredecessors: {} predecessors exceeds the cap of {}",
-                        deduped.len(),
+                        predecessors.len(),
                         MAX_MIGRATION_PREDECESSORS
                     )));
                 }
+                let deduped = dedupe_predecessors(predecessors);
 
                 // Register exactly as `RegisterDelegate` does, THEN run the
                 // one-shot, Local-scope copy-forward of the predecessors' secrets.
