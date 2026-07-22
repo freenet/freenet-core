@@ -2049,20 +2049,34 @@ impl<T: TimeSource> HostingCache<T> {
             // `finalize_loading`.
             recency_seq: 0,
             // Restore the genuine-access recency across restart for the
-            // cost-eviction guard (#4903 review round-3 Fix 5). Unlike
-            // `recency_seq` (an unrestorable sequence number), `last_genuine_access`
-            // is a TIMESTAMP and the persisted row records the last ACCESS TYPE,
-            // so we CAN tell whether the last pre-restart access was a genuine
-            // GET/PUT and, if so, seed it from the persisted age — a contract
-            // GET-read or PUT within `COST_RATE_MIN_WINDOW` before restart then
-            // keeps its cost-eviction protection (invariant 3: "a real GET or PUT
-            // resets recency") instead of being immediately cost-evictable. A
-            // SUBSCRIBE is NOT genuine access, so it stays unprotected (None) —
-            // matching the live `resets_recency` rule in
-            // `record_access_with_demand`.
+            // cost-eviction guard (#4903 review round-3 Fix 5, narrowed by the
+            // round-3-final review). `last_genuine_access` is a TIMESTAMP and the
+            // persisted row records the last ACCESS TYPE, so a contract GET-read
+            // within `COST_RATE_MIN_WINDOW` before restart keeps its
+            // cost-eviction protection (invariant 3: a real GET resets recency)
+            // instead of being immediately cost-evictable.
+            //
+            // ONLY `AccessType::Get` is restored — NOT `Put`. The persisted
+            // `access_type` is NOT a reliable "last genuine access" signal for
+            // Put: `StateStorage::store` (redb + sqlite) unconditionally stamps
+            // `access_type = Put` on EVERY state write, and `StateStore::update`
+            // (the UPDATE merge path) goes through `store`, so ordinary UPDATE
+            // churn persists `Put`. Restoring `Put` would therefore treat a
+            // zero-demand UPDATE-storm contract as genuine-accessed after every
+            // restart, shielding it from cost eviction for a full cost window
+            // each time (indefinitely under crash/restart cycles) — reintroducing
+            // the exact invariant-3 violation "a contract's own UPDATE churn
+            // never counts as genuine access" through the persistence layer.
+            // `Get` (0) can only be written by the hosting-manager access record
+            // for a genuine read (no state-write path ever writes 0), so it is
+            // safe. Cost: a write-only publisher loses cost protection across a
+            // restart until its next live PUT re-stamps `last_genuine_access`
+            // (via `record_access_with_demand`) — acceptable, since publishers
+            // re-PUT periodically and the alternative shields storms. SUBSCRIBE
+            // is not genuine access either → None.
             last_genuine_access: match access_type {
-                AccessType::Get | AccessType::Put => Some(last_accessed),
-                AccessType::Subscribe => None,
+                AccessType::Get => Some(last_accessed),
+                AccessType::Put | AccessType::Subscribe => None,
             },
             // Loaded entries start at the caller-supplied cold demand (the
             // distance prior when this peer's location is known at load, else
@@ -2492,13 +2506,15 @@ mod tests {
     }
 
     /// #4903 review round-3 Fix 5: a restart reload RESTORES
-    /// `last_genuine_access` from the persisted last-access age for GET/PUT
-    /// access types, so a contract genuinely read or written within the cost
-    /// window before restart keeps its cost-eviction protection across the
-    /// restart (invariant 3), even with NO local-client access. A SUBSCRIBE
-    /// reload is not genuine access and gets no such protection. Before Fix 5
-    /// the loader hard-coded `last_genuine_access = None`, so a
-    /// network-accessed (non-local) contract was immediately cost-evictable
+    /// `last_genuine_access` from the persisted last-access age for a GET
+    /// access type, so a contract genuinely READ within the cost window before
+    /// restart keeps its cost-eviction protection across the restart
+    /// (invariant 3), even with NO local-client access. A SUBSCRIBE reload is
+    /// not genuine access and gets no such protection. (PUT reloads are also NOT
+    /// restored — see `evict_cost_pressure_restart_does_not_restore_put_reload`
+    /// for why, since the persistence layer stamps Put on every UPDATE write.)
+    /// Before Fix 5 the loader hard-coded `last_genuine_access = None`, so a
+    /// network-GET-read (non-local) contract was immediately cost-evictable
     /// after every restart.
     #[test]
     fn evict_cost_pressure_restart_restores_recent_genuine_access() {
@@ -2546,6 +2562,61 @@ mod tests {
         let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].key, recent_get);
+    }
+
+    /// #4903 review round-3-final: a reload whose persisted `access_type` is PUT
+    /// must NOT restore `last_genuine_access`, so a zero-demand UPDATE-storm
+    /// contract stays a cost-eviction candidate after restart. This is the
+    /// storm-relevant guard: `StateStorage::store` (redb + sqlite) stamps
+    /// `access_type = Put` on EVERY state write, and `StateStore::update` (the
+    /// UPDATE merge path) goes through `store`, so ordinary UPDATE churn persists
+    /// `Put`. If the loader restored `Put`, a pure-UPDATE storm contract would be
+    /// shielded from cost eviction for a full cost window after every restart
+    /// (indefinitely under crash/restart cycles) — reintroducing the invariant-3
+    /// violation "a contract's own UPDATE churn never counts as genuine access"
+    /// through persistence. A recent GET reload right beside it is still
+    /// protected (the narrowing keeps genuine reads safe).
+    #[test]
+    fn evict_cost_pressure_restart_does_not_restore_put_reload() {
+        let (mut cache, _clock) = make_cache(1024 * 1024);
+        let update_storm = make_key(1); // last persisted access_type = Put
+        let genuine_get = make_key(2); // last persisted access_type = Get
+        // Both last written/read 1s before restart — as recent as possible, so
+        // if a stale `Put` were restored it WOULD be protected. Neither is
+        // locally accessed. The storm contract's `Put` comes from UPDATE churn
+        // via `store`, not a genuine PUT — indistinguishable in the persisted
+        // metadata, which is exactly why `Put` is not restored.
+        cache.load_persisted_entry(
+            update_storm,
+            121,
+            AccessType::Put,
+            Duration::from_secs(1),
+            false,
+        );
+        cache.load_persisted_entry(
+            genuine_get,
+            121,
+            AccessType::Get,
+            Duration::from_secs(1),
+            false,
+        );
+        cache.finalize_loading();
+
+        let axes = [cost_axis(
+            100_000.0,
+            50_000.0,
+            &[(&update_storm, 40_000.0), (&genuine_get, 40_000.0)],
+        )];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        let keys: Vec<ContractKey> = evicted.iter().map(|e| e.key).collect();
+        assert_eq!(
+            keys,
+            vec![update_storm],
+            "post-restart: a PUT reload (indistinguishable from UPDATE-storm \
+             churn in the persisted metadata) is NOT protected and stays a cost \
+             candidate; a genuine GET reload beside it IS protected"
+        );
+        assert!(cache.get(&genuine_get).is_some());
     }
 
     /// Exact-25%-share boundary: a contract holding EXACTLY the threshold
