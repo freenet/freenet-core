@@ -8513,6 +8513,58 @@ mod cost_pressure_seam_tests {
              survive (reads are demand — invariant 3)"
         );
     }
+
+    /// Drift guard (#4861 Codex round-3): the meter's per-axis cost floors
+    /// ([`crate::topology::meter::ResourceType::cost_pressure_floor`]) and its
+    /// sustained window ([`crate::topology::meter::COST_SUSTAINED_WINDOW`]) are
+    /// MIRRORS — the authoritative constants live in `ring::hosting::cache`,
+    /// which is not nameable from `topology::meter` (that module is private to
+    /// `hosting`, itself private to `ring`), so the meter cannot import them.
+    /// This test reads the authoritative values through the `ring`-visible
+    /// surface — `build_cost_axes` (which binds each axis to its cache.rs floor
+    /// constant) and the re-exported `COST_RATE_MIN_WINDOW` — and asserts the
+    /// meter's mirrors match, so the insert-time above-floor detection can
+    /// never key on a floor/window that differs from the eviction decision's.
+    #[test]
+    fn meter_cost_floors_mirror_cache_source_of_truth() {
+        use crate::topology::meter::{COST_SUSTAINED_WINDOW, ResourceType};
+
+        fn empty_read() -> (
+            f64,
+            std::collections::HashMap<freenet_stdlib::prelude::ContractInstanceId, f64>,
+        ) {
+            (0.0, std::collections::HashMap::new())
+        }
+
+        // build_cost_axes argument/return order: cpu, fanout_bytes, messages.
+        let axes = super::hosting::build_cost_axes(empty_read(), empty_read(), empty_read());
+        assert_eq!(
+            axes[0].floor,
+            ResourceType::ExecCpuMicros
+                .cost_pressure_floor()
+                .expect("ExecCpuMicros is a cost axis"),
+            "CPU floor mirror drifted from cache.rs source of truth",
+        );
+        assert_eq!(
+            axes[1].floor,
+            ResourceType::BroadcastFanoutCost
+                .cost_pressure_floor()
+                .expect("BroadcastFanoutCost is a cost axis"),
+            "fan-out byte floor mirror drifted from cache.rs source of truth",
+        );
+        assert_eq!(
+            axes[2].floor,
+            ResourceType::BroadcastMessagesSent
+                .cost_pressure_floor()
+                .expect("BroadcastMessagesSent is a cost axis"),
+            "message floor mirror drifted from cache.rs source of truth",
+        );
+        assert_eq!(
+            super::hosting::COST_RATE_MIN_WINDOW,
+            COST_SUSTAINED_WINDOW,
+            "sustained-window mirror drifted from cache.rs COST_RATE_MIN_WINDOW",
+        );
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

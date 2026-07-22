@@ -56,6 +56,50 @@ pub(crate) const MAX_ATTRIBUTION_SOURCES: usize = 4096;
 /// the same schedule.
 pub(crate) const ATTRIBUTION_SOURCE_TTL: Duration = Duration::from_secs(15 * 60);
 
+// ---------------------------------------------------------------------------
+// Cost-pressure per-axis floors + sustained window (#4861 Codex round-3).
+//
+// These MIRROR the authoritative constants in `ring/hosting/cache.rs`
+// (`EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC`, `BROADCAST_FANOUT_PRESSURE_FLOOR_
+// BYTES_PER_SEC`, `BROADCAST_MESSAGES_PRESSURE_FLOOR_PER_SEC`,
+// `COST_RATE_MIN_WINDOW`). They cannot be imported: the `cache` module is
+// private to `hosting`, which is itself private to `ring`, so the constants
+// are not nameable from `topology::meter`. The insert-time above-floor
+// sustained-run detection (`RunningAverage::new_cost_sustained`) needs the
+// floor + window at sample time, on this side of that privacy boundary.
+//
+// The drift risk is closed by the guard test
+// `ring::cost_pressure_seam_tests::meter_cost_floors_mirror_cache_source_of_truth`,
+// which reads the authoritative cache.rs values (through `build_cost_axes`
+// and the re-exported `COST_RATE_MIN_WINDOW`, both reachable from `ring`) and
+// asserts they equal these mirrors — so CI fails if the two ever diverge.
+// ---------------------------------------------------------------------------
+
+/// Mirror of `cache::EXEC_CPU_PRESSURE_FLOOR_MICROS_PER_SEC`.
+const EXEC_CPU_COST_FLOOR_MICROS_PER_SEC: f64 = 50_000.0;
+/// Mirror of `cache::BROADCAST_FANOUT_PRESSURE_FLOOR_BYTES_PER_SEC`.
+const BROADCAST_FANOUT_COST_FLOOR_BYTES_PER_SEC: f64 = 128.0 * 1024.0;
+/// Mirror of `cache::BROADCAST_MESSAGES_PRESSURE_FLOOR_PER_SEC`.
+const BROADCAST_MESSAGES_COST_FLOOR_PER_SEC: f64 = 10.0;
+/// Mirror of `cache::COST_RATE_MIN_WINDOW`. `pub(crate)` so the `ring` guard
+/// test can assert it equals the authoritative value.
+pub(crate) const COST_SUSTAINED_WINDOW: Duration = Duration::from_secs(300);
+
+/// Construct the [`RunningAverage`] for one `(source, resource)` cell.
+/// Contract cost axes ([`ResourceType::cost_pressure_floor`] is `Some`) get
+/// insert-time ABOVE-FLOOR sustained-run tracking (#4861 Codex round-3) so
+/// their eviction-candidacy gate keys on sustained above-FLOOR cost rather
+/// than mere sample continuity; every other axis keeps the plain running
+/// average, behaviorally unchanged.
+fn new_running_average(window_size: usize, resource: ResourceType) -> RunningAverage {
+    match resource.cost_pressure_floor() {
+        Some(floor) => {
+            RunningAverage::new_cost_sustained(window_size, floor, COST_SUSTAINED_WINDOW)
+        }
+        None => RunningAverage::new(window_size),
+    }
+}
+
 /// A structure that keeps track of the usage of dynamic resources which are consumed over time.
 /// It provides methods to report and query resource usage, both total and attributed to specific
 /// sources.
@@ -358,6 +402,7 @@ impl Meter {
         // must be size-bounded at insertion). Reporting against an existing
         // source never grows the map, so the scan is skipped on the hot path.
         use dashmap::mapref::entry::Entry;
+        let window_size = self.running_average_window_size;
         match self.attribution_meters.entry(attribution.clone()) {
             Entry::Occupied(mut occupied) => {
                 let totals = occupied.get_mut();
@@ -365,7 +410,7 @@ impl Meter {
                 totals
                     .map
                     .entry(resource)
-                    .or_insert_with(|| RunningAverage::new(self.running_average_window_size))
+                    .or_insert_with(|| new_running_average(window_size, resource))
                     .insert_with_time(at_time, value);
                 return;
             }
@@ -384,7 +429,7 @@ impl Meter {
         totals
             .map
             .entry(resource)
-            .or_insert_with(|| RunningAverage::new(self.running_average_window_size))
+            .or_insert_with(|| new_running_average(window_size, resource))
             .insert_with_time(at_time, value);
     }
 
@@ -574,6 +619,32 @@ impl ResourceType {
             ResourceType::InboundBandwidthBytes,
             ResourceType::OutboundBandwidthBytes,
         ]
+    }
+
+    /// The cost-pressure floor (axis units per second) for the three contract
+    /// COST axes, or `None` for every other resource. A cost axis's
+    /// [`RunningAverage`] uses this floor to track a sustained ABOVE-FLOOR run
+    /// at insert time (#4861 Codex round-3): its eviction-candidacy sustained
+    /// signal counts only while the contract's true windowed rate stays at or
+    /// above this floor, so a below-floor keep-alive trickle plus one dense
+    /// burst never registers as sustained cost.
+    ///
+    /// Values MIRROR the authoritative `ring/hosting/cache.rs` floor constants
+    /// (not importable across the private `hosting`/`cache` module boundary);
+    /// the `ring` guard test `meter_cost_floors_mirror_cache_source_of_truth`
+    /// fails CI if they drift. Enumerated exhaustively (no `_` arm) so a new
+    /// `ResourceType` must consciously declare its floor, matching the
+    /// [`AttributionSource::contributes_to`] discipline.
+    pub(crate) fn cost_pressure_floor(&self) -> Option<f64> {
+        match self {
+            ResourceType::ExecCpuMicros => Some(EXEC_CPU_COST_FLOOR_MICROS_PER_SEC),
+            ResourceType::BroadcastFanoutCost => Some(BROADCAST_FANOUT_COST_FLOOR_BYTES_PER_SEC),
+            ResourceType::BroadcastMessagesSent => Some(BROADCAST_MESSAGES_COST_FLOOR_PER_SEC),
+            ResourceType::InboundBandwidthBytes
+            | ResourceType::OutboundBandwidthBytes
+            | ResourceType::ExecFuelUnits
+            | ResourceType::StateBytesWritten => None,
+        }
     }
 
     /// Every resource type the meter understands, including non-bandwidth
@@ -1058,6 +1129,13 @@ mod tests {
     /// the old buffer-span gate that flood spanned only a couple of dispatches
     /// (< min_window/2) and could NEVER nominate. With `activity_span` the
     /// continuous run is what matters, so the CPU axis nominates.
+    ///
+    /// Per-sample CPU is 2000µs so the storm's true rate — 58 × 2000 / 1.6s ≈
+    /// 72_500µs/s — clears the 50_000µs/s CPU floor: under the ABOVE-FLOOR
+    /// sustained gate (#4861 Codex round-3) a candidate must sustain a rate at
+    /// or above the axis floor, so the flood modeled here has to be a genuine
+    /// above-floor storm, not a trickle of tiny samples that would (correctly)
+    /// no longer qualify.
     #[test]
     fn contract_cost_rates_multi_target_cpu_flood_nominates() {
         let meter = Meter::new_with_window_size(100);
@@ -1072,7 +1150,7 @@ mod tests {
                 meter.report(
                     &contract_source(1),
                     ResourceType::ExecCpuMicros,
-                    200.0,
+                    2000.0,
                     t0 + dispatch + Duration::from_millis(15 * target),
                 );
             }
@@ -1084,8 +1162,8 @@ mod tests {
             meter.contract_cost_rates(&ResourceType::ExecCpuMicros, now, min_window);
         assert!(
             rates.contains_key(&ContractInstanceId::new([1u8; 32])),
-            "a multi-target (58/dispatch) CPU flood must nominate on the \
-             ExecCpuMicros axis"
+            "a multi-target (58/dispatch) above-floor CPU flood must nominate \
+             on the ExecCpuMicros axis"
         );
         assert!(total > 0.0);
     }
@@ -1120,25 +1198,29 @@ mod tests {
 
     /// Boundary (#4903 review round-2 requirement): the 60s gap-reset must have
     /// generous headroom above ANY cadence that exceeds a floor, so a genuine
-    /// sustained storm never spuriously resets its run. The slowest
-    /// floor-exceeding message cadence (58 msgs per dispatch, 10 msgs/s floor)
-    /// is a dispatch every ~5.8s — far under 60s. A contract reporting even
-    /// more slowly than that (every 30s) is still ONE continuous run and stays
-    /// sustained: no spurious gap-reset.
+    /// sustained storm never spuriously resets its run. A contract reporting
+    /// every 30s (well under the 60s gap threshold) is ONE continuous run and
+    /// stays sustained: no spurious gap-reset.
+    ///
+    /// The 400-msgs-per-report value keeps the storm's true rate — 400 / 30s ≈
+    /// 13/s — above the 10 msgs/s floor, as the ABOVE-FLOOR sustained gate
+    /// (#4861 Codex round-3) requires: sustainedness is a sustained above-FLOOR
+    /// run, so the reporter modeled here has to clear the floor at its 30s
+    /// cadence for the "no spurious 30s gap-reset" property to be observable.
     #[test]
     fn contract_cost_rates_slow_cadence_does_not_gap_reset() {
         let meter = Meter::new_with_window_size(100);
         let t0 = Instant::now();
         let min_window = Duration::from_secs(300);
 
-        // Report every 30s (well under the 60s gap threshold but far slower
-        // than any real storm) for 240s continuous.
+        // Report every 30s (well under the 60s gap threshold) for 240s
+        // continuous, at a per-report volume that clears the message floor.
         let mut t = Duration::ZERO;
         while t <= Duration::from_secs(240) {
             meter.report(
                 &contract_source(1),
                 ResourceType::BroadcastMessagesSent,
-                58.0,
+                400.0,
                 t0 + t,
             );
             t += Duration::from_secs(30);
@@ -1189,6 +1271,98 @@ mod tests {
         assert!(
             total > 0.0,
             "the recent burst still counts toward the total"
+        );
+    }
+
+    /// #4861 Codex round-3 (THE finding): a contract that emits trivial
+    /// below-floor keep-alive samples CONTINUOUSLY (every 30s, under the 60s
+    /// gap — so sample continuity is never broken) for longer than
+    /// `min_window / 2`, then a SINGLE dense burst, must NOT be a candidate.
+    /// The old sustained gate keyed on `activity_start` (sample continuity),
+    /// which the no-gap trickle held alive for 180s+, so the lone burst's high
+    /// saturated-buffer rate would nominate the contract on ONE burst —
+    /// violating invariant 3's "a single burst never triggers". The above-floor
+    /// gate tracks how long the TRUE rate has stayed at or above the axis
+    /// floor, which the trickle never does, so the run only opens mid-burst and
+    /// spans a few seconds (< min_window/2). Before the fix this assertion
+    /// FAILS (the contract IS a candidate); after it passes.
+    #[test]
+    fn contract_cost_rates_trickle_then_single_burst_is_not_a_candidate() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+        let id1 = ContractInstanceId::new([1u8; 32]);
+
+        // Trickle: 0.1 msgs every 30s (< 60s gap, so sampling stays continuous;
+        // 0.1/30s ≈ 0.003/s — far below the 10 msgs/s floor) for 180s.
+        let mut t = Duration::ZERO;
+        while t <= Duration::from_secs(180) {
+            meter.report(
+                &contract_source(1),
+                ResourceType::BroadcastMessagesSent,
+                0.1,
+                t0 + t,
+            );
+            t += Duration::from_secs(30);
+        }
+        // Then ONE dense burst (120 samples over ~3s — saturates the buffer and
+        // reads a high true rate).
+        let burst_start = t0 + Duration::from_secs(181);
+        for i in 0..120u64 {
+            meter.report(
+                &contract_source(1),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                burst_start + Duration::from_millis(25 * i),
+            );
+        }
+        let now = burst_start + Duration::from_secs(4);
+
+        let (total, rates) =
+            meter.contract_cost_rates(&ResourceType::BroadcastMessagesSent, now, min_window);
+        assert!(
+            !rates.contains_key(&id1),
+            "a continuous below-floor trickle then a SINGLE dense burst must \
+             NOT be a candidate: sample continuity is sustained but above-FLOOR \
+             cost is not (Codex round-3)"
+        );
+        assert!(
+            total > 0.0,
+            "the burst still counts toward the node total (share denominator)"
+        );
+    }
+
+    /// The counterpart to the trickle-then-burst boundary: the SAME dense burst
+    /// shape, but REPEATED continuously (above the floor throughout) for longer
+    /// than `min_window / 2`, IS a candidate — this is genuine sustained
+    /// above-floor cost, not a lone burst.
+    #[test]
+    fn contract_cost_rates_repeated_dense_bursts_above_floor_is_a_candidate() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+        let id1 = ContractInstanceId::new([1u8; 32]);
+
+        // The 25ms-cadence dense burst of the test above, sustained for 200s:
+        // ~2320 msgs/s (buffer-saturating), continuously above the 10/s floor.
+        let mut i = 0u64;
+        while Duration::from_millis(25 * i) <= Duration::from_secs(200) {
+            meter.report(
+                &contract_source(1),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                t0 + Duration::from_millis(25 * i),
+            );
+            i += 1;
+        }
+        let now = t0 + Duration::from_millis(25 * (i - 1)) + Duration::from_secs(1);
+
+        let (_total, rates) =
+            meter.contract_cost_rates(&ResourceType::BroadcastMessagesSent, now, min_window);
+        assert!(
+            rates.contains_key(&id1),
+            "a dense burst sustained ABOVE the floor for > min_window/2 IS a \
+             candidate (sustained above-floor cost)"
         );
     }
 

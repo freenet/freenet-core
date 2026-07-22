@@ -431,12 +431,11 @@ impl TopologyManager {
         self.meter.attributed_usage_rate(source, resource_type, now)
     }
 
-    /// Per-contract attributed cost rates + their sum for one cost axis,
-    /// amortized over at least `min_window`. Read by the hosting sweep's
-    /// cost-pressure trigger (cost-aware eviction, #4861); see
-    /// [`Meter::contract_cost_rates`].
-    /// Read several cost axes in one pass over the meter (the hosting sweep
-    /// reads all three per tick — #4903 review perf). Delegates to
+    /// Per-contract attributed cost rates + their sum for SEVERAL cost axes,
+    /// read in one pass over the meter (the hosting sweep reads all three per
+    /// tick — #4903 review perf), each amortized over at least `min_window`.
+    /// Read by the hosting sweep's cost-pressure trigger (cost-aware eviction,
+    /// #4861). Delegates to
     /// [`crate::topology::meter::Meter::contract_cost_rates_multi`].
     pub(crate) fn contract_cost_rates_multi(
         &self,

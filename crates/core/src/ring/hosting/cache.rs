@@ -818,8 +818,9 @@ pub(crate) fn victim_order(
 // the byte-gated sweep never ran. Cost pressure closes that gap: the periodic
 // sweep additionally reads the per-contract attributed cost rates from the
 // topology meter — `ExecCpuMicros` (apply + probe + per-target
-// summarize/delta WASM), `BroadcastFanoutCost` (payload × targets, the
-// uplink-volume dimension), and `BroadcastMessagesSent` (per-peer send COUNT,
+// summarize/delta WASM), `BroadcastFanoutCost` (the actual per-send payload
+// bytes put on the wire, charged on real delivery only — the uplink-volume
+// dimension), and `BroadcastMessagesSent` (per-peer send COUNT,
 // the per-send-overhead dimension and the load-bearing storm signal: a
 // tiny-payload high-frequency storm is invisible in bytes but reads its true
 // message rate here) — and, when the node's total update-work on an axis is
@@ -832,8 +833,10 @@ pub(crate) fn victim_order(
 // calibration; the absolute floors only keep an idle node from evicting the
 // one contract that does any work at all. Two guards keep it honest:
 // SUSTAINED pressure (the meter read admits a contract into candidacy only
-// once its reporting is at least half the cost window old, so a single large
-// fan-out burst can never mass-evict — see `Meter::contract_cost_rates`) and
+// once its true windowed rate has stayed at or above the axis floor
+// continuously for at least half the cost window, so neither a below-floor
+// keep-alive trickle nor a single large fan-out burst can mass-evict — see
+// `Meter::contract_cost_rates`) and
 // the saturated-buffer true-rate fix (a full sample ring divides by its
 // actual span, so a sustained high-frequency storm's real rate is
 // representable instead of being count-truncated below the floor).
@@ -910,9 +913,15 @@ pub(crate) struct CostAxisPressure {
     pub floor: f64,
     /// Per-contract attributed rates (axis units per second). Contracts
     /// absent from the map have zero attributed cost. Pre-filtered by the
-    /// meter read to SUSTAINED sources only (first sample at least half the
-    /// cost window old), so a single large burst is never a candidate; every
-    /// positive-rate contract still counts in [`Self::total_rate`].
+    /// meter read to SUSTAINED sources only: a contract appears here only once
+    /// its true windowed rate has stayed at or above the axis floor
+    /// continuously for at least half the cost window (a >60s report-silence
+    /// gap-resets the run), so neither a below-floor keep-alive trickle nor a
+    /// single large burst is ever a candidate. A deliberate metering limit: a
+    /// source reporting fewer than one sample per 60s on an axis never counts
+    /// as sustained on it (a real storm's cadence is far denser, and the byte
+    /// budget backstops slow-large profiles). Every positive-rate contract
+    /// still counts in [`Self::total_rate`].
     pub rates: std::collections::HashMap<freenet_stdlib::prelude::ContractInstanceId, f64>,
 }
 
@@ -2031,18 +2040,30 @@ impl<T: TimeSource> HostingCache<T> {
             // Assigned a proper order by `finalize_loading` once all entries are
             // loaded (sorted by persisted recency). Temporary 0 until then.
             last_access_seq: 0,
-            // Reloaded entries stay at 0 ("never GET-read since restart") and are
-            // NOT re-stamped by `finalize_loading`: persistence records only a
-            // generic last-ACCESS time that can't distinguish a real GET from a
-            // PUT/SUBSCRIBE, so stamping real-GET recency from it would fabricate
-            // demand (a never-read PUT seed out-surviving a genuinely GET-read
-            // entry). A live GET after restart re-stamps it to a true value. See
+            // `recency_seq` is a per-run monotonic SEQUENCE number, not a
+            // timestamp, so there is no meaningful pre-restart value to restore:
+            // reloaded entries stay at 0 ("never GET-read since restart") and are
+            // NOT re-stamped by `finalize_loading`. `last_accessed` (from the
+            // persisted age) carries the recency ordering instead; a live GET
+            // after restart re-stamps `recency_seq` to a true value. See
             // `finalize_loading`.
             recency_seq: 0,
-            // Same reasoning as `recency_seq`: persistence can't distinguish a
-            // genuine GET/PUT from a SUBSCRIBE, so a reload starts with no
-            // genuine-access claim; a live GET/PUT re-stamps it (#4861).
-            last_genuine_access: None,
+            // Restore the genuine-access recency across restart for the
+            // cost-eviction guard (#4903 review round-3 Fix 5). Unlike
+            // `recency_seq` (an unrestorable sequence number), `last_genuine_access`
+            // is a TIMESTAMP and the persisted row records the last ACCESS TYPE,
+            // so we CAN tell whether the last pre-restart access was a genuine
+            // GET/PUT and, if so, seed it from the persisted age — a contract
+            // GET-read or PUT within `COST_RATE_MIN_WINDOW` before restart then
+            // keeps its cost-eviction protection (invariant 3: "a real GET or PUT
+            // resets recency") instead of being immediately cost-evictable. A
+            // SUBSCRIBE is NOT genuine access, so it stays unprotected (None) —
+            // matching the live `resets_recency` rule in
+            // `record_access_with_demand`.
+            last_genuine_access: match access_type {
+                AccessType::Get | AccessType::Put => Some(last_accessed),
+                AccessType::Subscribe => None,
+            },
             // Loaded entries start at the caller-supplied cold demand (the
             // distance prior when this peer's location is known at load, else
             // neutral). The first live read re-scores against the current prior.
@@ -2415,13 +2436,16 @@ mod tests {
         assert_eq!(evicted[0].key, local);
     }
 
-    /// #4903 review Fix 1 (restart facet): a restart reload leaves
-    /// `last_genuine_access = None` but seeds `local_client_last_access = now`
-    /// for locally-accessed contracts (one renewal window to re-establish
-    /// subscriptions). Cost candidacy must honor that lease — without it the
-    /// sweep evicts a just-reloaded contract reconciliation is about to renew
-    /// (~2.5 min churn after every restart). A reloaded contract with NO
-    /// pre-restart local access gets no such grace.
+    /// #4903 review Fix 1 (restart facet): a restart reload seeds
+    /// `local_client_last_access = now` for locally-accessed contracts (one
+    /// renewal window to re-establish subscriptions). Cost candidacy must honor
+    /// that lease — without it the sweep evicts a just-reloaded contract
+    /// reconciliation is about to renew (~2.5 min churn after every restart). A
+    /// reloaded contract with NO pre-restart local access gets no such grace.
+    /// Here the pre-restart access is 1h old (stale past the cost window), so
+    /// the round-3 Fix-5 genuine-access restore does not protect either entry —
+    /// only the local-client lease does. (The recent-access facet of Fix 5 is
+    /// covered by `evict_cost_pressure_restart_restores_recent_genuine_access`.)
     #[test]
     fn evict_cost_pressure_restart_local_lease_protects() {
         use crate::ring::hosting::SUBSCRIPTION_LEASE_DURATION;
@@ -2465,6 +2489,63 @@ mod tests {
         let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].key, local);
+    }
+
+    /// #4903 review round-3 Fix 5: a restart reload RESTORES
+    /// `last_genuine_access` from the persisted last-access age for GET/PUT
+    /// access types, so a contract genuinely read or written within the cost
+    /// window before restart keeps its cost-eviction protection across the
+    /// restart (invariant 3), even with NO local-client access. A SUBSCRIBE
+    /// reload is not genuine access and gets no such protection. Before Fix 5
+    /// the loader hard-coded `last_genuine_access = None`, so a
+    /// network-accessed (non-local) contract was immediately cost-evictable
+    /// after every restart.
+    #[test]
+    fn evict_cost_pressure_restart_restores_recent_genuine_access() {
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let recent_get = make_key(1);
+        let recent_sub = make_key(2);
+        // Both last accessed 60s before restart (well within the 300s cost
+        // window); NEITHER locally accessed, so only the genuine-access restore
+        // can protect them.
+        cache.load_persisted_entry(
+            recent_get,
+            121,
+            AccessType::Get,
+            Duration::from_secs(60),
+            false,
+        );
+        cache.load_persisted_entry(
+            recent_sub,
+            121,
+            AccessType::Subscribe,
+            Duration::from_secs(60),
+            false,
+        );
+        cache.finalize_loading();
+
+        let axes = [cost_axis(
+            100_000.0,
+            50_000.0,
+            &[(&recent_get, 40_000.0), (&recent_sub, 40_000.0)],
+        )];
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        let keys: Vec<ContractKey> = evicted.iter().map(|e| e.key).collect();
+        assert_eq!(
+            keys,
+            vec![recent_sub],
+            "post-restart: a recently GET-read contract keeps its restored \
+             genuine-access cost protection; a SUBSCRIBE reload (not genuine \
+             access) does not"
+        );
+        assert!(cache.get(&recent_get).is_some());
+
+        // The restored protection is time-bounded: once the pre-restart access
+        // ages past the cost window, the GET reload competes like anything else.
+        clock.advance_time(COST_RATE_MIN_WINDOW);
+        let evicted = cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &axes);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].key, recent_get);
     }
 
     /// Exact-25%-share boundary: a contract holding EXACTLY the threshold

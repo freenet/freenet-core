@@ -19,19 +19,48 @@ use tokio::time::Instant;
 /// minute, so 60 s of cost-stream silence means the storm has paused.
 pub(crate) const SUSTAINED_ACTIVITY_MAX_GAP: Duration = Duration::from_secs(60);
 
+/// Above-floor sustained-run configuration for a contract COST axis (#4861
+/// Codex round-3). Present only on the three cost-pressure axes; every other
+/// [`RunningAverage`] leaves it absent and keeps the sample-continuity
+/// (`activity_start`) sustained signal untouched.
+#[derive(Clone, Copy, Debug)]
+struct CostSustainedConfig {
+    /// Axis floor (units/sec). A run counts as "above floor" for as long as
+    /// the true windowed rate stays at or above this.
+    floor: f64,
+    /// Window the above-floor rate is measured over at insert time. MUST be
+    /// the same window the reader passes to [`RunningAverage::windowed_rate`]
+    /// (`COST_RATE_MIN_WINDOW`) so the insert-time detection and the read-time
+    /// rate agree on which samples are in scope.
+    window: Duration,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RunningAverage {
     max_samples: usize,
     samples: VecDeque<(Instant, f64)>,
     sum_samples: f64,
     total_sample_count: usize,
-    /// Start of the current continuous run of activity (gap-reset on a silence
-    /// longer than [`SUSTAINED_ACTIVITY_MAX_GAP`]). Tracked at INSERT time so
-    /// it survives count-bounding — a high-frequency source drops old samples
-    /// but its activity start is remembered here. Read by
-    /// [`Self::windowed_rate`] as the buffer-capacity-independent
-    /// sustained-activity signal for the cost-eviction trigger (#4861).
+    /// Start of the current continuous run of SAMPLING activity (gap-reset on
+    /// a silence longer than [`SUSTAINED_ACTIVITY_MAX_GAP`]). Tracked at INSERT
+    /// time so it survives count-bounding — a high-frequency source drops old
+    /// samples but its activity start is remembered here. For a NON-cost
+    /// average this is the sustained signal read by [`Self::windowed_rate`];
+    /// for a cost average the above-floor run (`above_floor_start`) is read
+    /// instead, but this field is still maintained cheaply and unchanged.
     activity_start: Option<Instant>,
+    /// Above-floor sustained-run config for the contract cost axes (#4861
+    /// Codex round-3). `None` for every other average.
+    cost_sustained: Option<CostSustainedConfig>,
+    /// Start of the current continuous ABOVE-FLOOR run: the instant the true
+    /// windowed rate first reached the axis floor and has stayed there since.
+    /// Gap-reset on a >[`SUSTAINED_ACTIVITY_MAX_GAP`] silence and cleared the
+    /// moment the rate drops below the floor. Maintained only when
+    /// `cost_sustained` is set; read by [`Self::windowed_rate`] as the cost
+    /// axes' sustained signal so a below-floor keep-alive trickle that merely
+    /// keeps SAMPLING continuous can never look sustained (the round-3 fix:
+    /// `activity_span` proved sustained SAMPLING, not sustained COST).
+    above_floor_start: Option<Instant>,
 }
 
 impl RunningAverage {
@@ -42,6 +71,25 @@ impl RunningAverage {
             sum_samples: 0.0,
             total_sample_count: 0,
             activity_start: None,
+            cost_sustained: None,
+            above_floor_start: None,
+        }
+    }
+
+    /// Like [`Self::new`] but tracks a sustained ABOVE-FLOOR run for a contract
+    /// cost axis: [`WindowedRate::activity_span`] then measures how long the
+    /// true windowed rate has continuously stayed at or above `floor`
+    /// (units/sec, measured over `window`), instead of how long the source has
+    /// merely been SAMPLING. This is the cost-eviction candidacy gate's
+    /// sustained input (#4861 Codex round-3): a source emitting trivial
+    /// below-floor keep-alive samples plus one dense burst keeps sample
+    /// continuity alive but never sustains above-floor cost, so it must not be
+    /// a candidate. `window` must equal the window the reader passes to
+    /// [`Self::windowed_rate`] (`COST_RATE_MIN_WINDOW`).
+    pub(crate) fn new_cost_sustained(max_samples: usize, floor: f64, window: Duration) -> Self {
+        RunningAverage {
+            cost_sustained: Some(CostSustainedConfig { floor, window }),
+            ..Self::new(max_samples)
         }
     }
 
@@ -70,6 +118,50 @@ impl RunningAverage {
         } else if let Some((_, old_value)) = self.samples.pop_front() {
             self.samples.push_back((now, value));
             self.sum_samples += value - old_value;
+        }
+
+        // Cost-axis ABOVE-FLOOR sustained-run tracking (#4861 Codex round-3).
+        // Runs only for cost-configured averages, AFTER the push (so `now` is
+        // in the buffer), and captures the run at INSERT time because the read
+        // sees only the final count-bounded buffer — the early trickle samples
+        // are gone by read time, so the above-floor history must be recorded
+        // as samples arrive.
+        if let Some(cfg) = self.cost_sustained {
+            // Same gap-reset as `activity_start`: a >SUSTAINED_ACTIVITY_MAX_GAP
+            // silence breaks the run, so a dense burst after a long quiet
+            // cannot inherit an earlier above-floor run. (`gap_restart` was
+            // computed from the last sample time BEFORE the push above.)
+            if gap_restart {
+                self.above_floor_start = None;
+            }
+            // True (undiluted) windowed rate at `now`: the in-window sum over
+            // its ACTUAL span. Deliberately NOT diluted by `window` the way
+            // `windowed_rate`'s MAGNITUDE reading is: that dilution exists to
+            // stop a lone burst from reading a huge instantaneous rate, but the
+            // boolean above-floor RUN already rejects lone bursts by run LENGTH
+            // (a single dense burst's run is only its own few seconds). Diluting
+            // here would instead impose a spurious warm-up — a genuine fast
+            // storm reads below floor until ~half the buffer fills — that
+            // shortens its sustained run below the bar and stops it nominating
+            // (regressing the fast-storm guarantee). The true delivery rate is
+            // the correct "is this source above the floor" signal; the run
+            // length is the correct "is it sustained" signal.
+            let above_floor = self
+                .windowed_scan(now, cfg.window)
+                .map(|scan| {
+                    let span = now
+                        .saturating_duration_since(scan.oldest)
+                        .max(Duration::from_secs(1));
+                    Rate::new(scan.recent_sum, span).per_second() >= cfg.floor
+                })
+                .unwrap_or(false);
+            if above_floor {
+                // Open the run at the first above-floor sample; keep the
+                // earlier start once the run is already open.
+                self.above_floor_start.get_or_insert(now);
+            } else {
+                self.above_floor_start = None;
+            }
         }
     }
 
@@ -118,15 +210,70 @@ impl RunningAverage {
     ///    for the saturated case comes from [`WindowedRate::activity_span`]:
     ///    the caller requires a sustained continuous run before acting.
     pub(crate) fn windowed_rate(&self, now: Instant, min_window: Duration) -> Option<WindowedRate> {
-        // Time-bound (review Fix 3): only samples no older than `min_window`
-        // count. Samples are appended in time order, so scanning the whole
-        // (small, count-bounded) buffer is cheap and needs no index math.
+        let scan = self.windowed_scan(now, min_window)?;
+        let since_oldest = now.saturating_duration_since(scan.oldest);
+        // "Saturated" (true-rate) reading requires the full buffer AND no
+        // time-excluded sample: only then does the buffer prove continuous
+        // activity across its span (see [`WindowScan`] and rustdoc point 3).
+        let divisor = if scan.saturated {
+            since_oldest.max(Duration::from_secs(1))
+        } else {
+            since_oldest.max(min_window).max(Duration::from_secs(1))
+        };
+        // Sustained-activity signal. For a COST-configured average this is the
+        // ABOVE-FLOOR run (`above_floor_start`, tracked at insert time): the
+        // run counts only while the true windowed rate stays >= the axis
+        // floor, so a below-floor keep-alive trickle that merely keeps SAMPLING
+        // continuous is NOT sustained (#4861 Codex round-3). For every other
+        // average it is the sample-continuity run (`activity_start`, #4903
+        // review BLOCKER), unchanged: the length of the current continuous
+        // run, buffer-CAPACITY-independent so a fast storm whose count-bounded
+        // buffer spans only tens of seconds is still recognized as sustained.
+        // A single burst (short run) can't reach the caller's `min_window / 2`
+        // bar, and a >SUSTAINED_ACTIVITY_MAX_GAP silence restarts the run.
+        //
+        // A run only counts as CURRENT if the newest sample is itself recent
+        // (within SUSTAINED_ACTIVITY_MAX_GAP of `now`): a source that stormed
+        // and then fell silent is no longer sustained, so it drops out of
+        // candidacy after one gap of silence (well before its samples fully
+        // age out of `min_window` and its rate decays to zero), rather than
+        // lingering as a candidate on the strength of a run that has ended.
+        let run_start = if self.cost_sustained.is_some() {
+            self.above_floor_start
+        } else {
+            self.activity_start
+        };
+        let currently_active =
+            now.saturating_duration_since(scan.newest) <= SUSTAINED_ACTIVITY_MAX_GAP;
+        let activity_span = match run_start {
+            Some(start) if currently_active => scan.newest.saturating_duration_since(start),
+            _ => Duration::ZERO,
+        };
+        Some(WindowedRate {
+            rate: Rate::new(scan.recent_sum, divisor),
+            activity_span,
+        })
+    }
+
+    /// Shared count-and-time-bounded scan behind BOTH the read-time
+    /// [`Self::windowed_rate`] and the insert-time above-floor check. Sums the
+    /// samples within `window` of `now`, reporting the recent span endpoints
+    /// and whether the retained buffer is SATURATED (full AND no sample was
+    /// excluded by the time-bound — only then does it prove continuous activity
+    /// across its span; see `windowed_rate` rustdoc point 3). Returns `None`
+    /// when no sample lies within the window. Extracted so the two callers
+    /// cannot diverge on the time-bound / saturation determination — the
+    /// divisor POLICY differs by purpose (see the insert-time comment) but the
+    /// scan is identical (#4861 Codex round-3).
+    fn windowed_scan(&self, now: Instant, window: Duration) -> Option<WindowScan> {
+        // Samples are appended in time order, so scanning the whole (small,
+        // count-bounded) buffer is cheap and needs no index math.
         let mut recent_sum = 0.0_f64;
         let mut oldest_recent: Option<Instant> = None;
         let mut newest_recent: Option<Instant> = None;
         let mut excluded_any = false;
         for (at, value) in &self.samples {
-            if now.saturating_duration_since(*at) > min_window {
+            if now.saturating_duration_since(*at) > window {
                 excluded_any = true;
                 continue;
             }
@@ -136,48 +283,31 @@ impl RunningAverage {
             newest_recent = Some(*at);
             recent_sum += value;
         }
-        // Every retained sample is stale (or the buffer is empty): the
-        // source has done no attributable work within the window.
+        // Every retained sample is stale (or the buffer is empty): the source
+        // has done no attributable work within the window.
         let oldest = oldest_recent?;
         let newest = newest_recent.expect("newest set whenever oldest is");
-        let since_oldest = now.saturating_duration_since(oldest);
-        // "Saturated" (true-rate) reading requires the full buffer AND no
-        // time-excluded sample: only then does the buffer prove continuous
-        // activity across its span. See rustdoc point 3.
-        let saturated = self.samples.len() >= self.max_samples && !excluded_any;
-        let divisor = if saturated {
-            since_oldest.max(Duration::from_secs(1))
-        } else {
-            since_oldest.max(min_window).max(Duration::from_secs(1))
-        };
-        // Sustained-activity signal (#4903 review BLOCKER): the length of the
-        // current continuous run, measured from `activity_start` (set/reset at
-        // insert time, see SUSTAINED_ACTIVITY_MAX_GAP) to the newest sample.
-        // Deliberately NOT the span of the count-bounded sample buffer — that
-        // span shrinks with cadence, so a fast storm's buffer spans only a few
-        // tens of seconds and could never reach the caller's `min_window / 2`
-        // bar (the inversion this replaces). `activity_start` survives
-        // count-bounding, so the run length is representable at any rate. A
-        // single burst (short run) still can't reach the bar, and a gap longer
-        // than SUSTAINED_ACTIVITY_MAX_GAP restarts the run, so an old-first-
-        // sample source followed by a fresh burst is not sustained either.
-        //
-        // A run only counts as CURRENT if the newest sample is itself recent
-        // (within SUSTAINED_ACTIVITY_MAX_GAP of `now`): a source that stormed
-        // and then fell silent is no longer sustained, so it drops out of
-        // candidacy after one gap of silence (well before its samples fully
-        // age out of `min_window` and its rate decays to zero), rather than
-        // lingering as a candidate on the strength of a run that has ended.
-        let currently_active = now.saturating_duration_since(newest) <= SUSTAINED_ACTIVITY_MAX_GAP;
-        let activity_span = match self.activity_start {
-            Some(start) if currently_active => newest.saturating_duration_since(start),
-            _ => Duration::ZERO,
-        };
-        Some(WindowedRate {
-            rate: Rate::new(recent_sum, divisor),
-            activity_span,
+        Some(WindowScan {
+            recent_sum,
+            oldest,
+            newest,
+            saturated: self.samples.len() >= self.max_samples && !excluded_any,
         })
     }
+}
+
+/// In-window scan ingredients shared by [`RunningAverage::windowed_rate`] and
+/// the insert-time above-floor check (#4861 Codex round-3).
+struct WindowScan {
+    /// Sum of the sample values within the window.
+    recent_sum: f64,
+    /// Oldest in-window sample time.
+    oldest: Instant,
+    /// Newest in-window sample time.
+    newest: Instant,
+    /// The buffer is full AND no retained sample was excluded by the
+    /// time-bound (so its `sum / span` is the true rate).
+    saturated: bool,
 }
 
 /// Result of [`RunningAverage::windowed_rate`]: the min-window-aware rate
@@ -185,16 +315,23 @@ impl RunningAverage {
 /// sustained-pressure input for the cost-eviction trigger, #4861).
 pub(crate) struct WindowedRate {
     pub rate: Rate,
-    /// `newest_recent_sample − activity_start`: how long the source has been
+    /// `newest_recent_sample − run_start`: how long the current run has been
     /// CONTINUOUSLY active (gap-reset on a silence longer than
-    /// [`SUSTAINED_ACTIVITY_MAX_GAP`]). A genuine sustained storm's run grows
-    /// past `min_window / 2` at ANY report cadence above the floor; a short
-    /// burst's run stays small no matter how dense; an old-first-sample source
-    /// followed by a fresh burst has its run restart at the burst. This is
-    /// buffer-CAPACITY-independent — the fix for the review BLOCKER, where the
-    /// count-bounded buffer's span inverted against high-frequency storms
-    /// (fast cadence ⇒ short buffer span ⇒ never "sustained" ⇒ the worst
-    /// storms were permanently exempted from candidacy).
+    /// [`SUSTAINED_ACTIVITY_MAX_GAP`]). For a cost-configured average the run
+    /// is the ABOVE-FLOOR run (`above_floor_start`): it grows only while the
+    /// true windowed rate stays at or above the axis floor, so a below-floor
+    /// keep-alive trickle that keeps SAMPLING continuous does not count and a
+    /// single dense burst — even one preceded by a long below-floor trickle —
+    /// stays short (#4861 Codex round-3). For every other average it is the
+    /// sample-continuity run (`activity_start`). Either way a genuine sustained
+    /// storm's run grows past `min_window / 2` at ANY report cadence above the
+    /// floor; a short burst's run stays small no matter how dense; an
+    /// old-first-sample source followed by a fresh burst has its run restart at
+    /// the burst. Buffer-CAPACITY-independent — the fix for the earlier review
+    /// BLOCKER, where the count-bounded buffer's span inverted against
+    /// high-frequency storms (fast cadence ⇒ short buffer span ⇒ never
+    /// "sustained" ⇒ the worst storms were permanently exempted from
+    /// candidacy).
     pub activity_span: Duration,
 }
 
@@ -444,6 +581,122 @@ mod tests {
                 avg.windowed_rate(storm_end + MIN_WINDOW + Duration::from_secs(1), MIN_WINDOW)
                     .is_none(),
                 "a source quiet for a full min_window must read None"
+            );
+        }
+
+        // --- above-floor sustained-run tracking (#4861 Codex round-3) ---
+        // These use the cost-configured constructor; the tests above use the
+        // plain `new` (non-cost) path, which keeps the `activity_start`
+        // sample-continuity signal unchanged.
+
+        const FLOOR: f64 = 10.0;
+
+        /// A below-floor keep-alive trickle (0.1/sample every 30s — under the
+        /// 60s gap so SAMPLING stays continuous) followed by ONE dense burst is
+        /// NOT sustained above-floor: the above-floor run opens only mid-burst
+        /// and spans a few seconds, far under `min_window / 2`. This is the
+        /// Codex round-3 scenario: `activity_start` alone (sampling continuity)
+        /// would report ~180s here.
+        #[test]
+        fn cost_trickle_then_single_burst_run_is_short() {
+            let mut avg = RunningAverage::new_cost_sustained(100, FLOOR, MIN_WINDOW);
+            let t0 = Instant::now();
+            let mut t = Duration::ZERO;
+            while t <= Duration::from_secs(180) {
+                avg.insert_with_time(t0 + t, 0.1);
+                t += Duration::from_secs(30);
+            }
+            let burst_start = t0 + Duration::from_secs(181);
+            for i in 0..120u64 {
+                avg.insert_with_time(burst_start + Duration::from_millis(25 * i), 58.0);
+            }
+            let now = burst_start + Duration::from_secs(4);
+            let windowed = avg.windowed_rate(now, MIN_WINDOW).unwrap();
+            assert!(
+                windowed.activity_span < MIN_WINDOW / 2,
+                "a below-floor trickle then one burst is not sustained \
+                 above-floor: span {:?}",
+                windowed.activity_span
+            );
+        }
+
+        /// The counterpart: the SAME dense cadence sustained ABOVE the floor for
+        /// longer than `min_window / 2` IS sustained. At 1.4s cadence (58/sample
+        /// ≈ 41/s, above the floor) the run reaches the bar over its FULL length
+        /// — the above-floor detection uses the true delivery rate, so there is
+        /// no diluted warm-up (the naive "reuse windowed_rate's diluted divisor"
+        /// approach reads below floor for ~71s and would push this 200s run's
+        /// sustained span below the 150s bar).
+        #[test]
+        fn cost_sustained_above_floor_reaches_bar_without_warmup_penalty() {
+            let mut avg = RunningAverage::new_cost_sustained(100, FLOOR, MIN_WINDOW);
+            let t0 = Instant::now();
+            // i in 0..143 at 1.4s cadence → last sample at 142 × 1.4 = 198.8s.
+            let n = 143u64;
+            for i in 0..n {
+                avg.insert_with_time(t0 + Duration::from_millis(1400 * i), 58.0);
+            }
+            let last = t0 + Duration::from_millis(1400 * (n - 1));
+            let windowed = avg
+                .windowed_rate(last + Duration::from_secs(1), MIN_WINDOW)
+                .unwrap();
+            assert!(
+                windowed.activity_span >= MIN_WINDOW / 2,
+                "a 1.4s-cadence above-floor storm must be sustained over its \
+                 full run (no warm-up penalty): span {:?}",
+                windowed.activity_span
+            );
+        }
+
+        /// A source SAMPLING continuously (every 5s, never a gap) but whose true
+        /// rate stays below the floor (1.0 per 5s = 0.2/s ≪ 10/s) never opens
+        /// the above-floor run, so it is never sustained no matter how long it
+        /// runs — cost-sustainedness is above-FLOOR cost, not mere sampling.
+        #[test]
+        fn cost_continuous_below_floor_source_never_sustained() {
+            let mut avg = RunningAverage::new_cost_sustained(100, FLOOR, MIN_WINDOW);
+            let t0 = Instant::now();
+            let mut t = Duration::ZERO;
+            while t <= Duration::from_secs(400) {
+                avg.insert_with_time(t0 + t, 1.0);
+                t += Duration::from_secs(5);
+            }
+            let now = t0 + Duration::from_secs(401);
+            let windowed = avg.windowed_rate(now, MIN_WINDOW).unwrap();
+            assert_eq!(
+                windowed.activity_span,
+                Duration::ZERO,
+                "a continuously-sampling but below-floor source is never \
+                 sustained above-floor"
+            );
+        }
+
+        /// The gap-reset applies to the above-floor run too: a sustained
+        /// above-floor storm, then a >`SUSTAINED_ACTIVITY_MAX_GAP` silence, then
+        /// a short fresh storm — the run restarts at the second storm, so its
+        /// span is only its own length (preserving the round-2 gap-reset).
+        #[test]
+        fn cost_gap_reset_restarts_above_floor_run() {
+            let mut avg = RunningAverage::new_cost_sustained(100, FLOOR, MIN_WINDOW);
+            let t0 = Instant::now();
+            let mut t = Duration::ZERO;
+            while t <= Duration::from_secs(200) {
+                avg.insert_with_time(t0 + t, 58.0);
+                t += Duration::from_millis(1600);
+            }
+            let resume = t0 + Duration::from_secs(200) + Duration::from_secs(90);
+            let mut t2 = Duration::ZERO;
+            while t2 <= Duration::from_secs(30) {
+                avg.insert_with_time(resume + t2, 58.0);
+                t2 += Duration::from_millis(1600);
+            }
+            let now = resume + Duration::from_secs(31);
+            let windowed = avg.windowed_rate(now, MIN_WINDOW).unwrap();
+            assert!(
+                windowed.activity_span < MIN_WINDOW / 2,
+                "the >max-gap silence restarts the above-floor run at the second \
+                 storm: span {:?}",
+                windowed.activity_span
             );
         }
     }
