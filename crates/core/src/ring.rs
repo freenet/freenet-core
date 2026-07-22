@@ -4372,15 +4372,20 @@ impl Ring {
         }
         // Also feed the governance manager — the meter stores rates for
         // telemetry/the dashboard's bandwidth view, while the governance
-        // manager aggregates these samples into the cost/benefit ratio that
-        // drives state. Both ingest from this one entry point so they can't
-        // diverge (governance reading from a stale meter snapshot, etc).
+        // manager aggregates cost into the cost/benefit ratio that drives its
+        // ban state. But governance ingests ONLY the axes in
+        // `governance_ingests_axis` (currently just `StateBytesWritten`) — the
+        // three #4861 cost-eviction axes are deliberately NOT fed to it (see
+        // that fn's rustdoc for the #4296 rationale). The meter above still
+        // gets EVERY axis, so cost-eviction is unaffected.
         //
         // Per-resource weight: identity (1.0) for now. Future tuning could
-        // weight CPU-µs and fanout-cost higher than state-bytes, but until we
-        // have live data to calibrate against, unit weights match what the
-        // design doc proposed as a starting point.
+        // weight axes differently, but until we have live data to calibrate
+        // against, unit weights match what the design doc proposed.
         for (resource, amount) in samples {
+            if !governance_ingests_axis(*resource) {
+                continue;
+            }
             let weight = resource_weight(*resource);
             self.governance.ingest_cost(contract_id, *amount * weight);
         }
@@ -4466,6 +4471,47 @@ fn resource_weight(resource: crate::topology::meter::ResourceType) -> f64 {
         InboundBandwidthBytes | OutboundBandwidthBytes => 1.0,
         ExecCpuMicros | ExecFuelUnits => 1.0,
         StateBytesWritten | BroadcastFanoutCost | BroadcastMessagesSent => 1.0,
+    }
+}
+
+/// Whether a cost axis feeds the GOVERNANCE cost/benefit ban decision.
+///
+/// This is deliberately an inclusion allowlist (only `StateBytesWritten`
+/// today), NOT "every axis" or "everything except X" — and it is exhaustive so
+/// a new [`ResourceType`](crate::topology::meter::ResourceType) variant must be
+/// consciously classified here.
+///
+/// WHY governance must NOT ingest the #4861 cost-eviction axes
+/// (`ExecCpuMicros`, `BroadcastFanoutCost`, `BroadcastMessagesSent`): those are
+/// per-send / per-update signals that scale with a contract's POPULARITY (a
+/// heavily-subscribed contract fans out more, so it accrues more send CPU and
+/// fan-out cost). Governance is a benefit-thresholded BAN system that — unlike
+/// the cost-eviction sweep — has NO zero-demand candidacy protection (invariant
+/// 3), so feeding it a popularity-scaled cost reproduces the #4296 "popular
+/// contract banned for being popular" false positive BY CONSTRUCTION: the
+/// contract crosses the ban threshold before its live-beneficiary count (the
+/// denominator that would spare it) can register, and a banned contract then
+/// drops inbound Subscribe, so its benefit can never catch up. The
+/// `popular_contract_with_subscribers_not_evicted` sim test is exactly this
+/// scenario. Storms are the cost-eviction sweep's job (it HAS the zero-demand
+/// protection); governance is Off in production, so excluding these axes is a
+/// pure de-risking that restores the cost basis governance was calibrated
+/// against on `main` (`StateBytesWritten`, the sole production feed via
+/// `commit_state_write`).
+///
+/// A future governance-On effort that wants to weigh CPU/fan-out MUST first add
+/// a benefit-aware normalization (e.g. cost-PER-beneficiary), NOT re-add these
+/// raw axes here — doing so silently re-opens #4296. See #4296 / #4861.
+fn governance_ingests_axis(resource: crate::topology::meter::ResourceType) -> bool {
+    use crate::topology::meter::ResourceType::*;
+    match resource {
+        // The axis governance was calibrated against on `main`.
+        StateBytesWritten => true,
+        // #4861 cost-eviction axes: popularity-scaled → meter/sweep only.
+        ExecCpuMicros | BroadcastFanoutCost | BroadcastMessagesSent => false,
+        // Peer-attributed bandwidth / fuel: never fed governance (it keys on
+        // per-contract cost), keep them out.
+        InboundBandwidthBytes | OutboundBandwidthBytes | ExecFuelUnits => false,
     }
 }
 
@@ -8563,6 +8609,71 @@ mod cost_pressure_seam_tests {
             super::hosting::COST_RATE_MIN_WINDOW,
             COST_SUSTAINED_WINDOW,
             "sustained-window mirror drifted from cache.rs COST_RATE_MIN_WINDOW",
+        );
+    }
+
+    /// Governance cost ingestion accepts ONLY `StateBytesWritten` and REJECTS
+    /// the three #4861 cost-eviction axes (and the peer/fuel axes). Pinning
+    /// this prevents silently re-feeding governance a popularity-scaled cost
+    /// axis, which reproduces the #4296 "popular contract banned for being
+    /// popular" false positive (see `governance_ingests_axis` rustdoc and the
+    /// `popular_contract_with_subscribers_not_evicted` sim test). Exhaustive so
+    /// a new ResourceType variant must be classified with the same guard.
+    #[test]
+    fn governance_ingests_only_state_bytes_written() {
+        use crate::topology::meter::ResourceType;
+        assert!(
+            super::governance_ingests_axis(ResourceType::StateBytesWritten),
+            "governance MUST ingest StateBytesWritten (its main-calibrated basis)"
+        );
+        for axis in [
+            ResourceType::ExecCpuMicros,
+            ResourceType::BroadcastFanoutCost,
+            ResourceType::BroadcastMessagesSent,
+        ] {
+            assert!(
+                !super::governance_ingests_axis(axis),
+                "governance MUST NOT ingest the #4861 cost-eviction axis {axis:?} \
+                 (popularity-scaled → resurrects #4296); it feeds the meter/sweep only"
+            );
+        }
+        for axis in [
+            ResourceType::InboundBandwidthBytes,
+            ResourceType::OutboundBandwidthBytes,
+            ResourceType::ExecFuelUnits,
+        ] {
+            assert!(
+                !super::governance_ingests_axis(axis),
+                "peer/fuel axis {axis:?} is not per-contract cost; governance must not ingest it"
+            );
+        }
+    }
+
+    /// Source-scrape pin: the governance feed in `report_contract_resource_usage_batch`
+    /// MUST stay gated by `governance_ingests_axis`, so a future edit can't drop
+    /// the gate and re-flood governance with the #4861 cost-eviction axes.
+    #[test]
+    fn governance_feed_is_gated_by_axis_allowlist() {
+        let src = include_str!("ring.rs");
+        let start = src
+            .find("fn report_contract_resource_usage_batch(")
+            .expect("report_contract_resource_usage_batch not found");
+        let body_end = src[start..]
+            .find("\n    // Note: there is intentionally no `ingest_contract_demand`")
+            .expect("end of report_contract_resource_usage_batch not found")
+            + start;
+        let body = &src[start..body_end];
+        let ingest = body
+            .find(".governance.ingest_cost(")
+            .expect("governance.ingest_cost call missing from the batch feed");
+        let gate = body
+            .find("if !governance_ingests_axis(")
+            .expect("governance feed MUST be gated by governance_ingests_axis (#4296 guard)");
+        assert!(
+            gate < ingest,
+            "the governance_ingests_axis gate MUST precede (guard) the \
+             ingest_cost call, else the #4861 axes re-flood governance and \
+             resurrect #4296"
         );
     }
 }
