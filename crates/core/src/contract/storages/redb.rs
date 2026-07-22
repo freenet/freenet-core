@@ -77,6 +77,40 @@ pub(crate) const USER_SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const MIGRATION_MARKER_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_secret_migration_marker");
 
+/// Durable record of the web-app contract origins under which each delegate has
+/// been registered (#4117 H1 same-origin gate). Written on EVERY successful
+/// delegate registration (both `RegisterDelegate` and
+/// `RegisterDelegateWithPredecessors`). Copy-forward consults it: a predecessor's
+/// Local secrets are copied into a successor ONLY when the registering request's
+/// origin is among the predecessor's recorded origins (or both are the Admin/None
+/// class), so a malicious web-app cannot register a delegate that names an
+/// unrelated victim delegate as a predecessor to exfiltrate its secrets
+/// (predecessor keys are public-derivable). See `SecretsStore::delegate_origins`.
+///
+/// Key: DelegateKey (64 bytes)
+/// Value: `[has_admin_none: 1][N × ContractInstanceId(32)]` — `has_admin_none`
+///        records that the delegate was at least once registered with no contract
+///        origin (loopback / CLI / admin).
+pub(crate) const DELEGATE_ORIGINS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_registration_origins");
+
+/// Durable, UNCAPPED set of the secret hashes each delegate holds in the reserved
+/// `\0freenet-migrate/` coordination namespace (#4117 finding 4a). Recorded at
+/// `store_secret` time whenever a Local secret's raw key is under that namespace
+/// (covers both this node's `pred-done:` markers and the app-side `pred-wip:`
+/// markers, since both are written via the registering `set_secret`/`store_secret`
+/// path). Copy-forward excludes these hashes from BOTH the value copy and the
+/// enumeration copy. It exists because the advisory `.keys` enumeration registry
+/// is CAPPED (`MAX_REGISTERED_KEYS_PER_SCOPE`) and may be unreadable — at/above
+/// the cap or with a missing registry, a marker's raw key would be invisible to a
+/// registry-based check and could chain-copy as user data, poisoning `had_data`
+/// and falsely gating a later migration. This table is registry-independent.
+///
+/// Key: DelegateKey (64 bytes)
+/// Value: concatenated 32-byte secret hashes (N × 32 bytes)
+pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_reserved_marker_hashes");
+
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
 pub struct HostingMetadata {
@@ -481,6 +515,28 @@ impl ReDb {
                     table = "MIGRATION_MARKER_TABLE",
                     phase = "table_init_failed",
                     "Failed to open MIGRATION_MARKER_TABLE"
+                );
+                e
+            })?;
+
+            // Delegate registration origins (#4117 H1) + reserved-marker hashes
+            // (#4117 4a). Both created on first open of upgraded databases too.
+            txn.open_table(DELEGATE_ORIGINS_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "DELEGATE_ORIGINS_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open DELEGATE_ORIGINS_TABLE"
+                );
+                e
+            })?;
+
+            txn.open_table(RESERVED_MARKER_HASHES_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "RESERVED_MARKER_HASHES_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open RESERVED_MARKER_HASHES_TABLE"
                 );
                 e
             })?;
@@ -1188,6 +1244,140 @@ impl ReDb {
             match tbl.get(key_bytes.as_slice())? {
                 Some(v) => Ok(Some(v.value().to_vec())),
                 None => Ok(None),
+            }
+        })
+    }
+
+    // ========== Delegate registration origins (#4117 H1) ==========
+
+    /// 64-byte delegate key `DelegateKey.key(32) || code_hash(32)` — the same
+    /// encoding the secrets-index tables use.
+    ///
+    /// NOTE (#4117 L3): this redb row key includes the `code_hash`, whereas the
+    /// copy-forward's on-disk namespace and the migration gate are keyed on the
+    /// 32-byte delegate KEY only (`DelegateKey::encode()`). This is harmless:
+    /// `key = BLAKE3(code_hash || params)`, so key and code_hash move together —
+    /// two `DelegateKey`s that share a key but differ in code_hash cannot occur
+    /// for a real delegate. The wider row key just matches the sibling
+    /// secrets-index tables' convention.
+    fn delegate_key64(delegate: &DelegateKey) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        b[..32].copy_from_slice(delegate.as_ref());
+        b[32..].copy_from_slice(delegate.code_hash().as_ref());
+        b
+    }
+
+    /// Record a web-app contract origin for `delegate` (idempotent). `origin =
+    /// None` records the Admin/None class (loopback / CLI registration). Grows
+    /// the row's origin set; a repeated origin is a no-op.
+    pub fn record_delegate_origin(
+        &self,
+        delegate: &DelegateKey,
+        origin: Option<[u8; 32]>,
+    ) -> Result<(), redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(DELEGATE_ORIGINS_TABLE)?;
+            let (mut has_admin_none, mut origins) = match tbl.get(key.as_slice())? {
+                Some(v) => Self::decode_origins(v.value()),
+                None => (false, Vec::new()),
+            };
+            match origin {
+                None => has_admin_none = true,
+                Some(o) => {
+                    if !origins.iter().any(|e| e == &o) {
+                        origins.push(o);
+                    }
+                }
+            }
+            let mut value = Vec::with_capacity(1 + origins.len() * 32);
+            value.push(u8::from(has_admin_none));
+            for o in &origins {
+                value.extend_from_slice(o);
+            }
+            tbl.insert(key.as_slice(), value.as_slice())?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Fetch `delegate`'s recorded origins as `(has_admin_none, origins)`, or
+    /// `None` if the delegate has never been registered on this node (the
+    /// grandfather case for copy-forward).
+    #[allow(clippy::type_complexity)]
+    pub fn get_delegate_origins(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<Option<(bool, Vec<[u8; 32]>)>, redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_ORIGINS_TABLE)?;
+            match tbl.get(key.as_slice())? {
+                Some(v) => Ok(Some(Self::decode_origins(v.value()))),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn decode_origins(bytes: &[u8]) -> (bool, Vec<[u8; 32]>) {
+        if bytes.is_empty() {
+            return (false, Vec::new());
+        }
+        let has_admin_none = bytes[0] != 0;
+        let rest = &bytes[1..];
+        let mut origins = Vec::with_capacity(rest.len() / 32);
+        for chunk in rest.chunks_exact(32) {
+            let arr: [u8; 32] = chunk.try_into().unwrap();
+            origins.push(arr);
+        }
+        (has_admin_none, origins)
+    }
+
+    // ========== Reserved-marker hashes (#4117 finding 4a) ==========
+
+    /// Record that `delegate` holds a reserved-namespace coordination secret
+    /// with hash `hash` (idempotent). Uncapped and registry-independent.
+    pub fn add_reserved_marker_hash(
+        &self,
+        delegate: &DelegateKey,
+        hash: &[u8; 32],
+    ) -> Result<(), redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(RESERVED_MARKER_HASHES_TABLE)?;
+            let mut hashes: Vec<u8> = match tbl.get(key.as_slice())? {
+                Some(v) => v.value().to_vec(),
+                None => Vec::new(),
+            };
+            // Idempotent: skip if already present.
+            if !hashes.chunks_exact(32).any(|c| c == hash.as_slice()) {
+                hashes.extend_from_slice(hash);
+                tbl.insert(key.as_slice(), hashes.as_slice())?;
+            }
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// All reserved-namespace secret hashes recorded for `delegate`.
+    pub fn get_reserved_marker_hashes(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<Vec<[u8; 32]>, redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(RESERVED_MARKER_HASHES_TABLE)?;
+            match tbl.get(key.as_slice())? {
+                Some(v) => {
+                    let bytes = v.value();
+                    let mut out = Vec::with_capacity(bytes.len() / 32);
+                    for chunk in bytes.chunks_exact(32) {
+                        let arr: [u8; 32] = chunk.try_into().unwrap();
+                        out.push(arr);
+                    }
+                    Ok(out)
+                }
+                None => Ok(Vec::new()),
             }
         })
     }

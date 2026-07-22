@@ -465,6 +465,19 @@ impl Runtime {
             .migrate_secrets(predecessors, successor, origin_contract)
     }
 
+    /// Durably record the web-app origin under which `delegate` was registered,
+    /// for the H1 same-origin copy-forward gate (#4117). Called on every
+    /// successful registration. Another route to the `pub(super) secret_store`
+    /// from the executor module tree, like `migrate_delegate_secrets`.
+    pub(crate) fn record_delegate_registration_origin(
+        &self,
+        delegate: &DelegateKey,
+        origin: Option<[u8; 32]>,
+    ) {
+        self.secret_store
+            .record_delegate_registration_origin(delegate, origin);
+    }
+
     pub fn build_with_config(
         contract_store: ContractStore,
         delegate_store: DelegateStore,
