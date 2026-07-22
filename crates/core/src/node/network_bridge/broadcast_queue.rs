@@ -747,6 +747,46 @@ pub(super) async fn broadcast_to_single_peer(
 
     let peer_key = PeerKey::from(target.pub_key().clone());
 
+    // Cost telemetry (cost-aware eviction, #4861): attribute this per-peer
+    // send's two costs to the contract:
+    //   * `ExecCpuMicros` — the summarize + delta WASM work below, burned for
+    //     EVERY peer send (dominant, otherwise-unmetered CPU for a
+    //     high-frequency tiny-payload storm). Wall elapsed of the awaited
+    //     computation via the ring's injected TimeSource; may include executor
+    //     queueing, still work this send triggered.
+    //   * `BroadcastFanoutCost` — the ACTUAL payload bytes put on the wire,
+    //     known only HERE after delta selection (the #4903 review P1 fix: the
+    //     dispatch site can no longer charge `full-state × targets`, which
+    //     phantom-inflated a large-state contract that sends tiny deltas).
+    // The CPU is reported at ALL exits (the WASM summarize+delta work is burned
+    // regardless of whether the send lands): the two summary-skip exits and the
+    // send-attempt path each report the CPU they burned. The payload BYTES are
+    // reported ONLY on a real delivery (streaming `Delivered` / inline send Ok
+    // — #4903 review round-3 Fix 4), NOT up-front: a dropped/timed-out stream or
+    // a failed enqueue put nothing on the wire, so charging its bytes inflated
+    // the contract's BroadcastFanoutCost with phantom fan-out. (This is why the
+    // send-CPU and bytes reports are no longer batched — they now happen at
+    // different points in the send lifecycle.)
+    let cost_clock = op_manager.ring.time_source.clone();
+    let send_wasm_started = cost_clock.now();
+    // Reports ONLY the send-CPU (summarize+delta WASM), burned for every attempt
+    // regardless of whether the send lands. The fan-out payload BYTES are charged
+    // separately at the real-delivery sites below (#4903 review round-3 Fix 4),
+    // so a dropped/timed-out stream or a failed enqueue never charges phantom
+    // BroadcastFanoutCost.
+    let report_send_cpu = |op_manager: &Arc<OpManager>| {
+        use crate::topology::meter::ResourceType;
+        let elapsed_us = cost_clock
+            .now()
+            .saturating_duration_since(send_wasm_started)
+            .as_micros() as f64;
+        op_manager.ring.report_contract_resource_usage(
+            *key.id(),
+            ResourceType::ExecCpuMicros,
+            elapsed_us,
+        );
+    };
+
     // Get our summary for delta computation
     let our_summary = op_manager
         .interest_manager
@@ -784,6 +824,7 @@ pub(super) async fn broadcast_to_single_peer(
                 "Skipping broadcast - peer already has our state (byte-equal \
                  or logically converged summaries)"
             );
+            report_send_cpu(op_manager);
             return;
         }
     }
@@ -830,6 +871,11 @@ pub(super) async fn broadcast_to_single_peer(
                         "Skipping broadcast - contract reported empty delta \
                          (peer converged)"
                     );
+                    // #4903 review P2: the summarize + delta WASM already ran,
+                    // so account for the CPU it burned even though nothing is
+                    // sent (no bytes). Previously this exit returned without
+                    // reporting, undercounting the send-CPU axis.
+                    report_send_cpu(op_manager);
                     return;
                 }
                 Err(err) => {
@@ -850,8 +896,16 @@ pub(super) async fn broadcast_to_single_peer(
             false,
         ),
     };
-
     let payload_size = payload.size();
+    // Attribute the summarize + delta WASM (CPU) burned to produce this send.
+    // Reported for EVERY attempt (the WASM work ran regardless of whether the
+    // send lands). The payload BYTES are charged separately, ONLY on a real
+    // delivery below (#4903 review round-3 Fix 4) — not here — so a dropped or
+    // failed send never charges phantom fan-out bytes. `payload_size` is the
+    // real delta/full-state size chosen above, not a `full-state × targets`
+    // over-estimate.
+    report_send_cpu(op_manager);
+
     let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
 
     // Check if we should use streaming for full state broadcasts
@@ -994,6 +1048,15 @@ pub(super) async fn broadcast_to_single_peer(
                 // v0.2.73 incident.
                 BROADCAST_STREAM_METRICS.record_attempt(delivered);
                 if delivered {
+                    // #4903 review round-3 Fix 4: charge the fan-out payload
+                    // bytes ONLY on a real delivery. A dropped/timed-out stream
+                    // put no bytes on the wire; the send CPU was already charged
+                    // for the attempt above.
+                    op_manager.ring.report_contract_resource_usage(
+                        *key.id(),
+                        crate::topology::meter::ResourceType::BroadcastFanoutCost,
+                        payload_size as f64,
+                    );
                     tracing::debug!(
                         tx = %update_tx,
                         peer = %peer_addr,
@@ -1026,6 +1089,15 @@ pub(super) async fn broadcast_to_single_peer(
         // successful enqueue is the terminal state we can observe, so delivery
         // tracks the send result (unchanged pre-#4235 behavior for this path).
         if res.is_ok() {
+            // #4903 review round-3 Fix 4: charge the fan-out payload bytes on a
+            // successful send only. For the inline path a successful enqueue is
+            // the terminal delivery signal (see the branch comment above); the
+            // send CPU was already charged for the attempt.
+            op_manager.ring.report_contract_resource_usage(
+                *key.id(),
+                crate::topology::meter::ResourceType::BroadcastFanoutCost,
+                payload_size as f64,
+            );
             // Delta-incompat attribution (HQk7 resync loop): remember that we
             // just delivered a DELTA to this peer so a prompt `ResyncRequest`
             // from it can be attributed to the delta failing to apply (deltas
@@ -1923,6 +1995,69 @@ mod tests {
             "fanout_send_needed must decide from the probe verdict via \
              summary_indicates_stale_peer (semantic policy), not inline byte \
              inequality"
+        );
+    }
+
+    /// Source-scrape pin (cost-aware eviction, #4861 / #4903 review P1+P2 +
+    /// round-3 Fix 4): `broadcast_to_single_peer` must charge its per-send CPU
+    /// at ALL THREE exits — the summaries-equal skip, the empty-delta converged
+    /// skip (the review-P2 exit that previously returned without reporting), and
+    /// the send attempt — since the WASM summarize+delta work is burned
+    /// regardless of whether the send lands. The fan-out payload BYTES, by
+    /// contrast, are charged ONLY at the two real-delivery sites (streaming
+    /// `Delivered` + inline send Ok), NEVER up-front — a dropped/failed send put
+    /// nothing on the wire (round-3 Fix 4). Dropping a report silently blinds
+    /// the cost-pressure eviction trigger while every behavioral test stays
+    /// green.
+    #[test]
+    fn broadcast_to_single_peer_reports_send_cost_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer (start of tests module) not found");
+        let body = &after[..fn_end];
+
+        // The CPU-only closure must be invoked at all three exits (the WASM
+        // summarize+delta work is burned regardless of whether the send lands).
+        let report_invocations = body.matches("report_send_cpu(op_manager)").count();
+        assert_eq!(
+            report_invocations, 3,
+            "broadcast_to_single_peer must invoke report_send_cpu at all three \
+             exits (summaries-equal skip + empty-delta converged skip + send \
+             attempt) — got {report_invocations}. A dropped report blinds \
+             cost-pressure eviction (#4861) to per-send CPU."
+        );
+        // Bytes are attributed on the BroadcastFanoutCost axis at exactly the
+        // two real-delivery sites (streaming `Delivered` + inline send Ok), and
+        // the send-CPU on the ExecCpuMicros axis (split needles so this test
+        // cannot self-count). The count of 2 (not 3) is the round-3 Fix 4 pin:
+        // the CPU closure no longer charges bytes, so a dropped/failed send
+        // charges no phantom fan-out.
+        let cpu_needle = concat!("ResourceType::", "Exec", "CpuMicros");
+        let bytes_needle = concat!("ResourceType::", "Broadcast", "FanoutCost");
+        assert!(
+            body.contains(cpu_needle),
+            "report_send_cpu must attribute on the ExecCpuMicros axis"
+        );
+        assert_eq!(
+            body.matches(bytes_needle).count(),
+            2,
+            "fan-out bytes must be charged on the BroadcastFanoutCost axis at \
+             exactly the two real-delivery sites (streaming Delivered + inline \
+             send Ok) — never up-front (review round-3 Fix 4)"
+        );
+        // The selected payload size (delta or full state) is what's charged, at
+        // both delivery sites and nowhere else.
+        assert_eq!(
+            body.matches("payload_size as f64").count(),
+            2,
+            "each delivery-gated bytes report must charge the selected \
+             payload_size (delta or full state), not the pre-delta full-state size"
         );
     }
 }

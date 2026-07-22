@@ -51,9 +51,27 @@
 //!   probe's own soundness hardening (it no longer flags benign byte-flutter
 //!   — see `Executor::maybe_probe_idempotency`), false positives should be
 //!   rare *and* recoverable rather than permanent.
+//! ## Escalating TTL on re-detection (#4903 review B-tweak)
+//!
+//! A fixed TTL turns a genuinely non-idempotent contract into a limit-cycle
+//! OSCILLATOR once #4902's egress gates suppress it: the flagged node goes
+//! dark for one TTL, the flag expires, the node re-enters the still-divergent
+//! mesh, a cascade burst (sized by the drift accumulated while it was dark)
+//! re-flags it, and the cycle repeats — raising per-peer emissions well above
+//! steady participation. To damp this, the TTL ESCALATES on re-detection:
+//! first detection stays at [`BROKEN_INVARIANT_TTL`], and each re-detection
+//! within the re-flag window doubles it (capped at
+//! [`BROKEN_INVARIANT_TTL_CAP`]). A genuinely-broken contract therefore
+//! converges to mostly-dark — its re-entry duty cycle collapses geometrically,
+//! drift shrinks as fewer peers advance it, and the oscillation dies out. A
+//! contract that stops being re-detected for a full quiet window resets to
+//! baseline, and a contract flagged exactly once (the #4295 false positive)
+//! never escalates at all. See [`BrokenInvariantsTracker::record`].
+//!
 //! - **True violation:** suppressed for a TTL, then re-detected and re-flagged
-//!   (which refreshes the window, so a continuously-merging violator stays
-//!   suppressed). Re-detection is probabilistic: after expiry the probe samples
+//!   with an ESCALATED (doubled) TTL, so a continuously-oscillating violator's
+//!   dark window grows each cycle until it is effectively silent. Re-detection
+//!   is probabilistic: after expiry the probe samples
 //!   at [`crate::contract::executor`]'s `IDEMPOTENCY_PROBE_PROBABILITY` (1/32),
 //!   so the contract leaks the merges that occur between expiry and the next
 //!   sampled probe — in expectation ~32 merges, with a longer tail under a high
@@ -81,14 +99,40 @@ use tokio::time::Instant;
 use crate::contract::storages::Storage;
 use crate::util::time_source::TimeSource;
 
-/// How long a broken-invariant flag suppresses a contract before it expires
-/// and the contract is given a fresh chance (re-detected by the next sampled
-/// probe if genuinely still broken).
+/// Baseline (FIRST-detection) suppression TTL: how long a freshly-flagged
+/// contract is suppressed before its flag expires and it is given a fresh
+/// chance (re-detected by the next sampled probe if genuinely still broken).
 ///
 /// Chosen to be long enough that a genuinely non-convergent contract leaks at
 /// most ≈one merge per window (negligible amplification) yet short enough that
-/// a false positive recovers promptly rather than bricking the contract.
+/// a false positive recovers promptly rather than bricking the contract. A
+/// contract flagged exactly ONCE (the #4295 false-positive shape) is
+/// suppressed for exactly this long and then recovers — escalation (below)
+/// never touches it, so this preserves the pre-escalation false-positive
+/// conservatism unchanged.
 pub(crate) const BROKEN_INVARIANT_TTL: Duration = Duration::from_secs(300);
+
+/// Ceiling for the escalated suppression TTL (#4903 review B-tweak, stops the
+/// #4902 egress oscillation). A contract that keeps being RE-detected after
+/// each expiry doubles its TTL toward this cap; past it the TTL stops growing.
+/// Six hours: long enough that a genuinely-broken contract's re-entry
+/// oscillation collapses to a negligible duty cycle, bounded so even a
+/// (vanishingly unlikely) escalated false positive still self-heals within a
+/// working day.
+pub(crate) const BROKEN_INVARIANT_TTL_CAP: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Re-flag window multiplier (#4903 review B-tweak). Measured from the last
+/// detection, the window `[ttl, REFLAG_WINDOW_MULT × ttl)` is the "still
+/// oscillating" band: a re-detection inside it ESCALATES (doubles) the TTL,
+/// because the contract went dark for its TTL and then re-entered the mesh and
+/// was caught again. A re-detection at or beyond `REFLAG_WINDOW_MULT × ttl`
+/// means the contract stayed quiet for an escalated TTL PLUS a full window, so
+/// escalation RESETS to baseline (it is no longer oscillating — genuinely
+/// fixed, or the flag was a one-off false positive). This multiplier is also
+/// the age at which [`BrokenInvariantsTracker::cleanup`] reclaims an idle
+/// entry, so the escalation memory outlives the suppression window (allowing a
+/// prompt re-detection to escalate rather than restart) but stays bounded.
+const REFLAG_WINDOW_MULT: u32 = 2;
 
 /// Per-contract cooldown for the deterministic identical-input idempotency
 /// probe (`Executor::probe_identical_input_idempotency`). The #4151
@@ -126,12 +170,20 @@ impl BrokenInvariant {
     }
 }
 
-/// An in-memory flag together with the instant it was (re-)recorded, so the
-/// flag can expire after [`BROKEN_INVARIANT_TTL`].
+/// An in-memory flag together with the instant it was (re-)recorded and the
+/// CURRENT (possibly escalated) suppression TTL for this detection, so the
+/// flag can expire after its own `ttl` and the escalation policy can grow that
+/// TTL on repeated re-detection (#4903 review B-tweak).
 #[derive(Debug, Clone, Copy)]
 struct FlagEntry {
     kind: BrokenInvariant,
     recorded_at: Instant,
+    /// Suppression TTL for THIS detection cycle. Starts at
+    /// [`BROKEN_INVARIANT_TTL`] on first detection and doubles (capped at
+    /// [`BROKEN_INVARIANT_TTL_CAP`]) on each re-detection within the re-flag
+    /// window; resets to baseline after a full quiet window. In-memory only —
+    /// a restart re-hydrates flags at the baseline TTL.
+    ttl: Duration,
 }
 
 /// Tracks per-contract broken-invariant flags with optional persistent backing.
@@ -199,7 +251,7 @@ impl BrokenInvariantsTracker {
     pub fn is_broken(&self, id: &ContractInstanceId) -> bool {
         let now = self.time_source.now();
         match self.flags.get(id) {
-            Some(entry) => now.saturating_duration_since(entry.recorded_at) < BROKEN_INVARIANT_TTL,
+            Some(entry) => now.saturating_duration_since(entry.recorded_at) < entry.ttl,
             None => false,
         }
     }
@@ -211,7 +263,7 @@ impl BrokenInvariantsTracker {
     pub fn get(&self, id: &ContractInstanceId) -> Option<BrokenInvariant> {
         let now = self.time_source.now();
         self.flags.get(id).and_then(|entry| {
-            if now.saturating_duration_since(entry.recorded_at) < BROKEN_INVARIANT_TTL {
+            if now.saturating_duration_since(entry.recorded_at) < entry.ttl {
                 Some(entry.kind)
             } else {
                 None
@@ -219,40 +271,115 @@ impl BrokenInvariantsTracker {
         })
     }
 
-    /// Mark `id` as broken with `kind`, stamping the current time. Re-recording
-    /// an already-flagged contract refreshes its expiry (so a contract the
-    /// probe keeps re-detecting stays suppressed). Persists best-effort to
-    /// storage if wired; persistence errors are logged but never block the
-    /// in-memory flag from taking effect (we'd rather suppress the storm than
-    /// crash on a database hiccup).
+    /// The current (possibly escalated) suppression TTL for `id`, if flagged.
+    /// Test-only accessor for the escalation-policy tests.
+    #[cfg(test)]
+    pub fn current_ttl(&self, id: &ContractInstanceId) -> Option<Duration> {
+        self.flags.get(id).map(|entry| entry.ttl)
+    }
+
+    /// Mark `id` as broken with `kind`, stamping the current time and applying
+    /// the escalating-TTL policy (#4903 review B-tweak).
+    ///
+    /// - **First detection** (no live entry): baseline [`BROKEN_INVARIANT_TTL`].
+    /// - **Re-detection within the re-flag window** (`[ttl, REFLAG_WINDOW_MULT ×
+    ///   ttl)` since the last detection): ESCALATE — double the TTL, capped at
+    ///   [`BROKEN_INVARIANT_TTL_CAP`]. This is a contract that went dark for its
+    ///   TTL, re-entered the mesh, and was caught again — the #4902 oscillator.
+    ///   Escalating collapses its re-entry duty cycle geometrically.
+    /// - **Re-detection while still suppressed** (`< ttl`): refresh the stamp
+    ///   at the SAME TTL (same detection cycle; not a new oscillation).
+    /// - **Re-detection after a full quiet window** (`≥ REFLAG_WINDOW_MULT ×
+    ///   ttl`): RESET to baseline — no longer oscillating.
+    ///
+    /// A contract flagged exactly ONCE (the #4295 false-positive shape) never
+    /// re-detects, so it never escalates: its behavior is identical to the
+    /// pre-escalation baseline.
+    ///
+    /// Persists best-effort to storage on first detection if wired; persistence
+    /// errors are logged but never block the in-memory flag (we'd rather
+    /// suppress the storm than crash on a database hiccup). The escalation level
+    /// is in-memory only — the persisted row records just the flag kind, so a
+    /// restart re-hydrates at the baseline TTL.
     pub fn record(&self, id: ContractInstanceId, kind: BrokenInvariant) {
-        let recorded_at = self.time_source.now();
-        let was_new = self
-            .flags
-            .insert(id, FlagEntry { kind, recorded_at })
-            .is_none();
-        if was_new {
-            tracing::warn!(
-                contract = %id,
-                invariant = ?kind,
-                event = "broken_invariant_detected",
-                "Marking contract as broken — gating outbound broadcast and merge propagation"
-            );
-            // Persistence is currently only wired for the redb backend;
-            // sqlite-only builds keep the in-memory flag but skip the
-            // on-disk hydration. This is the same trade-off
-            // `HostingManager` makes — see #4279 deferred follow-up to
-            // add sqlite parity.
-            #[cfg(feature = "redb")]
-            if let Some(storage) = self.storage.read().as_ref() {
-                if let Err(e) = storage.store_broken_invariant(&id, kind.to_byte()) {
-                    tracing::warn!(
-                        contract = %id,
-                        error = %e,
-                        "Failed to persist broken-invariant flag (in-memory flag still active)"
-                    );
+        use dashmap::mapref::entry::Entry;
+        let now = self.time_source.now();
+
+        // Decide the new TTL under the shard guard, then release it before any
+        // logging / persistence (never hold a DashMap guard across the storage
+        // lock).
+        enum Outcome {
+            New,
+            Escalated(Duration),
+            Refreshed,
+        }
+        let outcome = match self.flags.entry(id) {
+            Entry::Occupied(mut o) => {
+                let elapsed = now.saturating_duration_since(o.get().recorded_at);
+                let ttl = o.get().ttl;
+                let reflag_window = ttl * REFLAG_WINDOW_MULT;
+                let (new_ttl, outcome) = if elapsed >= reflag_window {
+                    // Quiet for an escalated TTL plus a full window → reset.
+                    (BROKEN_INVARIANT_TTL, Outcome::Refreshed)
+                } else if elapsed >= ttl {
+                    // Re-detected after expiry, within the re-flag window →
+                    // escalate (double, capped).
+                    let escalated = (ttl * 2).min(BROKEN_INVARIANT_TTL_CAP);
+                    (escalated, Outcome::Escalated(escalated))
+                } else {
+                    // Still within the active suppression window → same cycle.
+                    (ttl, Outcome::Refreshed)
+                };
+                *o.get_mut() = FlagEntry {
+                    kind,
+                    recorded_at: now,
+                    ttl: new_ttl,
+                };
+                outcome
+            }
+            Entry::Vacant(v) => {
+                v.insert(FlagEntry {
+                    kind,
+                    recorded_at: now,
+                    ttl: BROKEN_INVARIANT_TTL,
+                });
+                Outcome::New
+            }
+        };
+
+        match outcome {
+            Outcome::New => {
+                tracing::warn!(
+                    contract = %id,
+                    invariant = ?kind,
+                    event = "broken_invariant_detected",
+                    "Marking contract as broken — gating outbound broadcast and merge propagation"
+                );
+                // Persistence is currently only wired for the redb backend;
+                // sqlite-only builds keep the in-memory flag but skip the
+                // on-disk hydration. This is the same trade-off
+                // `HostingManager` makes — see #4279 deferred follow-up to
+                // add sqlite parity.
+                #[cfg(feature = "redb")]
+                if let Some(storage) = self.storage.read().as_ref() {
+                    if let Err(e) = storage.store_broken_invariant(&id, kind.to_byte()) {
+                        tracing::warn!(
+                            contract = %id,
+                            error = %e,
+                            "Failed to persist broken-invariant flag (in-memory flag still active)"
+                        );
+                    }
                 }
             }
+            Outcome::Escalated(new_ttl) => {
+                tracing::debug!(
+                    contract = %id,
+                    escalated_ttl_secs = new_ttl.as_secs(),
+                    event = "broken_invariant_ttl_escalated",
+                    "Re-detected broken contract — escalating suppression TTL (#4902 egress oscillation)"
+                );
+            }
+            Outcome::Refreshed => {}
         }
     }
 
@@ -286,27 +413,32 @@ impl BrokenInvariantsTracker {
     /// for contracts that are no longer being read on the hot path.
     pub fn cleanup(&self) {
         let now = self.time_source.now();
-        // Snapshot the currently-expired ids (read-only).
+        // Reclaim an entry only once it is past its RESET boundary
+        // (`REFLAG_WINDOW_MULT × ttl` since the last detection), not merely
+        // past its suppression TTL: between `ttl` and `REFLAG_WINDOW_MULT ×
+        // ttl` the flag no longer suppresses (`is_broken` is false) but the
+        // entry is retained as escalation memory, so a prompt re-detection can
+        // ESCALATE rather than restart at baseline (#4903 review B-tweak).
+        // Snapshot the reclaimable ids (read-only).
+        let reclaimable = |entry: &FlagEntry| {
+            now.saturating_duration_since(entry.recorded_at) >= entry.ttl * REFLAG_WINDOW_MULT
+        };
         let candidates: Vec<ContractInstanceId> = self
             .flags
             .iter()
-            .filter(|e| {
-                now.saturating_duration_since(e.value().recorded_at) >= BROKEN_INVARIANT_TTL
-            })
+            .filter(|e| reclaimable(e.value()))
             .map(|e| *e.key())
             .collect();
         for id in candidates {
-            // Atomically re-check expiry under the shard guard and remove only
-            // if STILL expired. This closes a TOCTOU race: a concurrent
+            // Atomically re-check under the shard guard and remove only if
+            // STILL reclaimable. This closes a TOCTOU race: a concurrent
             // `record()` (e.g. a probe re-detecting the same contract) may have
-            // refreshed `recorded_at` between the snapshot above and here — in
-            // which case `remove_if` keeps the fresh entry, and we must NOT
-            // purge its persisted row (a restart needs it to re-hydrate the
-            // active suppression). We only touch storage when we actually
-            // removed an expired entry.
-            let removed = self.flags.remove_if(&id, |_, entry| {
-                now.saturating_duration_since(entry.recorded_at) >= BROKEN_INVARIANT_TTL
-            });
+            // refreshed `recorded_at`/escalated `ttl` between the snapshot above
+            // and here — in which case `remove_if` keeps the fresh entry, and we
+            // must NOT purge its persisted row (a restart needs it to re-hydrate
+            // the active suppression). We only touch storage when we actually
+            // removed a reclaimable entry.
+            let removed = self.flags.remove_if(&id, |_, entry| reclaimable(entry));
             if removed.is_some() {
                 self.remove_from_storage(&id);
             }
@@ -359,7 +491,19 @@ impl BrokenInvariantsTracker {
                 let recorded_at = self.time_source.now();
                 for (id, byte) in entries {
                     if let Some(kind) = BrokenInvariant::from_byte(byte) {
-                        self.flags.insert(id, FlagEntry { kind, recorded_at });
+                        // Escalation state is in-memory only, so a reload starts
+                        // each flag at the baseline TTL (#4903 review B-tweak):
+                        // a restart resets any prior escalation, and the
+                        // contract re-escalates from scratch if it keeps
+                        // oscillating.
+                        self.flags.insert(
+                            id,
+                            FlagEntry {
+                                kind,
+                                recorded_at,
+                                ttl: BROKEN_INVARIANT_TTL,
+                            },
+                        );
                     } else {
                         tracing::warn!(
                             contract = %id,
@@ -485,23 +629,40 @@ mod tests {
         assert_eq!(t.get(&id), None, "expired flag reports no kind");
     }
 
-    /// `cleanup` physically reclaims expired entries from the in-memory map.
+    /// `cleanup` physically reclaims an entry only once it is past its RESET
+    /// boundary (`REFLAG_WINDOW_MULT × ttl`), not merely past its suppression
+    /// TTL: between the two it is retained as escalation memory so a prompt
+    /// re-detection can escalate rather than restart at baseline.
     #[test]
-    fn cleanup_reclaims_expired_entries() {
+    fn cleanup_reclaims_entries_past_reset_boundary() {
         let (t, ts) = mk_tracker();
         let id = fake_id(7);
         t.record(id, BrokenInvariant::NonIdempotent);
         assert_eq!(t.flags.len(), 1);
 
-        // Before expiry, cleanup keeps it.
-        ts.advance_time(BROKEN_INVARIANT_TTL / 2);
+        // Suppression has expired (past ttl) but we are still inside the
+        // reset boundary (< 2 × ttl): the entry is retained as escalation
+        // memory even though it no longer suppresses.
+        ts.advance_time(BROKEN_INVARIANT_TTL + Duration::from_secs(1));
+        assert!(
+            !t.is_broken(&id),
+            "past its ttl the flag no longer suppresses"
+        );
         t.cleanup();
-        assert_eq!(t.flags.len(), 1, "non-expired entry retained by cleanup");
+        assert_eq!(
+            t.flags.len(),
+            1,
+            "entry retained as escalation memory until the reset boundary"
+        );
 
-        // After expiry, cleanup removes it.
+        // Past the reset boundary (2 × ttl), cleanup reclaims it.
         ts.advance_time(BROKEN_INVARIANT_TTL);
         t.cleanup();
-        assert_eq!(t.flags.len(), 0, "expired entry reclaimed by cleanup");
+        assert_eq!(
+            t.flags.len(),
+            0,
+            "entry past the reset boundary reclaimed by cleanup"
+        );
     }
 
     /// Re-recording refreshes the expiry window so a contract the probe keeps
@@ -566,5 +727,187 @@ mod tests {
         }
         // Unknown bytes are rejected (forward-compat: skip rather than panic).
         assert_eq!(BrokenInvariant::from_byte(255), None);
+    }
+
+    // ===== Escalating-TTL policy (#4903 review B-tweak, #4902 oscillation) =====
+
+    /// (i) The FIRST detection uses exactly the baseline TTL and suppresses for
+    /// exactly that long — unchanged from the pre-escalation behavior, so the
+    /// #4295 false-positive conservatism is preserved.
+    #[test]
+    fn first_flag_uses_baseline_ttl() {
+        let (t, ts) = mk_tracker();
+        let id = fake_id(20);
+        t.record(id, BrokenInvariant::NonIdempotent);
+        assert_eq!(
+            t.current_ttl(&id),
+            Some(BROKEN_INVARIANT_TTL),
+            "first flag = baseline TTL"
+        );
+        ts.advance_time(BROKEN_INVARIANT_TTL - Duration::from_secs(1));
+        assert!(t.is_broken(&id), "suppressed right up to the baseline TTL");
+        ts.advance_time(Duration::from_secs(2));
+        assert!(
+            !t.is_broken(&id),
+            "first flag expires after exactly the baseline TTL"
+        );
+    }
+
+    /// (ii) Each re-detection within the re-flag window doubles the TTL,
+    /// geometrically, up to the cap — then stays pinned at the cap.
+    #[test]
+    fn re_detection_escalates_ttl_geometrically_to_cap() {
+        let (t, ts) = mk_tracker();
+        let id = fake_id(21);
+        t.record(id, BrokenInvariant::NonIdempotent);
+
+        let mut expected = BROKEN_INVARIANT_TTL;
+        assert_eq!(t.current_ttl(&id), Some(expected));
+        for cycle in 0..12 {
+            let ttl = t.current_ttl(&id).unwrap();
+            // Go dark for the whole TTL, then re-detect 1s into the re-flag
+            // window (a fresh oscillation cycle).
+            ts.advance_time(ttl + Duration::from_secs(1));
+            assert!(!t.is_broken(&id), "flag expired before re-detection");
+            t.record(id, BrokenInvariant::NonIdempotent);
+            expected = (expected * 2).min(BROKEN_INVARIANT_TTL_CAP);
+            assert_eq!(
+                t.current_ttl(&id),
+                Some(expected),
+                "re-detection at cycle {cycle} must double the TTL (capped)"
+            );
+        }
+        // The early doublings are exactly 300 → 600 → 1200 → 2400 …
+        // and the sequence converged to the cap.
+        assert_eq!(t.current_ttl(&id), Some(BROKEN_INVARIANT_TTL_CAP));
+    }
+
+    /// (iii) A re-detection AFTER a full quiet window (≥ 2× the current TTL
+    /// with no re-detection) resets escalation to baseline — the contract is
+    /// no longer oscillating.
+    #[test]
+    fn quiet_window_resets_escalation_to_baseline() {
+        let (t, ts) = mk_tracker();
+        let id = fake_id(22);
+        t.record(id, BrokenInvariant::NonIdempotent);
+        // Escalate once: 300 → 600.
+        ts.advance_time(BROKEN_INVARIANT_TTL + Duration::from_secs(1));
+        t.record(id, BrokenInvariant::NonIdempotent);
+        assert_eq!(t.current_ttl(&id), Some(BROKEN_INVARIANT_TTL * 2));
+
+        // Now go quiet for a full reset window (≥ 2× the current TTL) with no
+        // re-detection, then re-detect: escalation resets to baseline.
+        let ttl = t.current_ttl(&id).unwrap();
+        ts.advance_time(ttl * 2 + Duration::from_secs(1));
+        t.record(id, BrokenInvariant::NonIdempotent);
+        assert_eq!(
+            t.current_ttl(&id),
+            Some(BROKEN_INVARIANT_TTL),
+            "a re-detection after a full quiet window resets to baseline"
+        );
+    }
+
+    /// (v) A contract flagged exactly ONCE (the #4295 false-positive shape) is
+    /// never re-detected, so it never escalates: it self-heals after one
+    /// baseline TTL and is reclaimed at the reset boundary.
+    #[test]
+    fn single_false_positive_never_escalates() {
+        let (t, ts) = mk_tracker();
+        let id = fake_id(23);
+        t.record(id, BrokenInvariant::NonIdempotent);
+        assert_eq!(t.current_ttl(&id), Some(BROKEN_INVARIANT_TTL));
+
+        // Self-heals after one baseline TTL; the entry is retained (as
+        // escalation memory) but the TTL is still baseline — no escalation.
+        ts.advance_time(BROKEN_INVARIANT_TTL + Duration::from_secs(1));
+        assert!(!t.is_broken(&id), "false positive self-heals after one TTL");
+        assert_eq!(
+            t.current_ttl(&id),
+            Some(BROKEN_INVARIANT_TTL),
+            "no re-detection means no escalation"
+        );
+
+        // Past the reset boundary, cleanup reclaims it entirely.
+        ts.advance_time(BROKEN_INVARIANT_TTL);
+        t.cleanup();
+        assert!(
+            t.current_ttl(&id).is_none(),
+            "reclaimed after the reset boundary"
+        );
+    }
+
+    /// (iv) A simulated oscillator (dark / re-enter / re-flag cycles) whose
+    /// TTL escalates converges to a vanishing emission duty cycle. The model:
+    /// each cycle the host is dark for its (escalating) TTL, then re-enters the
+    /// mesh for a CONSTANT re-detection delay (bounded by the 1/32 probe
+    /// cadence, independent of the dark-window length) before being re-flagged.
+    /// The re-entry cascade's size is proportional to the drift accumulated
+    /// during the dark window WHILE OTHER hosts are active — and in a fleet
+    /// escalating in lockstep the active-other fraction is itself the shrinking
+    /// duty cycle, so per-cycle emission ≈ dark_window × duty_cycle, which is
+    /// bounded (≈ the constant re-detection delay). We assert the dark fraction
+    /// → ~1, the TTL reaches the cap, and cumulative emission is far below the
+    /// fixed-TTL baseline over the same horizon.
+    #[test]
+    fn oscillator_escalation_collapses_duty_cycle() {
+        let (t, ts) = mk_tracker();
+        let id = fake_id(24);
+        let redetect_delay = Duration::from_secs(10);
+
+        t.record(id, BrokenInvariant::NonIdempotent);
+
+        let mut total_dark = Duration::ZERO;
+        let mut total_active = Duration::ZERO;
+        let mut total_emission = 0.0_f64;
+
+        for _ in 0..20 {
+            let ttl = t.current_ttl(&id).unwrap();
+            // Dark for the whole TTL (suppressed).
+            assert!(
+                t.is_broken(&id),
+                "suppressed at the start of the dark window"
+            );
+            total_dark += ttl;
+            ts.advance_time(ttl);
+            assert!(
+                !t.is_broken(&id),
+                "flag expired at the end of the dark window"
+            );
+
+            // Re-entry: active for the constant re-detection delay, accruing a
+            // cascade ∝ dark_window × (fleet active fraction ≈ this cycle's
+            // duty cycle).
+            let cycle_len = ttl + redetect_delay;
+            let active_fraction = redetect_delay.as_secs_f64() / cycle_len.as_secs_f64();
+            total_emission += ttl.as_secs_f64() * active_fraction;
+            total_active += redetect_delay;
+            ts.advance_time(redetect_delay);
+            t.record(id, BrokenInvariant::NonIdempotent);
+        }
+
+        // Dark fraction → ~1 (duty cycle → ~0).
+        let dark_fraction =
+            total_dark.as_secs_f64() / (total_dark.as_secs_f64() + total_active.as_secs_f64());
+        assert!(
+            dark_fraction > 0.98,
+            "dark fraction must converge toward 1 (duty cycle collapses), got {dark_fraction}"
+        );
+
+        // Escalation is monotonic to the ceiling.
+        assert_eq!(t.current_ttl(&id), Some(BROKEN_INVARIANT_TTL_CAP));
+
+        // Cumulative re-entry emission is bounded: far below the fixed-TTL
+        // baseline (which re-cascades every baseline TTL) over the SAME horizon.
+        let horizon = total_dark + total_active;
+        let baseline_cycle = BROKEN_INVARIANT_TTL + redetect_delay;
+        let baseline_cycles = horizon.as_secs_f64() / baseline_cycle.as_secs_f64();
+        let baseline_active_fraction = redetect_delay.as_secs_f64() / baseline_cycle.as_secs_f64();
+        let baseline_emission =
+            baseline_cycles * BROKEN_INVARIANT_TTL.as_secs_f64() * baseline_active_fraction;
+        assert!(
+            total_emission < baseline_emission / 5.0,
+            "escalation must slash cumulative re-entry cascade emission vs the \
+             fixed-TTL baseline (escalated {total_emission:.1}, baseline {baseline_emission:.1})"
+        );
     }
 }

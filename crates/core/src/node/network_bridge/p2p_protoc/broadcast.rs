@@ -483,6 +483,30 @@ impl P2pConnManager {
             target_result.interest_resolve_failed,
         );
 
+        // Cost telemetry (cost-aware eviction, #4861): attribute the message
+        // COUNT — one per fan-out target — to the contract at this dispatch
+        // point, where the resolved target count is known (shared by the
+        // production broadcast-queue and simulation inline branches below).
+        // The count axis is the load-bearing storm signal: the #4861 profile
+        // (121-byte payload × ~58 targets at storm frequency) reads as a
+        // negligible byte rate while its per-message syscall/encryption/queue
+        // overhead dominates the node's real broadcast capacity. ONE report
+        // per dispatch (not per target) keeps this axis flood-free.
+        //
+        // The fan-out BYTES are NOT charged here: this pre-dispatch point
+        // predates per-peer delta selection, so charging `payload × targets`
+        // would over-attribute a large-state contract that actually sends
+        // tiny deltas (the #4903 review P1 phantom-MB/s). The actual payload
+        // bytes are charged per-send in `broadcast_to_single_peer` once the
+        // delta/full-state choice is made. Deadlock-safe:
+        // `report_contract_resource_usage` takes a brief sync lock, no
+        // channels (see its rustdoc).
+        op_manager.ring.report_contract_resource_usage(
+            *key.id(),
+            crate::topology::meter::ResourceType::BroadcastMessagesSent,
+            target_result.targets.len() as f64,
+        );
+
         // In production, enqueue each target into the broadcast queue.
         // The queue worker handles delta computation and streaming with bounded
         // concurrency (default: 2 concurrent streams) to prevent uplink saturation.
@@ -583,6 +607,20 @@ impl P2pConnManager {
             contract = %key,
             peer = %target_addr,
             "SyncStateToPeer: sending state to stale peer"
+        );
+
+        // Cost telemetry (cost-aware eviction, #4861): a targeted stale-peer
+        // heal burns the same broadcast capacity as one fan-out leg, so
+        // attribute one message (count) to the contract. A contract whose
+        // churning state drives constant resync heals (#4861's non-converging
+        // junk contract) accrues its real cost here even when the
+        // all-subscriber fan-out path is quiet. The heal's actual payload
+        // bytes are charged per-send in `broadcast_to_single_peer` (the
+        // #4903 review P1 fix), not full-state here.
+        op_manager.ring.report_contract_resource_usage(
+            *key.id(),
+            crate::topology::meter::ResourceType::BroadcastMessagesSent,
+            1.0,
         );
 
         #[cfg(not(feature = "simulation_tests"))]
@@ -950,5 +988,63 @@ impl P2pConnManager {
         ) {
             bridge.log_register.register_events(Either::Left(log)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod broadcast_fanout_cost_pin_tests {
+    //! Source-scrape pin for the `BroadcastFanoutCost` reporter (cost-aware
+    //! eviction, #4861). The "Manually-mirrored telemetry counters" row in
+    //! `.claude/rules/bug-prevention-patterns.md` is the precedent: a refactor
+    //! of the broadcast dispatch that drops the cost report silently blinds
+    //! the cost-pressure eviction trigger — the exact cost-blind gap this
+    //! change closes — and no behavioral test catches it because the fan-out
+    //! still works. Pin the report at the source level so the drop trips CI.
+
+    const BROADCAST_SRC: &str = include_str!("broadcast.rs");
+
+    /// Both dispatch sites — the all-subscriber fan-out
+    /// (`handle_broadcast_state_change`) and the targeted stale-peer heal
+    /// (`handle_sync_state_to_peer`) — report the message COUNT (per-send
+    /// overhead — the load-bearing #4861 storm signal, since a tiny-payload
+    /// storm is invisible to the byte axis), ONE report per dispatch. They
+    /// must NOT report fan-out BYTES here: the pre-dispatch site predates
+    /// per-peer delta selection, so charging `full-state × targets` would
+    /// phantom-inflate a large-state contract that sends tiny deltas (#4903
+    /// review P1). Actual payload bytes are charged per-send in
+    /// `broadcast_queue::broadcast_to_single_peer`. If a site is added or
+    /// removed, update these counts WITH a comment explaining where the cost
+    /// of that path is now attributed.
+    #[test]
+    fn broadcast_dispatch_sites_report_message_count_not_bytes() {
+        // Split needles so this test's own source lines never contain the
+        // contiguous tokens and cannot self-count.
+        let count_sites = |needle: &str| {
+            BROADCAST_SRC
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("//") && trimmed.contains(needle)
+                })
+                .count()
+        };
+        let bytes_needle = concat!("ResourceType::", "Broadcast", "FanoutCost");
+        let msgs_needle = concat!("ResourceType::", "Broadcast", "MessagesSent");
+        assert_eq!(
+            count_sites(bytes_needle),
+            0,
+            "broadcast.rs dispatch sites must NOT charge BroadcastFanoutCost \
+             (bytes): the pre-delta-selection full-state size over-attributes \
+             a delta-sending contract (#4903 review P1). Bytes are charged \
+             per-send in broadcast_queue::broadcast_to_single_peer."
+        );
+        assert_eq!(
+            count_sites(msgs_needle),
+            2,
+            "expected exactly 2 BroadcastMessagesSent report sites in broadcast.rs \
+             (fan-out dispatch + targeted stale-peer heal); dropping the message-\
+             COUNT report re-opens the exact #4861 blind spot — a tiny-payload \
+             storm that the byte axis cannot see"
+        );
     }
 }

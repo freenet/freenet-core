@@ -2297,6 +2297,36 @@ mod state_write_attribution_pin_tests {
     }
 
     #[test]
+    fn executor_update_state_call_sites_report_exec_cpu_micros() {
+        // Cost-aware eviction (#4861): both executor `update_state` WASM
+        // invocations — the upsert/apply chokepoint (`attempt_state_update`)
+        // AND the sampled idempotency probe (`maybe_probe_idempotency`, which
+        // fires precisely on the storm-relevant non-idempotent class) — MUST
+        // attribute their elapsed on the `ExecCpuMicros` meter axis, the
+        // signal the hosting sweep's cost-pressure trigger reads. A refactor
+        // that drops a report silently re-opens the cost-blind-eviction gap
+        // (a zero-demand contract burning update CPU is never an eviction
+        // candidate) while every behavioral test stays green — the exact
+        // failure mode of the "Manually-mirrored telemetry counters" row in
+        // `.claude/rules/bug-prevention-patterns.md`. (The third ExecCpuMicros
+        // reporter — the per-target send-time summarize/delta — lives in
+        // broadcast_queue.rs, pinned there by
+        // `broadcast_to_single_peer_reports_send_wasm_cost_pin`.)
+        //
+        // Split needle so this test's own source cannot self-count.
+        let needle = concat!("ResourceType::", "Exec", "CpuMicros");
+        let count = count_call_sites(RUNTIME_SRC, needle);
+        assert_eq!(
+            count, 2,
+            "expected exactly 2 ExecCpuMicros report sites in the executor \
+             runtime sources (attempt_state_update + the idempotency probe); \
+             found {count}. If you added a WASM-execution chokepoint that \
+             burns attributable CPU, report it on the same axis and bump \
+             this expectation with a comment."
+        );
+    }
+
+    #[test]
     fn v2_delegate_callback_installers_invalidate_state_caches() {
         // V2 delegate state writes (put/update_contract_state_sync) bypass
         // `StateStore::{store,update}`, so both `state_write_callback` installers

@@ -2381,9 +2381,11 @@ where
     }
 }
 
-/// Store a relayed PUT's contract locally: `put_contract` + (if not
-/// already hosting) `host_contract` + `announce_contract_hosted` +
-/// interest register/unregister + broadcast interest changes.
+/// Store a relayed PUT's contract locally: `put_contract` + `host_contract`
+/// (unconditional, so EVERY genuine PUT refreshes hosting recency —
+/// invariant 3 / #4903 review Fix 1) + (on first host, gated on the atomic
+/// `host_contract` `is_new` result) `announce_contract_hosted` + interest
+/// register/unregister + broadcast interest changes.
 ///
 /// Shared between the non-streaming relay driver (`drive_relay_put`)
 /// and the streaming relay driver (`drive_relay_put_streaming`) so both
@@ -2436,7 +2438,6 @@ async fn relay_put_store_locally(
     if crate::operations::findability_probe::scatter_disabled() {
         return Ok(value);
     }
-    let was_hosting = op_manager.ring.is_hosting_contract(&key);
     let (merged_value, _state_changed) = match super::put_contract(
         op_manager,
         key,
@@ -2487,11 +2488,33 @@ async fn relay_put_store_locally(
         }
     };
 
-    if !was_hosting {
-        let access_result =
-            op_manager
-                .ring
-                .host_contract(key, value.size() as u64, crate::ring::AccessType::Put);
+    // EVERY genuine PUT stamps hosting recency — including a repeat PUT to a
+    // contract this peer already hosts (invariant 3: "a real GET or PUT resets
+    // recency", and this applies to BOTH the client-loopback and the relay-hop
+    // PUT, which share this store chokepoint). This call is unconditional so a
+    // write-only publisher re-PUTting an already-hosted contract keeps its
+    // recency fresh instead of being stamped once at first host and becoming a
+    // cost-eviction candidate `COST_RATE_MIN_WINDOW` later — an evict →
+    // re-host churn loop (#4903 review Fix 1). Record the POST-merge size
+    // (`merged_value`), not the pre-merge `value`, so hosting-byte accounting
+    // reflects what is actually stored (#4903 review round-3 Fix 3).
+    let access_result = op_manager.ring.host_contract(
+        key,
+        merged_value.size() as u64,
+        crate::ring::AccessType::Put,
+    );
+
+    // Gate the first-time-hosting side effects on the ATOMIC `host_contract`
+    // result (`is_new`), NOT a pre-await `is_hosting_contract` snapshot
+    // (#4903 review round-3 Fix 1): a sweep can evict this contract during the
+    // `put_contract().await` above, in which case `host_contract` re-adds it
+    // (`is_new = true`) and we MUST run announce / interest-register /
+    // evicted-teardown here. A stale pre-await "was already hosting" snapshot
+    // would skip them AND drop `access_result.evicted` (leaking the contracts
+    // this re-add shed to make room). On the already-hosted refresh path
+    // `is_new` is false and `evicted` is empty (`record_access_with_demand`
+    // refreshes recency/size/generation only, evicts nothing).
+    if access_result.is_new {
         let evicted = access_result.evicted;
 
         // Sync the InterestManager for any subscribed contract the
@@ -6104,6 +6127,91 @@ mod tests {
             helper_src.contains("remove_evicted_in_use"),
             "helper MUST call interest_manager.remove_evicted_in_use to sync the \
              InterestManager after a subscribed eviction"
+        );
+    }
+
+    /// Pin (#4903 review Fix 1 / invariant 3): `relay_put_store_locally` MUST
+    /// call `ring.host_contract(.., AccessType::Put)` UNCONDITIONALLY — i.e.
+    /// BEFORE (outside) the first-time-hosting gate — so a repeat PUT to an
+    /// already-hosted contract refreshes hosting recency (`recency_seq` /
+    /// `last_genuine_access`). This applies to BOTH the client-loopback and the
+    /// relay-hop PUT, which share this store chokepoint. When the stamp was
+    /// gated on the first-time gate, a write-only publisher re-PUTting every few
+    /// seconds was stamped once at first host and became a cost-eviction
+    /// candidate `COST_RATE_MIN_WINDOW` later — an evict → re-host churn loop.
+    #[test]
+    fn relay_put_store_locally_stamps_recency_on_repeat_put() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn relay_put_store_locally(")
+            .expect("relay_put_store_locally not found");
+        let end = src[start..]
+            .find("\nasync fn relay_put_replicate_forward(")
+            .expect("relay_put_store_locally body end not found")
+            + start;
+        let body = &src[start..end];
+        let host_pos = body
+            .find(".host_contract(")
+            .expect("relay_put_store_locally must call ring.host_contract");
+        let gate_pos = body
+            .find("if access_result.is_new")
+            .expect("first-time-hosting gate not found");
+        assert!(
+            host_pos < gate_pos,
+            "host_contract MUST run before (outside) the first-time-hosting gate \
+             so a repeat PUT refreshes hosting recency (invariant 3: a real PUT \
+             resets recency; #4903 review Fix 1)"
+        );
+    }
+
+    /// Pin (#4903 review round-3 Fix 1 + Fix 3): `relay_put_store_locally` MUST
+    /// (1) gate the first-time-hosting side effects on the ATOMIC
+    ///     `access_result.is_new`, NOT a pre-await `is_hosting_contract` /
+    ///     `was_hosting` snapshot. A sweep can evict the contract during the
+    ///     `put_contract().await`; only the atomic `host_contract` result knows
+    ///     the re-add is new, so a stale pre-await snapshot would skip
+    ///     announce / interest-register and DROP `access_result.evicted`
+    ///     (leaking the contracts the re-add shed); and
+    /// (2) charge hosting bytes as the POST-merge `merged_value.size()`, not the
+    ///     pre-merge input `value.size()`.
+    #[test]
+    fn relay_put_store_locally_first_host_gate_uses_atomic_result_and_merged_size() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn relay_put_store_locally(")
+            .expect("relay_put_store_locally not found");
+        let end = src[start..]
+            .find("\nasync fn relay_put_replicate_forward(")
+            .expect("relay_put_store_locally body end not found")
+            + start;
+        let body = &src[start..end];
+
+        // (1) The gate is the atomic result, and NO pre-await snapshot survives.
+        assert!(
+            body.contains("if access_result.is_new"),
+            "first-time-hosting side effects MUST be gated on the atomic \
+             host_contract `is_new`, not a pre-await snapshot"
+        );
+        assert!(
+            !body.contains("was_hosting"),
+            "no pre-await `was_hosting` / `is_hosting_contract` snapshot may gate \
+             the first-time-hosting side effects — a sweep can evict during \
+             put_contract().await, and a stale snapshot would skip \
+             announce/register and drop access_result.evicted (round-3 Fix 1)"
+        );
+
+        // (2) host_contract charges the POST-merge size.
+        let host_pos = body
+            .find(".host_contract(")
+            .expect("relay_put_store_locally must call ring.host_contract");
+        let rel_end = body[host_pos..]
+            .find(");")
+            .expect("host_contract call end not found");
+        let host_args = &body[host_pos..host_pos + rel_end];
+        assert!(
+            host_args.contains("merged_value.size()"),
+            "host_contract MUST charge the POST-merge merged_value.size(), not \
+             the pre-merge value.size() (round-3 Fix 3)"
         );
     }
 

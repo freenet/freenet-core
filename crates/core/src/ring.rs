@@ -1739,6 +1739,11 @@ impl Ring {
             // as the rework ships (AtCapacity now sheds subscribed as a last
             // resort). Same periodic cadence.
             snapshot.hosting_subscribed_evictions_total = Some(hosting.subscribed_evictions_total);
+            // Cost-pressure eviction falsifier (cost-aware eviction, #4861):
+            // zero-demand contracts shed because their attributed update-work
+            // (CPU / broadcast fan-out) dominated the node's total. Nonzero =
+            // the trigger is firing; runaway = floors/share miscalibrated.
+            snapshot.hosting_cost_evictions_total = Some(hosting.cost_evictions_total);
             // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
             // current count of contracts in-use via a downstream subscriber with
             // NO state on disk (contract_in_use && !contract_state_present). After
@@ -4330,37 +4335,60 @@ impl Ring {
         resource: crate::topology::meter::ResourceType,
         amount: f64,
     ) {
-        // Use the injectable `TimeSource` (rather than `Instant::now()`
-        // directly) so deterministic simulation tests can drive this
-        // path. Per `.claude/rules/code-style.md` "Need current time?
-        // → USE: TimeSource trait" — the executor commit path will reach
-        // here from inside simulated nodes once the governance scoring
-        // integration tests land, and reading wall-clock there would
-        // break determinism.
-        let now = self.time_source.now();
-        let mut topo = self.connection_manager.topology_manager.write();
-        topo.report_resource_usage(
-            &crate::topology::meter::AttributionSource::Contract(contract_id),
-            resource,
-            amount,
-            now,
-        );
-        drop(topo);
-        // Also feed the governance manager — the meter stores rates
-        // for telemetry/the dashboard's bandwidth view, while the
-        // governance manager aggregates these samples into the
-        // cost/benefit ratio that drives state. Both ingest in
-        // parallel from this one entry point so there's no risk of
-        // them diverging (governance reading from a stale meter
-        // snapshot, etc).
+        self.report_contract_resource_usage_batch(contract_id, &[(resource, amount)]);
+    }
+
+    /// Report several cost axes for ONE contract under a SINGLE topology
+    /// write-lock acquisition.
+    ///
+    /// The broadcast send path (#4903 review MEDIUM) reports the send-time
+    /// WASM CPU AND the actual fan-out payload bytes for each per-peer send;
+    /// batching them into one lock (instead of two separate
+    /// `report_contract_resource_usage` calls) halves the per-send topology
+    /// write-lock traffic on a busy gateway's fan-out.
+    ///
+    /// Uses the injectable `TimeSource` (rather than `Instant::now()`
+    /// directly) so deterministic simulation tests can drive this path
+    /// (`.claude/rules/code-style.md`: "Need current time? → USE: TimeSource").
+    /// `now` is read INSIDE the write lock (#4903 review L2) so concurrent
+    /// reporters insert in lock-acquisition order and cannot trip the
+    /// `RunningAverage::insert_with_time` monotonicity `debug_assert!`.
+    pub(crate) fn report_contract_resource_usage_batch(
+        &self,
+        contract_id: freenet_stdlib::prelude::ContractInstanceId,
+        samples: &[(crate::topology::meter::ResourceType, f64)],
+    ) {
+        if samples.is_empty() {
+            return;
+        }
+        let source = crate::topology::meter::AttributionSource::Contract(contract_id);
+        {
+            let mut topo = self.connection_manager.topology_manager.write();
+            // Read `now` under the lock (see rustdoc — L2 monotonicity).
+            let now = self.time_source.now();
+            for (resource, amount) in samples {
+                topo.report_resource_usage(&source, *resource, *amount, now);
+            }
+        }
+        // Also feed the governance manager — the meter stores rates for
+        // telemetry/the dashboard's bandwidth view, while the governance
+        // manager aggregates cost into the cost/benefit ratio that drives its
+        // ban state. But governance ingests ONLY the axes in
+        // `governance_ingests_axis` (currently just `StateBytesWritten`) — the
+        // three #4861 cost-eviction axes are deliberately NOT fed to it (see
+        // that fn's rustdoc for the #4296 rationale). The meter above still
+        // gets EVERY axis, so cost-eviction is unaffected.
         //
-        // Per-resource weight: identity (1.0) for now. Future tuning
-        // could weight CPU-µs and fanout-cost higher than
-        // state-bytes, but until we have live data to calibrate
-        // against, unit weights match what the design doc proposed
-        // as a starting point.
-        let weight = resource_weight(resource);
-        self.governance.ingest_cost(contract_id, amount * weight);
+        // Per-resource weight: identity (1.0) for now. Future tuning could
+        // weight axes differently, but until we have live data to calibrate
+        // against, unit weights match what the design doc proposed.
+        for (resource, amount) in samples {
+            if !governance_ingests_axis(*resource) {
+                continue;
+            }
+            let weight = resource_weight(*resource);
+            self.governance.ingest_cost(contract_id, *amount * weight);
+        }
     }
 
     // Note: there is intentionally no `ingest_contract_demand` method
@@ -4442,7 +4470,48 @@ fn resource_weight(resource: crate::topology::meter::ResourceType) -> f64 {
     match resource {
         InboundBandwidthBytes | OutboundBandwidthBytes => 1.0,
         ExecCpuMicros | ExecFuelUnits => 1.0,
-        StateBytesWritten | BroadcastFanoutCost => 1.0,
+        StateBytesWritten | BroadcastFanoutCost | BroadcastMessagesSent => 1.0,
+    }
+}
+
+/// Whether a cost axis feeds the GOVERNANCE cost/benefit ban decision.
+///
+/// This is deliberately an inclusion allowlist (only `StateBytesWritten`
+/// today), NOT "every axis" or "everything except X" — and it is exhaustive so
+/// a new [`ResourceType`](crate::topology::meter::ResourceType) variant must be
+/// consciously classified here.
+///
+/// WHY governance must NOT ingest the #4861 cost-eviction axes
+/// (`ExecCpuMicros`, `BroadcastFanoutCost`, `BroadcastMessagesSent`): those are
+/// per-send / per-update signals that scale with a contract's POPULARITY (a
+/// heavily-subscribed contract fans out more, so it accrues more send CPU and
+/// fan-out cost). Governance is a benefit-thresholded BAN system that — unlike
+/// the cost-eviction sweep — has NO zero-demand candidacy protection (invariant
+/// 3), so feeding it a popularity-scaled cost reproduces the #4296 "popular
+/// contract banned for being popular" false positive BY CONSTRUCTION: the
+/// contract crosses the ban threshold before its live-beneficiary count (the
+/// denominator that would spare it) can register, and a banned contract then
+/// drops inbound Subscribe, so its benefit can never catch up. The
+/// `popular_contract_with_subscribers_not_evicted` sim test is exactly this
+/// scenario. Storms are the cost-eviction sweep's job (it HAS the zero-demand
+/// protection); governance is Off in production, so excluding these axes is a
+/// pure de-risking that restores the cost basis governance was calibrated
+/// against on `main` (`StateBytesWritten`, the sole production feed via
+/// `commit_state_write`).
+///
+/// A future governance-On effort that wants to weigh CPU/fan-out MUST first add
+/// a benefit-aware normalization (e.g. cost-PER-beneficiary), NOT re-add these
+/// raw axes here — doing so silently re-opens #4296. See #4296 / #4861.
+fn governance_ingests_axis(resource: crate::topology::meter::ResourceType) -> bool {
+    use crate::topology::meter::ResourceType::*;
+    match resource {
+        // The axis governance was calibrated against on `main`.
+        StateBytesWritten => true,
+        // #4861 cost-eviction axes: popularity-scaled → meter/sweep only.
+        ExecCpuMicros | BroadcastFanoutCost | BroadcastMessagesSent => false,
+        // Peer-attributed bandwidth / fuel: never fed governance (it keys on
+        // per-contract cost), keep them out.
+        InboundBandwidthBytes | OutboundBandwidthBytes | ExecFuelUnits => false,
     }
 }
 
@@ -4632,7 +4701,49 @@ impl Ring {
     /// subscribers is eligible). The generation snapshot is carried through
     /// `EvictContract` so the deletion-time guard can detect a re-host race.
     pub fn sweep_expired_hosting(&self) -> crate::ring::hosting::HostingSweepResult {
-        self.hosting_manager.sweep_expired_hosting()
+        // Cost-aware eviction (#4861): feed the sweep the node's attributed
+        // update-work cost so a zero-subscriber contract dominating CPU /
+        // broadcast capacity is shed even while UNDER the byte budget (the
+        // byte-gated sweep alone never fires for a tiny-state storm contract).
+        let cost_axes = self.hosting_cost_pressure_axes();
+        self.hosting_manager
+            .sweep_expired_hosting_with_cost(&cost_axes)
+    }
+
+    /// Build the per-axis attributed-cost snapshots for the hosting sweep's
+    /// cost-pressure trigger (cost-aware eviction, #4861): per-contract
+    /// `ExecCpuMicros`, `BroadcastFanoutCost` (bytes), and
+    /// `BroadcastMessagesSent` (per-send count — the load-bearing storm
+    /// signal) rates plus their node totals, read from the topology meter.
+    /// Sparse samples are amortized over at least
+    /// [`hosting::COST_RATE_MIN_WINDOW`] (a lone burst can't masquerade as a
+    /// sustained storm), a saturated sample buffer reads its true rate, and
+    /// candidacy is pre-filtered to sustained sources — see
+    /// `Meter::contract_cost_rates`. The floors, share threshold, and axis
+    /// assembly live beside the decision in `ring/hosting/cache.rs`
+    /// (`build_cost_axes`, shared with the storm-frequency integration test).
+    ///
+    /// Lock discipline: takes the topology read lock briefly and drops it
+    /// before the caller takes the hosting-cache write lock — the two are
+    /// never held together.
+    fn hosting_cost_pressure_axes(&self) -> Vec<hosting::CostAxisPressure> {
+        use crate::topology::meter::ResourceType;
+        let now = self.time_source.now();
+        // Read all three cost axes in ONE pass over the attribution meters
+        // (#4903 review perf) rather than three separate scans under the read
+        // lock. Order here must match the `build_cost_axes` argument order.
+        let axes = [
+            ResourceType::ExecCpuMicros,
+            ResourceType::BroadcastFanoutCost,
+            ResourceType::BroadcastMessagesSent,
+        ];
+        let topo = self.connection_manager.topology_manager.read();
+        let mut rates = topo.contract_cost_rates_multi(&axes, now, hosting::COST_RATE_MIN_WINDOW);
+        drop(topo);
+        let messages = rates.pop().expect("three axis results");
+        let fanout_bytes = rates.pop().expect("three axis results");
+        let cpu = rates.pop().expect("three axis results");
+        hosting::build_cost_axes(cpu, fanout_bytes, messages)
     }
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================
@@ -8317,6 +8428,252 @@ mod sleep_or_shutdown_tests {
         assert!(
             cancelled,
             "an already-cancelled token must short-circuit immediately"
+        );
+    }
+}
+
+/// End-to-end seam test for cost-aware eviction (#4861 / #4903 review):
+/// drives the message axis through the REAL production reporter
+/// (`Ring::report_contract_resource_usage` → topology meter) and the REAL
+/// `Ring::sweep_expired_hosting()` (→ `hosting_cost_pressure_axes` →
+/// `HostingManager::sweep_expired_hosting_with_cost`) — the exact
+/// reporter → meter → axes → sweep chain the manager-level storm test
+/// (`storm_frequency_profile_crosses_cost_trigger_through_real_meter`)
+/// bypasses by assembling its axes by hand from a standalone `Meter`.
+#[cfg(test)]
+mod cost_pressure_seam_tests {
+    use std::time::Duration;
+
+    fn seam_key(seed: u8) -> freenet_stdlib::prelude::ContractKey {
+        freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([seed; 32]),
+            freenet_stdlib::prelude::CodeHash::new([seed.wrapping_add(1); 32]),
+        )
+    }
+
+    /// Runs under `start_paused` so `tokio::time::Instant` — the clock behind
+    /// BOTH the Ring's production `InstantTimeSrc` (meter timestamps, sweep
+    /// reads, hosting recency) and every background interval — is virtual and
+    /// advanced deterministically with `tokio::time::advance`. The Ring's
+    /// periodic background tasks (including the 60s hosting sweep, which runs
+    /// this same seam) fire during the advances; the assertions are therefore
+    /// on the FINAL hosting state, which is identical whether a background
+    /// sweep or the explicit call below sheds the storm contract.
+    #[tokio::test(start_paused = true)]
+    async fn zero_demand_storm_is_shed_through_real_reporter_and_sweep() {
+        use crate::topology::meter::ResourceType;
+
+        // --- a real OpManager (and thus a real Ring with its production
+        // InstantTimeSrc), mirroring the fixture in node.rs
+        // (`resync_request_for_bogus_keys_does_not_consume_limiter_slots`). ---
+        let config_args = crate::config::ConfigArgs {
+            id: Some("cost-seam-4903".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr("127.0.0.1:14100".parse().unwrap());
+        let ring = &op_manager.ring;
+
+        let junk = seam_key(1);
+        let subscribed = seam_key(2);
+        let read_hot = seam_key(3);
+
+        // Host all three through the production entry point (PUT seeds).
+        let _ = ring.host_contract(junk, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(subscribed, 121, crate::ring::AccessType::Put);
+        let _ = ring.host_contract(read_hot, 121, crate::ring::AccessType::Put);
+        assert!(ring.is_hosting_contract(&junk), "precondition: hosted");
+
+        // Age the PUT-seed recency stamps past the cost window, so only the
+        // demand signals added BELOW protect anything.
+        tokio::time::advance(super::hosting::COST_RATE_MIN_WINDOW + Duration::from_secs(1)).await;
+
+        // Demand: `subscribed` gains a downstream subscriber (lease outlives
+        // this test's remaining ~3 virtual minutes); `read_hot` is genuinely
+        // GET-read now (within the cost window of the final sweep).
+        assert!(ring.add_downstream_subscriber(
+            &subscribed,
+            crate::ring::interest::PeerKey(crate::transport::TransportPublicKey::from_bytes(
+                [9u8; 32]
+            )),
+        ));
+        let _ = ring.record_get_access(read_hot, 121);
+
+        // The FX2j storm profile, reported for ALL THREE contracts through
+        // the production reporter: one 58-target fan-out dispatch every 1.6s
+        // for ~3 minutes (~36 per-peer sends/s sustained). Equal rates prove
+        // protection comes from demand, not from a smaller cost share.
+        for _ in 0..110u32 {
+            for key in [&junk, &subscribed, &read_hot] {
+                ring.report_contract_resource_usage(
+                    *key.id(),
+                    ResourceType::BroadcastMessagesSent,
+                    58.0,
+                );
+            }
+            tokio::time::advance(Duration::from_millis(1600)).await;
+        }
+
+        // The REAL sweep (the same call the 60s background sweep task makes).
+        let _ = ring.sweep_expired_hosting();
+
+        assert!(
+            !ring.is_hosting_contract(&junk),
+            "the zero-demand storm contract must be shed through the real \
+             reporter → meter → hosting_cost_pressure_axes → sweep seam"
+        );
+        assert!(
+            ring.is_hosting_contract(&subscribed),
+            "a subscribed contract storming at the SAME rate must survive \
+             (candidacy, not ranking, protects it)"
+        );
+        assert!(
+            ring.is_hosting_contract(&read_hot),
+            "a recently-GET-read contract storming at the SAME rate must \
+             survive (reads are demand — invariant 3)"
+        );
+    }
+
+    /// Drift guard (#4861 Codex round-3): the meter's per-axis cost floors
+    /// ([`crate::topology::meter::ResourceType::cost_pressure_floor`]) and its
+    /// sustained window ([`crate::topology::meter::COST_SUSTAINED_WINDOW`]) are
+    /// MIRRORS — the authoritative constants live in `ring::hosting::cache`,
+    /// which is not nameable from `topology::meter` (that module is private to
+    /// `hosting`, itself private to `ring`), so the meter cannot import them.
+    /// This test reads the authoritative values through the `ring`-visible
+    /// surface — `build_cost_axes` (which binds each axis to its cache.rs floor
+    /// constant) and the re-exported `COST_RATE_MIN_WINDOW` — and asserts the
+    /// meter's mirrors match, so the insert-time above-floor detection can
+    /// never key on a floor/window that differs from the eviction decision's.
+    #[test]
+    fn meter_cost_floors_mirror_cache_source_of_truth() {
+        use crate::topology::meter::{COST_SUSTAINED_WINDOW, ResourceType};
+
+        fn empty_read() -> (
+            f64,
+            std::collections::HashMap<freenet_stdlib::prelude::ContractInstanceId, f64>,
+        ) {
+            (0.0, std::collections::HashMap::new())
+        }
+
+        // build_cost_axes argument/return order: cpu, fanout_bytes, messages.
+        let axes = super::hosting::build_cost_axes(empty_read(), empty_read(), empty_read());
+        assert_eq!(
+            axes[0].floor,
+            ResourceType::ExecCpuMicros
+                .cost_pressure_floor()
+                .expect("ExecCpuMicros is a cost axis"),
+            "CPU floor mirror drifted from cache.rs source of truth",
+        );
+        assert_eq!(
+            axes[1].floor,
+            ResourceType::BroadcastFanoutCost
+                .cost_pressure_floor()
+                .expect("BroadcastFanoutCost is a cost axis"),
+            "fan-out byte floor mirror drifted from cache.rs source of truth",
+        );
+        assert_eq!(
+            axes[2].floor,
+            ResourceType::BroadcastMessagesSent
+                .cost_pressure_floor()
+                .expect("BroadcastMessagesSent is a cost axis"),
+            "message floor mirror drifted from cache.rs source of truth",
+        );
+        assert_eq!(
+            super::hosting::COST_RATE_MIN_WINDOW,
+            COST_SUSTAINED_WINDOW,
+            "sustained-window mirror drifted from cache.rs COST_RATE_MIN_WINDOW",
+        );
+    }
+
+    /// Governance cost ingestion accepts ONLY `StateBytesWritten` and REJECTS
+    /// the three #4861 cost-eviction axes (and the peer/fuel axes). Pinning
+    /// this prevents silently re-feeding governance a popularity-scaled cost
+    /// axis, which reproduces the #4296 "popular contract banned for being
+    /// popular" false positive (see `governance_ingests_axis` rustdoc and the
+    /// `popular_contract_with_subscribers_not_evicted` sim test). Exhaustive so
+    /// a new ResourceType variant must be classified with the same guard.
+    #[test]
+    fn governance_ingests_only_state_bytes_written() {
+        use crate::topology::meter::ResourceType;
+        assert!(
+            super::governance_ingests_axis(ResourceType::StateBytesWritten),
+            "governance MUST ingest StateBytesWritten (its main-calibrated basis)"
+        );
+        for axis in [
+            ResourceType::ExecCpuMicros,
+            ResourceType::BroadcastFanoutCost,
+            ResourceType::BroadcastMessagesSent,
+        ] {
+            assert!(
+                !super::governance_ingests_axis(axis),
+                "governance MUST NOT ingest the #4861 cost-eviction axis {axis:?} \
+                 (popularity-scaled → resurrects #4296); it feeds the meter/sweep only"
+            );
+        }
+        for axis in [
+            ResourceType::InboundBandwidthBytes,
+            ResourceType::OutboundBandwidthBytes,
+            ResourceType::ExecFuelUnits,
+        ] {
+            assert!(
+                !super::governance_ingests_axis(axis),
+                "peer/fuel axis {axis:?} is not per-contract cost; governance must not ingest it"
+            );
+        }
+    }
+
+    /// Source-scrape pin: the governance feed in `report_contract_resource_usage_batch`
+    /// MUST stay gated by `governance_ingests_axis`, so a future edit can't drop
+    /// the gate and re-flood governance with the #4861 cost-eviction axes.
+    #[test]
+    fn governance_feed_is_gated_by_axis_allowlist() {
+        let src = include_str!("ring.rs");
+        let start = src
+            .find("fn report_contract_resource_usage_batch(")
+            .expect("report_contract_resource_usage_batch not found");
+        let body_end = src[start..]
+            .find("\n    // Note: there is intentionally no `ingest_contract_demand`")
+            .expect("end of report_contract_resource_usage_batch not found")
+            + start;
+        let body = &src[start..body_end];
+        let ingest = body
+            .find(".governance.ingest_cost(")
+            .expect("governance.ingest_cost call missing from the batch feed");
+        let gate = body
+            .find("if !governance_ingests_axis(")
+            .expect("governance feed MUST be gated by governance_ingests_axis (#4296 guard)");
+        assert!(
+            gate < ingest,
+            "the governance_ingests_axis gate MUST precede (guard) the \
+             ingest_cost call, else the #4861 axes re-flood governance and \
+             resurrect #4296"
         );
     }
 }

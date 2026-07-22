@@ -1463,19 +1463,48 @@ where
         key: &ContractKey,
         updates: &[UpdateData<'_>],
     ) -> Result<Either<WrappedState, Vec<RelatedContract>>, ExecutorError> {
-        let update_modification =
-            match self
-                .runtime
-                .update_state(key, parameters, current_state, updates)
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    return Err(ExecutorError::execution(
-                        err,
-                        Some(InnerOpError::Upsert(*key)),
-                    ));
-                }
-            };
+        // Cost telemetry (cost-aware eviction, #4861): measure the elapsed
+        // time of the blocking WASM `update_state` call and attribute it to
+        // the contract on the `ExecCpuMicros` meter axis — INCLUDING applies
+        // whose commit is later suppressed (NoChange / byte-identical merge)
+        // and applies that ERROR (trap/timeout), since the CPU is burned
+        // regardless of whether anything commits. Feeds the hosting sweep's
+        // cost-pressure trigger so a zero-subscriber contract that dominates
+        // update CPU becomes an eviction candidate. Uses the ring's injected
+        // `TimeSource` (deterministic-sim discipline; under paused sim time
+        // the elapsed reads 0, and sim tests inject cost via
+        // `report_contract_resource_usage` directly). The report path is
+        // deadlock-safe by design (brief sync lock, no channels — see
+        // `Ring::report_contract_resource_usage`).
+        let cost_clock = self
+            .op_manager
+            .as_ref()
+            .map(|op_manager| op_manager.ring.time_source.clone());
+        let update_started = cost_clock.as_ref().map(|clock| clock.now());
+        let update_result = self
+            .runtime
+            .update_state(key, parameters, current_state, updates);
+        if let (Some(op_manager), Some(clock), Some(started)) = (
+            self.op_manager.as_ref(),
+            cost_clock.as_ref(),
+            update_started,
+        ) {
+            let elapsed = clock.now().saturating_duration_since(started);
+            op_manager.ring.report_contract_resource_usage(
+                *key.id(),
+                crate::topology::meter::ResourceType::ExecCpuMicros,
+                elapsed.as_micros() as f64,
+            );
+        }
+        let update_modification = match update_result {
+            Ok(result) => result,
+            Err(err) => {
+                return Err(ExecutorError::execution(
+                    err,
+                    Some(InnerOpError::Upsert(*key)),
+                ));
+            }
+        };
         let UpdateModification {
             new_state, related, ..
         } = update_modification;
@@ -1575,9 +1604,31 @@ where
             return;
         }
 
+        // Cost telemetry (cost-aware eviction, #4861): the probe is a full
+        // extra WASM `update_state` invocation, and it fires precisely on the
+        // storm-relevant class (frequently-merging contracts — including
+        // non-idempotent ones). Attribute its elapsed on the same
+        // `ExecCpuMicros` axis as the main apply in `attempt_state_update`.
+        let probe_clock = self
+            .op_manager
+            .as_ref()
+            .map(|op_manager| op_manager.ring.time_source.clone());
+        let probe_started = probe_clock.as_ref().map(|clock| clock.now());
         let probe_result = self
             .runtime
             .update_state(key, parameters, post_merge_state, updates);
+        if let (Some(op_manager), Some(clock), Some(started)) = (
+            self.op_manager.as_ref(),
+            probe_clock.as_ref(),
+            probe_started,
+        ) {
+            let elapsed = clock.now().saturating_duration_since(started);
+            op_manager.ring.report_contract_resource_usage(
+                *key.id(),
+                crate::topology::meter::ResourceType::ExecCpuMicros,
+                elapsed.as_micros() as f64,
+            );
+        }
         let probe_outcome = match probe_result {
             Ok(modification) => modification,
             Err(err) => {

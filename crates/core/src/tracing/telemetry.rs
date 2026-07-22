@@ -2344,6 +2344,15 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_subscribed_evictions_total".to_string(),
                     serde_json::json!(snapshot.hosting_subscribed_evictions_total),
                 );
+                // Cost-pressure eviction falsifier (cost-aware eviction,
+                // #4861): zero-demand contracts shed for dominating the
+                // node's attributed update-work. Same hand-mirrored footgun —
+                // invisible to the collector unless added here. Pinned by
+                // `router_snapshot_json_includes_cost_evictions_gauge`.
+                obj.insert(
+                    "hosting_cost_evictions_total".to_string(),
+                    serde_json::json!(snapshot.hosting_cost_evictions_total),
+                );
                 // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
                 // current count of contracts in-use via a downstream subscriber
                 // with NO state on disk. Should read 0 after register-after-state.
@@ -2870,6 +2879,26 @@ mod tests {
         assert_eq!(
             json["hosting_subscribed_evictions_total"], 287,
             "hosting_subscribed_evictions_total must reach the OTLP body"
+        );
+    }
+
+    /// Pin: the cost-pressure eviction falsifier gauge (cost-aware eviction,
+    /// #4861) must reach the hand-mirrored OTLP body. It counts zero-demand
+    /// contracts shed for dominating the node's attributed update-work (CPU /
+    /// broadcast fan-out); a silent drop would blind central telemetry to
+    /// whether the cost trigger fires in the field — the validation signal the
+    /// whole cost-aware-eviction change rests on.
+    #[test]
+    fn router_snapshot_json_includes_cost_evictions_gauge() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosting_cost_evictions_total = Some(58);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        assert_eq!(
+            json["hosting_cost_evictions_total"], 58,
+            "hosting_cost_evictions_total must reach the OTLP body"
         );
     }
 

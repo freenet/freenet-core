@@ -431,6 +431,25 @@ impl TopologyManager {
         self.meter.attributed_usage_rate(source, resource_type, now)
     }
 
+    /// Per-contract attributed cost rates + their sum for SEVERAL cost axes,
+    /// read in one pass over the meter (the hosting sweep reads all three per
+    /// tick — #4903 review perf), each amortized over at least `min_window`.
+    /// Read by the hosting sweep's cost-pressure trigger (cost-aware eviction,
+    /// #4861). Delegates to
+    /// [`crate::topology::meter::Meter::contract_cost_rates_multi`].
+    pub(crate) fn contract_cost_rates_multi(
+        &self,
+        resources: &[ResourceType],
+        now: Instant,
+        min_window: std::time::Duration,
+    ) -> Vec<(
+        f64,
+        std::collections::HashMap<freenet_stdlib::prelude::ContractInstanceId, f64>,
+    )> {
+        self.meter
+            .contract_cost_rates_multi(resources, now, min_window)
+    }
+
     /// Determine whether to add or remove connections based on current connection
     /// count and resource usage.
     ///
@@ -3029,7 +3048,8 @@ impl Limits {
             ResourceType::ExecCpuMicros
             | ResourceType::ExecFuelUnits
             | ResourceType::StateBytesWritten
-            | ResourceType::BroadcastFanoutCost => {
+            | ResourceType::BroadcastFanoutCost
+            | ResourceType::BroadcastMessagesSent => {
                 unreachable!(
                     "Limits::get called for non-bandwidth resource {:?} — \
                      these are tracked but not bandwidth-rate-limited",
