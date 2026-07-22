@@ -3121,23 +3121,56 @@ const MIGRATE_MARKER_KEY_PREFIX: &[u8] = b"\0freenet-migrate/v1/pred-done:";
 /// migration. `MIGRATE_MARKER_KEY_PREFIX` is a subset of this namespace.
 const MIGRATE_RESERVED_NAMESPACE_PREFIX: &[u8] = b"\0freenet-migrate/";
 
-/// The app-side two-phase INTENT marker prefix (`freenet-migrate` `pred-wip:`).
+/// The app-side two-phase INTENT marker prefix (`freenet-migrate` `v1/pred-wip:`).
 /// The node never WRITES this (it seals atomically, so it only ever writes the
-/// `pred-done:` completion marker), but a predecessor an app-side migration
+/// `v1/pred-done:` completion marker), but a predecessor an app-side migration
 /// touched may hold one, and it is a legal reserved shape.
 const MIGRATE_WIP_KEY_PREFIX: &[u8] = b"\0freenet-migrate/v1/pred-wip:";
 
-/// The ONLY legal secret-key shapes under the reserved
-/// [`MIGRATE_RESERVED_NAMESPACE_PREFIX`]: a `pred-done:` or `pred-wip:` prefix
-/// followed by EXACTLY a 32-byte delegate key. `store_secret` REJECTS any other
+/// LEGACY generation-keyed completion marker prefix (freenet-migrate 0.3-era),
+/// still written by the retained `import_secrets_once` API: MARKER_NS ++
+/// `done:` ++ `<gen decimal>`. Source: freenet-migrate `delegate.rs` DONE_PREFIX.
+const MIGRATE_LEGACY_DONE_PREFIX: &[u8] = b"\0freenet-migrate/done:";
+/// LEGACY generation-keyed in-progress marker prefix (0.3-era): MARKER_NS ++
+/// `wip:` ++ `<gen decimal>`. Source: freenet-migrate `delegate.rs` WIP_PREFIX.
+const MIGRATE_LEGACY_WIP_PREFIX: &[u8] = b"\0freenet-migrate/wip:";
+/// Upper bound on the `<gen decimal>` legacy suffix length (a generation counter
+/// fits well within a `u64`'s 20 decimal digits). Bounds the accepted key length
+/// so a client cannot pad a legacy-shaped key with an unbounded digit string.
+const MAX_LEGACY_GEN_DIGITS: usize = 20;
+
+/// The legal secret-key shapes under the reserved
+/// [`MIGRATE_RESERVED_NAMESPACE_PREFIX`]. `store_secret` REJECTS any other
 /// reserved-namespace key (#4117 P2a), so a client cannot pad the reserved
 /// namespace with arbitrary keys to bloat the reserved-hash table or shadow a
-/// real marker.
+/// real marker. The FULL legal matrix (pinned by
+/// `reserved_marker_shape_matrix_is_stable`, mirrored in the freenet-migrate
+/// crate) is:
+///   - v1 per-predecessor:  `\0freenet-migrate/v1/pred-done:` / `…/v1/pred-wip:`
+///     followed by EXACTLY a 32-byte delegate key;
+///   - legacy generation-keyed: `\0freenet-migrate/done:` / `…/wip:` followed by
+///     a NON-EMPTY, ≤ [`MAX_LEGACY_GEN_DIGITS`] ASCII-decimal generation.
 fn is_legal_reserved_marker_key(raw: &[u8]) -> bool {
-    (raw.len() == MIGRATE_MARKER_KEY_PREFIX.len() + 32
+    // v1 per-predecessor markers: prefix + exactly a 32-byte delegate key.
+    let v1 = (raw.len() == MIGRATE_MARKER_KEY_PREFIX.len() + 32
         && raw.starts_with(MIGRATE_MARKER_KEY_PREFIX))
         || (raw.len() == MIGRATE_WIP_KEY_PREFIX.len() + 32
-            && raw.starts_with(MIGRATE_WIP_KEY_PREFIX))
+            && raw.starts_with(MIGRATE_WIP_KEY_PREFIX));
+    if v1 {
+        return true;
+    }
+    // Legacy generation-keyed markers: prefix + a non-empty bounded decimal
+    // generation suffix (`gen` is a reserved keyword, hence `gen_suffix`).
+    for prefix in [MIGRATE_LEGACY_DONE_PREFIX, MIGRATE_LEGACY_WIP_PREFIX] {
+        if let Some(gen_suffix) = raw.strip_prefix(prefix)
+            && !gen_suffix.is_empty()
+            && gen_suffix.len() <= MAX_LEGACY_GEN_DIGITS
+            && gen_suffix.iter().all(u8::is_ascii_digit)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build the `SecretsId` of the "predecessor migrated" marker recorded under the
@@ -9911,7 +9944,7 @@ mod test {
             "a reserved key with a wrong-length suffix must be rejected"
         );
 
-        // Legal pred-done: + 32 bytes → accepted.
+        // Legal v1 pred-done: + 32 bytes → accepted.
         let mut legal = b"\0freenet-migrate/v1/pred-done:".to_vec();
         legal.extend_from_slice(&[0xCDu8; 32]);
         let legal_id = SecretsId::new(legal);
@@ -9924,7 +9957,22 @@ mod test {
                     Zeroizing::new(b"1".to_vec())
                 )
                 .is_ok(),
-            "a legal marker key must be accepted"
+            "a legal v1 marker key must be accepted"
+        );
+
+        // Legal LEGACY generation-keyed marker (done:<gen decimal>) → accepted
+        // (the crate's retained import_secrets_once still writes these).
+        let legacy_id = SecretsId::new(b"\0freenet-migrate/done:42".to_vec());
+        assert!(
+            store
+                .store_secret(
+                    d.key(),
+                    &legacy_id,
+                    SecretScope::Local,
+                    Zeroizing::new(b"1".to_vec())
+                )
+                .is_ok(),
+            "a legal legacy generation-keyed marker must be accepted"
         );
 
         // An ordinary (non-reserved) user key → accepted.
@@ -9941,6 +9989,51 @@ mod test {
             "an ordinary user key must be accepted"
         );
         Ok(())
+    }
+
+    /// The FULL legal reserved-namespace shape matrix (#4117 P2a), MIRRORING the
+    /// `freenet-migrate` crate: v1 per-predecessor `pred-done:`/`pred-wip:` + 32
+    /// bytes, AND legacy generation-keyed `done:`/`wip:` + a bounded ASCII-decimal
+    /// generation. Everything else in the namespace is rejected. Pinned so a
+    /// future crate marker shape that core does not accept trips CI here.
+    #[test]
+    fn reserved_marker_shape_matrix_is_stable() {
+        let key32 = |prefix: &[u8]| {
+            let mut k = prefix.to_vec();
+            k.extend_from_slice(&[0xCDu8; 32]);
+            k
+        };
+        // ACCEPT — v1 per-predecessor + exactly 32 bytes.
+        assert!(is_legal_reserved_marker_key(&key32(
+            b"\0freenet-migrate/v1/pred-done:"
+        )));
+        assert!(is_legal_reserved_marker_key(&key32(
+            b"\0freenet-migrate/v1/pred-wip:"
+        )));
+        // ACCEPT — legacy generation-keyed + non-empty decimal.
+        assert!(is_legal_reserved_marker_key(b"\0freenet-migrate/done:0"));
+        assert!(is_legal_reserved_marker_key(b"\0freenet-migrate/done:42"));
+        assert!(is_legal_reserved_marker_key(b"\0freenet-migrate/wip:7"));
+        assert!(is_legal_reserved_marker_key(
+            b"\0freenet-migrate/done:18446744073709551615"
+        )); // u64::MAX, 20 digits
+
+        // REJECT — v1 wrong suffix length.
+        let mut short = b"\0freenet-migrate/v1/pred-done:".to_vec();
+        short.extend_from_slice(&[0xCDu8; 8]);
+        assert!(!is_legal_reserved_marker_key(&short));
+        // REJECT — legacy empty gen / non-digit gen / over-long gen.
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:"));
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:abc"));
+        assert!(!is_legal_reserved_marker_key(
+            b"\0freenet-migrate/done:123456789012345678901"
+        )); // 21 digits > cap
+        // REJECT — foreign sub-prefix / bare namespace.
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/attacker"));
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/"));
+        // A non-reserved user key is not a "marker" (handled separately at the
+        // store_secret gate; is_legal only judges reserved-namespace keys).
+        assert!(!is_legal_reserved_marker_key(b"room:alice"));
     }
 
     /// Byte-exact pin of the crate-format marker key + value, MIRRORING the
