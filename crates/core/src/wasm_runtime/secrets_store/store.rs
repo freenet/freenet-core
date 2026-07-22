@@ -2449,11 +2449,11 @@ impl SecretsStore {
             //    copied OR already there) to drive the enumeration-registry copy.
             let mut copy_error = false;
             let mut present_hashes: HashSet<SecretKey> = HashSet::new();
-            // Coordination-marker secrets (the reserved `freenet-migrate`
+            // Coordination-marker secrets (the whole reserved `\0freenet-migrate/`
             // namespace) are NEVER copied forward — they are per-generation
             // metadata, not user data, and chain-copying them would accrete stale
-            // markers under later successors.
-            let marker_hashes = self.predecessor_marker_hashes(predecessor);
+            // markers under later successors and diverge from the app-side path.
+            let marker_hashes = self.predecessor_reserved_marker_hashes(predecessor);
             for hash in &hashes {
                 if marker_hashes.contains(hash) {
                     continue;
@@ -2689,20 +2689,20 @@ impl SecretsStore {
         Ok(count)
     }
 
-    /// Hashes of the predecessor's Local secrets that are freenet-migrate
-    /// coordination markers (raw key under [`MIGRATE_MARKER_KEY_PREFIX`]), so the
-    /// copy-forward walk can SKIP them. Markers are per-generation coordination
-    /// metadata written under a successor, NOT user secrets, and must not
-    /// chain-copy into a further successor (the reserved namespace is excluded
-    /// from copy). Best-effort: an unreadable registry yields an empty set
+    /// Hashes of the predecessor's Local secrets that live in the reserved
+    /// freenet-migrate coordination namespace ([`MIGRATE_RESERVED_NAMESPACE_PREFIX`]
+    /// — both this node's `pred-done:` markers AND the app-side `pred-wip:`
+    /// markers), so the copy-forward walk can SKIP them. They are per-generation
+    /// coordination metadata, NOT user secrets, and must not chain-copy into a
+    /// further successor. Best-effort: an unreadable registry yields an empty set
     /// (markers then fall through as ordinary secrets — the degraded case), never
     /// an error. Relies on markers being written via `store_secret` (which
     /// registers the raw key), so their raw key is recoverable here.
-    fn predecessor_marker_hashes(&self, predecessor: &DelegateKey) -> HashSet<SecretKey> {
+    fn predecessor_reserved_marker_hashes(&self, predecessor: &DelegateKey) -> HashSet<SecretKey> {
         let mut out = HashSet::new();
         if let Ok(keys) = self.read_key_registry(predecessor, &SecretScope::Local) {
             for raw in keys {
-                if raw.starts_with(MIGRATE_MARKER_KEY_PREFIX) {
+                if raw.starts_with(MIGRATE_RESERVED_NAMESPACE_PREFIX) {
                     out.insert(*SecretsId::new(raw).hash());
                 }
             }
@@ -2752,7 +2752,7 @@ impl SecretsStore {
                 break;
             }
             // Never enumerate the reserved coordination-marker namespace.
-            if raw.starts_with(MIGRATE_MARKER_KEY_PREFIX) {
+            if raw.starts_with(MIGRATE_RESERVED_NAMESPACE_PREFIX) {
                 continue;
             }
             // Only register a key whose value is actually present under the
@@ -2792,6 +2792,18 @@ impl SecretsStore {
 /// the whole `\0freenet-migrate/` namespace out of `list_secret_keys`/exports,
 /// and the copy-forward walk skips it so it is never enumerated forward.
 const MIGRATE_MARKER_KEY_PREFIX: &[u8] = b"\0freenet-migrate/v1/pred-done:";
+
+/// Reserved-namespace prefix covering ALL freenet-migrate coordination keys —
+/// the `pred-done:` completion markers this node writes AND the `pred-wip:`
+/// two-phase intent markers the app-side `freenet-migrate` path writes (which
+/// the node never writes). Copy-forward EXCLUDES this whole namespace from both
+/// the value copy and the enumeration copy, so a chained migration never sweeps
+/// a coordination marker onward. This is load-bearing for cross-transport
+/// consistency: the app-side import structurally skips every `\0freenet-migrate/`
+/// key, so the node must too, or a node-migrated successor would carry markers an
+/// app-migrated one never would and the two would diverge on a later chained
+/// migration. `MIGRATE_MARKER_KEY_PREFIX` is a subset of this namespace.
+const MIGRATE_RESERVED_NAMESPACE_PREFIX: &[u8] = b"\0freenet-migrate/";
 
 /// Build the `SecretsId` of the "predecessor migrated" marker recorded under the
 /// SUCCESSOR delegate: [`MIGRATE_MARKER_KEY_PREFIX`] followed by the
@@ -9017,6 +9029,75 @@ mod test {
         Ok(())
     }
 
+    /// The WHOLE reserved `\0freenet-migrate/` namespace is excluded from
+    /// copy-forward, not just `pred-done:` — including the app-side `pred-wip:`
+    /// intent markers the node never writes but may find on a predecessor an
+    /// app-side migration touched. Excluding the whole namespace keeps the node
+    /// and app transports' marker sets byte-identical.
+    #[tokio::test]
+    async fn migrate_excludes_whole_reserved_namespace() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+
+        // A real user secret plus an app-written WIP intent marker under the
+        // predecessor (the node never writes WIP, but an app-side migration may).
+        let real = SecretsId::new(b"room:real".to_vec());
+        let wip_raw = {
+            let mut k = b"\0freenet-migrate/v1/pred-wip:".to_vec();
+            k.extend_from_slice(&[0xAB; 32]);
+            k
+        };
+        let wip = SecretsId::new(wip_raw.clone());
+        store.store_secret(
+            pred.key(),
+            &real,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        store.store_secret(
+            pred.key(),
+            &wip,
+            SecretScope::Local,
+            Zeroizing::new(b"1".to_vec()),
+        )?;
+
+        let report = store.migrate_secrets(std::slice::from_ref(pred.key()), succ.key(), None);
+        // Only the real secret copies; the reserved-namespace key does not.
+        assert_eq!(report.total_copied(), 1, "only the real secret copies");
+        assert!(
+            store
+                .get_secret(succ.key(), &real, SecretScope::Local)
+                .is_ok(),
+            "the real secret migrates"
+        );
+        assert!(
+            store
+                .get_secret(succ.key(), &wip, SecretScope::Local)
+                .is_err(),
+            "the reserved-namespace WIP key must NOT copy forward"
+        );
+        // The WIP key is not enumerable under the successor. (The successor DOES
+        // carry its own `pred-done:` marker for `pred` — expected bookkeeping —
+        // so we assert the WIP key specifically is absent, not that the namespace
+        // is empty.)
+        let reserved = store.list_secret_keys(
+            succ.key(),
+            SecretScope::Local,
+            MIGRATE_RESERVED_NAMESPACE_PREFIX,
+        );
+        assert!(
+            !reserved.contains(&wip_raw),
+            "the WIP key must not be enumerable under the successor"
+        );
+        Ok(())
+    }
+
     /// Byte-exact pin of the crate-format marker key + value, MIRRORING the
     /// public `freenet-migrate` contract. A drift here (or in the crate) breaks
     /// the shared marker and is caught by CI on whichever side changed.
@@ -9026,6 +9107,10 @@ mod test {
             MIGRATE_MARKER_KEY_PREFIX,
             b"\0freenet-migrate/v1/pred-done:"
         );
+        // The whole reserved namespace is excluded from copy-forward (covers the
+        // app-side `pred-wip:` markers too); `pred-done:` lives under it.
+        assert_eq!(MIGRATE_RESERVED_NAMESPACE_PREFIX, b"\0freenet-migrate/");
+        assert!(MIGRATE_MARKER_KEY_PREFIX.starts_with(MIGRATE_RESERVED_NAMESPACE_PREFIX));
 
         let pred = DelegateKey::new([7u8; 32], CodeHash::from(&[9u8; 32]));
         let sid = pred_done_marker_secret_id(&pred);
