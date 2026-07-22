@@ -152,7 +152,9 @@ muda = "0.19"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-freenet-stdlib = "0.8.2"
+# 0.8.4 adds `DelegateRequest::RegisterDelegateWithPredecessors` (stdlib PR #86),
+# consumed by the #4117 delegate secret copy-forward.
+freenet-stdlib = "0.8.4"
 
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`

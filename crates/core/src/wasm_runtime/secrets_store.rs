@@ -52,7 +52,9 @@ pub use sweep::{
     spawn_inactive_user_sweep, stamp_user_last_seen, wall_clock_unix_secs,
 };
 
-pub use store::{ExportScopeError, ExportSecretEntry, SecretStoreError, SecretsStore};
+pub use store::{
+    ExportScopeError, ExportSecretEntry, MigrationReport, SecretStoreError, SecretsStore,
+};
 
 // ── pub(super) re-exports ─────────────────────────────────────────────────────
 // `secret_snapshots` and other wasm_runtime siblings import these.

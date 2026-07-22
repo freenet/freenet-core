@@ -60,6 +60,61 @@ pub(crate) const SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const USER_SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("user_secrets_index");
 
+/// One-shot idempotence / anti-resurrection marker for delegate secret
+/// copy-forward (`SecretsStore::migrate_secrets`, #4117). One row per
+/// `(predecessor, successor)` delegate pair. Presence alone gates the copy:
+/// once a `(predecessor, successor)` migration has run, it is NEVER re-run, so
+/// a secret the user deleted from the successor after migration cannot be
+/// resurrected by a later re-registration. The row value is a small AUDIT FACT
+/// (schema version, the originating contract when known, and the copied/skipped
+/// counts) — see `SecretsStore::migrate_secrets`. Created on first open of
+/// upgraded databases too (redb materializes a missing table inside the same
+/// write txn that opens it), so a pre-#4117 database gains an empty table
+/// without disturbing any existing table.
+///
+/// Key: predecessor DelegateKey (64 bytes) || successor DelegateKey (64 bytes) = 128 bytes
+/// Value: versioned marker blob (see `migration_marker` codec in the secrets store)
+pub(crate) const MIGRATION_MARKER_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_secret_migration_marker");
+
+/// Durable record of the web-app contract origins under which each delegate has
+/// been registered (#4117 H1 same-origin gate). Written on EVERY successful
+/// delegate registration (both `RegisterDelegate` and
+/// `RegisterDelegateWithPredecessors`). Copy-forward consults it: a predecessor's
+/// Local secrets are copied into a successor ONLY when the registering request's
+/// origin is among the predecessor's recorded origins (or both are the Admin/None
+/// class), so a malicious web-app cannot register a delegate that names an
+/// unrelated victim delegate as a predecessor to exfiltrate its secrets
+/// (predecessor keys are public-derivable). See `SecretsStore::delegate_origins`.
+///
+/// Key: DelegateKey (64 bytes)
+/// Value: `[has_admin_none: 1][N × ContractInstanceId(32)]` — `has_admin_none`
+///        records that the delegate was at least once registered with no contract
+///        origin (loopback / CLI / admin).
+pub(crate) const DELEGATE_ORIGINS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_registration_origins");
+
+/// Durable, UNCAPPED set of the secret hashes each delegate holds in the reserved
+/// `\0freenet-migrate/` coordination namespace (#4117 finding 4a). Recorded at
+/// `store_secret` time whenever a Local secret's raw key is under that namespace
+/// (covers both this node's `pred-done:` markers and the app-side `pred-wip:`
+/// markers, since both are written via the registering `set_secret`/`store_secret`
+/// path). Copy-forward excludes these hashes from BOTH the value copy and the
+/// enumeration copy. It exists because the advisory `.keys` enumeration registry
+/// is CAPPED (`MAX_REGISTERED_KEYS_PER_SCOPE`) and may be unreadable — at/above
+/// the cap or with a missing registry, a marker's raw key would be invisible to a
+/// registry-based check and could chain-copy as user data, poisoning `had_data`
+/// and falsely gating a later migration. This table is registry-independent.
+/// INDIVIDUALLY KEYED (#4117 P2a): one row per `(delegate, hash)`, so recording a
+/// marker is a single insert, never a read-modify-write of a growing blob (an
+/// amplification vector). Per-delegate rows are bounded
+/// (`MAX_RESERVED_MARKER_HASHES_PER_DELEGATE`) and read via a prefix range scan.
+///
+/// Key: DelegateKey (64 bytes) || secret hash (32 bytes) = 96 bytes
+/// Value: single presence byte
+pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_reserved_marker_hashes");
+
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
 pub struct HostingMetadata {
@@ -450,6 +505,42 @@ impl ReDb {
                     table = "BROKEN_INVARIANTS_TABLE",
                     phase = "table_init_failed",
                     "Failed to open BROKEN_INVARIANTS_TABLE"
+                );
+                e
+            })?;
+
+            // Delegate secret copy-forward marker (#4117). Created on first open
+            // of upgraded databases too (same missing-table-in-write-txn
+            // materialization as the tables above), so a pre-#4117 database
+            // gains an empty table without disturbing any existing one.
+            txn.open_table(MIGRATION_MARKER_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "MIGRATION_MARKER_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open MIGRATION_MARKER_TABLE"
+                );
+                e
+            })?;
+
+            // Delegate registration origins (#4117 H1) + reserved-marker hashes
+            // (#4117 4a). Both created on first open of upgraded databases too.
+            txn.open_table(DELEGATE_ORIGINS_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "DELEGATE_ORIGINS_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open DELEGATE_ORIGINS_TABLE"
+                );
+                e
+            })?;
+
+            txn.open_table(RESERVED_MARKER_HASHES_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "RESERVED_MARKER_HASHES_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open RESERVED_MARKER_HASHES_TABLE"
                 );
                 e
             })?;
@@ -1108,6 +1199,271 @@ impl ReDb {
         })
     }
 
+    // ============ Delegate Secret Copy-Forward Marker (#4117) ============
+    // One-shot idempotence / anti-resurrection marker keyed on the
+    // `(predecessor, successor)` delegate pair. See `MIGRATION_MARKER_TABLE`
+    // and `SecretsStore::migrate_secrets`.
+
+    /// Build the 128-byte composite key `predecessor(64) || successor(64)`,
+    /// where each 64-byte half is `DelegateKey.key(32) || code_hash(32)` — the
+    /// same DelegateKey encoding the secrets-index tables use.
+    fn migration_marker_key(predecessor: &DelegateKey, successor: &DelegateKey) -> [u8; 128] {
+        let mut key_bytes = [0u8; 128];
+        key_bytes[..32].copy_from_slice(predecessor.as_ref());
+        key_bytes[32..64].copy_from_slice(predecessor.code_hash().as_ref());
+        key_bytes[64..96].copy_from_slice(successor.as_ref());
+        key_bytes[96..].copy_from_slice(successor.code_hash().as_ref());
+        key_bytes
+    }
+
+    /// Persist the copy-forward marker for `(predecessor, successor)`. The
+    /// `value` is the opaque, versioned audit blob built by the secrets store.
+    /// Idempotent: re-writing the same pair overwrites in place.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb write transaction, table open, or
+    /// commit fails (e.g. a backend I/O error).
+    pub fn store_migration_marker(
+        &self,
+        predecessor: &DelegateKey,
+        successor: &DelegateKey,
+        value: &[u8],
+    ) -> Result<(), redb::Error> {
+        let key_bytes = Self::migration_marker_key(predecessor, successor);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(MIGRATION_MARKER_TABLE)?;
+            tbl.insert(key_bytes.as_slice(), value)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Fetch the copy-forward marker for `(predecessor, successor)`, or `None`
+    /// if this pair has never been migrated. The returned bytes are the opaque
+    /// audit blob the secrets store wrote; only the store interprets them.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb read transaction, table open, or
+    /// lookup fails (e.g. a backend I/O error).
+    pub fn get_migration_marker(
+        &self,
+        predecessor: &DelegateKey,
+        successor: &DelegateKey,
+    ) -> Result<Option<Vec<u8>>, redb::Error> {
+        let key_bytes = Self::migration_marker_key(predecessor, successor);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(MIGRATION_MARKER_TABLE)?;
+            match tbl.get(key_bytes.as_slice())? {
+                Some(v) => Ok(Some(v.value().to_vec())),
+                None => Ok(None),
+            }
+        })
+    }
+
+    // ========== Delegate registration origins (#4117 H1) ==========
+
+    /// 64-byte delegate key `DelegateKey.key(32) || code_hash(32)` — the same
+    /// encoding the secrets-index tables use.
+    ///
+    /// NOTE (#4117 L3): this redb row key includes the `code_hash`, whereas the
+    /// copy-forward's on-disk namespace and the migration gate are keyed on the
+    /// 32-byte delegate KEY only (`DelegateKey::encode()`). This is harmless:
+    /// `key = BLAKE3(code_hash || params)`, so key and code_hash move together —
+    /// two `DelegateKey`s that share a key but differ in code_hash cannot occur
+    /// for a real delegate. The wider row key just matches the sibling
+    /// secrets-index tables' convention.
+    fn delegate_key64(delegate: &DelegateKey) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        b[..32].copy_from_slice(delegate.as_ref());
+        b[32..].copy_from_slice(delegate.code_hash().as_ref());
+        b
+    }
+
+    /// Record the origin under which `delegate` was FIRST registered —
+    /// FIRST-WRITER-WINS and IMMUTABLE (#4117 H1). The record is written only if
+    /// none exists; a later registration NEVER modifies it. This is the whole
+    /// security property: an attacker who re-registers a victim's
+    /// (public-derivable) WASM later cannot add itself to the origin set, so it
+    /// can never satisfy the copy-forward same-origin gate for that delegate.
+    /// `origin = None` records the Admin/None class (a token-less / loopback
+    /// registration), which the gate treats as NEVER privileged. Returns whether
+    /// a NEW record was written (`false` if one already existed).
+    ///
+    /// Value encoding (unchanged): `[has_admin_none: 1][origin: 32 if Some]` — a
+    /// first-Some writer stores `[0][C]`, a first-None writer stores `[1]`.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb write transaction, table open,
+    /// lookup, or commit fails (e.g. a backend I/O error). The caller MUST fail
+    /// the registration on `Err` (persistence-succeeds-before-usable).
+    pub fn record_delegate_origin_first_writer(
+        &self,
+        delegate: &DelegateKey,
+        origin: Option<[u8; 32]>,
+    ) -> Result<bool, redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        let txn = self.begin_write()?;
+        let wrote = {
+            let mut tbl = txn.open_table(DELEGATE_ORIGINS_TABLE)?;
+            if tbl.get(key.as_slice())?.is_some() {
+                false
+            } else {
+                let mut value = Vec::with_capacity(1 + 32);
+                match origin {
+                    None => value.push(1u8), // Admin/None class, no Some origin
+                    Some(o) => {
+                        value.push(0u8);
+                        value.extend_from_slice(&o);
+                    }
+                }
+                tbl.insert(key.as_slice(), value.as_slice())?;
+                true
+            }
+        };
+        Self::commit_guarded(txn)?;
+        Ok(wrote)
+    }
+
+    /// Fetch `delegate`'s FIRST-registration origin as `(has_admin_none,
+    /// origins)`, or `None` if the delegate has never been registered on this
+    /// node (the NoProvenance case — copy-forward refuses). With first-writer
+    /// -wins, `origins` holds at most one entry.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb read transaction, table open, or
+    /// lookup fails (e.g. a backend I/O error). Copy-forward treats an `Err`
+    /// here as fail-closed (refuse the copy).
+    #[allow(clippy::type_complexity)]
+    pub fn get_delegate_origins(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<Option<(bool, Vec<[u8; 32]>)>, redb::Error> {
+        let key = Self::delegate_key64(delegate);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(DELEGATE_ORIGINS_TABLE)?;
+            match tbl.get(key.as_slice())? {
+                Some(v) => Ok(Some(Self::decode_origins(v.value()))),
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn decode_origins(bytes: &[u8]) -> (bool, Vec<[u8; 32]>) {
+        if bytes.is_empty() {
+            return (false, Vec::new());
+        }
+        let has_admin_none = bytes[0] != 0;
+        let rest = &bytes[1..];
+        let mut origins = Vec::with_capacity(rest.len() / 32);
+        for chunk in rest.chunks_exact(32) {
+            // `chunks_exact(32)` yields exactly-32 slices, but decode fallibly
+            // (no production `.unwrap()`): a wrong-length chunk is skipped.
+            if let Ok(arr) = <[u8; 32]>::try_from(chunk) {
+                origins.push(arr);
+            }
+        }
+        (has_admin_none, origins)
+    }
+
+    // ========== Reserved-marker hashes (#4117 finding 4a / P2a) ==========
+
+    /// Per-delegate cap on recorded reserved-marker hashes. Bounds the table
+    /// against a delegate that somehow accretes many reserved entries; a real
+    /// delegate's reserved set is at most its predecessor count (itself capped at
+    /// registration). Over the cap, further entries are not recorded (the
+    /// below-cap `.keys` union still covers a freshly-written marker).
+    pub(crate) const MAX_RESERVED_MARKER_HASHES_PER_DELEGATE: usize = 256;
+
+    /// 96-byte row key `delegate_key64(64) || hash(32)` for the individually
+    /// -keyed reserved-marker table (no read-modify-write of a growing blob —
+    /// #4117 P2a).
+    fn reserved_marker_row_key(delegate: &DelegateKey, hash: &[u8; 32]) -> [u8; 96] {
+        let mut k = [0u8; 96];
+        k[..64].copy_from_slice(&Self::delegate_key64(delegate));
+        k[64..].copy_from_slice(hash);
+        k
+    }
+
+    /// Record that `delegate` holds a reserved-namespace coordination secret with
+    /// hash `hash`, as an individually-keyed row (#4117 P2a — no read-modify
+    /// -write amplification). Idempotent; bounded at
+    /// [`Self::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE`] per delegate.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb write transaction, table open, range
+    /// count, or commit fails (e.g. a backend I/O error).
+    pub fn add_reserved_marker_hash(
+        &self,
+        delegate: &DelegateKey,
+        hash: &[u8; 32],
+    ) -> Result<(), redb::Error> {
+        let row_key = Self::reserved_marker_row_key(delegate, hash);
+        let (lo, hi) = Self::reserved_marker_range(delegate);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(RESERVED_MARKER_HASHES_TABLE)?;
+            // Idempotent + capped. Counting the existing rows is bounded by the
+            // cap; a present row means we're done.
+            if tbl.get(row_key.as_slice())?.is_none() {
+                let count = tbl.range(lo.as_slice()..=hi.as_slice())?.count();
+                if count < Self::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE {
+                    tbl.insert(row_key.as_slice(), [1u8].as_slice())?;
+                } else {
+                    tracing::warn!(
+                        delegate = %delegate.encode(),
+                        cap = Self::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE,
+                        "reserved-marker hash set at cap; not recording (below-cap .keys union still covers fresh markers)"
+                    );
+                }
+            }
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Inclusive `[lo, hi]` 96-byte range bounds covering every reserved-marker
+    /// row for `delegate` (its 64-byte prefix followed by all-zero .. all-ones
+    /// hash).
+    fn reserved_marker_range(delegate: &DelegateKey) -> ([u8; 96], [u8; 96]) {
+        let mut lo = [0u8; 96];
+        lo[..64].copy_from_slice(&Self::delegate_key64(delegate));
+        let mut hi = [0xffu8; 96];
+        hi[..64].copy_from_slice(&Self::delegate_key64(delegate));
+        (lo, hi)
+    }
+
+    /// All reserved-namespace secret hashes recorded for `delegate`. Callers use
+    /// this to EXCLUDE markers from copy-forward, so a read failure MUST NOT be
+    /// silently treated as "no markers" (that would let a marker chain-copy as
+    /// user data): the caller fails closed on `Err`.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb read transaction, table open, or
+    /// range scan fails (e.g. a backend I/O error). Callers MUST fail closed on
+    /// `Err` rather than treating it as "no markers".
+    pub fn get_reserved_marker_hashes(
+        &self,
+        delegate: &DelegateKey,
+    ) -> Result<Vec<[u8; 32]>, redb::Error> {
+        let (lo, hi) = Self::reserved_marker_range(delegate);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(RESERVED_MARKER_HASHES_TABLE)?;
+            let mut out = Vec::new();
+            for entry in tbl.range(lo.as_slice()..=hi.as_slice())? {
+                let (k, _v) = entry?;
+                let key_bytes = k.value();
+                // Rows are always 96 bytes (delegate64||hash), but decode
+                // fallibly (no production `.unwrap()`): a malformed row is
+                // skipped rather than panicking the read.
+                if let Some(suffix) = key_bytes.get(64..) {
+                    if let Ok(hash) = <[u8; 32]>::try_from(suffix) {
+                        out.push(hash);
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
     // ==================== Broken Invariants Methods ====================
     // Per-contract record of detected CRDT-invariant violations. See
     // `ring::broken_invariants` for the in-memory tracker.
@@ -1275,6 +1631,13 @@ impl StateStorage for ReDb {
         Self::commit_guarded(txn)
     }
 }
+
+// Test-only fault-injection helpers, re-exported so sibling modules' tests
+// (e.g. the secrets-store origin-record failure path, #4117) can build a
+// `ReDb` whose backend I/O can be flipped to fail on demand. Defined inside
+// `mod tests` below; surfaced at module level here for cross-module test use.
+#[cfg(test)]
+pub(crate) use tests::{FailingBackend, open_redb_with_backend};
 
 #[cfg(test)]
 mod tests {
@@ -1578,6 +1941,106 @@ mod tests {
         DelegateKey::new([key_seed; 32], CodeHash::from(&[code_seed; 32]))
     }
 
+    /// #4117 H1: the delegate-origin record is FIRST-WRITER-WINS — the first
+    /// write wins and returns `true`, a later write is a no-op returning `false`,
+    /// and the read observes the ORIGINAL (a racing loser sees the winner's
+    /// record). A `None` first-writer records the Admin/None class.
+    #[tokio::test]
+    async fn delegate_origin_first_writer_wins() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let d = fake_delegate_key(0x33, 0x44);
+        assert!(db.get_delegate_origins(&d).unwrap().is_none());
+
+        let a = [0xA1u8; 32];
+        assert!(db.record_delegate_origin_first_writer(&d, Some(a)).unwrap());
+        // A later, different origin is a no-op (loser).
+        let b = [0xB2u8; 32];
+        assert!(!db.record_delegate_origin_first_writer(&d, Some(b)).unwrap());
+        let (has_none, origins) = db.get_delegate_origins(&d).unwrap().unwrap();
+        assert!(!has_none);
+        assert_eq!(origins, vec![a], "the read observes only the first origin");
+
+        // A None first-writer records the Admin/None class (never privileged).
+        let d2 = fake_delegate_key(0x55, 0x66);
+        assert!(db.record_delegate_origin_first_writer(&d2, None).unwrap());
+        assert!(
+            !db.record_delegate_origin_first_writer(&d2, Some(a))
+                .unwrap()
+        );
+        let (has_none2, origins2) = db.get_delegate_origins(&d2).unwrap().unwrap();
+        assert!(has_none2);
+        assert!(origins2.is_empty());
+    }
+
+    /// #4117 H1 (persistence-succeeds-before-usable): a durable-write failure in
+    /// `record_delegate_origin_first_writer` SURFACES as `Err` — it is never
+    /// swallowed into a silent `Ok`. This is the storage-layer foundation of the
+    /// rule that a failed origin record must ABORT the whole registration (a
+    /// registered-but-recordless delegate has a claimable first-writer slot).
+    /// Uses the fault-injecting backend to produce a REAL redb I/O failure.
+    #[test]
+    fn record_delegate_origin_first_writer_surfaces_backend_failure() {
+        let backend = FailingBackend::new();
+        let db = open_redb_with_backend(backend.clone());
+        let d = fake_delegate_key(0x12, 0x34);
+
+        // Healthy: the first write succeeds and is observable.
+        assert!(
+            db.record_delegate_origin_first_writer(&d, Some([0x11u8; 32]))
+                .unwrap(),
+            "healthy first write must succeed and return `true`"
+        );
+
+        // Disk fails: a subsequent origin write MUST return Err, never a silent Ok.
+        backend.start_failing();
+        let d2 = fake_delegate_key(0x56, 0x78);
+        assert!(
+            db.record_delegate_origin_first_writer(&d2, Some([0x22u8; 32]))
+                .is_err(),
+            "a durable-write failure must surface as Err, never a silent Ok"
+        );
+    }
+
+    /// #4117 P2a: the reserved-marker-hash table is individually keyed,
+    /// idempotent, per-delegate isolated, and per-delegate CAPPED.
+    #[tokio::test]
+    async fn reserved_marker_hashes_capped_and_isolated() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let d = fake_delegate_key(0x77, 0x88);
+        let other = fake_delegate_key(0x99, 0xAA);
+
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        db.add_reserved_marker_hash(&d, &h1).unwrap();
+        db.add_reserved_marker_hash(&d, &h1).unwrap(); // idempotent
+        db.add_reserved_marker_hash(&d, &h2).unwrap();
+        db.add_reserved_marker_hash(&other, &[9u8; 32]).unwrap();
+
+        let mut got = db.get_reserved_marker_hashes(&d).unwrap();
+        got.sort();
+        assert_eq!(got, vec![h1, h2]);
+        assert_eq!(
+            db.get_reserved_marker_hashes(&other).unwrap(),
+            vec![[9u8; 32]],
+            "reserved hashes are per-delegate isolated"
+        );
+
+        // Cap: adding well past the per-delegate cap never exceeds it.
+        let cap = ReDb::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE;
+        for i in 0..(cap as u32 + 10) {
+            let mut h = [0u8; 32];
+            h[..4].copy_from_slice(&i.to_le_bytes());
+            db.add_reserved_marker_hash(&d, &h).unwrap();
+        }
+        assert_eq!(
+            db.get_reserved_marker_hashes(&d).unwrap().len(),
+            cap,
+            "per-delegate reserved-hash count is bounded at the cap"
+        );
+    }
+
     /// Full store → get → remove → load round trip for the per-user secrets
     /// index, exercising `store_user_secrets_index`, `get_user_secrets_index`,
     /// `remove_user_secrets_index` (otherwise uncalled in non-test builds),
@@ -1707,13 +2170,13 @@ mod tests {
     /// `StorageError::PreviousIo`) so the poison-detection and recovery path can be
     /// exercised without relying on the error message string.
     #[derive(Debug, Clone)]
-    struct FailingBackend {
+    pub(crate) struct FailingBackend {
         inner: Arc<redb::backends::InMemoryBackend>,
         fail: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FailingBackend {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 inner: Arc::new(redb::backends::InMemoryBackend::new()),
                 fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1721,7 +2184,7 @@ mod tests {
         }
 
         /// Make every subsequent I/O call fail, simulating a disk EIO / csum failure.
-        fn start_failing(&self) {
+        pub(crate) fn start_failing(&self) {
             self.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -1760,7 +2223,7 @@ mod tests {
     }
 
     /// Open a fully-initialised [`ReDb`] over an arbitrary backend (test-only).
-    fn open_redb_with_backend<B: redb::StorageBackend>(backend: B) -> ReDb {
+    pub(crate) fn open_redb_with_backend<B: redb::StorageBackend>(backend: B) -> ReDb {
         let db = Database::builder()
             .create_with_backend(backend)
             .expect("create_with_backend");

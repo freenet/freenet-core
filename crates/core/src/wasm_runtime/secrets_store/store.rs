@@ -4,7 +4,7 @@
 //! and the `#[cfg(test)]` test module.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -605,6 +605,21 @@ impl SecretsStore {
         scope: SecretScope<'_>,
         plaintext: Zeroizing<Vec<u8>>,
     ) -> RuntimeResult<()> {
+        // #4117 P2a: the `\0freenet-migrate/` namespace is RESERVED for protocol
+        // coordination markers. Reject any reserved-namespace key that is not a
+        // legal marker shape (`pred-done:`/`pred-wip:` + a 32-byte key), so a
+        // client cannot pad the namespace with arbitrary keys to bloat the
+        // reserved-hash table or shadow a real marker.
+        if key.key().starts_with(MIGRATE_RESERVED_NAMESPACE_PREFIX)
+            && !is_legal_reserved_marker_key(key.key())
+        {
+            return Err(SecretStoreError::IO(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "reserved freenet-migrate namespace: only pred-done:/pred-wip: + 32-byte marker keys are permitted",
+            ))
+            .into());
+        }
+
         let scope_path = self.scope_dir(delegate, &scope);
         let secret_file_path = scope_path.join(key.encode());
         let secret_key = *key.hash();
@@ -786,6 +801,27 @@ impl SecretsStore {
             file.write_all(&ciphertext)?;
             file.sync_all()?;
         }
+
+        // #4117 P1c: record the reserved-marker hash in the durable,
+        // registry-independent table BEFORE committing the value blob (the
+        // rename below). Ordering matters: a reserved-hash entry WITHOUT a
+        // committed blob is harmless (it just excludes a hash that isn't there),
+        // but the inverse — a committed marker blob with NO reserved-hash entry,
+        // so copy-forward wouldn't exclude it and could chain-copy it as user
+        // data — is the dangerous state. Recording first makes a crash between
+        // the two land in the safe state. Local scope only (markers are Local);
+        // P2a above guarantees a reserved-namespace key here is a legal marker.
+        if matches!(scope, SecretScope::Local)
+            && key.key().starts_with(MIGRATE_RESERVED_NAMESPACE_PREFIX)
+            && let Err(e) = self.db.add_reserved_marker_hash(delegate, key.hash())
+        {
+            tracing::warn!(
+                delegate = %delegate.encode(),
+                error = %e,
+                "failed to durably record reserved-marker hash; copy-forward exclusion falls back to the .keys registry"
+            );
+        }
+
         // Atomic on POSIX (and on Rust >=1.56 Windows: MoveFileExW with
         // MOVEFILE_REPLACE_EXISTING). If this rename fails, the active
         // path still holds the old value (or is empty if it never existed)
@@ -1186,23 +1222,30 @@ impl SecretsStore {
 
     /// Encrypt `keys` and atomically write the registry file for the scope,
     /// reusing the same `[VERSION_V1][nonce][AEAD]` layout, per-write random
-    /// nonce, owner-only perms, and tmp+rename discipline as the secret
-    /// values. Best-effort: a failure here is logged and swallowed — the
-    /// secret VALUE write has already committed, and a stale/absent registry
-    /// only degrades future enumeration, never the value's readability.
+    /// nonce, owner-only perms, and tmp+rename discipline as the secret values.
+    ///
+    /// Returns `Err` on a genuine persistence failure (encrypt, mkdir, or
+    /// write/rename). The `store_secret`/`register_key`/`deregister_key` callers
+    /// treat this as best-effort (a stale/absent registry only degrades future
+    /// enumeration, never a value's readability) and ignore the error after the
+    /// internal log; the copy-forward enumeration copy (#4117 P1) PROPAGATES it,
+    /// because a sealed migration whose enumeration silently failed would leave
+    /// River-style discovery empty forever.
     fn write_key_registry(
         &self,
         delegate: &DelegateKey,
         scope: &SecretScope<'_>,
         encryption: &Encryption,
         keys: &[Vec<u8>],
-    ) {
+    ) -> std::io::Result<()> {
         let scope_path = self.scope_dir(delegate, scope);
         let path = scope_path.join(KEY_REGISTRY_FILE);
 
         if keys.is_empty() {
             // Nothing left to enumerate; remove the registry so a future read
-            // sees a clean empty scope instead of an empty-list blob.
+            // sees a clean empty scope instead of an empty-list blob. Clearing
+            // is best-effort (a stale empty registry is harmless), so a remove
+            // failure is logged but still reported Ok.
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1210,7 +1253,7 @@ impl SecretsStore {
                     tracing::warn!(path = %path.display(), error = %e, "failed to clear key registry")
                 }
             }
-            return;
+            return Ok(());
         }
 
         let plaintext = encode_secret_key_list(keys.iter().map(|k| k.as_slice()));
@@ -1219,7 +1262,7 @@ impl SecretsStore {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to encrypt key registry");
-                return;
+                return Err(std::io::Error::other(format!("encrypt key registry: {e}")));
             }
         };
         let mut blob = Vec::with_capacity(HEADER_LEN + aead.len());
@@ -1229,7 +1272,7 @@ impl SecretsStore {
 
         if let Err(e) = fs::create_dir_all(&scope_path) {
             tracing::warn!(path = %scope_path.display(), error = %e, "failed to create scope dir for key registry");
-            return;
+            return Err(e);
         }
         if let Err(e) = ensure_owner_only_tree(&self.base_path, &scope_path) {
             tracing::warn!(path = %scope_path.display(), error = %e, "chmod scope dir tree failed (key registry)");
@@ -1262,7 +1305,9 @@ impl SecretsStore {
             if let Err(rm_err) = fs::remove_file(&tmp_path) {
                 tracing::debug!(path = %tmp_path.display(), error = %rm_err, "tmp registry cleanup failed (harmless)");
             }
+            return Err(e);
         }
+        Ok(())
     }
 
     /// Register `key`'s raw bytes in the scope's enumeration registry. Called
@@ -1316,7 +1361,11 @@ impl SecretsStore {
             return;
         }
         keys.push(key.key().to_vec());
-        self.write_key_registry(delegate, scope, encryption, &keys);
+        // Best-effort (advisory registry, already logged internally on failure):
+        // the secret VALUE + index are already durably committed. The named
+        // underscore binding consumes the `#[must_use]` result without a bare
+        // `let _` (clippy::let_underscore_must_use).
+        let _registry_write = self.write_key_registry(delegate, scope, encryption, &keys);
     }
 
     /// Drop `key` from the scope's enumeration registry. Called after
@@ -1347,7 +1396,9 @@ impl SecretsStore {
             return;
         }
         let encryption = self.encryption_for_scope_read(delegate, scope);
-        self.write_key_registry(delegate, scope, &encryption, &keys);
+        // Best-effort (advisory registry, already logged internally on failure).
+        // Named underscore binding avoids clippy::let_underscore_must_use.
+        let _registry_write = self.write_key_registry(delegate, scope, &encryption, &keys);
     }
 
     /// Enumerate the raw keys of every secret stored under `scope` whose key
@@ -1371,6 +1422,11 @@ impl SecretsStore {
         // the cause loudly and, critically, did NOT overwrite the on-disk blob
         // — so a later call can still recover the full set once it is readable.
         let mut keys = self.read_key_registry(delegate, &scope).unwrap_or_default();
+        // Defense-in-depth (#4117 L2): never surface the reserved
+        // `\0freenet-migrate/` coordination namespace to a delegate. These are
+        // node/app copy-forward markers, not user keys — a consumer must never
+        // see them even if one slipped into the enumeration registry.
+        keys.retain(|k| !k.starts_with(MIGRATE_RESERVED_NAMESPACE_PREFIX));
         if !prefix.is_empty() {
             keys.retain(|k| k.starts_with(prefix));
         }
@@ -2105,6 +2161,9 @@ impl SecretsStore {
         let mut entries: Vec<ExportSecretEntry> = Vec::new();
         let mut total_bytes: usize = 0;
         let mut count: usize = 0;
+        // Per-delegate cache of reserved-namespace marker hashes, so the export
+        // filter (#4117 L2) costs at most one DB read per delegate.
+        let mut reserved_cache: HashMap<DelegateKey, HashSet<SecretKey>> = HashMap::new();
         // The visit closure can't return a Result, so it stashes a terminal
         // outcome here and Breaks; we surface it after the walk.
         let mut bail: Option<ExportScopeError> = None;
@@ -2121,6 +2180,31 @@ impl SecretsStore {
                     limit: max_count,
                 });
                 return ControlFlow::Break(());
+            }
+            // Defense-in-depth (#4117 L2): never export the reserved
+            // `\0freenet-migrate/` coordination namespace — markers are node
+            // infrastructure, not user secrets. Skipped AFTER the count check so
+            // the DoS count bound stays consistent with the cheap pre-check.
+            // FAIL CLOSED (#4117 P1c): a reserved-hash lookup failure aborts the
+            // export rather than risk leaking a marker (no `unwrap_or_default`).
+            if !reserved_cache.contains_key(&delegate) {
+                match self.db.get_reserved_marker_hashes(&delegate) {
+                    Ok(h) => {
+                        reserved_cache.insert(delegate.clone(), h.into_iter().collect());
+                    }
+                    Err(e) => {
+                        bail = Some(ExportScopeError::Store(SecretStoreError::IO(
+                            std::io::Error::other(format!("reserved-marker lookup failed: {e}")),
+                        )));
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            if reserved_cache
+                .get(&delegate)
+                .is_some_and(|r| r.contains(&secret_hash))
+            {
+                return ControlFlow::Continue(());
             }
             let plaintext = match self.read_secret_by_hash(&delegate, &secret_hash, &scope) {
                 Ok(p) => p,
@@ -2258,6 +2342,1068 @@ impl SecretsStore {
 
         self.add_to_index(delegate, &scope, *secret_hash)?;
         Ok(true)
+    }
+
+    /// One-shot, idempotent, **Local-scope-only** copy-forward of delegate
+    /// secrets from one or more `predecessors` to a `successor` delegate key
+    /// (#4117).
+    ///
+    /// A delegate's on-disk key is `BLAKE3(code_hash || params)`, so ANY change
+    /// to the delegate's compiled WASM mints a new key, a new secrets namespace,
+    /// and an "empty new install" for every existing user. This copies each
+    /// predecessor's secret VALUES forward into the successor's namespace,
+    /// re-encrypting them from the predecessor's Local DEK to the successor's,
+    /// so a delegate rebuild no longer wipes user state.
+    ///
+    /// **Local scope only, by construction.** The Local DEK is
+    /// `HKDF(salt = delegate_key, ikm = node_KEK)`, both available at rest, so
+    /// the node can decrypt a predecessor's Local secret and re-encrypt it for
+    /// the successor without any client input. The per-user (hosted) DEK is
+    /// `HKDF(salt = delegate_key, ikm = client_dek_secret)`, and `dek_secret`
+    /// is supplied per request and is NOT available at rest — so User-scope
+    /// secrets simply cannot be re-encrypted here. They are never touched; the
+    /// count of User-scope blobs a predecessor holds is recorded in the report
+    /// (`user_scope_skipped`) as observability for that carve-out.
+    ///
+    /// **No-delete invariant + order semantics.** Predecessor data is only ever
+    /// read, never deleted or mutated. `overwrite = false` on the successor side
+    /// means an existing successor value (one it wrote itself, or one an
+    /// EARLIER predecessor in the list already supplied) is preserved — FIRST
+    /// WRITER WINS. Predecessors are processed strictly in the supplied order, so
+    /// **callers MUST pass `predecessors` newest-first**: the node-side copy is
+    /// therefore *union-with-newest-precedence* (the newest generation that holds
+    /// a given key supplies its value; older generations only fill keys the newer
+    /// ones lacked). NOTE (v1 wire limit): the wire carries only a
+    /// `Vec<DelegateKey>` with no generation/policy metadata, so delete-by-absence
+    /// (a newer generation having *dropped* a key the older one had) is NOT
+    /// preserved node-side — a value present in ANY listed predecessor is copied
+    /// unless a newer one already supplied that key. The app-side fallback layers
+    /// its own newest-snapshot-wins / stop-at-first-data-bearing policy on top;
+    /// that is app-side only, not promised here.
+    ///
+    /// **Enumeration carry-over.** For each copied secret, the predecessor's
+    /// enumeration-registry raw key is registered under the successor so
+    /// `list_secret_keys` (e.g. River's `room:<vk>` room discovery) still works
+    /// after a rebuild. Bound: a secret with no predecessor registry entry
+    /// (pre-#4355 or cap-evicted) migrates its VALUE but stays unenumerable until
+    /// re-stored. See [`Self::copy_enumeration_registry_forward`].
+    ///
+    /// **One-shot / anti-resurrection, sealed only on a CLEAN copy.** Each
+    /// `(predecessor, successor)` pair is gated by TWO markers: a node-local redb
+    /// row (`MIGRATION_MARKER_TABLE`, rich audit) and a crate-format marker
+    /// SECRET under the successor ([`MIGRATE_MARKER_KEY_PREFIX`]) that the
+    /// app-side `freenet-migrate` fallback also reads/writes — so a node
+    /// registration and an app-side migration never double-copy the same pair.
+    /// A marker — NOT deletion — is what prevents resurrection: once a pair has
+    /// migrated, it never migrates again, so a secret the user DELETES from the
+    /// successor cannot reappear when the delegate re-registers (which apps do on
+    /// every startup). Both markers are written ONLY when the copy is FULLY clean
+    /// (enumeration succeeded AND every read/import succeeded). A partial copy is
+    /// deliberately left UNSEALED so a later registration (or the app-side
+    /// fallback) can complete it — safe because `overwrite = false` never
+    /// re-copies an already-present secret, and a sealed-but-incomplete pair
+    /// could never be completed.
+    ///
+    /// **H1 SAME-ORIGIN GATE (`origin_contract`) — first-writer-wins, no
+    /// grandfather, None never privileged.** `origin_contract` is the 32-byte id
+    /// of the web-app contract driving the registration (or `None` for a
+    /// token-less / loopback registration). A predecessor's Local secrets are
+    /// copied ONLY IF `origin_contract` is a specific contract that EQUALS the
+    /// predecessor's FIRST-registration origin (recorded immutably on its first
+    /// registration; see [`Self::record_delegate_registration_origin`]). This is
+    /// a real authorization control, not an audit fact: a predecessor key is
+    /// public-derivable and a malicious web-app IS the client, so client consent
+    /// cannot gate it. The gate REFUSES (no copy, no seal, `origin_refused`; not a
+    /// registration failure) when: the registering origin differs from the
+    /// record; the registering origin is `None` (never privileged in v1); or the
+    /// predecessor has NO record (`no_provenance` — such legacy data migrates via
+    /// the app-side path, whose predecessor-delegate OriginPolicy is the sound
+    /// legacy authorizer). A lookup failure fails CLOSED. Because the record is
+    /// first-writer-wins, an attacker re-registering a victim's public WASM later
+    /// records nothing and can never satisfy the gate.
+    ///
+    /// **Never fails registration.** All errors (an unreadable blob, a failed
+    /// marker write, an origin-lookup failure) are recorded in the returned
+    /// [`MigrationReport`] and logged; this function returns a report, never an
+    /// `Err`, so the caller registers the successor regardless. An ABSENT
+    /// predecessor (one this node never held — no on-disk directory) is a clean
+    /// no-op that writes NO marker and NO redb row, so it is cheaply re-checked on
+    /// the next registration (and picked up if its secrets arrive later); this
+    /// also denies a client the ability to drive marker writes with bogus keys.
+    ///
+    /// Runs synchronously on the caller (the contract loop, via the
+    /// `RegisterDelegateWithPredecessors` handler), mirroring the on-loop write
+    /// discipline of `store_secret` / the live bundle import. The work is bounded
+    /// by the predecessors' own on-disk secret count.
+    pub fn migrate_secrets(
+        &mut self,
+        predecessors: &[DelegateKey],
+        successor: &DelegateKey,
+        origin_contract: Option<[u8; 32]>,
+    ) -> MigrationReport {
+        let mut report = MigrationReport {
+            successor: successor.clone(),
+            per_predecessor: Vec::with_capacity(predecessors.len()),
+        };
+
+        for predecessor in predecessors {
+            let mut pm = PredecessorMigration::new(predecessor.clone());
+
+            // A delegate that lists itself (or a repeated predecessor) as its
+            // own predecessor has nothing to copy: source and destination share
+            // the same on-disk namespace and DEK. Skip without writing a marker
+            // — there is nothing to gate. `encode()` is key-only, so this also
+            // collapses two DelegateKeys that differ only in `code_hash`.
+            if predecessor.encode() == successor.encode() {
+                report.per_predecessor.push(pm);
+                continue;
+            }
+
+            // 1. Idempotence gate — skip if this (predecessor, successor) pair
+            //    already migrated, by EITHER path. Two checks because the redb
+            //    row is node-local (invisible to the app-side freenet-migrate
+            //    fallback) while the crate-format marker secret under the
+            //    successor is the SHARED cross-path gate both sides read/write:
+            //    (a) node-local redb audit row — fast, carries origin + counts;
+            //        a read anomaly fails CLOSED (treat as migrated) so a corrupt
+            //        marker can never reopen the resurrection window.
+            //    (b) crate-format marker secret — written by a prior node OR
+            //        app-side migration. Since a marker is written ONLY on a
+            //        fully-clean copy (step 6), its presence always means
+            //        "completed", never "partial".
+            match self.db.get_migration_marker(predecessor, successor) {
+                Ok(Some(bytes)) => {
+                    if let Some(prior) = MigrationMarker::decode(&bytes) {
+                        tracing::debug!(
+                            predecessor = %predecessor.encode(),
+                            successor = %successor.encode(),
+                            prior_copied = prior.copied,
+                            prior_skipped_existing = prior.skipped_existing,
+                            prior_user_scope_skipped = prior.user_scope_skipped,
+                            prior_errors = prior.error_count,
+                            "delegate secret copy-forward: already migrated (redb marker); skipping"
+                        );
+                    }
+                    pm.already_migrated = true;
+                    report.per_predecessor.push(pm);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(
+                        predecessor = %predecessor.encode(),
+                        successor = %successor.encode(),
+                        error = %e,
+                        "delegate secret copy-forward: redb marker read failed; skipping copy (fail-closed)"
+                    );
+                    pm.already_migrated = true;
+                    pm.errors.push(format!("marker read failed: {e}"));
+                    report.per_predecessor.push(pm);
+                    continue;
+                }
+            }
+            let marker_id = pred_done_marker_secret_id(predecessor);
+            if self
+                .get_secret(successor, &marker_id, SecretScope::Local)
+                .is_ok()
+            {
+                tracing::debug!(
+                    predecessor = %predecessor.encode(),
+                    successor = %successor.encode(),
+                    "delegate secret copy-forward: already migrated (crate-format marker); skipping"
+                );
+                pm.already_migrated = true;
+                report.per_predecessor.push(pm);
+                continue;
+            }
+
+            // 1b. ABSENT predecessor (M1): if this node never held the predecessor
+            //     (no on-disk directory), there is nothing to migrate — write NO
+            //     marker files and NO redb row. Sealing an absent predecessor is
+            //     what let a malicious client drive ~10^6 marker/index writes with
+            //     bogus keys; the re-check on re-registration is cheap, and a
+            //     predecessor whose secrets arrive later is picked up then.
+            if !self.base_path.join(predecessor.encode()).is_dir() {
+                tracing::debug!(
+                    predecessor = %predecessor.encode(),
+                    successor = %successor.encode(),
+                    "delegate secret copy-forward: predecessor not held on this node; nothing to migrate"
+                );
+                report.per_predecessor.push(pm);
+                continue;
+            }
+
+            // 1c. H1 SAME-ORIGIN GATE (first-writer-wins, no grandfather, None
+            //     never privileged). A malicious web-app IS the client and a
+            //     predecessor delegate key is public-derivable, so client consent
+            //     is no control. Copy P ONLY IF the registering request's web-app
+            //     origin equals P's FIRST-registration origin (recorded
+            //     immutably on P's first registration — an attacker re-registering
+            //     P's WASM later records nothing and can never match).
+            //     - No record → NoProvenance → REFUSE (pre-release data migrates
+            //       via the app-side path, whose predecessor-delegate OriginPolicy
+            //       is the sound legacy authorizer). A failed first-record write
+            //       leaves no record, so this also fails closed and self-heals on
+            //       the next (normally legitimate) registration.
+            //     - Registering origin is None (token-less) → REFUSE: nothing about
+            //       a token-less connection is verifiable as locally trusted, and
+            //       None is NEVER privileged in v1 (an authenticated admin
+            //       mechanism is a later addition).
+            //     - Lookup Err → REFUSE (fail-closed).
+            //     A refusal is not a registration failure.
+            match self.db.get_delegate_origins(predecessor) {
+                Ok(None) => {
+                    pm.origin_refused = true;
+                    pm.no_provenance = true;
+                    tracing::warn!(
+                        predecessor = %predecessor.encode(),
+                        successor = %successor.encode(),
+                        "delegate secret copy-forward: predecessor has no recorded origin (NoProvenance); refusing (legacy data migrates via the app-side path)"
+                    );
+                    report.per_predecessor.push(pm);
+                    continue;
+                }
+                Ok(Some((_has_admin_none, origins))) => {
+                    // Allowed ONLY when the registering origin is a specific
+                    // contract that equals the predecessor's recorded origin. A
+                    // None registering origin, or a None-class predecessor record
+                    // (empty `origins`), never matches.
+                    let allowed = match origin_contract {
+                        Some(current) => origins.iter().any(|o| o == &current),
+                        None => false,
+                    };
+                    if !allowed {
+                        pm.origin_refused = true;
+                        tracing::warn!(
+                            predecessor = %predecessor.encode(),
+                            successor = %successor.encode(),
+                            "delegate secret copy-forward: origin refused (registering origin is not the predecessor's first-registration origin, or is the never-privileged None class)"
+                        );
+                        report.per_predecessor.push(pm);
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    // Fail CLOSED: a same-origin check we cannot evaluate must not
+                    // default to allowing cross-origin access.
+                    pm.origin_refused = true;
+                    tracing::error!(
+                        predecessor = %predecessor.encode(),
+                        successor = %successor.encode(),
+                        error = %e,
+                        "delegate secret copy-forward: origin lookup failed; refusing copy (fail-closed)"
+                    );
+                    pm.errors.push(format!("origin lookup failed: {e}"));
+                    report.per_predecessor.push(pm);
+                    continue;
+                }
+            }
+
+            // 2. Enumerate the predecessor's Local-scope secrets from disk. An
+            //    absent predecessor directory yields nothing (clean no-op for an
+            //    unknown predecessor). Any other read error means we could not
+            //    even list the predecessor: nothing is copied and NO marker is
+            //    sealed (step 6), so a later re-registration retries.
+            let mut hashes: Vec<SecretKey> = Vec::new();
+            let enumeration_ok =
+                match self.walk_predecessor_local_secrets(predecessor, |h| hashes.push(h)) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            predecessor = %predecessor.encode(),
+                            error = %e,
+                            "delegate secret copy-forward: failed to enumerate predecessor secrets"
+                        );
+                        pm.errors
+                            .push(format!("enumerate predecessor secrets failed: {e}"));
+                        false
+                    }
+                };
+
+            // 3. Read each secret under the predecessor's Local DEK, re-encrypt
+            //    under the successor's Local DEK (`overwrite = false` → first
+            //    writer wins ACROSS predecessors, so callers MUST pass
+            //    predecessors newest-first; see the method rustdoc). A per-secret
+            //    failure is recorded and un-seals this predecessor (step 6). We
+            //    also collect the hashes now present under the successor (freshly
+            //    copied OR already there) to drive the enumeration-registry copy.
+            let mut copy_error = false;
+            let mut present_hashes: HashSet<SecretKey> = HashSet::new();
+            // Coordination-marker secrets (the whole reserved `\0freenet-migrate/`
+            // namespace) are NEVER copied forward — they are per-generation
+            // metadata, not user data, and chain-copying them would accrete stale
+            // markers under later successors and diverge from the app-side path.
+            // The exclusion set FAILS CLOSED (#4117 P1c): if we cannot read which
+            // hashes are markers, abort this predecessor's copy and do NOT seal,
+            // rather than risk chain-copying a marker as user data.
+            let marker_hashes = match self.predecessor_reserved_marker_hashes(predecessor) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(
+                        predecessor = %predecessor.encode(),
+                        successor = %successor.encode(),
+                        error = %e,
+                        "delegate secret copy-forward: reserved-marker lookup failed; aborting copy (fail-closed, unsealed)"
+                    );
+                    pm.errors
+                        .push(format!("reserved-marker lookup failed: {e}"));
+                    report.per_predecessor.push(pm);
+                    continue;
+                }
+            };
+            for hash in &hashes {
+                if marker_hashes.contains(hash) {
+                    continue;
+                }
+                let encoded = bs58::encode(hash)
+                    .with_alphabet(bs58::Alphabet::BITCOIN)
+                    .into_string();
+                match self.read_secret_by_hash(predecessor, hash, &SecretScope::Local) {
+                    Ok(plaintext) => {
+                        match self.import_secret_by_hash(
+                            successor,
+                            hash,
+                            SecretScope::Local,
+                            plaintext,
+                            false,
+                        ) {
+                            Ok(true) => {
+                                pm.copied += 1;
+                                present_hashes.insert(*hash);
+                            }
+                            Ok(false) => {
+                                // A collision (overwrite=false left the existing
+                                // successor blob). Count it "present" ONLY if it
+                                // actually DECRYPTS under the successor DEK (#4117
+                                // P1). A corrupt / wrong-DEK successor blob would
+                                // otherwise be counted as a successful migration
+                                // and SEALED, making a broken secret un-retryable.
+                                // An unreadable collision = per-secret error =
+                                // unsealed, so a retry (or the app-side fallback)
+                                // can recover it.
+                                match self.read_secret_by_hash(successor, hash, &SecretScope::Local)
+                                {
+                                    Ok(_) => {
+                                        pm.skipped_existing += 1;
+                                        present_hashes.insert(*hash);
+                                    }
+                                    Err(e) => {
+                                        copy_error = true;
+                                        tracing::warn!(
+                                            predecessor = %predecessor.encode(),
+                                            successor = %successor.encode(),
+                                            secret = %encoded,
+                                            error = %e,
+                                            "delegate secret copy-forward: existing successor blob does not decrypt; treating collision as an error (unsealed)"
+                                        );
+                                        pm.errors.push(format!(
+                                            "unreadable successor collision {encoded}: {e}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                copy_error = true;
+                                tracing::warn!(
+                                    predecessor = %predecessor.encode(),
+                                    successor = %successor.encode(),
+                                    secret = %encoded,
+                                    error = %e,
+                                    "delegate secret copy-forward: import failed"
+                                );
+                                pm.errors.push(format!("import {encoded} failed: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        copy_error = true;
+                        tracing::warn!(
+                            predecessor = %predecessor.encode(),
+                            secret = %encoded,
+                            error = %e,
+                            "delegate secret copy-forward: read failed"
+                        );
+                        pm.errors.push(format!("read {encoded} failed: {e}"));
+                    }
+                }
+            }
+
+            // 4. Copy the predecessor's enumeration-registry raw keys forward for
+            //    the secrets now present under the successor, so `list_secret_keys`
+            //    (River's `room:<vk>` discovery) enumerates migrated keys. A
+            //    failure here UN-SEALS the pair (#4117 P1): a sealed migration
+            //    whose enumeration copy silently failed would leave discovery
+            //    empty forever, and the pair could never be retried to fix it.
+            let mut registry_error = false;
+            match self.copy_enumeration_registry_forward(predecessor, successor, &present_hashes) {
+                Ok(n) if n > 0 => tracing::debug!(
+                    predecessor = %predecessor.encode(),
+                    successor = %successor.encode(),
+                    registered = n,
+                    "delegate secret copy-forward: copied enumeration-registry keys"
+                ),
+                Ok(_) => {}
+                Err(e) => {
+                    registry_error = true;
+                    tracing::warn!(
+                        predecessor = %predecessor.encode(),
+                        error = %e,
+                        "delegate secret copy-forward: enumeration-registry copy failed; un-sealing so a retry can restore discovery"
+                    );
+                    pm.errors
+                        .push(format!("enumeration-registry copy failed: {e}"));
+                }
+            }
+
+            // 5. Record (never migrate) any User/hosted-scope secrets the
+            //    predecessor holds — the per-user DEK is not derivable at rest.
+            match self.count_predecessor_user_scope_secrets(predecessor) {
+                Ok(n) => pm.user_scope_skipped = n,
+                Err(e) => pm
+                    .errors
+                    .push(format!("user-scope secret count failed: {e}")),
+            }
+
+            // 6. SEAL ONLY ON A FULLY-CLEAN COPY: enumeration succeeded AND every
+            //    read/import succeeded (`!copy_error`) AND the enumeration-registry
+            //    copy succeeded (`!registry_error` — step 4 UN-SEALS on failure,
+            //    so a sealed pair never leaves `list_secret_keys`/River discovery
+            //    empty). A sealed marker means "completed", so the app-side
+            //    fallback and future registrations skip the pair; sealing a
+            //    PARTIAL copy would strand it forever. On any such error we write
+            //    NO marker (redb OR crate-format) and let a retry converge — safe
+            //    because `overwrite = false` never re-copies an already-present
+            //    secret. Only the user-scope count (step 5) is best-effort
+            //    observability that does NOT gate the seal, though its error still
+            //    appears in `pm.errors`.
+            let copy_clean = enumeration_ok && !copy_error && !registry_error;
+            if copy_clean {
+                // Marker ORDER is load-bearing (#4117 P1): the crate-format marker
+                // secret is the SHARED cross-path gate the app-side fallback reads.
+                // Write + durably VERIFY it FIRST; only then the redb audit row. If
+                // the crate-format marker cannot be written+read back, the pair is
+                // left FULLY unsealed (no redb row either) — otherwise the node
+                // would believe the pair complete while the app saw no marker and
+                // could re-copy (resurrecting a user-deleted secret), and a redb
+                // recreation would lose the only gate.
+                //
+                // The data-bearing flag is b"1" iff the predecessor HAD ≥1 Local
+                // secret now present under the successor (copied OR already there):
+                // it drives the app's stop-at-first-data-bearing newest-first walk,
+                // so an all-collided predecessor (had data, nothing newly written)
+                // must still read as data-bearing, not as empty.
+                let marker_value = pred_done_marker_value(pm.copied + pm.skipped_existing > 0);
+                let marker_written = match self.store_secret(
+                    successor,
+                    &marker_id,
+                    SecretScope::Local,
+                    Zeroizing::new(marker_value.to_vec()),
+                ) {
+                    Ok(()) => {
+                        // Durably verify it reads back before sealing the redb row.
+                        if self
+                            .get_secret(successor, &marker_id, SecretScope::Local)
+                            .is_ok()
+                        {
+                            true
+                        } else {
+                            tracing::error!(
+                                predecessor = %predecessor.encode(),
+                                successor = %successor.encode(),
+                                "delegate secret copy-forward: crate-format marker not readable after write; leaving pair fully unsealed"
+                            );
+                            pm.errors
+                                .push("crate-format marker not durable".to_string());
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            predecessor = %predecessor.encode(),
+                            successor = %successor.encode(),
+                            error = %e,
+                            "delegate secret copy-forward: crate-format marker write failed; leaving pair fully unsealed"
+                        );
+                        pm.errors
+                            .push(format!("crate-format marker write failed: {e}"));
+                        false
+                    }
+                };
+
+                // Only seal the node-local redb audit row once the SHARED marker
+                // is durable — never seal redb-only.
+                if marker_written {
+                    let value = encode_migration_marker(
+                        origin_contract,
+                        pm.copied,
+                        pm.skipped_existing,
+                        pm.user_scope_skipped,
+                        pm.errors.len(),
+                    );
+                    if let Err(e) = self
+                        .db
+                        .store_migration_marker(predecessor, successor, &value)
+                    {
+                        tracing::error!(
+                            predecessor = %predecessor.encode(),
+                            successor = %successor.encode(),
+                            error = %e,
+                            "delegate secret copy-forward: redb marker write failed; node-local audit incomplete (crate-format marker is durable, so idempotence holds)"
+                        );
+                        pm.errors.push(format!("marker write failed: {e}"));
+                    }
+                }
+            }
+
+            report.per_predecessor.push(pm);
+        }
+
+        report
+    }
+
+    /// Durably record the origin of `delegate`'s FIRST registration (web-app
+    /// contract `origin`, or the Admin/None class when `origin` is `None`), for
+    /// the H1 same-origin copy-forward gate (#4117). FIRST-WRITER-WINS: a record
+    /// is written only if none exists, and is NEVER modified afterward — an
+    /// attacker who re-registers a victim's public WASM later cannot add itself.
+    /// Called on EVERY registration, BEFORE the delegate is registered.
+    ///
+    /// # Errors
+    /// Returns `Err` only if the record could not be DURABLY persisted. The
+    /// caller MUST fail the whole registration in that case
+    /// (persistence-succeeds-before-usable): a registered-but-recordless delegate
+    /// has an empty first-writer slot that a later — possibly attacker —
+    /// registration could claim, so leaving it usable is the exact vulnerability
+    /// this gate exists to prevent. `Ok(())` covers both a freshly-written record
+    /// AND an already-present one (an idempotent re-registration); neither is an
+    /// error.
+    pub fn record_delegate_registration_origin(
+        &self,
+        delegate: &DelegateKey,
+        origin: Option<[u8; 32]>,
+    ) -> Result<(), SecretStoreError> {
+        match self
+            .db
+            .record_delegate_origin_first_writer(delegate, origin)
+        {
+            // Ok(true) wrote the first-writer record; Ok(false) means one already
+            // existed (idempotent re-registration) — both are success.
+            Ok(_wrote) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    delegate = %delegate.encode(),
+                    error = %e,
+                    "failed to durably record delegate first-registration origin (H1 gate); the caller must fail the registration so no usable-but-unowned delegate is left"
+                );
+                Err(SecretStoreError::IO(std::io::Error::other(format!(
+                    "could not durably record delegate first-registration origin (H1 gate): {e}"
+                ))))
+            }
+        }
+    }
+
+    /// Enumerate the Local-scope secret hashes `predecessor` holds on disk: the
+    /// regular files directly under `base_path/<predecessor.encode()>` whose
+    /// name bs58-decodes to a 32-byte hash. The predecessor-scoped analogue of
+    /// the inner loop of [`Self::walk_scope_secrets_on_disk`] — it descends only
+    /// the one delegate's directory instead of every delegate under `base_path`.
+    ///
+    /// A missing predecessor directory is the expected "this node never held
+    /// that old delegate's secrets" case and yields no entries; any other read
+    /// error is unexpected and fails loud so the caller can record it.
+    fn walk_predecessor_local_secrets(
+        &self,
+        predecessor: &DelegateKey,
+        mut visit: impl FnMut(SecretKey),
+    ) -> Result<(), SecretStoreError> {
+        let scope_path = self.base_path.join(predecessor.encode());
+        let files = match fs::read_dir(&scope_path) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(SecretStoreError::IO(e)),
+        };
+        for file_entry in files {
+            let file_entry = file_entry.map_err(SecretStoreError::IO)?;
+            let name = file_entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // Skip the enumeration registry, snapshot dir, tmp files, and the
+            // `users/` subtree (a dir whose name never bs58-decodes to 32 bytes
+            // anyway). Same filter as `walk_scope_secrets_on_disk`.
+            if name == KEY_REGISTRY_FILE || name == SNAPSHOTS_DIR || name.ends_with(".tmp") {
+                continue;
+            }
+            let Some(secret_hash) = decode_bs58_32(name) else {
+                continue;
+            };
+            match file_entry.file_type() {
+                Ok(ft) if ft.is_file() => {}
+                _ => continue,
+            }
+            visit(secret_hash);
+        }
+        Ok(())
+    }
+
+    /// Count the User/hosted-scope secret blobs `predecessor` holds on disk
+    /// (under `base_path/<predecessor.encode()>/users/<user_id>/`). Copy-forward
+    /// never migrates these (the per-user DEK is not derivable at rest); this
+    /// count is recorded purely as observability for that carve-out. A missing
+    /// `users/` subtree (the common single-user case) yields 0.
+    fn count_predecessor_user_scope_secrets(
+        &self,
+        predecessor: &DelegateKey,
+    ) -> Result<usize, SecretStoreError> {
+        let users_dir = self.base_path.join(predecessor.encode()).join("users");
+        let user_dirs = match fs::read_dir(&users_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(SecretStoreError::IO(e)),
+        };
+        let mut count = 0usize;
+        for user_entry in user_dirs {
+            let user_entry = user_entry.map_err(SecretStoreError::IO)?;
+            let user_path = user_entry.path();
+            if !user_path.is_dir() {
+                continue;
+            }
+            let files = match fs::read_dir(&user_path) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(SecretStoreError::IO(e)),
+            };
+            for file_entry in files {
+                let file_entry = file_entry.map_err(SecretStoreError::IO)?;
+                let name = file_entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name == KEY_REGISTRY_FILE || name == SNAPSHOTS_DIR || name.ends_with(".tmp") {
+                    continue;
+                }
+                if decode_bs58_32(name).is_none() {
+                    continue;
+                }
+                if matches!(file_entry.file_type(), Ok(ft) if ft.is_file()) {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Hashes of the predecessor's Local secrets that live in the reserved
+    /// freenet-migrate coordination namespace ([`MIGRATE_RESERVED_NAMESPACE_PREFIX`]
+    /// — both this node's `pred-done:` markers AND the app-side `pred-wip:`
+    /// markers), so the copy-forward walk can SKIP them. They are per-generation
+    /// coordination metadata, NOT user secrets, and must not chain-copy into a
+    /// further successor.
+    ///
+    /// AUTHORITATIVE source is the durable, uncapped
+    /// [`RESERVED_MARKER_HASHES_TABLE`](crate::contract::storages::redb) recorded
+    /// at `store_secret` time (#4117 finding 4a) — registry-independent, so it
+    /// works even at/above the `.keys` registration cap or with an unreadable
+    /// registry, where a registry-only check would MISS a marker and let it
+    /// chain-copy as user data. The `.keys` registry scan is UNIONED in as a
+    /// below-cap belt-and-suspenders (e.g. a marker durably recorded on a node
+    /// that predated the table). Both are best-effort; a read failure narrows the
+    /// set but never errors.
+    fn predecessor_reserved_marker_hashes(
+        &self,
+        predecessor: &DelegateKey,
+    ) -> Result<HashSet<SecretKey>, SecretStoreError> {
+        // AUTHORITATIVE durable, uncapped, registry-independent table. A read
+        // failure FAILS CLOSED — the caller aborts the copy and un-seals —
+        // because silently treating it as "no markers" (unwrap_or_default) would
+        // let a marker chain-copy as user data (#4117 P1c).
+        let mut out: HashSet<SecretKey> = self
+            .db
+            .get_reserved_marker_hashes(predecessor)
+            .map_err(|e| {
+                SecretStoreError::IO(std::io::Error::other(format!(
+                    "reserved-marker lookup failed: {e}"
+                )))
+            })?
+            .into_iter()
+            .collect();
+        // Below-cap belt-and-suspenders: registered markers in the `.keys`
+        // registry. Best-effort (the durable table is authoritative), so a
+        // registry read failure only narrows the union, never fails.
+        if let Ok(keys) = self.read_key_registry(predecessor, &SecretScope::Local) {
+            for raw in keys {
+                if raw.starts_with(MIGRATE_RESERVED_NAMESPACE_PREFIX) {
+                    out.insert(*SecretsId::new(raw).hash());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Copy the predecessor's Local enumeration-registry raw keys forward for the
+    /// secrets now present under the successor (`present_hashes`), so
+    /// `list_secret_keys` — e.g. River's `room:<vk>` room discovery — enumerates
+    /// migrated keys instead of returning empty after a delegate rebuild.
+    ///
+    /// Registers only keys whose value actually landed under the successor, skips
+    /// the reserved [`MIGRATE_MARKER_KEY_PREFIX`] coordination namespace, honors
+    /// the per-scope registration cap, and writes the successor registry ONCE
+    /// (not once per key). Returns the number of keys newly registered.
+    ///
+    /// BOUND: a secret with NO predecessor registry entry — stored before the
+    /// #4355 enumeration registry existed, or evicted at the per-scope cap — has
+    /// an unrecoverable raw key (the on-disk name is only its hash). Its VALUE
+    /// still migrates and is readable by `get_secret` with the known
+    /// `SecretsId`, but it stays UNENUMERABLE under the successor until the
+    /// delegate re-stores it. Best-effort: an unreadable predecessor OR successor
+    /// registry returns `Err` (enumeration degraded), never touching the
+    /// already-migrated values; a fail-safe `read_key_registry` refuses to
+    /// clobber an unreadable successor registry from empty.
+    fn copy_enumeration_registry_forward(
+        &self,
+        predecessor: &DelegateKey,
+        successor: &DelegateKey,
+        present_hashes: &HashSet<SecretKey>,
+    ) -> std::io::Result<usize> {
+        let pred_keys = self.read_key_registry(predecessor, &SecretScope::Local)?;
+        if pred_keys.is_empty() {
+            return Ok(0);
+        }
+        // Fail-safe: an unreadable successor registry must not be overwritten
+        // from empty, so a read error bails here (Err) rather than clobbering.
+        let mut succ_keys = self.read_key_registry(successor, &SecretScope::Local)?;
+        let existing: HashSet<&[u8]> = succ_keys.iter().map(|k| k.as_slice()).collect();
+        let mut to_add: Vec<Vec<u8>> = Vec::new();
+        let mut budget = self
+            .max_registered_keys_per_scope
+            .saturating_sub(succ_keys.len());
+        for raw in &pred_keys {
+            if budget == 0 {
+                break;
+            }
+            // Never enumerate the reserved coordination-marker namespace.
+            if raw.starts_with(MIGRATE_RESERVED_NAMESPACE_PREFIX) {
+                continue;
+            }
+            // Only register a key whose value is actually present under the
+            // successor (freshly copied or already there).
+            if !present_hashes.contains(SecretsId::new(raw.clone()).hash()) {
+                continue;
+            }
+            if existing.contains(raw.as_slice()) {
+                continue;
+            }
+            to_add.push(raw.clone());
+            budget -= 1;
+        }
+        if to_add.is_empty() {
+            return Ok(0);
+        }
+        let added = to_add.len();
+        drop(existing);
+        succ_keys.extend(to_add);
+        let encryption = self.encryption_for_scope_read(successor, &SecretScope::Local);
+        // PROPAGATE a registry-write failure (#4117 P1): a sealed migration whose
+        // enumeration copy silently failed would leave `list_secret_keys`
+        // (River room discovery) empty forever.
+        self.write_key_registry(successor, &SecretScope::Local, &encryption, &succ_keys)?;
+        Ok(added)
+    }
+}
+
+/// Reserved secret-key namespace prefix for freenet-migrate copy-forward
+/// coordination markers, written as a Local secret UNDER THE SUCCESSOR.
+///
+/// This MIRRORS the public, versioned byte contract published by the app-side
+/// `freenet-migrate` crate: the app's own copy-forward fallback writes and reads
+/// the identical marker, so a marker written by either side idempotently
+/// short-circuits the other (a node registration and an app-side migration never
+/// double-copy the same `(predecessor -> successor)` pair). The bytes are pinned
+/// on BOTH sides (`pred_done_marker_key_format_is_stable` here, plus the crate's
+/// own pin test), so a drift on either side breaks CI. A secret under this
+/// reserved prefix is coordination metadata, never a user key — the app filters
+/// the whole `\0freenet-migrate/` namespace out of `list_secret_keys`/exports,
+/// and the copy-forward walk skips it so it is never enumerated forward.
+const MIGRATE_MARKER_KEY_PREFIX: &[u8] = b"\0freenet-migrate/v1/pred-done:";
+
+/// Reserved-namespace prefix covering ALL freenet-migrate coordination keys —
+/// the `pred-done:` completion markers this node writes AND the `pred-wip:`
+/// two-phase intent markers the app-side `freenet-migrate` path writes (which
+/// the node never writes). Copy-forward EXCLUDES this whole namespace from both
+/// the value copy and the enumeration copy, so a chained migration never sweeps
+/// a coordination marker onward. This is load-bearing for cross-transport
+/// consistency: the app-side import structurally skips every `\0freenet-migrate/`
+/// key, so the node must too, or a node-migrated successor would carry markers an
+/// app-migrated one never would and the two would diverge on a later chained
+/// migration. `MIGRATE_MARKER_KEY_PREFIX` is a subset of this namespace.
+const MIGRATE_RESERVED_NAMESPACE_PREFIX: &[u8] = b"\0freenet-migrate/";
+
+/// The app-side two-phase INTENT marker prefix (`freenet-migrate` `v1/pred-wip:`).
+/// The node never WRITES this (it seals atomically, so it only ever writes the
+/// `v1/pred-done:` completion marker), but a predecessor an app-side migration
+/// touched may hold one, and it is a legal reserved shape.
+const MIGRATE_WIP_KEY_PREFIX: &[u8] = b"\0freenet-migrate/v1/pred-wip:";
+
+/// LEGACY generation-keyed completion marker prefix (freenet-migrate 0.3-era),
+/// still written by the retained `import_secrets_once` API: MARKER_NS ++
+/// `done:` ++ `<gen decimal>`. Source: freenet-migrate `delegate.rs` DONE_PREFIX.
+const MIGRATE_LEGACY_DONE_PREFIX: &[u8] = b"\0freenet-migrate/done:";
+/// LEGACY generation-keyed in-progress marker prefix (0.3-era): MARKER_NS ++
+/// `wip:` ++ `<gen decimal>`. Source: freenet-migrate `delegate.rs` WIP_PREFIX.
+const MIGRATE_LEGACY_WIP_PREFIX: &[u8] = b"\0freenet-migrate/wip:";
+/// Maximum decimal digits in a canonical `u32` generation suffix
+/// (`u32::MAX` = 4294967295 = 10 digits). The legacy `done:`/`wip:` markers
+/// (freenet-migrate 0.3-era `import_secrets_once`, confirmed against 0.4.0)
+/// encode a `u32` generation via `generation.to_string()`, so the ONLY legal
+/// suffixes are the CANONICAL decimal forms of a `u32` — see
+/// [`is_canonical_u32_decimal`]. Enforcing exactly that (rather than the earlier
+/// ≤20-digit `u64` superset) refuses non-canonical duplicates (`"00"`, `"01"`)
+/// and overflow forms (`"4294967296"`) the crate never writes, so a client
+/// cannot squat the reserved namespace with a legacy-shaped-but-illegal key.
+const MAX_LEGACY_GEN_DIGITS: usize = 10;
+
+/// True iff `s` is the CANONICAL decimal encoding of a `u32` — exactly the suffix
+/// set the crate's `generation.to_string()` (`generation: u32`) can produce:
+/// non-empty, ASCII digits only, no leading zeros (except the single digit
+/// `"0"`), at most [`MAX_LEGACY_GEN_DIGITS`] digits, and numerically `≤ u32::MAX`.
+/// Rejects `""`, `"00"`, `"01"`, `"4294967296"` (overflow within 10 digits), and
+/// any 11+-digit run — none of which the crate ever writes.
+fn is_canonical_u32_decimal(s: &[u8]) -> bool {
+    if s.is_empty() || s.len() > MAX_LEGACY_GEN_DIGITS {
+        return false;
+    }
+    if !s.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    // Leading zero is non-canonical: only the single digit "0" is legal.
+    if s.len() > 1 && s[0] == b'0' {
+        return false;
+    }
+    // All-digits + len ≤ 10 guarantees valid UTF-8; the parse is the numeric
+    // bound that rejects the 10-digit overflow window (e.g. "4294967296").
+    std::str::from_utf8(s)
+        .ok()
+        .and_then(|t| t.parse::<u32>().ok())
+        .is_some()
+}
+
+/// The legal secret-key shapes under the reserved
+/// [`MIGRATE_RESERVED_NAMESPACE_PREFIX`]. `store_secret` REJECTS any other
+/// reserved-namespace key (#4117 P2a), so a client cannot pad the reserved
+/// namespace with arbitrary keys to bloat the reserved-hash table or shadow a
+/// real marker. The FULL legal matrix (pinned by
+/// `reserved_marker_shape_matrix_is_stable`, mirrored in the freenet-migrate
+/// crate) is:
+///   - v1 per-predecessor:  `\0freenet-migrate/v1/pred-done:` / `…/v1/pred-wip:`
+///     followed by EXACTLY a 32-byte delegate key;
+///   - legacy generation-keyed: `\0freenet-migrate/done:` / `…/wip:` followed by
+///     a CANONICAL `u32` decimal generation (see [`is_canonical_u32_decimal`]).
+///
+/// SHAPE-EVOLUTION LAW. This whitelist is deliberately an ENFORCEMENT list, not
+/// just documentation: it keeps the reserved namespace strictly protocol-defined
+/// (a foreign reserved key is refused rather than silently absorbed). The cost is
+/// a deploy-ordering obligation identical to the wire-variant law: any FUTURE
+/// marker shape (e.g. a hypothetical `\0freenet-migrate/v2/…`) MUST ship node-side
+/// acceptance HERE, in a RELEASED node, BEFORE any crate version writes it
+/// (crate publish → node merge → node release → only then the crate emits the new
+/// shape). If that ordering is ever violated, the failure mode is SAFE and LOUD,
+/// never silent: an old node rejects the unknown marker write with a store error,
+/// which degrades that one migration to a visible Incomplete-retry — the crate
+/// re-attempts once the node is upgraded — rather than diverging silently. Both
+/// repos byte-pin this matrix (`reserved_marker_shape_matrix_is_stable` here; the
+/// mirror crate-side), so any drift trips CI on both sides.
+fn is_legal_reserved_marker_key(raw: &[u8]) -> bool {
+    // v1 per-predecessor markers: prefix + exactly a 32-byte delegate key.
+    let v1 = (raw.len() == MIGRATE_MARKER_KEY_PREFIX.len() + 32
+        && raw.starts_with(MIGRATE_MARKER_KEY_PREFIX))
+        || (raw.len() == MIGRATE_WIP_KEY_PREFIX.len() + 32
+            && raw.starts_with(MIGRATE_WIP_KEY_PREFIX));
+    if v1 {
+        return true;
+    }
+    // Legacy generation-keyed markers: prefix + a CANONICAL u32 decimal
+    // generation suffix (`gen` is a reserved keyword, hence `gen_suffix`).
+    for prefix in [MIGRATE_LEGACY_DONE_PREFIX, MIGRATE_LEGACY_WIP_PREFIX] {
+        if let Some(gen_suffix) = raw.strip_prefix(prefix)
+            && is_canonical_u32_decimal(gen_suffix)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build the `SecretsId` of the "predecessor migrated" marker recorded under the
+/// SUCCESSOR delegate: [`MIGRATE_MARKER_KEY_PREFIX`] followed by the
+/// predecessor's 32-byte delegate key (`DelegateKey::bytes()`, NOT its
+/// `code_hash`).
+fn pred_done_marker_secret_id(predecessor: &DelegateKey) -> SecretsId {
+    let mut key = Vec::with_capacity(MIGRATE_MARKER_KEY_PREFIX.len() + 32);
+    key.extend_from_slice(MIGRATE_MARKER_KEY_PREFIX);
+    key.extend_from_slice(predecessor.bytes());
+    SecretsId::new(key)
+}
+
+/// Marker VALUE per the freenet-migrate contract: `b"1"` when the predecessor
+/// was data-bearing (at least one secret was copied), else `b"0"`.
+fn pred_done_marker_value(had_data: bool) -> &'static [u8] {
+    if had_data { b"1" } else { b"0" }
+}
+
+/// On-disk schema version for the copy-forward marker blob (the redb
+/// `MIGRATION_MARKER_TABLE` value). Bump only on a layout change; the decoder
+/// tolerates trailing bytes, so a newer writer may append fields without
+/// breaking an older reader.
+const MIGRATION_MARKER_VERSION: u8 = 1;
+
+/// Serialize a copy-forward marker value. Fixed 50-byte v1 layout:
+/// `[version:1][has_origin:1][origin:32][copied:u32][skipped:u32][user_skipped:u32][errors:u32]`
+/// (all `u32` little-endian). See [`MigrationMarker`] for the decoder.
+fn encode_migration_marker(
+    origin_contract: Option<[u8; 32]>,
+    copied: usize,
+    skipped_existing: usize,
+    user_scope_skipped: usize,
+    error_count: usize,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(50);
+    v.push(MIGRATION_MARKER_VERSION);
+    v.push(u8::from(origin_contract.is_some()));
+    v.extend_from_slice(&origin_contract.unwrap_or([0u8; 32]));
+    // Counts are bounded by a delegate's on-disk secret count; u32 is ample and
+    // saturating-casts a pathological overflow rather than wrapping.
+    v.extend_from_slice(&(copied.min(u32::MAX as usize) as u32).to_le_bytes());
+    v.extend_from_slice(&(skipped_existing.min(u32::MAX as usize) as u32).to_le_bytes());
+    v.extend_from_slice(&(user_scope_skipped.min(u32::MAX as usize) as u32).to_le_bytes());
+    v.extend_from_slice(&(error_count.min(u32::MAX as usize) as u32).to_le_bytes());
+    v
+}
+
+/// Per-predecessor outcome of a [`SecretsStore::migrate_secrets`] copy-forward.
+#[derive(Debug, Clone)]
+pub struct PredecessorMigration {
+    /// The predecessor delegate key this row describes.
+    pub predecessor: DelegateKey,
+    /// Local-scope secrets newly written under the successor (value was absent).
+    pub copied: usize,
+    /// Local-scope secrets already present under the successor and left
+    /// untouched (`overwrite = false`, first writer wins).
+    pub skipped_existing: usize,
+    /// User/hosted-scope secrets the predecessor holds that were DELIBERATELY
+    /// not migrated (the per-user DEK is not derivable at rest). Observability
+    /// for the Local-only carve-out; not an error.
+    pub user_scope_skipped: usize,
+    /// `true` when a prior `(predecessor, successor)` marker short-circuited the
+    /// copy (one-shot idempotence / anti-resurrection), so no copy ran this call
+    /// and the counts above are all 0.
+    pub already_migrated: bool,
+    /// `true` when the H1 same-origin gate REFUSED the copy: the registering
+    /// request's web-app origin is not the predecessor's recorded first-writer
+    /// origin (or the request/predecessor is the never-privileged Admin/None
+    /// class), so nothing was copied and nothing sealed. A legitimate
+    /// registration from the recorded origin can still migrate it.
+    pub origin_refused: bool,
+    /// `true` when the copy was refused specifically because the predecessor has
+    /// NO recorded first-registration origin (NoProvenance) — e.g. a delegate
+    /// registered before this release. Such data migrates via the app-side
+    /// `freenet-migrate` path, whose own predecessor-delegate OriginPolicy is the
+    /// sound authorizer for legacy data. (`origin_refused` is also set.)
+    pub no_provenance: bool,
+    /// Non-fatal per-secret / marker errors, recorded rather than propagated so
+    /// registration never fails because a predecessor's data was partly
+    /// unreadable. Each entry is a non-secret description (bs58 hash + cause).
+    pub errors: Vec<String>,
+}
+
+impl PredecessorMigration {
+    fn new(predecessor: DelegateKey) -> Self {
+        Self {
+            predecessor,
+            copied: 0,
+            skipped_existing: 0,
+            user_scope_skipped: 0,
+            already_migrated: false,
+            origin_refused: false,
+            no_provenance: false,
+            errors: Vec::new(),
+        }
+    }
+}
+
+/// Aggregate outcome of a [`SecretsStore::migrate_secrets`] copy-forward — one
+/// [`PredecessorMigration`] per predecessor, in the order supplied.
+#[derive(Debug, Clone)]
+pub struct MigrationReport {
+    /// The successor delegate key everything was copied into.
+    pub successor: DelegateKey,
+    pub per_predecessor: Vec<PredecessorMigration>,
+}
+
+impl MigrationReport {
+    /// Total Local-scope secrets newly copied across all predecessors.
+    pub fn total_copied(&self) -> usize {
+        self.per_predecessor.iter().map(|p| p.copied).sum()
+    }
+    /// Total Local-scope secrets already present under the successor.
+    pub fn total_skipped_existing(&self) -> usize {
+        self.per_predecessor
+            .iter()
+            .map(|p| p.skipped_existing)
+            .sum()
+    }
+    /// Total User/hosted-scope secrets not migrated (Local-only carve-out).
+    pub fn total_user_scope_skipped(&self) -> usize {
+        self.per_predecessor
+            .iter()
+            .map(|p| p.user_scope_skipped)
+            .sum()
+    }
+    /// Total non-fatal errors recorded across all predecessors.
+    pub fn total_errors(&self) -> usize {
+        self.per_predecessor.iter().map(|p| p.errors.len()).sum()
+    }
+}
+
+/// Decoded copy-forward AUDIT marker (the redb `MIGRATION_MARKER_TABLE` value
+/// for one `(predecessor, successor)` pair). Written by
+/// [`SecretsStore::migrate_secrets`]; readable for audit and tests. Presence of
+/// the row alone is the idempotence / anti-resurrection gate — these fields are
+/// the recorded audit fact, not part of the gate decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationMarker {
+    /// Schema version of the blob ([`MIGRATION_MARKER_VERSION`] when written).
+    pub version: u8,
+    /// The originating web-app contract id recorded at migration time (a
+    /// consent-primary-v1 audit fact), or `None` if the registration carried no
+    /// contract origin.
+    pub origin_contract: Option<[u8; 32]>,
+    /// Counts snapshotted at migration time (see [`PredecessorMigration`]).
+    pub copied: u32,
+    pub skipped_existing: u32,
+    pub user_scope_skipped: u32,
+    pub error_count: u32,
+}
+
+impl MigrationMarker {
+    /// Decode a marker blob. Returns `None` if the blob is shorter than the v1
+    /// layout; any trailing bytes beyond the known fields are ignored so a
+    /// future writer can append fields without breaking this reader.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 50 {
+            return None;
+        }
+        let version = bytes[0];
+        let has_origin = bytes[1] != 0;
+        let origin_arr: [u8; 32] = bytes[2..34].try_into().ok()?;
+        let origin_contract = has_origin.then_some(origin_arr);
+        let copied = u32::from_le_bytes(bytes[34..38].try_into().ok()?);
+        let skipped_existing = u32::from_le_bytes(bytes[38..42].try_into().ok()?);
+        let user_scope_skipped = u32::from_le_bytes(bytes[42..46].try_into().ok()?);
+        let error_count = u32::from_le_bytes(bytes[46..50].try_into().ok()?);
+        Some(Self {
+            version,
+            origin_contract,
+            copied,
+            skipped_existing,
+            user_scope_skipped,
+            error_count,
+        })
     }
 }
 
@@ -2453,6 +3599,14 @@ mod test {
         user_activity_dir,
     };
     use super::super::user::{user_dek_secret, user_id};
+
+    /// Shared web-app origin used by the `migrate_secrets` H1 same-origin-gate
+    /// tests below (#4117). A predecessor must have this recorded as its
+    /// FIRST-registration origin (via
+    /// [`SecretsStore::record_delegate_registration_origin`]) before a
+    /// `migrate_secrets(..., Some(TEST_ORIGIN))` call is allowed to copy its
+    /// secrets forward.
+    const TEST_ORIGIN: [u8; 32] = [0x11u8; 32];
 
     async fn create_test_db(path: &std::path::Path) -> Storage {
         Storage::new(path).await.expect("failed to create test db")
@@ -7653,5 +8807,1370 @@ mod test {
             "B's secret must remain readable after A's reclaim"
         );
         Ok(())
+    }
+
+    // ============ #4117: delegate secret copy-forward (migrate_secrets) ============
+
+    /// Happy path: a Local secret written under a predecessor delegate's DERIVED
+    /// DEK (the true at-rest path, no client `register_delegate`) is copied
+    /// forward and is readable under the SUCCESSOR's distinct derived DEK — which
+    /// a raw byte copy could not achieve — while the predecessor's copy is left
+    /// intact (no-delete invariant).
+    #[tokio::test]
+    async fn migrate_copies_local_secret_forward_readable_under_successor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        // Same params, different code == an ABI bump that mints a new key.
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        assert_ne!(
+            pred.key().encode(),
+            succ.key().encode(),
+            "predecessor and successor must be distinct on-disk namespaces"
+        );
+
+        let secret_id = SecretsId::new(b"room:alice".to_vec());
+        let plaintext = b"user-profile-blob".to_vec();
+        store.store_secret(
+            pred.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(plaintext.clone()),
+        )?;
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        let report = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert_eq!(report.total_copied(), 1);
+        assert_eq!(report.total_skipped_existing(), 0);
+        assert_eq!(
+            report.total_errors(),
+            0,
+            "unexpected errors: {:?}",
+            report.per_predecessor
+        );
+        assert!(!report.per_predecessor[0].already_migrated);
+
+        // Readable under the successor DEK (re-encrypted, not byte-copied).
+        let got = store.get_secret(succ.key(), &secret_id, SecretScope::Local)?;
+        assert_eq!(got.to_vec(), plaintext);
+
+        // Predecessor untouched, still readable.
+        let pred_still = store.get_secret(pred.key(), &secret_id, SecretScope::Local)?;
+        assert_eq!(pred_still.to_vec(), plaintext);
+        Ok(())
+    }
+
+    /// The one-shot marker makes re-migration a no-op AND prevents resurrection:
+    /// a secret the user deletes from the successor after migration is NOT
+    /// re-created when the delegate re-registers (which apps do on every start).
+    #[tokio::test]
+    async fn migrate_is_one_shot_and_prevents_resurrection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let secret_id = SecretsId::new(b"room:bob".to_vec());
+        store.store_secret(
+            pred.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v1".to_vec()),
+        )?;
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        let report1 = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert_eq!(report1.total_copied(), 1);
+        assert!(!report1.per_predecessor[0].already_migrated);
+
+        // The user deletes the migrated secret from the successor.
+        store.remove_secret(succ.key(), &secret_id, SecretScope::Local)?;
+        assert!(
+            store
+                .get_secret(succ.key(), &secret_id, SecretScope::Local)
+                .is_err()
+        );
+
+        // Re-registration re-runs the copy — the marker must short-circuit it, so
+        // the deleted secret stays deleted.
+        let report2 = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert!(
+            report2.per_predecessor[0].already_migrated,
+            "second migration must be gated by the marker"
+        );
+        assert_eq!(report2.total_copied(), 0);
+        assert!(
+            store
+                .get_secret(succ.key(), &secret_id, SecretScope::Local)
+                .is_err(),
+            "a user-deleted secret must NOT be resurrected by re-registration"
+        );
+        Ok(())
+    }
+
+    /// `overwrite = false`: a value the successor already holds for the same
+    /// secret id is preserved (first writer wins); the predecessor's differing
+    /// value does not clobber it, and the copy is reported as skipped.
+    #[tokio::test]
+    async fn migrate_overwrite_false_preserves_successor_existing_value()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let secret_id = SecretsId::new(b"room:carol".to_vec());
+
+        store.store_secret(
+            pred.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"predecessor-value".to_vec()),
+        )?;
+        store.store_secret(
+            succ.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"successor-own-value".to_vec()),
+        )?;
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        let report = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert_eq!(report.total_copied(), 0);
+        assert_eq!(report.total_skipped_existing(), 1);
+
+        // The successor's own value survives — the predecessor did not overwrite.
+        let got = store.get_secret(succ.key(), &secret_id, SecretScope::Local)?;
+        assert_eq!(got.to_vec(), b"successor-own-value".to_vec());
+        Ok(())
+    }
+
+    /// User/hosted-scope secrets are never migrated (the per-user DEK is not
+    /// derivable at rest): only the Local secret is copied, the User secret is
+    /// counted as skipped, no User secret is created under the successor, and the
+    /// predecessor's User secret is left intact.
+    #[tokio::test]
+    async fn migrate_skips_and_counts_user_scope_secrets() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+
+        let local_id = SecretsId::new(b"local".to_vec());
+        let user_secret_id = SecretsId::new(b"per-user".to_vec());
+        let alice = UserId::new([0xAA; 32]);
+        let alice_dek = user_dek(0xA1);
+
+        store.store_secret(
+            pred.key(),
+            &local_id,
+            SecretScope::Local,
+            Zeroizing::new(b"local-value".to_vec()),
+        )?;
+        store.store_secret(
+            pred.key(),
+            &user_secret_id,
+            SecretScope::User {
+                id: &alice,
+                dek_secret: &alice_dek,
+            },
+            Zeroizing::new(b"alice-value".to_vec()),
+        )?;
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        let report = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert_eq!(report.total_copied(), 1, "only the Local secret is copied");
+        assert_eq!(report.total_user_scope_skipped(), 1);
+        assert_eq!(report.total_errors(), 0);
+
+        // Local secret arrived under the successor.
+        assert!(
+            store
+                .get_secret(succ.key(), &local_id, SecretScope::Local)
+                .is_ok()
+        );
+        // No User-scope secret was created under the successor.
+        assert!(
+            store
+                .get_secret(
+                    succ.key(),
+                    &user_secret_id,
+                    SecretScope::User {
+                        id: &alice,
+                        dek_secret: &alice_dek,
+                    },
+                )
+                .is_err(),
+            "user-scope secret must NOT be migrated to the successor"
+        );
+        // Predecessor's User secret is untouched.
+        assert!(
+            store
+                .get_secret(
+                    pred.key(),
+                    &user_secret_id,
+                    SecretScope::User {
+                        id: &alice,
+                        dek_secret: &alice_dek,
+                    },
+                )
+                .is_ok(),
+            "predecessor's user-scope secret must remain intact"
+        );
+        Ok(())
+    }
+
+    /// An unknown / ABSENT predecessor (never held on this node) is a clean
+    /// no-op that writes NO marker (M1): nothing to migrate → nothing to seal, so
+    /// a later re-registration re-checks cheaply (and would pick it up if its
+    /// secrets arrived). This also denies a client the ability to drive marker
+    /// writes with bogus keys.
+    #[tokio::test]
+    async fn migrate_absent_predecessor_is_noop_and_not_sealed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        // Never had any secrets on this node (no on-disk directory).
+        let unknown = Delegate::from((&vec![9].into(), &vec![9].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+
+        let report = store.migrate_secrets(std::slice::from_ref(unknown.key()), succ.key(), None);
+        assert_eq!(report.total_copied(), 0);
+        assert_eq!(report.total_errors(), 0);
+        assert!(!report.per_predecessor[0].already_migrated);
+
+        // NOT sealed: no crate-format marker under the successor for the absent
+        // predecessor, and a second call is still NOT gated (retryable).
+        let marker_id = pred_done_marker_secret_id(unknown.key());
+        assert!(
+            store
+                .get_secret(succ.key(), &marker_id, SecretScope::Local)
+                .is_err(),
+            "an absent predecessor must not be sealed"
+        );
+        let report2 = store.migrate_secrets(std::slice::from_ref(unknown.key()), succ.key(), None);
+        assert!(
+            !report2.per_predecessor[0].already_migrated,
+            "an absent predecessor stays retryable (no marker written)"
+        );
+        Ok(())
+    }
+
+    /// Multiple predecessors all feed the same successor, in order; each yields
+    /// its own report row.
+    #[tokio::test]
+    async fn migrate_multiple_predecessors() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let pred1 = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let pred2 = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![3].into()));
+
+        let id_a = SecretsId::new(b"a".to_vec());
+        let id_b = SecretsId::new(b"b".to_vec());
+        store.store_secret(
+            pred1.key(),
+            &id_a,
+            SecretScope::Local,
+            Zeroizing::new(b"va".to_vec()),
+        )?;
+        store.store_secret(
+            pred2.key(),
+            &id_b,
+            SecretScope::Local,
+            Zeroizing::new(b"vb".to_vec()),
+        )?;
+
+        store
+            .record_delegate_registration_origin(pred1.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        store
+            .record_delegate_registration_origin(pred2.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        let report = store.migrate_secrets(
+            &[pred1.key().clone(), pred2.key().clone()],
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert_eq!(report.per_predecessor.len(), 2);
+        assert_eq!(report.total_copied(), 2);
+        assert!(
+            store
+                .get_secret(succ.key(), &id_a, SecretScope::Local)
+                .is_ok()
+        );
+        assert!(
+            store
+                .get_secret(succ.key(), &id_b, SecretScope::Local)
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    /// A delegate listed as its own predecessor is a no-op and writes no marker
+    /// (there is nothing to gate), so it never reports `already_migrated`.
+    #[tokio::test]
+    async fn migrate_self_predecessor_is_noop() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let d = Delegate::from((&vec![0].into(), &vec![1].into()));
+        store.store_secret(
+            d.key(),
+            &SecretsId::new(b"x".to_vec()),
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+
+        let report = store.migrate_secrets(std::slice::from_ref(d.key()), d.key(), None);
+        assert_eq!(report.total_copied(), 0);
+        assert_eq!(report.total_errors(), 0);
+        assert!(!report.per_predecessor[0].already_migrated);
+
+        // No marker was written for the self case, so a repeat is still not gated.
+        let report2 = store.migrate_secrets(std::slice::from_ref(d.key()), d.key(), None);
+        assert!(!report2.per_predecessor[0].already_migrated);
+        Ok(())
+    }
+
+    /// The redb marker round-trips through the store/get API and decodes back to
+    /// the audit fields, and a different `(predecessor, successor)` pair is
+    /// independent.
+    #[tokio::test]
+    async fn migration_marker_redb_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let db = create_test_db(temp_dir.path()).await;
+
+        let pred = DelegateKey::new([1u8; 32], CodeHash::from(&[2u8; 32]));
+        let succ = DelegateKey::new([3u8; 32], CodeHash::from(&[4u8; 32]));
+
+        assert!(db.get_migration_marker(&pred, &succ)?.is_none());
+
+        let value = encode_migration_marker(Some([9u8; 32]), 5, 2, 1, 0);
+        db.store_migration_marker(&pred, &succ, &value)?;
+
+        let got = db
+            .get_migration_marker(&pred, &succ)?
+            .expect("marker present");
+        let marker = MigrationMarker::decode(&got).expect("decodes");
+        assert_eq!(marker.version, MIGRATION_MARKER_VERSION);
+        assert_eq!(marker.origin_contract, Some([9u8; 32]));
+        assert_eq!(marker.copied, 5);
+        assert_eq!(marker.skipped_existing, 2);
+        assert_eq!(marker.user_scope_skipped, 1);
+        assert_eq!(marker.error_count, 0);
+
+        // The reversed pair is a distinct key with no marker.
+        assert!(db.get_migration_marker(&succ, &pred)?.is_none());
+        Ok(())
+    }
+
+    /// Marker codec: `None` origin round-trips, a too-short blob decodes to
+    /// `None`, and trailing bytes are tolerated (forward compatibility).
+    #[test]
+    fn migration_marker_codec_edge_cases() {
+        let v = encode_migration_marker(None, 0, 0, 0, 3);
+        let m = MigrationMarker::decode(&v).expect("decodes");
+        assert_eq!(m.origin_contract, None);
+        assert_eq!(m.error_count, 3);
+
+        assert!(
+            MigrationMarker::decode(&v[..10]).is_none(),
+            "a truncated blob must not decode"
+        );
+
+        let mut extended = v.clone();
+        extended.extend_from_slice(&[0xFFu8; 8]);
+        assert_eq!(
+            MigrationMarker::decode(&extended).expect("decodes with trailing bytes"),
+            m,
+            "trailing bytes beyond the known layout must be ignored"
+        );
+    }
+
+    /// Enumeration carries forward: after migration, `list_secret_keys` on the
+    /// successor returns the predecessor's raw keys (River's `room:<vk>`
+    /// discovery must keep working across a delegate rebuild).
+    #[tokio::test]
+    async fn migrate_carries_enumeration_registry_forward() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        for k in [b"room:alice".to_vec(), b"room:bob".to_vec()] {
+            store.store_secret(
+                pred.key(),
+                &SecretsId::new(k),
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )?;
+        }
+
+        // Successor enumerates nothing yet.
+        assert!(
+            store
+                .list_secret_keys(succ.key(), SecretScope::Local, b"room:")
+                .is_empty()
+        );
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        let report = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert_eq!(report.total_copied(), 2);
+
+        let mut keys = store.list_secret_keys(succ.key(), SecretScope::Local, b"room:");
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![b"room:alice".to_vec(), b"room:bob".to_vec()],
+            "migrated room keys must be enumerable under the successor"
+        );
+        Ok(())
+    }
+
+    /// First-writer-wins in the SUPPLIED (newest-first) order: when two
+    /// predecessors hold the same secret id with different values, the FIRST
+    /// listed (newest) supplies the value; the later (older) is skipped.
+    #[tokio::test]
+    async fn migrate_first_writer_wins_under_supplied_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let newer = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let older = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![3].into()));
+        let sid = SecretsId::new(b"room:shared".to_vec());
+        store.store_secret(
+            newer.key(),
+            &sid,
+            SecretScope::Local,
+            Zeroizing::new(b"NEW".to_vec()),
+        )?;
+        store.store_secret(
+            older.key(),
+            &sid,
+            SecretScope::Local,
+            Zeroizing::new(b"OLD".to_vec()),
+        )?;
+
+        store
+            .record_delegate_registration_origin(newer.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        store
+            .record_delegate_registration_origin(older.key(), Some(TEST_ORIGIN))
+            .unwrap();
+
+        // Supplied newest-first: newer wins, older collides (skipped).
+        let report = store.migrate_secrets(
+            &[newer.key().clone(), older.key().clone()],
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert_eq!(
+            report.per_predecessor[0].copied, 1,
+            "newer supplies the value"
+        );
+        assert_eq!(
+            report.per_predecessor[1].skipped_existing, 1,
+            "older collides and is skipped"
+        );
+        let got = store.get_secret(succ.key(), &sid, SecretScope::Local)?;
+        assert_eq!(
+            got.to_vec(),
+            b"NEW".to_vec(),
+            "the newest (first-supplied) predecessor's value wins"
+        );
+        Ok(())
+    }
+
+    /// The crate-format marker secret is written under the successor with the
+    /// data-bearing flag, and a FRESH store (no redb marker, e.g. the app-side
+    /// path or another process) sees ONLY that on-disk marker and still
+    /// short-circuits — proving the shared cross-path gate.
+    #[tokio::test]
+    async fn migrate_writes_crate_format_marker_and_gates_cross_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let sid = SecretsId::new(b"room:x".to_vec());
+        store.store_secret(
+            pred.key(),
+            &sid,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+
+        // Marker secret exists under the successor with value b"1" (data-bearing).
+        let marker_id = pred_done_marker_secret_id(pred.key());
+        let marker = store.get_secret(succ.key(), &marker_id, SecretScope::Local)?;
+        assert_eq!(marker.to_vec(), b"1".to_vec());
+
+        // A SECOND store with a FRESH redb db but the SAME secrets_dir (so it
+        // sees the on-disk marker + the same KEK) must short-circuit purely on
+        // the crate-format marker.
+        let db2_dir = temp_dir.path().join("db2");
+        std::fs::create_dir_all(&db2_dir)?;
+        let db2 = create_test_db(&db2_dir).await;
+        let mut store2 = SecretsStore::new(secrets_dir, Default::default(), db2)?;
+        let report2 = store2.migrate_secrets(std::slice::from_ref(pred.key()), succ.key(), None);
+        assert!(
+            report2.per_predecessor[0].already_migrated,
+            "the crate-format marker alone must gate a fresh store (cross-path idempotence)"
+        );
+        assert_eq!(report2.total_copied(), 0);
+        Ok(())
+    }
+
+    /// A clean but EMPTY predecessor that this node DID hold (its on-disk
+    /// directory exists, but it has no real secrets) seals with the NoData flag
+    /// b"0", so the app's stop-at-first-data-bearing walk skips past it. (An
+    /// ABSENT predecessor — no directory — is not sealed at all; see
+    /// `migrate_absent_predecessor_is_noop_and_not_sealed`.)
+    #[tokio::test]
+    async fn migrate_empty_predecessor_marker_is_nodata() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![9].into(), &vec![9].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+
+        // The predecessor directory EXISTS (this node held it) but has no real
+        // secrets — e.g. every secret was removed. Create the empty dir directly.
+        std::fs::create_dir_all(secrets_dir.join(pred.key().encode()))?;
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        let marker_id = pred_done_marker_secret_id(pred.key());
+        let marker = store.get_secret(succ.key(), &marker_id, SecretScope::Local)?;
+        assert_eq!(
+            marker.to_vec(),
+            b"0".to_vec(),
+            "empty (but held) predecessor => NoData"
+        );
+        Ok(())
+    }
+
+    /// SEAL ONLY ON CLEAN: a per-secret read failure (a corrupted predecessor
+    /// blob) un-seals the copy — NO marker is written, and a later registration
+    /// is NOT gated (retryable), so the app-side fallback can still complete it.
+    #[tokio::test]
+    async fn migrate_partial_error_does_not_seal() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let sid = SecretsId::new(b"room:corrupt".to_vec());
+        store.store_secret(
+            pred.key(),
+            &sid,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+
+        // Corrupt the on-disk blob so read_secret_by_hash fails to decrypt.
+        let blob_path = secrets_dir.join(pred.key().encode()).join(sid.encode());
+        std::fs::write(&blob_path, b"not-a-valid-ciphertext-blob")?;
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        let report = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert!(
+            report.total_errors() >= 1,
+            "the corrupted blob must be recorded as an error"
+        );
+
+        // NOT sealed: no crate-format marker under the successor.
+        let marker_id = pred_done_marker_secret_id(pred.key());
+        assert!(
+            store
+                .get_secret(succ.key(), &marker_id, SecretScope::Local)
+                .is_err(),
+            "a partial copy must not write a marker"
+        );
+
+        // Re-registration is NOT gated — the pair stays retryable.
+        let report2 = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert!(
+            !report2.per_predecessor[0].already_migrated,
+            "an unsealed partial copy must remain retryable"
+        );
+        Ok(())
+    }
+
+    /// Coordination markers are NOT chain-copied: after P1 -> S1 (which writes a
+    /// marker under S1), migrating S1 -> S2 copies S1's real secret but NOT the
+    /// P1 marker, so the reserved namespace does not accrete down the chain.
+    #[tokio::test]
+    async fn migrate_does_not_chain_copy_markers() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let p1 = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let s1 = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let s2 = Delegate::from((&vec![0].into(), &vec![3].into()));
+        let sid = SecretsId::new(b"room:z".to_vec());
+        store.store_secret(
+            p1.key(),
+            &sid,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+
+        // P1 -> S1: writes a marker for P1 under S1.
+        store
+            .record_delegate_registration_origin(p1.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        store.migrate_secrets(std::slice::from_ref(p1.key()), s1.key(), Some(TEST_ORIGIN));
+        assert!(
+            store
+                .get_secret(
+                    s1.key(),
+                    &pred_done_marker_secret_id(p1.key()),
+                    SecretScope::Local
+                )
+                .is_ok(),
+            "P1 marker present under S1"
+        );
+
+        // S1 -> S2: copies S1's real secret but NOT the P1 marker.
+        store
+            .record_delegate_registration_origin(s1.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        store.migrate_secrets(std::slice::from_ref(s1.key()), s2.key(), Some(TEST_ORIGIN));
+        assert!(
+            store.get_secret(s2.key(), &sid, SecretScope::Local).is_ok(),
+            "the real secret chain-copies to S2"
+        );
+        assert!(
+            store
+                .get_secret(
+                    s2.key(),
+                    &pred_done_marker_secret_id(p1.key()),
+                    SecretScope::Local
+                )
+                .is_err(),
+            "the P1 coordination marker must NOT chain-copy into S2"
+        );
+        // S2 does carry its own S1 marker (the S1 -> S2 migration).
+        assert!(
+            store
+                .get_secret(
+                    s2.key(),
+                    &pred_done_marker_secret_id(s1.key()),
+                    SecretScope::Local
+                )
+                .is_ok(),
+            "S2 carries the S1 marker for the S1 -> S2 migration"
+        );
+        Ok(())
+    }
+
+    /// The WHOLE reserved `\0freenet-migrate/` namespace is excluded from
+    /// copy-forward, not just `pred-done:` — including the app-side `pred-wip:`
+    /// intent markers the node never writes but may find on a predecessor an
+    /// app-side migration touched. Excluding the whole namespace keeps the node
+    /// and app transports' marker sets byte-identical.
+    #[tokio::test]
+    async fn migrate_excludes_whole_reserved_namespace() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+
+        // A real user secret plus an app-written WIP intent marker under the
+        // predecessor (the node never writes WIP, but an app-side migration may).
+        let real = SecretsId::new(b"room:real".to_vec());
+        let wip_raw = {
+            let mut k = b"\0freenet-migrate/v1/pred-wip:".to_vec();
+            k.extend_from_slice(&[0xAB; 32]);
+            k
+        };
+        let wip = SecretsId::new(wip_raw.clone());
+        store.store_secret(
+            pred.key(),
+            &real,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        store.store_secret(
+            pred.key(),
+            &wip,
+            SecretScope::Local,
+            Zeroizing::new(b"1".to_vec()),
+        )?;
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        let report = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        // Only the real secret copies; the reserved-namespace key does not.
+        assert_eq!(report.total_copied(), 1, "only the real secret copies");
+        assert!(
+            store
+                .get_secret(succ.key(), &real, SecretScope::Local)
+                .is_ok(),
+            "the real secret migrates"
+        );
+        assert!(
+            store
+                .get_secret(succ.key(), &wip, SecretScope::Local)
+                .is_err(),
+            "the reserved-namespace WIP key must NOT copy forward"
+        );
+        // The WIP key is not enumerable under the successor. (The successor DOES
+        // carry its own `pred-done:` marker for `pred` — expected bookkeeping —
+        // so we assert the WIP key specifically is absent, not that the namespace
+        // is empty.)
+        let reserved = store.list_secret_keys(
+            succ.key(),
+            SecretScope::Local,
+            MIGRATE_RESERVED_NAMESPACE_PREFIX,
+        );
+        assert!(
+            !reserved.contains(&wip_raw),
+            "the WIP key must not be enumerable under the successor"
+        );
+        Ok(())
+    }
+
+    /// KNOWN LIMITATION (#4117 M2, pinned): seal-only-on-fully-clean has a
+    /// side effect — a PERMANENTLY corrupt/unreadable predecessor blob keeps the
+    /// pair unsealed forever, so its healthy co-resident secrets are re-copied on
+    /// every registration, and a healthy secret the user DELETED from the
+    /// successor is RESURRECTED each time. This is a deliberate v1 tradeoff
+    /// (pair-level sealing; per-secret sealing needs a crate-contract evolution —
+    /// tracked as freenet-core#4909) and is SYMMETRIC with the app-side
+    /// path, which has the same pair-level semantics. This test documents the
+    /// behavior so a future change to it is a conscious decision.
+    #[tokio::test]
+    async fn migrate_unsealed_pair_resurrects_deleted_healthy_secret_known_limitation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let healthy = SecretsId::new(b"room:healthy".to_vec());
+        let broken = SecretsId::new(b"room:broken".to_vec());
+        store.store_secret(
+            pred.key(),
+            &healthy,
+            SecretScope::Local,
+            Zeroizing::new(b"keep".to_vec()),
+        )?;
+        store.store_secret(
+            pred.key(),
+            &broken,
+            SecretScope::Local,
+            Zeroizing::new(b"x".to_vec()),
+        )?;
+        // Corrupt the predecessor's `broken` blob so its READ fails → the pair
+        // can never be fully clean → never seals.
+        let broken_blob = secrets_dir.join(pred.key().encode()).join(broken.encode());
+        std::fs::write(&broken_blob, b"corrupt")?;
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+
+        // First migration: healthy copies, broken errors → unsealed.
+        let r1 = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert!(r1.total_errors() >= 1);
+        assert!(
+            store
+                .get_secret(succ.key(), &healthy, SecretScope::Local)
+                .is_ok()
+        );
+
+        // The user DELETES the healthy secret from the successor.
+        store.remove_secret(succ.key(), &healthy, SecretScope::Local)?;
+        assert!(
+            store
+                .get_secret(succ.key(), &healthy, SecretScope::Local)
+                .is_err()
+        );
+
+        // Re-registration re-runs the copy. Because the pair never sealed (broken
+        // still corrupt), the deleted-but-healthy secret is RESURRECTED — the
+        // documented v1 limitation.
+        store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert!(
+            store
+                .get_secret(succ.key(), &healthy, SecretScope::Local)
+                .is_ok(),
+            "KNOWN v1 LIMITATION: an unsealed pair resurrects a deleted healthy secret"
+        );
+        Ok(())
+    }
+
+    /// H1 same-origin gate: a copy proceeds only when the registering origin
+    /// matches a predecessor's recorded origin; a mismatch refuses
+    /// (`origin_refused`, NOT `no_provenance` — the predecessor DOES have a
+    /// record, it just doesn't match); a predecessor with NO recorded origin at
+    /// all is refused as `no_provenance` (legacy data migrates via the app-side
+    /// path instead — see #4117 H1, no grandfathering in the redesigned gate).
+    #[tokio::test]
+    async fn migrate_origin_gate_match_mismatch_and_no_provenance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let sid = SecretsId::new(b"room:a".to_vec());
+        store.store_secret(
+            pred.key(),
+            &sid,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+
+        let origin_a = [0x11u8; 32];
+        store
+            .record_delegate_registration_origin(pred.key(), Some(origin_a))
+            .unwrap();
+
+        // MISMATCH: a different registering origin is refused, but there IS a
+        // record for this predecessor, so it is NOT no_provenance.
+        let other = [0x22u8; 32];
+        let report =
+            store.migrate_secrets(std::slice::from_ref(pred.key()), succ.key(), Some(other));
+        assert!(
+            report.per_predecessor[0].origin_refused,
+            "mismatch must refuse"
+        );
+        assert!(
+            !report.per_predecessor[0].no_provenance,
+            "a mismatch against an EXISTING record must not be no_provenance"
+        );
+        assert_eq!(report.total_copied(), 0);
+        assert!(
+            store
+                .get_secret(succ.key(), &sid, SecretScope::Local)
+                .is_err(),
+            "an origin mismatch must copy nothing"
+        );
+
+        // MATCH: the recorded origin is allowed and copies.
+        let report2 =
+            store.migrate_secrets(std::slice::from_ref(pred.key()), succ.key(), Some(origin_a));
+        assert!(!report2.per_predecessor[0].origin_refused);
+        assert_eq!(report2.total_copied(), 1);
+        assert!(
+            store
+                .get_secret(succ.key(), &sid, SecretScope::Local)
+                .is_ok()
+        );
+
+        // NO PROVENANCE: a SEPARATE predecessor with NO recorded origin at all is
+        // refused — origin_refused AND no_provenance, regardless of the supplied
+        // origin. Legacy data like this migrates via the app-side path instead.
+        let pred2 = Delegate::from((&vec![0].into(), &vec![3].into()));
+        let succ2 = Delegate::from((&vec![0].into(), &vec![4].into()));
+        let sid2 = SecretsId::new(b"room:b".to_vec());
+        store.store_secret(
+            pred2.key(),
+            &sid2,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        let report3 =
+            store.migrate_secrets(std::slice::from_ref(pred2.key()), succ2.key(), Some(other));
+        assert!(
+            report3.per_predecessor[0].origin_refused,
+            "a predecessor with no recorded origin must be refused"
+        );
+        assert!(
+            report3.per_predecessor[0].no_provenance,
+            "a predecessor with no recorded origin is no_provenance"
+        );
+        assert_eq!(report3.total_copied(), 0);
+        Ok(())
+    }
+
+    /// H1 None-class: `origin_contract == None` (a token-less / loopback
+    /// registration) is NEVER privileged — not even against a predecessor whose
+    /// FIRST-registration origin was ITSELF recorded as `None`. There is no
+    /// admin/loopback bypass in the redesigned gate. Since the predecessor DOES
+    /// have a record (the None-class record), refusal here is `origin_refused`
+    /// without `no_provenance`.
+    #[tokio::test]
+    async fn migrate_origin_none_class_never_privileged() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let sid = SecretsId::new(b"room:a".to_vec());
+        store.store_secret(
+            pred.key(),
+            &sid,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        // Recorded as None-class (a loopback registration) — this does NOT
+        // privilege a later None registering origin.
+        store
+            .record_delegate_registration_origin(pred.key(), None)
+            .unwrap();
+
+        // A loopback (None) registering origin → refused: None is NEVER
+        // privileged, even against a None-class record. There IS a record for
+        // this predecessor, so no_provenance is false.
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let report = store.migrate_secrets(std::slice::from_ref(pred.key()), succ.key(), None);
+        assert!(
+            report.per_predecessor[0].origin_refused,
+            "a None registering origin must be refused"
+        );
+        assert!(
+            !report.per_predecessor[0].no_provenance,
+            "the predecessor DOES have a record (None-class), so this is not no_provenance"
+        );
+        assert_eq!(report.total_copied(), 0);
+
+        // A web-app (Some) registration against a None-class record → also
+        // refused (a None-class record never matches any Some origin).
+        let succ2 = Delegate::from((&vec![0].into(), &vec![3].into()));
+        let report2 = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ2.key(),
+            Some([0x55u8; 32]),
+        );
+        assert!(report2.per_predecessor[0].origin_refused);
+        assert_eq!(report2.total_copied(), 0);
+        Ok(())
+    }
+
+    /// H1 first-writer-wins is IMMUTABLE: once a delegate's FIRST-registration
+    /// origin is recorded, a later `record_delegate_registration_origin` call
+    /// (e.g. an attacker re-registering a victim's public WASM later) is a no-op
+    /// — the original (victim's) origin keeps gating copy-forward forever.
+    #[tokio::test]
+    async fn migrate_origin_first_writer_is_immutable() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let victim_origin = [0xA1u8; 32];
+        let attacker_origin = [0xEEu8; 32];
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let sid = SecretsId::new(b"room:a".to_vec());
+        store.store_secret(
+            pred.key(),
+            &sid,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+
+        // The victim's origin is recorded FIRST...
+        store
+            .record_delegate_registration_origin(pred.key(), Some(victim_origin))
+            .unwrap();
+        // ...then an attacker re-registers the same (public-derivable) predecessor
+        // key, trying to overwrite the record. First-writer-wins: a no-op.
+        store
+            .record_delegate_registration_origin(pred.key(), Some(attacker_origin))
+            .unwrap();
+
+        // The attacker's origin does NOT satisfy the gate — the record still
+        // holds the FIRST (victim's) origin, not the attacker's.
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let report = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(attacker_origin),
+        );
+        assert!(
+            report.per_predecessor[0].origin_refused,
+            "the attacker's origin must not satisfy the gate"
+        );
+        assert_eq!(report.total_copied(), 0);
+
+        // The victim's ORIGINAL origin still works.
+        let succ2 = Delegate::from((&vec![0].into(), &vec![3].into()));
+        let report2 = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ2.key(),
+            Some(victim_origin),
+        );
+        assert!(!report2.per_predecessor[0].origin_refused);
+        assert_eq!(
+            report2.total_copied(),
+            1,
+            "the FIRST-recorded (victim's) origin must still gate the copy"
+        );
+        Ok(())
+    }
+
+    /// P1: a collision whose existing successor blob does NOT decrypt is treated
+    /// as a per-secret error (not a successful skip), so the pair is NOT sealed
+    /// and stays retryable — a corrupt successor secret can never masquerade as a
+    /// completed migration.
+    #[tokio::test]
+    async fn migrate_corrupt_collision_is_error_and_unsealed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let sid = SecretsId::new(b"room:c".to_vec());
+        store.store_secret(
+            pred.key(),
+            &sid,
+            SecretScope::Local,
+            Zeroizing::new(b"good".to_vec()),
+        )?;
+        // The successor already has the SAME secret id (a collision), then its
+        // on-disk blob is corrupted so it no longer decrypts.
+        store.store_secret(
+            succ.key(),
+            &sid,
+            SecretScope::Local,
+            Zeroizing::new(b"succ".to_vec()),
+        )?;
+        let succ_blob = secrets_dir.join(succ.key().encode()).join(sid.encode());
+        std::fs::write(&succ_blob, b"corrupt-not-decryptable")?;
+
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        let report = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        assert!(
+            report.total_errors() >= 1,
+            "a non-decrypting collision must be recorded as an error"
+        );
+        let marker_id = pred_done_marker_secret_id(pred.key());
+        assert!(
+            store
+                .get_secret(succ.key(), &marker_id, SecretScope::Local)
+                .is_err(),
+            "a corrupt collision must leave the pair unsealed"
+        );
+        Ok(())
+    }
+
+    /// P2a: `store_secret` REJECTS a foreign key in the reserved
+    /// `\0freenet-migrate/` namespace — only `pred-done:`/`pred-wip:` + exactly a
+    /// 32-byte key are legal — so a client cannot pad the reserved namespace to
+    /// bloat the reserved-hash table or shadow a real marker. A legal marker and
+    /// an ordinary user key are accepted.
+    #[tokio::test]
+    async fn store_secret_rejects_foreign_reserved_namespace_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let d = Delegate::from((&vec![0].into(), &vec![1].into()));
+
+        // Foreign reserved key (wrong sub-prefix) → rejected.
+        let foreign = SecretsId::new(b"\0freenet-migrate/attacker".to_vec());
+        assert!(
+            store
+                .store_secret(
+                    d.key(),
+                    &foreign,
+                    SecretScope::Local,
+                    Zeroizing::new(b"x".to_vec())
+                )
+                .is_err(),
+            "a foreign reserved-namespace key must be rejected"
+        );
+
+        // Correct prefix but WRONG suffix length (not 32 bytes) → rejected.
+        let mut wrong = b"\0freenet-migrate/v1/pred-done:".to_vec();
+        wrong.extend_from_slice(&[0xABu8; 8]);
+        let wrong_id = SecretsId::new(wrong);
+        assert!(
+            store
+                .store_secret(
+                    d.key(),
+                    &wrong_id,
+                    SecretScope::Local,
+                    Zeroizing::new(b"x".to_vec())
+                )
+                .is_err(),
+            "a reserved key with a wrong-length suffix must be rejected"
+        );
+
+        // Legal v1 pred-done: + 32 bytes → accepted.
+        let mut legal = b"\0freenet-migrate/v1/pred-done:".to_vec();
+        legal.extend_from_slice(&[0xCDu8; 32]);
+        let legal_id = SecretsId::new(legal);
+        assert!(
+            store
+                .store_secret(
+                    d.key(),
+                    &legal_id,
+                    SecretScope::Local,
+                    Zeroizing::new(b"1".to_vec())
+                )
+                .is_ok(),
+            "a legal v1 marker key must be accepted"
+        );
+
+        // Legal LEGACY generation-keyed marker (done:<gen decimal>) → accepted
+        // (the crate's retained import_secrets_once still writes these).
+        let legacy_id = SecretsId::new(b"\0freenet-migrate/done:42".to_vec());
+        assert!(
+            store
+                .store_secret(
+                    d.key(),
+                    &legacy_id,
+                    SecretScope::Local,
+                    Zeroizing::new(b"1".to_vec())
+                )
+                .is_ok(),
+            "a legal legacy generation-keyed marker must be accepted"
+        );
+
+        // An ordinary (non-reserved) user key → accepted.
+        let normal = SecretsId::new(b"room:alice".to_vec());
+        assert!(
+            store
+                .store_secret(
+                    d.key(),
+                    &normal,
+                    SecretScope::Local,
+                    Zeroizing::new(b"x".to_vec())
+                )
+                .is_ok(),
+            "an ordinary user key must be accepted"
+        );
+        Ok(())
+    }
+
+    /// The FULL legal reserved-namespace shape matrix (#4117 P2a), MIRRORING the
+    /// `freenet-migrate` crate: v1 per-predecessor `pred-done:`/`pred-wip:` + 32
+    /// bytes, AND legacy generation-keyed `done:`/`wip:` + a bounded ASCII-decimal
+    /// generation. Everything else in the namespace is rejected. Pinned so a
+    /// future crate marker shape that core does not accept trips CI here.
+    #[test]
+    fn reserved_marker_shape_matrix_is_stable() {
+        let key32 = |prefix: &[u8]| {
+            let mut k = prefix.to_vec();
+            k.extend_from_slice(&[0xCDu8; 32]);
+            k
+        };
+        // ACCEPT — v1 per-predecessor + exactly 32 bytes.
+        assert!(is_legal_reserved_marker_key(&key32(
+            b"\0freenet-migrate/v1/pred-done:"
+        )));
+        assert!(is_legal_reserved_marker_key(&key32(
+            b"\0freenet-migrate/v1/pred-wip:"
+        )));
+        // ACCEPT — legacy generation-keyed + a CANONICAL u32 decimal generation.
+        assert!(is_legal_reserved_marker_key(b"\0freenet-migrate/done:0")); // the single "0" is canonical
+        assert!(is_legal_reserved_marker_key(b"\0freenet-migrate/done:42"));
+        assert!(is_legal_reserved_marker_key(b"\0freenet-migrate/wip:7"));
+        assert!(is_legal_reserved_marker_key(
+            b"\0freenet-migrate/done:4294967295"
+        )); // u32::MAX, 10 digits
+        assert!(is_legal_reserved_marker_key(
+            b"\0freenet-migrate/wip:4294967295"
+        ));
+
+        // REJECT — v1 wrong suffix length.
+        let mut short = b"\0freenet-migrate/v1/pred-done:".to_vec();
+        short.extend_from_slice(&[0xCDu8; 8]);
+        assert!(!is_legal_reserved_marker_key(&short));
+        // REJECT — legacy gen that is not a CANONICAL u32:
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:")); // empty
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:abc")); // non-digit
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:00")); // leading zero (non-canonical)
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:01")); // leading zero (non-canonical)
+        assert!(!is_legal_reserved_marker_key(
+            b"\0freenet-migrate/done:4294967296"
+        )); // u32::MAX + 1 (10 digits, but overflows u32)
+        assert!(!is_legal_reserved_marker_key(
+            b"\0freenet-migrate/done:99999999999"
+        )); // 11 digits > cap
+        assert!(!is_legal_reserved_marker_key(
+            b"\0freenet-migrate/done:18446744073709551615"
+        )); // u64::MAX (20 digits) — a legacy u64 superset value, now REJECTED
+        // REJECT — foreign sub-prefix / bare namespace.
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/attacker"));
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/"));
+        // A non-reserved user key is not a "marker" (handled separately at the
+        // store_secret gate; is_legal only judges reserved-namespace keys).
+        assert!(!is_legal_reserved_marker_key(b"room:alice"));
+    }
+
+    /// Byte-exact pin of the crate-format marker key + value, MIRRORING the
+    /// public `freenet-migrate` contract. A drift here (or in the crate) breaks
+    /// the shared marker and is caught by CI on whichever side changed.
+    #[test]
+    fn pred_done_marker_key_format_is_stable() {
+        assert_eq!(
+            MIGRATE_MARKER_KEY_PREFIX,
+            b"\0freenet-migrate/v1/pred-done:"
+        );
+        // The whole reserved namespace is excluded from copy-forward (covers the
+        // app-side `pred-wip:` markers too); `pred-done:` lives under it.
+        assert_eq!(MIGRATE_RESERVED_NAMESPACE_PREFIX, b"\0freenet-migrate/");
+        assert!(MIGRATE_MARKER_KEY_PREFIX.starts_with(MIGRATE_RESERVED_NAMESPACE_PREFIX));
+
+        let pred = DelegateKey::new([7u8; 32], CodeHash::from(&[9u8; 32]));
+        let sid = pred_done_marker_secret_id(&pred);
+        // Raw key = prefix ++ the 32-byte delegate KEY (never the code_hash).
+        let mut expected = b"\0freenet-migrate/v1/pred-done:".to_vec();
+        expected.extend_from_slice(&[7u8; 32]);
+        assert_eq!(
+            sid.key(),
+            expected.as_slice(),
+            "marker key must be prefix ++ predecessor.bytes() (32-byte key, not code_hash)"
+        );
+
+        assert_eq!(pred_done_marker_value(true), b"1");
+        assert_eq!(pred_done_marker_value(false), b"0");
     }
 }
