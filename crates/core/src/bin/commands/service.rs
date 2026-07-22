@@ -26,7 +26,7 @@ mod single_instance;
 mod windows;
 pub mod wrapper;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use freenet::config::ConfigPaths;
 use std::path::{Path, PathBuf};
@@ -91,6 +91,30 @@ pub enum ServiceCommand {
         #[arg(long)]
         system: bool,
     },
+    /// Disable the background daemon so it stays stopped across restarts.
+    ///
+    /// Writes a persistent marker in the config directory that the node checks
+    /// at startup: while it is present, `freenet network` refuses to run and
+    /// stays idle instead, so systemd, launchd, or the tray wrapper cannot
+    /// bring the node back on reboot or re-login. The still-running service is
+    /// restarted so the change takes effect immediately (the supervisor stays
+    /// alive; only the node stops doing work). Re-enable with
+    /// `freenet service enable`.
+    Disable {
+        /// Target the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
+    /// Re-enable the background daemon previously disabled with
+    /// `freenet service disable`.
+    ///
+    /// Removes the disable marker and restarts the service so the node comes
+    /// back immediately.
+    Enable {
+        /// Target the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
     /// Recover a wedged service install: re-template the wrapper/unit to the
     /// current binary, reap stale orphaned `freenet network` processes (PPID=1,
     /// holding the port on an old binary), and restart cleanly. Use when the
@@ -133,10 +157,12 @@ impl ServiceCommand {
                 purge,
                 keep_data,
             } => uninstall_service(*system, *purge, *keep_data),
-            ServiceCommand::Status { system } => service_status(*system),
+            ServiceCommand::Status { system } => service_status_reporting(*system, &config_dirs),
             ServiceCommand::Start { system } => start_service(*system),
             ServiceCommand::Stop { system } => stop_service(*system),
             ServiceCommand::Restart { system } => restart_service(*system),
+            ServiceCommand::Disable { system } => disable_daemon(*system, &config_dirs),
+            ServiceCommand::Enable { system } => enable_daemon(*system, &config_dirs),
             ServiceCommand::Doctor { system } => service_doctor(*system),
             ServiceCommand::Logs { err } => service_logs(*err),
             ServiceCommand::Report(cmd) => {
@@ -338,6 +364,105 @@ fn service_logs(error_only: bool) -> Result<()> {
 
 fn service_doctor(system: bool) -> Result<()> {
     purge::service_doctor(system)
+}
+
+// ── Persistent daemon enable/disable ──────────────────────────────────────────
+//
+// These are platform-independent: the disable state is a marker file in the
+// config dir (see `super::daemon_control`), honored by `freenet network` itself
+// at startup, so it works the same whether the node is supervised by systemd, a
+// launchd agent, or the tray wrapper. The `system` flag only selects which
+// service to restart so the change takes effect without waiting for a reboot.
+
+/// `freenet service disable`: write the persistent disable marker, then restart
+/// the running service so the node drops into its idle state immediately.
+fn disable_daemon(system: bool, config_dirs: &ConfigPaths) -> Result<()> {
+    let config_dir = config_dirs.config_dir();
+    let already = super::daemon_control::write_disabled_marker(&config_dir).with_context(|| {
+        format!(
+            "failed to write daemon-disabled marker in {}",
+            config_dir.display()
+        )
+    })?;
+
+    if already {
+        println!("Freenet background daemon was already disabled.");
+    } else {
+        println!(
+            "Freenet background daemon disabled. It will stay stopped across restarts and \
+             reboots until you run `freenet service enable`."
+        );
+    }
+    println!(
+        "Marker: {}",
+        super::daemon_control::disabled_marker_path(&config_dir).display()
+    );
+
+    // Best-effort: restart the (still-supervised) service so the node re-reads
+    // the marker and stops serving now instead of at the next reboot/relaunch.
+    // The supervisor stays alive; only the node child goes idle. If no service
+    // is installed/running, say so rather than failing the command — the marker
+    // is written and will take effect the next time the node starts.
+    match restart_service(system) {
+        Ok(()) => {}
+        Err(e) => {
+            println!(
+                "Note: could not restart the running service ({e}). The daemon will enter its \
+                 disabled state the next time it starts."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `freenet service enable`: remove the disable marker, then restart the service
+/// so the node comes back immediately.
+fn enable_daemon(system: bool, config_dirs: &ConfigPaths) -> Result<()> {
+    let config_dir = config_dirs.config_dir();
+    let was_disabled =
+        super::daemon_control::remove_disabled_marker(&config_dir).with_context(|| {
+            format!(
+                "failed to remove daemon-disabled marker in {}",
+                config_dir.display()
+            )
+        })?;
+
+    if !was_disabled {
+        println!("Freenet background daemon was not disabled; nothing to do.");
+        return Ok(());
+    }
+
+    println!("Freenet background daemon re-enabled.");
+    // Best-effort: restart so the node picks up the change now. If no service is
+    // installed, tell the user how to start it manually.
+    match restart_service(system) {
+        Ok(()) => {}
+        Err(e) => {
+            println!(
+                "Note: could not restart the service ({e}). Start it with \
+                 `freenet service start` (or launch `freenet network` manually)."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `freenet service status`, augmented with the persistent-disable state. When
+/// the daemon is disabled the underlying service may still report "active"
+/// (a supervised-but-idle node), so surface the disable explicitly first.
+fn service_status_reporting(system: bool, config_dirs: &ConfigPaths) -> Result<()> {
+    let config_dir = config_dirs.config_dir();
+    if super::daemon_control::is_daemon_disabled(&config_dir) {
+        println!("Freenet background daemon: DISABLED (via `freenet service disable`).");
+        println!("The node stays idle and will not join the network until you re-enable it:");
+        println!("    freenet service enable");
+        println!(
+            "Marker: {}",
+            super::daemon_control::disabled_marker_path(&config_dir).display()
+        );
+        println!();
+    }
+    service_status(system)
 }
 fn run_wrapper(version: &str) -> Result<()> {
     wrapper::run_wrapper(version)

@@ -209,6 +209,16 @@ fn auto_update_is_disabled(git_dirty: &str, disable_flag: bool) -> bool {
 async fn run_network(config: Config) -> anyhow::Result<()> {
     tracing::info!("Starting freenet node in network mode");
 
+    // Honor a persistent operator disable (`freenet service disable`, #4690
+    // sibling): while the marker is present the node must not run, and must stay
+    // down across restarts/reboots. Idle instead of serving so the supervisor
+    // keeps us as a healthy (but inert) unit rather than restart-looping.
+    // `freenet service enable` removes the marker and restarts the service.
+    let config_dir = config.paths().config_dir();
+    if commands::daemon_control::is_daemon_disabled(&config_dir) {
+        return run_disabled_idle(&config_dir).await;
+    }
+
     // Check if another freenet process is already using the WS API port.
     // If so, bail out immediately instead of proceeding to bind and fail.
     // This prevents systemd restart loops when another instance is running.
@@ -237,6 +247,47 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
 
     // Run node with signal handling for graceful shutdown
     run_network_node_with_signals(node, shutdown_handle, disable_auto_update).await
+}
+
+/// Park the process in an inert "disabled" state until it receives a shutdown
+/// signal. Entered when `freenet service disable` has written the daemon-
+/// disabled marker (checked in `run_network`).
+///
+/// The node deliberately does NOT bind the WS API or join the network: it stays
+/// a live-but-idle process so the service supervisor (systemd unit, launchd
+/// agent, or tray wrapper) keeps it as a healthy unit instead of restart-looping
+/// on a fast exit. It does no work until re-enabled. `freenet service enable`
+/// removes the marker and restarts the service to bring the node back.
+///
+/// Returning `Ok(())` on SIGTERM/SIGINT means a `systemctl stop` (or the wrapper
+/// killing the child) exits cleanly; with no signal the process simply parks
+/// indefinitely, which is the whole point of "disabled until turned on again".
+async fn run_disabled_idle(config_dir: &std::path::Path) -> anyhow::Result<()> {
+    use tokio::signal;
+
+    tracing::warn!(
+        marker = %commands::daemon_control::disabled_marker_path(config_dir).display(),
+        "Freenet background daemon is DISABLED (`freenet service disable`). The node will NOT \
+         start or join the network and will remain idle until you run `freenet service enable`. \
+         This persists across restarts and reboots."
+    );
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .context("failed to install SIGTERM handler")?;
+        tokio::select! {
+            _ = signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+    }
+
+    tracing::info!("Disabled daemon received shutdown signal; exiting cleanly.");
+    Ok(())
 }
 
 /// Run the network node with signal handling for graceful shutdown.
