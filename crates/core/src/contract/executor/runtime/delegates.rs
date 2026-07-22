@@ -103,6 +103,44 @@ impl Executor<Runtime> {
             })
     }
 
+    /// Register a delegate and record its WebApp origin, shared by the
+    /// `RegisterDelegate` and `RegisterDelegateWithPredecessors` request arms so
+    /// the two cannot drift. Installs the client-supplied cipher/nonce, records
+    /// `origin_contract` as this delegate's attestation, and registers the WASM
+    /// module. Returns the delegate key on success, or a mapped
+    /// [`ExecutorError`] (already carrying `RegisterError(key)`) on failure.
+    fn register_delegate_and_record_origin(
+        &mut self,
+        delegate: DelegateContainer,
+        cipher: [u8; 32],
+        nonce: [u8; 24],
+        origin_contract: Option<&ContractInstanceId>,
+    ) -> Result<DelegateKey, ExecutorError> {
+        use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+        let key = delegate.key().clone();
+        let arr = (&cipher).into();
+        let cipher = XChaCha20Poly1305::new(arr);
+        let nonce = nonce.into();
+        if let Some(contract) = origin_contract {
+            self.delegate_origin_ids
+                .entry(key.clone())
+                .or_default()
+                .push(*contract);
+        }
+        match self.runtime.register_delegate(delegate, cipher, nonce) {
+            Ok(_) => Ok(key),
+            Err(err) => {
+                tracing::warn!(
+                    delegate_key = %key,
+                    error = %err,
+                    phase = "register_failed",
+                    "Failed to register delegate"
+                );
+                Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
+            }
+        }
+    }
+
     pub fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
@@ -134,32 +172,77 @@ impl Executor<Runtime> {
                 delegate,
                 cipher,
                 nonce,
+            } => match self.register_delegate_and_record_origin(
+                delegate,
+                cipher,
+                nonce,
+                origin_contract,
+            ) {
+                Ok(key) => Ok(DelegateResponse {
+                    key,
+                    values: Vec::new(),
+                }),
+                Err(err) => Err(err),
+            },
+            DelegateRequest::RegisterDelegateWithPredecessors {
+                delegate,
+                cipher,
+                nonce,
+                predecessors,
             } => {
-                use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
-                let key = delegate.key().clone();
-                let arr = (&cipher).into();
-                let cipher = XChaCha20Poly1305::new(arr);
-                let nonce = nonce.into();
-                if let Some(contract) = origin_contract {
-                    self.delegate_origin_ids
-                        .entry(key.clone())
-                        .or_default()
-                        .push(*contract);
-                }
-                match self.runtime.register_delegate(delegate, cipher, nonce) {
-                    Ok(_) => Ok(DelegateResponse {
-                        key,
-                        values: Vec::new(),
-                    }),
-                    Err(err) => {
-                        tracing::warn!(
-                            delegate_key = %key,
-                            error = %err,
-                            phase = "register_failed",
-                            "Failed to register delegate"
+                // Register exactly as `RegisterDelegate` does, THEN run the
+                // one-shot, Local-scope copy-forward of the predecessors' secrets
+                // (#4117). The copy is best-effort and never fails registration:
+                // an absent/partly-unreadable predecessor is recorded in the
+                // report and logged, but the successor still registers. See
+                // `Runtime::migrate_delegate_secrets` /
+                // `SecretsStore::migrate_secrets` for the full contract.
+                match self.register_delegate_and_record_origin(
+                    delegate,
+                    cipher,
+                    nonce,
+                    origin_contract,
+                ) {
+                    Ok(key) => {
+                        // Record the originating web-app contract (when present)
+                        // verbatim in the migration marker as a consent-primary-v1
+                        // AUDIT FACT. `ContractInstanceId::as_bytes` is the 32-byte
+                        // id; `try_into` never fails but is used to stay panic-free.
+                        let origin_bytes: Option<[u8; 32]> =
+                            origin_contract.and_then(|c| c.as_bytes().try_into().ok());
+                        let report = self.runtime.migrate_delegate_secrets(
+                            &predecessors,
+                            &key,
+                            origin_bytes,
                         );
-                        Err(ExecutorError::other(StdDelegateError::RegisterError(key)))
+                        if report.total_errors() > 0 {
+                            tracing::warn!(
+                                delegate_key = %key,
+                                predecessors = predecessors.len(),
+                                copied = report.total_copied(),
+                                skipped_existing = report.total_skipped_existing(),
+                                user_scope_skipped = report.total_user_scope_skipped(),
+                                errors = report.total_errors(),
+                                phase = "secret_copy_forward",
+                                "delegate secret copy-forward completed with errors"
+                            );
+                        } else {
+                            tracing::info!(
+                                delegate_key = %key,
+                                predecessors = predecessors.len(),
+                                copied = report.total_copied(),
+                                skipped_existing = report.total_skipped_existing(),
+                                user_scope_skipped = report.total_user_scope_skipped(),
+                                phase = "secret_copy_forward",
+                                "delegate secret copy-forward completed"
+                            );
+                        }
+                        Ok(DelegateResponse {
+                            key,
+                            values: Vec::new(),
+                        })
                     }
+                    Err(err) => Err(err),
                 }
             }
             DelegateRequest::UnregisterDelegate(key) => {

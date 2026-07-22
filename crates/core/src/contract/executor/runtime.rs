@@ -1495,6 +1495,112 @@ mod remove_contract_tests {
             .with_extension("wasm")
     }
 
+    /// Handler-level (#4117): a `RegisterDelegateWithPredecessors` request
+    /// registers the successor AND copies a predecessor's Local secret into the
+    /// successor's namespace end-to-end — the request→register→migrate→disk
+    /// wiring that the store-level `migrate_secrets` tests do not cover. Verified
+    /// on disk (the successor's secret file materializes), so no successor
+    /// secret-store handle is needed. Also asserts the one-shot marker prevents
+    /// resurrection when the delegate re-registers after the user deletes a copy.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_delegate_with_predecessors_copies_secrets_forward() {
+        use crate::wasm_runtime::SecretScope;
+        use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
+        use freenet_stdlib::prelude::{
+            Delegate, DelegateContainer, DelegateWasmAPIVersion, SecretsId,
+        };
+        use zeroize::Zeroizing;
+
+        let temp_dir = crate::util::tests::get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await.expect("create db");
+        let contract_store =
+            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
+                .expect("create contract store");
+        let delegate_store =
+            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
+                .expect("create delegate store");
+        let secrets_dir = temp_dir.path().join("secrets");
+        let mut secrets_store =
+            SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())
+                .expect("create secrets store");
+
+        // Same params, different code == an ABI bump that mints a new key.
+        let pred = Delegate::from((&vec![0u8].into(), &vec![1u8].into()));
+        let succ = Delegate::from((&vec![0u8].into(), &vec![2u8].into()));
+
+        // Seed a predecessor Local secret under its DERIVED DEK (the at-rest
+        // path) BEFORE moving the secrets store into the runtime.
+        let secret_id = SecretsId::new(b"room:alice".to_vec());
+        secrets_store
+            .store_secret(
+                pred.key(),
+                &secret_id,
+                SecretScope::Local,
+                Zeroizing::new(b"profile".to_vec()),
+            )
+            .expect("seed predecessor secret");
+
+        let successor_secret_path = secrets_dir
+            .join(succ.key().encode())
+            .join(secret_id.encode());
+        assert!(
+            !successor_secret_path.exists(),
+            "successor secret must not exist before migration"
+        );
+
+        let state_store = StateStore::new(db, 10_000_000).expect("create state store");
+        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
+            .expect("build runtime");
+        let mut executor = Executor::new(
+            state_store,
+            || Ok(()),
+            crate::contract::executor::OperationMode::Local,
+            runtime,
+            None,
+        )
+        .await
+        .expect("create executor");
+
+        let req = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: vec![pred.key().clone()],
+        };
+        let resp = executor
+            .delegate_request(req, None, None, None)
+            .expect("register-with-predecessors must succeed");
+        match resp {
+            HostResponse::DelegateResponse { key, .. } => {
+                assert_eq!(&key, succ.key(), "response carries the successor key");
+            }
+            other => panic!("expected DelegateResponse, got {other:?}"),
+        }
+
+        // The predecessor's Local secret was copied into the successor namespace.
+        assert!(
+            successor_secret_path.exists(),
+            "successor secret file must exist after copy-forward"
+        );
+
+        // One-shot / anti-resurrection at the handler level: delete the copy and
+        // re-register — the marker must make the re-run a no-op.
+        std::fs::remove_file(&successor_secret_path).expect("remove copied secret");
+        let req2 = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: vec![pred.key().clone()],
+        };
+        executor
+            .delegate_request(req2, None, None, None)
+            .expect("re-registration must succeed");
+        assert!(
+            !successor_secret_path.exists(),
+            "one-shot marker must prevent resurrection on re-registration"
+        );
+    }
+
     /// Core regression test: storing a contract makes its state retrievable
     /// and its `.wasm` blob present on disk; `remove_contract` reclaims both.
     #[tokio::test(flavor = "multi_thread")]

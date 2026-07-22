@@ -1594,6 +1594,9 @@ async fn process_open_request(
                         freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
                             ..
                         } => "RegisterDelegate".to_string(),
+                        freenet_stdlib::client_api::DelegateRequest::RegisterDelegateWithPredecessors {
+                            ..
+                        } => "RegisterDelegateWithPredecessors".to_string(),
                         freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(_) => {
                             "UnregisterDelegate".to_string()
                         }

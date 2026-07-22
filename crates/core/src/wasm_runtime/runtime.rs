@@ -439,6 +439,32 @@ impl Runtime {
         )
     }
 
+    /// One-shot, idempotent, Local-scope copy-forward of delegate secrets from
+    /// `predecessors` into `successor` (#4117), the node-side primitive behind
+    /// `DelegateRequest::RegisterDelegateWithPredecessors`. Another route to the
+    /// `pub(super) secret_store` for a write from outside the `wasm_runtime`
+    /// module (the executor lives in a different module tree and wraps secret
+    /// access in `Runtime` methods, exactly as `register_delegate` /
+    /// `import_secret_bundle` do).
+    ///
+    /// Never returns an error: every failure is recorded in the returned
+    /// [`super::MigrationReport`] and logged, so a registration is never blocked
+    /// by a predecessor's data being absent or partly unreadable. See
+    /// [`SecretsStore::migrate_secrets`] for the full contract (Local-only DEK
+    /// carve-out, no-delete invariant, one-shot / anti-resurrection marker).
+    ///
+    /// Runs ON the contract loop (serialized with delegate `store_secret`),
+    /// mirroring the on-loop write discipline of `import_secret_bundle`.
+    pub(crate) fn migrate_delegate_secrets(
+        &mut self,
+        predecessors: &[DelegateKey],
+        successor: &DelegateKey,
+        origin_contract: Option<[u8; 32]>,
+    ) -> super::MigrationReport {
+        self.secret_store
+            .migrate_secrets(predecessors, successor, origin_contract)
+    }
+
     pub fn build_with_config(
         contract_store: ContractStore,
         delegate_store: DelegateStore,

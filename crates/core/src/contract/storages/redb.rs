@@ -60,6 +60,23 @@ pub(crate) const SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const USER_SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("user_secrets_index");
 
+/// One-shot idempotence / anti-resurrection marker for delegate secret
+/// copy-forward (`SecretsStore::migrate_secrets`, #4117). One row per
+/// `(predecessor, successor)` delegate pair. Presence alone gates the copy:
+/// once a `(predecessor, successor)` migration has run, it is NEVER re-run, so
+/// a secret the user deleted from the successor after migration cannot be
+/// resurrected by a later re-registration. The row value is a small AUDIT FACT
+/// (schema version, the originating contract when known, and the copied/skipped
+/// counts) — see `SecretsStore::migrate_secrets`. Created on first open of
+/// upgraded databases too (redb materializes a missing table inside the same
+/// write txn that opens it), so a pre-#4117 database gains an empty table
+/// without disturbing any existing table.
+///
+/// Key: predecessor DelegateKey (64 bytes) || successor DelegateKey (64 bytes) = 128 bytes
+/// Value: versioned marker blob (see `migration_marker` codec in the secrets store)
+pub(crate) const MIGRATION_MARKER_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("delegate_secret_migration_marker");
+
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
 pub struct HostingMetadata {
@@ -450,6 +467,20 @@ impl ReDb {
                     table = "BROKEN_INVARIANTS_TABLE",
                     phase = "table_init_failed",
                     "Failed to open BROKEN_INVARIANTS_TABLE"
+                );
+                e
+            })?;
+
+            // Delegate secret copy-forward marker (#4117). Created on first open
+            // of upgraded databases too (same missing-table-in-write-txn
+            // materialization as the tables above), so a pre-#4117 database
+            // gains an empty table without disturbing any existing one.
+            txn.open_table(MIGRATION_MARKER_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "MIGRATION_MARKER_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open MIGRATION_MARKER_TABLE"
                 );
                 e
             })?;
@@ -1105,6 +1136,59 @@ impl ReDb {
                 result.push(((delegate_key, user_id_bytes), secret_keys));
             }
             Ok(result)
+        })
+    }
+
+    // ============ Delegate Secret Copy-Forward Marker (#4117) ============
+    // One-shot idempotence / anti-resurrection marker keyed on the
+    // `(predecessor, successor)` delegate pair. See `MIGRATION_MARKER_TABLE`
+    // and `SecretsStore::migrate_secrets`.
+
+    /// Build the 128-byte composite key `predecessor(64) || successor(64)`,
+    /// where each 64-byte half is `DelegateKey.key(32) || code_hash(32)` — the
+    /// same DelegateKey encoding the secrets-index tables use.
+    fn migration_marker_key(predecessor: &DelegateKey, successor: &DelegateKey) -> [u8; 128] {
+        let mut key_bytes = [0u8; 128];
+        key_bytes[..32].copy_from_slice(predecessor.as_ref());
+        key_bytes[32..64].copy_from_slice(predecessor.code_hash().as_ref());
+        key_bytes[64..96].copy_from_slice(successor.as_ref());
+        key_bytes[96..].copy_from_slice(successor.code_hash().as_ref());
+        key_bytes
+    }
+
+    /// Persist the copy-forward marker for `(predecessor, successor)`. The
+    /// `value` is the opaque, versioned audit blob built by the secrets store.
+    /// Idempotent: re-writing the same pair overwrites in place.
+    pub fn store_migration_marker(
+        &self,
+        predecessor: &DelegateKey,
+        successor: &DelegateKey,
+        value: &[u8],
+    ) -> Result<(), redb::Error> {
+        let key_bytes = Self::migration_marker_key(predecessor, successor);
+        let txn = self.begin_write()?;
+        {
+            let mut tbl = txn.open_table(MIGRATION_MARKER_TABLE)?;
+            tbl.insert(key_bytes.as_slice(), value)?;
+        }
+        Self::commit_guarded(txn)
+    }
+
+    /// Fetch the copy-forward marker for `(predecessor, successor)`, or `None`
+    /// if this pair has never been migrated. The returned bytes are the opaque
+    /// audit blob the secrets store wrote; only the store interprets them.
+    pub fn get_migration_marker(
+        &self,
+        predecessor: &DelegateKey,
+        successor: &DelegateKey,
+    ) -> Result<Option<Vec<u8>>, redb::Error> {
+        let key_bytes = Self::migration_marker_key(predecessor, successor);
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(MIGRATION_MARKER_TABLE)?;
+            match tbl.get(key_bytes.as_slice())? {
+                Some(v) => Ok(Some(v.value().to_vec())),
+                None => Ok(None),
+            }
         })
     }
 
