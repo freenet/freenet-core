@@ -1502,14 +1502,22 @@ mod remove_contract_tests {
     /// on disk (the successor's secret file materializes), so no successor
     /// secret-store handle is needed. Also asserts the one-shot marker prevents
     /// resurrection when the delegate re-registers after the user deletes a copy.
+    ///
+    /// Exercises the H1 same-origin gate (#4117): the predecessor's
+    /// FIRST-registration origin is recorded as `Some(ORIGIN)` before the
+    /// migrating registration, and the registration itself supplies
+    /// `origin_contract = Some(&contract_instance_id)` whose bytes equal
+    /// `ORIGIN` — otherwise the copy would be refused as `no_provenance`.
     #[tokio::test(flavor = "multi_thread")]
     async fn register_delegate_with_predecessors_copies_secrets_forward() {
         use crate::wasm_runtime::SecretScope;
         use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
         use freenet_stdlib::prelude::{
-            Delegate, DelegateContainer, DelegateWasmAPIVersion, SecretsId,
+            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion, SecretsId,
         };
         use zeroize::Zeroizing;
+
+        const ORIGIN: [u8; 32] = [0x11u8; 32];
 
         let temp_dir = crate::util::tests::get_temp_dir();
         let db = Storage::new(temp_dir.path()).await.expect("create db");
@@ -1540,6 +1548,11 @@ mod remove_contract_tests {
             )
             .expect("seed predecessor secret");
 
+        // Record the predecessor's FIRST-registration origin (H1 same-origin
+        // gate): the migrating registration below must present this SAME origin
+        // for the copy to be allowed.
+        secrets_store.record_delegate_registration_origin(pred.key(), Some(ORIGIN));
+
         let successor_secret_path = secrets_dir
             .join(succ.key().encode())
             .join(secret_id.encode());
@@ -1561,6 +1574,8 @@ mod remove_contract_tests {
         .await
         .expect("create executor");
 
+        let origin_contract = ContractInstanceId::new(ORIGIN);
+
         let req = DelegateRequest::RegisterDelegateWithPredecessors {
             delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
             cipher: [7u8; 32],
@@ -1568,7 +1583,7 @@ mod remove_contract_tests {
             predecessors: vec![pred.key().clone()],
         };
         let resp = executor
-            .delegate_request(req, None, None, None)
+            .delegate_request(req, Some(&origin_contract), None, None)
             .expect("register-with-predecessors must succeed");
         match resp {
             HostResponse::DelegateResponse { key, .. } => {
@@ -1584,7 +1599,9 @@ mod remove_contract_tests {
         );
 
         // One-shot / anti-resurrection at the handler level: delete the copy and
-        // re-register — the marker must make the re-run a no-op.
+        // re-register — the marker must make the re-run a no-op (the marker gate
+        // short-circuits before the origin gate, so the same origin is supplied
+        // here purely for realism, not because it's load-bearing for this part).
         std::fs::remove_file(&successor_secret_path).expect("remove copied secret");
         let req2 = DelegateRequest::RegisterDelegateWithPredecessors {
             delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
@@ -1593,7 +1610,7 @@ mod remove_contract_tests {
             predecessors: vec![pred.key().clone()],
         };
         executor
-            .delegate_request(req2, None, None, None)
+            .delegate_request(req2, Some(&origin_contract), None, None)
             .expect("re-registration must succeed");
         assert!(
             !successor_secret_path.exists(),

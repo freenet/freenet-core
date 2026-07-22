@@ -19,31 +19,22 @@ use super::*;
 /// registration itself still succeeds.
 const MAX_MIGRATION_PREDECESSORS: usize = 64;
 
-/// Dedupe (preserving newest-first order) then cap a client-supplied predecessor
-/// list at `cap` (#4117 P2/M1). Returns the bounded list and whether it was
-/// truncated (either dropped duplicates OR hit the cap), so the caller can warn.
-/// Extracted as a free function so the amplification bound is unit-testable
-/// without standing up an executor.
-fn dedupe_and_cap_predecessors(
-    predecessors: Vec<DelegateKey>,
-    cap: usize,
-) -> (Vec<DelegateKey>, bool) {
-    let requested = predecessors.len();
+/// Dedupe a client-supplied predecessor list, preserving newest-first order
+/// (#4117 P2/M1). A duplicate is pure waste (the migration is idempotent per
+/// pair), so it is dropped SILENTLY. The cap is enforced by the CALLER on the
+/// deduped length: over the cap, the whole request is REJECTED before
+/// registration (never silently truncated, which would strand older
+/// generations — the client is expected to split its request). Extracted as a
+/// free function so the dedupe is unit-testable without standing up an executor.
+fn dedupe_predecessors(predecessors: Vec<DelegateKey>) -> Vec<DelegateKey> {
     let mut seen = std::collections::HashSet::new();
-    let mut bounded: Vec<DelegateKey> = Vec::with_capacity(requested.min(cap));
-    let mut capped = false;
+    let mut out: Vec<DelegateKey> = Vec::with_capacity(predecessors.len());
     for p in predecessors {
-        if !seen.insert(p.clone()) {
-            continue; // duplicate — pure waste
+        if seen.insert(p.clone()) {
+            out.push(p);
         }
-        if bounded.len() >= cap {
-            capped = true;
-            break;
-        }
-        bounded.push(p);
     }
-    let truncated = capped || bounded.len() != requested;
-    (bounded, truncated)
+    out
 }
 
 impl Executor<Runtime> {
@@ -240,12 +231,35 @@ impl Executor<Runtime> {
                 nonce,
                 predecessors,
             } => {
+                // Bound the client-controlled predecessor list BEFORE registering
+                // (#4117 P2b/M1). Dedupe silently (a repeat is pure waste — the
+                // migration is idempotent per pair), then REJECT the whole request
+                // if the deduped list still exceeds the cap: each predecessor
+                // drives synchronous marker/index/redb writes on the contract
+                // loop, so an unbounded list is an amplification vector, and
+                // silently truncating would strand older generations. The client
+                // splits an over-cap request.
+                let deduped = dedupe_predecessors(predecessors);
+                if deduped.len() > MAX_MIGRATION_PREDECESSORS {
+                    let key = delegate.key().clone();
+                    tracing::warn!(
+                        delegate_key = %key,
+                        predecessors = deduped.len(),
+                        cap = MAX_MIGRATION_PREDECESSORS,
+                        "RegisterDelegateWithPredecessors rejected: too many predecessors (split the request)"
+                    );
+                    return Err(ExecutorError::other(anyhow::anyhow!(
+                        "RegisterDelegateWithPredecessors: {} predecessors exceeds the cap of {}",
+                        deduped.len(),
+                        MAX_MIGRATION_PREDECESSORS
+                    )));
+                }
+
                 // Register exactly as `RegisterDelegate` does, THEN run the
-                // one-shot, Local-scope copy-forward of the predecessors' secrets
-                // (#4117). The copy is best-effort and never fails registration:
-                // an absent/partly-unreadable predecessor is recorded in the
+                // one-shot, Local-scope copy-forward of the predecessors' secrets.
+                // The copy is best-effort and never fails registration: a
+                // refused/absent/partly-unreadable predecessor is recorded in the
                 // report and logged, but the successor still registers. See
-                // `Runtime::migrate_delegate_secrets` /
                 // `SecretsStore::migrate_secrets` for the full contract.
                 match self.register_delegate_and_record_origin(
                     delegate,
@@ -254,35 +268,18 @@ impl Executor<Runtime> {
                     origin_contract,
                 ) {
                     Ok(key) => {
-                        // Bound + dedupe the client-controlled predecessor list
-                        // (#4117 P2/M1): each predecessor drives synchronous
-                        // marker/index/redb writes on the contract loop, so an
-                        // unbounded or duplicate-padded list is an amplification
-                        // vector. See `dedupe_and_cap_predecessors`.
-                        let requested = predecessors.len();
-                        let (bounded, truncated) =
-                            dedupe_and_cap_predecessors(predecessors, MAX_MIGRATION_PREDECESSORS);
-                        if truncated {
-                            tracing::warn!(
-                                delegate_key = %key,
-                                requested,
-                                cap = MAX_MIGRATION_PREDECESSORS,
-                                "delegate secret copy-forward: predecessor list over cap; deduped + truncated (registration still succeeds)"
-                            );
-                        }
-                        // Record the originating web-app contract (when present)
-                        // verbatim in the migration marker as an AUDIT FACT.
+                        // Record the originating web-app contract (when present).
                         // `ContractInstanceId::as_bytes` is the 32-byte id;
                         // `try_into` never fails but is used to stay panic-free.
                         let origin_bytes: Option<[u8; 32]> =
                             origin_contract.and_then(|c| c.as_bytes().try_into().ok());
                         let report =
                             self.runtime
-                                .migrate_delegate_secrets(&bounded, &key, origin_bytes);
+                                .migrate_delegate_secrets(&deduped, &key, origin_bytes);
                         if report.total_errors() > 0 {
                             tracing::warn!(
                                 delegate_key = %key,
-                                predecessors = bounded.len(),
+                                predecessors = deduped.len(),
                                 copied = report.total_copied(),
                                 skipped_existing = report.total_skipped_existing(),
                                 user_scope_skipped = report.total_user_scope_skipped(),
@@ -293,7 +290,7 @@ impl Executor<Runtime> {
                         } else {
                             tracing::info!(
                                 delegate_key = %key,
-                                predecessors = bounded.len(),
+                                predecessors = deduped.len(),
                                 copied = report.total_copied(),
                                 skipped_existing = report.total_skipped_existing(),
                                 user_scope_skipped = report.total_user_scope_skipped(),
@@ -454,31 +451,25 @@ mod resolve_message_origin_tests {
         crate::wasm_runtime::new_inherited_origins()
     }
 
-    /// #4117 P2/M1: the predecessor list is deduped (preserving newest-first
-    /// order) then capped, and the truncation flag is set for either a dropped
-    /// duplicate or a hit cap. Bounds the client-driven copy-forward work.
+    /// #4117 P2/M1: the predecessor list is deduped silently, preserving
+    /// newest-first order (first occurrence wins). The cap itself is enforced in
+    /// the handler on the deduped length (over-cap → the whole request is
+    /// rejected, never silently truncated).
     #[test]
-    fn dedupe_and_cap_predecessors_bounds_the_list() {
-        // Unique, under cap → unchanged, not truncated.
+    fn dedupe_predecessors_preserves_order_and_drops_duplicates() {
+        // Unique → unchanged, order preserved.
         let keys: Vec<DelegateKey> = (0u8..5).map(dkey).collect();
-        let (bounded, truncated) = dedupe_and_cap_predecessors(keys.clone(), 64);
-        assert_eq!(bounded, keys);
-        assert!(!truncated);
+        assert_eq!(dedupe_predecessors(keys.clone()), keys);
 
-        // Duplicates are dropped (first occurrence wins, order preserved) and
-        // flagged as truncated.
+        // Duplicates dropped, first occurrence wins, order preserved.
         let dupes = vec![dkey(1), dkey(2), dkey(1), dkey(3), dkey(2)];
-        let (bounded, truncated) = dedupe_and_cap_predecessors(dupes, 64);
-        assert_eq!(bounded, vec![dkey(1), dkey(2), dkey(3)]);
-        assert!(truncated, "dropping a duplicate flags truncation");
+        assert_eq!(dedupe_predecessors(dupes), vec![dkey(1), dkey(2), dkey(3)]);
 
-        // Over the cap → truncated to the cap, keeping the first (newest) `cap`.
+        // Dedupe does not itself cap: a large unique list passes through (the
+        // handler rejects it against MAX_MIGRATION_PREDECESSORS).
         let many: Vec<DelegateKey> = (0u8..200).map(dkey).collect();
-        let (bounded, truncated) = dedupe_and_cap_predecessors(many, 64);
-        assert_eq!(bounded.len(), 64);
-        assert_eq!(bounded[0], dkey(0));
-        assert_eq!(bounded[63], dkey(63));
-        assert!(truncated);
+        assert_eq!(dedupe_predecessors(many).len(), 200);
+        assert!(200 > MAX_MIGRATION_PREDECESSORS);
     }
 
     /// Caller delegate identity wins over a concurrently-supplied WebApp

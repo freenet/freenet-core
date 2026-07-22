@@ -105,9 +105,13 @@ pub(crate) const DELEGATE_ORIGINS_TABLE: TableDefinition<&[u8], &[u8]> =
 /// the cap or with a missing registry, a marker's raw key would be invisible to a
 /// registry-based check and could chain-copy as user data, poisoning `had_data`
 /// and falsely gating a later migration. This table is registry-independent.
+/// INDIVIDUALLY KEYED (#4117 P2a): one row per `(delegate, hash)`, so recording a
+/// marker is a single insert, never a read-modify-write of a growing blob (an
+/// amplification vector). Per-delegate rows are bounded
+/// (`MAX_RESERVED_MARKER_HASHES_PER_DELEGATE`) and read via a prefix range scan.
 ///
-/// Key: DelegateKey (64 bytes)
-/// Value: concatenated 32-byte secret hashes (N × 32 bytes)
+/// Key: DelegateKey (64 bytes) || secret hash (32 bytes) = 96 bytes
+/// Value: single presence byte
 pub(crate) const RESERVED_MARKER_HASHES_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_reserved_marker_hashes");
 
@@ -1267,43 +1271,50 @@ impl ReDb {
         b
     }
 
-    /// Record a web-app contract origin for `delegate` (idempotent). `origin =
-    /// None` records the Admin/None class (loopback / CLI registration). Grows
-    /// the row's origin set; a repeated origin is a no-op.
-    pub fn record_delegate_origin(
+    /// Record the origin under which `delegate` was FIRST registered —
+    /// FIRST-WRITER-WINS and IMMUTABLE (#4117 H1). The record is written only if
+    /// none exists; a later registration NEVER modifies it. This is the whole
+    /// security property: an attacker who re-registers a victim's
+    /// (public-derivable) WASM later cannot add itself to the origin set, so it
+    /// can never satisfy the copy-forward same-origin gate for that delegate.
+    /// `origin = None` records the Admin/None class (a token-less / loopback
+    /// registration), which the gate treats as NEVER privileged. Returns whether
+    /// a NEW record was written (`false` if one already existed).
+    ///
+    /// Value encoding (unchanged): `[has_admin_none: 1][origin: 32 if Some]` — a
+    /// first-Some writer stores `[0][C]`, a first-None writer stores `[1]`.
+    pub fn record_delegate_origin_first_writer(
         &self,
         delegate: &DelegateKey,
         origin: Option<[u8; 32]>,
-    ) -> Result<(), redb::Error> {
+    ) -> Result<bool, redb::Error> {
         let key = Self::delegate_key64(delegate);
         let txn = self.begin_write()?;
-        {
+        let wrote = {
             let mut tbl = txn.open_table(DELEGATE_ORIGINS_TABLE)?;
-            let (mut has_admin_none, mut origins) = match tbl.get(key.as_slice())? {
-                Some(v) => Self::decode_origins(v.value()),
-                None => (false, Vec::new()),
-            };
-            match origin {
-                None => has_admin_none = true,
-                Some(o) => {
-                    if !origins.iter().any(|e| e == &o) {
-                        origins.push(o);
+            if tbl.get(key.as_slice())?.is_some() {
+                false
+            } else {
+                let mut value = Vec::with_capacity(1 + 32);
+                match origin {
+                    None => value.push(1u8), // Admin/None class, no Some origin
+                    Some(o) => {
+                        value.push(0u8);
+                        value.extend_from_slice(&o);
                     }
                 }
+                tbl.insert(key.as_slice(), value.as_slice())?;
+                true
             }
-            let mut value = Vec::with_capacity(1 + origins.len() * 32);
-            value.push(u8::from(has_admin_none));
-            for o in &origins {
-                value.extend_from_slice(o);
-            }
-            tbl.insert(key.as_slice(), value.as_slice())?;
-        }
-        Self::commit_guarded(txn)
+        };
+        Self::commit_guarded(txn)?;
+        Ok(wrote)
     }
 
-    /// Fetch `delegate`'s recorded origins as `(has_admin_none, origins)`, or
-    /// `None` if the delegate has never been registered on this node (the
-    /// grandfather case for copy-forward).
+    /// Fetch `delegate`'s FIRST-registration origin as `(has_admin_none,
+    /// origins)`, or `None` if the delegate has never been registered on this
+    /// node (the NoProvenance case — copy-forward refuses). With first-writer
+    /// -wins, `origins` holds at most one entry.
     #[allow(clippy::type_complexity)]
     pub fn get_delegate_origins(
         &self,
@@ -1333,52 +1344,89 @@ impl ReDb {
         (has_admin_none, origins)
     }
 
-    // ========== Reserved-marker hashes (#4117 finding 4a) ==========
+    // ========== Reserved-marker hashes (#4117 finding 4a / P2a) ==========
 
-    /// Record that `delegate` holds a reserved-namespace coordination secret
-    /// with hash `hash` (idempotent). Uncapped and registry-independent.
+    /// Per-delegate cap on recorded reserved-marker hashes. Bounds the table
+    /// against a delegate that somehow accretes many reserved entries; a real
+    /// delegate's reserved set is at most its predecessor count (itself capped at
+    /// registration). Over the cap, further entries are not recorded (the
+    /// below-cap `.keys` union still covers a freshly-written marker).
+    pub(crate) const MAX_RESERVED_MARKER_HASHES_PER_DELEGATE: usize = 256;
+
+    /// 96-byte row key `delegate_key64(64) || hash(32)` for the individually
+    /// -keyed reserved-marker table (no read-modify-write of a growing blob —
+    /// #4117 P2a).
+    fn reserved_marker_row_key(delegate: &DelegateKey, hash: &[u8; 32]) -> [u8; 96] {
+        let mut k = [0u8; 96];
+        k[..64].copy_from_slice(&Self::delegate_key64(delegate));
+        k[64..].copy_from_slice(hash);
+        k
+    }
+
+    /// Record that `delegate` holds a reserved-namespace coordination secret with
+    /// hash `hash`, as an individually-keyed row (#4117 P2a — no read-modify
+    /// -write amplification). Idempotent; bounded at
+    /// [`Self::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE`] per delegate.
     pub fn add_reserved_marker_hash(
         &self,
         delegate: &DelegateKey,
         hash: &[u8; 32],
     ) -> Result<(), redb::Error> {
-        let key = Self::delegate_key64(delegate);
+        let row_key = Self::reserved_marker_row_key(delegate, hash);
+        let (lo, hi) = Self::reserved_marker_range(delegate);
         let txn = self.begin_write()?;
         {
             let mut tbl = txn.open_table(RESERVED_MARKER_HASHES_TABLE)?;
-            let mut hashes: Vec<u8> = match tbl.get(key.as_slice())? {
-                Some(v) => v.value().to_vec(),
-                None => Vec::new(),
-            };
-            // Idempotent: skip if already present.
-            if !hashes.chunks_exact(32).any(|c| c == hash.as_slice()) {
-                hashes.extend_from_slice(hash);
-                tbl.insert(key.as_slice(), hashes.as_slice())?;
+            // Idempotent + capped. Counting the existing rows is bounded by the
+            // cap; a present row means we're done.
+            if tbl.get(row_key.as_slice())?.is_none() {
+                let count = tbl.range(lo.as_slice()..=hi.as_slice())?.count();
+                if count < Self::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE {
+                    tbl.insert(row_key.as_slice(), [1u8].as_slice())?;
+                } else {
+                    tracing::warn!(
+                        delegate = %delegate.encode(),
+                        cap = Self::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE,
+                        "reserved-marker hash set at cap; not recording (below-cap .keys union still covers fresh markers)"
+                    );
+                }
             }
         }
         Self::commit_guarded(txn)
     }
 
-    /// All reserved-namespace secret hashes recorded for `delegate`.
+    /// Inclusive `[lo, hi]` 96-byte range bounds covering every reserved-marker
+    /// row for `delegate` (its 64-byte prefix followed by all-zero .. all-ones
+    /// hash).
+    fn reserved_marker_range(delegate: &DelegateKey) -> ([u8; 96], [u8; 96]) {
+        let mut lo = [0u8; 96];
+        lo[..64].copy_from_slice(&Self::delegate_key64(delegate));
+        let mut hi = [0xffu8; 96];
+        hi[..64].copy_from_slice(&Self::delegate_key64(delegate));
+        (lo, hi)
+    }
+
+    /// All reserved-namespace secret hashes recorded for `delegate`. Callers use
+    /// this to EXCLUDE markers from copy-forward, so a read failure MUST NOT be
+    /// silently treated as "no markers" (that would let a marker chain-copy as
+    /// user data): the caller fails closed on `Err`.
     pub fn get_reserved_marker_hashes(
         &self,
         delegate: &DelegateKey,
     ) -> Result<Vec<[u8; 32]>, redb::Error> {
-        let key = Self::delegate_key64(delegate);
+        let (lo, hi) = Self::reserved_marker_range(delegate);
         self.read_guarded(|txn| {
             let tbl = txn.open_table(RESERVED_MARKER_HASHES_TABLE)?;
-            match tbl.get(key.as_slice())? {
-                Some(v) => {
-                    let bytes = v.value();
-                    let mut out = Vec::with_capacity(bytes.len() / 32);
-                    for chunk in bytes.chunks_exact(32) {
-                        let arr: [u8; 32] = chunk.try_into().unwrap();
-                        out.push(arr);
-                    }
-                    Ok(out)
+            let mut out = Vec::new();
+            for entry in tbl.range(lo.as_slice()..=hi.as_slice())? {
+                let (k, _v) = entry?;
+                let key_bytes = k.value();
+                if key_bytes.len() == 96 {
+                    let hash: [u8; 32] = key_bytes[64..].try_into().unwrap();
+                    out.push(hash);
                 }
-                None => Ok(Vec::new()),
             }
+            Ok(out)
         })
     }
 
