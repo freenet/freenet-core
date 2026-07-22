@@ -1219,6 +1219,10 @@ impl ReDb {
     /// Persist the copy-forward marker for `(predecessor, successor)`. The
     /// `value` is the opaque, versioned audit blob built by the secrets store.
     /// Idempotent: re-writing the same pair overwrites in place.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb write transaction, table open, or
+    /// commit fails (e.g. a backend I/O error).
     pub fn store_migration_marker(
         &self,
         predecessor: &DelegateKey,
@@ -1237,6 +1241,10 @@ impl ReDb {
     /// Fetch the copy-forward marker for `(predecessor, successor)`, or `None`
     /// if this pair has never been migrated. The returned bytes are the opaque
     /// audit blob the secrets store wrote; only the store interprets them.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb read transaction, table open, or
+    /// lookup fails (e.g. a backend I/O error).
     pub fn get_migration_marker(
         &self,
         predecessor: &DelegateKey,
@@ -1283,6 +1291,11 @@ impl ReDb {
     ///
     /// Value encoding (unchanged): `[has_admin_none: 1][origin: 32 if Some]` — a
     /// first-Some writer stores `[0][C]`, a first-None writer stores `[1]`.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb write transaction, table open,
+    /// lookup, or commit fails (e.g. a backend I/O error). The caller MUST fail
+    /// the registration on `Err` (persistence-succeeds-before-usable).
     pub fn record_delegate_origin_first_writer(
         &self,
         delegate: &DelegateKey,
@@ -1315,6 +1328,11 @@ impl ReDb {
     /// origins)`, or `None` if the delegate has never been registered on this
     /// node (the NoProvenance case — copy-forward refuses). With first-writer
     /// -wins, `origins` holds at most one entry.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb read transaction, table open, or
+    /// lookup fails (e.g. a backend I/O error). Copy-forward treats an `Err`
+    /// here as fail-closed (refuse the copy).
     #[allow(clippy::type_complexity)]
     pub fn get_delegate_origins(
         &self,
@@ -1370,6 +1388,10 @@ impl ReDb {
     /// hash `hash`, as an individually-keyed row (#4117 P2a — no read-modify
     /// -write amplification). Idempotent; bounded at
     /// [`Self::MAX_RESERVED_MARKER_HASHES_PER_DELEGATE`] per delegate.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb write transaction, table open, range
+    /// count, or commit fails (e.g. a backend I/O error).
     pub fn add_reserved_marker_hash(
         &self,
         delegate: &DelegateKey,
@@ -1413,6 +1435,11 @@ impl ReDb {
     /// this to EXCLUDE markers from copy-forward, so a read failure MUST NOT be
     /// silently treated as "no markers" (that would let a marker chain-copy as
     /// user data): the caller fails closed on `Err`.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying redb read transaction, table open, or
+    /// range scan fails (e.g. a backend I/O error). Callers MUST fail closed on
+    /// `Err` rather than treating it as "no markers".
     pub fn get_reserved_marker_hashes(
         &self,
         delegate: &DelegateKey,

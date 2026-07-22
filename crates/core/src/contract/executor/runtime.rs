@@ -1897,6 +1897,69 @@ mod remove_contract_tests {
             !reg_path(&succ_raw).exists(),
             "a rejected raw-oversize request must register NOTHING"
         );
+
+        // (4) EXACTLY 64 UNIQUE predecessors (the at-cap boundary) → ACCEPTED.
+        let succ_at_cap = Delegate::from((&vec![0u8].into(), &vec![0xD4u8].into()));
+        let at_cap: Vec<_> = (0u8..64).map(make_pred).collect(); // 64 distinct
+        assert_eq!(at_cap.len(), MAX_MIGRATION_PREDECESSORS);
+        let req_at_cap = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_at_cap.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: at_cap,
+        };
+        executor
+            .delegate_request(req_at_cap, None, None, None)
+            .expect("an exactly-at-cap UNIQUE count (64) must be accepted");
+        assert!(
+            reg_path(&succ_at_cap).exists(),
+            "the at-cap boundary (64 unique) must register the successor"
+        );
+
+        // (5) EMPTY predecessor list → ACCEPTED, behaving like a plain
+        //     RegisterDelegate (successor registered, nothing to copy). Pins the
+        //     intended zero-predecessor semantics (the code does NOT reject empty).
+        let succ_empty = Delegate::from((&vec![0u8].into(), &vec![0xE5u8].into()));
+        let req_empty = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_empty.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: Vec::new(),
+        };
+        executor
+            .delegate_request(req_empty, None, None, None)
+            .expect("an empty predecessor list must be accepted (plain-register equivalent)");
+        assert!(
+            reg_path(&succ_empty).exists(),
+            "an empty-predecessor request must register the successor"
+        );
+
+        // (6) A raw list at EXACTLY the sanity bound (1024) with a within-cap
+        //     UNIQUE count (64) → ACCEPTED (the raw-bound boundary: only > the
+        //     bound is rejected).
+        let succ_raw_boundary = Delegate::from((&vec![0u8].into(), &vec![0xF6u8].into()));
+        let mut raw_at_bound: Vec<_> = Vec::new();
+        for _ in 0..(MAX_MIGRATION_PREDECESSORS_RAW / MAX_MIGRATION_PREDECESSORS) {
+            for i in 0..MAX_MIGRATION_PREDECESSORS as u8 {
+                raw_at_bound.push(make_pred(i));
+            }
+        } // 16 * 64 = 1024 raw, 64 unique
+        assert_eq!(raw_at_bound.len(), MAX_MIGRATION_PREDECESSORS_RAW);
+        let req_raw_boundary = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(
+                succ_raw_boundary.clone(),
+            )),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: raw_at_bound,
+        };
+        executor
+            .delegate_request(req_raw_boundary, None, None, None)
+            .expect("a raw list at exactly the sanity bound (unique within cap) must be accepted");
+        assert!(
+            reg_path(&succ_raw_boundary).exists(),
+            "the raw-bound boundary (raw == 1024, 64 unique) must register the successor"
+        );
     }
 
     /// Core regression test: storing a contract makes its state retrievable
