@@ -1338,8 +1338,11 @@ impl ReDb {
         let rest = &bytes[1..];
         let mut origins = Vec::with_capacity(rest.len() / 32);
         for chunk in rest.chunks_exact(32) {
-            let arr: [u8; 32] = chunk.try_into().unwrap();
-            origins.push(arr);
+            // `chunks_exact(32)` yields exactly-32 slices, but decode fallibly
+            // (no production `.unwrap()`): a wrong-length chunk is skipped.
+            if let Ok(arr) = <[u8; 32]>::try_from(chunk) {
+                origins.push(arr);
+            }
         }
         (has_admin_none, origins)
     }
@@ -1421,9 +1424,13 @@ impl ReDb {
             for entry in tbl.range(lo.as_slice()..=hi.as_slice())? {
                 let (k, _v) = entry?;
                 let key_bytes = k.value();
-                if key_bytes.len() == 96 {
-                    let hash: [u8; 32] = key_bytes[64..].try_into().unwrap();
-                    out.push(hash);
+                // Rows are always 96 bytes (delegate64||hash), but decode
+                // fallibly (no production `.unwrap()`): a malformed row is
+                // skipped rather than panicking the read.
+                if let Some(suffix) = key_bytes.get(64..) {
+                    if let Ok(hash) = <[u8; 32]>::try_from(suffix) {
+                        out.push(hash);
+                    }
                 }
             }
             Ok(out)
