@@ -4513,9 +4513,12 @@ mod tests {
     /// that routes an UPDATE through `host_contract` / `record_get_access` /
     /// `touch_hosting` / `mark_local_client_access` would make storms
     /// self-protecting and silently disarm cost-pressure eviction. This pin
-    /// scans the PRODUCTION regions of the update op modules and the
-    /// broadcast queue for any recency-stamping call, with comment text
-    /// stripped so prose references stay legal.
+    /// scans the PRODUCTION regions of the update op modules, the broadcast
+    /// queue, AND the executor apply chokepoint (`executor_impl.rs`, #4903
+    /// review L3 — the PUT/UPDATE state-apply path, which today reports only
+    /// `ExecCpuMicros` and must never grow a recency stamp on the UPDATE side)
+    /// for any recency-stamping call, with comment text stripped so prose
+    /// references stay legal.
     #[test]
     fn update_and_broadcast_paths_never_stamp_hosting_recency() {
         // Strip line comments so documentation may mention the forbidden
@@ -4527,7 +4530,7 @@ mod tests {
                 .join("\n")
         }
 
-        let sources: [(&str, &str); 3] = [
+        let sources: [(&str, &str); 4] = [
             (
                 "operations/update/op_ctx_task.rs",
                 include_str!("op_ctx_task.rs"),
@@ -4536,6 +4539,10 @@ mod tests {
             (
                 "node/network_bridge/broadcast_queue.rs",
                 include_str!("../../node/network_bridge/broadcast_queue.rs"),
+            ),
+            (
+                "contract/executor/runtime/executor_impl.rs",
+                include_str!("../../contract/executor/runtime/executor_impl.rs"),
             ),
         ];
         // Every entry point that stamps hosting recency (`recency_seq` /

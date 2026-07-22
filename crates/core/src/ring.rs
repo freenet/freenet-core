@@ -4335,37 +4335,55 @@ impl Ring {
         resource: crate::topology::meter::ResourceType,
         amount: f64,
     ) {
-        // Use the injectable `TimeSource` (rather than `Instant::now()`
-        // directly) so deterministic simulation tests can drive this
-        // path. Per `.claude/rules/code-style.md` "Need current time?
-        // → USE: TimeSource trait" — the executor commit path will reach
-        // here from inside simulated nodes once the governance scoring
-        // integration tests land, and reading wall-clock there would
-        // break determinism.
-        let now = self.time_source.now();
-        let mut topo = self.connection_manager.topology_manager.write();
-        topo.report_resource_usage(
-            &crate::topology::meter::AttributionSource::Contract(contract_id),
-            resource,
-            amount,
-            now,
-        );
-        drop(topo);
-        // Also feed the governance manager — the meter stores rates
-        // for telemetry/the dashboard's bandwidth view, while the
-        // governance manager aggregates these samples into the
-        // cost/benefit ratio that drives state. Both ingest in
-        // parallel from this one entry point so there's no risk of
-        // them diverging (governance reading from a stale meter
-        // snapshot, etc).
+        self.report_contract_resource_usage_batch(contract_id, &[(resource, amount)]);
+    }
+
+    /// Report several cost axes for ONE contract under a SINGLE topology
+    /// write-lock acquisition.
+    ///
+    /// The broadcast send path (#4903 review MEDIUM) reports the send-time
+    /// WASM CPU AND the actual fan-out payload bytes for each per-peer send;
+    /// batching them into one lock (instead of two separate
+    /// `report_contract_resource_usage` calls) halves the per-send topology
+    /// write-lock traffic on a busy gateway's fan-out.
+    ///
+    /// Uses the injectable `TimeSource` (rather than `Instant::now()`
+    /// directly) so deterministic simulation tests can drive this path
+    /// (`.claude/rules/code-style.md`: "Need current time? → USE: TimeSource").
+    /// `now` is read INSIDE the write lock (#4903 review L2) so concurrent
+    /// reporters insert in lock-acquisition order and cannot trip the
+    /// `RunningAverage::insert_with_time` monotonicity `debug_assert!`.
+    pub(crate) fn report_contract_resource_usage_batch(
+        &self,
+        contract_id: freenet_stdlib::prelude::ContractInstanceId,
+        samples: &[(crate::topology::meter::ResourceType, f64)],
+    ) {
+        if samples.is_empty() {
+            return;
+        }
+        let source = crate::topology::meter::AttributionSource::Contract(contract_id);
+        {
+            let mut topo = self.connection_manager.topology_manager.write();
+            // Read `now` under the lock (see rustdoc — L2 monotonicity).
+            let now = self.time_source.now();
+            for (resource, amount) in samples {
+                topo.report_resource_usage(&source, *resource, *amount, now);
+            }
+        }
+        // Also feed the governance manager — the meter stores rates for
+        // telemetry/the dashboard's bandwidth view, while the governance
+        // manager aggregates these samples into the cost/benefit ratio that
+        // drives state. Both ingest from this one entry point so they can't
+        // diverge (governance reading from a stale meter snapshot, etc).
         //
-        // Per-resource weight: identity (1.0) for now. Future tuning
-        // could weight CPU-µs and fanout-cost higher than
-        // state-bytes, but until we have live data to calibrate
-        // against, unit weights match what the design doc proposed
-        // as a starting point.
-        let weight = resource_weight(resource);
-        self.governance.ingest_cost(contract_id, amount * weight);
+        // Per-resource weight: identity (1.0) for now. Future tuning could
+        // weight CPU-µs and fanout-cost higher than state-bytes, but until we
+        // have live data to calibrate against, unit weights match what the
+        // design doc proposed as a starting point.
+        for (resource, amount) in samples {
+            let weight = resource_weight(*resource);
+            self.governance.ingest_cost(contract_id, *amount * weight);
+        }
     }
 
     // Note: there is intentionally no `ingest_contract_demand` method
@@ -4665,23 +4683,20 @@ impl Ring {
     fn hosting_cost_pressure_axes(&self) -> Vec<hosting::CostAxisPressure> {
         use crate::topology::meter::ResourceType;
         let now = self.time_source.now();
+        // Read all three cost axes in ONE pass over the attribution meters
+        // (#4903 review perf) rather than three separate scans under the read
+        // lock. Order here must match the `build_cost_axes` argument order.
+        let axes = [
+            ResourceType::ExecCpuMicros,
+            ResourceType::BroadcastFanoutCost,
+            ResourceType::BroadcastMessagesSent,
+        ];
         let topo = self.connection_manager.topology_manager.read();
-        let cpu = topo.contract_cost_rates(
-            &ResourceType::ExecCpuMicros,
-            now,
-            hosting::COST_RATE_MIN_WINDOW,
-        );
-        let fanout_bytes = topo.contract_cost_rates(
-            &ResourceType::BroadcastFanoutCost,
-            now,
-            hosting::COST_RATE_MIN_WINDOW,
-        );
-        let messages = topo.contract_cost_rates(
-            &ResourceType::BroadcastMessagesSent,
-            now,
-            hosting::COST_RATE_MIN_WINDOW,
-        );
+        let mut rates = topo.contract_cost_rates_multi(&axes, now, hosting::COST_RATE_MIN_WINDOW);
         drop(topo);
+        let messages = rates.pop().expect("three axis results");
+        let fanout_bytes = rates.pop().expect("three axis results");
+        let cpu = rates.pop().expect("three axis results");
         hosting::build_cost_axes(cpu, fanout_bytes, messages)
     }
 

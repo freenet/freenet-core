@@ -1892,6 +1892,21 @@ impl<T: TimeSource> HostingCache<T> {
                 .iter()
                 .filter_map(|(key, entry)| {
                     let rate = axis.rates.get(key.id()).copied().unwrap_or(0.0);
+                    // Cheap, highly-selective gate FIRST (#4903 review perf):
+                    // only a contract whose attributed rate exceeds the share
+                    // cutoff can ever be a victim, so short-circuit BEFORE the
+                    // two DashMap `subscriber_counts` gets and the recency
+                    // check. This filter runs under the hosting write lock on
+                    // every sweep where any axis is over its floor (a busy
+                    // gateway: always), across every hosted contract, so paying
+                    // the subscriber lookup only for the handful over the cutoff
+                    // matters. `rate <= cutoff` rejects rate == 0 and negatives;
+                    // a NaN rate (defensive: meter math) is not <= cutoff so it
+                    // falls through here, but `cost_eviction_candidate` then
+                    // rejects it (its `attributed_rate > 0.0` is false for NaN).
+                    if rate <= share_cutoff {
+                        return None;
+                    }
                     let (local, downstream) = subscriber_counts(key);
                     // Recent demand by the SAME definition the rest of the
                     // system honors (review Fix 1 / invariant 3), so cost
@@ -1920,8 +1935,7 @@ impl<T: TimeSource> HostingCache<T> {
                         || entry.local_client_last_access.is_some_and(|at| {
                             now.saturating_duration_since(at) < super::SUBSCRIPTION_LEASE_DURATION
                         });
-                    (cost_eviction_candidate(local, downstream, rate, recently_accessed)
-                        && rate > share_cutoff)
+                    cost_eviction_candidate(local, downstream, rate, recently_accessed)
                         .then_some((*key, rate))
                 })
                 .collect();

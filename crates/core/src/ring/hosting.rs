@@ -3301,10 +3301,10 @@ mod tests {
     ///    seconds before the sweep) is NOT shed (sustained-pressure gate), so
     ///    one burst can never mass-evict a large-state contract;
     /// 6. an OLD-first-sample contract whose only recent activity is a
-    ///    ~60-second flurry is NOT shed (#4903 review Fix 2: the sustained
-    ///    gate keys on the span of the recent samples, not the lifetime
-    ///    first-sample age — which is set once, never reset, and would
-    ///    otherwise admit any later burst on a long-known contract).
+    ///    ~60-second flurry is NOT shed (#4903 review Fix 2 / BLOCKER: the
+    ///    continuity gap-reset restarts the activity run at the flurry, so its
+    ///    `activity_span` is only ~60s — a long-known contract's later burst
+    ///    can never masquerade as sustained).
     #[tokio::test]
     async fn storm_frequency_profile_crosses_cost_trigger_through_real_meter() {
         use crate::topology::meter::{AttributionSource, Meter, ResourceType};
@@ -3352,10 +3352,11 @@ mod tests {
             burst_bytes,
             now - Duration::from_secs(1),
         );
-        // OLD-first-sample contract (#4903 review Fix 2): one sample 10
-        // minutes before the sweep, then a ~60s buffer-saturating flurry just
-        // before it (120 samples at 0.5s cadence — the retained 100 span
-        // ~50s, far under the min_window/2 sustained bar).
+        // OLD-first-sample contract (#4903 review Fix 2 / BLOCKER): one sample
+        // 10 minutes before the sweep, then a ~60s flurry just before it (120
+        // samples at 0.5s cadence). The >max-gap silence between them restarts
+        // the activity run at the flurry, so its activity_span is ~60s — under
+        // the sustained bar.
         meter.report(
             &AttributionSource::Contract(*old_then_burst.id()),
             ResourceType::BroadcastMessagesSent,
@@ -3413,14 +3414,15 @@ mod tests {
         // (sustained gate: its recent samples span ~0s).
         assert!(!msgs.1.contains_key(burst.id()));
         assert!(!fanout.1.contains_key(burst.id()));
-        // (6) The old-first-sample flurry is ALSO excluded from candidacy:
-        // its within-window samples span only ~50s. Under the pre-fix
-        // lifetime-first-sample-age gate (first report 10 min old — trivially
-        // "sustained") it would be a candidate here and this assertion fails.
+        // (6) The old-first-sample flurry is ALSO excluded from candidacy: the
+        // gap-reset restarts its activity run at the flurry, so activity_span
+        // is ~60s. Under the pre-fix lifetime-first-sample-age gate (first
+        // report 10 min old — trivially "sustained") it would be a candidate
+        // here and this assertion fails.
         assert!(
             !msgs.1.contains_key(old_then_burst.id()),
             "an old-first-sample contract's short flurry must not be a candidate \
-             (#4903 review Fix 2)"
+             (#4903 review Fix 2 / BLOCKER)"
         );
 
         let axes = cache::build_cost_axes(cpu, fanout, msgs);
@@ -3465,6 +3467,74 @@ mod tests {
              (#4903 review Fix 2: sustained = recent-sample SPAN, not lifetime \
              first-sample age)"
         );
+    }
+
+    /// #4903 review BLOCKER, end-to-end: a FAST-cadence (0.5s) zero-demand
+    /// storm — whose count-bounded sample buffer spans only ~50s, far under the
+    /// 150s sustained bar — is shed by the real sweep. Under the old
+    /// buffer-span sustained gate this exact storm (the fastest, worst profile)
+    /// was PERMANENTLY exempt from candidacy while still inflating the share
+    /// denominator; the continuity-tracked `activity_span` makes it a
+    /// candidate, so the sweep sheds it.
+    #[tokio::test]
+    async fn fast_cadence_storm_is_shed_through_real_sweep() {
+        use crate::topology::meter::{AttributionSource, Meter, ResourceType};
+
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let fast_junk = make_contract_key(1);
+
+        // 400s of storm at 0.5s cadence (800 dispatches): the 100-sample buffer
+        // retains only the last ~50s of it — the old gate's fatal blind spot.
+        for i in 0..800u64 {
+            meter.report(
+                &AttributionSource::Contract(*fast_junk.id()),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                t0 + Duration::from_millis(500 * i),
+            );
+        }
+        let now = t0 + Duration::from_millis(500 * 799) + Duration::from_secs(1);
+
+        let msgs = meter.contract_cost_rates(
+            &ResourceType::BroadcastMessagesSent,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+        assert!(
+            msgs.1.contains_key(fast_junk.id()),
+            "the 0.5s-cadence storm must be a candidate (activity_span, not the \
+             ~50s buffer span, decides sustained-ness)"
+        );
+        let cpu = meter.contract_cost_rates(
+            &ResourceType::ExecCpuMicros,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+        let fanout = meter.contract_cost_rates(
+            &ResourceType::BroadcastFanoutCost,
+            now,
+            cache::COST_RATE_MIN_WINDOW,
+        );
+        let axes = cache::build_cost_axes(cpu, fanout, msgs);
+
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let manager = HostingManager::with_time_source(
+            DEFAULT_HOSTING_BUDGET_BYTES,
+            std::sync::Arc::new(clock.clone()),
+        );
+        manager.record_contract_access(fast_junk, 121, AccessType::Put);
+        // Long past the cost window with no genuine access.
+        clock.advance_time(cache::COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+
+        let result = manager.sweep_expired_hosting_with_cost(&axes);
+        let expired_keys: Vec<ContractKey> = result.expired.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            expired_keys,
+            vec![fast_junk],
+            "the fast-cadence zero-demand storm must be shed end-to-end"
+        );
+        assert!(!manager.is_hosting_contract(&fast_junk));
     }
 
     /// The no-cost degradation path: `sweep_expired_hosting()` (no axes) is

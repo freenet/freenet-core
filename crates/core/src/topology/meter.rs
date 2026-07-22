@@ -173,43 +173,83 @@ impl Meter {
     /// Returns `(total_rate, per_contract_rate)` in axis units per second.
     /// EVERY positive-rate contract counts toward `total_rate` (the share
     /// denominator), but the per-contract map — the eviction CANDIDACY input —
-    /// contains only contracts whose reporting is SUSTAINED: the within-window
-    /// samples must SPAN at least `min_window / 2`
-    /// ([`crate::topology::running_average::WindowedRate::retained_span`]).
-    /// A contract absent from the map has zero attributed cost for candidacy
-    /// purposes, so a short burst — even a buffer-saturating one, and even on
-    /// a source whose FIRST-EVER sample is arbitrarily old (the lifetime
-    /// first-sample age was the review-Fix-2 hole: set once and never reset)
+    /// contains only contracts whose reporting is SUSTAINED: the source's
+    /// current CONTINUOUS activity run must be at least `min_window / 2` long
+    /// ([`crate::topology::running_average::WindowedRate::activity_span`]).
+    /// That run length is buffer-CAPACITY-independent (tracked at insert time
+    /// via `activity_start`), so it works at ANY report cadence above the
+    /// floor — the fix for the review BLOCKER, where the old span-of-the-
+    /// count-bounded-buffer signal INVERTED against high-frequency storms
+    /// (fast cadence ⇒ short buffer span ⇒ never "sustained" ⇒ the worst
+    /// storms were permanently exempted). A contract absent from the map has
+    /// zero attributed cost for candidacy purposes, so a short burst — even a
+    /// buffer-saturating one, and even on a source whose first-ever sample is
+    /// arbitrarily old (a >`SUSTAINED_ACTIVITY_MAX_GAP` gap restarts the run)
     /// — can never make its contract a cost victim, no matter how big the
     /// burst.
+    ///
+    /// Single-axis convenience wrapper over [`Self::contract_cost_rates_multi`]
+    /// for the unit tests; production reads all three cost axes in one pass via
+    /// the multi form (#4903 review perf).
+    #[cfg(test)]
     pub(crate) fn contract_cost_rates(
         &self,
         resource: &ResourceType,
         at_time: Instant,
         min_window: Duration,
     ) -> (f64, std::collections::HashMap<ContractInstanceId, f64>) {
+        let mut out =
+            self.contract_cost_rates_multi(std::slice::from_ref(resource), at_time, min_window);
+        out.pop()
+            .expect("exactly one result for one requested axis")
+    }
+
+    /// Multi-axis form of [`Self::contract_cost_rates`]: read SEVERAL cost
+    /// axes in a SINGLE pass over the attribution meters, returning one
+    /// `(total_rate, per_contract_rate)` per requested axis in the same order.
+    ///
+    /// The hosting sweep needs all three cost axes (CPU, fan-out bytes,
+    /// broadcast messages) every tick; reading them with three separate
+    /// [`Self::contract_cost_rates`] calls scanned the (potentially large)
+    /// attribution-meter map three times under the topology read lock (#4903
+    /// review perf). One pass amortizes the scan; the per-source windowing and
+    /// the SUSTAINED continuous-run gate are identical to the single-axis form.
+    pub(crate) fn contract_cost_rates_multi(
+        &self,
+        resources: &[ResourceType],
+        at_time: Instant,
+        min_window: Duration,
+    ) -> Vec<(f64, std::collections::HashMap<ContractInstanceId, f64>)> {
         let sustained_min_span = min_window / 2;
-        let mut per_contract = std::collections::HashMap::new();
-        let mut total = 0.0_f64;
+        let mut results: Vec<(f64, std::collections::HashMap<ContractInstanceId, f64>)> = resources
+            .iter()
+            .map(|_| (0.0_f64, std::collections::HashMap::new()))
+            .collect();
+        if resources.is_empty() {
+            return results;
+        }
         for entry in self.attribution_meters.iter() {
             let AttributionSource::Contract(id) = entry.key() else {
                 continue;
             };
-            let Some(avg) = entry.value().map.get(resource) else {
-                continue;
-            };
-            let Some(windowed) = avg.windowed_rate(at_time, min_window) else {
-                continue;
-            };
-            let per_second = windowed.rate.per_second();
-            if per_second > 0.0 {
-                total += per_second;
-                if windowed.retained_span >= sustained_min_span {
-                    per_contract.insert(*id, per_second);
+            let source_map = &entry.value().map;
+            for (i, resource) in resources.iter().enumerate() {
+                let Some(avg) = source_map.get(resource) else {
+                    continue;
+                };
+                let Some(windowed) = avg.windowed_rate(at_time, min_window) else {
+                    continue;
+                };
+                let per_second = windowed.rate.per_second();
+                if per_second > 0.0 {
+                    results[i].0 += per_second;
+                    if windowed.activity_span >= sustained_min_span {
+                        results[i].1.insert(*id, per_second);
+                    }
                 }
             }
         }
-        (total, per_contract)
+        results
     }
 
     /// Estimates the usage rate for a given resource type based on existing data.
@@ -716,8 +756,9 @@ mod tests {
     /// true rate over its actual span (the count-truncation fix — without it
     /// a sustained high-frequency storm's rate is capped at
     /// samples×value/window and can hide under the floor); and the
-    /// per-contract candidacy map admits only SUSTAINED sources (within-
-    /// window samples spanning at least half the window) while every positive
+    /// per-contract candidacy map admits only SUSTAINED sources (a continuous
+    /// activity run of at least half the window — the buffer-capacity-
+    /// independent `activity_span`, #4903 review BLOCKER) while every positive
     /// rate still counts toward the total.
     #[test]
     fn contract_cost_rates_aggregates_contract_sources_with_min_window() {
@@ -773,15 +814,16 @@ mod tests {
         let id2 = ContractInstanceId::new([2u8; 32]);
         // Sparse source: the t0 sample is older than the window and ignored
         // (review Fix 3), leaving one within-window sample — diluted over the
-        // window (30_000/300s = 100/s) and NOT sustained (span 0), so it
-        // counts toward the total but is no candidacy entry.
+        // window (30_000/300s = 100/s) and NOT sustained (the >max-gap silence
+        // between the two samples restarts the run, so activity_span is 0), so
+        // it counts toward the total but is no candidacy entry.
         assert!(
             !cpu_rates.contains_key(&id1),
             "a lone within-window sample must not be a candidate"
         );
         // Burst source: counted in the TOTAL (diluted over min_window: 30M/300s
-        // = 100_000/s) but EXCLUDED from the candidacy map (recent samples
-        // span ~0s — not sustained), so one burst can never nominate a victim.
+        // = 100_000/s) but EXCLUDED from the candidacy map (activity run ~0s —
+        // not sustained), so one burst can never nominate a victim.
         assert!(
             !cpu_rates.contains_key(&id2),
             "burst must not be a candidate"
@@ -802,13 +844,13 @@ mod tests {
         assert!((msgs_total - rate3).abs() < 1e-9);
     }
 
-    /// Review Fix 2 regression: an OLD first-ever sample must not admit a
-    /// later short burst into candidacy. Before the fix the sustained gate
-    /// keyed on the lifetime `first_sample_time` (set once, never reset), so
-    /// a contract that reported once long ago passed the gate forever and a
-    /// buffer-saturating 60-second flurry then read a high instantaneous
-    /// rate and became a cost-eviction candidate — "a single burst can never
-    /// make its contract a victim" was false for old-first-sample sources.
+    /// Review Fix 2 / BLOCKER regression: an OLD first-ever sample must not
+    /// admit a later short burst into candidacy. The continuity gap-reset
+    /// (a >`SUSTAINED_ACTIVITY_MAX_GAP` silence restarts the activity run)
+    /// makes the burst's `activity_span` measure only the burst, so a
+    /// buffer-saturating 60-second flurry after a long silence is not
+    /// sustained — "a single burst can never make its contract a victim"
+    /// holds for old-first-sample sources too.
     #[test]
     fn contract_cost_rates_old_first_sample_then_burst_is_not_a_candidate() {
         let meter = Meter::new_with_window_size(100);
@@ -842,7 +884,8 @@ mod tests {
         assert!(
             !rates.contains_key(&id1),
             "an old-first-sample source's short burst must NOT be a candidate \
-             (the recent samples span only ~50s, not min_window/2)"
+             (the gap-reset restarts the run at the burst, activity_span ~50s \
+             < min_window/2)"
         );
         assert!(
             total > 0.0,
@@ -850,12 +893,13 @@ mod tests {
         );
     }
 
-    /// Review Fix 3 regression: a contract that stops reporting decays out of
-    /// the cost read within a bounded time (one `min_window` of silence) —
-    /// it leaves the candidacy map first (its recent samples no longer span
-    /// half the window) and then stops inflating the node total entirely,
-    /// instead of holding its stale storm rate for as long as the
-    /// count-bounded buffer retains old samples.
+    /// Review Fix 3 / BLOCKER regression: a contract that stops reporting
+    /// decays out of the cost read within a bounded time — it leaves the
+    /// candidacy map first (after one `SUSTAINED_ACTIVITY_MAX_GAP` of silence
+    /// its activity run is no longer current, `activity_span` → 0) and then
+    /// stops inflating the node total entirely (once every sample ages past
+    /// `min_window`), instead of holding its stale storm rate for as long as
+    /// the count-bounded buffer retains old samples.
     #[test]
     fn contract_cost_rates_quiet_contract_decays_out_within_min_window() {
         let meter = Meter::new_with_window_size(100);
@@ -883,9 +927,9 @@ mod tests {
         assert!(live_rates[&id1] > 30.0);
         assert!(live_total > 30.0);
 
-        // After 180s of silence the within-window samples span under half
-        // the window: no longer a CANDIDATE (even though some rate remains
-        // in the total while recent samples linger).
+        // After 180s of silence (longer than SUSTAINED_ACTIVITY_MAX_GAP) the
+        // activity run is no longer current: no longer a CANDIDATE (even
+        // though some rate remains in the total while recent samples linger).
         let (_, stale_rates) = meter.contract_cost_rates(
             &ResourceType::BroadcastMessagesSent,
             storm_end + Duration::from_secs(180),
@@ -893,7 +937,8 @@ mod tests {
         );
         assert!(
             !stale_rates.contains_key(&id1),
-            "a quiet contract must drop out of candidacy as its recent span shrinks"
+            "a quiet contract must drop out of candidacy once its activity run \
+             goes stale"
         );
 
         // After a full min_window of silence every sample is stale: the
@@ -907,6 +952,243 @@ mod tests {
         assert_eq!(
             gone_total, 0.0,
             "a source quiet for min_window must stop inflating total_rate"
+        );
+    }
+
+    /// #4903 review BLOCKER regression: storms at ANY report cadence above the
+    /// floor must nominate. The old sustained gate keyed on the span of the
+    /// count-bounded sample buffer, which shrinks with cadence — a fast storm's
+    /// 100-sample buffer spans only a few tens of seconds, far under
+    /// `min_window / 2`, so the FASTEST (worst) storms were PERMANENTLY exempt.
+    /// The continuity-tracked `activity_span` is buffer-capacity-independent,
+    /// so a 1.4s-cadence storm AND a 0.5s-cadence storm (buffer span ~50s) both
+    /// nominate.
+    #[test]
+    fn contract_cost_rates_fast_storm_cadences_nominate() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+        let run = Duration::from_secs(220); // > min_window/2, continuous
+
+        // id1: 1.4s cadence (just under the old [1.52s, 3.03s] catchable band).
+        let mut t = Duration::ZERO;
+        while t <= run {
+            meter.report(
+                &contract_source(1),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                t0 + t,
+            );
+            t += Duration::from_millis(1400);
+        }
+        // id2: 0.5s cadence — the 100-sample buffer spans only ~50s, deep
+        // inside the old inversion (never "sustained" under the buffer-span
+        // gate), yet the run is 220s.
+        let mut t = Duration::ZERO;
+        while t <= run {
+            meter.report(
+                &contract_source(2),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                t0 + t,
+            );
+            t += Duration::from_millis(500);
+        }
+
+        let now = t0 + run + Duration::from_secs(1);
+        let (_total, rates) =
+            meter.contract_cost_rates(&ResourceType::BroadcastMessagesSent, now, min_window);
+        let id1 = ContractInstanceId::new([1u8; 32]);
+        let id2 = ContractInstanceId::new([2u8; 32]);
+        assert!(
+            rates.contains_key(&id1),
+            "a 1.4s-cadence storm must be a candidate"
+        );
+        assert!(
+            rates.contains_key(&id2),
+            "a 0.5s-cadence storm (buffer span ~50s ≪ min_window/2) must STILL \
+             be a candidate — the BLOCKER inversion is fixed"
+        );
+    }
+
+    /// A storm whose cadence is IRREGULAR — a 1.6s fan-out interleaved with
+    /// sporadic targeted stale-peer heal samples — is still one continuous run
+    /// (every gap stays under `SUSTAINED_ACTIVITY_MAX_GAP`), so it nominates.
+    #[test]
+    fn contract_cost_rates_heal_interleaved_storm_nominates() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+
+        // 220s of fan-out at 1.6s, plus an extra heal sample at a jittered
+        // offset every ~5th dispatch — irregular but never a >max-gap silence.
+        let mut t = Duration::ZERO;
+        let mut n = 0u64;
+        while t <= Duration::from_secs(220) {
+            meter.report(
+                &contract_source(1),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                t0 + t,
+            );
+            if n % 5 == 0 {
+                meter.report(
+                    &contract_source(1),
+                    ResourceType::BroadcastMessagesSent,
+                    1.0,
+                    t0 + t + Duration::from_millis(700),
+                );
+            }
+            n += 1;
+            t += Duration::from_millis(1600);
+        }
+
+        let now = t0 + Duration::from_secs(221);
+        let (_total, rates) =
+            meter.contract_cost_rates(&ResourceType::BroadcastMessagesSent, now, min_window);
+        assert!(
+            rates.contains_key(&ContractInstanceId::new([1u8; 32])),
+            "a heal-interleaved (irregular-cadence) storm must be a candidate"
+        );
+    }
+
+    /// The `ExecCpuMicros` axis must be able to nominate a multi-target CPU
+    /// storm. The send-time summarize/delta CPU is reported per PEER send, so a
+    /// 58-target fan-out floods the axis with 58 samples per dispatch — under
+    /// the old buffer-span gate that flood spanned only a couple of dispatches
+    /// (< min_window/2) and could NEVER nominate. With `activity_span` the
+    /// continuous run is what matters, so the CPU axis nominates.
+    #[test]
+    fn contract_cost_rates_multi_target_cpu_flood_nominates() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+
+        // 120 dispatches at 1.6s (192s continuous); each dispatch reports 58
+        // per-target CPU samples spread across the ~1s send window.
+        let mut dispatch = Duration::ZERO;
+        for _ in 0..120u64 {
+            for target in 0..58u64 {
+                meter.report(
+                    &contract_source(1),
+                    ResourceType::ExecCpuMicros,
+                    200.0,
+                    t0 + dispatch + Duration::from_millis(15 * target),
+                );
+            }
+            dispatch += Duration::from_millis(1600);
+        }
+
+        let now = t0 + dispatch + Duration::from_secs(1);
+        let (total, rates) =
+            meter.contract_cost_rates(&ResourceType::ExecCpuMicros, now, min_window);
+        assert!(
+            rates.contains_key(&ContractInstanceId::new([1u8; 32])),
+            "a multi-target (58/dispatch) CPU flood must nominate on the \
+             ExecCpuMicros axis"
+        );
+        assert!(total > 0.0);
+    }
+
+    /// Boundary: a single dense burst — even one that saturates the sample
+    /// buffer — is NOT a candidate (its continuous run is short), though it
+    /// still counts toward the total (share denominator).
+    #[test]
+    fn contract_cost_rates_single_dense_burst_never_nominates() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+
+        // 200 samples over 30s (saturates the 100-sample buffer), then read.
+        for i in 0..200u64 {
+            meter.report(
+                &contract_source(1),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                t0 + Duration::from_millis(150 * i),
+            );
+        }
+        let now = t0 + Duration::from_secs(31);
+        let (total, rates) =
+            meter.contract_cost_rates(&ResourceType::BroadcastMessagesSent, now, min_window);
+        assert!(
+            !rates.contains_key(&ContractInstanceId::new([1u8; 32])),
+            "a 30s dense burst must not be sustained (run < min_window/2)"
+        );
+        assert!(total > 0.0, "the burst still counts toward the total");
+    }
+
+    /// Boundary (#4903 review round-2 requirement): the 60s gap-reset must have
+    /// generous headroom above ANY cadence that exceeds a floor, so a genuine
+    /// sustained storm never spuriously resets its run. The slowest
+    /// floor-exceeding message cadence (58 msgs per dispatch, 10 msgs/s floor)
+    /// is a dispatch every ~5.8s — far under 60s. A contract reporting even
+    /// more slowly than that (every 30s) is still ONE continuous run and stays
+    /// sustained: no spurious gap-reset.
+    #[test]
+    fn contract_cost_rates_slow_cadence_does_not_gap_reset() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+
+        // Report every 30s (well under the 60s gap threshold but far slower
+        // than any real storm) for 240s continuous.
+        let mut t = Duration::ZERO;
+        while t <= Duration::from_secs(240) {
+            meter.report(
+                &contract_source(1),
+                ResourceType::BroadcastMessagesSent,
+                58.0,
+                t0 + t,
+            );
+            t += Duration::from_secs(30);
+        }
+        let now = t0 + Duration::from_secs(241);
+        let (_total, rates) =
+            meter.contract_cost_rates(&ResourceType::BroadcastMessagesSent, now, min_window);
+        assert!(
+            rates.contains_key(&ContractInstanceId::new([1u8; 32])),
+            "a continuous 30s-cadence reporter must stay one sustained run — the \
+             60s gap threshold must not spuriously reset a sub-60s cadence"
+        );
+    }
+
+    /// Boundary (#4903 review round-2 requirement): an INTERMITTENT burst
+    /// pattern — a 3s storm, then 90s of silence, repeated — must NOT
+    /// accumulate span across the silences. Each >60s gap restarts the run, so
+    /// every burst's `activity_span` is only ~3s and the contract is NEVER
+    /// sustained, no matter how many cycles run.
+    #[test]
+    fn contract_cost_rates_intermittent_bursts_do_not_accumulate_span() {
+        let meter = Meter::new_with_window_size(100);
+        let t0 = Instant::now();
+        let min_window = Duration::from_secs(300);
+
+        // Three cycles of {3s burst (7 samples @ 0.5s), 90s silence}.
+        let cycle = Duration::from_secs(93);
+        for c in 0..3u64 {
+            let start = cycle * c as u32;
+            for i in 0..7u64 {
+                meter.report(
+                    &contract_source(1),
+                    ResourceType::BroadcastMessagesSent,
+                    58.0,
+                    t0 + start + Duration::from_millis(500 * i),
+                );
+            }
+        }
+        // Read right after the third burst (t0 + 186 + 3).
+        let now = t0 + cycle * 2 + Duration::from_secs(4);
+        let (total, rates) =
+            meter.contract_cost_rates(&ResourceType::BroadcastMessagesSent, now, min_window);
+        assert!(
+            !rates.contains_key(&ContractInstanceId::new([1u8; 32])),
+            "intermittent bursts separated by >60s silences must never become \
+             sustained — span must not accumulate across the gaps"
+        );
+        assert!(
+            total > 0.0,
+            "the recent burst still counts toward the total"
         );
     }
 

@@ -747,27 +747,46 @@ pub(super) async fn broadcast_to_single_peer(
 
     let peer_key = PeerKey::from(target.pub_key().clone());
 
-    // Cost telemetry (cost-aware eviction, #4861): the per-target
-    // summarize + delta computation below is send-time WASM work burned for
-    // EVERY peer send of this contract — for a high-frequency tiny-payload
-    // storm it is a dominant, previously-unmetered CPU cost. Time it via the
-    // ring's injected TimeSource and attribute it on the `ExecCpuMicros`
-    // axis (wall elapsed of the awaited computation; may include executor
-    // queueing, which is still work this contract's send triggered).
-    // Reported at BOTH exits (the summaries-equal skip and the payload
-    // completion) so skipped sends still account for the summary work they
-    // burned.
+    // Cost telemetry (cost-aware eviction, #4861): attribute this per-peer
+    // send's two costs to the contract:
+    //   * `ExecCpuMicros` — the summarize + delta WASM work below, burned for
+    //     EVERY peer send (dominant, otherwise-unmetered CPU for a
+    //     high-frequency tiny-payload storm). Wall elapsed of the awaited
+    //     computation via the ring's injected TimeSource; may include executor
+    //     queueing, still work this send triggered.
+    //   * `BroadcastFanoutCost` — the ACTUAL payload bytes put on the wire,
+    //     known only HERE after delta selection (the #4903 review P1 fix: the
+    //     dispatch site can no longer charge `full-state × targets`, which
+    //     phantom-inflated a large-state contract that sends tiny deltas).
+    // Both are reported through ONE topology write lock per send
+    // (`report_contract_resource_usage_batch`, #4903 review MEDIUM) so the
+    // send CPU adds no lock traffic beyond the per-send bytes report that
+    // accurate attribution already requires. Reported at ALL exits: the two
+    // summary-skip exits report only the CPU they burned (no bytes sent — the
+    // #4903 review P2 fix adds the empty-delta exit); the send exit reports
+    // CPU + actual payload bytes.
     let cost_clock = op_manager.ring.time_source.clone();
     let send_wasm_started = cost_clock.now();
-    let report_send_wasm_cost = |op_manager: &Arc<OpManager>| {
-        let elapsed = cost_clock
+    let report_send_cost = |op_manager: &Arc<OpManager>, sent_bytes: Option<f64>| {
+        use crate::topology::meter::ResourceType;
+        let elapsed_us = cost_clock
             .now()
-            .saturating_duration_since(send_wasm_started);
-        op_manager.ring.report_contract_resource_usage(
-            *key.id(),
-            crate::topology::meter::ResourceType::ExecCpuMicros,
-            elapsed.as_micros() as f64,
-        );
+            .saturating_duration_since(send_wasm_started)
+            .as_micros() as f64;
+        match sent_bytes {
+            Some(bytes) => op_manager.ring.report_contract_resource_usage_batch(
+                *key.id(),
+                &[
+                    (ResourceType::ExecCpuMicros, elapsed_us),
+                    (ResourceType::BroadcastFanoutCost, bytes),
+                ],
+            ),
+            None => op_manager.ring.report_contract_resource_usage(
+                *key.id(),
+                ResourceType::ExecCpuMicros,
+                elapsed_us,
+            ),
+        }
     };
 
     // Get our summary for delta computation
@@ -807,7 +826,7 @@ pub(super) async fn broadcast_to_single_peer(
                 "Skipping broadcast - peer already has our state (byte-equal \
                  or logically converged summaries)"
             );
-            report_send_wasm_cost(op_manager);
+            report_send_cost(op_manager, None);
             return;
         }
     }
@@ -854,6 +873,11 @@ pub(super) async fn broadcast_to_single_peer(
                         "Skipping broadcast - contract reported empty delta \
                          (peer converged)"
                     );
+                    // #4903 review P2: the summarize + delta WASM already ran,
+                    // so account for the CPU it burned even though nothing is
+                    // sent (no bytes). Previously this exit returned without
+                    // reporting, undercounting the send-CPU axis.
+                    report_send_cost(op_manager, None);
                     return;
                 }
                 Err(err) => {
@@ -874,10 +898,13 @@ pub(super) async fn broadcast_to_single_peer(
             false,
         ),
     };
-    // Attribute the summarize + delta WASM burned for this send (#4861).
-    report_send_wasm_cost(op_manager);
-
     let payload_size = payload.size();
+    // Attribute the summarize + delta WASM (CPU) AND the actual payload bytes
+    // for this send in one batched report (#4861 / #4903 review P1 + MEDIUM):
+    // the bytes are the real delta/full-state size chosen above, not the
+    // dispatch-site `full-state × targets` over-estimate.
+    report_send_cost(op_manager, Some(payload_size as f64));
+
     let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
 
     // Check if we should use streaming for full state broadcasts
@@ -1952,16 +1979,17 @@ mod tests {
         );
     }
 
-    /// Source-scrape pin (cost-aware eviction, #4861): the per-target
-    /// summarize + delta computation in `broadcast_to_single_peer` is
-    /// send-time WASM burned for EVERY peer send — a dominant, otherwise-
-    /// unmetered CPU cost for a high-frequency tiny-payload storm. It must be
-    /// attributed on the `ExecCpuMicros` axis at BOTH exits (the summaries-
-    /// equal skip and the payload completion). Dropping a report silently
-    /// blinds the cost-pressure eviction trigger to send-time CPU while every
+    /// Source-scrape pin (cost-aware eviction, #4861 / #4903 review P1+P2):
+    /// `broadcast_to_single_peer` must account for its per-send cost at ALL
+    /// THREE exits — the summaries-equal skip, the empty-delta converged skip
+    /// (the review-P2 exit that previously returned without reporting), and
+    /// the payload completion. The two skip exits report only CPU (no bytes
+    /// sent); the send exit reports CPU + the ACTUAL payload bytes (review P1
+    /// — not the dispatch-site `full-state × targets` over-estimate). Dropping
+    /// a report silently blinds the cost-pressure eviction trigger while every
     /// behavioral test stays green.
     #[test]
-    fn broadcast_to_single_peer_reports_send_wasm_cost_pin() {
+    fn broadcast_to_single_peer_reports_send_cost_pin() {
         let src = include_str!("broadcast_queue.rs");
         let fn_start = src
             .find("pub(super) async fn broadcast_to_single_peer(")
@@ -1973,21 +2001,43 @@ mod tests {
             .expect("end of broadcast_to_single_peer (start of tests module) not found");
         let body = &after[..fn_end];
 
-        // The reporting closure must exist and be invoked at both exits.
-        let report_invocations = body.matches("report_send_wasm_cost(op_manager)").count();
+        // The reporting closure must be invoked at all three exits.
+        let report_invocations = body.matches("report_send_cost(op_manager").count();
         assert_eq!(
-            report_invocations, 2,
-            "broadcast_to_single_peer must invoke report_send_wasm_cost at both \
-             exits (summaries-equal skip + payload completion) — got \
-             {report_invocations}. A dropped report blinds cost-pressure \
-             eviction (#4861) to per-send WASM cost."
+            report_invocations, 3,
+            "broadcast_to_single_peer must invoke report_send_cost at all three \
+             exits (summaries-equal skip + empty-delta converged skip + payload \
+             completion) — got {report_invocations}. A dropped report blinds \
+             cost-pressure eviction (#4861) to per-send cost."
         );
-        // And the closure must report on the ExecCpuMicros axis (split needle
-        // so this test cannot self-count).
-        let axis_needle = concat!("ResourceType::", "Exec", "CpuMicros");
+        // Exactly one exit (the payload completion) sends bytes; the two skip
+        // exits report CPU only.
+        let bytes_invocations = body.matches("report_send_cost(op_manager, Some(").count();
+        assert_eq!(
+            bytes_invocations, 1,
+            "exactly the payload-completion exit reports actual bytes \
+             (Some(payload_size)); the two skip exits report CPU only (None) — \
+             got {bytes_invocations}"
+        );
+        // The closure must attribute BOTH the send-CPU and the actual fan-out
+        // bytes (split needles so this test cannot self-count).
+        let cpu_needle = concat!("ResourceType::", "Exec", "CpuMicros");
+        let bytes_needle = concat!("ResourceType::", "Broadcast", "FanoutCost");
         assert!(
-            body.contains(axis_needle),
-            "report_send_wasm_cost must attribute on the ExecCpuMicros axis"
+            body.contains(cpu_needle),
+            "report_send_cost must attribute on the ExecCpuMicros axis"
+        );
+        assert!(
+            body.contains(bytes_needle),
+            "report_send_cost must attribute the actual payload on the \
+             BroadcastFanoutCost axis (review P1 — bytes charged at the actual \
+             send, not full-state × targets at dispatch)"
+        );
+        // The actual payload size (not full state) must be what's charged.
+        assert!(
+            body.contains("report_send_cost(op_manager, Some(payload_size as f64))"),
+            "the bytes charged must be the selected payload_size (delta or full \
+             state), not the pre-delta full-state size"
         );
     }
 }
