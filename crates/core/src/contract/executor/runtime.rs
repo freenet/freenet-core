@@ -1801,6 +1801,104 @@ mod remove_contract_tests {
         );
     }
 
+    /// #4117 P2b/M1: the predecessor-list bound is TWO-tiered and enforced
+    /// through the real `Executor::delegate_request` path (not just the pure
+    /// dedupe fn). The cap is on the UNIQUE count, matching the docstrings:
+    ///   - 65 DISTINCT predecessors (> the deduped cap of 64) → request REJECTED,
+    ///     nothing registered (silent truncation would strand older generations);
+    ///   - a duplicate-heavy list whose UNIQUE count is within the cap → ACCEPTED
+    ///     (duplicates dropped, not counted);
+    ///   - a raw list past the DoS sanity bound → REJECTED up front regardless of
+    ///     unique count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_with_predecessors_cap_is_on_unique_count_end_to_end() {
+        use super::delegates::{MAX_MIGRATION_PREDECESSORS, MAX_MIGRATION_PREDECESSORS_RAW};
+        use freenet_stdlib::client_api::DelegateRequest;
+        use freenet_stdlib::prelude::{Delegate, DelegateContainer, DelegateWasmAPIVersion};
+
+        let (mut executor, _contracts_dir, temp_dir) = build_disk_executor("pred-cap").await;
+        let delegate_dir = temp_dir.path().join("delegate");
+
+        let make_pred = |i: u8| {
+            Delegate::from((&vec![i].into(), &vec![0u8].into()))
+                .key()
+                .clone()
+        };
+        let reg_path =
+            |succ: &Delegate| delegate_dir.join(succ.key().encode()).with_extension("reg");
+
+        // (1) 65 UNIQUE predecessors > the deduped cap of 64 → REJECTED.
+        let succ_over = Delegate::from((&vec![0u8].into(), &vec![0xA1u8].into()));
+        let over: Vec<_> = (0u8..=64).map(make_pred).collect(); // 65 distinct
+        assert_eq!(over.len(), MAX_MIGRATION_PREDECESSORS + 1);
+        let req_over = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_over.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: over,
+        };
+        assert!(
+            executor
+                .delegate_request(req_over, None, None, None)
+                .is_err(),
+            "an over-cap UNIQUE predecessor list must be rejected"
+        );
+        assert!(
+            !reg_path(&succ_over).exists(),
+            "a rejected over-cap request must register NOTHING"
+        );
+
+        // (2) A duplicate-heavy list whose UNIQUE count (3) is within the cap →
+        //     ACCEPTED (duplicates dropped, not counted).
+        let succ_ok = Delegate::from((&vec![0u8].into(), &vec![0xB2u8].into()));
+        let mut dupes: Vec<_> = Vec::new();
+        for _ in 0..40 {
+            dupes.push(make_pred(1));
+            dupes.push(make_pred(2));
+            dupes.push(make_pred(3));
+        } // 120 raw, 3 unique
+        assert!(
+            dupes.len() > MAX_MIGRATION_PREDECESSORS
+                && dupes.len() <= MAX_MIGRATION_PREDECESSORS_RAW,
+            "the duplicate-heavy list must exceed the deduped cap in RAW length \
+             yet stay under the raw sanity bound, to isolate the dedupe semantics"
+        );
+        let req_ok = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_ok.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: dupes,
+        };
+        executor
+            .delegate_request(req_ok, None, None, None)
+            .expect("a duplicate-heavy but under-cap-UNIQUE list must be accepted");
+        assert!(
+            reg_path(&succ_ok).exists(),
+            "an accepted request must register the successor"
+        );
+
+        // (3) A raw list past the DoS sanity bound → REJECTED up front regardless
+        //     of unique count (all identical here: unique = 1, raw > the bound).
+        let succ_raw = Delegate::from((&vec![0u8].into(), &vec![0xC3u8].into()));
+        let raw_huge = vec![make_pred(7); MAX_MIGRATION_PREDECESSORS_RAW + 1];
+        let req_raw = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ_raw.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: raw_huge,
+        };
+        assert!(
+            executor
+                .delegate_request(req_raw, None, None, None)
+                .is_err(),
+            "a raw list past the DoS sanity bound must be rejected even when unique count is small"
+        );
+        assert!(
+            !reg_path(&succ_raw).exists(),
+            "a rejected raw-oversize request must register NOTHING"
+        );
+    }
+
     /// Core regression test: storing a contract makes its state retrievable
     /// and its `.wasm` blob present on disk; `remove_contract` reclaims both.
     #[tokio::test(flavor = "multi_thread")]

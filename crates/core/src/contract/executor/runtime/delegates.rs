@@ -7,7 +7,7 @@
 
 use super::*;
 
-/// Upper bound on the number of predecessor delegate keys a single
+/// Upper bound on the number of UNIQUE predecessor delegate keys a single
 /// `RegisterDelegateWithPredecessors` request may drive copy-forward for
 /// (#4117 P2/M1). The predecessor list is client-controlled, and each
 /// predecessor drives synchronous marker/index/redb writes on the contract
@@ -15,9 +15,24 @@ use super::*;
 /// stall amplification vector. 64 matches the delegate-lineage / probe-hop
 /// bound used by the app-side migration driver (`DEFAULT_MAX_PROBE_HOPS`): a
 /// realistic delegate never accumulates anywhere near 64 retired generations.
-/// Over the cap the list is deduped-then-truncated with a warning;
-/// registration itself still succeeds.
-const MAX_MIGRATION_PREDECESSORS: usize = 64;
+/// This is the DEDUPED cap, enforced on the UNIQUE count: a request whose
+/// unique predecessor count exceeds it is REJECTED whole (never silently
+/// truncated, which would strand older generations — the client splits its
+/// request). Duplicates are dropped first and never count against it, so a
+/// duplicate-heavy but genuinely-small list is accepted. A separate, much
+/// larger raw-length sanity bound ([`MAX_MIGRATION_PREDECESSORS_RAW`]) rejects a
+/// giant list up front so the dedupe work itself stays bounded.
+pub(super) const MAX_MIGRATION_PREDECESSORS: usize = 64;
+
+/// Pre-dedupe SANITY bound on the RAW predecessor-list length: 16× the deduped
+/// cap [`MAX_MIGRATION_PREDECESSORS`]. This is pure DoS protection — it caps the
+/// dedupe / `HashSet`-insert work for a giant list BEFORE any per-element
+/// processing — NOT the semantic limit. No legitimate client comes anywhere
+/// near it: a realistic delegate has a handful of retired generations, and even
+/// a duplicate-heavy legitimate list stays far under 1024. The semantic limit
+/// is the deduped cap above; a list whose UNIQUE count is within the cap is
+/// accepted even when the raw list carried duplicates.
+pub(super) const MAX_MIGRATION_PREDECESSORS_RAW: usize = MAX_MIGRATION_PREDECESSORS * 16;
 
 /// Dedupe a client-supplied predecessor list, preserving newest-first order
 /// (#4117 P2/M1). A duplicate is pure waste (the migration is idempotent per
@@ -253,30 +268,50 @@ impl Executor<Runtime> {
                 predecessors,
             } => {
                 // Bound the client-controlled predecessor list BEFORE registering
-                // (#4117 P2b/M1). CHEAP EARLY LENGTH CHECK FIRST — reject an
-                // over-length request before ANY per-element work (dedupe / HashSet
-                // inserts), so a giant list can't burn the contract loop just to be
-                // rejected. Each predecessor drives synchronous marker/index/redb
-                // writes, so an unbounded list is an amplification vector, and
-                // silently truncating would strand older generations; the client
-                // splits an over-cap request (and should send no duplicates). Then
-                // dedupe silently (a repeat is pure waste — migration is idempotent
-                // per pair) the now-bounded list.
-                if predecessors.len() > MAX_MIGRATION_PREDECESSORS {
+                // (#4117 P2b/M1) with TWO tiers, so the DoS bound and the
+                // documented DEDUPED semantics both hold:
+                //   (a) a cheap pre-dedupe SANITY check on the RAW length rejects
+                //       a giant list up front, keeping the dedupe / HashSet work
+                //       itself bounded (a giant list can't burn the contract
+                //       loop just to be rejected);
+                //   (b) dedupe silently (a repeat is pure waste — migration is
+                //       idempotent per pair);
+                //   (c) enforce the real cap on the UNIQUE count, matching every
+                //       docstring and test. A duplicate-heavy but genuinely-small
+                //       list is ACCEPTED; an over-cap UNIQUE list is REJECTED
+                //       whole (silent truncation would strand older generations —
+                //       the client splits its request).
+                // Each predecessor drives synchronous marker/index/redb writes,
+                // so an unbounded list is a disk-growth / loop-stall vector.
+                if predecessors.len() > MAX_MIGRATION_PREDECESSORS_RAW {
                     let key = delegate.key().clone();
                     tracing::warn!(
                         delegate_key = %key,
                         predecessors = predecessors.len(),
-                        cap = MAX_MIGRATION_PREDECESSORS,
-                        "RegisterDelegateWithPredecessors rejected: too many predecessors (split the request)"
+                        raw_cap = MAX_MIGRATION_PREDECESSORS_RAW,
+                        "RegisterDelegateWithPredecessors rejected: raw predecessor list too large (DoS sanity bound)"
                     );
                     return Err(ExecutorError::other(anyhow::anyhow!(
-                        "RegisterDelegateWithPredecessors: {} predecessors exceeds the cap of {}",
+                        "RegisterDelegateWithPredecessors: raw predecessor list of {} exceeds the sanity bound of {}",
                         predecessors.len(),
-                        MAX_MIGRATION_PREDECESSORS
+                        MAX_MIGRATION_PREDECESSORS_RAW
                     )));
                 }
                 let deduped = dedupe_predecessors(predecessors);
+                if deduped.len() > MAX_MIGRATION_PREDECESSORS {
+                    let key = delegate.key().clone();
+                    tracing::warn!(
+                        delegate_key = %key,
+                        unique_predecessors = deduped.len(),
+                        cap = MAX_MIGRATION_PREDECESSORS,
+                        "RegisterDelegateWithPredecessors rejected: too many UNIQUE predecessors (split the request)"
+                    );
+                    return Err(ExecutorError::other(anyhow::anyhow!(
+                        "RegisterDelegateWithPredecessors: {} unique predecessors exceeds the cap of {}",
+                        deduped.len(),
+                        MAX_MIGRATION_PREDECESSORS
+                    )));
+                }
 
                 // Register exactly as `RegisterDelegate` does, THEN run the
                 // one-shot, Local-scope copy-forward of the predecessors' secrets.
