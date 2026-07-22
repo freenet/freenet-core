@@ -1,4 +1,5 @@
 pub mod auto_update;
+pub mod daemon_control;
 pub mod report;
 pub mod rollback;
 pub mod secrets_cmd;
