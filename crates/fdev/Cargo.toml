@@ -52,7 +52,7 @@ http = { workspace = true }
 
 ciborium = "0.2"
 dirs = { workspace = true }
-ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+ed25519-dalek = { version = "3", features = ["rand_core", "serde"] }
 hex = { workspace = true }
 
 # internal

@@ -13,7 +13,7 @@ freenet-stdlib = { workspace = true }
 serde = { workspace = true }
 
 # Fully remove `rand_core` from `ed25519-dalek` for wasm builds
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "serde"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "serde"] }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"] }

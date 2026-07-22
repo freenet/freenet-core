@@ -105,7 +105,7 @@ x25519-dalek = { workspace = true }
 # Verifies the ed25519 signature over the release SHA256SUMS.txt manifest in
 # the auto-update path (commands/update.rs). Default features (native std) are
 # sufficient — only verification (and test-only signing) is needed here.
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 sha2 = { workspace = true }
 
 # Tracing deps
