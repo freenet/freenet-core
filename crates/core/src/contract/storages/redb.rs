@@ -1605,6 +1605,13 @@ impl StateStorage for ReDb {
     }
 }
 
+// Test-only fault-injection helpers, re-exported so sibling modules' tests
+// (e.g. the secrets-store origin-record failure path, #4117) can build a
+// `ReDb` whose backend I/O can be flipped to fail on demand. Defined inside
+// `mod tests` below; surfaced at module level here for cross-module test use.
+#[cfg(test)]
+pub(crate) use tests::{FailingBackend, open_redb_with_backend};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1939,6 +1946,35 @@ mod tests {
         assert!(origins2.is_empty());
     }
 
+    /// #4117 H1 (persistence-succeeds-before-usable): a durable-write failure in
+    /// `record_delegate_origin_first_writer` SURFACES as `Err` — it is never
+    /// swallowed into a silent `Ok`. This is the storage-layer foundation of the
+    /// rule that a failed origin record must ABORT the whole registration (a
+    /// registered-but-recordless delegate has a claimable first-writer slot).
+    /// Uses the fault-injecting backend to produce a REAL redb I/O failure.
+    #[test]
+    fn record_delegate_origin_first_writer_surfaces_backend_failure() {
+        let backend = FailingBackend::new();
+        let db = open_redb_with_backend(backend.clone());
+        let d = fake_delegate_key(0x12, 0x34);
+
+        // Healthy: the first write succeeds and is observable.
+        assert!(
+            db.record_delegate_origin_first_writer(&d, Some([0x11u8; 32]))
+                .unwrap(),
+            "healthy first write must succeed and return `true`"
+        );
+
+        // Disk fails: a subsequent origin write MUST return Err, never a silent Ok.
+        backend.start_failing();
+        let d2 = fake_delegate_key(0x56, 0x78);
+        assert!(
+            db.record_delegate_origin_first_writer(&d2, Some([0x22u8; 32]))
+                .is_err(),
+            "a durable-write failure must surface as Err, never a silent Ok"
+        );
+    }
+
     /// #4117 P2a: the reserved-marker-hash table is individually keyed,
     /// idempotent, per-delegate isolated, and per-delegate CAPPED.
     #[tokio::test]
@@ -2107,13 +2143,13 @@ mod tests {
     /// `StorageError::PreviousIo`) so the poison-detection and recovery path can be
     /// exercised without relying on the error message string.
     #[derive(Debug, Clone)]
-    struct FailingBackend {
+    pub(crate) struct FailingBackend {
         inner: Arc<redb::backends::InMemoryBackend>,
         fail: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FailingBackend {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 inner: Arc::new(redb::backends::InMemoryBackend::new()),
                 fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2121,7 +2157,7 @@ mod tests {
         }
 
         /// Make every subsequent I/O call fail, simulating a disk EIO / csum failure.
-        fn start_failing(&self) {
+        pub(crate) fn start_failing(&self) {
             self.fail.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -2160,7 +2196,7 @@ mod tests {
     }
 
     /// Open a fully-initialised [`ReDb`] over an arbitrary backend (test-only).
-    fn open_redb_with_backend<B: redb::StorageBackend>(backend: B) -> ReDb {
+    pub(crate) fn open_redb_with_backend<B: redb::StorageBackend>(backend: B) -> ReDb {
         let db = Database::builder()
             .create_with_backend(backend)
             .expect("create_with_backend");

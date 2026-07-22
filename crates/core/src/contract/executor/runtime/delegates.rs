@@ -151,20 +151,34 @@ impl Executor<Runtime> {
 
         // RECORD BEFORE REGISTER (#4117 P1, H1 first-writer gate). The immutable
         // first-writer origin record is written (insert-if-absent) BEFORE the
-        // delegate is registered. If we registered first and the record write
-        // then failed (or crashed between), the delegate would be usable but
-        // RECORDLESS, and the next — possibly attacker — registration would claim
-        // the empty first-writer slot (stealing the victim's provenance).
-        // Recording first makes a crash between the two harmless (a record for an
-        // unregistered delegate gates nothing, and the same app's retry
-        // re-registers under its already-recorded origin). A record-write failure
-        // is surfaced (logged inside record_delegate_registration_origin) and
-        // leaves copy-forward fail-closed (no record ⇒ NoProvenance); the next
-        // registration retries the insert-if-absent.
+        // delegate is registered, and a record-write failure ABORTS THE WHOLE
+        // REGISTRATION (persistence-succeeds-before-usable). If we registered
+        // first, or proceeded despite a failed record, the delegate would be
+        // usable but RECORDLESS — an empty first-writer slot the next, possibly
+        // attacker, registration could claim (stealing the victim's provenance
+        // and then migrating its accumulated secrets). Registration already
+        // depends on delegate-store disk health, so a failing origin-record DB is
+        // a visibly sick node and the app simply retries; a usable-but-unowned
+        // delegate is the one unacceptable state. Recording first also makes a
+        // crash BETWEEN record and register harmless (a record for an
+        // unregistered delegate gates nothing, and the app's retry re-registers
+        // under its already-recorded origin — Ok(false), still success).
         let origin_bytes: Option<[u8; 32]> =
             origin_contract.and_then(|c| c.as_bytes().try_into().ok());
-        self.runtime
-            .record_delegate_registration_origin(&key, origin_bytes);
+        if let Err(err) = self
+            .runtime
+            .record_delegate_registration_origin(&key, origin_bytes)
+        {
+            tracing::warn!(
+                delegate_key = %key,
+                error = %err,
+                phase = "record_origin_failed",
+                "aborting delegate registration: could not durably record the first-registration origin (persistence-succeeds-before-usable)"
+            );
+            return Err(ExecutorError::other(anyhow::anyhow!(
+                "delegate registration aborted: could not durably record first-registration origin (H1 gate): {err}"
+            )));
+        }
 
         let arr = (&cipher).into();
         let cipher = XChaCha20Poly1305::new(arr);

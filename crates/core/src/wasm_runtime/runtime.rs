@@ -467,15 +467,19 @@ impl Runtime {
 
     /// Durably record the web-app origin under which `delegate` was registered,
     /// for the H1 same-origin copy-forward gate (#4117). Called on every
-    /// successful registration. Another route to the `pub(super) secret_store`
-    /// from the executor module tree, like `migrate_delegate_secrets`.
+    /// registration, BEFORE it is registered. Another route to the
+    /// `pub(super) secret_store` from the executor module tree, like
+    /// `migrate_delegate_secrets`.
+    ///
+    /// Propagates the store's error: a persistence failure MUST fail the whole
+    /// registration (see `SecretsStore::record_delegate_registration_origin`).
     pub(crate) fn record_delegate_registration_origin(
         &self,
         delegate: &DelegateKey,
         origin: Option<[u8; 32]>,
-    ) {
+    ) -> Result<(), super::SecretStoreError> {
         self.secret_store
-            .record_delegate_registration_origin(delegate, origin);
+            .record_delegate_registration_origin(delegate, origin)
     }
 
     pub fn build_with_config(

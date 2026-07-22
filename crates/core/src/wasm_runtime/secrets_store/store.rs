@@ -2866,26 +2866,39 @@ impl SecretsStore {
     /// the H1 same-origin copy-forward gate (#4117). FIRST-WRITER-WINS: a record
     /// is written only if none exists, and is NEVER modified afterward — an
     /// attacker who re-registers a victim's public WASM later cannot add itself.
-    /// Called on EVERY successful registration; best-effort (a persistence
-    /// failure is logged, and — critically — leaves NO record, so a future
-    /// migration naming this delegate as a predecessor fails CLOSED with
-    /// NoProvenance rather than being silently allowed; the next registration
-    /// retries the record).
+    /// Called on EVERY registration, BEFORE the delegate is registered.
+    ///
+    /// # Errors
+    /// Returns `Err` only if the record could not be DURABLY persisted. The
+    /// caller MUST fail the whole registration in that case
+    /// (persistence-succeeds-before-usable): a registered-but-recordless delegate
+    /// has an empty first-writer slot that a later — possibly attacker —
+    /// registration could claim, so leaving it usable is the exact vulnerability
+    /// this gate exists to prevent. `Ok(())` covers both a freshly-written record
+    /// AND an already-present one (an idempotent re-registration); neither is an
+    /// error.
     pub fn record_delegate_registration_origin(
         &self,
         delegate: &DelegateKey,
         origin: Option<[u8; 32]>,
-    ) {
+    ) -> Result<(), SecretStoreError> {
         match self
             .db
             .record_delegate_origin_first_writer(delegate, origin)
         {
-            Ok(_wrote) => {}
-            Err(e) => tracing::warn!(
-                delegate = %delegate.encode(),
-                error = %e,
-                "failed to record delegate first-registration origin (H1 gate fails closed until the next registration retries)"
-            ),
+            // Ok(true) wrote the first-writer record; Ok(false) means one already
+            // existed (idempotent re-registration) — both are success.
+            Ok(_wrote) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    delegate = %delegate.encode(),
+                    error = %e,
+                    "failed to durably record delegate first-registration origin (H1 gate); the caller must fail the registration so no usable-but-unowned delegate is left"
+                );
+                Err(SecretStoreError::IO(std::io::Error::other(format!(
+                    "could not durably record delegate first-registration origin (H1 gate): {e}"
+                ))))
+            }
         }
     }
 
@@ -3134,15 +3147,41 @@ const MIGRATE_LEGACY_DONE_PREFIX: &[u8] = b"\0freenet-migrate/done:";
 /// LEGACY generation-keyed in-progress marker prefix (0.3-era): MARKER_NS ++
 /// `wip:` ++ `<gen decimal>`. Source: freenet-migrate `delegate.rs` WIP_PREFIX.
 const MIGRATE_LEGACY_WIP_PREFIX: &[u8] = b"\0freenet-migrate/wip:";
-/// Upper bound on the `<gen decimal>` legacy suffix length. The crate writes a
-/// `u32` generation (confirmed against freenet-migrate 0.4.0 `import_secrets_once`:
-/// `generation.to_string()` where `generation: u32`), whose decimal form is at
-/// most 10 digits (`u32::MAX` = 4294967295). The `20` here is a deliberate SAFE
-/// SUPERSET (a `u64`'s worth of digits): it never rejects a legitimate crate
-/// marker (an 11–20-digit value can't be a valid `u32` gen anyway, and the crate
-/// ignores an unparseable gen), while still bounding the suffix so a client
-/// cannot pad a legacy-shaped key with an unbounded digit string.
-const MAX_LEGACY_GEN_DIGITS: usize = 20;
+/// Maximum decimal digits in a canonical `u32` generation suffix
+/// (`u32::MAX` = 4294967295 = 10 digits). The legacy `done:`/`wip:` markers
+/// (freenet-migrate 0.3-era `import_secrets_once`, confirmed against 0.4.0)
+/// encode a `u32` generation via `generation.to_string()`, so the ONLY legal
+/// suffixes are the CANONICAL decimal forms of a `u32` — see
+/// [`is_canonical_u32_decimal`]. Enforcing exactly that (rather than the earlier
+/// ≤20-digit `u64` superset) refuses non-canonical duplicates (`"00"`, `"01"`)
+/// and overflow forms (`"4294967296"`) the crate never writes, so a client
+/// cannot squat the reserved namespace with a legacy-shaped-but-illegal key.
+const MAX_LEGACY_GEN_DIGITS: usize = 10;
+
+/// True iff `s` is the CANONICAL decimal encoding of a `u32` — exactly the suffix
+/// set the crate's `generation.to_string()` (`generation: u32`) can produce:
+/// non-empty, ASCII digits only, no leading zeros (except the single digit
+/// `"0"`), at most [`MAX_LEGACY_GEN_DIGITS`] digits, and numerically `≤ u32::MAX`.
+/// Rejects `""`, `"00"`, `"01"`, `"4294967296"` (overflow within 10 digits), and
+/// any 11+-digit run — none of which the crate ever writes.
+fn is_canonical_u32_decimal(s: &[u8]) -> bool {
+    if s.is_empty() || s.len() > MAX_LEGACY_GEN_DIGITS {
+        return false;
+    }
+    if !s.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    // Leading zero is non-canonical: only the single digit "0" is legal.
+    if s.len() > 1 && s[0] == b'0' {
+        return false;
+    }
+    // All-digits + len ≤ 10 guarantees valid UTF-8; the parse is the numeric
+    // bound that rejects the 10-digit overflow window (e.g. "4294967296").
+    std::str::from_utf8(s)
+        .ok()
+        .and_then(|t| t.parse::<u32>().ok())
+        .is_some()
+}
 
 /// The legal secret-key shapes under the reserved
 /// [`MIGRATE_RESERVED_NAMESPACE_PREFIX`]. `store_secret` REJECTS any other
@@ -3154,7 +3193,7 @@ const MAX_LEGACY_GEN_DIGITS: usize = 20;
 ///   - v1 per-predecessor:  `\0freenet-migrate/v1/pred-done:` / `…/v1/pred-wip:`
 ///     followed by EXACTLY a 32-byte delegate key;
 ///   - legacy generation-keyed: `\0freenet-migrate/done:` / `…/wip:` followed by
-///     a NON-EMPTY, ≤ [`MAX_LEGACY_GEN_DIGITS`] ASCII-decimal generation.
+///     a CANONICAL `u32` decimal generation (see [`is_canonical_u32_decimal`]).
 ///
 /// SHAPE-EVOLUTION LAW. This whitelist is deliberately an ENFORCEMENT list, not
 /// just documentation: it keeps the reserved namespace strictly protocol-defined
@@ -3178,13 +3217,11 @@ fn is_legal_reserved_marker_key(raw: &[u8]) -> bool {
     if v1 {
         return true;
     }
-    // Legacy generation-keyed markers: prefix + a non-empty bounded decimal
+    // Legacy generation-keyed markers: prefix + a CANONICAL u32 decimal
     // generation suffix (`gen` is a reserved keyword, hence `gen_suffix`).
     for prefix in [MIGRATE_LEGACY_DONE_PREFIX, MIGRATE_LEGACY_WIP_PREFIX] {
         if let Some(gen_suffix) = raw.strip_prefix(prefix)
-            && !gen_suffix.is_empty()
-            && gen_suffix.len() <= MAX_LEGACY_GEN_DIGITS
-            && gen_suffix.iter().all(u8::is_ascii_digit)
+            && is_canonical_u32_decimal(gen_suffix)
         {
             return true;
         }
@@ -8806,7 +8843,9 @@ mod test {
             Zeroizing::new(plaintext.clone()),
         )?;
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
         let report = store.migrate_secrets(
             std::slice::from_ref(pred.key()),
             succ.key(),
@@ -8854,7 +8893,9 @@ mod test {
             Zeroizing::new(b"v1".to_vec()),
         )?;
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
         let report1 = store.migrate_secrets(
             std::slice::from_ref(pred.key()),
             succ.key(),
@@ -8921,7 +8962,9 @@ mod test {
             Zeroizing::new(b"successor-own-value".to_vec()),
         )?;
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
         let report = store.migrate_secrets(
             std::slice::from_ref(pred.key()),
             succ.key(),
@@ -8973,7 +9016,9 @@ mod test {
             Zeroizing::new(b"alice-value".to_vec()),
         )?;
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
         let report = store.migrate_secrets(
             std::slice::from_ref(pred.key()),
             succ.key(),
@@ -9089,8 +9134,12 @@ mod test {
             Zeroizing::new(b"vb".to_vec()),
         )?;
 
-        store.record_delegate_registration_origin(pred1.key(), Some(TEST_ORIGIN));
-        store.record_delegate_registration_origin(pred2.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred1.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        store
+            .record_delegate_registration_origin(pred2.key(), Some(TEST_ORIGIN))
+            .unwrap();
         let report = store.migrate_secrets(
             &[pred1.key().clone(), pred2.key().clone()],
             succ.key(),
@@ -9225,7 +9274,9 @@ mod test {
                 .is_empty()
         );
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
         let report = store.migrate_secrets(
             std::slice::from_ref(pred.key()),
             succ.key(),
@@ -9272,8 +9323,12 @@ mod test {
             Zeroizing::new(b"OLD".to_vec()),
         )?;
 
-        store.record_delegate_registration_origin(newer.key(), Some(TEST_ORIGIN));
-        store.record_delegate_registration_origin(older.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(newer.key(), Some(TEST_ORIGIN))
+            .unwrap();
+        store
+            .record_delegate_registration_origin(older.key(), Some(TEST_ORIGIN))
+            .unwrap();
 
         // Supplied newest-first: newer wins, older collides (skipped).
         let report = store.migrate_secrets(
@@ -9321,7 +9376,9 @@ mod test {
             Zeroizing::new(b"v".to_vec()),
         )?;
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
         store.migrate_secrets(
             std::slice::from_ref(pred.key()),
             succ.key(),
@@ -9370,7 +9427,9 @@ mod test {
         // secrets — e.g. every secret was removed. Create the empty dir directly.
         std::fs::create_dir_all(secrets_dir.join(pred.key().encode()))?;
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
         store.migrate_secrets(
             std::slice::from_ref(pred.key()),
             succ.key(),
@@ -9411,7 +9470,9 @@ mod test {
         let blob_path = secrets_dir.join(pred.key().encode()).join(sid.encode());
         std::fs::write(&blob_path, b"not-a-valid-ciphertext-blob")?;
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
         let report = store.migrate_secrets(
             std::slice::from_ref(pred.key()),
             succ.key(),
@@ -9467,7 +9528,9 @@ mod test {
         )?;
 
         // P1 -> S1: writes a marker for P1 under S1.
-        store.record_delegate_registration_origin(p1.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(p1.key(), Some(TEST_ORIGIN))
+            .unwrap();
         store.migrate_secrets(std::slice::from_ref(p1.key()), s1.key(), Some(TEST_ORIGIN));
         assert!(
             store
@@ -9481,7 +9544,9 @@ mod test {
         );
 
         // S1 -> S2: copies S1's real secret but NOT the P1 marker.
-        store.record_delegate_registration_origin(s1.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(s1.key(), Some(TEST_ORIGIN))
+            .unwrap();
         store.migrate_secrets(std::slice::from_ref(s1.key()), s2.key(), Some(TEST_ORIGIN));
         assert!(
             store.get_secret(s2.key(), &sid, SecretScope::Local).is_ok(),
@@ -9549,7 +9614,9 @@ mod test {
             Zeroizing::new(b"1".to_vec()),
         )?;
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
         let report = store.migrate_secrets(
             std::slice::from_ref(pred.key()),
             succ.key(),
@@ -9624,7 +9691,9 @@ mod test {
         let broken_blob = secrets_dir.join(pred.key().encode()).join(broken.encode());
         std::fs::write(&broken_blob, b"corrupt")?;
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
 
         // First migration: healthy copies, broken errors → unsealed.
         let r1 = store.migrate_secrets(
@@ -9690,7 +9759,9 @@ mod test {
         )?;
 
         let origin_a = [0x11u8; 32];
-        store.record_delegate_registration_origin(pred.key(), Some(origin_a));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(origin_a))
+            .unwrap();
 
         // MISMATCH: a different registering origin is refused, but there IS a
         // record for this predecessor, so it is NOT no_provenance.
@@ -9775,7 +9846,9 @@ mod test {
         )?;
         // Recorded as None-class (a loopback registration) — this does NOT
         // privilege a later None registering origin.
-        store.record_delegate_registration_origin(pred.key(), None);
+        store
+            .record_delegate_registration_origin(pred.key(), None)
+            .unwrap();
 
         // A loopback (None) registering origin → refused: None is NEVER
         // privileged, even against a None-class record. There IS a record for
@@ -9830,10 +9903,14 @@ mod test {
         )?;
 
         // The victim's origin is recorded FIRST...
-        store.record_delegate_registration_origin(pred.key(), Some(victim_origin));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(victim_origin))
+            .unwrap();
         // ...then an attacker re-registers the same (public-derivable) predecessor
         // key, trying to overwrite the record. First-writer-wins: a no-op.
-        store.record_delegate_registration_origin(pred.key(), Some(attacker_origin));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(attacker_origin))
+            .unwrap();
 
         // The attacker's origin does NOT satisfy the gate — the record still
         // holds the FIRST (victim's) origin, not the attacker's.
@@ -9898,7 +9975,9 @@ mod test {
         let succ_blob = secrets_dir.join(succ.key().encode()).join(sid.encode());
         std::fs::write(&succ_blob, b"corrupt-not-decryptable")?;
 
-        store.record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN));
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
         let report = store.migrate_secrets(
             std::slice::from_ref(pred.key()),
             succ.key(),
@@ -10029,24 +10108,35 @@ mod test {
         assert!(is_legal_reserved_marker_key(&key32(
             b"\0freenet-migrate/v1/pred-wip:"
         )));
-        // ACCEPT — legacy generation-keyed + non-empty decimal.
-        assert!(is_legal_reserved_marker_key(b"\0freenet-migrate/done:0"));
+        // ACCEPT — legacy generation-keyed + a CANONICAL u32 decimal generation.
+        assert!(is_legal_reserved_marker_key(b"\0freenet-migrate/done:0")); // the single "0" is canonical
         assert!(is_legal_reserved_marker_key(b"\0freenet-migrate/done:42"));
         assert!(is_legal_reserved_marker_key(b"\0freenet-migrate/wip:7"));
         assert!(is_legal_reserved_marker_key(
-            b"\0freenet-migrate/done:18446744073709551615"
-        )); // u64::MAX, 20 digits
+            b"\0freenet-migrate/done:4294967295"
+        )); // u32::MAX, 10 digits
+        assert!(is_legal_reserved_marker_key(
+            b"\0freenet-migrate/wip:4294967295"
+        ));
 
         // REJECT — v1 wrong suffix length.
         let mut short = b"\0freenet-migrate/v1/pred-done:".to_vec();
         short.extend_from_slice(&[0xCDu8; 8]);
         assert!(!is_legal_reserved_marker_key(&short));
-        // REJECT — legacy empty gen / non-digit gen / over-long gen.
-        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:"));
-        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:abc"));
+        // REJECT — legacy gen that is not a CANONICAL u32:
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:")); // empty
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:abc")); // non-digit
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:00")); // leading zero (non-canonical)
+        assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/done:01")); // leading zero (non-canonical)
         assert!(!is_legal_reserved_marker_key(
-            b"\0freenet-migrate/done:123456789012345678901"
-        )); // 21 digits > cap
+            b"\0freenet-migrate/done:4294967296"
+        )); // u32::MAX + 1 (10 digits, but overflows u32)
+        assert!(!is_legal_reserved_marker_key(
+            b"\0freenet-migrate/done:99999999999"
+        )); // 11 digits > cap
+        assert!(!is_legal_reserved_marker_key(
+            b"\0freenet-migrate/done:18446744073709551615"
+        )); // u64::MAX (20 digits) — a legacy u64 superset value, now REJECTED
         // REJECT — foreign sub-prefix / bare namespace.
         assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/attacker"));
         assert!(!is_legal_reserved_marker_key(b"\0freenet-migrate/"));

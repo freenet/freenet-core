@@ -1551,7 +1551,9 @@ mod remove_contract_tests {
         // Record the predecessor's FIRST-registration origin (H1 same-origin
         // gate): the migrating registration below must present this SAME origin
         // for the copy to be allowed.
-        secrets_store.record_delegate_registration_origin(pred.key(), Some(ORIGIN));
+        secrets_store
+            .record_delegate_registration_origin(pred.key(), Some(ORIGIN))
+            .unwrap();
 
         let successor_secret_path = secrets_dir
             .join(succ.key().encode())
@@ -1615,6 +1617,187 @@ mod remove_contract_tests {
         assert!(
             !successor_secret_path.exists(),
             "one-shot marker must prevent resurrection on re-registration"
+        );
+    }
+
+    /// Handler-level (#4117 H1, persistence-succeeds-before-usable): if the
+    /// first-writer origin record cannot be DURABLY persisted, the WHOLE
+    /// registration is aborted — for BOTH the plain `RegisterDelegate` and the
+    /// `RegisterDelegateWithPredecessors` variants. The delegate is NOT
+    /// registered (no `.reg` file) and no predecessor secret is copied, so a
+    /// registered-but-recordless delegate (a claimable first-writer slot an
+    /// attacker could later name as its own) can never exist. Once the disk
+    /// recovers, the app's retry registers, records, and copies normally. Uses
+    /// the fault-injecting redb backend to fail the origin-record write on demand.
+    #[cfg(feature = "redb")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_aborts_when_origin_record_fails_then_recovers() {
+        use crate::contract::storages::redb::{FailingBackend, open_redb_with_backend};
+        use crate::wasm_runtime::SecretScope;
+        use freenet_stdlib::client_api::DelegateRequest;
+        use freenet_stdlib::prelude::{
+            ContractInstanceId, Delegate, DelegateContainer, DelegateWasmAPIVersion, SecretsId,
+        };
+        use zeroize::Zeroizing;
+
+        const ORIGIN: [u8; 32] = [0x11u8; 32];
+
+        let temp_dir = crate::util::tests::get_temp_dir();
+        let delegate_dir = temp_dir.path().join("delegate");
+        let secrets_dir = temp_dir.path().join("secrets");
+
+        // A secrets-store DB whose backend I/O can be flipped to fail on demand.
+        let backend = FailingBackend::new();
+        let db = open_redb_with_backend(backend.clone());
+
+        let contract_store =
+            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db.clone())
+                .expect("create contract store");
+        let delegate_store = DelegateStore::new(delegate_dir.clone(), 10_000, db.clone())
+            .expect("create delegate store");
+        let mut secrets_store =
+            SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())
+                .expect("create secrets store");
+
+        let pred = Delegate::from((&vec![0u8].into(), &vec![1u8].into()));
+        let succ = Delegate::from((&vec![0u8].into(), &vec![2u8].into()));
+
+        // Seed a predecessor Local secret + its first-registration origin WHILE the
+        // backend is healthy (both must exist for the copy to be allowed later).
+        let secret_id = SecretsId::new(b"room:alice".to_vec());
+        secrets_store
+            .store_secret(
+                pred.key(),
+                &secret_id,
+                SecretScope::Local,
+                Zeroizing::new(b"profile".to_vec()),
+            )
+            .expect("seed predecessor secret");
+        secrets_store
+            .record_delegate_registration_origin(pred.key(), Some(ORIGIN))
+            .expect("record predecessor origin");
+
+        let state_store = StateStore::new(db.clone(), 10_000_000).expect("create state store");
+        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
+            .expect("build runtime");
+        let mut executor = Executor::new(
+            state_store,
+            || Ok(()),
+            crate::contract::executor::OperationMode::Local,
+            runtime,
+            None,
+        )
+        .await
+        .expect("create executor");
+
+        let origin_contract = ContractInstanceId::new(ORIGIN);
+        let succ_reg_path = delegate_dir.join(succ.key().encode()).with_extension("reg");
+        let succ_secret_path = secrets_dir
+            .join(succ.key().encode())
+            .join(secret_id.encode());
+        let pred_secret_path = secrets_dir
+            .join(pred.key().encode())
+            .join(secret_id.encode());
+
+        // ---- The disk now fails: the successor's origin-record write cannot persist.
+        backend.start_failing();
+
+        // (a) RegisterDelegateWithPredecessors MUST abort: no register, no copy.
+        let req = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: vec![pred.key().clone()],
+        };
+        assert!(
+            executor
+                .delegate_request(req, Some(&origin_contract), None, None)
+                .is_err(),
+            "registration must FAIL when the first-writer origin record cannot persist"
+        );
+        assert!(
+            !succ_reg_path.exists(),
+            "an aborted registration must register NOTHING (no .reg file on disk)"
+        );
+        assert!(
+            !succ_secret_path.exists(),
+            "an aborted registration must copy NOTHING"
+        );
+
+        // (b) Plain RegisterDelegate MUST abort under the SAME failure (both variants).
+        let plain = Delegate::from((&vec![0u8].into(), &vec![3u8].into()));
+        let plain_reg_path = delegate_dir
+            .join(plain.key().encode())
+            .with_extension("reg");
+        let req_plain = DelegateRequest::RegisterDelegate {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(plain.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+        };
+        assert!(
+            executor
+                .delegate_request(req_plain, Some(&origin_contract), None, None)
+                .is_err(),
+            "plain RegisterDelegate must ALSO fail when the origin record cannot persist"
+        );
+        assert!(
+            !plain_reg_path.exists(),
+            "an aborted RegisterDelegate must register NOTHING"
+        );
+
+        // The predecessor's own secret is untouched throughout.
+        assert!(
+            pred_secret_path.exists(),
+            "the predecessor's own secret must survive the failed migrating registrations"
+        );
+
+        // ---- Recovery: the disk heals (a fresh handle over a healthy backend);
+        // the app retries and the registration now completes end-to-end.
+        drop(executor); // release the poisoned db handle
+        let db2 = open_redb_with_backend(FailingBackend::new()); // healthy
+        let contract_store2 =
+            ContractStore::new(temp_dir.path().join("contracts"), 10_000, db2.clone())
+                .expect("create contract store 2");
+        let delegate_store2 = DelegateStore::new(delegate_dir.clone(), 10_000, db2.clone())
+            .expect("create delegate store 2");
+        let secrets_store2 =
+            SecretsStore::new(secrets_dir.clone(), Default::default(), db2.clone())
+                .expect("create secrets store 2");
+        // The origin table lived in the failed DB; on a real node it persists
+        // across the restart, but here the fresh handle starts empty, so
+        // re-establish the predecessor's origin as the app's retry would.
+        secrets_store2
+            .record_delegate_registration_origin(pred.key(), Some(ORIGIN))
+            .expect("re-record predecessor origin after recovery");
+        let state_store2 = StateStore::new(db2, 10_000_000).expect("create state store 2");
+        let runtime2 = Runtime::build(contract_store2, delegate_store2, secrets_store2, false)
+            .expect("build runtime 2");
+        let mut executor2 = Executor::new(
+            state_store2,
+            || Ok(()),
+            crate::contract::executor::OperationMode::Local,
+            runtime2,
+            None,
+        )
+        .await
+        .expect("create executor 2");
+
+        let req2 = DelegateRequest::RegisterDelegateWithPredecessors {
+            delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(succ.clone())),
+            cipher: [7u8; 32],
+            nonce: [9u8; 24],
+            predecessors: vec![pred.key().clone()],
+        };
+        executor2
+            .delegate_request(req2, Some(&origin_contract), None, None)
+            .expect("retry after recovery must succeed");
+        assert!(
+            succ_reg_path.exists(),
+            "after recovery the successor IS registered (.reg present)"
+        );
+        assert!(
+            succ_secret_path.exists(),
+            "after recovery the predecessor secret IS copied forward"
         );
     }
 
