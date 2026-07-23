@@ -830,6 +830,42 @@ impl Runtime {
         )
     }
 
+    /// Drop the compiled module for `key` from the shared contract-module
+    /// cache.
+    ///
+    /// Mirrors `unregister_delegate`'s `delegate_modules.remove`: when a
+    /// contract is unhosted and `Executor::reclaim_contract_storage` deletes
+    /// its persisted state and `.wasm` blob, the compiled module would
+    /// otherwise linger in the byte-budget LRU until cold-eviction pressure.
+    /// Removing it here reclaims ~1-2 MB promptly and keeps the contract path
+    /// consistent with the delegate path. See issue #4754.
+    pub(crate) fn remove_contract_module(&self, key: &ContractKey) {
+        self.contract_modules.lock().unwrap().remove(key);
+    }
+
+    /// Test-only: compile a minimal module and seed the shared contract-module
+    /// cache for `key`, so a test can assert that reclamation later removes it.
+    /// `contract_modules` is `pub(super)`, so the same-crate
+    /// `remove_contract_tests` mod cannot poke it directly.
+    #[cfg(test)]
+    pub(crate) fn seed_contract_module_for_test(&mut self, key: ContractKey) {
+        // Minimal valid module: `\0asm` + version 1. Compiles fine; export/ABI
+        // validation happens at instantiation, not compile.
+        const EMPTY_WASM: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let module = self.engine.compile(EMPTY_WASM).expect("compile empty wasm");
+        let size = self.engine.module_compiled_size(&module);
+        self.contract_modules
+            .lock()
+            .unwrap()
+            .insert(key, module, size);
+    }
+
+    /// Test-only companion to `seed_contract_module_for_test`.
+    #[cfg(test)]
+    pub(crate) fn contract_module_cached_for_test(&self, key: &ContractKey) -> bool {
+        self.contract_modules.lock().unwrap().get(key).is_some()
+    }
+
     /// Prepare a delegate for execution and detect its API version.
     ///
     /// Returns the running instance and the detected API version (V1 or V2).
