@@ -585,8 +585,181 @@ pub(super) fn service_status(system: bool) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of a `launchctl bootout`/`bootstrap` invocation, classified from
+/// the exit status and stderr.
+///
+/// Pure so the classification is unit-testable on every CI platform without
+/// shelling out to `launchctl` (which only exists on macOS). See the
+/// "extract the platform-independent decision logic into a pure function"
+/// rule in `.claude/rules/deployment.md`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LaunchctlOutcome {
+    /// The agent reached the requested state.
+    Ok,
+    /// The agent was already in the requested state (not loaded when booting
+    /// out, already loaded when bootstrapping). Idempotent success.
+    AlreadyInState,
+    /// The invocation genuinely failed; the payload is a human-readable reason.
+    Failed(String),
+}
+
+/// Whether the requested end state already held, given a `launchctl` invocation
+/// that reported failure. `desired_loaded` is what the caller was aiming for:
+/// `true` for `bootstrap` (want it loaded), `false` for `bootout` (want it gone).
+/// `still_loaded` is the observed state *after* the call.
+///
+/// This is the load-bearing half of the classification, and it deliberately
+/// does NOT try to read meaning out of launchd's errno. On macOS 15 both
+/// idempotent no-ops collapse onto the same opaque message:
+///
+/// ```text
+/// $ launchctl bootout gui/501 …   # when not loaded
+/// Boot-out failed: 5: Input/output error
+/// $ launchctl bootstrap gui/501 … # when already loaded
+/// Bootstrap failed: 5: Input/output error
+/// ```
+///
+/// errno 5 is also what a genuine failure returns, so no amount of string or
+/// exit-code matching can separate "already in that state" from "actually
+/// broke" — the only reliable signal is to observe the end state and ask
+/// whether it is the one we wanted.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn reconcile_launchctl_failure(
+    desired_loaded: bool,
+    still_loaded: bool,
+) -> LaunchctlOutcome {
+    if desired_loaded == still_loaded {
+        // The call complained, but the world is how we wanted it. Treat the
+        // complaint as noise: a `stop` of an already-stopped service, or a
+        // `start` of an already-running one, must succeed idempotently.
+        LaunchctlOutcome::AlreadyInState
+    } else if desired_loaded {
+        LaunchctlOutcome::Failed("service did not come up".to_string())
+    } else {
+        LaunchctlOutcome::Failed("service is still loaded".to_string())
+    }
+}
+
+/// Strip launchd's boilerplate "Try re-running as root" advice from stderr so
+/// it doesn't get echoed alongside our own, more actionable hint.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn clean_launchctl_stderr(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.to_ascii_lowercase().starts_with("try re-running"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Classify a `launchctl` invocation from its raw exit code and stderr, without
+/// consulting the end state.
+///
+/// A clean exit 0 with nothing on stderr is the only unambiguous success:
+/// launchd's legacy `load`/`unload` subcommands print `Unload failed: 5:
+/// Input/output error` while *still exiting 0*, which is precisely how #4900's
+/// `service disable` came to report "Freenet service stopped." for a stop that
+/// never happened. Every other combination is provisional — the caller must
+/// resolve it against the observed end state via
+/// [`reconcile_launchctl_failure`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn classify_launchctl(code: Option<i32>, stderr: &str) -> LaunchctlOutcome {
+    let cleaned = clean_launchctl_stderr(stderr);
+
+    match code {
+        Some(0) if cleaned.is_empty() => LaunchctlOutcome::Ok,
+        // Exit 0 *with* a diagnostic: launchd lied about succeeding.
+        Some(0) => LaunchctlOutcome::Failed(cleaned),
+        Some(c) if cleaned.is_empty() => LaunchctlOutcome::Failed(format!("exit code {c}")),
+        Some(c) => LaunchctlOutcome::Failed(format!("exit code {c}: {cleaned}")),
+        // Killed by a signal.
+        None if cleaned.is_empty() => LaunchctlOutcome::Failed("terminated by signal".to_string()),
+        None => LaunchctlOutcome::Failed(format!("terminated by signal: {cleaned}")),
+    }
+}
+
+/// The launchd domain target for the current user's GUI session, e.g. `gui/501`.
+#[cfg(target_os = "macos")]
+fn gui_domain_target() -> String {
+    // SAFETY: libc::getuid is always safe; it returns the current user ID
+    // without touching user-provided pointers.
+    let uid = unsafe { libc::getuid() };
+    format!("gui/{uid}")
+}
+
+/// Whether the Freenet agent is currently present in the user's GUI domain.
+///
+/// `launchctl print` exits 0 when the service exists in the domain and non-zero
+/// (with "Could not find service ... in domain") when it does not. This is the
+/// ground truth used to disambiguate launchd's opaque errno 5 — see
+/// [`reconcile_launchctl_failure`].
+#[cfg(target_os = "macos")]
+fn service_is_loaded() -> bool {
+    std::process::Command::new("launchctl")
+        .arg("print")
+        .arg(format!("{}/org.freenet.node", gui_domain_target()))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Run `launchctl <subcommand> gui/<uid> <plist>`, then resolve the result
+/// against the observed end state.
+///
+/// `desired_loaded` is the state the caller wants to end up in: `true` for
+/// `bootstrap`, `false` for `bootout`. When launchd reports failure we re-probe
+/// the domain rather than trusting the errno, because macOS returns the same
+/// opaque `5: Input/output error` for a genuine failure and for a no-op.
+#[cfg(target_os = "macos")]
+fn run_launchctl(
+    subcommand: &str,
+    plist_path: &Path,
+    desired_loaded: bool,
+) -> Result<LaunchctlOutcome> {
+    let output = std::process::Command::new("launchctl")
+        .arg(subcommand)
+        .arg(gui_domain_target())
+        .arg(plist_path)
+        .output()
+        .with_context(|| format!("Failed to run `launchctl {subcommand}`"))?;
+
+    let outcome = classify_launchctl(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Only a clean exit is trusted outright; anything else is checked against
+    // reality before being reported to the operator as an error.
+    Ok(match outcome {
+        LaunchctlOutcome::Ok => LaunchctlOutcome::Ok,
+        LaunchctlOutcome::AlreadyInState => LaunchctlOutcome::AlreadyInState,
+        LaunchctlOutcome::Failed(reason) => {
+            match reconcile_launchctl_failure(desired_loaded, service_is_loaded()) {
+                // Genuinely failed: keep launchd's own message, which is more
+                // specific than our end-state summary.
+                LaunchctlOutcome::Failed(_) => LaunchctlOutcome::Failed(reason),
+                LaunchctlOutcome::AlreadyInState => LaunchctlOutcome::AlreadyInState,
+                LaunchctlOutcome::Ok => LaunchctlOutcome::Ok,
+            }
+        }
+    })
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn start_service(system: bool) -> Result<()> {
+    check_no_system_flag(system)?;
+    start_service_quiet(system)?;
+    println!("Freenet service started.");
+    println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
+    Ok(())
+}
+
+/// `start_service` without the user-facing success banner, so callers that
+/// know the node will not actually come up (e.g. `service disable`, which
+/// restarts the agent only so it re-reads the disable marker and parks idle)
+/// don't print "started" and a dashboard URL that nothing is listening on.
+#[cfg(target_os = "macos")]
+pub(super) fn start_service_quiet(system: bool) -> Result<()> {
     check_no_system_flag(system)?;
 
     let plist_path = dirs::home_dir()
@@ -597,23 +770,17 @@ pub(super) fn start_service(system: bool) -> Result<()> {
         anyhow::bail!("Service not installed. Run 'freenet service install' first.");
     }
 
-    let plist_path_str = plist_path
-        .to_str()
-        .context("Plist path contains invalid UTF-8")?;
-
-    let status = std::process::Command::new("launchctl")
-        .args(["load", plist_path_str])
-        .status()
-        .context("Failed to start service")?;
-
-    if status.success() {
-        println!("Freenet service started.");
-        println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
-    } else {
-        anyhow::bail!("Failed to start service");
+    // `bootstrap` (not the deprecated `load`): see stop_service for why.
+    match run_launchctl("bootstrap", &plist_path, true)? {
+        LaunchctlOutcome::Ok | LaunchctlOutcome::AlreadyInState => Ok(()),
+        LaunchctlOutcome::Failed(reason) => {
+            anyhow::bail!(
+                "Failed to start service: {reason}\n\
+                 Try `launchctl bootstrap gui/$(id -u) {}` for richer errors.",
+                plist_path.display()
+            )
+        }
     }
-
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -624,22 +791,25 @@ pub(super) fn stop_service(system: bool) -> Result<()> {
         .context("Failed to get home directory")?
         .join("Library/LaunchAgents/org.freenet.node.plist");
 
-    let plist_path_str = plist_path
-        .to_str()
-        .context("Plist path contains invalid UTF-8")?;
-
-    let status = std::process::Command::new("launchctl")
-        .args(["unload", plist_path_str])
-        .status()
-        .context("Failed to stop service")?;
-
-    if status.success() {
-        println!("Freenet service stopped.");
-    } else {
-        anyhow::bail!("Failed to stop service");
+    // `bootout`, not the deprecated `unload`: against a live agent, `unload`
+    // fails with `Unload failed: 5: Input/output error` while still exiting 0,
+    // so the service kept running and the CLI printed "stopped" anyway. The
+    // rest of the codebase already standardized on the modern domain-target
+    // subcommands — see `launch_at_login.rs::launchctl_bootout` and the
+    // `update.rs` wrapper-restart path.
+    match run_launchctl("bootout", &plist_path, false)? {
+        LaunchctlOutcome::Ok | LaunchctlOutcome::AlreadyInState => {
+            println!("Freenet service stopped.");
+            Ok(())
+        }
+        LaunchctlOutcome::Failed(reason) => {
+            anyhow::bail!(
+                "Failed to stop service: {reason}\n\
+                 Try `launchctl bootout gui/$(id -u) {}` for richer errors.",
+                plist_path.display()
+            )
+        }
     }
-
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -647,6 +817,16 @@ pub(super) fn restart_service(system: bool) -> Result<()> {
     check_no_system_flag(system)?;
     stop_service(false)?;
     start_service(false)
+}
+
+/// `restart_service` that does not claim the node came up. Used by
+/// `service disable`, where the restart exists purely so the agent re-reads
+/// the disable marker and parks in its idle state.
+#[cfg(target_os = "macos")]
+pub(super) fn restart_service_quiet(system: bool) -> Result<()> {
+    check_no_system_flag(system)?;
+    stop_service(false)?;
+    start_service_quiet(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -662,4 +842,140 @@ pub(super) fn service_logs(error_only: bool) -> Result<()> {
     };
 
     super::log_utils::tail_with_rotation(&log_dir, base_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LaunchctlOutcome, classify_launchctl, clean_launchctl_stderr, reconcile_launchctl_failure,
+    };
+
+    /// Regression pin for the #4900 report: `launchctl unload` against a live
+    /// agent printed `Unload failed: 5: Input/output error` on stderr but
+    /// still exited 0, so the CLI reported "Freenet service stopped." for a
+    /// service that was still running. Exit code alone is not a valid signal.
+    #[test]
+    fn zero_exit_with_stderr_diagnostic_is_a_failure() {
+        assert_eq!(
+            classify_launchctl(Some(0), "Unload failed: 5: Input/output error\n"),
+            LaunchctlOutcome::Failed("Unload failed: 5: Input/output error".to_string()),
+            "a launchctl diagnostic on stderr must not be reported as success"
+        );
+    }
+
+    #[test]
+    fn clean_zero_exit_is_ok() {
+        assert_eq!(classify_launchctl(Some(0), ""), LaunchctlOutcome::Ok);
+        // Whitespace-only stderr, and launchd's boilerplate root advice, both
+        // count as "no diagnostic".
+        assert_eq!(classify_launchctl(Some(0), "  \n\t "), LaunchctlOutcome::Ok);
+        assert_eq!(
+            classify_launchctl(
+                Some(0),
+                "Try re-running the command as root for richer errors."
+            ),
+            LaunchctlOutcome::Ok
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_carries_code_and_cleaned_reason() {
+        assert_eq!(
+            classify_launchctl(Some(5), "Boot-out failed: 5: Input/output error"),
+            LaunchctlOutcome::Failed("exit code 5: Boot-out failed: 5: Input/output error".into())
+        );
+        assert_eq!(
+            classify_launchctl(Some(1), ""),
+            LaunchctlOutcome::Failed("exit code 1".to_string())
+        );
+    }
+
+    /// `None` means killed by a signal — never success.
+    #[test]
+    fn signal_termination_is_a_failure() {
+        assert_eq!(
+            classify_launchctl(None, ""),
+            LaunchctlOutcome::Failed("terminated by signal".to_string())
+        );
+        assert_eq!(
+            classify_launchctl(None, "partial output"),
+            LaunchctlOutcome::Failed("terminated by signal: partial output".to_string())
+        );
+    }
+
+    /// launchd's "Try re-running the command as root" line is boilerplate that
+    /// appears on every failure; echoing it would crowd out our own, more
+    /// actionable `launchctl bootout gui/$(id -u) <plist>` hint.
+    #[test]
+    fn root_advice_boilerplate_is_stripped() {
+        assert_eq!(
+            clean_launchctl_stderr(
+                "Boot-out failed: 5: Input/output error\n\
+                 Try re-running the command as root for richer errors.\n"
+            ),
+            "Boot-out failed: 5: Input/output error"
+        );
+        // Matching is case-insensitive and survives leading whitespace.
+        assert_eq!(clean_launchctl_stderr("   TRY RE-RUNNING as root\n"), "");
+        // Multiple real diagnostics are preserved, joined readably.
+        assert_eq!(
+            clean_launchctl_stderr("first problem\nsecond problem\n"),
+            "first problem; second problem"
+        );
+    }
+
+    /// The core of the fix. On macOS 15 an idempotent no-op and a genuine
+    /// failure are indistinguishable by errno — `bootout` when not loaded and
+    /// `bootstrap` when already loaded BOTH return `5: Input/output error`,
+    /// the same code a real failure returns. Only the observed end state can
+    /// tell them apart.
+    #[test]
+    fn end_state_matching_desire_is_an_idempotent_no_op() {
+        // `stop` (want unloaded) on an already-stopped service.
+        assert_eq!(
+            reconcile_launchctl_failure(false, false),
+            LaunchctlOutcome::AlreadyInState
+        );
+        // `start` (want loaded) on an already-running service.
+        assert_eq!(
+            reconcile_launchctl_failure(true, true),
+            LaunchctlOutcome::AlreadyInState
+        );
+    }
+
+    #[test]
+    fn end_state_contradicting_desire_is_a_real_failure() {
+        // Wanted it gone, it is still there.
+        assert_eq!(
+            reconcile_launchctl_failure(false, true),
+            LaunchctlOutcome::Failed("service is still loaded".to_string())
+        );
+        // Wanted it up, it did not come up.
+        assert_eq!(
+            reconcile_launchctl_failure(true, false),
+            LaunchctlOutcome::Failed("service did not come up".to_string())
+        );
+    }
+
+    /// Guard against a tempting "simplification": reading errno 5 as
+    /// already-in-state. That would silently convert a genuine stop failure
+    /// (service still running) into a reported success — reintroducing the
+    /// exact #4900 symptom through a different door.
+    #[test]
+    fn errno_five_alone_must_not_imply_already_in_state() {
+        let stderr = "Boot-out failed: 5: Input/output error";
+        // Same stderr, same exit code, opposite verdicts — driven purely by
+        // the end state. Any classifier keying on the message would be wrong
+        // for one of these two cases.
+        assert_eq!(
+            reconcile_launchctl_failure(false, false),
+            LaunchctlOutcome::AlreadyInState,
+            "not loaded after bootout: {stderr} is noise"
+        );
+        assert_eq!(
+            reconcile_launchctl_failure(false, true),
+            LaunchctlOutcome::Failed("service is still loaded".to_string()),
+            "still loaded after bootout: {stderr} is a real failure"
+        );
+    }
 }

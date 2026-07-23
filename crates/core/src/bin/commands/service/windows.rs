@@ -165,6 +165,18 @@ pub(super) fn service_status(system: bool) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub(super) fn start_service(system: bool) -> Result<()> {
+    start_service_quiet(system)?;
+    println!("Freenet started.");
+    println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
+    Ok(())
+}
+
+/// `start_service` without the user-facing success banner, for callers that
+/// know the node will not actually come up — `service disable` restarts the
+/// wrapper only so it re-reads the disable marker and parks idle, so
+/// announcing a dashboard URL that nothing is listening on would be a lie.
+#[cfg(target_os = "windows")]
+pub(super) fn start_service_quiet(system: bool) -> Result<()> {
     check_no_system_flag_windows(system)?;
 
     let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
@@ -183,9 +195,6 @@ pub(super) fn start_service(system: bool) -> Result<()> {
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .context("Failed to start Freenet")?;
-
-    println!("Freenet started.");
-    println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
 
     Ok(())
 }
@@ -394,6 +403,16 @@ pub(super) fn restart_service(system: bool) -> Result<()> {
     // Give it a moment to stop
     std::thread::sleep(std::time::Duration::from_secs(2));
     start_service(false)
+}
+
+/// `restart_service` without the "started" banner. See `start_service_quiet`.
+#[cfg(target_os = "windows")]
+pub(super) fn restart_service_quiet(system: bool) -> Result<()> {
+    check_no_system_flag_windows(system)?;
+    drop(stop_service(false));
+    // Give it a moment to stop
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    start_service_quiet(false)
 }
 
 #[cfg(target_os = "windows")]
