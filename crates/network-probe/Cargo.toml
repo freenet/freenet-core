@@ -1,0 +1,22 @@
+[package]
+name = "network-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Nightly probe against the production Freenet network: cross-peer PUT/GET and multi-day retention checks (#4665)"
+
+[dependencies]
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+freenet-stdlib = { workspace = true, features = ["net"] }
+hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+x25519-dalek = { workspace = true }
