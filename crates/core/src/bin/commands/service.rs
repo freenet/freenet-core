@@ -349,6 +349,25 @@ fn restart_service(system: bool) -> Result<()> {
     windows::restart_service(system)
 }
 
+/// Restart the service without announcing that the node came up.
+///
+/// `disable_daemon` restarts the service purely so the supervisor re-reads the
+/// disable marker and the node parks in its idle state. The normal
+/// `restart_service` ends by printing "started" plus the dashboard URL, which
+/// is false there: nothing is listening on 7509 once the marker is honored.
+#[cfg(target_os = "linux")]
+fn restart_service_quiet(system: bool) -> Result<()> {
+    linux::restart_service_quiet(system)
+}
+#[cfg(target_os = "macos")]
+fn restart_service_quiet(system: bool) -> Result<()> {
+    macos::restart_service_quiet(system)
+}
+#[cfg(target_os = "windows")]
+fn restart_service_quiet(system: bool) -> Result<()> {
+    windows::restart_service_quiet(system)
+}
+
 #[cfg(target_os = "linux")]
 fn service_logs(error_only: bool) -> Result<()> {
     linux::service_logs(error_only)
@@ -403,8 +422,14 @@ fn disable_daemon(system: bool, config_dirs: &ConfigPaths) -> Result<()> {
     // The supervisor stays alive; only the node child goes idle. If no service
     // is installed/running, say so rather than failing the command — the marker
     // is written and will take effect the next time the node starts.
-    match restart_service(system) {
-        Ok(()) => {}
+    //
+    // Deliberately the *quiet* restart: the normal one signs off with "started"
+    // and a dashboard URL, which is exactly wrong here — the node comes back up
+    // only to read the marker and park idle, with nothing listening on 7509.
+    match restart_service_quiet(system) {
+        Ok(()) => {
+            println!("Service restarted; the node is now idle and off the network.");
+        }
         Err(e) => {
             println!(
                 "Note: could not restart the running service ({e}). The daemon will enter its \
@@ -539,6 +564,11 @@ fn stop_service(_system: bool) -> Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn restart_service(_system: bool) -> Result<()> {
+    anyhow::bail!("Service management is not supported on this platform")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn restart_service_quiet(_system: bool) -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
