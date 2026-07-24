@@ -2953,7 +2953,10 @@ mod tests {
     /// anyone's computed upstream.
     fn seed_location_and_one_connection(op_manager: &OpManager) {
         let self_addr: std::net::SocketAddr = "127.0.0.1:12000".parse().unwrap();
-        op_manager.ring.connection_manager.set_own_addr(self_addr);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(self_addr);
         assert!(
             op_manager
                 .ring
@@ -3032,7 +3035,10 @@ mod tests {
         // Own address. The UPDATE sender is a DIFFERENT peer, so the self/sender
         // echo-skip never applies to A or B below.
         let self_addr: std::net::SocketAddr = "127.0.0.1:12000".parse().unwrap();
-        op_manager.ring.connection_manager.set_own_addr(self_addr);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(self_addr);
         let sender_addr: std::net::SocketAddr = "127.0.0.1:20000".parse().unwrap();
 
         let key = reroot_contract_key(0x5A);

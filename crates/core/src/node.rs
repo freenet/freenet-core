@@ -4484,7 +4484,7 @@ mod tests {
         op_manager
             .ring
             .connection_manager
-            .set_own_addr("127.0.0.1:14000".parse().unwrap());
+            .set_own_addr_local_for_test("127.0.0.1:14000".parse().unwrap());
 
         // Attach an EMPTY redb hosting store so `contract_state_present`
         // returns false for unknown keys (a fresh store creates the STATE
@@ -4589,7 +4589,7 @@ mod tests {
         op_manager
             .ring
             .connection_manager
-            .set_own_addr("127.0.0.1:14100".parse().unwrap());
+            .set_own_addr_local_for_test("127.0.0.1:14100".parse().unwrap());
 
         // The one contract we DO hold.
         let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
@@ -4732,7 +4732,7 @@ mod tests {
         op_manager
             .ring
             .connection_manager
-            .set_own_addr("127.0.0.1:14200".parse().unwrap());
+            .set_own_addr_local_for_test("127.0.0.1:14200".parse().unwrap());
 
         // Stand-in contract handler: flips `update_query_seen` to true if it EVER
         // receives an UpdateQuery (proof the WASM-apply path was entered),
@@ -4861,7 +4861,7 @@ mod tests {
         op_manager
             .ring
             .connection_manager
-            .set_own_addr("127.0.0.1:14300".parse().unwrap());
+            .set_own_addr_local_for_test("127.0.0.1:14300".parse().unwrap());
 
         // Stand-in contract handler: answers UpdateQuery with a SUCCESSFUL,
         // state-changed merge (mirrors the ResyncResponse arm's

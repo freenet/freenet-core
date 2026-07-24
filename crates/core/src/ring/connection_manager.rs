@@ -1649,6 +1649,27 @@ impl ConnectionManager {
         );
     }
 
+    /// Set only the local `own_addr`, WITHOUT mirroring to the process-global
+    /// `network_status::external_address`.
+    ///
+    /// For tests that need routing to know this node's address but do not
+    /// exercise the external-address mirror. The full [`Self::set_own_addr`]
+    /// writes a `OnceLock`-backed process global shared by every test in the
+    /// binary; a test that calls it must hold
+    /// [`crate::node::network_status::TEST_GLOBAL_STATE_LOCK`], or it races the
+    /// `set_own_addr` atomicity regression test
+    /// (`test_set_own_addr_atomic_with_network_status`) under `cargo test`'s
+    /// shared-process model. Using this local-only setter sidesteps that
+    /// coupling entirely — the write never touches the global, so there is
+    /// nothing to serialize. See issue #4918.
+    ///
+    /// `test_no_test_calls_global_set_own_addr` pins that the test files which
+    /// previously raced use this helper and not the mirroring setter.
+    #[cfg(test)]
+    pub(crate) fn set_own_addr_local_for_test(&self, addr: SocketAddr) {
+        *self.own_addr.lock() = Some(addr);
+    }
+
     pub fn prune_alive_connection(&self, addr: SocketAddr) -> Option<Location> {
         self.prune_connection(addr, true)
     }
@@ -3643,10 +3664,16 @@ mod tests {
         // global races this one's `assert_eq!`. (CI's `cargo nextest` masks
         // the race with per-process isolation; `cargo test` does not.)
         //
-        // `connection_manager`'s `test_try_set_own_addr_*` tests and every
-        // test in `node::network_status` also touch this global. They are all
-        // serialized by the crate-wide `TEST_GLOBAL_STATE_LOCK`, which this
-        // test acquires below for its entire body.
+        // Other writers of this global — `connection_manager`'s
+        // `test_try_set_own_addr_*` tests and every `node::network_status`
+        // test — take the crate-wide `TEST_GLOBAL_STATE_LOCK`, which this test
+        // holds for its entire body. Tests that only need routing to know
+        // their address (resync/eviction tests in `node.rs`, `ring.rs`,
+        // `node/op_state_manager.rs`) do NOT write the global at all: they use
+        // `ConnectionManager::set_own_addr_local_for_test`, so they cannot race
+        // this assertion. `test_no_test_calls_global_set_own_addr` pins that.
+        // (Before #4918 those tests used the mirroring `set_own_addr` without
+        // the lock and flaked this test ~1 run in 3 under `cargo test`.)
         //
         // `network_status::set_external_address` is a no-op until `init()` has
         // run. `init()` is idempotent-overwrite (installs the tracker on the
@@ -3716,6 +3743,58 @@ mod tests {
         drop(_global);
         if let Some(msg) = divergence {
             panic!("{msg}");
+        }
+    }
+
+    /// Guard for #4918: tests that only need routing to know their address
+    /// must NOT call the mirroring [`ConnectionManager::set_own_addr`], which
+    /// writes the process-global `network_status::external_address` and races
+    /// `test_set_own_addr_atomic_with_network_status` unless serialized by
+    /// `TEST_GLOBAL_STATE_LOCK`.
+    ///
+    /// This is a SOURCE-SCRAPE guard on purpose. The race only manifests under
+    /// `cargo test`'s shared-process model; CI's `cargo nextest` gives every
+    /// test its own process and masks it. A behavioural test therefore could
+    /// not catch a regression in CI — but this scrape runs deterministically
+    /// under both runners, so it does.
+    ///
+    /// The three scanned files hold `set_own_addr` calls only in test code
+    /// (production own-address writes live in `operations/` and node startup).
+    /// If a genuine production need for the mirroring setter ever arises in one
+    /// of them, this test will fail loudly — that is the intended prompt to
+    /// consider the global-state coupling, not a reason to weaken the guard.
+    #[test]
+    fn test_no_test_calls_global_set_own_addr() {
+        // Paths are relative to THIS file (`src/ring/connection_manager.rs`).
+        let files = [
+            ("node.rs", include_str!("../node.rs")),
+            ("ring.rs", include_str!("../ring.rs")),
+            (
+                "node/op_state_manager.rs",
+                include_str!("../node/op_state_manager.rs"),
+            ),
+        ];
+        // `.set_own_addr(` requires `(` immediately after the name, so it does
+        // NOT match `.set_own_addr_local_for_test(`.
+        const BARE: &str = ".set_own_addr(";
+        for (name, src) in files {
+            assert!(
+                !src.contains(BARE),
+                "{name} calls the mirroring `set_own_addr`, which writes the \
+                 process-global external_address and races \
+                 test_set_own_addr_atomic_with_network_status under `cargo \
+                 test`. Use `set_own_addr_local_for_test` for tests that only \
+                 need routing to know the address, or hold \
+                 TEST_GLOBAL_STATE_LOCK if the global mirror is genuinely \
+                 required. See #4918."
+            );
+            // ...and confirm the safe helper is actually the one in use, so a
+            // future edit can't quietly drop address-setting and pass vacuously.
+            assert!(
+                src.contains(".set_own_addr_local_for_test("),
+                "{name} should set own address via set_own_addr_local_for_test \
+                 (see #4918)"
+            );
         }
     }
 
