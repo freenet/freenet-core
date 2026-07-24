@@ -526,14 +526,7 @@ pub(crate) enum TimeoutCause {
     Deadline,
     /// Streaming PUT: no fragment arrived for a whole
     /// [`STREAM_OP_INACTIVITY_TIMEOUT`] window (a confirmed stall).
-    ///
-    /// Carries the silence actually observed. This is NOT always the nominal
-    /// window: an atomic-tiebreak `continue` restarts a full window from the
-    /// current instant rather than from the last fragment, so a confirmed
-    /// stall is declared somewhere in `[window, 2 * window)`. Logging the flat
-    /// nominal value would understate the wait by up to 2x — a smaller version
-    /// of the very misreport this enum exists to fix.
-    StreamStall { silent_for: std::time::Duration },
+    StreamStall,
     /// Streaming PUT: the hard [`STREAMING_ATTEMPT_TIMEOUT_CAP`] ceiling was
     /// reached while fragments were still dribbling in.
     StreamCeiling,
@@ -546,41 +539,28 @@ impl TimeoutCause {
     /// queries). Treat a rename as a breaking change; the values are pinned by
     /// `attempt_timeout_budget_matches_the_condition_that_fired`.
     pub(crate) fn label(self) -> &'static str {
+        // Exhaustive on purpose: a catch-all would silently give a future
+        // variant the wrong label, which is the class of bug this whole type
+        // exists to prevent (and the codebase bans wildcard arms in
+        // classification code for exactly that reason).
         match self {
             Self::Deadline => "attempt_deadline",
-            Self::StreamStall { .. } => "stream_stall",
+            Self::StreamStall => "stream_stall",
             Self::StreamCeiling => "stream_ceiling",
         }
     }
 
     /// The configured bound that governed this attempt.
     ///
-    /// Only [`Self::Deadline`] is bounded by the driver's `attempt_timeout`;
-    /// the two streaming variants are bounded by their own constants. Logging
+    /// This is the RULE that fired, not a measurement: how long the attempt
+    /// actually ran is logged separately as `elapsed_secs`. Only
+    /// [`Self::Deadline`] is bounded by the driver's `attempt_timeout`; the two
+    /// streaming variants are bounded by their own constants. Logging
     /// `attempt_timeout` for those is what made #4912 hard to read.
     fn budget(self, attempt_timeout: std::time::Duration) -> std::time::Duration {
         match self {
             Self::Deadline => attempt_timeout,
-            Self::StreamStall { .. } => {
-                crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT
-            }
-            Self::StreamCeiling => crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
-        }
-    }
-
-    /// How long the attempt actually ran before being abandoned.
-    ///
-    /// `Deadline` and `StreamCeiling` fire exactly at their bound, so observed
-    /// equals budget. A stall is the one case where they diverge (see
-    /// [`Self::StreamStall`]), which is why it carries a measured value.
-    fn observed(self, attempt_timeout: std::time::Duration) -> std::time::Duration {
-        // Exhaustive on purpose: a catch-all would silently give a future
-        // variant the wrong observed value, which is the class of bug this
-        // whole type exists to prevent (and the codebase bans wildcard arms
-        // in classification code for exactly that reason).
-        match self {
-            Self::StreamStall { silent_for } => silent_for,
-            Self::Deadline => attempt_timeout,
+            Self::StreamStall => crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT,
             Self::StreamCeiling => crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
         }
     }
@@ -652,11 +632,7 @@ async fn await_streaming_attempt(
                 if elapsed < STREAM_OP_INACTIVITY_TIMEOUT {
                     continue;
                 }
-                // Report the silence we actually measured, not the nominal
-                // window: a tiebreak `continue` restarts a full window from
-                // now rather than from the last fragment, so `elapsed` can be
-                // up to 2x the window by the time a stall is confirmed.
-                return Err(TimeoutCause::StreamStall { silent_for: elapsed });
+                return Err(TimeoutCause::StreamStall);
             }
         }
     }
@@ -697,6 +673,15 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
         let request = driver.build_request(attempt_tx);
 
         let attempt_timeout = driver.attempt_timeout();
+        // Measure how long the attempt really runs, so the log carries an
+        // observation and not just the rule that fired. Deriving elapsed from
+        // the cause would repeat #4912's mistake in miniature: a stall's
+        // inactivity window is not the attempt's duration (a stream can make
+        // progress for 40 s and then stall for 30 s, a 70 s attempt).
+        // `tokio::time::Instant` is auto-paused under `start_paused(true)`, so
+        // simulation tests see virtual elapsed time — same reasoning as
+        // `subscribe/op_ctx_task.rs`'s `request_sent_at`.
+        let attempt_started = tokio::time::Instant::now();
         let mut ctx = op_manager.op_ctx(attempt_tx);
 
         // `round_trip: Result<Result<NetMessage, OpError>, TimeoutCause>` —
@@ -798,7 +783,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     outcome = "timeout",
                     timeout_kind = cause.label(),
                     timeout_secs = cause.budget(attempt_timeout).as_secs(),
-                    elapsed_secs = cause.observed(attempt_timeout).as_secs(),
+                    elapsed_secs = attempt_started.elapsed().as_secs(),
                     "{op_label}: attempt timed out; advancing"
                 );
                 match driver.advance() {
@@ -2207,16 +2192,10 @@ mod tests {
         // Assert the CAUSE, not merely that it failed: a stall reported as a
         // ceiling (or vice versa) is the same class of misattribution #4912 is
         // about, and `is_err()` alone would not notice the two being swapped.
-        let cause = result.expect_err("a stalled stream must time out");
-        let TimeoutCause::StreamStall { silent_for } = cause else {
-            panic!("a stalled stream must be attributed to StreamStall, got {cause:?}");
-        };
-        // The reported silence must be a real measurement covering at least the
-        // window, not the nominal constant echoed back.
-        assert!(
-            silent_for >= STREAM_OP_INACTIVITY_TIMEOUT,
-            "reported silence must cover at least one full inactivity window, \
-             got {silent_for:?}"
+        assert_eq!(
+            result.err(),
+            Some(TimeoutCause::StreamStall),
+            "a stalled stream must be attributed to StreamStall"
         );
         // Stall detected after 40 s progress + 30 s silence ≈ 70 s, and well
         // before the 600 s ceiling.
@@ -2372,9 +2351,10 @@ mod tests {
     ///
     /// Before the fix all three conditions collapsed to `Err(())` and the
     /// shared warning logged `attempt_timeout` unconditionally. On the nova
-    /// gateway that printed `timeout_secs=117` for an attempt a 30 s stream
-    /// stall had abandoned — a 4x discrepancy with nothing in the log to
-    /// explain it, which sent the investigation after the wrong mechanism.
+    /// gateway that printed `timeout_secs=117` for an attempt the 30 s stream
+    /// inactivity check had abandoned after 30.001 s, with nothing in the log
+    /// to explain the gap, which sent the investigation after the wrong
+    /// mechanism.
     #[test]
     fn attempt_timeout_budget_matches_the_condition_that_fired() {
         use crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
@@ -2383,11 +2363,6 @@ mod tests {
         // A deliberately distinctive value so a mix-up is unambiguous, and
         // one that matches neither streaming constant.
         let attempt_timeout = Duration::from_secs(117);
-        // A silence longer than the nominal window, which is what a real
-        // tiebreak-extended stall looks like.
-        let stall = TimeoutCause::StreamStall {
-            silent_for: Duration::from_secs(47),
-        };
 
         assert_eq!(
             TimeoutCause::Deadline.budget(attempt_timeout),
@@ -2395,7 +2370,7 @@ mod tests {
             "the fixed-deadline path IS bounded by attempt_timeout"
         );
         assert_eq!(
-            stall.budget(attempt_timeout),
+            TimeoutCause::StreamStall.budget(attempt_timeout),
             STREAM_OP_INACTIVITY_TIMEOUT,
             "a stream stall is bounded by the inactivity window, NOT attempt_timeout"
         );
@@ -2408,46 +2383,17 @@ mod tests {
         // The specific #4912 misreport: a stall must never be described
         // using the driver's per-attempt budget.
         assert_ne!(
-            stall.budget(attempt_timeout),
+            TimeoutCause::StreamStall.budget(attempt_timeout),
             attempt_timeout,
             "#4912 regression: a 30s stream stall reported as a 117s \
              attempt deadline is exactly the misattribution this fixes"
-        );
-
-        // `observed` is the measured wait, which for a stall is NOT the
-        // nominal window. Deadline/ceiling fire exactly at their bound, so for
-        // those the two coincide.
-        assert_eq!(
-            stall.observed(attempt_timeout),
-            Duration::from_secs(47),
-            "a stall must report the silence it actually measured"
-        );
-        assert_ne!(
-            stall.observed(attempt_timeout),
-            stall.budget(attempt_timeout),
-            "a tiebreak-extended stall runs longer than the nominal window; \
-             collapsing observed onto budget would understate it by up to 2x"
-        );
-        assert_eq!(
-            TimeoutCause::Deadline.observed(attempt_timeout),
-            attempt_timeout
-        );
-        assert_eq!(
-            TimeoutCause::StreamCeiling.observed(attempt_timeout),
-            STREAMING_ATTEMPT_TIMEOUT_CAP
         );
 
         // Pin the label VALUES, not just their uniqueness. These strings are an
         // operator-facing interface: a silent rename breaks every saved log
         // filter and dashboard query built on `timeout_kind`.
         assert_eq!(TimeoutCause::Deadline.label(), "attempt_deadline");
-        assert_eq!(
-            TimeoutCause::StreamStall {
-                silent_for: Duration::from_secs(30)
-            }
-            .label(),
-            "stream_stall"
-        );
+        assert_eq!(TimeoutCause::StreamStall.label(), "stream_stall");
         assert_eq!(TimeoutCause::StreamCeiling.label(), "stream_ceiling");
     }
 
@@ -2488,8 +2434,8 @@ mod tests {
             .expect("the inactivity select arm must exist");
         let stall_arm = &body[stall_arm_start..];
         assert!(
-            stall_arm.contains("Err(TimeoutCause::StreamStall {"),
-            "the confirmed-stall arm must report StreamStall with its measured silence"
+            stall_arm.contains("Err(TimeoutCause::StreamStall)"),
+            "the confirmed-stall arm must report StreamStall"
         );
         assert!(
             !stall_arm.contains("StreamCeiling"),
@@ -2538,6 +2484,15 @@ mod tests {
             !window.contains("timeout_secs = attempt_timeout.as_secs()"),
             "#4912 regression: logging attempt_timeout unconditionally \
              misreports streaming stalls/ceilings by up to 20x"
+        );
+        // `elapsed_secs` must be a MEASUREMENT. Deriving it from the cause
+        // would repeat the same mistake one level down: a stall's inactivity
+        // window is not the attempt's duration (40 s of progress then a 30 s
+        // stall is a 70 s attempt that would be logged as 30).
+        assert!(
+            window.contains("elapsed_secs = attempt_started.elapsed()"),
+            "elapsed_secs MUST come from the measured attempt clock, not from \
+             the timeout cause"
         );
     }
 }
