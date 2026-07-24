@@ -124,6 +124,48 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         String::new()
     };
 
+    // Contract-handler queue occupancy (#4917). Every client operation passes
+    // through this queue on its way to the single-threaded WASM executor, so a
+    // sustained backlog here is what a user experiences as a slow or
+    // timed-out request — the #4912 failure mode, where a client PUT waited
+    // ~2 minutes behind it with no way to see the queue at all.
+    //
+    // Hidden while the queue has never been used AND has never rejected
+    // anything, so an idle node shows nothing. `high_water` is the load-bearing
+    // number: this page is polled, and a burst between two polls would leave
+    // no trace in the instantaneous depth.
+    let fair_queue_html = if snap.fair_queue.high_water > 0
+        || snap.fair_queue.rejected_global_capacity > 0
+        || snap.fair_queue.rejected_per_contract > 0
+    {
+        format!(
+            r#"<div class="metrics-row">
+            <div class="metric-tile">
+                <span class="metric-value">{depth}</span>
+                <span class="metric-label">Queue depth</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{high_water}</span>
+                <span class="metric-label">Peak depth</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{rejected_capacity}</span>
+                <span class="metric-label">Queue-full rejects</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{shed}</span>
+                <span class="metric-label">Background shed</span>
+            </div>
+        </div>"#,
+            depth = snap.fair_queue.depth_total,
+            high_water = snap.fair_queue.high_water,
+            rejected_capacity = snap.fair_queue.rejected_global_capacity,
+            shed = snap.fair_queue.background_shed,
+        )
+    } else {
+        String::new()
+    };
+
     // Nearest-neighbor ring lattice completeness. A peer with BOTH a successor
     // (closest-higher) and predecessor (closest-lower) ring edge has the base
     // lattice greedy routing needs. Shown once the node has any connections.
@@ -284,6 +326,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             {ring_stats_html}
             {lattice_html}
             {rate_limit_html}
+            {fair_queue_html}
             {external_addr_html}
             {spinner}
             {gateway_warning}
@@ -294,6 +337,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         ring_stats_html = ring_stats_html,
         lattice_html = lattice_html,
         rate_limit_html = rate_limit_html,
+        fair_queue_html = fair_queue_html,
         external_addr_html = external_addr_html,
         spinner = spinner,
         gateway_warning = gateway_warning,

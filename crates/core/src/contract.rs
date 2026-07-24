@@ -11,6 +11,10 @@ pub(crate) mod delegate_app_registry;
 mod executor;
 mod fair_queue;
 pub(crate) use fair_queue::Priority;
+/// Fair-queue occupancy for the status snapshot (#4917). Re-exported rather
+/// than widening `fair_queue` itself, which is otherwise private to this
+/// module.
+pub(crate) use fair_queue::{FairQueueStats, global_stats as fair_queue_stats};
 pub(crate) mod governance;
 mod handler;
 pub mod storages;

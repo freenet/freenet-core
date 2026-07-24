@@ -1336,6 +1336,11 @@ pub struct NetworkStatusSnapshot {
     pub health: HealthLevel,
     /// Live ring-level statistics: connection count, hosted contracts.
     pub ring_stats: RingStatsSnapshot,
+    /// Contract-handler fair-queue occupancy (#4917). Read from the queue's own
+    /// gauge at snapshot time rather than mirrored into `NetworkStatus`, so it
+    /// cannot drift from the canonical value the way a hand-maintained counter
+    /// does (`.claude/rules/bug-prevention-patterns.md`, #4009 / #4010).
+    pub fair_queue: crate::contract::FairQueueStats,
     /// Period transport metrics (current values, not reset on read).
     pub transport_snapshot: TransportSnapshot,
     /// Per-contract governance state (Phase 4). The dashboard's
@@ -1873,6 +1878,9 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
             .as_ref()
             .map(|provider| provider())
             .unwrap_or_default(),
+        // Read straight from the queue's gauge — no provider registration and
+        // no mirrored counter to keep in sync (#4917).
+        fair_queue: crate::contract::fair_queue_stats(),
     })
 }
 

@@ -227,6 +227,7 @@ mod tests {
             bytes_downloaded: 0,
             health: HealthLevel::Connecting,
             ring_stats: RingStatsSnapshot::default(),
+            fair_queue: Default::default(),
             transport_snapshot: TransportSnapshot::default(),
             governance: Default::default(),
             ban_list: Default::default(),
@@ -604,6 +605,40 @@ mod tests {
         assert!(
             !html.contains("Rate-limited"),
             "rate-limit row should be hidden when the limiter has seen no traffic"
+        );
+    }
+
+    #[test]
+    fn fair_queue_stats_hidden_when_queue_never_used() {
+        // An idle node must not render the queue row — same
+        // uncluttered-dashboard rule as the rate limiter above.
+        let snap = base_snapshot();
+        assert_eq!(snap.fair_queue.high_water, 0);
+        let html = build_status_card(&Some(snap));
+        assert!(
+            !html.contains("Queue depth"),
+            "queue row should be hidden until the queue has been used"
+        );
+    }
+
+    #[test]
+    fn fair_queue_stats_rendered_after_backlog_even_once_drained() {
+        // The #4912 case: a burst that has since drained. Instantaneous depth
+        // is back to 0, so ONLY `high_water` reveals that the executor was
+        // ever backed up — a polled dashboard would otherwise show nothing.
+        let mut snap = base_snapshot();
+        snap.fair_queue.depth_total = 0;
+        snap.fair_queue.high_water = 4096;
+        snap.fair_queue.rejected_global_capacity = 17;
+        let html = build_status_card(&Some(snap));
+        assert!(html.contains("Peak depth"), "peak-depth label missing");
+        assert!(
+            html.contains("4096</span>"),
+            "peak depth must be shown even though the queue has since drained"
+        );
+        assert!(
+            html.contains("Queue-full rejects") && html.contains("17</span>"),
+            "queue-full reject count missing"
         );
     }
 
