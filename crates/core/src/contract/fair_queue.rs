@@ -385,6 +385,33 @@ impl FairEventQueue {
         }
     }
 
+    /// Count an admission failure that the caller could NOT recover from, i.e.
+    /// one that actually sent the client a queue-full response.
+    ///
+    /// Deliberately separate from [`Self::try_push`]: a `GlobalCapacity`
+    /// failure there is often recoverable — `push_with_background_eviction`
+    /// sheds `Background` work and retries, and the event is admitted. Counting
+    /// at the `try_push` failure would report a "reject" for an operation that
+    /// in fact succeeded, overstating client-visible failures on the dashboard.
+    /// Only the caller knows which failures were terminal, so it says so.
+    ///
+    /// `Evicted` is not an admission failure — a shed `Background` event is
+    /// counted by [`Self::evict_background`] and re-emits on its next cycle.
+    pub(super) fn record_terminal_rejection(&mut self, reason: RejectReason) {
+        match reason {
+            RejectReason::GlobalCapacity => {
+                self.counters.rejected_global_capacity =
+                    self.counters.rejected_global_capacity.saturating_add(1);
+            }
+            RejectReason::PerContract => {
+                self.counters.rejected_per_contract =
+                    self.counters.rejected_per_contract.saturating_add(1);
+            }
+            RejectReason::Evicted => return,
+        }
+        self.publish();
+    }
+
     /// Mirror [`Self::stats`] into the process-global gauge, and emit one WARN
     /// the first time occupancy crosses each [`DEPTH_WARN_BANDS`] threshold.
     ///
@@ -446,9 +473,6 @@ impl FairEventQueue {
     ) -> Result<(), Box<RejectedEvent>> {
         // Hard global cap — never exceeded by any class.
         if self.total_queued >= MAX_TOTAL_FAIR_QUEUE {
-            self.counters.rejected_global_capacity =
-                self.counters.rejected_global_capacity.saturating_add(1);
-            self.publish();
             return Err(Box::new(RejectedEvent {
                 id,
                 event,
@@ -463,9 +487,6 @@ impl FairEventQueue {
         // Background (a GlobalCapacity rejection is eviction-recoverable).
         let soft_cap = MAX_TOTAL_FAIR_QUEUE - CLIENT_LOCAL_RESERVE;
         if priority < Priority::ClientLocal && self.total_queued >= soft_cap {
-            self.counters.rejected_global_capacity =
-                self.counters.rejected_global_capacity.saturating_add(1);
-            self.publish();
             return Err(Box::new(RejectedEvent {
                 id,
                 event,
@@ -478,9 +499,6 @@ impl FairEventQueue {
         // original flat queue but now scoped to the tier). Evicting Background
         // cannot help here, so this is flagged PerContract.
         if self.tier(priority).len_for(&event) >= MAX_QUEUED_PER_CONTRACT {
-            self.counters.rejected_per_contract =
-                self.counters.rejected_per_contract.saturating_add(1);
-            self.publish();
             return Err(Box::new(RejectedEvent {
                 id,
                 event,
@@ -1752,13 +1770,23 @@ mod tests {
                 )
                 .expect("under per-contract cap");
         }
-        queue
+        let rejected = queue
             .try_push(
                 make_event_id(9999),
                 make_get_event(hot),
                 Priority::NetworkRelay,
             )
             .expect_err("at per-contract cap");
+        assert_eq!(
+            queue.stats().rejected_per_contract,
+            0,
+            "try_push alone must not count: only the caller knows whether the \
+             failure was terminal"
+        );
+
+        // The caller finds eviction cannot help a per-contract cap, so this is
+        // terminal and a queue-full response goes to the client.
+        queue.record_terminal_rejection(rejected.reason);
 
         let s = queue.stats();
         assert_eq!(s.rejected_per_contract, 1);
@@ -1766,6 +1794,61 @@ mod tests {
             s.rejected_global_capacity, 0,
             "a single contract hitting its own cap is not global backpressure; \
              conflating the two would misdiagnose the node as saturated"
+        );
+    }
+
+    #[test]
+    fn recovered_capacity_hit_is_not_counted_as_a_rejection() {
+        // The `push_with_background_eviction` flow: a foreground push hits the
+        // soft cap, Background is shed, the retry succeeds. The client never
+        // saw an error, so the dashboard must not report a reject — that would
+        // overstate client-visible failures.
+        let mut queue = FairEventQueue::new();
+        let soft_cap = MAX_TOTAL_FAIR_QUEUE - CLIENT_LOCAL_RESERVE;
+        let mut pushed = 0usize;
+        let mut seed = 0u32;
+        while pushed < soft_cap {
+            let cid = make_contract_id_u32(seed);
+            seed += 1;
+            for _ in 0..MAX_QUEUED_PER_CONTRACT.min(soft_cap - pushed) {
+                queue
+                    .try_push(
+                        make_event_id(pushed as u64),
+                        make_get_event(cid),
+                        Priority::Background,
+                    )
+                    .expect("under soft cap");
+                pushed += 1;
+            }
+        }
+
+        let fresh = make_contract_id_u32(seed);
+        let rejected = queue
+            .try_push(
+                make_event_id(u64::MAX),
+                make_get_event(fresh),
+                Priority::NetworkRelay,
+            )
+            .expect_err("soft cap reached");
+        assert_eq!(rejected.reason, RejectReason::GlobalCapacity);
+
+        // Caller sheds Background and retries — the recovery path.
+        let shed = queue.evict_background(CLIENT_LOCAL_RESERVE);
+        assert!(!shed.is_empty(), "Background was available to shed");
+        queue
+            .try_push(rejected.id, rejected.event, rejected.priority)
+            .expect("retry succeeds after eviction");
+
+        assert_eq!(
+            queue.stats().rejected_global_capacity,
+            0,
+            "a capacity hit the caller recovered from is NOT a rejection: the \
+             event was admitted and no queue-full response was sent"
+        );
+        assert_eq!(
+            queue.stats().background_shed,
+            shed.len() as u64,
+            "the shed Background work IS counted, under its own name"
         );
     }
 
@@ -1801,6 +1884,8 @@ mod tests {
                 Priority::NetworkRelay,
             )
             .expect_err("soft cap reached");
+        // Terminal in this scenario: the caller does not retry.
+        queue.record_terminal_rejection(RejectReason::GlobalCapacity);
         assert_eq!(queue.stats().rejected_global_capacity, 1);
 
         let shed = queue.evict_background(10);
