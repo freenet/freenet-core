@@ -2409,8 +2409,15 @@ mod tests {
         let warn_pos = body
             .find("outcome = \"timeout\"")
             .expect("drive_retry_loop must emit the outcome=timeout warning");
-        // Bound the window to the warning's own field list.
-        let window = &body[warn_pos..warn_pos + 400];
+        // Bound the window to the warning's own field list by anchoring on its
+        // closing message rather than a byte count. A fixed-width slice would
+        // panic if it ever landed mid-character — this file contains multibyte
+        // punctuation — and would silently widen or narrow as fields are added.
+        let msg_anchor = "\"{op_label}: attempt timed out; advancing\"";
+        let warn_len = body[warn_pos..]
+            .find(msg_anchor)
+            .expect("the timeout warning must retain its message literal");
+        let window = &body[warn_pos..warn_pos + warn_len];
 
         assert!(
             window.contains("timeout_kind = cause.label()"),
