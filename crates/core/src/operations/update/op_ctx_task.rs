@@ -3750,7 +3750,10 @@ mod tests {
         );
         op_manager.ring.attach_op_manager(&op_manager);
         let self_addr: SocketAddr = "127.0.0.1:12000".parse().unwrap();
-        op_manager.ring.connection_manager.set_own_addr(self_addr);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(self_addr);
 
         let handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
@@ -4019,7 +4022,10 @@ mod tests {
         );
         op_manager.ring.attach_op_manager(&op_manager);
         let self_addr: SocketAddr = "127.0.0.1:12000".parse().unwrap();
-        op_manager.ring.connection_manager.set_own_addr(self_addr);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test(self_addr);
 
         let update_query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = update_query_count.clone();
