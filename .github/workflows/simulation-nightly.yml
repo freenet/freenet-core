@@ -161,6 +161,62 @@ jobs:
       #       echo "Skipping large_network test - riverctl not installed"
       #     fi
 
+  # Daily cross-peer PUT/GET retention test (issue #4665).
+  # PUTs contracts (including a ~1 MB payload) via peer-a, then boots a fresh
+  # node that joins the network AFTER the PUTs and GETs every contract through
+  # it — a late joiner holds no replica, so its GETs must route over the
+  # network (a GET on a node that already stores the contract is served
+  # locally and would not detect a broken network-GET path). A second GET pass
+  # runs after a 540s gap, past the 480s subscription-lease boundary, to
+  # exercise retention over time.
+  # Runs as its own job so the daily signal fires even when the (unrelated)
+  # simulation steps above fail. Gated by the nightly_tests feature — does
+  # NOT run in regular CI.
+  daily-cross-peer-put-get:
+    name: Daily Cross-Peer PUT/GET Retention
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 45
+
+    env:
+      RUST_LOG: info
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          # The test compiles test-contract-integration to WASM at runtime.
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: daily-cross-peer
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - name: Install nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Cross-peer PUT/GET retention test
+        timeout-minutes: 30
+        run: |
+          echo "Running cross-peer PUT/GET retention test (issue #4665)"
+          cargo nextest run -p freenet \
+            --features "testing,nightly_tests" \
+            --test daily_cross_peer_put_get \
+            --no-capture \
+            --profile nightly
+
   # Notify the Freenet dev room on failure.
   #
   # This used to post to Matrix via a direct curl against the matrix.org REST
@@ -176,8 +232,8 @@ jobs:
     name: Notify River on Failure
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: large-scale-simulation
-    if: failure() && needs.large-scale-simulation.result == 'failure'
+    needs: [large-scale-simulation, daily-cross-peer-put-get]
+    if: failure() && (needs.large-scale-simulation.result == 'failure' || needs.daily-cross-peer-put-get.result == 'failure')
     continue-on-error: true
     steps:
       - name: Install Rust
@@ -218,8 +274,8 @@ jobs:
   notify-dev-room-failure:
     name: Notify dev room on Failure
     runs-on: ubuntu-latest
-    needs: large-scale-simulation
-    if: failure() && needs.large-scale-simulation.result == 'failure'
+    needs: [large-scale-simulation, daily-cross-peer-put-get]
+    if: failure() && (needs.large-scale-simulation.result == 'failure' || needs.daily-cross-peer-put-get.result == 'failure')
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
