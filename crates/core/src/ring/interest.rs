@@ -322,6 +322,45 @@ pub fn is_delta_efficient(summary_size: usize, state_size: usize) -> bool {
     summary_size * 2 < state_size
 }
 
+/// Why [`InterestManager::compute_delta`] could not hand back a delta.
+///
+/// Typed rather than a bare `String` so callers can tell the two cases apart:
+/// they have different remedies, and the fan-out's payload-mix telemetry
+/// ([`crate::node::network_bridge::broadcast_payload_mix`]) reports them as
+/// separate arms. Every caller falls back to sending FULL STATE, which is
+/// never smaller than the delta that was declined — see #3335.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaUnavailable {
+    /// The wire-efficiency gate ([`is_delta_efficient`]) refused *before* any
+    /// delta was computed, because the peer's summary is >= 50 % of our state
+    /// size. No contract code ran.
+    NotEfficient {
+        summary_size: usize,
+        state_size: usize,
+    },
+    /// A delta was attempted and the contract handler failed — WASM error,
+    /// timeout, or an unexpected response.
+    ComputeFailed(String),
+}
+
+impl std::fmt::Display for DeltaUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Keep the historical prefix so existing log greps still match;
+            // the sizes are additive.
+            DeltaUnavailable::NotEfficient {
+                summary_size,
+                state_size,
+            } => write!(
+                f,
+                "Delta not efficient for this contract (summary {summary_size} B, \
+                 state {state_size} B)"
+            ),
+            DeltaUnavailable::ComputeFailed(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
 /// Decide whether a peer that reported `their_summary` is stale relative to our
 /// `our_summary` — i.e. whether the InterestSync heartbeat should heal it with
 /// our state.
@@ -1434,7 +1473,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         their_summary: &StateSummary<'static>,
         our_summary: &StateSummary<'static>,
         our_state_size: usize,
-    ) -> Result<Option<StateDelta<'static>>, String> {
+    ) -> Result<Option<StateDelta<'static>>, DeltaUnavailable> {
         use crate::contract::ContractHandlerEvent;
 
         // Use slices directly - cache methods hash internally, no allocation needed
@@ -1454,7 +1493,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // Check if delta would be efficient
         // (summary > 50% of state size means delta probably won't help)
         if !is_delta_efficient(their_summary_bytes.len(), our_state_size) {
-            return Err("Delta not efficient for this contract".to_string());
+            return Err(DeltaUnavailable::NotEfficient {
+                summary_size: their_summary_bytes.len(),
+                state_size: our_state_size,
+            });
         }
 
         // Compute delta via contract handler (short timeout for broadcast path)
@@ -1484,11 +1526,17 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     Ok(Some(d))
                 }
             }
-            Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => {
-                Err(format!("Delta computation failed: {}", e))
-            }
-            Ok(other) => Err(format!("Unexpected response to GetDeltaQuery: {:?}", other)),
-            Err(e) => Err(format!("Error computing delta: {}", e)),
+            Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => Err(
+                DeltaUnavailable::ComputeFailed(format!("Delta computation failed: {}", e)),
+            ),
+            Ok(other) => Err(DeltaUnavailable::ComputeFailed(format!(
+                "Unexpected response to GetDeltaQuery: {:?}",
+                other
+            ))),
+            Err(e) => Err(DeltaUnavailable::ComputeFailed(format!(
+                "Error computing delta: {}",
+                e
+            ))),
         }
     }
 

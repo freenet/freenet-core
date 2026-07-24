@@ -20,6 +20,7 @@ use crate::node::OpManager;
 use crate::ring::PeerKeyLocation;
 use crate::transport::BroadcastDeliveryOutcome;
 
+use super::broadcast_payload_mix::{BROADCAST_PAYLOAD_MIX, PayloadArm};
 use super::p2p_protoc::P2pBridge;
 
 /// Timeout for awaiting stream completion signal before releasing the permit
@@ -845,11 +846,19 @@ pub(super) async fn broadcast_to_single_peer(
         );
     }
 
-    // Compute delta if we have their summary
-    let (payload, sent_delta) = match (&our_summary, &their_summary) {
+    // Compute delta if we have their summary.
+    //
+    // Every arm below is tagged with the `PayloadArm` that produced it. The
+    // three full-state arms have completely different remedies, and until
+    // #3335 none of them were separately instrumented — the production
+    // measurement could see that large states go out whole but not why. The
+    // tag is carried to the real-delivery sites below and recorded there, so
+    // the mix counts bytes that actually reached the wire.
+    let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
         _ if deltas_suppressed => (
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
+            PayloadArm::FullDeltaSuppressed,
         ),
         (Some(ours), Some(theirs)) => {
             match op_manager
@@ -857,7 +866,11 @@ pub(super) async fn broadcast_to_single_peer(
                 .compute_delta(op_manager, &key, theirs, ours, new_state.size())
                 .await
             {
-                Ok(Some(delta)) => (DeltaOrFullState::Delta(delta.as_ref().to_vec()), true),
+                Ok(Some(delta)) => (
+                    DeltaOrFullState::Delta(delta.as_ref().to_vec()),
+                    true,
+                    PayloadArm::Delta,
+                ),
                 Ok(None) => {
                     // The contract computed an EMPTY delta against the peer's
                     // summary: the peer is logically converged despite the
@@ -884,9 +897,22 @@ pub(super) async fn broadcast_to_single_peer(
                         error = %err,
                         "Delta computation failed, falling back to full state"
                     );
+                    // Split the refusal from a genuine failure: `NotEfficient`
+                    // means no contract code ran at all — the gate declined a
+                    // delta because the peer's summary is >= 50 % of our state,
+                    // and we then send the whole state, which is never smaller.
+                    let arm = match err {
+                        crate::ring::interest::DeltaUnavailable::NotEfficient { .. } => {
+                            PayloadArm::FullNotEfficient
+                        }
+                        crate::ring::interest::DeltaUnavailable::ComputeFailed(_) => {
+                            PayloadArm::FullComputeFailed
+                        }
+                    };
                     (
                         DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
                         false,
+                        arm,
                     )
                 }
             }
@@ -894,6 +920,7 @@ pub(super) async fn broadcast_to_single_peer(
         _ => (
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
+            PayloadArm::FullNoSummary,
         ),
     };
     let payload_size = payload.size();
@@ -1057,6 +1084,9 @@ pub(super) async fn broadcast_to_single_peer(
                         crate::topology::meter::ResourceType::BroadcastFanoutCost,
                         payload_size as f64,
                     );
+                    // Same delivery gate as the cost axis above, so the mix and
+                    // the cost axis always agree on what "sent" means (#3335).
+                    BROADCAST_PAYLOAD_MIX.record_delivered(payload_arm, key.id(), payload_size);
                     tracing::debug!(
                         tx = %update_tx,
                         peer = %peer_addr,
@@ -1098,6 +1128,9 @@ pub(super) async fn broadcast_to_single_peer(
                 crate::topology::meter::ResourceType::BroadcastFanoutCost,
                 payload_size as f64,
             );
+            // Same delivery gate as the cost axis above, so the mix and the
+            // cost axis always agree on what "sent" means (#3335).
+            BROADCAST_PAYLOAD_MIX.record_delivered(payload_arm, key.id(), payload_size);
             // Delta-incompat attribution (HQk7 resync loop): remember that we
             // just delivered a DELTA to this peer so a prompt `ResyncRequest`
             // from it can be attributed to the delta failing to apply (deltas
@@ -2058,6 +2091,70 @@ mod tests {
             2,
             "each delivery-gated bytes report must charge the selected \
              payload_size (delta or full state), not the pre-delta full-state size"
+        );
+    }
+
+    /// Source-scrape pin for the payload-mix arm tagging (#3335).
+    ///
+    /// Same precedent as the cost-report pin above (the "Manually-mirrored
+    /// telemetry counters" row in `.claude/rules/bug-prevention-patterns.md`):
+    /// a refactor that drops an arm tag, or re-tags a full-state fallback as
+    /// `Delta`, silently corrupts the measurement that decides which fan-out
+    /// fix to build — and every behavioral test stays green, because the
+    /// fan-out still works. The whole point of this instrumentation is that
+    /// the four full-state causes are distinguishable, so pin that each one
+    /// is constructed exactly where it is decided.
+    #[test]
+    fn broadcast_to_single_peer_tags_every_payload_arm_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer (start of tests module) not found");
+        let body = &after[..fn_end];
+
+        // Every arm must be constructed in the selection match. A missing arm
+        // means some payload is attributed to the wrong cause (or to none).
+        for arm in [
+            "PayloadArm::Delta",
+            "PayloadArm::FullDeltaSuppressed",
+            "PayloadArm::FullNotEfficient",
+            "PayloadArm::FullComputeFailed",
+            "PayloadArm::FullNoSummary",
+        ] {
+            assert!(
+                body.contains(arm),
+                "broadcast_to_single_peer must tag the {arm} arm — an untagged \
+                 fallback makes the #3335 payload-mix measurement attribute \
+                 bytes to the wrong cause"
+            );
+        }
+
+        // The mix is recorded at exactly the two real-delivery sites, the same
+        // gate as BroadcastFanoutCost, so the two axes always agree on what
+        // "sent" means. Recording up-front would count phantom fan-out.
+        let record_needle = concat!("BROADCAST_PAYLOAD_MIX", ".record_delivered(");
+        assert_eq!(
+            body.matches(record_needle).count(),
+            2,
+            "payload mix must be recorded at exactly the two real-delivery \
+             sites (streaming Delivered + inline send Ok) — recording up-front \
+             would count dropped/failed sends as bytes on the wire"
+        );
+
+        // The `NotEfficient` / `ComputeFailed` split is the load-bearing one:
+        // the first means no contract code ran and we shipped a whole state
+        // anyway, the second means the WASM failed. Collapsing them back into
+        // one arm loses the distinction the measurement exists to make.
+        assert!(
+            body.contains("DeltaUnavailable::NotEfficient")
+                && body.contains("DeltaUnavailable::ComputeFailed"),
+            "the delta-failure arm must keep the typed NotEfficient vs \
+             ComputeFailed split — collapsing them re-blinds the measurement"
         );
     }
 }

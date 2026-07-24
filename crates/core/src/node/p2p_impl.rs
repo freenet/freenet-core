@@ -865,6 +865,14 @@ impl NodeP2P {
             local_peer_id.clone(),
             &background_task_monitor,
         );
+        // Fan-out payload-mix rollup (#3335): which arm of the payload
+        // selection put bytes on the wire (delta vs each of the three
+        // full-state fallbacks), and which contracts those full states belong
+        // to. Always-on and observation-only, same as the aggregators above.
+        crate::node::network_bridge::broadcast_payload_mix::spawn_payload_mix_aggregator(
+            local_peer_id.clone(),
+            &background_task_monitor,
+        );
         if reference_ping_enabled {
             crate::transport::reference_ping::spawn_reference_ping(
                 local_peer_id.clone(),

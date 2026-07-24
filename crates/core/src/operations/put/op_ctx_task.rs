@@ -3842,7 +3842,7 @@ async fn compute_probe_reverse_delta(
 /// heal via a normal GET / anti-entropy. Kept as a pure function so the three
 /// arms are unit-testable without a live contract handler.
 fn reverse_delta_from_compute_result(
-    computed: Result<Option<StateDelta<'static>>, String>,
+    computed: Result<Option<StateDelta<'static>>, crate::ring::interest::DeltaUnavailable>,
 ) -> Option<StateDelta<'static>> {
     computed.unwrap_or(None)
 }
@@ -4383,11 +4383,25 @@ mod tests {
         // Delta inefficient or uncomputable: send nothing — the originator
         // heals via a normal GET / anti-entropy instead of receiving a
         // bloated or absent delta.
-        let inefficient =
-            reverse_delta_from_compute_result(Err("Delta not efficient for this contract".into()));
+        // Both Err variants must behave identically here: the reverse leg
+        // ships nothing whether the wire-efficiency gate refused up front or
+        // the contract's delta computation failed.
+        let inefficient = reverse_delta_from_compute_result(Err(
+            crate::ring::interest::DeltaUnavailable::NotEfficient {
+                summary_size: 600,
+                state_size: 1000,
+            },
+        ));
         assert!(
             inefficient.is_none(),
-            "Err (inefficient/uncomputable) must send NO reverse delta"
+            "Err (gate refused as inefficient) must send NO reverse delta"
+        );
+        let uncomputable = reverse_delta_from_compute_result(Err(
+            crate::ring::interest::DeltaUnavailable::ComputeFailed("wasm exploded".into()),
+        ));
+        assert!(
+            uncomputable.is_none(),
+            "Err (delta computation failed) must send NO reverse delta"
         );
     }
 
