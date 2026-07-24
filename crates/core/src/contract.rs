@@ -11,6 +11,10 @@ pub(crate) mod delegate_app_registry;
 mod executor;
 mod fair_queue;
 pub(crate) use fair_queue::Priority;
+/// Fair-queue occupancy for the status snapshot (#4917). Re-exported rather
+/// than widening `fair_queue` itself, which is otherwise private to this
+/// module.
+pub(crate) use fair_queue::{FairQueueStats, global_stats as fair_queue_stats};
 pub(crate) mod governance;
 mod handler;
 pub mod storages;
@@ -1797,6 +1801,8 @@ async fn push_with_background_eviction<CH>(
         match fair_queue.try_push(rejected.id, rejected.event, rejected.priority) {
             Ok(()) => return,
             Err(still_rejected) => {
+                // Terminal: eviction did not free enough room (#4917).
+                fair_queue.record_terminal_rejection(still_rejected.reason);
                 track_pending_reclamation_if_evict(contract_handler, &still_rejected);
                 send_queue_full_response(contract_handler.channel(), still_rejected).await;
                 return;
@@ -1804,6 +1810,9 @@ async fn push_with_background_eviction<CH>(
         }
     }
 
+    // Terminal: eviction could not help (wrong priority, wrong reason, or no
+    // Background queued), so this event is refused (#4917).
+    fair_queue.record_terminal_rejection(rejected.reason);
     track_pending_reclamation_if_evict(contract_handler, &rejected);
     send_queue_full_response(contract_handler.channel(), rejected).await;
 }
@@ -3599,6 +3608,56 @@ mod tests {
                 other => panic!("expected UpdateResponse for {label}, got {other}"),
             }
         }
+    }
+
+    /// Anti-rot pin for #4917: every TERMINAL admission rejection in
+    /// `push_with_background_eviction` must record itself.
+    ///
+    /// The counter deliberately does not live in `try_push`, because a
+    /// capacity failure there is often recovered by shedding Background and
+    /// retrying — counting it would report a client-visible reject for an
+    /// operation that succeeded. That correctness depends on the terminal arms
+    /// remembering to call `record_terminal_rejection`, so pin it: a new
+    /// terminal path that forgets would silently under-report queue-full
+    /// failures on the dashboard.
+    #[test]
+    fn terminal_rejection_paths_record_the_rejection() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contract.rs");
+        let source = std::fs::read_to_string(&path).expect("read own source");
+        let start = source
+            .find("async fn push_with_background_eviction")
+            .expect("push_with_background_eviction must exist");
+        let rest = &source[start..];
+        let end = rest
+            .find("\n/// ")
+            .map(|o| start + o)
+            .unwrap_or(source.len());
+        let body = &source[start..end];
+
+        let records = body.matches("record_terminal_rejection(").count();
+        assert_eq!(
+            records, 2,
+            "expected exactly two terminal rejection sites (eviction retry \
+             exhausted, and eviction-cannot-help), found {records}. If you \
+             added a terminal path, record the rejection there too; if you \
+             removed one, update this pin deliberately. See #4917."
+        );
+
+        // The shed loop also calls send_queue_full_response, for Background
+        // work that is re-emitted on its next cycle. That is a shed, not an
+        // admission rejection, and must NOT be counted as one.
+        let shed_loop = body
+            .find("for shed in evicted {")
+            .expect("the Background shed loop must exist");
+        let shed_end = body[shed_loop..]
+            .find('}')
+            .map(|o| shed_loop + o)
+            .expect("shed loop must close");
+        assert!(
+            !body[shed_loop..shed_end].contains("record_terminal_rejection"),
+            "a shed Background event is not an admission rejection; counting \
+             it would inflate the client-visible failure count (#4917)"
+        );
     }
 }
 

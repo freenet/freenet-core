@@ -31,6 +31,7 @@
 //! `Background` event is a best-effort drop that re-emits on its next cycle.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use freenet_stdlib::prelude::ContractInstanceId;
 
@@ -248,7 +249,103 @@ pub(super) struct FairEventQueue {
     /// non-empty lower tier so sustained client load cannot indefinitely starve
     /// remote relay / background execution (#4534 review).
     client_streak: usize,
+    /// Observability counters (#4917). Instance-scoped on purpose: a purely
+    /// process-global counter would make every gauge assertion race other
+    /// tests sharing the binary, which is the #4918 flake. [`Self::publish`]
+    /// mirrors these into the process-global gauge for the status snapshot;
+    /// tests assert on [`Self::stats`], which reads only this instance.
+    counters: FairQueueCounters,
 }
+
+/// Instance-scoped observability counters for a [`FairEventQueue`].
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FairQueueCounters {
+    /// Highest `total_queued` this instance has reached.
+    pub high_water: usize,
+    /// Admission rejections that the global (or soft) cap caused. This is the
+    /// systemic-backpressure signal: the queue as a whole could not keep up.
+    pub rejected_global_capacity: u64,
+    /// Admission rejections from a single contract's per-tier cap. Distinct
+    /// from the above: one noisy contract, not node-wide saturation.
+    pub rejected_per_contract: u64,
+    /// `Background` events shed to make room for higher-priority work.
+    pub background_shed: u64,
+}
+
+/// A point-in-time view of queue occupancy plus cumulative admission
+/// outcomes (#4917).
+///
+/// The depth fields answer "is the executor backed up right now"; `high_water`
+/// answers "was it ever backed up", which a periodic sampler would otherwise
+/// miss between polls. Both were unavailable while diagnosing #4912, where a
+/// client PUT sat ~2 minutes behind this queue and the backlog had to be
+/// inferred from rejection *rates* over a whole hour.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FairQueueStats {
+    pub depth_total: usize,
+    pub depth_client_local: usize,
+    pub depth_network_relay: usize,
+    pub depth_background: usize,
+    pub high_water: usize,
+    pub rejected_global_capacity: u64,
+    pub rejected_per_contract: u64,
+    pub background_shed: u64,
+}
+
+/// Process-global mirror of the live queue's [`FairQueueStats`].
+///
+/// Written by [`FairEventQueue::publish`] from the single-threaded
+/// `contract_handling` loop, read by the status snapshot on demand. Relaxed
+/// ordering throughout: these are diagnostics, and a reader that observes a
+/// slightly-torn set of fields sees a state the queue passed through
+/// microseconds earlier. Same shape as the transport layer's
+/// `shadow_demand` gauges — cheap atomic writes on the hot path, all reads in
+/// the consumer — but kept here rather than there because `shadow_demand` is
+/// transport-scoped and carries a "never read from the production data path"
+/// rule that does not apply to a contract-layer diagnostic.
+///
+/// No production code reads these back; they exist only to be reported.
+mod gauge {
+    use super::*;
+
+    pub(super) static DEPTH_TOTAL: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static DEPTH_CLIENT_LOCAL: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static DEPTH_NETWORK_RELAY: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static DEPTH_BACKGROUND: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static REJECTED_GLOBAL_CAPACITY: AtomicU64 = AtomicU64::new(0);
+    pub(super) static REJECTED_PER_CONTRACT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BACKGROUND_SHED: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Read the process-global fair-queue gauge for the status snapshot (#4917).
+///
+/// Returns zeroes before the contract-handling loop has run, which is
+/// indistinguishable from "an idle queue that has never been used" — the
+/// distinction does not matter to a reader of this diagnostic.
+pub(crate) fn global_stats() -> FairQueueStats {
+    FairQueueStats {
+        depth_total: gauge::DEPTH_TOTAL.load(Ordering::Relaxed),
+        depth_client_local: gauge::DEPTH_CLIENT_LOCAL.load(Ordering::Relaxed),
+        depth_network_relay: gauge::DEPTH_NETWORK_RELAY.load(Ordering::Relaxed),
+        depth_background: gauge::DEPTH_BACKGROUND.load(Ordering::Relaxed),
+        high_water: gauge::HIGH_WATER.load(Ordering::Relaxed),
+        rejected_global_capacity: gauge::REJECTED_GLOBAL_CAPACITY.load(Ordering::Relaxed),
+        rejected_per_contract: gauge::REJECTED_PER_CONTRACT.load(Ordering::Relaxed),
+        background_shed: gauge::BACKGROUND_SHED.load(Ordering::Relaxed),
+    }
+}
+
+/// Occupancy fractions (of [`MAX_TOTAL_FAIR_QUEUE`]) at which crossing the
+/// high-water mark emits one WARN.
+///
+/// Edge-triggered against a monotonic high-water mark, so each band logs at
+/// most once for the lifetime of the process — deliberately not level-triggered,
+/// because this loop's log already runs to several MB/hour and a per-event or
+/// per-sample line would be pure noise. The point is a single breadcrumb of the
+/// form "the client-dispatch queue got deep", which is precisely what #4912's
+/// logs could not show.
+const DEPTH_WARN_BANDS: [usize; 2] = [MAX_TOTAL_FAIR_QUEUE / 2, MAX_TOTAL_FAIR_QUEUE * 9 / 10];
 
 /// After this many consecutive `ClientLocal` pops (while lower-tier work is
 /// waiting), `pop()` serves one lower-tier event regardless of pending
@@ -263,11 +360,94 @@ impl FairEventQueue {
             tiers: Default::default(),
             total_queued: 0,
             client_streak: 0,
+            counters: FairQueueCounters::default(),
         }
     }
 
     fn tier(&mut self, priority: Priority) -> &mut PriorityTier {
         &mut self.tiers[priority as usize]
+    }
+
+    /// This instance's occupancy and cumulative admission outcomes (#4917).
+    ///
+    /// Reads only `self`, so tests can assert on it without touching (or
+    /// racing on) the process-global mirror.
+    pub(super) fn stats(&self) -> FairQueueStats {
+        FairQueueStats {
+            depth_total: self.total_queued,
+            depth_client_local: self.tiers[Priority::ClientLocal as usize].queued,
+            depth_network_relay: self.tiers[Priority::NetworkRelay as usize].queued,
+            depth_background: self.tiers[Priority::Background as usize].queued,
+            high_water: self.counters.high_water,
+            rejected_global_capacity: self.counters.rejected_global_capacity,
+            rejected_per_contract: self.counters.rejected_per_contract,
+            background_shed: self.counters.background_shed,
+        }
+    }
+
+    /// Count an admission failure that the caller could NOT recover from, i.e.
+    /// one that actually sent the client a queue-full response.
+    ///
+    /// Deliberately separate from [`Self::try_push`]: a `GlobalCapacity`
+    /// failure there is often recoverable — `push_with_background_eviction`
+    /// sheds `Background` work and retries, and the event is admitted. Counting
+    /// at the `try_push` failure would report a "reject" for an operation that
+    /// in fact succeeded, overstating client-visible failures on the dashboard.
+    /// Only the caller knows which failures were terminal, so it says so.
+    ///
+    /// `Evicted` is not an admission failure — a shed `Background` event is
+    /// counted by [`Self::evict_background`] and re-emits on its next cycle.
+    pub(super) fn record_terminal_rejection(&mut self, reason: RejectReason) {
+        match reason {
+            RejectReason::GlobalCapacity => {
+                self.counters.rejected_global_capacity =
+                    self.counters.rejected_global_capacity.saturating_add(1);
+            }
+            RejectReason::PerContract => {
+                self.counters.rejected_per_contract =
+                    self.counters.rejected_per_contract.saturating_add(1);
+            }
+            RejectReason::Evicted => return,
+        }
+        self.publish();
+    }
+
+    /// Mirror [`Self::stats`] into the process-global gauge, and emit one WARN
+    /// the first time occupancy crosses each [`DEPTH_WARN_BANDS`] threshold.
+    ///
+    /// MUST be called by every method that changes `total_queued`; the pin test
+    /// `every_total_queued_mutation_publishes` enforces that. Without it the
+    /// gauge silently rots, which is the failure mode
+    /// `.claude/rules/bug-prevention-patterns.md` records for manually-mirrored
+    /// telemetry (#4009 / #4010).
+    fn publish(&mut self) {
+        let previous_high_water = self.counters.high_water;
+        self.counters.high_water = self.counters.high_water.max(self.total_queued);
+        let s = self.stats();
+
+        gauge::DEPTH_TOTAL.store(s.depth_total, Ordering::Relaxed);
+        gauge::DEPTH_CLIENT_LOCAL.store(s.depth_client_local, Ordering::Relaxed);
+        gauge::DEPTH_NETWORK_RELAY.store(s.depth_network_relay, Ordering::Relaxed);
+        gauge::DEPTH_BACKGROUND.store(s.depth_background, Ordering::Relaxed);
+        gauge::HIGH_WATER.fetch_max(s.high_water, Ordering::Relaxed);
+        gauge::REJECTED_GLOBAL_CAPACITY.store(s.rejected_global_capacity, Ordering::Relaxed);
+        gauge::REJECTED_PER_CONTRACT.store(s.rejected_per_contract, Ordering::Relaxed);
+        gauge::BACKGROUND_SHED.store(s.background_shed, Ordering::Relaxed);
+
+        for band in DEPTH_WARN_BANDS {
+            if previous_high_water < band && s.high_water >= band {
+                tracing::warn!(
+                    depth_total = s.depth_total,
+                    depth_client_local = s.depth_client_local,
+                    depth_network_relay = s.depth_network_relay,
+                    depth_background = s.depth_background,
+                    high_water = s.high_water,
+                    capacity = MAX_TOTAL_FAIR_QUEUE,
+                    "contract-handler queue depth crossed {band}; client \
+                     operations may be queueing behind the executor"
+                );
+            }
+        }
     }
 
     /// Attempt to enqueue an event at the given priority.
@@ -329,6 +509,7 @@ impl FairEventQueue {
 
         self.tier(priority).push((id, event, priority));
         self.total_queued += 1;
+        self.publish();
         Ok(())
     }
 
@@ -353,6 +534,11 @@ impl FairEventQueue {
                 None => break,
             }
         }
+        self.counters.background_shed = self
+            .counters
+            .background_shed
+            .saturating_add(evicted.len() as u64);
+        self.publish();
         evicted
     }
 
@@ -423,6 +609,7 @@ impl FairEventQueue {
                 } else {
                     self.client_streak = 0;
                 }
+                self.publish();
                 return Some((id, event));
             }
         }
@@ -1522,5 +1709,230 @@ mod tests {
             RejectReason::PerContract,
             "post-eviction retry failure must be PerContract, not GlobalCapacity"
         );
+    }
+
+    // ============ observability (#4917) ============
+    //
+    // These assert on `queue.stats()`, which reads only the instance. They
+    // deliberately never touch the process-global `gauge` statics: several
+    // tests share the binary, so asserting on a process-global would make them
+    // race each other — the #4918 flake.
+
+    #[test]
+    fn stats_track_depth_per_tier() {
+        let mut queue = FairEventQueue::new();
+        let cid = make_contract_id(1);
+        assert_eq!(queue.stats(), FairQueueStats::default(), "fresh queue");
+
+        queue
+            .try_push(make_event_id(1), make_get_event(cid), Priority::ClientLocal)
+            .expect("push client");
+        queue
+            .try_push(
+                make_event_id(2),
+                make_get_event(cid),
+                Priority::NetworkRelay,
+            )
+            .expect("push relay");
+        queue
+            .try_push(make_event_id(3), make_get_event(cid), Priority::Background)
+            .expect("push background");
+
+        let s = queue.stats();
+        assert_eq!(s.depth_total, 3);
+        assert_eq!(s.depth_client_local, 1);
+        assert_eq!(s.depth_network_relay, 1);
+        assert_eq!(s.depth_background, 1);
+        assert_eq!(s.high_water, 3);
+
+        queue.pop().expect("pop one");
+        let s = queue.stats();
+        assert_eq!(s.depth_total, 2, "depth follows pops");
+        assert_eq!(s.depth_client_local, 0, "ClientLocal drains first");
+        assert_eq!(
+            s.high_water, 3,
+            "high_water is monotonic — it must survive the queue draining, \
+             which is the whole point of recording it"
+        );
+    }
+
+    #[test]
+    fn stats_distinguish_rejection_reasons() {
+        // Per-contract cap: one noisy contract, NOT node-wide saturation.
+        let mut queue = FairEventQueue::new();
+        let hot = make_contract_id(7);
+        for i in 0..MAX_QUEUED_PER_CONTRACT {
+            queue
+                .try_push(
+                    make_event_id(i as u64),
+                    make_get_event(hot),
+                    Priority::NetworkRelay,
+                )
+                .expect("under per-contract cap");
+        }
+        let rejected = queue
+            .try_push(
+                make_event_id(9999),
+                make_get_event(hot),
+                Priority::NetworkRelay,
+            )
+            .expect_err("at per-contract cap");
+        assert_eq!(
+            queue.stats().rejected_per_contract,
+            0,
+            "try_push alone must not count: only the caller knows whether the \
+             failure was terminal"
+        );
+
+        // The caller finds eviction cannot help a per-contract cap, so this is
+        // terminal and a queue-full response goes to the client.
+        queue.record_terminal_rejection(rejected.reason);
+
+        let s = queue.stats();
+        assert_eq!(s.rejected_per_contract, 1);
+        assert_eq!(
+            s.rejected_global_capacity, 0,
+            "a single contract hitting its own cap is not global backpressure; \
+             conflating the two would misdiagnose the node as saturated"
+        );
+    }
+
+    #[test]
+    fn recovered_capacity_hit_is_not_counted_as_a_rejection() {
+        // The `push_with_background_eviction` flow: a foreground push hits the
+        // soft cap, Background is shed, the retry succeeds. The client never
+        // saw an error, so the dashboard must not report a reject — that would
+        // overstate client-visible failures.
+        let mut queue = FairEventQueue::new();
+        let soft_cap = MAX_TOTAL_FAIR_QUEUE - CLIENT_LOCAL_RESERVE;
+        let mut pushed = 0usize;
+        let mut seed = 0u32;
+        while pushed < soft_cap {
+            let cid = make_contract_id_u32(seed);
+            seed += 1;
+            for _ in 0..MAX_QUEUED_PER_CONTRACT.min(soft_cap - pushed) {
+                queue
+                    .try_push(
+                        make_event_id(pushed as u64),
+                        make_get_event(cid),
+                        Priority::Background,
+                    )
+                    .expect("under soft cap");
+                pushed += 1;
+            }
+        }
+
+        let fresh = make_contract_id_u32(seed);
+        let rejected = queue
+            .try_push(
+                make_event_id(u64::MAX),
+                make_get_event(fresh),
+                Priority::NetworkRelay,
+            )
+            .expect_err("soft cap reached");
+        assert_eq!(rejected.reason, RejectReason::GlobalCapacity);
+
+        // Caller sheds Background and retries — the recovery path.
+        let shed = queue.evict_background(CLIENT_LOCAL_RESERVE);
+        assert!(!shed.is_empty(), "Background was available to shed");
+        queue
+            .try_push(rejected.id, rejected.event, rejected.priority)
+            .expect("retry succeeds after eviction");
+
+        assert_eq!(
+            queue.stats().rejected_global_capacity,
+            0,
+            "a capacity hit the caller recovered from is NOT a rejection: the \
+             event was admitted and no queue-full response was sent"
+        );
+        assert_eq!(
+            queue.stats().background_shed,
+            shed.len() as u64,
+            "the shed Background work IS counted, under its own name"
+        );
+    }
+
+    #[test]
+    fn stats_count_global_capacity_rejections_and_background_sheds() {
+        let mut queue = FairEventQueue::new();
+        // Fill past the soft cap with Background spread over many contracts so
+        // no per-contract cap trips first.
+        let soft_cap = MAX_TOTAL_FAIR_QUEUE - CLIENT_LOCAL_RESERVE;
+        let mut pushed = 0usize;
+        let mut seed = 0u32;
+        while pushed < soft_cap {
+            let cid = make_contract_id_u32(seed);
+            seed += 1;
+            for _ in 0..MAX_QUEUED_PER_CONTRACT.min(soft_cap - pushed) {
+                queue
+                    .try_push(
+                        make_event_id(pushed as u64),
+                        make_get_event(cid),
+                        Priority::Background,
+                    )
+                    .expect("under soft cap");
+                pushed += 1;
+            }
+        }
+        assert_eq!(queue.stats().depth_total, soft_cap);
+
+        // A sub-ClientLocal push now crosses the soft cap.
+        queue
+            .try_push(
+                make_event_id(u64::MAX),
+                make_get_event(make_contract_id_u32(seed)),
+                Priority::NetworkRelay,
+            )
+            .expect_err("soft cap reached");
+        // Terminal in this scenario: the caller does not retry.
+        queue.record_terminal_rejection(RejectReason::GlobalCapacity);
+        assert_eq!(queue.stats().rejected_global_capacity, 1);
+
+        let shed = queue.evict_background(10);
+        assert_eq!(shed.len(), 10);
+        assert_eq!(queue.stats().background_shed, 10);
+        assert_eq!(queue.stats().depth_total, soft_cap - 10);
+    }
+
+    /// Anti-rot pin: every method that changes `total_queued` must call
+    /// `publish`, or the gauge silently stops tracking the queue.
+    ///
+    /// This is the failure mode `.claude/rules/bug-prevention-patterns.md`
+    /// records for manually-mirrored telemetry (#4009 / #4010): the mirror is
+    /// correct when written, then a later change adds a path that forgets it
+    /// and the counter quietly flatlines in production.
+    #[test]
+    fn every_total_queued_mutation_publishes() {
+        const SRC: &str = include_str!("fair_queue.rs");
+        // Only the impl block, so the test module's own text can't satisfy it.
+        let impl_start = SRC
+            .find("impl FairEventQueue {")
+            .expect("FairEventQueue impl must exist");
+        let impl_end = SRC[impl_start..]
+            .find("\n#[cfg(test)]")
+            .map(|o| impl_start + o)
+            .unwrap_or(SRC.len());
+        let body = &SRC[impl_start..impl_end];
+
+        for method in ["fn try_push(", "fn evict_background(", "fn pop("] {
+            let start = body
+                .find(method)
+                .unwrap_or_else(|| panic!("{method} must exist in the impl"));
+            // Bound each method at the next one so the search cannot leak into
+            // a neighbour that does publish.
+            let rest = &body[start + method.len()..];
+            let end = rest
+                .find("\n    pub(super) fn ")
+                .or_else(|| rest.find("\n    fn "))
+                .map(|o| start + method.len() + o)
+                .unwrap_or(body.len());
+            let method_body = &body[start..end];
+            assert!(
+                method_body.contains("self.publish()"),
+                "{method} mutates total_queued but does not call self.publish(); \
+                 the #4917 gauge would stop tracking the queue. See \
+                 bug-prevention-patterns.md on mirrored telemetry."
+            );
+        }
     }
 }
