@@ -715,6 +715,13 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
             }
         };
 
+        // Stop the clock the moment the attempt resolves, BEFORE the cleanup
+        // await below. `release_pending_op_slot` can block for up to
+        // `NOTIFICATION_SEND_TIMEOUT` (30 s) under notification backpressure,
+        // and charging that to the attempt would overstate `elapsed_secs` by
+        // as much as the stall window it is meant to expose.
+        let attempt_elapsed = attempt_started.elapsed();
+
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the
         // 60s periodic sweep.
@@ -783,7 +790,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     outcome = "timeout",
                     timeout_kind = cause.label(),
                     timeout_secs = cause.budget(attempt_timeout).as_secs(),
-                    elapsed_secs = attempt_started.elapsed().as_secs(),
+                    elapsed_secs = attempt_elapsed.as_secs(),
                     "{op_label}: attempt timed out; advancing"
                 );
                 match driver.advance() {
@@ -2490,9 +2497,25 @@ mod tests {
         // window is not the attempt's duration (40 s of progress then a 30 s
         // stall is a 70 s attempt that would be logged as 30).
         assert!(
-            window.contains("elapsed_secs = attempt_started.elapsed()"),
+            window.contains("elapsed_secs = attempt_elapsed.as_secs()"),
             "elapsed_secs MUST come from the measured attempt clock, not from \
              the timeout cause"
+        );
+
+        // ...and that measurement must be taken BEFORE the cleanup await.
+        // `release_pending_op_slot` can block for up to NOTIFICATION_SEND_TIMEOUT
+        // (30 s) under backpressure; charging that to the attempt would inflate
+        // `elapsed_secs` by as much as the stall window it exists to reveal.
+        let capture = body
+            .find("let attempt_elapsed = attempt_started.elapsed();")
+            .expect("the attempt clock must be stopped explicitly");
+        let cleanup = body
+            .find("release_pending_op_slot(attempt_tx).await")
+            .expect("the pending-slot cleanup must still run");
+        assert!(
+            capture < cleanup,
+            "attempt_elapsed MUST be captured before the release_pending_op_slot \
+             await, or cleanup backpressure is charged to the attempt"
         );
     }
 }
