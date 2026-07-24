@@ -508,49 +508,79 @@ const MAX_INFRA_RETRIES: usize = 3;
 ///
 /// [`drive_retry_loop`] treats all three the same way (advance to the next
 /// peer), but they carry very different diagnostic meaning AND very different
-/// effective budgets. They used to be collapsed into a bare `()`, which left
-/// the shared `outcome="timeout"` warning reporting
-/// [`RetryDriver::attempt_timeout`] unconditionally — a budget the streaming
-/// path never enforces.
+/// effective budgets, so the shared `outcome="timeout"` warning must name which
+/// one fired. [`RetryDriver::attempt_timeout`] bounds only [`Self::Deadline`];
+/// the streaming path never enforces it.
 ///
-/// That misattribution has real cost: issue #4912 reported a gateway PUT
-/// failing with `timeout_secs=117`, sending the investigation after a
-/// ~2-minute per-attempt budget, when the attempt had actually been abandoned
-/// by the 30 s [`STREAM_OP_INACTIVITY_TIMEOUT`] stall check ~30 s in. The
-/// logged number and the elapsed time disagreed by 4x with nothing in the log
-/// to explain the gap.
+/// Concretely, issue #4912 reported a gateway PUT logging `timeout_secs=117`.
+/// Measured from the attempt's own start (`PUT relay: processing Request` at
+/// 15:35:20.894 to `attempt timed out` at 15:35:50.895) that attempt ran
+/// 30.001 s, because the 30 s [`STREAM_OP_INACTIVITY_TIMEOUT`] stall check is
+/// what abandoned it. The client-visible span was ~150 s, but the extra ~120 s
+/// was queue starvation BEFORE the attempt began, not attempt time. Reporting
+/// a 117 s budget described neither number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AttemptTimeout {
+pub(crate) enum TimeoutCause {
     /// The fixed per-attempt deadline ([`RetryDriver::attempt_timeout`])
     /// elapsed — the non-streaming GET / SUBSCRIBE / PUT path.
     Deadline,
     /// Streaming PUT: no fragment arrived for a whole
     /// [`STREAM_OP_INACTIVITY_TIMEOUT`] window (a confirmed stall).
-    StreamStall,
+    ///
+    /// Carries the silence actually observed. This is NOT always the nominal
+    /// window: an atomic-tiebreak `continue` restarts a full window from the
+    /// current instant rather than from the last fragment, so a confirmed
+    /// stall is declared somewhere in `[window, 2 * window)`. Logging the flat
+    /// nominal value would understate the wait by up to 2x — a smaller version
+    /// of the very misreport this enum exists to fix.
+    StreamStall { silent_for: std::time::Duration },
     /// Streaming PUT: the hard [`STREAMING_ATTEMPT_TIMEOUT_CAP`] ceiling was
     /// reached while fragments were still dribbling in.
     StreamCeiling,
 }
 
-impl AttemptTimeout {
+impl TimeoutCause {
     /// Stable, greppable label for the `timeout_kind` log field.
+    ///
+    /// These strings are an operator-facing interface (log filters, dashboard
+    /// queries). Treat a rename as a breaking change; the values are pinned by
+    /// `attempt_timeout_budget_matches_the_condition_that_fired`.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Deadline => "attempt_deadline",
-            Self::StreamStall => "stream_stall",
+            Self::StreamStall { .. } => "stream_stall",
             Self::StreamCeiling => "stream_ceiling",
         }
     }
 
-    /// The budget that ACTUALLY governed this attempt.
+    /// The configured bound that governed this attempt.
     ///
     /// Only [`Self::Deadline`] is bounded by the driver's `attempt_timeout`;
     /// the two streaming variants are bounded by their own constants. Logging
     /// `attempt_timeout` for those is what made #4912 hard to read.
-    pub(crate) fn budget(self, attempt_timeout: std::time::Duration) -> std::time::Duration {
+    fn budget(self, attempt_timeout: std::time::Duration) -> std::time::Duration {
         match self {
             Self::Deadline => attempt_timeout,
-            Self::StreamStall => crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT,
+            Self::StreamStall { .. } => {
+                crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT
+            }
+            Self::StreamCeiling => crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
+        }
+    }
+
+    /// How long the attempt actually ran before being abandoned.
+    ///
+    /// `Deadline` and `StreamCeiling` fire exactly at their bound, so observed
+    /// equals budget. A stall is the one case where they diverge (see
+    /// [`Self::StreamStall`]), which is why it carries a measured value.
+    fn observed(self, attempt_timeout: std::time::Duration) -> std::time::Duration {
+        // Exhaustive on purpose: a catch-all would silently give a future
+        // variant the wrong observed value, which is the class of bug this
+        // whole type exists to prevent (and the codebase bans wildcard arms
+        // in classification code for exactly that reason).
+        match self {
+            Self::StreamStall { silent_for } => silent_for,
+            Self::Deadline => attempt_timeout,
             Self::StreamCeiling => crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
         }
     }
@@ -559,7 +589,7 @@ impl AttemptTimeout {
 /// Await a single streaming attempt under a stream-inactivity timeout (#4001).
 ///
 /// Returns `Ok(reply)` when the terminal reply arrives, and the specific
-/// [`AttemptTimeout`] variant when the attempt is abandoned (no fragment for
+/// [`TimeoutCause`] variant when the attempt is abandoned (no fragment for
 /// [`STREAM_OP_INACTIVITY_TIMEOUT`], or the hard
 /// [`STREAMING_ATTEMPT_TIMEOUT_CAP`] ceiling is reached). Both abandon paths
 /// map to the shared `outcome="timeout"` advance arm in [`drive_retry_loop`],
@@ -583,7 +613,7 @@ async fn await_streaming_attempt(
     ctx: &mut OpCtx,
     request: NetMessage,
     progress: &crate::operations::stream_progress::StreamProgress,
-) -> Result<Result<NetMessage, OpError>, AttemptTimeout> {
+) -> Result<Result<NetMessage, OpError>, TimeoutCause> {
     use crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP;
     use crate::operations::stream_progress::STREAM_OP_INACTIVITY_TIMEOUT;
 
@@ -605,7 +635,7 @@ async fn await_streaming_attempt(
             // Arm 1: terminal reply (unchanged semantics).
             reply = &mut round_trip => return Ok(reply),
             // Arm 3: hard ceiling.
-            _ = &mut ceiling => return Err(AttemptTimeout::StreamCeiling),
+            _ = &mut ceiling => return Err(TimeoutCause::StreamCeiling),
             // Arm 2: a fragment landed — reset the inactivity window.
             _ = handle.notified() => continue,
             // Arm 2: inactivity window elapsed with no Notify ping. Before
@@ -617,12 +647,16 @@ async fn await_streaming_attempt(
                 // `since_last()` reads the handle's own clock — the SAME clock
                 // record() writes to — so this elapsed value is the true gap
                 // since the last fragment (#4001 single-epoch invariant).
-                // Only a confirmed stall returns `AttemptTimeout::StreamStall`.
+                // Only a confirmed stall returns `TimeoutCause::StreamStall`.
                 let elapsed = handle.since_last();
                 if elapsed < STREAM_OP_INACTIVITY_TIMEOUT {
                     continue;
                 }
-                return Err(AttemptTimeout::StreamStall);
+                // Report the silence we actually measured, not the nominal
+                // window: a tiebreak `continue` restarts a full window from
+                // now rather than from the last fragment, so `elapsed` can be
+                // up to 2x the window by the time a stall is confirmed.
+                return Err(TimeoutCause::StreamStall { silent_for: elapsed });
             }
         }
     }
@@ -665,7 +699,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
         let attempt_timeout = driver.attempt_timeout();
         let mut ctx = op_manager.op_ctx(attempt_tx);
 
-        // `round_trip: Result<Result<NetMessage, OpError>, AttemptTimeout>` —
+        // `round_trip: Result<Result<NetMessage, OpError>, TimeoutCause>` —
         // the `Err` arm models "attempt timed out" (fixed deadline OR streaming
         // stall/ceiling) so the downstream match arms below are shared by both
         // paths, while still naming WHICH condition fired for the log.
@@ -674,7 +708,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
             // UNCHANGED fixed-deadline `tokio::time::timeout`.
             None => tokio::time::timeout(attempt_timeout, ctx.send_and_await(request))
                 .await
-                .map_err(|_| AttemptTimeout::Deadline),
+                .map_err(|_| TimeoutCause::Deadline),
             // Streaming PUT path (#4001): replace the fixed deadline with a
             // stream-inactivity timeout driven by real per-fragment progress,
             // bounded by the STREAMING_ATTEMPT_TIMEOUT_CAP hard ceiling.
@@ -764,6 +798,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     outcome = "timeout",
                     timeout_kind = cause.label(),
                     timeout_secs = cause.budget(attempt_timeout).as_secs(),
+                    elapsed_secs = cause.observed(attempt_timeout).as_secs(),
                     "{op_label}: attempt timed out; advancing"
                 );
                 match driver.advance() {
@@ -2063,10 +2098,10 @@ mod tests {
     // `renewal_per_attempt_timeout_fires_before_outer_cancel`.
     //
     // `await_streaming_attempt` returns `Ok(reply)` on the terminal reply,
-    // `AttemptTimeout::StreamStall` on a stream-inactivity stall, and
-    // `AttemptTimeout::StreamCeiling` on the hard ceiling. The non-streaming
+    // `TimeoutCause::StreamStall` on a stream-inactivity stall, and
+    // `TimeoutCause::StreamCeiling` on the hard ceiling. The non-streaming
     // `None` arm (a fixed `OPERATION_TTL`/scaled deadline) instead fires
-    // `AttemptTimeout::Deadline` at the fixed deadline regardless of fragment
+    // `TimeoutCause::Deadline` at the fixed deadline regardless of fragment
     // progress — which is exactly the #4001 self-retry-while-in-flight bug
     // these tests guard against.
     // -------------------------------------------------------------------------
@@ -2108,8 +2143,9 @@ mod tests {
     /// 30 s inactivity window is continuously reset by progress.
     ///
     /// This FAILS against the pre-#4001 fixed-deadline behaviour: a 60 s
-    /// (or even payload-scaled) deadline fires `Err(())` at 60 s while the
-    /// stream is still flowing, producing the version-conflict self-retry.
+    /// (or even payload-scaled) deadline fires `TimeoutCause::Deadline` at
+    /// 60 s while the stream is still flowing, producing the version-conflict
+    /// self-retry.
     #[tokio::test(start_paused = true)]
     async fn streaming_put_does_not_retry_while_chunks_flow() {
         let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
@@ -2142,7 +2178,7 @@ mod tests {
 
     /// Progress flows for 40 s then stops. The 30 s inactivity timeout MUST
     /// fire ~70 s in (40 s of progress + 30 s of silence), returning
-    /// `AttemptTimeout::StreamStall` exactly once. Asserts the stall is
+    /// `TimeoutCause::StreamStall` exactly once. Asserts the stall is
     /// detected on a genuinely dead stream.
     #[tokio::test(start_paused = true)]
     async fn streaming_put_retries_on_true_stall() {
@@ -2168,7 +2204,20 @@ mod tests {
         let outbound = dummy_reply_with_tx(tx);
         let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
         let elapsed = start.now().saturating_sub(t0);
-        assert!(result.is_err(), "a stalled stream must time out (Err)");
+        // Assert the CAUSE, not merely that it failed: a stall reported as a
+        // ceiling (or vice versa) is the same class of misattribution #4912 is
+        // about, and `is_err()` alone would not notice the two being swapped.
+        let cause = result.expect_err("a stalled stream must time out");
+        let TimeoutCause::StreamStall { silent_for } = cause else {
+            panic!("a stalled stream must be attributed to StreamStall, got {cause:?}");
+        };
+        // The reported silence must be a real measurement covering at least the
+        // window, not the nominal constant echoed back.
+        assert!(
+            silent_for >= STREAM_OP_INACTIVITY_TIMEOUT,
+            "reported silence must cover at least one full inactivity window, \
+             got {silent_for:?}"
+        );
         // Stall detected after 40 s progress + 30 s silence ≈ 70 s, and well
         // before the 600 s ceiling.
         assert!(
@@ -2182,7 +2231,7 @@ mod tests {
     /// A stream that records a fragment forever (never replies, never stalls
     /// for 30 s) MUST still be bounded: the hard 600 s
     /// `STREAMING_ATTEMPT_TIMEOUT_CAP` ceiling fires and returns
-    /// `AttemptTimeout::StreamCeiling`.
+    /// `TimeoutCause::StreamCeiling`.
     #[tokio::test(start_paused = true)]
     async fn streaming_put_hard_ceiling_fires() {
         let (mut ctx, tx, handle, progress, mut rx) = streaming_attempt_fixture();
@@ -2203,7 +2252,14 @@ mod tests {
         let outbound = dummy_reply_with_tx(tx);
         let result = await_streaming_attempt(&mut ctx, outbound, &progress).await;
         let elapsed = start.now().saturating_sub(t0);
-        assert!(result.is_err(), "the hard ceiling must abandon the attempt");
+        // Assert the CAUSE, not merely that it failed: reporting a ceiling as
+        // a stall (or vice versa) is the misattribution class #4912 is about,
+        // and `is_err()` alone would not notice the two being swapped.
+        assert_eq!(
+            result.err(),
+            Some(TimeoutCause::StreamCeiling),
+            "the hard ceiling must be attributed to StreamCeiling"
+        );
         assert!(
             elapsed >= crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
             "ceiling must fire at/after STREAMING_ATTEMPT_TIMEOUT_CAP (600 s), \
@@ -2327,19 +2383,24 @@ mod tests {
         // A deliberately distinctive value so a mix-up is unambiguous, and
         // one that matches neither streaming constant.
         let attempt_timeout = Duration::from_secs(117);
+        // A silence longer than the nominal window, which is what a real
+        // tiebreak-extended stall looks like.
+        let stall = TimeoutCause::StreamStall {
+            silent_for: Duration::from_secs(47),
+        };
 
         assert_eq!(
-            AttemptTimeout::Deadline.budget(attempt_timeout),
+            TimeoutCause::Deadline.budget(attempt_timeout),
             attempt_timeout,
             "the fixed-deadline path IS bounded by attempt_timeout"
         );
         assert_eq!(
-            AttemptTimeout::StreamStall.budget(attempt_timeout),
+            stall.budget(attempt_timeout),
             STREAM_OP_INACTIVITY_TIMEOUT,
             "a stream stall is bounded by the inactivity window, NOT attempt_timeout"
         );
         assert_eq!(
-            AttemptTimeout::StreamCeiling.budget(attempt_timeout),
+            TimeoutCause::StreamCeiling.budget(attempt_timeout),
             STREAMING_ATTEMPT_TIMEOUT_CAP,
             "the hard ceiling is bounded by the cap, NOT attempt_timeout"
         );
@@ -2347,24 +2408,47 @@ mod tests {
         // The specific #4912 misreport: a stall must never be described
         // using the driver's per-attempt budget.
         assert_ne!(
-            AttemptTimeout::StreamStall.budget(attempt_timeout),
+            stall.budget(attempt_timeout),
             attempt_timeout,
             "#4912 regression: a 30s stream stall reported as a 117s \
              attempt deadline is exactly the misattribution this fixes"
         );
 
-        // Labels must be distinct, or `timeout_kind` cannot disambiguate.
-        let labels = [
-            AttemptTimeout::Deadline.label(),
-            AttemptTimeout::StreamStall.label(),
-            AttemptTimeout::StreamCeiling.label(),
-        ];
-        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        // `observed` is the measured wait, which for a stall is NOT the
+        // nominal window. Deadline/ceiling fire exactly at their bound, so for
+        // those the two coincide.
         assert_eq!(
-            unique.len(),
-            labels.len(),
-            "timeout_kind labels must be distinct"
+            stall.observed(attempt_timeout),
+            Duration::from_secs(47),
+            "a stall must report the silence it actually measured"
         );
+        assert_ne!(
+            stall.observed(attempt_timeout),
+            stall.budget(attempt_timeout),
+            "a tiebreak-extended stall runs longer than the nominal window; \
+             collapsing observed onto budget would understate it by up to 2x"
+        );
+        assert_eq!(
+            TimeoutCause::Deadline.observed(attempt_timeout),
+            attempt_timeout
+        );
+        assert_eq!(
+            TimeoutCause::StreamCeiling.observed(attempt_timeout),
+            STREAMING_ATTEMPT_TIMEOUT_CAP
+        );
+
+        // Pin the label VALUES, not just their uniqueness. These strings are an
+        // operator-facing interface: a silent rename breaks every saved log
+        // filter and dashboard query built on `timeout_kind`.
+        assert_eq!(TimeoutCause::Deadline.label(), "attempt_deadline");
+        assert_eq!(
+            TimeoutCause::StreamStall {
+                silent_for: Duration::from_secs(30)
+            }
+            .label(),
+            "stream_stall"
+        );
+        assert_eq!(TimeoutCause::StreamCeiling.label(), "stream_ceiling");
     }
 
     /// The two streaming abandon paths must stay distinguishable at their
@@ -2378,18 +2462,40 @@ mod tests {
             .expect("await_streaming_attempt must exist");
         let body = &SRC[fn_pos..];
         let end = body
-            .find("\n/// Drive a retry loop against the network.")
-            .expect("await_streaming_attempt must be followed by drive_retry_loop's docs");
+            .find("\npub(crate) async fn drive_retry_loop")
+            .expect("await_streaming_attempt must precede drive_retry_loop");
         let body = &body[..end];
 
+        // Check each arm SEPARATELY. Asserting only that both variant names
+        // appear somewhere in the function would pass even if the two returns
+        // were swapped between arms — which is precisely the misattribution
+        // this change exists to prevent.
+        let ceiling_arm_start = body
+            .find("_ = &mut ceiling =>")
+            .expect("the hard-ceiling select arm must exist");
+        let ceiling_arm = &body[ceiling_arm_start..];
+        let ceiling_arm_end = ceiling_arm
+            .find('\n')
+            .expect("the ceiling arm must be a single line");
+        let ceiling_arm = &ceiling_arm[..ceiling_arm_end];
         assert!(
-            body.contains("return Err(AttemptTimeout::StreamCeiling)"),
-            "the hard-ceiling arm must report StreamCeiling"
+            ceiling_arm.contains("Err(TimeoutCause::StreamCeiling)"),
+            "the hard-ceiling arm must report StreamCeiling, got: {ceiling_arm}"
+        );
+
+        let stall_arm_start = body
+            .find("_ = inactivity =>")
+            .expect("the inactivity select arm must exist");
+        let stall_arm = &body[stall_arm_start..];
+        assert!(
+            stall_arm.contains("Err(TimeoutCause::StreamStall {"),
+            "the confirmed-stall arm must report StreamStall with its measured silence"
         );
         assert!(
-            body.contains("return Err(AttemptTimeout::StreamStall)"),
-            "the confirmed-stall arm must report StreamStall"
+            !stall_arm.contains("StreamCeiling"),
+            "the stall arm must not report a ceiling"
         );
+
         assert!(
             !body.contains("Err(())"),
             "streaming abandon paths must not regress to an untyped Err(()) — \

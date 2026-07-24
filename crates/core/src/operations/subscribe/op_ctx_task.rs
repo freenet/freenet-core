@@ -959,6 +959,13 @@ async fn drive_client_subscribe_inner(
                     retries,
                     attempts_at_hop,
                     outcome = "timeout",
+                    // This path really is a fixed `attempt_timeout` deadline,
+                    // so the kind is constant here — but it must still be
+                    // emitted, or a filter on `timeout_kind` silently drops
+                    // every subscribe/renewal timeout from the
+                    // `outcome="timeout"` stream. Uses the shared label rather
+                    // than a duplicated literal so the two cannot drift.
+                    timeout_kind = crate::operations::op_ctx::TimeoutCause::Deadline.label(),
                     timeout_secs = attempt_timeout.as_secs(),
                     is_renewal,
                     "subscribe: attempt timed out; advancing to next peer"
