@@ -531,6 +531,9 @@ async fn drive_client_connect_inner(
                 // diagnostics) and `own_location` (for routing).
                 // Idempotent: subsequent observations overwrite.
                 let location = Location::from_address(&address);
+                // GLOBAL-ADDR-WRITE-OK: production. A real node learning its
+                // peer-observed address is exactly what the external_address
+                // mirror is for (#4918).
                 op_manager.ring.connection_manager.set_own_addr(address);
                 op_manager
                     .ring

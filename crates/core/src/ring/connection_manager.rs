@@ -1649,6 +1649,27 @@ impl ConnectionManager {
         );
     }
 
+    /// Set only the local `own_addr`, WITHOUT mirroring to the process-global
+    /// `network_status::external_address`.
+    ///
+    /// For tests that need routing to know this node's address but do not
+    /// exercise the external-address mirror. The full [`Self::set_own_addr`]
+    /// writes a `OnceLock`-backed process global shared by every test in the
+    /// binary; a test that calls it must hold
+    /// [`crate::node::network_status::TEST_GLOBAL_STATE_LOCK`], or it races the
+    /// `set_own_addr` atomicity regression test
+    /// (`test_set_own_addr_atomic_with_network_status`) under `cargo test`'s
+    /// shared-process model. Using this local-only setter sidesteps that
+    /// coupling entirely — the write never touches the global, so there is
+    /// nothing to serialize. See issue #4918.
+    ///
+    /// `test_no_test_calls_global_set_own_addr` pins that the test files which
+    /// previously raced use this helper and not the mirroring setter.
+    #[cfg(test)]
+    pub(crate) fn set_own_addr_local_for_test(&self, addr: SocketAddr) {
+        *self.own_addr.lock() = Some(addr);
+    }
+
     pub fn prune_alive_connection(&self, addr: SocketAddr) -> Option<Location> {
         self.prune_connection(addr, true)
     }
@@ -3643,10 +3664,16 @@ mod tests {
         // global races this one's `assert_eq!`. (CI's `cargo nextest` masks
         // the race with per-process isolation; `cargo test` does not.)
         //
-        // `connection_manager`'s `test_try_set_own_addr_*` tests and every
-        // test in `node::network_status` also touch this global. They are all
-        // serialized by the crate-wide `TEST_GLOBAL_STATE_LOCK`, which this
-        // test acquires below for its entire body.
+        // Other writers of this global — `connection_manager`'s
+        // `test_try_set_own_addr_*` tests and every `node::network_status`
+        // test — take the crate-wide `TEST_GLOBAL_STATE_LOCK`, which this test
+        // holds for its entire body. Tests that only need routing to know
+        // their address (resync/eviction tests in `node.rs`, `ring.rs`,
+        // `node/op_state_manager.rs`) do NOT write the global at all: they use
+        // `ConnectionManager::set_own_addr_local_for_test`, so they cannot race
+        // this assertion. `test_no_test_calls_global_set_own_addr` pins that.
+        // (Before #4918 those tests used the mirroring `set_own_addr` without
+        // the lock and flaked this test ~1 run in 3 under `cargo test`.)
         //
         // `network_status::set_external_address` is a no-op until `init()` has
         // run. `init()` is idempotent-overwrite (installs the tracker on the
@@ -3684,6 +3711,9 @@ mod tests {
                 handles.push(std::thread::spawn(move || {
                     // Align starts so the threads' critical sections overlap.
                     barrier.wait();
+                    // GLOBAL-ADDR-WRITE-OK: this test IS the mirror's
+                    // atomicity regression test, and its body holds
+                    // TEST_GLOBAL_STATE_LOCK throughout (#4918).
                     cm.set_own_addr(addr);
                 }));
             }
@@ -3716,6 +3746,108 @@ mod tests {
         drop(_global);
         if let Some(msg) = divergence {
             panic!("{msg}");
+        }
+    }
+
+    /// Guard for #4918: tests that only need routing to know their address
+    /// must NOT call the mirroring [`ConnectionManager::set_own_addr`], which
+    /// writes the process-global `network_status::external_address` and races
+    /// `test_set_own_addr_atomic_with_network_status` unless serialized by
+    /// `TEST_GLOBAL_STATE_LOCK`.
+    ///
+    /// This is a SOURCE-SCRAPE guard on purpose. The race only manifests under
+    /// `cargo test`'s shared-process model; CI's `cargo nextest` gives every
+    /// test its own process and masks it. A behavioural test therefore could
+    /// not catch a regression in CI — but this scrape runs deterministically
+    /// under both runners, so it does.
+    ///
+    /// It walks the WHOLE crate source and checks each call site individually.
+    /// Neither a fixed file list nor a per-file allowlist is enough: both are
+    /// the same "remember to update it" fragility this fix exists to remove.
+    /// The caller inventory for this bug was wrong three times running (5 sites,
+    /// then 7, then 9 — the last two found by review), and the two files that
+    /// legitimately write the global both contain test modules, so exempting
+    /// them wholesale would let the identical race back in. Every call site
+    /// must therefore carry an explicit [`MARKER`] annotation justifying it.
+    #[test]
+    fn test_no_test_calls_global_set_own_addr() {
+        use std::path::Path;
+
+        // Built at runtime so this file's own source does not contain the
+        // literal being searched for (which would match the guard itself).
+        let bare = format!(".set_own_addr{}", "(");
+        // An annotation on the call line, or anywhere in the comment block
+        // immediately above it, marks a write to the process-global mirror as
+        // deliberate and justified. The whole block is searched so a
+        // multi-line justification can lead with the marker and still read
+        // naturally.
+        const MARKER: &str = "GLOBAL-ADDR-WRITE-OK";
+
+        fn visit(dir: &Path, out: &mut Vec<(String, usize, String)>, bare: &str) {
+            let entries = std::fs::read_dir(dir).expect("read crate source dir");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, out, bare);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let src = std::fs::read_to_string(&path).expect("read source file");
+                    let lines: Vec<&str> = src.lines().collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        if !line.contains(bare) {
+                            continue;
+                        }
+                        // Walk back over the contiguous comment block directly
+                        // above the call, stopping at the first non-comment
+                        // line so a marker on an unrelated earlier statement
+                        // cannot vouch for this one.
+                        let annotated = line.contains(MARKER)
+                            || lines[..i]
+                                .iter()
+                                .rev()
+                                .take_while(|l| l.trim_start().starts_with("//"))
+                                .any(|l| l.contains(MARKER));
+                        if !annotated {
+                            out.push((
+                                path.to_string_lossy().replace('\\', "/"),
+                                i + 1,
+                                line.trim().to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut unannotated = Vec::new();
+        visit(&src_root, &mut unannotated, &bare);
+
+        assert!(
+            unannotated.is_empty(),
+            "unannotated calls to the mirroring `set_own_addr`, which writes \
+             the process-global external_address and races \
+             test_set_own_addr_atomic_with_network_status under `cargo test`: \
+             {unannotated:#?}\nFor a test that only needs routing to know the \
+             address, use `set_own_addr_local_for_test`. If the global mirror \
+             is genuinely required, hold TEST_GLOBAL_STATE_LOCK (or be \
+             production code) and annotate the line with `{MARKER}` plus a \
+             reason. See #4918."
+        );
+
+        // The migrated files must still SET an address, so a future edit
+        // cannot quietly drop address-setting and pass vacuously.
+        for name in [
+            "node.rs",
+            "ring.rs",
+            "node/op_state_manager.rs",
+            "operations/update/op_ctx_task.rs",
+        ] {
+            let src = std::fs::read_to_string(src_root.join(name)).expect("read migrated file");
+            assert!(
+                src.contains(".set_own_addr_local_for_test("),
+                "{name} should set own address via set_own_addr_local_for_test \
+                 (see #4918)"
+            );
         }
     }
 

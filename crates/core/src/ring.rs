@@ -8497,7 +8497,7 @@ mod cost_pressure_seam_tests {
         op_manager
             .ring
             .connection_manager
-            .set_own_addr("127.0.0.1:14100".parse().unwrap());
+            .set_own_addr_local_for_test("127.0.0.1:14100".parse().unwrap());
         let ring = &op_manager.ring;
 
         let junk = seam_key(1);
