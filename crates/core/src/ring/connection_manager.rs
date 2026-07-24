@@ -3711,6 +3711,9 @@ mod tests {
                 handles.push(std::thread::spawn(move || {
                     // Align starts so the threads' critical sections overlap.
                     barrier.wait();
+                    // GLOBAL-ADDR-WRITE-OK: this test IS the mirror's
+                    // atomicity regression test, and its body holds
+                    // TEST_GLOBAL_STATE_LOCK throughout (#4918).
                     cm.set_own_addr(addr);
                 }));
             }
@@ -3758,61 +3761,77 @@ mod tests {
     /// not catch a regression in CI — but this scrape runs deterministically
     /// under both runners, so it does.
     ///
-    /// It walks the WHOLE crate source rather than a fixed file list, and
-    /// allowlists the known-good production sites. A hardcoded list is the same
-    /// "remember to update it" fragility this fix exists to remove: the caller
-    /// inventory for this bug was wrong three times running (5 sites, then 7,
-    /// then 9 — the last two found by review), so the guard must fail CLOSED on
-    /// anything new anywhere.
+    /// It walks the WHOLE crate source and checks each call site individually.
+    /// Neither a fixed file list nor a per-file allowlist is enough: both are
+    /// the same "remember to update it" fragility this fix exists to remove.
+    /// The caller inventory for this bug was wrong three times running (5 sites,
+    /// then 7, then 9 — the last two found by review), and the two files that
+    /// legitimately write the global both contain test modules, so exempting
+    /// them wholesale would let the identical race back in. Every call site
+    /// must therefore carry an explicit [`MARKER`] annotation justifying it.
     #[test]
     fn test_no_test_calls_global_set_own_addr() {
         use std::path::Path;
 
-        // Sites that legitimately write the process-global mirror.
-        // `connect/op_ctx_task.rs` is production (a real node learning its
-        // observed address); `connection_manager.rs` is this module — the
-        // atomicity test's own call, which holds `TEST_GLOBAL_STATE_LOCK`,
-        // plus these string literals.
-        const ALLOWED: [&str; 2] = [
-            "operations/connect/op_ctx_task.rs",
-            "ring/connection_manager.rs",
-        ];
-        // `.set_own_addr(` requires `(` immediately after the name, so it does
-        // NOT match `.set_own_addr_local_for_test(`.
-        const BARE: &str = ".set_own_addr(";
+        // Built at runtime so this file's own source does not contain the
+        // literal being searched for (which would match the guard itself).
+        let bare = format!(".set_own_addr{}", "(");
+        // An annotation on the call line, or anywhere in the comment block
+        // immediately above it, marks a write to the process-global mirror as
+        // deliberate and justified. The whole block is searched so a
+        // multi-line justification can lead with the marker and still read
+        // naturally.
+        const MARKER: &str = "GLOBAL-ADDR-WRITE-OK";
 
-        fn visit(dir: &Path, out: &mut Vec<String>) {
+        fn visit(dir: &Path, out: &mut Vec<(String, usize, String)>, bare: &str) {
             let entries = std::fs::read_dir(dir).expect("read crate source dir");
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    visit(&path, out);
+                    visit(&path, out, bare);
                 } else if path.extension().is_some_and(|e| e == "rs") {
                     let src = std::fs::read_to_string(&path).expect("read source file");
-                    if src.contains(BARE) {
-                        out.push(path.to_string_lossy().replace('\\', "/"));
+                    let lines: Vec<&str> = src.lines().collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        if !line.contains(bare) {
+                            continue;
+                        }
+                        // Walk back over the contiguous comment block directly
+                        // above the call, stopping at the first non-comment
+                        // line so a marker on an unrelated earlier statement
+                        // cannot vouch for this one.
+                        let annotated = line.contains(MARKER)
+                            || lines[..i]
+                                .iter()
+                                .rev()
+                                .take_while(|l| l.trim_start().starts_with("//"))
+                                .any(|l| l.contains(MARKER));
+                        if !annotated {
+                            out.push((
+                                path.to_string_lossy().replace('\\', "/"),
+                                i + 1,
+                                line.trim().to_string(),
+                            ));
+                        }
                     }
                 }
             }
         }
 
         let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut hits = Vec::new();
-        visit(&src_root, &mut hits);
+        let mut unannotated = Vec::new();
+        visit(&src_root, &mut unannotated, &bare);
 
-        let unexpected: Vec<&String> = hits
-            .iter()
-            .filter(|p| !ALLOWED.iter().any(|a| p.ends_with(a)))
-            .collect();
         assert!(
-            unexpected.is_empty(),
-            "these files call the mirroring `set_own_addr`, which writes the \
-             process-global external_address and races \
+            unannotated.is_empty(),
+            "unannotated calls to the mirroring `set_own_addr`, which writes \
+             the process-global external_address and races \
              test_set_own_addr_atomic_with_network_status under `cargo test`: \
-             {unexpected:?}\nUse `set_own_addr_local_for_test` for tests that \
-             only need routing to know the address, or hold \
-             TEST_GLOBAL_STATE_LOCK if the global mirror is genuinely \
-             required. See #4918."
+             {unannotated:#?}\nFor a test that only needs routing to know the \
+             address, use `set_own_addr_local_for_test`. If the global mirror \
+             is genuinely required, hold TEST_GLOBAL_STATE_LOCK (or be \
+             production code) and annotate the line with `{MARKER}` plus a \
+             reason. See #4918."
         );
 
         // The migrated files must still SET an address, so a future edit
