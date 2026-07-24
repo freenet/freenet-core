@@ -153,13 +153,23 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
                 <span class="metric-label">Queue-full rejects</span>
             </div>
             <div class="metric-tile">
+                <span class="metric-value">{rejected_contract}</span>
+                <span class="metric-label">Contract-cap rejects</span>
+            </div>
+            <div class="metric-tile">
                 <span class="metric-value">{shed}</span>
                 <span class="metric-label">Background shed</span>
             </div>
         </div>"#,
             depth = snap.fair_queue.depth_total,
             high_water = snap.fair_queue.high_water,
+            // Shown as its own tile rather than folded into the total: the
+            // whole point of splitting the two causes is that node-wide
+            // backpressure and one contract hitting its own cap call for
+            // different responses. Summing them would put the misdiagnosis
+            // this split exists to prevent back on the dashboard.
             rejected_capacity = snap.fair_queue.rejected_global_capacity,
+            rejected_contract = snap.fair_queue.rejected_per_contract,
             shed = snap.fair_queue.background_shed,
         )
     } else {

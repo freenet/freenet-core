@@ -643,6 +643,28 @@ mod tests {
     }
 
     #[test]
+    fn fair_queue_per_contract_rejects_are_not_reported_as_zero() {
+        // One hot contract hits its own per-tier cap while the node is
+        // nowhere near global capacity. The row renders because rejections
+        // happened, so it must not then show "0" for them — a card that
+        // appears *because* of an event and reports zero of it is worse than
+        // not rendering at all.
+        let mut snap = base_snapshot();
+        snap.fair_queue.high_water = 100;
+        snap.fair_queue.rejected_per_contract = 42;
+        snap.fair_queue.rejected_global_capacity = 0;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("Contract-cap rejects"),
+            "per-contract rejections need their own label"
+        );
+        assert!(
+            html.contains("42</span>"),
+            "per-contract reject count must be displayed, not silently dropped"
+        );
+    }
+
+    #[test]
     fn rate_limit_stats_rendered_when_active() {
         // Once the limiter has dropped traffic, the operator must see the
         // accepted / rate-limited / capacity-dropped counts on the card.
