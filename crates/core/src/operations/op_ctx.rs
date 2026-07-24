@@ -552,11 +552,12 @@ impl TimeoutCause {
 
     /// The configured bound that governed this attempt.
     ///
-    /// This is the RULE that fired, not a measurement: how long the attempt
-    /// actually ran is logged separately as `elapsed_secs`. Only
-    /// [`Self::Deadline`] is bounded by the driver's `attempt_timeout`; the two
-    /// streaming variants are bounded by their own constants. Logging
-    /// `attempt_timeout` for those is what made #4912 hard to read.
+    /// This is the RULE that fired, not a measurement of how long the attempt
+    /// ran. Only [`Self::Deadline`] is bounded by the driver's
+    /// `attempt_timeout`; the two streaming variants are bounded by their own
+    /// constants. Logging `attempt_timeout` for those is what made #4912 hard
+    /// to read — pair this with [`Self::label`] so a reader can tell which
+    /// bound the number refers to.
     fn budget(self, attempt_timeout: std::time::Duration) -> std::time::Duration {
         match self {
             Self::Deadline => attempt_timeout,
@@ -673,15 +674,6 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
         let request = driver.build_request(attempt_tx);
 
         let attempt_timeout = driver.attempt_timeout();
-        // Measure how long the attempt really runs, so the log carries an
-        // observation and not just the rule that fired. Deriving elapsed from
-        // the cause would repeat #4912's mistake in miniature: a stall's
-        // inactivity window is not the attempt's duration (a stream can make
-        // progress for 40 s and then stall for 30 s, a 70 s attempt).
-        // `tokio::time::Instant` is auto-paused under `start_paused(true)`, so
-        // simulation tests see virtual elapsed time — same reasoning as
-        // `subscribe/op_ctx_task.rs`'s `request_sent_at`.
-        let attempt_started = tokio::time::Instant::now();
         let mut ctx = op_manager.op_ctx(attempt_tx);
 
         // `round_trip: Result<Result<NetMessage, OpError>, TimeoutCause>` —
@@ -714,13 +706,6 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 await_streaming_attempt(&mut ctx, request, &progress).await
             }
         };
-
-        // Stop the clock the moment the attempt resolves, BEFORE the cleanup
-        // await below. `release_pending_op_slot` can block for up to
-        // `NOTIFICATION_SEND_TIMEOUT` (30 s) under notification backpressure,
-        // and charging that to the attempt would overstate `elapsed_secs` by
-        // as much as the stall window it is meant to expose.
-        let attempt_elapsed = attempt_started.elapsed();
 
         // Release the per-attempt pending_op_results slot regardless
         // of outcome. Without this, slots are only reclaimed by the
@@ -790,7 +775,6 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     outcome = "timeout",
                     timeout_kind = cause.label(),
                     timeout_secs = cause.budget(attempt_timeout).as_secs(),
-                    elapsed_secs = attempt_elapsed.as_secs(),
                     "{op_label}: attempt timed out; advancing"
                 );
                 match driver.advance() {
@@ -2492,30 +2476,18 @@ mod tests {
             "#4912 regression: logging attempt_timeout unconditionally \
              misreports streaming stalls/ceilings by up to 20x"
         );
-        // `elapsed_secs` must be a MEASUREMENT. Deriving it from the cause
-        // would repeat the same mistake one level down: a stall's inactivity
-        // window is not the attempt's duration (40 s of progress then a 30 s
-        // stall is a 70 s attempt that would be logged as 30).
+        // No measured-duration field here on purpose. An `elapsed_secs` would
+        // need the SAME clock the path being timed uses: the streaming path
+        // sleeps on the driver's injected `TimeSource` (`VirtualTime` under
+        // DST), which `tokio::time::Instant` does not track, so a 30 s virtual
+        // stall would log 0. Getting it right means threading a clock through
+        // this generic loop for both paths — a design change, not a log tweak.
+        // See the follow-up issue referenced on #4916.
         assert!(
-            window.contains("elapsed_secs = attempt_elapsed.as_secs()"),
-            "elapsed_secs MUST come from the measured attempt clock, not from \
-             the timeout cause"
-        );
-
-        // ...and that measurement must be taken BEFORE the cleanup await.
-        // `release_pending_op_slot` can block for up to NOTIFICATION_SEND_TIMEOUT
-        // (30 s) under backpressure; charging that to the attempt would inflate
-        // `elapsed_secs` by as much as the stall window it exists to reveal.
-        let capture = body
-            .find("let attempt_elapsed = attempt_started.elapsed();")
-            .expect("the attempt clock must be stopped explicitly");
-        let cleanup = body
-            .find("release_pending_op_slot(attempt_tx).await")
-            .expect("the pending-slot cleanup must still run");
-        assert!(
-            capture < cleanup,
-            "attempt_elapsed MUST be captured before the release_pending_op_slot \
-             await, or cleanup backpressure is charged to the attempt"
+            !window.contains("elapsed_secs"),
+            "an elapsed_secs field must not be reintroduced without a \
+             clock-correct source for BOTH the streaming and non-streaming \
+             paths; a wall-clock reading is wrong under VirtualTime"
         );
     }
 }
