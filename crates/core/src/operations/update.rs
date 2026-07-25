@@ -130,9 +130,20 @@ pub(crate) struct BroadcastTargetResult {
     pub skipped_sender: usize,
 }
 
+/// Result of [`update_contract`]: the merged state and whether it changed.
+///
+/// Deliberately carries NO summary (#4923): an earlier version bundled
+/// `StateSummary::from(<state bytes>)` here — the state relabeled as a
+/// summary — which `send_proactive_summary_notification` then broadcast,
+/// poisoning every receiver's delta-efficiency gate into permanent
+/// full-state fallbacks. The consumers that genuinely need a summary (the
+/// two client-facing `UpdateResponse` sites in `drive_client_update`) fetch
+/// the contract's real one via [`contract_summary_or_empty`] themselves, so
+/// the relay/no-change hot paths pay zero extra contract-handler
+/// round-trips. Pinned by
+/// `update_contract_never_builds_a_summary_from_state_bytes`.
 pub(crate) struct UpdateExecution {
     pub(crate) value: WrappedState,
-    pub(crate) summary: StateSummary<'static>,
     pub(crate) changed: bool,
 }
 
@@ -557,12 +568,81 @@ pub(crate) fn log_broadcast_to_streaming_failure(
     !err.is_contract_exec_rejection() && !err.is_contract_queue_full()
 }
 
+/// Fetch the contract's REAL `summarize_state` output for `key`, falling back
+/// to an EMPTY summary when the summarize is unavailable (missing state,
+/// saturated executor queue, WASM failure).
+///
+/// Called by the two client-facing `UpdateResponse { summary }` sites in
+/// `drive_client_update` (the only consumers that need a summary after an
+/// update; #4923 MAJOR 4 — `update_contract` itself does no summary work so
+/// the relay/no-change hot paths pay zero extra handler round-trips).
+///
+/// The fallback is deliberately empty rather than the state bytes: an empty
+/// summary is an honest "no summary available" for the client-facing
+/// `ContractResponse::UpdateResponse { summary }` (whose type requires a
+/// value), while state bytes relabeled as a summary poisoned every receiver's
+/// delta-efficiency gate (`is_delta_efficient` refuses when
+/// `summary * 2 >= state`, and state == summary always refuses) and forced
+/// full-state broadcast fallbacks — 41% of all network wire bytes in the
+/// #4923 incident. See the `update_contract_never_builds_a_summary_from_state_bytes`
+/// pin test, which also pins that the ONLY `StateSummary` this helper may
+/// construct is the empty fallback.
+///
+/// Cost note: the executor's `summary_cache` memoizes on the state hash, but
+/// that cache is invalidated on every state write (`state_store.rs`), so a
+/// post-commit summarize after a CHANGED apply is always a memo MISS. The
+/// real cost argument: the broadcast fan-out already issues the identical
+/// `get_contract_summary` on every state change (`broadcast_queue.rs`), so
+/// whichever of the two runs first pays the one WASM call and the other hits
+/// the cache; and the dominant no-change client case IS a memo hit.
+async fn contract_summary_or_empty(
+    op_manager: &OpManager,
+    key: ContractKey,
+    priority: crate::contract::Priority,
+) -> StateSummary<'static> {
+    match op_manager
+        .notify_contract_handler_prioritized(
+            ContractHandlerEvent::GetSummaryQuery { key },
+            priority,
+        )
+        .await
+    {
+        Ok(ContractHandlerEvent::GetSummaryResponse {
+            summary: Ok(summary),
+            ..
+        }) => summary,
+        Ok(ContractHandlerEvent::GetSummaryResponse {
+            summary: Err(err), ..
+        }) => {
+            tracing::debug!(
+                contract = %key,
+                error = %err,
+                "client update: summarize failed; returning empty summary"
+            );
+            StateSummary::from(Vec::new())
+        }
+        other => {
+            tracing::debug!(
+                contract = %key,
+                response = ?other,
+                "client update: unexpected GetSummaryQuery response; returning empty summary"
+            );
+            StateSummary::from(Vec::new())
+        }
+    }
+}
+
 /// Apply an update to a contract.
 ///
 /// This function:
 /// 1. Fetches the current state (for change detection)
 /// 2. Calls UpdateQuery to merge the update and persist
-/// 3. Returns the merged state, summary, and whether the state changed
+/// 3. Returns the merged state and whether the state changed
+///
+/// It deliberately does NO summary work (#4923 MAJOR 4): it runs on the
+/// relay-broadcast and no-change hot paths, so any per-call summary fetch
+/// here multiplies contract-handler round-trips network-wide. Consumers that
+/// need a summary fetch it themselves ([`contract_summary_or_empty`]).
 ///
 /// The `update_data` parameter can be:
 /// - `UpdateData::Delta(delta)` - A delta from the client, merged with current state
@@ -619,12 +699,12 @@ pub(crate) async fn update_contract(
                 new_val.size() > 0,
                 "update_contract: state must be non-empty after successful UPDATE for contract {key}"
             );
-            let new_bytes = State::from(new_val.clone()).into_bytes();
-            let summary = StateSummary::from(new_bytes);
-
+            // #4923: no summary is computed here — never relabel the state
+            // bytes as a summary (the self-poisoning full-state-broadcast
+            // loop), and no per-apply summary fetch on this hot path either
+            // (MAJOR 4). Consumers that need a summary fetch it themselves.
             Ok(UpdateExecution {
                 value: new_val,
-                summary,
                 changed: state_changed,
             })
         }
@@ -724,11 +804,9 @@ pub(crate) async fn update_contract(
                 }
             };
 
-            let bytes = State::from(resolved_state.clone()).into_bytes();
-            let summary = StateSummary::from(bytes);
+            // #4923: same as the changed branch — no summary work here.
             Ok(UpdateExecution {
                 value: resolved_state,
-                summary,
                 changed: false,
             })
         }
@@ -745,13 +823,28 @@ pub(crate) async fn update_contract(
 /// summary" so they can update their cached view of us and skip sending
 /// redundant broadcasts.
 ///
-/// Accepts the already-computed summary from `UpdateExecution` to avoid an
-/// extra WASM `summarize_state` call.
+/// Fetches the contract's REAL summary itself (like its sibling
+/// [`send_summary_back_on_rejection`]) rather than accepting a precomputed one
+/// from the caller. An earlier version took `UpdateExecution.summary` as a
+/// parameter "to avoid an extra WASM `summarize_state` call" — that rationale
+/// is obsolete: the 100ms per-contract throttle below bounds the call rate,
+/// and the broadcast fan-out already issues the identical
+/// `get_contract_summary` on every state change (`broadcast_queue.rs`), so
+/// whichever runs first pays the one WASM call and the other hits the
+/// executor's `summary_cache`. Worse, the value the parameter received was
+/// the full post-update STATE relabeled as a summary. Broadcasting that
+/// poisoned every interested peer's cached view of us
+/// (`interested_peers[contract][peer].summary` == our state), so their
+/// `is_delta_efficient` gate refused every delta and every broadcast fell
+/// back to full state — 41% of all network wire bytes in the #4923 incident.
+/// If no real summary is available, send nothing — note the throttle token is
+/// consumed even in that case, so a no-summary tick still burns the
+/// contract's 100ms notification slot (acceptable: no summary means there is
+/// nothing to advertise yet, and the next state change retries).
 pub(crate) async fn send_proactive_summary_notification(
     op_manager: &OpManager,
     key: &ContractKey,
     sender_addr: SocketAddr,
-    summary: StateSummary<'static>,
 ) {
     use crate::message::{InterestMessage, SummaryEntry};
     use crate::ring::interest::contract_hash;
@@ -763,6 +856,21 @@ pub(crate) async fn send_proactive_summary_notification(
     {
         return;
     }
+
+    // Fetch our REAL summary (the contract's `summarize_state` output,
+    // memoized on the state hash). Never send a caller-supplied value here —
+    // see the function docs and #4923.
+    let Some(summary) = op_manager
+        .interest_manager
+        .get_contract_summary(op_manager, key)
+        .await
+    else {
+        tracing::debug!(
+            contract = %key,
+            "Skipping proactive summary notification — no local summary available"
+        );
+        return;
+    };
 
     // Build the Summaries message with our updated summary
     let hash = contract_hash(key);
@@ -1674,6 +1782,299 @@ mod tests {
             !driver_src.contains("sender_addr, AutoFetchReason::Originator"),
             "inbound relay/broadcast auto-fetch sites (keyed on sender_addr) MUST \
              use AutoFetchReason::InboundRelay, not Originator, or #4473 regresses"
+        );
+    }
+
+    // ── #4923 state-as-summary poison regression tests ───────────────────────
+    //
+    // Sizes taken from the production case: a River room contract whose state
+    // is ~253.2 KB and whose real `summarize_state` output is ~33.8 KB (13%).
+    const ROOM_STATE_BYTES: usize = 253_200;
+    const ROOM_SUMMARY_BYTES: usize = 33_800;
+
+    /// The end of the #4923 poison chain, as pure logic: the wire-efficiency
+    /// gate admits a delta for the contract's REAL summary, but refuses when
+    /// the FULL STATE is cached in the same slot (what the pre-fix
+    /// `send_proactive_summary_notification` published) — `state == summary`
+    /// always refuses, so every broadcast to a poisoned peer fell back to a
+    /// full-state send of exactly the state size (~253.2 KB per send, 41% of
+    /// all network wire bytes in production).
+    #[test]
+    fn honest_summary_passes_the_delta_gate_where_poisoned_refused() {
+        use crate::ring::interest::is_delta_efficient;
+
+        assert!(
+            is_delta_efficient(ROOM_SUMMARY_BYTES, ROOM_STATE_BYTES),
+            "the contract's real summary must pass the delta-efficiency gate"
+        );
+        assert!(
+            !is_delta_efficient(ROOM_STATE_BYTES, ROOM_STATE_BYTES),
+            "a state-sized 'summary' (the state relabeled) must be refused by \
+             the gate — this refusal is what forced every broadcast to a \
+             poisoned peer down the full-state fallback (#4923)"
+        );
+    }
+
+    /// Build a minimal real OpManager wired to a stand-in contract handler
+    /// playing a contract with a 253.2 KB state and a 33.8 KB
+    /// `summarize_state` output (production sizes from the #4923 incident).
+    /// `summary_ok = false` makes `GetSummaryQuery` fail with an executor
+    /// error, exercising the empty fallback. Returns the op_manager, the
+    /// stand-in's state and summary, and a keep-alive guard for the channel
+    /// halves and handler task. Mirrors
+    /// `op_ctx_task.rs::build_queue_full_test_node`.
+    async fn build_summary_test_node(
+        id: &str,
+        summary_ok: bool,
+    ) -> (
+        std::sync::Arc<OpManager>,
+        WrappedState,
+        StateSummary<'static>,
+        Box<dyn std::any::Any>,
+    ) {
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        // Stand-in contract: 253.2 KB state, 33.8 KB summary.
+        let merged_state = WrappedState::from(vec![7u8; ROOM_STATE_BYTES]);
+        let contract_summary = StateSummary::from(vec![9u8; ROOM_SUMMARY_BYTES]);
+        let handler_state = merged_state.clone();
+        let handler_summary = contract_summary.clone();
+        let handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                let response = match ev {
+                    ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
+                        key: None,
+                        response: Ok(StoreResponse {
+                            state: Some(handler_state.clone()),
+                            contract: None,
+                        }),
+                    },
+                    ContractHandlerEvent::GetSummaryQuery { key } => {
+                        ContractHandlerEvent::GetSummaryResponse {
+                            key,
+                            summary: if summary_ok {
+                                Ok(handler_summary.clone())
+                            } else {
+                                Err(ExecutorError::other(crate::contract::ContractQueueFull))
+                            },
+                        }
+                    }
+                    ContractHandlerEvent::UpdateQuery { .. } => {
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(handler_state.clone()),
+                            state_changed: true,
+                        }
+                    }
+                    other => panic!("unexpected handler event: {other:?}"),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let guard: Box<dyn std::any::Any> = Box::new((
+            handler,
+            notification_rx,
+            result_router_rx,
+            task_monitor,
+            wait_for_event,
+        ));
+        (op_manager, merged_state, contract_summary, guard)
+    }
+
+    /// The head of the #4923 chain, against the real production functions.
+    ///
+    /// The client driver (`drive_client_update`) applies the update via
+    /// `update_contract` — which computes NO summary at all (MAJOR 4) — and
+    /// then fetches the `UpdateResponse` summary via
+    /// `contract_summary_or_empty`. That fetched value must be the contract's
+    /// real `summarize_state` output. Pre-fix, the client response carried
+    /// the merged STATE relabeled as a summary, and the proactive
+    /// notification broadcast the same poisoned value to every interested
+    /// peer, where `is_delta_efficient` then refused every delta (#4923).
+    #[tokio::test]
+    async fn client_facing_summary_is_the_contract_summary_not_the_state() {
+        let (op_manager, merged_state, contract_summary, _guard) =
+            build_summary_test_node("update-summary-poison-4923", true).await;
+
+        let key = make_contract_key(1);
+        let execution = update_contract(
+            &op_manager,
+            key,
+            UpdateData::Delta(StateDelta::from(vec![1u8, 2, 3])),
+            RelatedContracts::default(),
+            crate::contract::Priority::ClientLocal,
+        )
+        .await
+        .expect("update must succeed");
+        assert!(execution.changed, "stand-in reports a changed state");
+
+        // Exactly what the two client `UpdateResponse { summary }` sites in
+        // `drive_client_update` do after the update resolves.
+        let summary =
+            contract_summary_or_empty(&op_manager, key, crate::contract::Priority::ClientLocal)
+                .await;
+
+        assert_eq!(
+            summary.as_ref(),
+            contract_summary.as_ref(),
+            "the client-facing summary must be the contract's `summarize_state` \
+             output ({ROOM_SUMMARY_BYTES} bytes), not the merged state \
+             ({ROOM_STATE_BYTES} bytes) relabeled as a summary (#4923)"
+        );
+        assert_ne!(
+            summary.as_ref(),
+            merged_state.as_ref(),
+            "the client-facing summary must never equal the state bytes (#4923)"
+        );
+        assert!(
+            crate::ring::interest::is_delta_efficient(
+                summary.as_ref().len(),
+                execution.value.size()
+            ),
+            "the client-facing summary must pass the receiver's \
+             delta-efficiency gate; got a {}-byte summary for a {}-byte state",
+            summary.as_ref().len(),
+            execution.value.size(),
+        );
+    }
+
+    /// MINOR 6 error path: when the summarize fails (saturated executor,
+    /// WASM error, missing state), `contract_summary_or_empty` must return
+    /// the EMPTY summary — never the state bytes, which would re-open the
+    /// #4923 poison through the client-facing `UpdateResponse`.
+    #[tokio::test]
+    async fn contract_summary_or_empty_error_path_returns_empty_not_state() {
+        let (op_manager, merged_state, _contract_summary, _guard) =
+            build_summary_test_node("update-summary-poison-4923-errpath", false).await;
+
+        let key = make_contract_key(1);
+        let summary =
+            contract_summary_or_empty(&op_manager, key, crate::contract::Priority::ClientLocal)
+                .await;
+
+        assert!(
+            summary.as_ref().is_empty(),
+            "the summarize-failure fallback must be the EMPTY summary, got {} bytes",
+            summary.as_ref().len()
+        );
+        assert_ne!(
+            summary.as_ref(),
+            merged_state.as_ref(),
+            "the fallback must never be the state bytes (#4923)"
+        );
+    }
+
+    /// Source-scrape pin so a future refactor cannot silently re-introduce
+    /// the #4923 mislabeling (or the MAJOR-4 per-apply summary cost).
+    /// Whitespace is collapsed before matching so rustfmt re-wrapping cannot
+    /// break the needles; call-site needles match the fn name only, so a
+    /// trailing comma or argument reflow cannot break them either.
+    ///
+    /// Three pinned regions:
+    /// 1. `update_contract` does NO summary work: no `StateSummary::from(`
+    ///    (the poison construction) and no `contract_summary_or_empty(` call
+    ///    (it runs on the relay/no-change hot paths — consumers fetch their
+    ///    own summary).
+    /// 2. `contract_summary_or_empty` may construct a `StateSummary` ONLY as
+    ///    the empty fallback `StateSummary::from(Vec::new())`.
+    /// 3. `drive_client_update` fetches the client-facing summary via
+    ///    `contract_summary_or_empty` in BOTH arms (local-only and
+    ///    remote-forward) and never builds one from bytes.
+    #[test]
+    fn update_contract_never_builds_a_summary_from_state_bytes() {
+        let src = include_str!("update.rs");
+
+        // Region 1: update_contract body.
+        let uc_start = src
+            .find("pub(crate) async fn update_contract(")
+            .expect("update_contract must exist");
+        let uc_end = src[uc_start..]
+            .find("\n/// Send proactive summary notifications")
+            .map(|off| uc_start + off)
+            .expect("update_contract must be followed by send_proactive_summary_notification");
+        let uc_body: String = src[uc_start..uc_end].split_whitespace().collect();
+        assert!(
+            !uc_body.contains("StateSummary::from("),
+            "update_contract must not synthesize a StateSummary from bytes it \
+             has on hand — a state-sized summary poisons every peer's delta \
+             gate (#4923)"
+        );
+        assert!(
+            !uc_body.contains("contract_summary_or_empty("),
+            "update_contract must do NO summary work — it runs on the \
+             relay-broadcast and no-change hot paths; the client driver \
+             fetches the summary itself (#4923 MAJOR 4)"
+        );
+
+        // Region 2: contract_summary_or_empty body — only the empty fallback.
+        let h_start = src
+            .find("async fn contract_summary_or_empty(")
+            .expect("contract_summary_or_empty must exist");
+        let h_end = src[h_start..]
+            .find("\n/// Apply an update to a contract.")
+            .map(|off| h_start + off)
+            .expect("contract_summary_or_empty must be followed by update_contract's doc");
+        let h_body: String = src[h_start..h_end].split_whitespace().collect();
+        let h_sans_fallback = h_body.replace("StateSummary::from(Vec::new())", "");
+        assert!(
+            !h_sans_fallback.contains("StateSummary::from("),
+            "contract_summary_or_empty may construct a StateSummary ONLY as \
+             the empty fallback StateSummary::from(Vec::new()) — any other \
+             construction risks re-introducing state-as-summary (#4923)"
+        );
+
+        // Region 3: the client driver fetches via the helper in both arms.
+        let driver_src = include_str!("update/op_ctx_task.rs");
+        let d_start = driver_src
+            .find("async fn drive_client_update(")
+            .expect("drive_client_update must exist");
+        let d_after = &driver_src[d_start + 1..];
+        let d_end = d_after
+            .find("\nasync fn ")
+            .or_else(|| d_after.find("\nfn "))
+            .unwrap_or(d_after.len());
+        let d_body: String = driver_src[d_start..d_start + 1 + d_end]
+            .split_whitespace()
+            .collect();
+        assert!(
+            d_body.matches("contract_summary_or_empty(").count() >= 2,
+            "drive_client_update must fetch the client-facing summary via \
+             contract_summary_or_empty in BOTH arms (local-only and \
+             remote-forward) — hand-rolled summaries re-open #4923"
+        );
+        assert!(
+            !d_body.contains("StateSummary::from("),
+            "drive_client_update must never build a StateSummary from bytes \
+             (#4923)"
         );
     }
 }
