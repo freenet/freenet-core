@@ -20,6 +20,7 @@ use crate::node::OpManager;
 use crate::ring::PeerKeyLocation;
 use crate::transport::BroadcastDeliveryOutcome;
 
+use super::broadcast_payload_mix::PayloadArm;
 use super::p2p_protoc::P2pBridge;
 
 /// Timeout for awaiting stream completion signal before releasing the permit
@@ -845,11 +846,28 @@ pub(super) async fn broadcast_to_single_peer(
         );
     }
 
-    // Compute delta if we have their summary
-    let (payload, sent_delta) = match (&our_summary, &their_summary) {
-        _ if deltas_suppressed => (
+    // Compute delta if we have their summary.
+    //
+    // Every arm below is tagged with the `PayloadArm` that produced it. The
+    // three full-state arms have completely different remedies, and until
+    // #3335 none of them were separately instrumented — the production
+    // measurement could see that large states go out whole but not why. The
+    // tag is carried to the real-delivery sites below and recorded there, so
+    // the mix counts bytes that actually reached the wire.
+    let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
+        // Scoped to the both-summaries-present case ON PURPOSE. When a summary
+        // is missing a delta was impossible regardless of the memo, so letting
+        // the suppression guard win there would credit the memo for a full
+        // state it did not cause — overstating `FullDeltaSuppressed` and
+        // undercounting `FullNoSummary`, which is exactly the distinction this
+        // instrumentation exists to draw. Behavior is unchanged either way (a
+        // missing summary falls to the `_` arm, which also sends full state and
+        // also never reaches `compute_delta`), so this is purely about
+        // attributing the bytes to the right cause.
+        (Some(_), Some(_)) if deltas_suppressed => (
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
+            PayloadArm::FullDeltaSuppressed,
         ),
         (Some(ours), Some(theirs)) => {
             match op_manager
@@ -857,7 +875,11 @@ pub(super) async fn broadcast_to_single_peer(
                 .compute_delta(op_manager, &key, theirs, ours, new_state.size())
                 .await
             {
-                Ok(Some(delta)) => (DeltaOrFullState::Delta(delta.as_ref().to_vec()), true),
+                Ok(Some(delta)) => (
+                    DeltaOrFullState::Delta(delta.as_ref().to_vec()),
+                    true,
+                    PayloadArm::Delta,
+                ),
                 Ok(None) => {
                     // The contract computed an EMPTY delta against the peer's
                     // summary: the peer is logically converged despite the
@@ -884,9 +906,22 @@ pub(super) async fn broadcast_to_single_peer(
                         error = %err,
                         "Delta computation failed, falling back to full state"
                     );
+                    // Split the refusal from a genuine failure: `NotEfficient`
+                    // means no contract code ran at all — the gate declined a
+                    // delta because the peer's summary is >= 50 % of our state,
+                    // and we then send the whole state, which is never smaller.
+                    let arm = match err {
+                        crate::ring::interest::DeltaUnavailable::NotEfficient { .. } => {
+                            PayloadArm::FullNotEfficient
+                        }
+                        crate::ring::interest::DeltaUnavailable::ComputeFailed(_) => {
+                            PayloadArm::FullComputeFailed
+                        }
+                    };
                     (
                         DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
                         false,
+                        arm,
                     )
                 }
             }
@@ -894,6 +929,7 @@ pub(super) async fn broadcast_to_single_peer(
         _ => (
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
+            PayloadArm::FullNoSummary,
         ),
     };
     let payload_size = payload.size();
@@ -1057,6 +1093,11 @@ pub(super) async fn broadcast_to_single_peer(
                         crate::topology::meter::ResourceType::BroadcastFanoutCost,
                         payload_size as f64,
                     );
+                    // Same delivery gate as the cost axis above, so the mix and
+                    // the cost axis always agree on what "sent" means (#3335).
+                    op_manager
+                        .payload_mix
+                        .record_delivered(payload_arm, key.id(), payload_size);
                     tracing::debug!(
                         tx = %update_tx,
                         peer = %peer_addr,
@@ -1098,6 +1139,11 @@ pub(super) async fn broadcast_to_single_peer(
                 crate::topology::meter::ResourceType::BroadcastFanoutCost,
                 payload_size as f64,
             );
+            // Same delivery gate as the cost axis above, so the mix and the
+            // cost axis always agree on what "sent" means (#3335).
+            op_manager
+                .payload_mix
+                .record_delivered(payload_arm, key.id(), payload_size);
             // Delta-incompat attribution (HQk7 resync loop): remember that we
             // just delivered a DELTA to this peer so a prompt `ResyncRequest`
             // from it can be attributed to the delta failing to apply (deltas
@@ -1599,11 +1645,24 @@ mod tests {
              doomed delta is still computed and sent"
         );
         assert!(
-            body.contains("_ if deltas_suppressed => ("),
+            body.contains("if deltas_suppressed => ("),
             "suppression must short-circuit the payload match to FullState"
         );
-        // The guard arm must be FIRST in the payload match: Rust evaluates
-        // arms in order, so `_ if deltas_suppressed` has to precede the
+        // The guard is deliberately scoped to `(Some(_), Some(_))` rather than
+        // `_`: with a summary missing a delta was impossible anyway, so a
+        // wildcard guard would credit the memo for a full state it did not
+        // cause and skew the #3335 payload-mix attribution. Safety is
+        // unaffected — `compute_delta` lives only in the `(Some(ours),
+        // Some(theirs))` arm, so a suppressed contract cannot reach it via
+        // either path.
+        assert!(
+            body.contains("(Some(_), Some(_)) if deltas_suppressed => ("),
+            "the suppression guard must be scoped to the both-summaries-present \
+             case — a wildcard guard mis-attributes missing-summary full states \
+             to FullDeltaSuppressed (#3335 payload-mix accuracy)"
+        );
+        // The guard arm must still be FIRST in the payload match: Rust
+        // evaluates arms in order, so it has to precede the
         // `(Some(ours), Some(theirs))` compute_delta arm — otherwise a
         // suppressed contract with both summaries present would compute and
         // send the doomed delta (or, post-#4901, hit the Ok(None) converged
@@ -1611,7 +1670,7 @@ mod tests {
         // above precedes the match regardless, so only this arm-ordering
         // assertion catches a reordering regression.
         let guard_arm = body
-            .find("_ if deltas_suppressed => (")
+            .find("if deltas_suppressed => (")
             .expect("guard arm not found");
         let compute_arm = body
             .find("(Some(ours), Some(theirs)) => {")
@@ -2058,6 +2117,91 @@ mod tests {
             2,
             "each delivery-gated bytes report must charge the selected \
              payload_size (delta or full state), not the pre-delta full-state size"
+        );
+    }
+
+    /// Source-scrape pin for the payload-mix arm tagging (#3335).
+    ///
+    /// Same precedent as the cost-report pin above (the "Manually-mirrored
+    /// telemetry counters" row in `.claude/rules/bug-prevention-patterns.md`):
+    /// a refactor that drops an arm tag, or re-tags a full-state fallback as
+    /// `Delta`, silently corrupts the measurement that decides which fan-out
+    /// fix to build — and every behavioral test stays green, because the
+    /// fan-out still works. The whole point of this instrumentation is that
+    /// the four full-state causes are distinguishable, so pin that each one
+    /// is constructed exactly where it is decided.
+    #[test]
+    fn broadcast_to_single_peer_tags_every_payload_arm_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer (start of tests module) not found");
+        let body = &after[..fn_end];
+
+        // Every arm must be constructed in the selection match. A missing arm
+        // means some payload is attributed to the wrong cause (or to none).
+        for arm in [
+            "PayloadArm::Delta",
+            "PayloadArm::FullDeltaSuppressed",
+            "PayloadArm::FullNotEfficient",
+            "PayloadArm::FullComputeFailed",
+            "PayloadArm::FullNoSummary",
+        ] {
+            assert!(
+                body.contains(arm),
+                "broadcast_to_single_peer must tag the {arm} arm — an untagged \
+                 fallback makes the #3335 payload-mix measurement attribute \
+                 bytes to the wrong cause"
+            );
+        }
+
+        // The mix is recorded at exactly the two real-delivery sites, the same
+        // gate as BroadcastFanoutCost, so the two axes always agree on what
+        // "sent" means. Recording up-front would count phantom fan-out.
+        // Anchor on the call, not the receiver: rustfmt splits
+        // `op_manager.payload_mix.record_delivered(..)` across lines, so a
+        // receiver-shaped needle would be whitespace-fragile.
+        let record_needle = concat!(".record_", "delivered(payload_arm, key.id(), payload_size)");
+        assert_eq!(
+            body.matches(record_needle).count(),
+            2,
+            "payload mix must be recorded at exactly the two real-delivery \
+             sites (streaming Delivered + inline send Ok) — recording up-front \
+             would count dropped/failed sends as bytes on the wire"
+        );
+        // ...and it must be THIS node's accumulator, never a process global:
+        // several nodes share a process in the simulation harness and the
+        // aggregator drains destructively, so a global would let one node's
+        // ticker steal another's records.
+        assert_eq!(
+            body.matches(concat!(
+                "op_manager",
+                "\n",
+                "                        .payload_mix"
+            ))
+            .count()
+                + body
+                    .matches(concat!("op_manager", "\n                .payload_mix"))
+                    .count(),
+            2,
+            "the payload mix must be recorded on op_manager.payload_mix (the \
+             per-node accumulator), not a process-global static"
+        );
+
+        // The `NotEfficient` / `ComputeFailed` split is the load-bearing one:
+        // the first means no contract code ran and we shipped a whole state
+        // anyway, the second means the WASM failed. Collapsing them back into
+        // one arm loses the distinction the measurement exists to make.
+        assert!(
+            body.contains("DeltaUnavailable::NotEfficient")
+                && body.contains("DeltaUnavailable::ComputeFailed"),
+            "the delta-failure arm must keep the typed NotEfficient vs \
+             ComputeFailed split — collapsing them re-blinds the measurement"
         );
     }
 }
