@@ -673,6 +673,34 @@ function freenetBridge(authToken, userToken, hostedMode) {
   var NOTIFY_SW_URL = '/freenet-notify-sw.js';
   var notifySwPromise = null;
   var notifySwMsgListenerAdded = false;
+
+  // Forward a worker-posted notification click to the iframe. Installed at most
+  // once, and EAGERLY at shell startup (see the call below) — NOT only on lazy
+  // SW registration: a persistent notification can outlive a shell reload, and
+  // if it's clicked before the reloaded app triggers notification setup, the
+  // worker posts the click to this (matching) client and we must already be
+  // listening or the click is lost. Listening is harmless when no worker is
+  // registered, so it doesn't require a secure context.
+  function installNotifyClickListener() {
+    if (notifySwMsgListenerAdded) return;
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+      return;
+    }
+    notifySwMsgListenerAdded = true;
+    navigator.serviceWorker.addEventListener('message', function (event) {
+      var d = event && event.data;
+      if (!d || d.__freenet_notify_click__ !== true) return;
+      try {
+        window.focus();
+      } catch (e) {}
+      sendToIframe({
+        __freenet_shell__: true,
+        type: 'notification_click',
+        tag: typeof d.tag === 'string' ? d.tag : null,
+      });
+    });
+  }
+
   function ensureNotifyServiceWorker() {
     if (notifySwPromise) return notifySwPromise;
     if (
@@ -686,25 +714,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
       notifySwPromise = Promise.resolve(null);
       return notifySwPromise;
     }
-    // Add the click-forward listener exactly once — guarded separately from the
-    // registration promise, which may be cleared and retried below.
-    if (!notifySwMsgListenerAdded) {
-      notifySwMsgListenerAdded = true;
-      // The worker posts a notification click to the shell; forward it to the
-      // iframe as the same message the page-level n.onclick path sends.
-      navigator.serviceWorker.addEventListener('message', function (event) {
-        var d = event && event.data;
-        if (!d || d.__freenet_notify_click__ !== true) return;
-        try {
-          window.focus();
-        } catch (e) {}
-        sendToIframe({
-          __freenet_shell__: true,
-          type: 'notification_click',
-          tag: typeof d.tag === 'string' ? d.tag : null,
-        });
-      });
-    }
+    installNotifyClickListener();
     try {
       notifySwPromise = navigator.serviceWorker.register(NOTIFY_SW_URL).then(
         function (reg) {
@@ -838,6 +848,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
       }
     });
   }
+
+  // Install the click-forward listener eagerly on every shell load (see
+  // installNotifyClickListener) so a click on a persistent notification that
+  // outlived a reload is still delivered even before the reloaded app triggers
+  // notification setup. Cheap and inert when no worker ever posts.
+  installNotifyClickListener();
 
   window.addEventListener('message', function (event) {
     if (event.source !== iframe.contentWindow) return;

@@ -3561,6 +3561,14 @@ mod tests {
             SHELL_BRIDGE_JS.contains("window.isSecureContext"),
             "service worker registration must be gated on a secure context"
         );
+        // The click-forward listener is a standalone function installed EAGERLY
+        // at startup (not only on lazy registration), so a click on a persistent
+        // notification that outlived a shell reload is still delivered. Pinned so
+        // a refactor can't fold it back into ensureNotifyServiceWorker only.
+        assert!(
+            SHELL_BRIDGE_JS.contains("function installNotifyClickListener("),
+            "the SW click-forward listener must be a standalone, eagerly-installed function"
+        );
     }
 
     /// Regression for #4849: the notification-proxy flood-cap (the rolling
