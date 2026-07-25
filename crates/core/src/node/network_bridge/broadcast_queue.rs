@@ -20,7 +20,7 @@ use crate::node::OpManager;
 use crate::ring::PeerKeyLocation;
 use crate::transport::BroadcastDeliveryOutcome;
 
-use super::broadcast_payload_mix::{BROADCAST_PAYLOAD_MIX, PayloadArm};
+use super::broadcast_payload_mix::PayloadArm;
 use super::p2p_protoc::P2pBridge;
 
 /// Timeout for awaiting stream completion signal before releasing the permit
@@ -1095,7 +1095,9 @@ pub(super) async fn broadcast_to_single_peer(
                     );
                     // Same delivery gate as the cost axis above, so the mix and
                     // the cost axis always agree on what "sent" means (#3335).
-                    BROADCAST_PAYLOAD_MIX.record_delivered(payload_arm, key.id(), payload_size);
+                    op_manager
+                        .payload_mix
+                        .record_delivered(payload_arm, key.id(), payload_size);
                     tracing::debug!(
                         tx = %update_tx,
                         peer = %peer_addr,
@@ -1139,7 +1141,9 @@ pub(super) async fn broadcast_to_single_peer(
             );
             // Same delivery gate as the cost axis above, so the mix and the
             // cost axis always agree on what "sent" means (#3335).
-            BROADCAST_PAYLOAD_MIX.record_delivered(payload_arm, key.id(), payload_size);
+            op_manager
+                .payload_mix
+                .record_delivered(payload_arm, key.id(), payload_size);
             // Delta-incompat attribution (HQk7 resync loop): remember that we
             // just delivered a DELTA to this peer so a prompt `ResyncRequest`
             // from it can be attributed to the delta failing to apply (deltas
@@ -2159,13 +2163,34 @@ mod tests {
         // The mix is recorded at exactly the two real-delivery sites, the same
         // gate as BroadcastFanoutCost, so the two axes always agree on what
         // "sent" means. Recording up-front would count phantom fan-out.
-        let record_needle = concat!("BROADCAST_PAYLOAD_MIX", ".record_delivered(");
+        // Anchor on the call, not the receiver: rustfmt splits
+        // `op_manager.payload_mix.record_delivered(..)` across lines, so a
+        // receiver-shaped needle would be whitespace-fragile.
+        let record_needle = concat!(".record_", "delivered(payload_arm, key.id(), payload_size)");
         assert_eq!(
             body.matches(record_needle).count(),
             2,
             "payload mix must be recorded at exactly the two real-delivery \
              sites (streaming Delivered + inline send Ok) — recording up-front \
              would count dropped/failed sends as bytes on the wire"
+        );
+        // ...and it must be THIS node's accumulator, never a process global:
+        // several nodes share a process in the simulation harness and the
+        // aggregator drains destructively, so a global would let one node's
+        // ticker steal another's records.
+        assert_eq!(
+            body.matches(concat!(
+                "op_manager",
+                "\n",
+                "                        .payload_mix"
+            ))
+            .count()
+                + body
+                    .matches(concat!("op_manager", "\n                .payload_mix"))
+                    .count(),
+            2,
+            "the payload mix must be recorded on op_manager.payload_mix (the \
+             per-node accumulator), not a process-global static"
         );
 
         // The `NotEfficient` / `ComputeFailed` split is the load-bearing one:

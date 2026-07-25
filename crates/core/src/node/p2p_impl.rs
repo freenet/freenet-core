@@ -849,6 +849,10 @@ impl NodeP2P {
             && !config.config.telemetry.is_test_environment
             && config.config.telemetry.iface_tx_enabled;
         let local_peer_id = config.local_peer_id_string();
+        // Cloned up front: `local_peer_id` is moved into the iface-tx spawn
+        // below, but the payload-mix aggregator is spawned later (it needs
+        // `op_manager`, which does not exist yet).
+        let payload_mix_peer_id = local_peer_id.clone();
         crate::transport::rolling_rtt_stats::spawn_aggregator(
             local_peer_id.clone(),
             &background_task_monitor,
@@ -862,14 +866,6 @@ impl NodeP2P {
             &background_task_monitor,
         );
         crate::transport::shadow_demand::spawn_outbound_class_aggregator(
-            local_peer_id.clone(),
-            &background_task_monitor,
-        );
-        // Fan-out payload-mix rollup (#3335): which arm of the payload
-        // selection put bytes on the wire (delta vs each of the four
-        // full-state fallbacks), and which contracts those full states belong
-        // to. Always-on and observation-only, same as the aggregators above.
-        crate::node::network_bridge::broadcast_payload_mix::spawn_payload_mix_aggregator(
             local_peer_id.clone(),
             &background_task_monitor,
         );
@@ -897,6 +893,19 @@ impl NodeP2P {
             &background_task_monitor,
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
+
+        // Fan-out payload-mix rollup (#3335): which arm of the payload
+        // selection put bytes on the wire (delta vs each of the four
+        // full-state fallbacks), and which contracts those full states belong
+        // to. Always-on and observation-only, same as the shadow aggregators
+        // above. Spawned HERE rather than with them because it reads this
+        // node's own accumulator, which lives on `op_manager` — a process
+        // global would let one node's ticker drain another's records.
+        crate::node::network_bridge::broadcast_payload_mix::spawn_payload_mix_aggregator(
+            op_manager.payload_mix.clone(),
+            payload_mix_peer_id,
+            &background_task_monitor,
+        );
 
         let contract_handler = CH::build(ch_inbound, op_manager.clone(), ch_builder)
             .await

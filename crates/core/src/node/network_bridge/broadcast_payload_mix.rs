@@ -51,7 +51,6 @@
 //! [`broadcast_to_single_peer`]: super::broadcast_queue::broadcast_to_single_peer
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use freenet_stdlib::prelude::ContractInstanceId;
@@ -140,9 +139,6 @@ impl PayloadArm {
     }
 }
 
-/// Process-wide payload-mix accumulator. See the module docs.
-pub(crate) static BROADCAST_PAYLOAD_MIX: LazyLock<PayloadMix> = LazyLock::new(PayloadMix::new);
-
 /// One rollup window's counters.
 ///
 /// Every field advances together under a single lock so a rollup takes a
@@ -185,10 +181,23 @@ impl Default for Window {
 /// Per-arm send/byte counters plus bounded per-contract full-state
 /// attribution.
 ///
-/// All state lives on the struct rather than in free statics so tests can
-/// instantiate an isolated accumulator: a shared global would make the unit
-/// tests order-dependent and intermittently failing, which this repo treats
-/// as a broken test, not an acceptable one.
+/// ## One instance PER NODE, never a process global
+///
+/// This is deliberately owned by [`OpManager`](crate::node::OpManager) rather
+/// than living in a `static`. A process-global accumulator drained by
+/// per-node aggregators is actively wrong when several `NodeP2P` instances
+/// share a process (the simulation harness): whichever node's ticker fires
+/// first would drain everyone's records and publish them under its own
+/// `local_peer_id`, while the other nodes emitted empty windows.
+///
+/// Note the sibling `shadow_demand` aggregators DO read process-global
+/// counters, but non-destructively (load + a locally-tracked delta), so N of
+/// them merely double-report. This accumulator is drained destructively, which
+/// turns the same shape into misattribution — so it does not follow that
+/// convention.
+///
+/// Keeping state on the struct also means tests instantiate an isolated
+/// accumulator instead of sharing one, so they are not order-dependent.
 ///
 /// ## Why one mutex rather than per-field atomics
 ///
@@ -217,7 +226,7 @@ pub(crate) struct PayloadMix {
 }
 
 impl PayloadMix {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             window: Mutex::new(Window::default()),
         }
@@ -383,11 +392,15 @@ fn payload_mix_json(
 /// Emit one `broadcast_payload_mix` rollup and reset the window.
 ///
 /// Returns the payload so callers (and tests) can inspect what was sent.
-pub(crate) fn emit_payload_mix_rollup(local_peer_id: &str, window_secs: u64) -> serde_json::Value {
+pub(crate) fn emit_payload_mix_rollup(
+    mix: &PayloadMix,
+    local_peer_id: &str,
+    window_secs: u64,
+) -> serde_json::Value {
     // ONE atomic take: the arm counters and the per-contract tallies describe
     // exactly the same set of broadcasts, so the top-N list always reconciles
     // against `full_state_bytes`.
-    let window = BROADCAST_PAYLOAD_MIX.take_window();
+    let window = mix.take_window();
     let payload = payload_mix_json(
         &window.arms(),
         &window.top_contracts(),
@@ -426,7 +439,11 @@ fn rollup_window_secs(elapsed: Duration) -> u64 {
 /// Always-on and cheap: it takes one lock and drains a bounded map once per
 /// [`ROLLUP_WINDOW`]. Observation only — nothing reads these counters to make
 /// a decision, and nothing on the hot path ever reads them at all.
-pub(crate) fn spawn_payload_mix_aggregator(local_peer_id: String, monitor: &BackgroundTaskMonitor) {
+pub(crate) fn spawn_payload_mix_aggregator(
+    mix: std::sync::Arc<PayloadMix>,
+    local_peer_id: String,
+    monitor: &BackgroundTaskMonitor,
+) {
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(ROLLUP_WINDOW);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -440,7 +457,7 @@ pub(crate) fn spawn_payload_mix_aggregator(local_peer_id: String, monitor: &Back
             let now = tokio::time::Instant::now();
             let elapsed = now.saturating_duration_since(last_rollup);
             last_rollup = now;
-            emit_payload_mix_rollup(&local_peer_id, rollup_window_secs(elapsed));
+            emit_payload_mix_rollup(&mix, &local_peer_id, rollup_window_secs(elapsed));
         }
     });
     monitor.register("broadcast_payload_mix_aggregator", handle);
