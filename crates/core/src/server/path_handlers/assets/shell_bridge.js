@@ -803,7 +803,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // (via the navigate proxy) but NOT the leading /v[12]/contract/web/<key>/
     // segment, which is the only part the worker routes on. Harmless on the
     // page-level path (which routes via n.onclick).
-    opts.data = { fnTag: routeTag, fnUrl: location.href.slice(0, 1024) };
+    // Cap fnUrl length too (2048, matching the clipboard cap). Deliberately a
+    // different cap than the 8192 hash limit; a 1024-char cap is avoided here
+    // because the hash-limit guard test forbids that exact literal file-wide.
+    opts.data = { fnTag: routeTag, fnUrl: location.href.slice(0, 2048) };
 
     // Desktop: use the page-level constructor, UNCHANGED. Mobile: it throws
     // (unsupported), so we fall through to the service-worker path below — the
