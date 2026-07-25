@@ -1663,6 +1663,7 @@ mod tests {
     mod byte_bounded_lru_cache_tests {
         use super::*;
 
+        #[allow(clippy::ptr_arg)]
         fn vec_len(v: &Vec<u8>) -> usize {
             v.len()
         }
@@ -2462,7 +2463,11 @@ mod tests {
             );
             match put_err.unwrap_request() {
                 RequestError::ContractError(StdContractError::Put { .. }) => {}
-                other => panic!("fresh-PUT validation error must be a Put variant, got {other:?}"),
+                other @ (RequestError::ContractError(_)
+                | RequestError::DelegateError(_)
+                | RequestError::Disconnect
+                | RequestError::Timeout
+                | _) => panic!("fresh-PUT validation error must be a Put variant, got {other:?}"),
             }
 
             // UPDATE op → Update variant, is_contract_exec_rejection true, timeout true.
@@ -2472,7 +2477,11 @@ mod tests {
             assert!(upd_err.is_contract_exec_rejection());
             match upd_err.unwrap_request() {
                 RequestError::ContractError(StdContractError::Update { .. }) => {}
-                other => panic!("UPDATE validation error must be an Update variant, got {other:?}"),
+                other @ (RequestError::ContractError(_)
+                | RequestError::DelegateError(_)
+                | RequestError::Disconnect
+                | RequestError::Timeout
+                | _) => panic!("UPDATE validation error must be an Update variant, got {other:?}"),
             }
         }
 

@@ -527,7 +527,7 @@ mod resolve_message_origin_tests {
         // handler rejects it against MAX_MIGRATION_PREDECESSORS).
         let many: Vec<DelegateKey> = (0u8..200).map(dkey).collect();
         assert_eq!(dedupe_predecessors(many).len(), 200);
-        assert!(200 > MAX_MIGRATION_PREDECESSORS);
+        const { assert!(200 > MAX_MIGRATION_PREDECESSORS) };
     }
 
     /// Caller delegate identity wins over a concurrently-supplied WebApp

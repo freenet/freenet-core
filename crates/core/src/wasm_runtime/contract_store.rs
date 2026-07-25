@@ -1227,7 +1227,7 @@ mod test {
         store_b.set_after_blob_write_hook(Box::new(move || {
             let mut store_a = store_a_opt.take().expect("hook is invoked exactly once");
             let handle = std::thread::spawn(move || {
-                let _ = store_a.remove_contract(&key1);
+                _ = store_a.remove_contract(&key1);
             });
             // Real wall-clock sleep: this is a genuine cross-thread race test,
             // so a deterministic TimeSource cannot model the interleaving.

@@ -1591,7 +1591,12 @@ mod remove_contract_tests {
             HostResponse::DelegateResponse { key, .. } => {
                 assert_eq!(&key, succ.key(), "response carries the successor key");
             }
-            other => panic!("expected DelegateResponse, got {other:?}"),
+            other @ (HostResponse::ContractResponse(_)
+            | HostResponse::QueryResponse(_)
+            | HostResponse::Ok
+            | HostResponse::StreamChunk { .. }
+            | HostResponse::StreamHeader { .. }
+            | _) => panic!("expected DelegateResponse, got {other:?}"),
         }
 
         // The predecessor's Local secret was copied into the successor namespace.

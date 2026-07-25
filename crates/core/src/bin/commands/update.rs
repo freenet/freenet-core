@@ -3941,11 +3941,13 @@ done
         // any node still updating from an unsigned older release. Only flip it
         // (and then update this test) once every release a live node could be
         // updating from publishes SHA256SUMS.txt.sig. See REQUIRE_RELEASE_SIGNATURE.
-        assert!(
-            !REQUIRE_RELEASE_SIGNATURE,
-            "do not require signatures until the signed floor is established; \
-             see the two-release transition note on REQUIRE_RELEASE_SIGNATURE"
-        );
+        const {
+            assert!(
+                !REQUIRE_RELEASE_SIGNATURE,
+                "do not require signatures until the signed floor is established; \
+                 see the two-release transition note on REQUIRE_RELEASE_SIGNATURE"
+            );
+        }
     }
 
     #[test]

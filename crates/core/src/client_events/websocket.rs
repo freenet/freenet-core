@@ -2699,7 +2699,7 @@ mod tests {
         tokio::spawn(async move {
             while let Some(conn) = req_rx.recv().await {
                 if let ClientConnection::NewConnection { callbacks, .. } = conn {
-                    let _ = callbacks.send(HostCallbackResult::NewId {
+                    _ = callbacks.send(HostCallbackResult::NewId {
                         id: ClientId::next(),
                     });
                 }
@@ -2712,7 +2712,7 @@ mod tests {
         ) -> impl IntoResponse {
             ws.on_upgrade(move |socket| async move {
                 // `token_is_invalid = true` drives the stale-token close path.
-                let _ = websocket_interface(
+                _ = websocket_interface(
                     rs,
                     None,
                     None,
@@ -2735,7 +2735,7 @@ mod tests {
             .unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            _ = axum::serve(listener, app).await;
         });
 
         let (mut client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -2751,7 +2751,11 @@ mod tests {
                         return Some(u16::from(cf.code));
                     }
                     tokio_tungstenite::tungstenite::Message::Close(None) => return None,
-                    _ => continue,
+                    tokio_tungstenite::tungstenite::Message::Text(_)
+                    | tokio_tungstenite::tungstenite::Message::Binary(_)
+                    | tokio_tungstenite::tungstenite::Message::Ping(_)
+                    | tokio_tungstenite::tungstenite::Message::Pong(_)
+                    | tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
                 }
             }
             None
