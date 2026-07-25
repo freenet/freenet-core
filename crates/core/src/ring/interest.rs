@@ -2511,6 +2511,75 @@ mod tests {
         );
     }
 
+    /// `update_peer_summary` is a SILENT no-op for a peer that has no
+    /// `PeerInterest` entry for the contract — it cannot create one.
+    ///
+    /// This is the mechanism behind the `FullNoTheirSummaryUntracked` payload
+    /// arm, and it is load-bearing rather than incidental. Since #4642 step 9
+    /// removed the interest-manager fan-out arm, live broadcast targets are
+    /// resolved from `neighbor_hosting` (advertised co-hosts) while the
+    /// peer-summary cache still lives here, keyed on interest registration.
+    /// The two populations are maintained by independent mechanisms — the
+    /// advertisement exchange never touches `InterestManager`.
+    ///
+    /// So for a target present in one and absent from the other,
+    /// `get_peer_summary` returns None (the fan-out sends FULL STATE) and the
+    /// post-delivery `update_peer_summary` that is supposed to fix that
+    /// (#4442's fix for exactly this chicken-and-egg) silently does nothing —
+    /// so the pair never escapes to deltas. This is a fixed point, not a cold
+    /// start.
+    ///
+    /// The pre-existing broadcast-path tests all `register_peer_interest`
+    /// first, so none of them exercise this state.
+    #[test]
+    fn update_peer_summary_is_a_silent_noop_for_an_untracked_peer() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        let summary = StateSummary::from(vec![1u8, 2, 3]);
+
+        // No register_peer_interest: this peer is an advertised co-host that
+        // the InterestSync heartbeat has not registered.
+        assert!(
+            manager.get_peer_interest(&contract, &peer).is_none(),
+            "precondition: the peer must be untracked"
+        );
+
+        manager.update_peer_summary(&contract, &peer, Some(summary));
+
+        assert!(
+            manager.get_peer_summary(&contract, &peer).is_none(),
+            "update_peer_summary silently dropped the write for an untracked \
+             peer. A broadcast target in this state can never cache a summary, \
+             so every broadcast to it is FULL STATE forever — if this ever \
+             starts passing, the structural full-state trap is closed and the \
+             FullNoTheirSummaryUntracked arm should go to zero in production."
+        );
+
+        // And it stays that way no matter how many deliveries land.
+        for _ in 0..5 {
+            manager.update_peer_summary(&contract, &peer, Some(StateSummary::from(vec![9u8])));
+        }
+        assert!(
+            manager.get_peer_summary(&contract, &peer).is_none(),
+            "repeated deliveries must not accumulate a summary either — the \
+             trap is a fixed point, not a slow warm-up"
+        );
+
+        // Contrast: once the peer IS tracked, the very same call sticks.
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        manager.update_peer_summary(&contract, &peer, Some(StateSummary::from(vec![7u8])));
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![7u8]),
+            "a TRACKED peer caches the summary, so it escapes to deltas — this \
+             is what makes the untracked case a distinct bug rather than cold \
+             start"
+        );
+    }
+
     #[test]
     fn test_resync_full_flow() {
         // Simulate the complete ResyncRequest -> ResyncResponse flow

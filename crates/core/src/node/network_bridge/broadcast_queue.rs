@@ -854,6 +854,12 @@ pub(super) async fn broadcast_to_single_peer(
     // measurement could see that large states go out whole but not why. The
     // tag is carried to the real-delivery sites below and recorded there, so
     // the mix counts bytes that actually reached the wire.
+    // Gate inputs for the `FullNotEfficient` arm, carried to the delivery site
+    // so the payload-mix rollup can report what the wire-efficiency gate
+    // actually refused on. `DeltaUnavailable::NotEfficient` has always carried
+    // these, but its only reader was a `debug!` — compiled out in release — so
+    // in production the refusals were unattributable. See #3335.
+    let mut not_efficient_gate_inputs: Option<(usize, usize)> = None;
     let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
         // Scoped to the both-summaries-present case ON PURPOSE. When a summary
         // is missing a delta was impossible regardless of the memo, so letting
@@ -911,7 +917,11 @@ pub(super) async fn broadcast_to_single_peer(
                     // delta because the peer's summary is >= 50 % of our state,
                     // and we then send the whole state, which is never smaller.
                     let arm = match err {
-                        crate::ring::interest::DeltaUnavailable::NotEfficient { .. } => {
+                        crate::ring::interest::DeltaUnavailable::NotEfficient {
+                            summary_size,
+                            state_size,
+                        } => {
+                            not_efficient_gate_inputs = Some((summary_size, state_size));
                             PayloadArm::FullNotEfficient
                         }
                         crate::ring::interest::DeltaUnavailable::ComputeFailed(_) => {
@@ -926,11 +936,53 @@ pub(super) async fn broadcast_to_single_peer(
                 }
             }
         }
-        _ => (
+        // No summary on one side, so no delta was possible. Which side is
+        // missing decides the remedy, and until #3335's follow-up they were
+        // indistinguishable in the rollup:
+        //
+        //   * ours missing  -> `get_contract_summary` failed (contract-handler
+        //     timeout at BROADCAST_CH_TIMEOUT, WASM error, unexpected reply).
+        //     A LOAD problem. It also poisons the peer: `sender_summary_bytes`
+        //     below is `unwrap_or_default()`, so the peer caches an EMPTY
+        //     summary as ours with no way to tell it from a real one.
+        //
+        //   * theirs missing -> a peer-summary CACHE gap, and the two
+        //     sub-cases are not alike. `update_peer_summary` writes through
+        //     `interested_peers`, so it is a silent no-op for a peer with no
+        //     `PeerInterest` entry for this contract. Broadcast targets come
+        //     from `neighbor_hosting` (advertised co-hosts) since #4642 step 9
+        //     dropped the interest-manager fan-out arm, so a target that the
+        //     ~5-min InterestSync heartbeat has not registered can NEVER cache
+        //     a summary from a delivery — every broadcast to it is full state,
+        //     permanently. That is the #4442 chicken-and-egg re-opened for a
+        //     different peer population, and it is a different bug from an
+        //     ordinary cold-start peer that IS tracked and repairs itself on
+        //     the next delivery. Splitting them is the whole point.
+        //
+        // `get_peer_interest` is an in-memory DashMap read — no contract
+        // handler round-trip — so this classification costs nothing on a path
+        // that has already decided to put a whole state on the wire.
+        (None, _) => (
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
-            PayloadArm::FullNoSummary,
+            PayloadArm::FullNoOurSummary,
         ),
+        (Some(_), None) => {
+            let arm = if op_manager
+                .interest_manager
+                .get_peer_interest(&key, &peer_key)
+                .is_some()
+            {
+                PayloadArm::FullNoTheirSummaryTracked
+            } else {
+                PayloadArm::FullNoTheirSummaryUntracked
+            };
+            (
+                DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+                false,
+                arm,
+            )
+        }
     };
     let payload_size = payload.size();
     // Attribute the summarize + delta WASM (CPU) burned to produce this send.
@@ -1095,9 +1147,12 @@ pub(super) async fn broadcast_to_single_peer(
                     );
                     // Same delivery gate as the cost axis above, so the mix and
                     // the cost axis always agree on what "sent" means (#3335).
-                    op_manager
-                        .payload_mix
-                        .record_delivered(payload_arm, key.id(), payload_size);
+                    op_manager.payload_mix.record_delivered(
+                        payload_arm,
+                        key.id(),
+                        payload_size,
+                        not_efficient_gate_inputs,
+                    );
                     tracing::debug!(
                         tx = %update_tx,
                         peer = %peer_addr,
@@ -1141,9 +1196,12 @@ pub(super) async fn broadcast_to_single_peer(
             );
             // Same delivery gate as the cost axis above, so the mix and the
             // cost axis always agree on what "sent" means (#3335).
-            op_manager
-                .payload_mix
-                .record_delivered(payload_arm, key.id(), payload_size);
+            op_manager.payload_mix.record_delivered(
+                payload_arm,
+                key.id(),
+                payload_size,
+                not_efficient_gate_inputs,
+            );
             // Delta-incompat attribution (HQk7 resync loop): remember that we
             // just delivered a DELTA to this peer so a prompt `ResyncRequest`
             // from it can be attributed to the delta failing to apply (deltas
@@ -2150,7 +2208,9 @@ mod tests {
             "PayloadArm::FullDeltaSuppressed",
             "PayloadArm::FullNotEfficient",
             "PayloadArm::FullComputeFailed",
-            "PayloadArm::FullNoSummary",
+            "PayloadArm::FullNoOurSummary",
+            "PayloadArm::FullNoTheirSummaryUntracked",
+            "PayloadArm::FullNoTheirSummaryTracked",
         ] {
             assert!(
                 body.contains(arm),
@@ -2163,12 +2223,21 @@ mod tests {
         // The mix is recorded at exactly the two real-delivery sites, the same
         // gate as BroadcastFanoutCost, so the two axes always agree on what
         // "sent" means. Recording up-front would count phantom fan-out.
-        // Anchor on the call, not the receiver: rustfmt splits
-        // `op_manager.payload_mix.record_delivered(..)` across lines, so a
-        // receiver-shaped needle would be whitespace-fragile.
-        let record_needle = concat!(".record_", "delivered(payload_arm, key.id(), payload_size)");
+        // Match against a whitespace-stripped copy of the body. rustfmt
+        // re-wraps this call whenever its argument list changes width (adding
+        // the gate-inputs argument split it across five lines), so any needle
+        // carrying literal spacing silently rots into a false failure — or,
+        // worse, a false PASS if the count happens to still match. Collapsing
+        // first makes the pin depend on the code rather than on the formatter;
+        // this is the same `collapsed` shape node.rs uses for its
+        // `update_peer_summary(&key,pk,None)` pin.
+        let collapsed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let record_needle = concat!(
+            ".record_",
+            "delivered(payload_arm,key.id(),payload_size,not_efficient_gate_inputs,)"
+        );
         assert_eq!(
-            body.matches(record_needle).count(),
+            collapsed.matches(record_needle).count(),
             2,
             "payload mix must be recorded at exactly the two real-delivery \
              sites (streaming Delivered + inline send Ok) — recording up-front \
@@ -2179,15 +2248,9 @@ mod tests {
         // aggregator drains destructively, so a global would let one node's
         // ticker steal another's records.
         assert_eq!(
-            body.matches(concat!(
-                "op_manager",
-                "\n",
-                "                        .payload_mix"
-            ))
-            .count()
-                + body
-                    .matches(concat!("op_manager", "\n                .payload_mix"))
-                    .count(),
+            collapsed
+                .matches(concat!("op_manager.payload_mix.record_", "delivered("))
+                .count(),
             2,
             "the payload mix must be recorded on op_manager.payload_mix (the \
              per-node accumulator), not a process-global static"
@@ -2202,6 +2265,25 @@ mod tests {
                 && body.contains("DeltaUnavailable::ComputeFailed"),
             "the delta-failure arm must keep the typed NotEfficient vs \
              ComputeFailed split — collapsing them re-blinds the measurement"
+        );
+
+        // The no-summary split must stay decided by WHICH side is missing, and
+        // the untracked/tracked sub-split must keep consulting the interest
+        // map. Collapsing either one re-creates the single `full_no_summary`
+        // bucket that the 2026-07-25 measurement could not act on: it was the
+        // largest consumer of wire bytes on the network with no way to tell a
+        // contract-handler failure from a permanent peer-tracking gap.
+        assert!(
+            collapsed.contains("(None,_)=>") && collapsed.contains("(Some(_),None)=>"),
+            "the no-summary arms must branch on WHICH side of the pair is \
+             missing — a catch-all `_` arm re-blinds the split"
+        );
+        assert!(
+            collapsed.contains("get_peer_interest(&key,&peer_key)"),
+            "the missing-their-summary arm must consult get_peer_interest to \
+             separate an UNTRACKED peer (whose update_peer_summary write is a \
+             silent no-op, so it is stuck on full state permanently) from a \
+             TRACKED cold-start peer (which repairs itself on next delivery)"
         );
     }
 }
