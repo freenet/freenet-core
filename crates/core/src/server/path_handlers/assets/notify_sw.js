@@ -36,22 +36,30 @@ self.addEventListener('activate', function (event) {
   event.waitUntil(self.clients.claim());
 });
 
-// Choose which open window a notification click routes to: ONLY a window on the
-// originating contract's shell path (`prefix`, the /v[12]/contract/web/<key>/
-// segment). This keeps a click for contract A from focusing contract B's tab or
-// posting A's room tag into B's iframe (a cross-contract leak), and keeps it off
-// the gateway dashboard. Returns null when no open window matches — the caller
-// then opens a fresh window rather than handing the tag to an unrelated tab.
+// Derive a contract's routing prefix (the FIRST /v[12]/contract/web/<key>/
+// segment) from a URL, and select the open window that belongs to it. Anchoring
+// on the FIRST segment — the contract its shell actually serves; the shell nav
+// proxy pins the leading key — and comparing for EQUALITY is what keeps a click
+// for contract A from focusing contract B's tab or leaking A's room tag into it
+// (and off the gateway dashboard). A plain substring test would be fooled by a
+// crafted same-contract subpath that merely CONTAINS another contract's segment
+// (e.g. .../web/BBB/v1/contract/web/AAA/, reachable via the nav proxy). Returns
+// null when no open window matches — the caller then opens a fresh window rather
+// than handing the tag to an unrelated tab.
 //
 // notify-pick-client:BEGIN — pure; extracted verbatim between these markers and
 // unit-tested by notify_sw.test.mjs. Keep it pure (params/locals only).
+function contractPrefixOf(url) {
+  if (typeof url !== 'string') return null;
+  var m = url.match(/\/v[12]\/contract\/web\/[^/?#]+\//);
+  return m ? m[0] : null;
+}
+
 function pickNotifyClient(clients, prefix) {
   if (!prefix) return null;
   for (var i = 0; i < clients.length; i++) {
     var c = clients[i];
-    if (c && typeof c.url === 'string' && c.url.indexOf(prefix) !== -1) {
-      return c;
-    }
+    if (c && contractPrefixOf(c.url) === prefix) return c;
   }
   return null;
 }
@@ -71,11 +79,7 @@ self.addEventListener('notificationclick', function (event) {
   // The contract-web path prefix (/v[12]/contract/web/<key>/) identifies the
   // contract whose shell showed this notification, so the click routes back to
   // exactly that contract.
-  var prefix = null;
-  if (url) {
-    var m = url.match(/\/v[12]\/contract\/web\/[^/?#]+\//);
-    if (m) prefix = m[0];
-  }
+  var prefix = contractPrefixOf(url);
   event.waitUntil(
     self.clients
       .matchAll({ type: 'window', includeUncontrolled: true })

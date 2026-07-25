@@ -36,12 +36,12 @@ use super::{
 ///
 /// `worker-src 'self'` allows the shell to register the same-origin
 /// notification service worker (`/freenet-notify-sw.js`). Without an explicit
-/// `worker-src`, the worker source falls back through `child-src` to
-/// `default-src 'none'` (older browsers fell back to `script-src` instead) —
-/// none of which permit the `/freenet-notify-sw.js` script URL, so
-/// `navigator.serviceWorker.register` is CSP-blocked and notifications can
-/// never show on mobile (where the page-level `Notification` constructor is
-/// unsupported).
+/// `worker-src`, the worker source falls back through `child-src` (absent here)
+/// to `script-src 'unsafe-inline'` — which permits inline scripts but NOT an
+/// external script URL — so `navigator.serviceWorker.register` is CSP-blocked
+/// and notifications can never show on mobile (where the page-level
+/// `Notification` constructor is unsupported). `worker-src 'self'` is the
+/// minimal directive that permits the same-origin worker.
 const SHELL_PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src 'self' ws: wss:; worker-src 'self'";
 
 /// The notification service worker, served at `/freenet-notify-sw.js`. See the

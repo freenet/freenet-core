@@ -24,17 +24,22 @@ if (b < 0 || e < 0) {
   );
   process.exit(1);
 }
-// Slice from the `function` keyword (the BEGIN marker sits inside a `//`
-// comment, so slicing from it would start the region mid-comment-line).
-const fnStart = src.indexOf('function pickNotifyClient(', b);
+// Slice from the first `function` keyword (the BEGIN marker sits inside a `//`
+// comment, so slicing from it would start the region mid-comment-line). The
+// region holds both `contractPrefixOf` and `pickNotifyClient`.
+const fnStart = src.indexOf('function contractPrefixOf(', b);
 if (fnStart < 0 || fnStart > e) {
-  console.error('FAIL: no `function pickNotifyClient(` between the markers.');
+  console.error('FAIL: no `function contractPrefixOf(` between the markers.');
   process.exit(1);
 }
 const region = src.slice(fnStart, e);
+if (!region.includes('function pickNotifyClient(')) {
+  console.error('FAIL: no `function pickNotifyClient(` between the markers.');
+  process.exit(1);
+}
 // eslint-disable-next-line no-new-func
-const pickNotifyClient = new Function(
-  region + '\nreturn pickNotifyClient;',
+const { contractPrefixOf, pickNotifyClient } = new Function(
+  region + '\nreturn { contractPrefixOf: contractPrefixOf, pickNotifyClient: pickNotifyClient };',
 )();
 
 let failures = 0;
@@ -46,6 +51,32 @@ function check(name, cond) {
     failures++;
   }
 }
+
+// contractPrefixOf: derives the FIRST (leftmost) contract segment, so a crafted
+// subpath can't move a contract's identity, and non-contract URLs -> null.
+check(
+  'contractPrefixOf extracts the v1 prefix',
+  contractPrefixOf('https://gw.example/v1/contract/web/AAA/x') ===
+    '/v1/contract/web/AAA/',
+);
+check(
+  'contractPrefixOf extracts the v2 prefix (ignoring hash)',
+  contractPrefixOf('https://gw.example/v2/contract/web/BBB/#room') ===
+    '/v2/contract/web/BBB/',
+);
+check(
+  'contractPrefixOf takes the LEFTMOST segment of a crafted subpath',
+  contractPrefixOf('https://gw.example/v1/contract/web/BBB/v1/contract/web/AAA/') ===
+    '/v1/contract/web/BBB/',
+);
+check(
+  'contractPrefixOf -> null for a non-contract URL',
+  contractPrefixOf('https://gw.example/') === null,
+);
+check(
+  'contractPrefixOf -> null for a non-string',
+  contractPrefixOf(null) === null,
+);
 
 const a = { url: 'https://gw.example/v1/contract/web/AAA/' };
 const b2 = { url: 'https://gw.example/v2/contract/web/BBB/#room' };
@@ -77,6 +108,22 @@ check(
   pickNotifyClient([], '/v1/contract/web/AAA/') === null,
 );
 check('null prefix -> null', pickNotifyClient([a, b2], null) === null);
+
+// A crafted same-contract subpath that merely CONTAINS another contract's
+// segment must NOT be mistaken for it (substring-match bypass; a malicious BBB
+// app can reach such a URL via the shell navigation proxy). Anchored equality
+// on the FIRST contract segment defeats it.
+const bbbSpoof = {
+  url: 'https://gw.example/v1/contract/web/BBB/v1/contract/web/AAA/',
+};
+check(
+  'crafted subpath containing another contract segment does NOT match it',
+  pickNotifyClient([bbbSpoof], '/v1/contract/web/AAA/') === null,
+);
+check(
+  'the spoof window still matches its OWN contract (BBB)',
+  pickNotifyClient([bbbSpoof], '/v1/contract/web/BBB/') === bbbSpoof,
+);
 // Defensive: a client with no url string must not throw or match.
 check(
   'client without a url string is skipped',

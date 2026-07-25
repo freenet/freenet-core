@@ -789,8 +789,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // Carry the room tag AND this shell's own URL so the worker's
     // notificationclick routes the click back to THIS contract's shell (and
     // reopens it if closed) — never another contract's tab. fnUrl is the shell's
-    // own same-origin location, not iframe-supplied. Harmless on the page-level
-    // path (which routes via n.onclick).
+    // own same-origin location; the framed app can influence its subpath/hash
+    // (via the navigate proxy) but NOT the leading /v[12]/contract/web/<key>/
+    // segment, which is the only part the worker routes on. Harmless on the
+    // page-level path (which routes via n.onclick).
     opts.data = { fnTag: routeTag, fnUrl: location.href.slice(0, 1024) };
 
     // Desktop: use the page-level constructor, UNCHANGED. Mobile: it throws
