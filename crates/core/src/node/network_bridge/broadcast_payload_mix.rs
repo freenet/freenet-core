@@ -486,8 +486,13 @@ fn payload_mix_json(
         "not_efficient_state_bytes_max".into(),
         gate.state_bytes_max.into(),
     );
+    // Ratio-of-SUMS (aggregate summary bytes / aggregate state bytes), NOT a
+    // mean of per-send ratios — the two diverge under mixed contract sizes,
+    // and the aggregate form is the one that answers "were the refused bytes
+    // refused on oversized inputs" (poisoned pairs read ~1.0; an honest fleet
+    // reads well under 0.5). Named for what it computes.
     obj.insert(
-        "not_efficient_mean_summary_state_ratio".into(),
+        "not_efficient_summary_to_state_bytes_ratio".into(),
         if gate.state_bytes_sum == 0 {
             serde_json::Value::Null
         } else {
@@ -1012,7 +1017,7 @@ mod tests {
         assert_eq!(json["not_efficient_state_bytes_sum"], 3000);
         assert_eq!(json["not_efficient_summary_bytes_max"], 1400);
         assert_eq!(
-            json["not_efficient_mean_summary_state_ratio"],
+            json["not_efficient_summary_to_state_bytes_ratio"],
             2000.0 / 3000.0
         );
     }
@@ -1034,7 +1039,7 @@ mod tests {
             window.gate_stats(),
             60,
         );
-        assert!(json["not_efficient_mean_summary_state_ratio"].is_null());
+        assert!(json["not_efficient_summary_to_state_bytes_ratio"].is_null());
     }
 
     /// A window with no traffic must emit 0.0, not NaN — `Number::from_f64`
