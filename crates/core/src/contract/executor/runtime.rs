@@ -1587,16 +1587,12 @@ mod remove_contract_tests {
         let resp = executor
             .delegate_request(req, Some(&origin_contract), None, None)
             .expect("register-with-predecessors must succeed");
+        #[allow(clippy::wildcard_enum_match_arm)]
         match resp {
             HostResponse::DelegateResponse { key, .. } => {
                 assert_eq!(&key, succ.key(), "response carries the successor key");
             }
-            other @ (HostResponse::ContractResponse(_)
-            | HostResponse::QueryResponse(_)
-            | HostResponse::Ok
-            | HostResponse::StreamChunk { .. }
-            | HostResponse::StreamHeader { .. }
-            | _) => panic!("expected DelegateResponse, got {other:?}"),
+            other => panic!("expected DelegateResponse, got {other:?}"),
         }
 
         // The predecessor's Local secret was copied into the successor namespace.

@@ -2461,13 +2461,10 @@ mod tests {
                 !put_err.is_contract_exec_rejection(),
                 "a Put variant is NOT an UPDATE-side exec rejection"
             );
+            #[allow(clippy::wildcard_enum_match_arm)]
             match put_err.unwrap_request() {
                 RequestError::ContractError(StdContractError::Put { .. }) => {}
-                other @ (RequestError::ContractError(_)
-                | RequestError::DelegateError(_)
-                | RequestError::Disconnect
-                | RequestError::Timeout
-                | _) => panic!("fresh-PUT validation error must be a Put variant, got {other:?}"),
+                other => panic!("fresh-PUT validation error must be a Put variant, got {other:?}"),
             }
 
             // UPDATE op → Update variant, is_contract_exec_rejection true, timeout true.
@@ -2475,13 +2472,10 @@ mod tests {
                 ExecutorError::execution(mk(), Some(super::super::InnerOpError::Upsert(key)));
             assert!(upd_err.is_wasm_timeout());
             assert!(upd_err.is_contract_exec_rejection());
+            #[allow(clippy::wildcard_enum_match_arm)]
             match upd_err.unwrap_request() {
                 RequestError::ContractError(StdContractError::Update { .. }) => {}
-                other @ (RequestError::ContractError(_)
-                | RequestError::DelegateError(_)
-                | RequestError::Disconnect
-                | RequestError::Timeout
-                | _) => panic!("UPDATE validation error must be an Update variant, got {other:?}"),
+                other => panic!("UPDATE validation error must be an Update variant, got {other:?}"),
             }
         }
 
