@@ -2193,15 +2193,22 @@ mod tests {
         // The mix is recorded at exactly the two real-delivery sites, the same
         // gate as BroadcastFanoutCost, so the two axes always agree on what
         // "sent" means. Recording up-front would count phantom fan-out.
-        // Anchor on the call, not the receiver: rustfmt splits
-        // `op_manager.payload_mix.record_delivered(..)` across lines, so a
-        // receiver-shaped needle would be whitespace-fragile.
+        //
+        // Match against a WHITESPACE-STRIPPED copy of the body. rustfmt
+        // reformats this call whenever its argument list changes — it split it
+        // across five lines the moment #4923 added `gate_sizes`, and an
+        // indentation-shaped needle broke with it. A pin that fails for a
+        // formatting reason instead of a real one is worse than no pin: it
+        // trains the next person to "fix" it by loosening the assertion.
+        // Stripping whitespace makes the needle independent of how rustfmt
+        // chooses to lay the call out.
+        let squashed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
         let record_needle = concat!(
             ".record_",
-            "delivered(payload_arm, key.id(), payload_size, gate_sizes)"
+            "delivered(payload_arm,key.id(),payload_size,gate_sizes"
         );
         assert_eq!(
-            body.matches(record_needle).count(),
+            squashed.matches(record_needle).count(),
             2,
             "payload mix must be recorded at exactly the two real-delivery \
              sites (streaming Delivered + inline send Ok) — recording up-front \
@@ -2215,15 +2222,9 @@ mod tests {
         // aggregator drains destructively, so a global would let one node's
         // ticker steal another's records.
         assert_eq!(
-            body.matches(concat!(
-                "op_manager",
-                "\n",
-                "                        .payload_mix"
-            ))
-            .count()
-                + body
-                    .matches(concat!("op_manager", "\n                .payload_mix"))
-                    .count(),
+            squashed
+                .matches(concat!("op_manager.payload_mix.record_", "delivered("))
+                .count(),
             2,
             "the payload mix must be recorded on op_manager.payload_mix (the \
              per-node accumulator), not a process-global static"
