@@ -1262,6 +1262,13 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         "0".to_string()
     };
 
+    // Cost-pressure evictions (#4861) are a SEPARATE trigger from the byte
+    // budget: a tiny-state contract burning the node's update-work capacity is
+    // shed while comfortably under `budget_bytes`. Shown as its own tile so an
+    // operator can tell "the cost trigger is firing" from "the cost trigger has
+    // never fired", which the byte-eviction tile cannot express.
+    let cost_evictions_value = h.cost_evictions_total.to_string();
+
     // Per-contract table, bounded. Rows arrive in EVICTION order (lowest
     // keep-score first); show at most MAX_ROWS. The tile carries the full count.
     //
@@ -1345,6 +1352,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                     <div class="g-norm"><div class="g-norm-label">Headroom</div><div class="g-norm-value">{headroom}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Hosted</div><div class="g-norm-value">{count}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Budget evictions</div><div class="g-norm-value">{budget_evictions}</div></div>
+                    <div class="g-norm" title="Zero-demand contracts shed because their attributed update-work (WASM CPU, broadcast fan-out bytes, or broadcast message count) dominated this node's total on a cost axis — a separate trigger from the byte budget (#4861)."><div class="g-norm-label">Cost evictions</div><div class="g-norm-value">{cost_evictions}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Evicted w/ demand</div><div class="g-norm-value">{recently_read}</div></div>
                 </div>
             </div>
@@ -1369,6 +1377,7 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
         headroom = format_bytes(headroom),
         count = h.contract_count,
         budget_evictions = h.budget_evictions_total,
+        cost_evictions = cost_evictions_value,
         recently_read = recently_read_value,
         disk_breakdown_title = html_escape(&disk_breakdown_title),
         disk_used = disk_used_value,

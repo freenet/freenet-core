@@ -1612,6 +1612,18 @@ pub struct HostingSnapshot {
     /// times). Should stay near zero; a rising value means the demand estimate
     /// is mis-ordering the working set (the #4338 miscalibration symptom).
     pub evictions_of_recently_read_total: u64,
+    /// Monotonic count of COST-PRESSURE evictions (cost-aware eviction,
+    /// #4861): zero-demand contracts shed because their attributed update-work
+    /// (WASM CPU / broadcast fan-out / broadcast message count) dominated the
+    /// node's total on a cost axis, independently of the byte budget. Disjoint
+    /// from [`Self::budget_evictions_total`].
+    ///
+    /// Surfaced here because the local dashboard is the only hosting-counter
+    /// view an operator gets ON the box, with no telemetry collector in the
+    /// loop — the gap that left the 2026-07-25 vega storm undiagnosable. The
+    /// same counter reaches central telemetry as
+    /// `RouterSnapshot::hosting_cost_evictions_total`.
+    pub cost_evictions_total: u64,
     /// Per-contract Greedy-Dual rows in EVICTION order (the next victim under
     /// budget pressure is first). May be truncated by the renderer; the full
     /// count is `contract_count`.

@@ -2505,6 +2505,46 @@ mod tests {
         }
     }
 
+    /// The cost-pressure eviction counter (#4861) must reach the local
+    /// dashboard, not only central telemetry: on a gateway the local card is
+    /// the only hosting-counter view an operator has WITHOUT a collector, and
+    /// its absence is part of why the 2026-07-25 vega storm could not be
+    /// diagnosed on the box. Zero must render as a real "0" (the trigger has
+    /// never fired) rather than being hidden.
+    #[test]
+    fn hosting_card_renders_cost_eviction_counter() {
+        use crate::node::network_status::HostingSnapshot;
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 1024,
+            contract_count: 1,
+            cost_evictions_total: 0,
+            contracts: vec![mk_hosted_entry("A", 1.0, true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains("Cost evictions"),
+            "cost-eviction tile label present — got:\n{html}"
+        );
+
+        let mut snap = base_snapshot();
+        snap.hosting = HostingSnapshot {
+            budget_bytes: 256 * 1024 * 1024,
+            used_bytes: 1024,
+            contract_count: 1,
+            cost_evictions_total: 42,
+            contracts: vec![mk_hosted_entry("A", 1.0, true)],
+            ..Default::default()
+        };
+        let html = build_hosting_card(&Some(snap));
+        assert!(
+            html.contains(r#"<div class="g-norm-value">42</div>"#),
+            "cost-eviction count must render — got:\n{html}"
+        );
+    }
+
     #[test]
     fn hosting_card_badges_first_eligible_row_not_lowest_score() {
         use crate::node::network_status::HostingSnapshot;
@@ -2589,6 +2629,7 @@ mod tests {
             contract_count: 1,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
+            cost_evictions_total: 0,
             contracts: vec![mk_hosted_entry("A", 1.0, false)],
             disk_state_bytes: None,
             disk_wasm_bytes: None,
@@ -2630,6 +2671,7 @@ mod tests {
             contract_count: 1,
             budget_evictions_total: 0,
             evictions_of_recently_read_total: 0,
+            cost_evictions_total: 0,
             contracts: vec![mk_hosted_entry("A", 1.0, false)],
             disk_state_bytes: Some(100 * 1024 * 1024),
             disk_wasm_bytes: Some(20 * 1024 * 1024),

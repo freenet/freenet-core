@@ -4234,6 +4234,7 @@ impl Ring {
             contract_count: stats.contract_count,
             budget_evictions_total: stats.budget_evictions_total,
             evictions_of_recently_read_total: stats.evictions_of_recently_read_total,
+            cost_evictions_total: stats.cost_evictions_total,
             contracts,
             disk_state_bytes,
             disk_wasm_bytes,

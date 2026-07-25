@@ -761,6 +761,14 @@ pub struct HostingCache<T: TimeSource> {
     /// #4861). Only [`Self::evict_cost_pressure`] increments it. See
     /// [`HostingCacheStats::cost_evictions_total`].
     cost_evictions_total: u64,
+    /// Time of the last cost-pressure decision summary, for the rate limit in
+    /// [`Self::log_cost_decision`]. Observability only — never read by the
+    /// eviction decision.
+    last_cost_decision_log_at: Option<Instant>,
+    /// Digest of the last logged cost-pressure decision, so a CHANGE in the
+    /// decision surfaces within one sweep instead of waiting out
+    /// [`COST_DECISION_LOG_INTERVAL`]. Observability only.
+    last_cost_decision_digest: Option<u64>,
     /// Time source for testability
     time_source: T,
 }
@@ -987,6 +995,216 @@ pub(crate) fn cost_eviction_candidate(
     local_subs == 0 && downstream_subs == 0 && !recently_accessed && attributed_rate > 0.0
 }
 
+// -----------------------------------------------------------------------------
+// Cost-pressure decision OBSERVABILITY (no behavior change)
+// -----------------------------------------------------------------------------
+//
+// Everything below classifies and reports a decision the sweep has already
+// made. None of it is an input to the decision: `evict_cost_pressure` sheds
+// exactly the contracts it shed before, in the same order. The motivation is a
+// field incident (vega, 2026-07-25): a gateway sat in a sustained update storm
+// for ~7 hours while cost-pressure eviction never fired once, and from outside
+// the process there was no way to tell WHICH of three mutually-exclusive causes
+// held — the axis was under its floor, the offender was immune by design
+// (subscribed / recently read), or the meter was not attributing the work to
+// any hosted contract at all. Those need completely different fixes. Before
+// this, the ONLY log on the path fired on a successful eviction, so the
+// "nothing happened" case — the interesting one — was silent.
+
+/// Minimum spacing between periodic cost-pressure decision summaries.
+///
+/// The production sweep that drives [`HostingCache::evict_cost_pressure`] runs
+/// every 60s (`Ring::GET_SUBSCRIPTION_SWEEP_INTERVAL`), so logging every sweep
+/// would add ~60 `info!` lines/hour/node to gateways already emitting ~8 MB/hour
+/// (the #4259 log-volume budget). One heartbeat per this interval — plus an
+/// immediate line whenever the DECISION ITSELF changes, see
+/// [`cost_decision_digest`] — costs ~12 lines/hour in steady state while still
+/// surfacing a state change within one sweep.
+pub(crate) const COST_DECISION_LOG_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Why the highest-attributed-cost hosted contract on a cost axis was NOT shed.
+///
+/// OBSERVABILITY ONLY. [`classify_cost_rejection`] returning `None` is exactly
+/// the condition under which [`HostingCache::evict_cost_pressure`] sheds a
+/// contract, which is what makes this a faithful explanation rather than a
+/// second, drift-prone copy of the policy (pinned by
+/// `cost_reject_classification_matches_eviction_decision`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CostRejectReason {
+    /// No positive attributed rate on this axis — covers zero, negatives, and
+    /// NaN (all fail `attributed_rate > 0.0`). Reported ahead of
+    /// [`Self::UnderShare`] because "the meter attributed nothing to this
+    /// contract" and "the contract holds less than the share" are DIFFERENT
+    /// diagnoses with different fixes.
+    ZeroRate,
+    /// Attributed rate did not exceed `COST_SHARE_THRESHOLD × total_rate`.
+    UnderShare,
+    /// A LOCAL client subscription (invariant 3's top demand tier). Immune by
+    /// candidacy, not by ranking.
+    HasLocalSubs,
+    /// A DOWNSTREAM subscriber (forwarded demand). Immune by candidacy.
+    HasDownstreamSubs,
+    /// A genuine GET/PUT within the cost window, or a local-client access
+    /// within the reconciliation renewal lease — the read-but-never-subscribed
+    /// class invariant 3 protects.
+    RecentlyAccessed,
+}
+
+impl CostRejectReason {
+    /// Stable operator-facing token (the grep target in the summary line).
+    ///
+    /// Exhaustive on purpose — no catch-all arm — so a future reason cannot
+    /// silently render as an existing one (`.claude/rules/code-style.md`:
+    /// outcome-classifying matches must not use `_ =>`).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ZeroRate => "zero_rate",
+            Self::UnderShare => "under_share",
+            Self::HasLocalSubs => "has_local_subs",
+            Self::HasDownstreamSubs => "has_downstream_subs",
+            Self::RecentlyAccessed => "recently_accessed",
+        }
+    }
+}
+
+impl std::fmt::Display for CostRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Classify why a contract was not shed by cost pressure on one axis, or
+/// `None` when it WAS (i.e. it cleared every gate).
+///
+/// Precedence mirrors the order the sweep applies its gates — rate share
+/// first (the cheap pre-filter), then the candidacy terms in invariant 3's
+/// demand order (local subscriptions, downstream subscribers, recent genuine
+/// access) — with the single refinement described on
+/// [`CostRejectReason::ZeroRate`].
+///
+/// Pure function of the same five inputs the decision uses, so it can be unit
+/// tested exhaustively without a cache.
+pub(crate) fn classify_cost_rejection(
+    local_subs: usize,
+    downstream_subs: usize,
+    attributed_rate: f64,
+    share_cutoff: f64,
+    recently_accessed: bool,
+) -> Option<CostRejectReason> {
+    // NaN-safe and written without `!(a > b)` so clippy's
+    // `neg_cmp_op_on_partial_ord` stays quiet: NaN and any non-positive rate
+    // both land here, exactly as they fail `cost_eviction_candidate`.
+    if attributed_rate.is_nan() || attributed_rate <= 0.0 {
+        return Some(CostRejectReason::ZeroRate);
+    }
+    if attributed_rate <= share_cutoff {
+        return Some(CostRejectReason::UnderShare);
+    }
+    if local_subs > 0 {
+        return Some(CostRejectReason::HasLocalSubs);
+    }
+    if downstream_subs > 0 {
+        return Some(CostRejectReason::HasDownstreamSubs);
+    }
+    if recently_accessed {
+        return Some(CostRejectReason::RecentlyAccessed);
+    }
+    None
+}
+
+/// The highest-attributed-cost hosted contract on one axis, with the outcome
+/// the sweep reached for it.
+#[derive(Debug, Clone)]
+pub(crate) struct CostTopOffender {
+    pub key: ContractKey,
+    /// Its attributed rate in the axis's units per second.
+    pub rate: f64,
+    /// `rate / total_rate` — its share of the node's attributed work on this
+    /// axis, the quantity [`COST_SHARE_THRESHOLD`] is compared against.
+    pub share: f64,
+    /// `None` when this contract was shed; otherwise the gate that saved it.
+    pub rejected: Option<CostRejectReason>,
+}
+
+/// The cost-pressure decision for ONE axis on ONE sweep.
+///
+/// Observability only: built FROM the decision pass (never from a second read
+/// of the same state that could reach a different conclusion) and consumed
+/// solely by [`HostingCache::log_cost_decision`] and its tests.
+#[derive(Debug, Clone)]
+pub(crate) struct CostAxisDecision {
+    /// Axis name, e.g. `"broadcast_messages_per_sec"`.
+    pub axis: &'static str,
+    /// Node-total attributed rate across all contracts.
+    pub total_rate: f64,
+    /// The absolute floor below which the axis never triggers.
+    pub floor: f64,
+    /// `total_rate > floor` (NaN-safe) — whether the axis could shed at all.
+    pub armed: bool,
+    /// Highest-attributed-rate hosted contract on this axis. `None` on an
+    /// UNARMED axis (the sweep does not scan hosted contracts there, and
+    /// reporting an offender would cost a scan the decision itself never pays
+    /// — `total_rate` vs `floor` is the whole explanation in that case) and on
+    /// an armed axis with nothing hosted.
+    pub top: Option<CostTopOffender>,
+    /// Contracts shed on this axis this sweep.
+    pub evicted: usize,
+}
+
+impl std::fmt::Display for CostAxisDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: total={:.3} floor={:.3} armed={}",
+            self.axis, self.total_rate, self.floor, self.armed
+        )?;
+        match &self.top {
+            Some(top) => write!(
+                f,
+                " top={} rate={:.3} share={:.3} outcome={}",
+                top.key,
+                top.rate,
+                top.share,
+                match top.rejected {
+                    Some(reason) => reason.as_str(),
+                    None => "evicted",
+                }
+            )?,
+            None if self.armed => f.write_str(" top=none")?,
+            None => {}
+        }
+        if self.evicted > 0 {
+            write!(f, " evicted={}", self.evicted)?;
+        }
+        Ok(())
+    }
+}
+
+/// Digest of a sweep's cost-pressure decision, used to emit a summary
+/// immediately when the DECISION changes rather than waiting out
+/// [`COST_DECISION_LOG_INTERVAL`].
+///
+/// Deliberately covers only each axis's name, armed flag, and top-offender
+/// outcome — NOT the offender's identity or the rates. Rates wobble every
+/// sweep and the top offender can swap between two near-equal contracts, so
+/// including either would turn the change-trigger into a per-sweep line. Those
+/// details still appear in the next periodic summary.
+fn cost_decision_digest(decisions: &[CostAxisDecision]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for decision in decisions {
+        decision.axis.hash(&mut hasher);
+        decision.armed.hash(&mut hasher);
+        // `Option<Option<_>>` distinguishes no-offender / shed / rejected(why).
+        decision
+            .top
+            .as_ref()
+            .map(|top| top.rejected)
+            .hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 impl<T: TimeSource> HostingCache<T> {
     /// Create a new hosting cache with the given byte budget.
     pub fn new(budget_bytes: u64, time_source: T) -> Self {
@@ -1003,6 +1221,8 @@ impl<T: TimeSource> HostingCache<T> {
             oom_valve_evictions_total: 0,
             subscribed_evictions_total: 0,
             cost_evictions_total: 0,
+            last_cost_decision_log_at: None,
+            last_cost_decision_digest: None,
             time_source,
         }
     }
@@ -1888,65 +2108,120 @@ impl<T: TimeSource> HostingCache<T> {
     where
         G: Fn(&ContractKey) -> (usize, usize),
     {
+        self.evict_cost_pressure_observed(subscriber_counts, axes).0
+    }
+
+    /// [`Self::evict_cost_pressure`] plus the per-axis decision record it
+    /// logs.
+    ///
+    /// The record is derived from the SAME pass that makes the decision — it
+    /// never re-reads state to reach an independent conclusion — so a test can
+    /// assert the explanation and the outcome agree contract-for-contract.
+    /// Production calls the wrapper and drops the record; only the summary log
+    /// consumes it there.
+    pub(crate) fn evict_cost_pressure_observed<G>(
+        &mut self,
+        subscriber_counts: &G,
+        axes: &[CostAxisPressure],
+    ) -> (Vec<EvictedContract>, Vec<CostAxisDecision>)
+    where
+        G: Fn(&ContractKey) -> (usize, usize),
+    {
         let now = self.time_source.now();
         let mut evicted = Vec::new();
+        let mut decisions: Vec<CostAxisDecision> = Vec::with_capacity(axes.len());
         for axis in axes {
             // NaN-safe: a NaN/zero/sub-floor total never triggers the axis.
             if axis.total_rate.is_nan() || axis.total_rate <= axis.floor {
+                decisions.push(CostAxisDecision {
+                    axis: axis.axis,
+                    total_rate: axis.total_rate,
+                    floor: axis.floor,
+                    armed: false,
+                    top: None,
+                    evicted: 0,
+                });
                 continue;
             }
             let share_cutoff = COST_SHARE_THRESHOLD * axis.total_rate;
-            let mut offenders: Vec<(ContractKey, f64)> = self
-                .contracts
+            // OBSERVABILITY, same pass, no extra state reads: `top_rate` is the
+            // highest attributed rate across ALL hosted contracts (so the
+            // summary can name the offender even when it is rejected), and
+            // `probed` records the candidacy inputs of every contract that
+            // cleared the share cutoff, so the summary explains the rejection
+            // from the inputs the DECISION used rather than from a second,
+            // racy read. `probed` stays tiny by construction: the per-contract
+            // rates are a subset of `total_rate` (see
+            // `Meter::contract_cost_rates_multi`), so at most three contracts
+            // can each hold more than COST_SHARE_THRESHOLD (25%) of it.
+            let mut top_rate: Option<(ContractKey, f64)> = None;
+            let mut probed: Vec<(ContractKey, f64, usize, usize, bool)> = Vec::new();
+            for (key, entry) in self.contracts.iter() {
+                let rate = axis.rates.get(key.id()).copied().unwrap_or(0.0);
+                // Highest rate wins; equal rates fall back to the SAME
+                // ascending key-byte tiebreak the eviction sort below uses, so
+                // the reported offender is deterministic and matches the first
+                // victim when there is one. A NaN rate is skipped rather than
+                // allowed to become an unbeatable maximum (nothing compares
+                // greater than NaN); it is never a candidate anyway.
+                if !rate.is_nan()
+                    && top_rate.as_ref().is_none_or(|(top_key, top)| {
+                        rate > *top || (rate == *top && key.as_bytes() < top_key.as_bytes())
+                    })
+                {
+                    top_rate = Some((*key, rate));
+                }
+                // Cheap, highly-selective gate FIRST (#4903 review perf):
+                // only a contract whose attributed rate exceeds the share
+                // cutoff can ever be a victim, so short-circuit BEFORE the
+                // two DashMap `subscriber_counts` gets and the recency
+                // check. This filter runs under the hosting write lock on
+                // every sweep where any axis is over its floor (a busy
+                // gateway: always), across every hosted contract, so paying
+                // the subscriber lookup only for the handful over the cutoff
+                // matters. `rate <= cutoff` rejects rate == 0 and negatives;
+                // a NaN rate (defensive: meter math) is not <= cutoff so it
+                // falls through here, but `cost_eviction_candidate` then
+                // rejects it (its `attributed_rate > 0.0` is false for NaN).
+                if rate <= share_cutoff {
+                    continue;
+                }
+                let (local, downstream) = subscriber_counts(key);
+                // Recent demand by the SAME definition the rest of the
+                // system honors (review Fix 1 / invariant 3), so cost
+                // eviction can never shed a contract reconciliation
+                // still leases (an evict → re-lease churn loop):
+                //
+                // 1. A genuine GET/PUT within the cost window
+                //    (`last_genuine_access`) — read/write demand.
+                //    UPDATE churn never stamps it, so a storm contract
+                //    cannot protect itself.
+                // 2. A LOCAL-CLIENT access within the renewal lease
+                //    (`local_client_last_access` <
+                //    `SUBSCRIPTION_LEASE_DURATION`) — the exact signal
+                //    `contracts_needing_renewal` branch 3 renews on.
+                //    This covers both the 5–8-minute tail after a local
+                //    access (the lease outlives the cost window) and the
+                //    restart window: a reload stamps
+                //    `local_client_last_access = now` for locally-
+                //    accessed contracts while `last_genuine_access`
+                //    restarts at `None`, so without this clause the cost
+                //    sweep could evict a contract the reconcile loop was
+                //    still renewing.
+                let recently_accessed = entry
+                    .last_genuine_access
+                    .is_some_and(|at| now.saturating_duration_since(at) < COST_RATE_MIN_WINDOW)
+                    || entry.local_client_last_access.is_some_and(|at| {
+                        now.saturating_duration_since(at) < super::SUBSCRIPTION_LEASE_DURATION
+                    });
+                probed.push((*key, rate, local, downstream, recently_accessed));
+            }
+            let mut offenders: Vec<(ContractKey, f64)> = probed
                 .iter()
-                .filter_map(|(key, entry)| {
-                    let rate = axis.rates.get(key.id()).copied().unwrap_or(0.0);
-                    // Cheap, highly-selective gate FIRST (#4903 review perf):
-                    // only a contract whose attributed rate exceeds the share
-                    // cutoff can ever be a victim, so short-circuit BEFORE the
-                    // two DashMap `subscriber_counts` gets and the recency
-                    // check. This filter runs under the hosting write lock on
-                    // every sweep where any axis is over its floor (a busy
-                    // gateway: always), across every hosted contract, so paying
-                    // the subscriber lookup only for the handful over the cutoff
-                    // matters. `rate <= cutoff` rejects rate == 0 and negatives;
-                    // a NaN rate (defensive: meter math) is not <= cutoff so it
-                    // falls through here, but `cost_eviction_candidate` then
-                    // rejects it (its `attributed_rate > 0.0` is false for NaN).
-                    if rate <= share_cutoff {
-                        return None;
-                    }
-                    let (local, downstream) = subscriber_counts(key);
-                    // Recent demand by the SAME definition the rest of the
-                    // system honors (review Fix 1 / invariant 3), so cost
-                    // eviction can never shed a contract reconciliation
-                    // still leases (an evict → re-lease churn loop):
-                    //
-                    // 1. A genuine GET/PUT within the cost window
-                    //    (`last_genuine_access`) — read/write demand.
-                    //    UPDATE churn never stamps it, so a storm contract
-                    //    cannot protect itself.
-                    // 2. A LOCAL-CLIENT access within the renewal lease
-                    //    (`local_client_last_access` <
-                    //    `SUBSCRIPTION_LEASE_DURATION`) — the exact signal
-                    //    `contracts_needing_renewal` branch 3 renews on.
-                    //    This covers both the 5–8-minute tail after a local
-                    //    access (the lease outlives the cost window) and the
-                    //    restart window: a reload stamps
-                    //    `local_client_last_access = now` for locally-
-                    //    accessed contracts while `last_genuine_access`
-                    //    restarts at `None`, so without this clause the cost
-                    //    sweep could evict a contract the reconcile loop was
-                    //    still renewing.
-                    let recently_accessed = entry
-                        .last_genuine_access
-                        .is_some_and(|at| now.saturating_duration_since(at) < COST_RATE_MIN_WINDOW)
-                        || entry.local_client_last_access.is_some_and(|at| {
-                            now.saturating_duration_since(at) < super::SUBSCRIPTION_LEASE_DURATION
-                        });
-                    cost_eviction_candidate(local, downstream, rate, recently_accessed)
-                        .then_some((*key, rate))
+                .filter(|(_, rate, local, downstream, recently_accessed)| {
+                    cost_eviction_candidate(*local, *downstream, *rate, *recently_accessed)
                 })
+                .map(|(key, rate, ..)| (*key, *rate))
                 .collect();
             // Descending by attributed rate; key bytes break exact-rate ties
             // deterministically.
@@ -1955,6 +2230,7 @@ impl<T: TimeSource> HostingCache<T> {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
             });
+            let evicted_before_axis = evicted.len();
             for (key, rate) in offenders {
                 if let Some(entry) = self.contracts.remove(&key) {
                     self.current_bytes = self.current_bytes.saturating_sub(entry.size_bytes);
@@ -1983,8 +2259,92 @@ impl<T: TimeSource> HostingCache<T> {
                     });
                 }
             }
+            // Explain THIS axis's outcome from the inputs used above. The
+            // classification of the top offender is `None` exactly when it was
+            // shed, because `classify_cost_rejection` returns `None` under
+            // precisely the `rate > cutoff && cost_eviction_candidate(..)`
+            // condition the loop above acted on.
+            let top = top_rate.map(|(key, rate)| {
+                let rejected = match probed.iter().find(|(probed_key, ..)| *probed_key == key) {
+                    Some((_, rate, local, downstream, recently_accessed)) => {
+                        classify_cost_rejection(
+                            *local,
+                            *downstream,
+                            *rate,
+                            share_cutoff,
+                            *recently_accessed,
+                        )
+                    }
+                    // Never cleared the share cutoff, so it has no recorded
+                    // candidacy inputs — and needs none: the rate gates
+                    // (`ZeroRate` / `UnderShare`) decide it before any
+                    // subscriber or recency term is consulted.
+                    None => classify_cost_rejection(0, 0, rate, share_cutoff, false),
+                };
+                CostTopOffender {
+                    key,
+                    rate,
+                    share: rate / axis.total_rate,
+                    rejected,
+                }
+            });
+            decisions.push(CostAxisDecision {
+                axis: axis.axis,
+                total_rate: axis.total_rate,
+                floor: axis.floor,
+                armed: true,
+                top,
+                evicted: evicted.len() - evicted_before_axis,
+            });
         }
-        evicted
+        self.log_cost_decision(now, &decisions);
+        (evicted, decisions)
+    }
+
+    /// Emit the operator-facing cost-pressure decision summary, rate-limited.
+    ///
+    /// This is the field-diagnosis surface for "cost eviction never fired".
+    /// Per axis it reports the node total, the floor, whether the axis armed,
+    /// the top attributed-cost contract with its share, and — when that
+    /// contract was NOT shed — the specific gate that saved it. Without it the
+    /// three causes an operator must tell apart (axis under floor / offender
+    /// immune by design / meter not attributing the work) are
+    /// indistinguishable from outside the process, which is exactly what
+    /// blocked the 2026-07-25 vega storm diagnosis: the only log on this path
+    /// fired on a successful eviction, so a sweep that shed nothing was
+    /// silent.
+    ///
+    /// `info!`, NOT `debug!`: release builds compile out `debug!` via
+    /// `max_level_info`, so a debug line here would be invisible in exactly
+    /// the environment it exists for.
+    fn log_cost_decision(&mut self, now: Instant, decisions: &[CostAxisDecision]) {
+        if decisions.is_empty() {
+            return;
+        }
+        let digest = cost_decision_digest(decisions);
+        let due = self
+            .last_cost_decision_log_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= COST_DECISION_LOG_INTERVAL);
+        if !due && self.last_cost_decision_digest == Some(digest) {
+            return;
+        }
+        self.last_cost_decision_log_at = Some(now);
+        self.last_cost_decision_digest = Some(digest);
+        // One line for all axes rather than one per axis: `tracing` field
+        // names must be static, so a rendered summary is what keeps the whole
+        // decision greppable in a single record.
+        let rendered = decisions
+            .iter()
+            .map(CostAxisDecision::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::info!(
+            axes_armed = decisions.iter().filter(|decision| decision.armed).count(),
+            hosted_contracts = self.contracts.len(),
+            cost_evictions_total = self.cost_evictions_total,
+            axes = %rendered,
+            "cost-pressure eviction decision (#4861)"
+        );
     }
 
     /// Load a contract entry from persisted data during startup, using an
@@ -2745,6 +3105,442 @@ mod tests {
         );
         assert!(cache.get(&small).is_some());
         assert_eq!(cache.stats().cost_evictions_total, 2);
+    }
+
+    // =========================================================================
+    // Cost-pressure decision OBSERVABILITY (no behavior change)
+    // =========================================================================
+
+    /// Every reject reason is reachable and reported for the gate that
+    /// actually saved the contract, and the accepted shape reports `None`.
+    #[test]
+    fn classify_cost_rejection_reports_each_reason() {
+        let cutoff = 25_000.0;
+
+        // Accepted: over the share cutoff, zero demand.
+        assert_eq!(
+            classify_cost_rejection(0, 0, 58_000.0, cutoff, false),
+            None,
+            "an over-share zero-demand contract is shed, so nothing rejected it"
+        );
+
+        // zero_rate — the "meter attributed nothing here" diagnosis. Covers
+        // exact zero, negatives, and NaN (all fail `attributed_rate > 0.0`).
+        for rate in [0.0, -1.0, f64::NAN] {
+            assert_eq!(
+                classify_cost_rejection(0, 0, rate, cutoff, false),
+                Some(CostRejectReason::ZeroRate),
+                "rate {rate} must classify as zero_rate"
+            );
+        }
+
+        // under_share — positive but not dominant. Includes the exact-cutoff
+        // boundary, since the share test is strict `>`.
+        assert_eq!(
+            classify_cost_rejection(0, 0, 10_000.0, cutoff, false),
+            Some(CostRejectReason::UnderShare)
+        );
+        assert_eq!(
+            classify_cost_rejection(0, 0, cutoff, cutoff, false),
+            Some(CostRejectReason::UnderShare),
+            "exactly at the cutoff is under_share (strict >)"
+        );
+
+        // has_local_subs / has_downstream_subs — immune by candidacy.
+        assert_eq!(
+            classify_cost_rejection(1, 0, 58_000.0, cutoff, false),
+            Some(CostRejectReason::HasLocalSubs)
+        );
+        assert_eq!(
+            classify_cost_rejection(0, 3, 58_000.0, cutoff, false),
+            Some(CostRejectReason::HasDownstreamSubs)
+        );
+
+        // recently_accessed — the read-but-never-subscribed class.
+        assert_eq!(
+            classify_cost_rejection(0, 0, 58_000.0, cutoff, true),
+            Some(CostRejectReason::RecentlyAccessed)
+        );
+    }
+
+    /// Precedence when several gates would reject: the summary names the gate
+    /// the sweep applies FIRST, so an operator reading it sees the same order
+    /// of reasoning the code uses. `ZeroRate` is the one deliberate refinement
+    /// (a zero rate is also under-share, but the two need different fixes).
+    #[test]
+    fn classify_cost_rejection_precedence_is_gate_order() {
+        let cutoff = 25_000.0;
+        assert_eq!(
+            classify_cost_rejection(9, 9, 0.0, cutoff, true),
+            Some(CostRejectReason::ZeroRate),
+            "no attributed cost is reported ahead of the share and demand gates"
+        );
+        assert_eq!(
+            classify_cost_rejection(9, 9, 100.0, cutoff, true),
+            Some(CostRejectReason::UnderShare),
+            "the share gate is checked before any subscriber term"
+        );
+        assert_eq!(
+            classify_cost_rejection(1, 9, 58_000.0, cutoff, true),
+            Some(CostRejectReason::HasLocalSubs),
+            "local subscriptions outrank downstream and recency (invariant 3)"
+        );
+        assert_eq!(
+            classify_cost_rejection(0, 1, 58_000.0, cutoff, true),
+            Some(CostRejectReason::HasDownstreamSubs),
+            "downstream subscribers outrank recency"
+        );
+    }
+
+    /// The pin that makes the explanation trustworthy: over a grid covering
+    /// every gate and its boundaries, `classify_cost_rejection(..) == None` is
+    /// EXACTLY the condition under which `evict_cost_pressure` sheds a
+    /// contract (`rate > share_cutoff && cost_eviction_candidate(..)`). If a
+    /// future change moves one and not the other, this fails rather than the
+    /// logs quietly lying about the policy.
+    #[test]
+    fn cost_reject_classification_matches_eviction_decision() {
+        let cutoff = 25_000.0;
+        let rates = [
+            f64::NAN,
+            f64::NEG_INFINITY,
+            -1.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.0,
+            cutoff - 0.1,
+            cutoff,
+            cutoff + 0.1,
+            100_000.0,
+            f64::INFINITY,
+        ];
+        for &rate in &rates {
+            for local in [0usize, 1, 7] {
+                for downstream in [0usize, 1, 7] {
+                    for recent in [false, true] {
+                        // The sweep's own two gates, transcribed from
+                        // `evict_cost_pressure`: the cheap share pre-filter
+                        // (`rate <= cutoff` → skip) then candidacy. The
+                        // pre-filter is written positively here — a NaN rate
+                        // is NOT `<= cutoff`, so it survives the filter and is
+                        // rejected one line later by candidacy, exactly as in
+                        // the sweep.
+                        let clears_share_filter = rate.is_nan() || rate > cutoff;
+                        let shed = clears_share_filter
+                            && cost_eviction_candidate(local, downstream, rate, recent);
+                        let classified =
+                            classify_cost_rejection(local, downstream, rate, cutoff, recent);
+                        assert_eq!(
+                            classified.is_none(),
+                            shed,
+                            "classification disagrees with the eviction decision for \
+                             rate={rate} local={local} downstream={downstream} \
+                             recent={recent}: classified={classified:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// An UNARMED axis reports the numbers that explain it — node total vs
+    /// floor — and deliberately reports no top offender: the sweep does not
+    /// scan hosted contracts on an unarmed axis, and naming one would cost a
+    /// scan the decision itself never pays.
+    #[test]
+    fn cost_decision_reports_unarmed_axis_without_scanning() {
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let only = make_key(1);
+        cache.record_access(only, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+
+        let axes = [cost_axis(10_000.0, 50_000.0, &[(&only, 10_000.0)])];
+        let (evicted, decisions) =
+            cache.evict_cost_pressure_observed(&|_: &ContractKey| (0, 0), &axes);
+
+        assert!(evicted.is_empty());
+        assert_eq!(decisions.len(), 1);
+        let decision = &decisions[0];
+        assert!(!decision.armed, "sub-floor total must report armed=false");
+        assert_eq!(decision.total_rate, 10_000.0);
+        assert_eq!(decision.floor, 50_000.0);
+        assert!(decision.top.is_none());
+        assert_eq!(decision.evicted, 0);
+        let rendered = decision.to_string();
+        assert!(
+            rendered.contains("armed=false") && rendered.contains("floor=50000"),
+            "the unarmed line must carry total vs floor — got: {rendered}"
+        );
+    }
+
+    /// The armed-axis summary names the top attributed-cost contract, its
+    /// share, and the specific gate that saved it — one case per reason an
+    /// operator has to be able to tell apart in the field.
+    #[test]
+    fn cost_decision_reports_top_offender_and_reject_reason() {
+        // Shared shape: one dominant contract on an armed axis, aged past the
+        // cost window so recency is not what protects it unless we say so.
+        let armed_axis =
+            |key: &ContractKey, rate: f64| [cost_axis(100_000.0, 50_000.0, &[(key, rate)])];
+
+        // 1. Shed: zero demand, dominant share → no reject reason.
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let junk = make_key(1);
+        cache.record_access(junk, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let (evicted, decisions) = cache
+            .evict_cost_pressure_observed(&|_: &ContractKey| (0, 0), &armed_axis(&junk, 58_000.0));
+        assert_eq!(evicted.len(), 1);
+        let top = decisions[0].top.as_ref().expect("armed axis names a top");
+        assert_eq!(top.key, junk);
+        assert_eq!(top.rate, 58_000.0);
+        assert!((top.share - 0.58).abs() < 1e-9);
+        assert_eq!(top.rejected, None, "it was shed, so nothing rejected it");
+        assert_eq!(decisions[0].evicted, 1);
+        assert!(
+            decisions[0].to_string().contains("outcome=evicted"),
+            "rendered: {}",
+            decisions[0]
+        );
+
+        // 2. has_local_subs.
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let local_sub = make_key(2);
+        cache.record_access(local_sub, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let (evicted, decisions) = cache.evict_cost_pressure_observed(
+            &|_: &ContractKey| (1, 0),
+            &armed_axis(&local_sub, 58_000.0),
+        );
+        assert!(evicted.is_empty());
+        assert_eq!(
+            decisions[0].top.as_ref().unwrap().rejected,
+            Some(CostRejectReason::HasLocalSubs)
+        );
+
+        // 3. has_downstream_subs.
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let downstream_sub = make_key(3);
+        cache.record_access(downstream_sub, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let (evicted, decisions) = cache.evict_cost_pressure_observed(
+            &|_: &ContractKey| (0, 2),
+            &armed_axis(&downstream_sub, 58_000.0),
+        );
+        assert!(evicted.is_empty());
+        assert_eq!(
+            decisions[0].top.as_ref().unwrap().rejected,
+            Some(CostRejectReason::HasDownstreamSubs)
+        );
+
+        // 4. recently_accessed — the never-subscribed-but-read class.
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let read_hot = make_key(4);
+        cache.record_access(read_hot, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        cache.touch(&read_hot);
+        let (evicted, decisions) = cache.evict_cost_pressure_observed(
+            &|_: &ContractKey| (0, 0),
+            &armed_axis(&read_hot, 58_000.0),
+        );
+        assert!(evicted.is_empty());
+        assert_eq!(
+            decisions[0].top.as_ref().unwrap().rejected,
+            Some(CostRejectReason::RecentlyAccessed)
+        );
+
+        // 5. under_share — armed axis, but nothing dominates it.
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let a = make_key(5);
+        let b = make_key(6);
+        cache.record_access(a, 121, AccessType::Put, 1, |_| (0, 0));
+        cache.record_access(b, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let axes = [cost_axis(
+            100_000.0,
+            50_000.0,
+            &[(&a, 20_000.0), (&b, 24_000.0)],
+        )];
+        let (evicted, decisions) =
+            cache.evict_cost_pressure_observed(&|_: &ContractKey| (0, 0), &axes);
+        assert!(evicted.is_empty());
+        let top = decisions[0].top.as_ref().unwrap();
+        assert_eq!(top.key, b, "the highest-rate contract is the reported top");
+        assert_eq!(top.rejected, Some(CostRejectReason::UnderShare));
+
+        // 6. zero_rate — the axis is armed node-wide, but the meter attributes
+        //    nothing to any hosted contract. This is the diagnosis that is
+        //    otherwise indistinguishable from "everything is under share".
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let unattributed = make_key(7);
+        cache.record_access(unattributed, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let axes = [cost_axis(100_000.0, 50_000.0, &[])];
+        let (evicted, decisions) =
+            cache.evict_cost_pressure_observed(&|_: &ContractKey| (0, 0), &axes);
+        assert!(evicted.is_empty());
+        let top = decisions[0].top.as_ref().unwrap();
+        assert_eq!(top.key, unattributed);
+        assert_eq!(top.rate, 0.0);
+        assert_eq!(top.rejected, Some(CostRejectReason::ZeroRate));
+        assert!(
+            decisions[0].to_string().contains("outcome=zero_rate"),
+            "rendered: {}",
+            decisions[0]
+        );
+    }
+
+    /// The observability path must not perturb the decision. Two identical
+    /// caches, one with the summary-log rate limiter already primed (so it
+    /// stays silent) and one fresh (so it logs), shed exactly the same
+    /// contracts in the same order — proving the log gate is downstream of the
+    /// decision, not an input to it.
+    #[test]
+    fn cost_decision_logging_state_does_not_change_evictions() {
+        let scenario = |prime_log_state: bool| {
+            let (mut cache, clock) = make_cache(1024 * 1024);
+            let bigger = make_key(1);
+            let big = make_key(2);
+            let subscribed = make_key(3);
+            let quiet = make_key(4);
+            for (key, generation) in [(bigger, 1), (big, 2), (subscribed, 3), (quiet, 4)] {
+                cache.record_access(key, 121, AccessType::Put, generation, |_| (0, 0));
+            }
+            clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+            if prime_log_state {
+                // Pretend a summary was just emitted with an arbitrary digest:
+                // the rate limiter is now closed for this sweep.
+                cache.last_cost_decision_log_at = Some(cache.time_source.now());
+                cache.last_cost_decision_digest = Some(0);
+            }
+            let axes = [
+                cost_axis(
+                    100_000.0,
+                    50_000.0,
+                    &[
+                        (&bigger, 45_000.0),
+                        (&big, 30_000.0),
+                        (&subscribed, 40_000.0),
+                        (&quiet, 1.0),
+                    ],
+                ),
+                cost_axis(5_000.0, 50_000.0, &[(&quiet, 5_000.0)]),
+            ];
+            let counts = |key: &ContractKey| if *key == subscribed { (0, 1) } else { (0, 0) };
+            let evicted = cache.evict_cost_pressure(&counts, &axes);
+            (
+                evicted
+                    .iter()
+                    .map(|e| (e.key, e.write_generation))
+                    .collect::<Vec<_>>(),
+                cache.stats().cost_evictions_total,
+                cache.keys_eviction_order(),
+            )
+        };
+
+        let fresh = scenario(false);
+        let primed = scenario(true);
+        assert_eq!(
+            fresh, primed,
+            "the summary-log rate-limiter state must not influence which \
+             contracts are shed, their order, or the counter"
+        );
+        // And the outcome is the independently-expected one: both super-share
+        // zero-demand contracts, descending by rate; the subscribed one and the
+        // sub-share one survive.
+        assert_eq!(
+            fresh.0.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![make_key(1), make_key(2)]
+        );
+        assert_eq!(fresh.1, 2);
+    }
+
+    /// The summary is rate-limited but change-responsive: the first sweep
+    /// emits, an identical follow-up sweep inside the interval stays silent, a
+    /// sweep whose DECISION changed emits immediately, and the periodic
+    /// heartbeat resumes once the interval elapses. Asserted through the
+    /// emit-only bookkeeping (`last_cost_decision_log_at` advances exactly
+    /// when a line is emitted) so it needs no subscriber capture.
+    #[test]
+    fn cost_decision_log_is_rate_limited_and_change_triggered() {
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let junk = make_key(1);
+        cache.record_access(junk, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+
+        let quiet_axis = [cost_axis(10_000.0, 50_000.0, &[(&junk, 10_000.0)])];
+        let armed_axis = [cost_axis(100_000.0, 50_000.0, &[(&junk, 10_000.0)])];
+
+        // First sweep always emits (nothing has been logged yet).
+        cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &quiet_axis);
+        let first = cache.last_cost_decision_log_at.expect("first sweep emits");
+
+        // Same decision, well inside the interval: silent.
+        clock.advance_time(Duration::from_secs(60));
+        cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &quiet_axis);
+        assert_eq!(
+            cache.last_cost_decision_log_at,
+            Some(first),
+            "an unchanged decision inside the interval must not re-log"
+        );
+
+        // The axis arms (and the top offender is now rejected under_share):
+        // the decision changed, so it is surfaced within one sweep.
+        clock.advance_time(Duration::from_secs(60));
+        cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &armed_axis);
+        let changed = cache
+            .last_cost_decision_log_at
+            .expect("a changed decision emits");
+        assert!(changed > first, "change-trigger must emit immediately");
+
+        // Unchanged again → silent until the heartbeat interval elapses.
+        clock.advance_time(Duration::from_secs(60));
+        cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &armed_axis);
+        assert_eq!(cache.last_cost_decision_log_at, Some(changed));
+        clock.advance_time(COST_DECISION_LOG_INTERVAL);
+        cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &armed_axis);
+        assert!(
+            cache
+                .last_cost_decision_log_at
+                .is_some_and(|at| at > changed),
+            "the periodic heartbeat resumes after COST_DECISION_LOG_INTERVAL"
+        );
+    }
+
+    /// Equal-rate contracts pick the same deterministic top offender the
+    /// eviction sort would pick first (ascending key bytes), so the summary
+    /// never reports a different contract than the one that was acted on.
+    #[test]
+    fn cost_decision_top_offender_tiebreak_matches_eviction_order() {
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let k1 = make_key(1);
+        let k2 = make_key(2);
+        cache.record_access(k1, 121, AccessType::Put, 1, |_| (0, 0));
+        cache.record_access(k2, 121, AccessType::Put, 2, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let (lower, _higher) = if k1.as_bytes() < k2.as_bytes() {
+            (k1, k2)
+        } else {
+            (k2, k1)
+        };
+        // Exactly equal rates, both over the 25% share.
+        let axes = [cost_axis(
+            100_000.0,
+            50_000.0,
+            &[(&k1, 30_000.0), (&k2, 30_000.0)],
+        )];
+        let (evicted, decisions) =
+            cache.evict_cost_pressure_observed(&|_: &ContractKey| (0, 0), &axes);
+        assert_eq!(evicted.len(), 2, "both dominate; both are shed");
+        assert_eq!(
+            evicted[0].key, lower,
+            "eviction breaks equal-rate ties by ascending key bytes"
+        );
+        assert_eq!(
+            decisions[0].top.as_ref().unwrap().key,
+            lower,
+            "the reported top offender uses the SAME tiebreak as the eviction sort"
+        );
     }
 
     #[test]
