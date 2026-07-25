@@ -20,7 +20,7 @@ use crate::node::OpManager;
 use crate::ring::PeerKeyLocation;
 use crate::transport::BroadcastDeliveryOutcome;
 
-use super::broadcast_payload_mix::PayloadArm;
+use super::broadcast_payload_mix::{GateSizes, PayloadArm};
 use super::p2p_protoc::P2pBridge;
 
 /// Timeout for awaiting stream completion signal before releasing the permit
@@ -854,7 +854,7 @@ pub(super) async fn broadcast_to_single_peer(
     // measurement could see that large states go out whole but not why. The
     // tag is carried to the real-delivery sites below and recorded there, so
     // the mix counts bytes that actually reached the wire.
-    let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
+    let (payload, sent_delta, payload_arm, gate_sizes) = match (&our_summary, &their_summary) {
         // Scoped to the both-summaries-present case ON PURPOSE. When a summary
         // is missing a delta was impossible regardless of the memo, so letting
         // the suppression guard win there would credit the memo for a full
@@ -868,6 +868,7 @@ pub(super) async fn broadcast_to_single_peer(
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
             PayloadArm::FullDeltaSuppressed,
+            None,
         ),
         (Some(ours), Some(theirs)) => {
             match op_manager
@@ -879,6 +880,7 @@ pub(super) async fn broadcast_to_single_peer(
                     DeltaOrFullState::Delta(delta.as_ref().to_vec()),
                     true,
                     PayloadArm::Delta,
+                    None,
                 ),
                 Ok(None) => {
                     // The contract computed an EMPTY delta against the peer's
@@ -910,18 +912,39 @@ pub(super) async fn broadcast_to_single_peer(
                     // means no contract code ran at all — the gate declined a
                     // delta because the peer's summary is >= 50 % of our state,
                     // and we then send the whole state, which is never smaller.
-                    let arm = match err {
-                        crate::ring::interest::DeltaUnavailable::NotEfficient { .. } => {
-                            PayloadArm::FullNotEfficient
-                        }
+                    //
+                    // Capture the gate's two INPUTS on the refusal arm (#4923).
+                    // The `debug!` above already renders them via
+                    // `DeltaUnavailable`'s Display, but `debug!` is compiled out
+                    // of release builds (`max_level_info`), so in production
+                    // they have never been observable — which is why the
+                    // measured `full_not_efficient` share cannot currently be
+                    // reconciled with the summary/state ratios the contracts
+                    // actually have. Carrying them to the delivery site (rather
+                    // than recording here) keeps the distribution gated on the
+                    // same real-delivery condition as the arm's own send and
+                    // byte counts, so the three always describe one set of
+                    // sends.
+                    let (arm, gate_sizes) = match err {
+                        crate::ring::interest::DeltaUnavailable::NotEfficient {
+                            summary_size,
+                            state_size,
+                        } => (
+                            PayloadArm::FullNotEfficient,
+                            Some(GateSizes {
+                                summary_size,
+                                state_size,
+                            }),
+                        ),
                         crate::ring::interest::DeltaUnavailable::ComputeFailed(_) => {
-                            PayloadArm::FullComputeFailed
+                            (PayloadArm::FullComputeFailed, None)
                         }
                     };
                     (
                         DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
                         false,
                         arm,
+                        gate_sizes,
                     )
                 }
             }
@@ -930,6 +953,7 @@ pub(super) async fn broadcast_to_single_peer(
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
             PayloadArm::FullNoSummary,
+            None,
         ),
     };
     let payload_size = payload.size();
@@ -1095,9 +1119,12 @@ pub(super) async fn broadcast_to_single_peer(
                     );
                     // Same delivery gate as the cost axis above, so the mix and
                     // the cost axis always agree on what "sent" means (#3335).
-                    op_manager
-                        .payload_mix
-                        .record_delivered(payload_arm, key.id(), payload_size);
+                    op_manager.payload_mix.record_delivered(
+                        payload_arm,
+                        key.id(),
+                        payload_size,
+                        gate_sizes,
+                    );
                     tracing::debug!(
                         tx = %update_tx,
                         peer = %peer_addr,
@@ -1141,9 +1168,12 @@ pub(super) async fn broadcast_to_single_peer(
             );
             // Same delivery gate as the cost axis above, so the mix and the
             // cost axis always agree on what "sent" means (#3335).
-            op_manager
-                .payload_mix
-                .record_delivered(payload_arm, key.id(), payload_size);
+            op_manager.payload_mix.record_delivered(
+                payload_arm,
+                key.id(),
+                payload_size,
+                gate_sizes,
+            );
             // Delta-incompat attribution (HQk7 resync loop): remember that we
             // just delivered a DELTA to this peer so a prompt `ResyncRequest`
             // from it can be attributed to the delta failing to apply (deltas
@@ -2166,13 +2196,19 @@ mod tests {
         // Anchor on the call, not the receiver: rustfmt splits
         // `op_manager.payload_mix.record_delivered(..)` across lines, so a
         // receiver-shaped needle would be whitespace-fragile.
-        let record_needle = concat!(".record_", "delivered(payload_arm, key.id(), payload_size)");
+        let record_needle = concat!(
+            ".record_",
+            "delivered(payload_arm, key.id(), payload_size, gate_sizes)"
+        );
         assert_eq!(
             body.matches(record_needle).count(),
             2,
             "payload mix must be recorded at exactly the two real-delivery \
              sites (streaming Delivered + inline send Ok) — recording up-front \
-             would count dropped/failed sends as bytes on the wire"
+             would count dropped/failed sends as bytes on the wire. The \
+             `gate_sizes` argument must ride along at BOTH (#4923): a site that \
+             drops it silently halves the efficiency-gate size distribution \
+             while every arm count stays correct, so nothing else would notice"
         );
         // ...and it must be THIS node's accumulator, never a process global:
         // several nodes share a process in the simulation harness and the
@@ -2202,6 +2238,72 @@ mod tests {
                 && body.contains("DeltaUnavailable::ComputeFailed"),
             "the delta-failure arm must keep the typed NotEfficient vs \
              ComputeFailed split — collapsing them re-blinds the measurement"
+        );
+    }
+
+    /// Source-scrape pin: the `NotEfficient` arm must destructure the gate's
+    /// two sizes and carry them to the delivery site (#4923).
+    ///
+    /// This is the one arm whose measured share cannot be reconciled with the
+    /// contracts' actual summary/state ratios, and the sizes that would explain
+    /// it are otherwise invisible: `DeltaUnavailable`'s `Display` renders them,
+    /// but its only consumer is a `tracing::debug!`, and `debug!` is compiled
+    /// out of release builds. A refactor that goes back to matching with `..`
+    /// would restore that blindness while every arm count stayed correct, so
+    /// no behavioral test would notice.
+    #[test]
+    fn not_efficient_arm_captures_the_gate_sizes_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer not found");
+        let body = &after[..fn_end];
+
+        // The arm must BIND the sizes, not discard them with `..`.
+        let arm_start = body
+            .find("DeltaUnavailable::NotEfficient")
+            .expect("NotEfficient arm not found");
+        let arm = &body[arm_start..];
+        let arm_end = arm
+            .find("ComputeFailed")
+            .expect("the two delta-failure arms must stay adjacent");
+        let arm = &arm[..arm_end];
+        assert!(
+            arm.contains("summary_size") && arm.contains("state_size"),
+            "the NotEfficient arm must destructure `summary_size` and \
+             `state_size` — matching with `..` discards the only evidence of \
+             what the gate actually weighed, which is the whole point of #4923"
+        );
+        assert!(
+            !arm.contains(".."),
+            "the NotEfficient arm must not use `..` — that is exactly the \
+             pattern that threw the sizes away before #4923"
+        );
+
+        // They must reach the recorder as a `GateSizes`, bound once.
+        assert_eq!(
+            body.matches(concat!("Some(", "GateSizes {")).count(),
+            1,
+            "the gate sizes must be wrapped exactly once, on the NotEfficient \
+             arm — a second construction site means some other arm is \
+             contributing sizes the gate never weighed"
+        );
+        let bind = body
+            .find("gate_sizes")
+            .expect("the fan-out must carry the gate sizes to the delivery site");
+        let record = body
+            .find(concat!(".record_", "delivered("))
+            .expect("payload mix record site not found");
+        assert!(
+            bind < record,
+            "the gate sizes must be captured at the refusal and carried to the \
+             delivery site, so the size distribution is gated on the same real \
+             delivery as the arm's send and byte counts"
         );
     }
 }

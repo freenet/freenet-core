@@ -164,6 +164,9 @@ struct Window {
     /// an 11-contract window look perfectly reconciled while 10 % of its bytes
     /// were unaccounted for.
     attribution_dropped_bytes: u64,
+    /// Distribution of the efficiency gate's two INPUTS on the refusals it
+    /// caused. See [`NotEfficientSizes`].
+    not_efficient: NotEfficientSizes,
 }
 
 impl Default for Window {
@@ -174,6 +177,103 @@ impl Default for Window {
             contract_full_state_bytes: HashMap::new(),
             attribution_dropped_sends: 0,
             attribution_dropped_bytes: 0,
+            not_efficient: NotEfficientSizes::default(),
+        }
+    }
+}
+
+/// The two sizes [`is_delta_efficient`][ide] compared when it refused to
+/// compute a delta.
+///
+/// [ide]: crate::ring::interest::is_delta_efficient
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GateSizes {
+    /// `their_summary.as_ref().len()` — the cached summary for the TARGET peer.
+    pub summary_size: usize,
+    /// The `our_state_size` argument the fan-out passed to `compute_delta`.
+    pub state_size: usize,
+}
+
+/// Aggregated gate inputs across one window's `FullNotEfficient` refusals.
+///
+/// ## Why this exists
+///
+/// The gate is `summary * 2 < state`, so it refuses when the summary is >= 50 %
+/// of the state. The 2026-07-25 measurement found `full_not_efficient` at 38 %
+/// of fleet wire bytes and 83 % of the River room's — against a room whose
+/// summary measures 33,804 B on a 251,887 B state (13.4 %), well under the
+/// threshold, and structurally so: the per-message marginal is +67 B of summary
+/// per +521 B of state, so growth moves the ratio further from the threshold,
+/// not toward it. No reachable state of that contract should trip this gate,
+/// yet the gate is where its bytes are attributed.
+///
+/// So the gate's inputs are not what anyone assumes, and this records what they
+/// actually were. `DeltaUnavailable::NotEfficient` has always carried both
+/// sizes and renders them in its `Display`, but its only consumer is a
+/// `tracing::debug!`, and `debug!` is compiled out of release builds
+/// (`max_level_info`) — which is exactly why there are zero occurrences of it
+/// in production telemetry.
+///
+/// ## Why min and max, not just a mean
+///
+/// A mean cannot separate the candidate explanations; the extremes can:
+///
+/// * `summary_min == summary_max` at some fixed value suggests a defaulted or
+///   empty summary being sized wrong, not a real one.
+/// * A `summary_max` far above any reachable summary suggests a stale or
+///   wrong-peer summary in the cache.
+/// * A `state_min` at or near zero implicates [`is_delta_efficient`][ide]'s
+///   explicit `state_size == 0` early return, which also lands on this arm even
+///   though "summary >= 50 % of state" is not the reason —
+///   [`zero_state_samples`](Self::zero_state_samples) counts that case outright.
+/// * Sizes consistent with the measured 13.4 % ratio would mean the gate is NOT
+///   refusing on these inputs and the arm is mis-attributed at the
+///   classification site instead.
+///
+/// Fixed cardinality: eight scalars per window, keyed by nothing. This is
+/// per-send data feeding a per-node rollup, so anything keyed by contract or
+/// peer would be an amplification vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NotEfficientSizes {
+    /// Refusals recorded this window. Zero means the other fields are
+    /// meaningless and they are published as `null`.
+    samples: u64,
+    summary_sum: u64,
+    summary_min: u64,
+    summary_max: u64,
+    state_sum: u64,
+    state_min: u64,
+    state_max: u64,
+    /// Refusals where `state_size == 0`, i.e. the gate's explicit zero-state
+    /// early return rather than the ratio test. Counted separately because the
+    /// two have completely different causes and the ratio cannot distinguish
+    /// them (anything over zero state is ">= 50 %").
+    zero_state_samples: u64,
+}
+
+impl NotEfficientSizes {
+    fn record(&mut self, sizes: GateSizes) {
+        let summary = sizes.summary_size as u64;
+        let state = sizes.state_size as u64;
+        if self.samples == 0 {
+            // First sample seeds both extremes; seeding min at 0 instead would
+            // pin it there forever and report a zero-byte summary that never
+            // happened.
+            self.summary_min = summary;
+            self.summary_max = summary;
+            self.state_min = state;
+            self.state_max = state;
+        } else {
+            self.summary_min = self.summary_min.min(summary);
+            self.summary_max = self.summary_max.max(summary);
+            self.state_min = self.state_min.min(state);
+            self.state_max = self.state_max.max(state);
+        }
+        self.samples = self.samples.saturating_add(1);
+        self.summary_sum = self.summary_sum.saturating_add(summary);
+        self.state_sum = self.state_sum.saturating_add(state);
+        if state == 0 {
+            self.zero_state_samples = self.zero_state_samples.saturating_add(1);
         }
     }
 }
@@ -238,11 +338,20 @@ impl PayloadMix {
     /// charged, so the mix and the cost axis agree on what "sent" means.
     ///
     /// [rt]: crate::topology::meter::ResourceType::BroadcastFanoutCost
+    /// `gate_sizes` carries the two inputs [`is_delta_efficient`][ide] weighed
+    /// when it refused, and is `Some` only for
+    /// [`PayloadArm::FullNotEfficient`] — the arm those inputs explain. Sizes
+    /// arriving with any other arm are ignored rather than folded in, so a
+    /// mis-wired call site cannot quietly contaminate the distribution that
+    /// exists to explain this one arm.
+    ///
+    /// [ide]: crate::ring::interest::is_delta_efficient
     pub(crate) fn record_delivered(
         &self,
         arm: PayloadArm,
         contract: &ContractInstanceId,
         payload_bytes: usize,
+        gate_sizes: Option<GateSizes>,
     ) {
         let bytes = payload_bytes as u64;
         let idx = arm.index();
@@ -252,6 +361,11 @@ impl PayloadMix {
         // what this measurement is for.
         w.sends[idx] = w.sends[idx].saturating_add(1);
         w.bytes[idx] = w.bytes[idx].saturating_add(bytes);
+        if arm == PayloadArm::FullNotEfficient {
+            if let Some(sizes) = gate_sizes {
+                w.not_efficient.record(sizes);
+            }
+        }
         if arm.is_full_state() {
             if let Some(tally) = w.contract_full_state_bytes.get_mut(contract) {
                 *tally = tally.saturating_add(bytes);
@@ -308,6 +422,7 @@ impl Window {
 ///
 /// Pure so the schema is unit-testable without the telemetry sender, matching
 /// the `shadow_demand` rollup builders.
+#[allow(clippy::too_many_arguments)]
 fn payload_mix_json(
     arms: &[(PayloadArm, u64, u64)],
     contracts: &[(ContractInstanceId, u64)],
@@ -315,6 +430,7 @@ fn payload_mix_json(
     contracts_tracked: u64,
     attribution_dropped_sends: u64,
     attribution_dropped_bytes: u64,
+    not_efficient: NotEfficientSizes,
     window_secs: u64,
 ) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
@@ -385,6 +501,68 @@ fn payload_mix_json(
         "attribution_dropped_bytes".into(),
         attribution_dropped_bytes.into(),
     );
+    // The efficiency gate's own inputs on the refusals it caused (#4923).
+    // `full_not_efficient_sends` above says HOW MANY times the gate refused;
+    // these say WHAT IT SAW, which is the part that is currently invisible in
+    // release builds. See `NotEfficientSizes` for why min/max are published
+    // and not just a mean.
+    //
+    // With no samples every derived field is `null` rather than 0: a zero
+    // minimum summary is a specific and alarming claim ("the gate saw an empty
+    // summary"), and publishing it for an idle window would manufacture exactly
+    // the finding this instrumentation exists to test for.
+    obj.insert("not_efficient_samples".into(), not_efficient.samples.into());
+    obj.insert(
+        "not_efficient_zero_state_sends".into(),
+        not_efficient.zero_state_samples.into(),
+    );
+    let mean = |sum: u64| -> serde_json::Value {
+        if not_efficient.samples == 0 {
+            return serde_json::Value::Null;
+        }
+        serde_json::Number::from_f64(sum as f64 / not_efficient.samples as f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let extreme = |v: u64| -> serde_json::Value {
+        if not_efficient.samples == 0 {
+            serde_json::Value::Null
+        } else {
+            v.into()
+        }
+    };
+    obj.insert(
+        "not_efficient_summary_bytes_sum".into(),
+        not_efficient.summary_sum.into(),
+    );
+    obj.insert(
+        "not_efficient_summary_bytes_mean".into(),
+        mean(not_efficient.summary_sum),
+    );
+    obj.insert(
+        "not_efficient_summary_bytes_min".into(),
+        extreme(not_efficient.summary_min),
+    );
+    obj.insert(
+        "not_efficient_summary_bytes_max".into(),
+        extreme(not_efficient.summary_max),
+    );
+    obj.insert(
+        "not_efficient_state_bytes_sum".into(),
+        not_efficient.state_sum.into(),
+    );
+    obj.insert(
+        "not_efficient_state_bytes_mean".into(),
+        mean(not_efficient.state_sum),
+    );
+    obj.insert(
+        "not_efficient_state_bytes_min".into(),
+        extreme(not_efficient.state_min),
+    );
+    obj.insert(
+        "not_efficient_state_bytes_max".into(),
+        extreme(not_efficient.state_max),
+    );
     obj.insert("window_secs".into(), window_secs.into());
     serde_json::Value::Object(obj)
 }
@@ -408,6 +586,7 @@ pub(crate) fn emit_payload_mix_rollup(
         window.contract_full_state_bytes.len() as u64,
         window.attribution_dropped_sends,
         window.attribution_dropped_bytes,
+        window.not_efficient,
         window_secs,
     );
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
@@ -476,7 +655,7 @@ mod tests {
     #[test]
     fn take_window_resets_the_window() {
         let mix = PayloadMix::new();
-        mix.record_delivered(PayloadArm::Delta, &contract(1), 100);
+        mix.record_delivered(PayloadArm::Delta, &contract(1), 100, None);
         let first = mix.take_window().arms();
         assert_eq!(first[PayloadArm::Delta.index()].1, 1);
         assert_eq!(first[PayloadArm::Delta.index()].2, 100);
@@ -497,7 +676,7 @@ mod tests {
         let mix = PayloadMix::new();
         for (i, arm) in PayloadArm::ALL.iter().enumerate() {
             for _ in 0..=i {
-                mix.record_delivered(*arm, &contract(i as u8), 10);
+                mix.record_delivered(*arm, &contract(i as u8), 10, None);
             }
         }
         let drained = mix.take_window().arms();
@@ -521,10 +700,10 @@ mod tests {
     #[test]
     fn per_contract_tallies_reconcile_with_arm_totals() {
         let mix = PayloadMix::new();
-        mix.record_delivered(PayloadArm::FullNotEfficient, &contract(1), 500);
-        mix.record_delivered(PayloadArm::FullNoSummary, &contract(2), 300);
-        mix.record_delivered(PayloadArm::FullDeltaSuppressed, &contract(1), 200);
-        mix.record_delivered(PayloadArm::Delta, &contract(3), 50); // not full state
+        mix.record_delivered(PayloadArm::FullNotEfficient, &contract(1), 500, None);
+        mix.record_delivered(PayloadArm::FullNoSummary, &contract(2), 300, None);
+        mix.record_delivered(PayloadArm::FullDeltaSuppressed, &contract(1), 200, None);
+        mix.record_delivered(PayloadArm::Delta, &contract(3), 50, None); // not full state
 
         let window = mix.take_window();
         let full_state_total: u64 = window
@@ -560,6 +739,7 @@ mod tests {
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
             window.attribution_dropped_bytes,
+            NotEfficientSizes::default(),
             60,
         );
         let top_sum: u64 = json["top_contracts_by_full_state_bytes"]
@@ -591,7 +771,7 @@ mod tests {
     fn window_with_more_contracts_than_top_n_still_reconciles() {
         let mix = PayloadMix::new();
         for i in 0..(TOP_CONTRACTS_REPORTED + 1) {
-            mix.record_delivered(PayloadArm::FullNotEfficient, &contract(i as u8), 100);
+            mix.record_delivered(PayloadArm::FullNotEfficient, &contract(i as u8), 100, None);
         }
         let window = mix.take_window();
         assert_reconciles(&window);
@@ -603,6 +783,7 @@ mod tests {
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
             window.attribution_dropped_bytes,
+            NotEfficientSizes::default(),
             60,
         );
         assert_eq!(json["full_state_bytes"], 1100);
@@ -628,7 +809,12 @@ mod tests {
             let mut raw = [0u8; 32];
             raw[0] = (i % 256) as u8;
             raw[1] = (i / 256) as u8;
-            mix.record_delivered(PayloadArm::FullNoSummary, &ContractInstanceId::new(raw), 10);
+            mix.record_delivered(
+                PayloadArm::FullNoSummary,
+                &ContractInstanceId::new(raw),
+                10,
+                None,
+            );
         }
         let window = mix.take_window();
         assert!(
@@ -679,7 +865,12 @@ mod tests {
                 let mix = Arc::clone(&mix);
                 std::thread::spawn(move || {
                     for _ in 0..PER_THREAD {
-                        mix.record_delivered(PayloadArm::FullNotEfficient, &contract(t as u8), 7);
+                        mix.record_delivered(
+                            PayloadArm::FullNotEfficient,
+                            &contract(t as u8),
+                            7,
+                            None,
+                        );
                     }
                 })
             })
@@ -711,7 +902,7 @@ mod tests {
             (PayloadArm::FullComputeFailed, 0, 0),
             (PayloadArm::FullNoSummary, 0, 0),
         ];
-        let json = payload_mix_json(&arms, &[], 0, 0, 0, 0, 60);
+        let json = payload_mix_json(&arms, &[], 0, 0, 0, 0, NotEfficientSizes::default(), 60);
         assert_eq!(json["total_bytes"], 1000);
         assert_eq!(json["full_state_bytes"], 700);
         assert_eq!(json["full_state_byte_share"], 0.7);
@@ -724,7 +915,7 @@ mod tests {
     #[test]
     fn empty_window_reports_zero_share_not_nan() {
         let arms: Vec<_> = PayloadArm::ALL.iter().map(|a| (*a, 0, 0)).collect();
-        let json = payload_mix_json(&arms, &[], 0, 0, 0, 0, 60);
+        let json = payload_mix_json(&arms, &[], 0, 0, 0, 0, NotEfficientSizes::default(), 60);
         assert_eq!(json["full_state_byte_share"], 0.0);
         assert_eq!(json["total_bytes"], 0);
     }
@@ -750,6 +941,7 @@ mod tests {
                 PayloadArm::FullNotEfficient,
                 &ContractInstanceId::new(raw),
                 5,
+                None,
             );
         }
         let window = mix.take_window();
@@ -788,6 +980,7 @@ mod tests {
                 PayloadArm::FullNotEfficient,
                 &ContractInstanceId::new(raw),
                 1,
+                None,
             );
         }
         // A single additional contract, broadcasting many times.
@@ -795,7 +988,7 @@ mod tests {
         raw[31] = 7;
         let over_cap = ContractInstanceId::new(raw);
         for _ in 0..1000 {
-            mix.record_delivered(PayloadArm::FullNotEfficient, &over_cap, 3);
+            mix.record_delivered(PayloadArm::FullNotEfficient, &over_cap, 3, None);
         }
         let window = mix.take_window();
         assert_eq!(window.attribution_dropped_sends, 1000);
@@ -808,9 +1001,9 @@ mod tests {
     #[test]
     fn top_contracts_sort_is_deterministic() {
         let mix = PayloadMix::new();
-        mix.record_delivered(PayloadArm::FullNoSummary, &contract(9), 100);
-        mix.record_delivered(PayloadArm::FullNoSummary, &contract(2), 100);
-        mix.record_delivered(PayloadArm::FullNoSummary, &contract(5), 500);
+        mix.record_delivered(PayloadArm::FullNoSummary, &contract(9), 100, None);
+        mix.record_delivered(PayloadArm::FullNoSummary, &contract(2), 100, None);
+        mix.record_delivered(PayloadArm::FullNoSummary, &contract(5), 500, None);
         let top = mix.take_window().top_contracts();
         assert_eq!(top[0].0, contract(5), "largest first");
         assert_eq!(top[1].0, contract(2), "tie broken by contract id");
@@ -821,7 +1014,7 @@ mod tests {
     #[test]
     fn delta_sends_are_not_attributed_as_full_state() {
         let mix = PayloadMix::new();
-        mix.record_delivered(PayloadArm::Delta, &contract(7), 1234);
+        mix.record_delivered(PayloadArm::Delta, &contract(7), 1234, None);
         let window = mix.take_window();
         assert!(
             window.contract_full_state_bytes.is_empty(),
@@ -864,7 +1057,7 @@ mod tests {
     fn every_full_state_arm_attributes_to_its_contract() {
         for arm in PayloadArm::ALL.iter().filter(|a| a.is_full_state()) {
             let mix = PayloadMix::new();
-            mix.record_delivered(*arm, &contract(3), 99);
+            mix.record_delivered(*arm, &contract(3), 99, None);
             let top = mix.take_window().top_contracts();
             assert_eq!(
                 top,
@@ -872,5 +1065,181 @@ mod tests {
                 "{arm:?} must attribute its full-state bytes to the contract"
             );
         }
+    }
+
+    // ---- Efficiency-gate input distribution (#4923) ----
+
+    fn sizes(summary: usize, state: usize) -> GateSizes {
+        GateSizes {
+            summary_size: summary,
+            state_size: state,
+        }
+    }
+
+    fn json_of(mix: &PayloadMix) -> serde_json::Value {
+        let w = mix.take_window();
+        payload_mix_json(
+            &w.arms(),
+            &w.top_contracts(),
+            w.contract_full_state_bytes.values().sum(),
+            w.contract_full_state_bytes.len() as u64,
+            w.attribution_dropped_sends,
+            w.attribution_dropped_bytes,
+            w.not_efficient,
+            60,
+        )
+    }
+
+    /// The headline case: the gate's inputs reach the emitted event. Without
+    /// this the arm reports only how OFTEN it refused, never what it saw —
+    /// which is the state this change exists to end.
+    #[test]
+    fn not_efficient_gate_inputs_reach_the_rollup() {
+        let mix = PayloadMix::new();
+        mix.record_delivered(
+            PayloadArm::FullNotEfficient,
+            &contract(1),
+            254_000,
+            Some(sizes(33_804, 251_887)),
+        );
+        let json = json_of(&mix);
+        assert_eq!(json["not_efficient_samples"], 1);
+        assert_eq!(json["not_efficient_summary_bytes_sum"], 33_804);
+        assert_eq!(json["not_efficient_summary_bytes_min"], 33_804);
+        assert_eq!(json["not_efficient_summary_bytes_max"], 33_804);
+        assert_eq!(json["not_efficient_state_bytes_sum"], 251_887);
+        assert_eq!(json["not_efficient_state_bytes_min"], 251_887);
+        assert_eq!(json["not_efficient_state_bytes_max"], 251_887);
+        assert_eq!(json["not_efficient_summary_bytes_mean"], 33_804.0);
+        assert_eq!(json["not_efficient_state_bytes_mean"], 251_887.0);
+        assert_eq!(json["not_efficient_zero_state_sends"], 0);
+    }
+
+    /// Min and max are the whole point: a mean alone cannot separate "one
+    /// enormous stale summary" from "every summary is enormous", and those are
+    /// different bugs. Feed a deliberately bimodal window and check the
+    /// extremes survive rather than being averaged away.
+    #[test]
+    fn bimodal_gate_inputs_keep_their_extremes() {
+        let mix = PayloadMix::new();
+        for s in [1_000usize, 127_000, 2_000] {
+            mix.record_delivered(
+                PayloadArm::FullNotEfficient,
+                &contract(1),
+                10,
+                Some(sizes(s, 250_000)),
+            );
+        }
+        let json = json_of(&mix);
+        assert_eq!(json["not_efficient_samples"], 3);
+        assert_eq!(json["not_efficient_summary_bytes_min"], 1_000);
+        assert_eq!(
+            json["not_efficient_summary_bytes_max"], 127_000,
+            "the outlier summary must survive the rollup — averaging it away \
+             would hide the single most diagnostic observation"
+        );
+        assert_eq!(json["not_efficient_summary_bytes_sum"], 130_000);
+    }
+
+    /// `is_delta_efficient` returns false when `state_size == 0`, and that
+    /// refusal lands on this arm even though "summary >= 50 % of state" is not
+    /// the reason. The ratio cannot distinguish it (anything over zero state is
+    /// >= 50 %), so it is counted outright.
+    #[test]
+    fn zero_state_refusals_are_counted_separately() {
+        let mix = PayloadMix::new();
+        mix.record_delivered(
+            PayloadArm::FullNotEfficient,
+            &contract(1),
+            0,
+            Some(sizes(4_096, 0)),
+        );
+        mix.record_delivered(
+            PayloadArm::FullNotEfficient,
+            &contract(1),
+            10,
+            Some(sizes(4_096, 5_000)),
+        );
+        let json = json_of(&mix);
+        assert_eq!(json["not_efficient_samples"], 2);
+        assert_eq!(
+            json["not_efficient_zero_state_sends"], 1,
+            "a zero-state refusal has a different cause than a ratio refusal \
+             and must be countable on its own"
+        );
+        assert_eq!(json["not_efficient_state_bytes_min"], 0);
+    }
+
+    /// An idle window must publish `null`, not `0`. A zero minimum summary is a
+    /// specific and alarming claim — "the gate saw an empty summary" — and
+    /// emitting it for a window with no refusals would manufacture the very
+    /// finding this instrumentation exists to test for.
+    #[test]
+    fn window_with_no_refusals_publishes_null_not_zero() {
+        let mix = PayloadMix::new();
+        mix.record_delivered(PayloadArm::Delta, &contract(1), 100, None);
+        let json = json_of(&mix);
+        assert_eq!(json["not_efficient_samples"], 0);
+        for field in [
+            "not_efficient_summary_bytes_min",
+            "not_efficient_summary_bytes_max",
+            "not_efficient_summary_bytes_mean",
+            "not_efficient_state_bytes_min",
+            "not_efficient_state_bytes_max",
+            "not_efficient_state_bytes_mean",
+        ] {
+            assert!(
+                json[field].is_null(),
+                "{field} must be null with no samples, not a fabricated 0"
+            );
+        }
+    }
+
+    /// The sizes explain the `FullNotEfficient` arm and only that arm. A
+    /// mis-wired call site that attached them to another arm would silently
+    /// contaminate the distribution with sizes the gate never weighed.
+    #[test]
+    fn gate_sizes_are_ignored_for_other_arms() {
+        for arm in PayloadArm::ALL
+            .iter()
+            .filter(|a| **a != PayloadArm::FullNotEfficient)
+        {
+            let mix = PayloadMix::new();
+            mix.record_delivered(*arm, &contract(1), 10, Some(sizes(9_999, 10_000)));
+            let json = json_of(&mix);
+            assert_eq!(
+                json["not_efficient_samples"], 0,
+                "{arm:?} must not contribute to the efficiency-gate distribution"
+            );
+        }
+    }
+
+    /// A window is drained on emit, so a later window must not inherit the
+    /// previous one's extremes — that would smear one node's outlier across
+    /// every subsequent minute.
+    #[test]
+    fn gate_input_distribution_resets_between_windows() {
+        let mix = PayloadMix::new();
+        mix.record_delivered(
+            PayloadArm::FullNotEfficient,
+            &contract(1),
+            10,
+            Some(sizes(127_000, 250_000)),
+        );
+        let first = json_of(&mix);
+        assert_eq!(first["not_efficient_summary_bytes_max"], 127_000);
+
+        mix.record_delivered(
+            PayloadArm::FullNotEfficient,
+            &contract(1),
+            10,
+            Some(sizes(1_000, 250_000)),
+        );
+        let second = json_of(&mix);
+        assert_eq!(second["not_efficient_samples"], 1);
+        assert_eq!(
+            second["not_efficient_summary_bytes_max"], 1_000,
+            "the previous window's outlier must not carry over"
+        );
     }
 }
