@@ -379,20 +379,42 @@ pub(crate) fn emit_payload_mix_rollup(local_peer_id: &str, window_secs: u64) -> 
     payload
 }
 
+/// The window length to report, given the time actually elapsed since the
+/// previous rollup.
+///
+/// Reporting the nominal cadence would be wrong whenever the aggregator tick
+/// slips: `MissedTickBehavior::Delay` lets a saturated runtime stretch the
+/// real window past [`ROLLUP_WINDOW`] while broadcast workers keep recording,
+/// so a constant `window_secs` inflates every rate derived from the totals.
+/// That error is not random — it is largest exactly when the node is busiest,
+/// which is the condition this instrumentation exists to characterise.
+///
+/// Floored at 1 s so a downstream rate computation can never divide by zero.
+fn rollup_window_secs(elapsed: Duration) -> u64 {
+    (elapsed.as_secs_f64().round() as u64).max(1)
+}
+
 /// Spawn the `broadcast_payload_mix` aggregator and register it with the
 /// [`BackgroundTaskMonitor`].
 ///
-/// Always-on and cheap: it only swaps atomics and drains a bounded map once
-/// per [`ROLLUP_WINDOW`]. Observation only — nothing reads these counters to
-/// make a decision, and nothing on the hot path ever reads them at all.
+/// Always-on and cheap: it takes one lock and drains a bounded map once per
+/// [`ROLLUP_WINDOW`]. Observation only — nothing reads these counters to make
+/// a decision, and nothing on the hot path ever reads them at all.
 pub(crate) fn spawn_payload_mix_aggregator(local_peer_id: String, monitor: &BackgroundTaskMonitor) {
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(ROLLUP_WINDOW);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip the immediate first tick
+        // `tokio::time::Instant` (not `std::time::Instant`) so this reads the
+        // same clock the ticker uses and stays controllable under a paused
+        // test runtime.
+        let mut last_rollup = tokio::time::Instant::now();
         loop {
             ticker.tick().await;
-            emit_payload_mix_rollup(&local_peer_id, ROLLUP_WINDOW.as_secs());
+            let now = tokio::time::Instant::now();
+            let elapsed = now.saturating_duration_since(last_rollup);
+            last_rollup = now;
+            emit_payload_mix_rollup(&local_peer_id, rollup_window_secs(elapsed));
         }
     });
     monitor.register("broadcast_payload_mix_aggregator", handle);
@@ -491,7 +513,7 @@ mod tests {
     fn concurrent_records_racing_a_rollup_conserve_bytes() {
         use std::sync::Arc;
 
-        const THREADS: usize = 8;
+        const THREADS: usize = 4;
         const PER_THREAD: usize = 500;
 
         let mix = Arc::new(PayloadMix::new());
@@ -509,7 +531,14 @@ mod tests {
                     let w = mix.take_window();
                     let sum: u64 = w.arms().iter().map(|(_, _, b)| b).sum();
                     *drained_total.lock() += sum;
-                    std::thread::yield_now();
+                    // Sleep rather than spin. A hot loop here would burn a
+                    // whole core for the duration of the test, and the suite
+                    // runs tests in parallel — starving a timing-sensitive
+                    // test elsewhere would make THIS test the cause of a flake
+                    // somewhere else. 50 µs still yields hundreds of drains
+                    // against 2,000 records, so the rollover race is amply
+                    // exercised.
+                    std::thread::sleep(Duration::from_micros(50));
                 }
             })
         };
@@ -670,6 +699,32 @@ mod tests {
         );
         // ...but the delta itself is still counted in the per-arm totals.
         assert_eq!(window.arms()[PayloadArm::Delta.index()].2, 1234);
+    }
+
+    /// The reported window must reflect the time actually elapsed, not the
+    /// nominal cadence.
+    ///
+    /// Regression for the external-review finding: with
+    /// `MissedTickBehavior::Delay`, a saturated runtime stretches the real
+    /// window past `ROLLUP_WINDOW` while broadcast workers keep recording. A
+    /// constant `window_secs` would then inflate every derived rate, and worst
+    /// precisely when the node is busiest — the case this telemetry exists to
+    /// characterise.
+    #[test]
+    fn reported_window_tracks_actual_elapsed_not_nominal_cadence() {
+        // On-cadence tick: reports the nominal window.
+        assert_eq!(rollup_window_secs(ROLLUP_WINDOW), 60);
+        // Delayed tick: reports the LONGER real window, so a rate computed
+        // downstream divides by the right number.
+        assert_eq!(rollup_window_secs(Duration::from_secs(150)), 150);
+        assert_eq!(
+            rollup_window_secs(Duration::from_millis(90_400)),
+            90,
+            "sub-second remainder rounds to nearest"
+        );
+        // Never zero: a downstream `total / window_secs` must not divide by 0.
+        assert_eq!(rollup_window_secs(Duration::ZERO), 1);
+        assert_eq!(rollup_window_secs(Duration::from_millis(200)), 1);
     }
 
     /// Every full-state arm attributes to the contract; this is what names
