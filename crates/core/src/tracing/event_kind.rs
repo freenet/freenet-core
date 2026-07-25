@@ -212,6 +212,31 @@ impl EventKind {
         )
     }
 
+    /// Returns one fan-out's delta-vs-full-state split for `BroadcastComplete`
+    /// events: `(delta_sends, full_state_sends, bytes_saved, state_size)`.
+    ///
+    /// `state_size` is the FULL post-apply state, not the wire payload;
+    /// `state_size * (delta_sends + full_state_sends) - bytes_saved` is the real
+    /// payload total the fan-out put on the wire. Accessor rather than a public
+    /// `UpdateEvent` because the enum is `pub(crate)`, matching
+    /// [`router_snapshot_summary`](Self::router_snapshot_summary).
+    pub fn broadcast_complete_summary(&self) -> Option<(usize, usize, u64, usize)> {
+        // `if let` rather than a `match` with a catch-all: this crate bans
+        // wildcard enum arms (`.claude/rules/code-style.md`) precisely so a new
+        // variant cannot be silently swallowed by a telemetry classifier.
+        let EventKind::Update(UpdateEvent::BroadcastComplete {
+            delta_sends,
+            full_state_sends,
+            bytes_saved,
+            state_size,
+            ..
+        }) = self
+        else {
+            return None;
+        };
+        Some((*delta_sends, *full_state_sends, *bytes_saved, *state_size))
+    }
+
     /// Returns router snapshot summary data for `RouterSnapshot` events.
     ///
     /// Returns `(failure_events, success_events, prediction_active)`.

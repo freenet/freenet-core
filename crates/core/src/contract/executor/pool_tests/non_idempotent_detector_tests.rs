@@ -213,8 +213,13 @@ fn egress_paths_gated_on_is_contract_broken() {
     let heal_gate = body
         .find("is_contract_broken")
         .expect("handle_sync_state_to_peer must gate on is_contract_broken");
+    // Anchor on the call, not the receiver: rustfmt splits
+    // `self.broadcast_queue.enqueue(..)` across lines once the argument list
+    // grows, so a receiver-shaped needle silently stops matching and this pin
+    // fails for a formatting reason rather than a real one. Same precedent as
+    // the `record_delivered` needle in broadcast_queue.rs.
     let heal_send = body
-        .find("broadcast_queue.enqueue")
+        .find(".enqueue(")
         .expect("handle_sync_state_to_peer must still enqueue the heal send");
     assert!(
         heal_gate < heal_send,

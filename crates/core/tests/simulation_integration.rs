@@ -4770,6 +4770,25 @@ fn test_subscription_broadcast_propagation() {
         broadcast_emitted_count
     );
 
+    // An emitted-but-empty event is the failure an event count alone cannot see:
+    // the wiring fires, the JSON is well-formed, every arm reads zero, and the
+    // delta-vs-full-state question is no better answered than before. These peers
+    // demonstrably converged on the same state above, so at least one fan-out must
+    // have recorded a real send.
+    let recorded_sends: usize = broadcast_complete
+        .iter()
+        .filter_map(|log| log.kind.broadcast_complete_summary())
+        .map(|(delta_sends, full_state_sends, _, _)| delta_sends + full_state_sends)
+        .sum();
+    assert!(
+        recorded_sends > 0,
+        "All {} BroadcastComplete events reported zero sends. The peers converged, \
+         so payloads did reach the wire — a zero total means the per-fan-out tally \
+         is no longer being written where the delta/full-state choice is made, so \
+         the event carries no information.",
+        broadcast_complete.len()
+    );
+
     tracing::info!(
         "test_subscription_broadcast_propagation PASSED: {} peers converged to same state, \
          {} BroadcastEmitted events",
