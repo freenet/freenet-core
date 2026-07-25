@@ -35,11 +35,13 @@ use super::{
 ///     sandboxed iframe.
 ///
 /// `worker-src 'self'` allows the shell to register the same-origin
-/// notification service worker (`/freenet-notify-sw.js`). Without it the
-/// registration falls back through `child-src` to `script-src 'unsafe-inline'`,
-/// which does not permit a script URL, so `navigator.serviceWorker.register`
-/// is blocked and notifications can never show on mobile (where the page-level
-/// `Notification` constructor is unsupported).
+/// notification service worker (`/freenet-notify-sw.js`). Without an explicit
+/// `worker-src`, the worker source falls back through `child-src` to
+/// `default-src 'none'` (older browsers fell back to `script-src` instead) —
+/// none of which permit the `/freenet-notify-sw.js` script URL, so
+/// `navigator.serviceWorker.register` is CSP-blocked and notifications can
+/// never show on mobile (where the page-level `Notification` constructor is
+/// unsupported).
 const SHELL_PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src 'self' ws: wss:; worker-src 'self'";
 
 /// The notification service worker, served at `/freenet-notify-sw.js`. See the
@@ -230,7 +232,7 @@ impl HttpClientApi {
             // Notification service worker, served at the origin root so its
             // default scope (`/`) covers every contract shell page. The shell
             // registers it to show notifications via showNotification() — the
-            // only path that works on mobile browsers (#see notify_sw.js).
+            // only path that works on mobile browsers (see notify_sw.js).
             .route(
                 "/freenet-notify-sw.js",
                 axum::routing::get(notify_service_worker),
@@ -318,6 +320,14 @@ async fn notify_service_worker() -> impl IntoResponse {
             // navigation regardless of this header.
             (axum::http::header::CACHE_CONTROL, "max-age=3600"),
             (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            // Defense-in-depth: the worker makes NO network requests (no fetch,
+            // no importScripts), so lock its own execution context to nothing.
+            // showNotification()/clients/postMessage are JS API calls, not
+            // CSP-governed resource loads, so this does not affect it.
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'",
+            ),
         ],
         NOTIFY_SW_JS,
     )
@@ -1028,12 +1038,28 @@ mod tests {
             src.contains("__freenet_notify_click__"),
             "worker must post clicks back to the shell for iframe routing"
         );
-        // A fetch handler would make this worker intercept every request on the
-        // origin. Its ABSENCE is a hard invariant — the worker exists only to
-        // own showNotification() and click routing.
+        // A fetch handler would make this root-scoped worker intercept every
+        // request on the origin. Its ABSENCE is a hard invariant — the worker
+        // exists only to own showNotification() and click routing. Catch every
+        // form: addEventListener('fetch'/"fetch") AND self.onfetch. Also forbid
+        // importScripts, so it stays a self-contained, no-network worker.
         assert!(
-            !src.contains("'fetch'") && !src.contains("\"fetch\""),
-            "worker must NOT register a fetch handler (it must not intercept requests)"
+            !src.contains("'fetch'")
+                && !src.contains("\"fetch\"")
+                && !src.contains("onfetch")
+                && !src.contains("importScripts"),
+            "worker must NOT register a fetch handler in any form, nor importScripts (it must not intercept or make requests)"
+        );
+        // Click routing reads the tag + originating URL from notification data
+        // and routes only to the originating contract's window. Pin the read
+        // side of the shell<->worker contract and the per-contract routing.
+        assert!(
+            src.contains("data.fnTag") && src.contains("data.fnUrl"),
+            "worker must read the routing tag and originating URL from notification data"
+        );
+        assert!(
+            src.contains("pickNotifyClient"),
+            "worker must route the click only to the originating contract's window"
         );
     }
 

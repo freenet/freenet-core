@@ -3522,6 +3522,27 @@ mod tests {
             SHELL_BRIDGE_JS.contains("new Notification(title, opts)"),
             "desktop must still use the page-level Notification constructor"
         );
+        // Constructor-FIRST ordering: the page-level constructor must appear
+        // BEFORE the showNotification fallback. A refactor that inverts them
+        // (SW-first) would silently switch desktop to SW-shown notifications and
+        // onto the click-forwarding path — this catches it.
+        let ctor = SHELL_BRIDGE_JS
+            .find("new Notification(title, opts)")
+            .expect("constructor call present");
+        let sw_show = SHELL_BRIDGE_JS
+            .find("reg.showNotification(")
+            .expect("showNotification fallback present");
+        assert!(
+            ctor < sw_show,
+            "the page-level constructor must be tried BEFORE the service-worker fallback"
+        );
+        // Click-routing tag contract: the shell writes the routing tag as
+        // `fnTag` in notification data; the worker reads `data.fnTag` (pinned in
+        // client_api.rs). A rename on the shell side silently breaks routing.
+        assert!(
+            SHELL_BRIDGE_JS.contains("fnTag: routeTag"),
+            "shell must put the routing tag in notification data as fnTag"
+        );
         // When neither the constructor nor the worker can display it, the app is
         // told so it can rely on the in-app unread badge.
         assert!(

@@ -665,9 +665,14 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // fires in the worker (not the page), so the worker posts it to the shell,
   // which forwards it to the iframe as the same `notification_click` the
   // page-level onclick path emits. Registration is lazy — only users who have
-  // enabled notifications install the worker (see maybeOfferNotifications).
+  // enabled notifications register the worker (pre-warmed on opt-in in
+  // maybeOfferNotifications). On DESKTOP the constructor succeeds first, so the
+  // worker is never used to display: desktop's notification DISPLAY and CLICK
+  // path are unchanged, and only a dormant same-origin worker is registered so
+  // mobile has it ready.
   var NOTIFY_SW_URL = '/freenet-notify-sw.js';
   var notifySwPromise = null;
+  var notifySwMsgListenerAdded = false;
   function ensureNotifyServiceWorker() {
     if (notifySwPromise) return notifySwPromise;
     if (
@@ -676,11 +681,15 @@ function freenetBridge(authToken, userToken, hostedMode) {
       !window.isSecureContext
     ) {
       // No SW support, or an insecure (plain-http, non-localhost) origin where
-      // registration would fail. Fall back to the page-level constructor path.
+      // registration would fail. This is permanent for the page, so cache it —
+      // the page-level constructor path covers these (desktop) cases.
       notifySwPromise = Promise.resolve(null);
       return notifySwPromise;
     }
-    try {
+    // Add the click-forward listener exactly once — guarded separately from the
+    // registration promise, which may be cleared and retried below.
+    if (!notifySwMsgListenerAdded) {
+      notifySwMsgListenerAdded = true;
       // The worker posts a notification click to the shell; forward it to the
       // iframe as the same message the page-level n.onclick path sends.
       navigator.serviceWorker.addEventListener('message', function (event) {
@@ -695,16 +704,24 @@ function freenetBridge(authToken, userToken, hostedMode) {
           tag: typeof d.tag === 'string' ? d.tag : null,
         });
       });
+    }
+    try {
       notifySwPromise = navigator.serviceWorker.register(NOTIFY_SW_URL).then(
         function (reg) {
           return reg;
         },
         function () {
+          // Don't cache a TRANSIENT failure (e.g. the script fetch failing
+          // during a node restart) for the whole page lifetime — clear the memo
+          // so a later notification retries registration.
+          notifySwPromise = null;
           return null;
         },
       );
     } catch (e) {
-      notifySwPromise = Promise.resolve(null);
+      // A synchronous throw from register() is unusual; allow a retry too.
+      notifySwPromise = null;
+      return Promise.resolve(null);
     }
     return notifySwPromise;
   }
@@ -766,12 +783,15 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // Per-tag throttle + rolling global cap: distinct rooms aren't dropped, but
     // a consented contract can't flood with unique tags.
     if (!notifyLimiter.ok(opts.tag, Date.now())) return;
-    var routeTag = typeof msg.tag === 'string' ? msg.tag : null;
-    // Carry the room tag so the worker's notificationclick can post it back to
-    // the shell for iframe routing. Harmless on the page-level path (which
-    // routes via n.onclick). No attacker-controlled fields beyond the tag, which
-    // is already the room key the app itself supplied.
-    opts.data = { fnTag: routeTag };
+    // Cap the routing tag like opts.tag — it's attacker-controlled (the app
+    // supplies msg.tag) and is echoed back into the iframe on click.
+    var routeTag = typeof msg.tag === 'string' ? msg.tag.slice(0, 64) : null;
+    // Carry the room tag AND this shell's own URL so the worker's
+    // notificationclick routes the click back to THIS contract's shell (and
+    // reopens it if closed) — never another contract's tab. fnUrl is the shell's
+    // own same-origin location, not iframe-supplied. Harmless on the page-level
+    // path (which routes via n.onclick).
+    opts.data = { fnTag: routeTag, fnUrl: location.href.slice(0, 1024) };
 
     // Desktop: use the page-level constructor, UNCHANGED. Mobile: it throws
     // (unsupported), so we fall through to the service-worker path below — the
