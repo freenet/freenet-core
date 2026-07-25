@@ -516,10 +516,47 @@ impl P2pConnManager {
         // delivery order and breaks convergence.
         #[cfg(not(feature = "simulation_tests"))]
         {
+            // One tally for this whole fan-out (#4923). It carries the SAME
+            // `update_tx` as the `BroadcastEmitted` below, which is what lets
+            // the two events be joined on `id` — `BroadcastEmitted` says how
+            // many targets were enqueued, `BroadcastComplete` says how many of
+            // them ended up receiving a delta versus the entire state.
+            //
+            // The tally is created here, before any target is registered,
+            // holding a creation guard that is retired after the loop. Without
+            // it a fast first target could complete the fan-out before the last
+            // target was even enqueued, emitting a truncated event.
+            let update_tx =
+                crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+            let fanout = crate::node::network_bridge::broadcast_fanout_tally::FanoutTally::new(
+                update_tx,
+                key,
+                new_state.size(),
+                target_result.targets.len(),
+            );
             for target in &target_result.targets {
                 self.broadcast_queue
-                    .enqueue(key, target.clone(), new_state.clone())
+                    .enqueue(
+                        key,
+                        target.clone(),
+                        new_state.clone(),
+                        Some(
+                            crate::node::network_bridge::broadcast_fanout_tally::FanoutTarget::new(
+                                fanout.clone(),
+                                op_manager.clone(),
+                            ),
+                        ),
+                    )
                     .await;
+            }
+            // Retire the creation guard. If every target has already finished
+            // (a small fan-out can drain faster than this loop), this is the
+            // retirement that completes the tally and emits.
+            if let Some(summary) = fanout.finish_one() {
+                crate::node::network_bridge::broadcast_fanout_tally::emit_broadcast_complete(
+                    op_manager, summary,
+                )
+                .await;
             }
             // Emit broadcast emitted telemetry (issue #3622)
             //
@@ -527,13 +564,16 @@ impl P2pConnManager {
             // - Transaction ID is synthetic (not from the original update operation).
             //   BroadcastQueue creates its own TX per target, so this ID cannot be
             //   correlated with downstream BroadcastReceived/BroadcastApplied events.
+            //   It IS shared with this fan-out's `BroadcastComplete` (#4923) — the
+            //   two are emitted from this one block against the same `update_tx`,
+            //   so they join on `id` even though neither joins downstream.
             // - `broadcasted_to` = number of targets enqueued, not actual delivery
-            //   count. Actual sends are async via BroadcastQueue.
+            //   count. Actual sends are async via BroadcastQueue. `BroadcastComplete`
+            //   reports the delivered arms, so the difference between them is the
+            //   skipped/failed count.
             // - `broadcast_to` is empty to avoid cloning up to 512 PeerKeyLocations
             //   purely for telemetry. The peer list can be reconstructed from
             //   BroadcastReceived events on the receiving end.
-            let update_tx =
-                crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
             let enqueued_count = target_result.targets.len();
             if let Some(log) = NetEventLog::update_broadcast_emitted(
                 &update_tx,
@@ -623,9 +663,14 @@ impl P2pConnManager {
             1.0,
         );
 
+        // No fan-out tally (#4923): this is a targeted single-peer heal, not an
+        // all-subscriber fan-out, so there is no delta-vs-full-state mix to
+        // summarize. Its bytes are still counted by the #4922 payload mix.
         #[cfg(not(feature = "simulation_tests"))]
         {
-            self.broadcast_queue.enqueue(key, target, new_state).await;
+            self.broadcast_queue
+                .enqueue(key, target, new_state, None)
+                .await;
         }
         #[cfg(feature = "simulation_tests")]
         {
@@ -635,6 +680,7 @@ impl P2pConnManager {
                 key,
                 new_state,
                 target,
+                None,
             )
             .await;
         }
@@ -673,6 +719,21 @@ impl P2pConnManager {
             .await;
 
         let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+        // Per-fan-out delta-vs-full-state tally (#4923), shared with the
+        // `BroadcastEmitted` below via `update_tx`. This path is inline and
+        // sequential, so it drives the tally directly and emits inline at the
+        // end — no `FanoutTarget` RAII and no spawn, which would perturb the
+        // deterministic broadcast ordering this whole function exists to
+        // preserve.
+        // Zero declared targets: this path records against the tally inline
+        // rather than handing out `FanoutTarget`s, so the creation guard is the
+        // only retirement and it completes the tally at the end of the fan-out.
+        let fanout = crate::node::network_bridge::broadcast_fanout_tally::FanoutTally::new(
+            update_tx,
+            key,
+            new_state.size(),
+            0,
+        );
 
         tracing::debug!(
             tx = %update_tx,
@@ -906,13 +967,23 @@ impl P2pConnManager {
             } else {
                 send_success += 1;
                 // Track delta vs full state sends for testing (PR #2763)
+                //
+                // The per-fan-out tally (#4923) is written HERE, immediately
+                // beside the canonical `InterestManager` counter it shadows —
+                // the same co-location rule the production path follows in
+                // `broadcast_queue::record_delivery_to_interest`, for the same
+                // reason (`.claude/rules/bug-prevention-patterns.md`,
+                // "Manually-mirrored telemetry counters"). Pinned by
+                // `sim_fanout_records_tally_beside_the_canonical_counters_pin`.
                 if sent_delta {
                     op_manager
                         .interest_manager
                         .record_delta_send(new_state.size(), payload_size);
+                    fanout.record_delta(new_state.size(), payload_size);
                     crate::config::GlobalTestMetrics::record_delta_send();
                 } else {
                     op_manager.interest_manager.record_full_state_send();
+                    fanout.record_full_state();
                     crate::config::GlobalTestMetrics::record_full_state_send();
                 }
 
@@ -962,6 +1033,16 @@ impl P2pConnManager {
                     );
                 }
             }
+        }
+
+        // Emit the per-fan-out delta-vs-full-state split (#4923). This path
+        // registered no targets, so the creation guard alone completes the
+        // tally and this always yields a summary.
+        if let Some(summary) = fanout.finish_one() {
+            crate::node::network_bridge::broadcast_fanout_tally::emit_broadcast_complete(
+                op_manager, summary,
+            )
+            .await;
         }
 
         // Emit broadcast emitted telemetry (issue #3622)
@@ -1045,6 +1126,111 @@ mod broadcast_fanout_cost_pin_tests {
              (fan-out dispatch + targeted stale-peer heal); dropping the message-\
              COUNT report re-opens the exact #4861 blind spot — a tiny-payload \
              storm that the byte axis cannot see"
+        );
+    }
+
+    /// Source-scrape pin: both fan-out dispatch paths must build a
+    /// `FanoutTally` and emit its summary (#4923).
+    ///
+    /// Same precedent as the cost-report pin above. A refactor that drops
+    /// either half leaves `UpdateEvent::BroadcastComplete` unconstructed again
+    /// — the exact state this change fixes, in which `telemetry.rs` serializes
+    /// a `broadcast_complete` event, four `match` sites handle the variant, and
+    /// nothing ever produces one. Nothing behavioral breaks, so only a pin
+    /// catches it.
+    #[test]
+    fn both_fanout_paths_build_and_emit_a_fanout_tally_pin() {
+        // Needles are split with `concat!` so they do not appear verbatim in
+        // this test's own source, which `include_str!` pulls back in.
+        assert_eq!(
+            BROADCAST_SRC
+                .matches(concat!("FanoutTally", "::new("))
+                .count(),
+            2,
+            "exactly two fan-out dispatch paths must build a tally: the \
+             production BroadcastQueue path and the inline simulation path. \
+             Fewer means a path stopped reporting its delta-vs-full-state split"
+        );
+        assert_eq!(
+            BROADCAST_SRC
+                .matches(concat!("emit_broadcast_", "complete("))
+                .count(),
+            2,
+            "each fan-out path must emit its tally's summary — building a tally \
+             nothing emits is precisely the #4922 shape this change closes \
+             (counters tallied in memory, never reported)"
+        );
+
+        // The production path must reuse the SAME `update_tx` for both events,
+        // which is the only thing that lets a reader join a fan-out's
+        // BroadcastEmitted (targets enqueued) to its BroadcastComplete (arms
+        // delivered). Minting a second transaction would silently break the
+        // join while both events kept flowing.
+        assert_eq!(
+            BROADCAST_SRC
+                .matches(concat!(
+                    "Transaction",
+                    "::new::<crate::operations::update::UpdateMsg>()"
+                ))
+                .count(),
+            3,
+            "expected exactly three synthetic update transactions in this file: \
+             the no-targets delivery summary, the production fan-out (shared by \
+             BroadcastEmitted and BroadcastComplete), and the simulation \
+             fan-out (likewise shared). A fourth means a path minted its own \
+             transaction and broke the emitted/complete join"
+        );
+    }
+
+    /// Source-scrape pin: the simulation fan-out records the tally beside the
+    /// canonical `InterestManager` counters (#4923).
+    ///
+    /// The production counterpart of this pin lives in
+    /// `broadcast_queue.rs::fanout_tally_is_recorded_beside_the_canonical_counters_pin`.
+    /// This path predates the shared `record_delivery_to_interest` helper and
+    /// still inlines its own copy of the recording, so it needs its own pin:
+    /// the co-location is the only thing keeping the tally from drifting away
+    /// from the counter it shadows (#4009 / #4010).
+    #[test]
+    fn sim_fanout_records_tally_beside_the_canonical_counters_pin() {
+        let fn_start = BROADCAST_SRC
+            .find("async fn broadcast_state_to_peers(")
+            .expect("broadcast_state_to_peers not found");
+        let after = &BROADCAST_SRC[fn_start..];
+        let fn_end = after
+            .find("\n#[cfg(test)]")
+            .expect("end of broadcast_state_to_peers not found");
+        let body = &after[..fn_end];
+
+        let canonical_delta = body
+            .find("record_delta_send(new_state.size(), payload_size)")
+            .expect("the simulation fan-out must call record_delta_send");
+        let tally_delta = body
+            .find(concat!(
+                "fanout.record_",
+                "delta(new_state.size(), payload_size)"
+            ))
+            .expect(
+                "the simulation fan-out must record its delta send into the \
+                 per-fan-out tally, beside the canonical counter",
+            );
+        assert!(
+            tally_delta > canonical_delta,
+            "the tally's delta write must sit immediately after the canonical \
+             record_delta_send"
+        );
+
+        let canonical_full = body
+            .find("record_full_state_send()")
+            .expect("the simulation fan-out must call record_full_state_send");
+        let tally_full = body.find(concat!("fanout.record_", "full_state()")).expect(
+            "the simulation fan-out must record its full-state send into \
+                 the per-fan-out tally, beside the canonical counter",
+        );
+        assert!(
+            tally_full > canonical_full,
+            "the tally's full-state write must sit immediately after the \
+             canonical record_full_state_send"
         );
     }
 }

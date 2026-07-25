@@ -4733,6 +4733,43 @@ fn test_subscription_broadcast_propagation() {
          This means the emission wiring from #3622 is broken."
     );
 
+    // Verify BroadcastComplete telemetry events were produced (#4923).
+    //
+    // This is the delta-vs-full-state split for a fan-out. It matters because
+    // `state_size` alone — the only size the rest of the update telemetry
+    // carries — reports the post-apply FULL state whether a small delta or the
+    // entire state crossed the wire, so nothing else in the per-fan-out event
+    // stream can tell those apart.
+    //
+    // Every fan-out emits exactly one, so this must track BroadcastEmitted
+    // one-for-one: they are emitted from the same block against the same
+    // transaction. An inequality means one of the two emissions was dropped or
+    // duplicated — including the "emitted early, before every target was
+    // dispatched" failure the tally's creation guard exists to prevent.
+    let broadcast_complete: Vec<_> = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.iter()
+            .filter(|log| log.kind.is_update_broadcast_complete())
+            .cloned()
+            .collect()
+    });
+
+    assert!(
+        !broadcast_complete.is_empty(),
+        "Expected at least one UpdateEvent::BroadcastComplete telemetry event, got 0. \
+         The variant is serialized by telemetry.rs and matched in four places, so a \
+         zero count means it is being counted as live telemetry while never actually \
+         being constructed — exactly the #4923 gap."
+    );
+    assert_eq!(
+        broadcast_complete.len(),
+        broadcast_emitted_count,
+        "Expected one BroadcastComplete per BroadcastEmitted (both are emitted once \
+         per fan-out, from the same block, against the same transaction), got {} vs {}",
+        broadcast_complete.len(),
+        broadcast_emitted_count
+    );
+
     tracing::info!(
         "test_subscription_broadcast_propagation PASSED: {} peers converged to same state, \
          {} BroadcastEmitted events",

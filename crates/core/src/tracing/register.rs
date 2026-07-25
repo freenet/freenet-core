@@ -824,6 +824,58 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create an Update broadcast complete event: the delta-vs-full-state split
+    /// for ONE fan-out (issue #3335, #4923).
+    ///
+    /// Emitted once per fan-out, after every per-target send has finished, and
+    /// carries the same `tx` as that fan-out's
+    /// [`update_broadcast_emitted`](Self::update_broadcast_emitted) so the two
+    /// join on `id`.
+    ///
+    /// Field semantics, because two of them are easy to misread:
+    ///
+    /// * `state_size` is the size of the FULL post-apply state that was
+    ///   broadcast — the same number [`UpdateEvent::UpdateSuccess`] and
+    ///   [`UpdateEvent::BroadcastApplied`] report, NOT the bytes that crossed
+    ///   the wire. On its own it cannot distinguish a delta from a full state,
+    ///   which is exactly the ambiguity this event exists to close.
+    /// * `bytes_saved` closes it: it is `sum(state_size - delta_size)` over the
+    ///   delta sends, so `state_size * (delta_sends + full_state_sends) -
+    ///   bytes_saved` is the real payload total this fan-out put on the wire.
+    ///
+    /// `delta_sends + full_state_sends` counts only sends that were actually
+    /// DELIVERED, so it is normally less than the fan-out's target count: a
+    /// converged peer is skipped before any payload is chosen, and a dropped or
+    /// timed-out stream is not counted as either arm. Join against
+    /// [`update_broadcast_emitted`](Self::update_broadcast_emitted)'s
+    /// `broadcasted_to` (targets enqueued) and
+    /// [`broadcast_delivery_summary`](Self::broadcast_delivery_summary) for the
+    /// skip/failure breakdown that accounts for the difference.
+    pub fn update_broadcast_complete(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        key: ContractKey,
+        delta_sends: usize,
+        full_state_sends: usize,
+        bytes_saved: u64,
+        state_size: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Update(UpdateEvent::BroadcastComplete {
+                id: *tx,
+                key,
+                delta_sends,
+                full_state_sends,
+                bytes_saved,
+                state_size,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
     /// Create a broadcast delivery summary event with the full breakdown of
     /// why each potential target was or was not sent the broadcast (issue #3046).
     pub fn broadcast_delivery_summary(

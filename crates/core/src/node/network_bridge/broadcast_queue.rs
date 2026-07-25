@@ -20,6 +20,7 @@ use crate::node::OpManager;
 use crate::ring::PeerKeyLocation;
 use crate::transport::BroadcastDeliveryOutcome;
 
+use super::broadcast_fanout_tally::FanoutTally;
 use super::broadcast_payload_mix::PayloadArm;
 use super::p2p_protoc::P2pBridge;
 
@@ -332,6 +333,7 @@ mod queue {
     use crate::node::OpManager;
     use crate::ring::PeerKeyLocation;
 
+    use super::super::broadcast_fanout_tally::FanoutTarget;
     use super::super::p2p_protoc::P2pBridge;
     use super::broadcast_to_single_peer;
 
@@ -361,6 +363,12 @@ mod queue {
         new_state: WrappedState,
         /// Payload size in bytes, used to select concurrency pool.
         payload_size: usize,
+        /// This target's share of its fan-out's delta-vs-full-state tally
+        /// (#4923). Retired by `Drop`, so every way an entry can leave the
+        /// queue — sent, superseded by replace-on-dedup, or evicted at
+        /// capacity — retires it without a bespoke call at each site.
+        /// `None` for a send with no fan-out to summarize.
+        fanout: Option<FanoutTarget>,
     }
 
     /// Internal queue state: FIFO ordering via VecDeque + HashMap for dedup lookup.
@@ -431,13 +439,26 @@ mod queue {
             key: ContractKey,
             target: PeerKeyLocation,
             new_state: WrappedState,
+            fanout: Option<FanoutTarget>,
         ) {
             let dedup_key = (key, target.clone());
+            // Entries whose `FanoutTarget` must be retired, collected under the
+            // lock and dropped after it is released. Retiring a target can
+            // complete its fan-out, which spawns the telemetry emission, and
+            // there is no reason to do that while holding the queue lock every
+            // broadcast contends on.
+            let mut retired: Vec<Option<FanoutTarget>> = Vec::new();
             let mut queue = self.queue.lock().await;
 
             // Replace-on-dedup: if same contract+peer exists, update state in-place
             if let Some(existing) = queue.entries.get_mut(&dedup_key) {
                 existing.new_state = new_state;
+                // The entry now carries the NEWER fan-out's state, so its send
+                // must be attributed to the newer fan-out. Swapping (rather than
+                // keeping the original) also keeps each fan-out retiring exactly
+                // as many targets as it registered: the superseded one retires
+                // here, having contributed no send for this peer.
+                retired.push(std::mem::replace(&mut existing.fanout, fanout));
                 tracing::trace!(
                     contract = %dedup_key.0,
                     peer = ?target.socket_addr(),
@@ -446,13 +467,14 @@ mod queue {
             } else {
                 // Evict oldest if at capacity
                 while queue.len() >= self.max_queue_depth {
-                    if let Some(entry) = queue.pop_front() {
+                    if let Some(mut entry) = queue.pop_front() {
                         tracing::warn!(
                             contract = %entry.key,
                             peer = ?entry.target.socket_addr(),
                             queue_depth = self.max_queue_depth,
                             "Broadcast queue full, evicted oldest entry"
                         );
+                        retired.push(entry.fanout.take());
                     } else {
                         break;
                     }
@@ -465,6 +487,7 @@ mod queue {
                         target,
                         new_state,
                         payload_size,
+                        fanout,
                     },
                 );
                 queue.order.push_back(dedup_key);
@@ -477,6 +500,7 @@ mod queue {
             crate::transport::shadow_demand::record_broadcast_queue_depth(queue.len());
 
             drop(queue);
+            drop(retired);
             self.notify.notify_one();
         }
 
@@ -540,12 +564,21 @@ mod queue {
                         tokio::spawn(async move {
                             let _permit = permit; // Held until this task completes
 
+                            // Retired when this task ends — including on an
+                            // early return inside `broadcast_to_single_peer`
+                            // (contract not hosted, peer already converged,
+                            // serialization failure), none of which record a
+                            // send. A fan-out that ends that way still emits,
+                            // with the arms it did record.
+                            let fanout = entry.fanout;
+
                             broadcast_to_single_peer(
                                 &bridge,
                                 &op_manager,
                                 entry.key,
                                 entry.new_state,
                                 entry.target,
+                                fanout.as_ref().map(|f| f.tally().as_ref()),
                             )
                             .await;
                         });
@@ -629,6 +662,7 @@ fn record_streaming_delivery<T: crate::util::time_source::TimeSource + Sync>(
     our_summary: Option<&freenet_stdlib::prelude::StateSummary<'static>>,
     state_size: usize,
     payload_size: usize,
+    fanout: Option<&FanoutTally>,
 ) -> bool {
     let delivered = streaming_completion_delivered(completion);
     if delivered {
@@ -640,6 +674,7 @@ fn record_streaming_delivery<T: crate::util::time_source::TimeSource + Sync>(
             our_summary,
             state_size,
             payload_size,
+            fanout,
         );
     }
     delivered
@@ -650,6 +685,7 @@ fn record_streaming_delivery<T: crate::util::time_source::TimeSource + Sync>(
 /// summary (on ANY delivered broadcast — delta or full state — per #4145).
 /// Factored out so both the streaming gate ([`record_streaming_delivery`]) and
 /// the non-streaming path share one body.
+#[allow(clippy::too_many_arguments)]
 fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     interest_manager: &crate::ring::interest::InterestManager<T>,
     sent_delta: bool,
@@ -658,13 +694,30 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     our_summary: Option<&freenet_stdlib::prelude::StateSummary<'static>>,
     state_size: usize,
     payload_size: usize,
+    fanout: Option<&FanoutTally>,
 ) {
     // Track delta vs full state sends for testing (PR #2763)
+    //
+    // The per-fan-out tally (#4923) is written HERE, immediately beside the
+    // canonical `InterestManager` counter it shadows, and never anywhere else.
+    // Those counters are process-lifetime totals across every contract and peer,
+    // so they cannot attribute a send to the fan-out that caused it; the tally
+    // can. Keeping the two writes adjacent is what stops the tally becoming an
+    // independently-rotting mirror — the failure mode in the
+    // "Manually-mirrored telemetry counters" row of
+    // `.claude/rules/bug-prevention-patterns.md` (#4009 / #4010). Pinned by
+    // `fanout_tally_is_recorded_beside_the_canonical_counters_pin`.
     if sent_delta {
         interest_manager.record_delta_send(state_size, payload_size);
+        if let Some(tally) = fanout {
+            tally.record_delta(state_size, payload_size);
+        }
         crate::config::GlobalTestMetrics::record_delta_send();
     } else {
         interest_manager.record_full_state_send();
+        if let Some(tally) = fanout {
+            tally.record_full_state();
+        }
         crate::config::GlobalTestMetrics::record_full_state_send();
     }
 
@@ -722,6 +775,10 @@ pub(super) async fn broadcast_to_single_peer(
     key: ContractKey,
     new_state: WrappedState,
     target: PeerKeyLocation,
+    // Per-fan-out delta-vs-full-state tally (#4923). `None` for a send that is
+    // not part of an all-subscriber fan-out (the targeted `SyncStateToPeer`
+    // heal), which has no fan-out to summarize.
+    fanout: Option<&FanoutTally>,
 ) {
     use crate::message::{DeltaOrFullState, NetMessage};
     use crate::node::network_bridge::NetworkBridge;
@@ -1071,6 +1128,7 @@ pub(super) async fn broadcast_to_single_peer(
                     our_summary.as_ref(),
                     new_state.size(),
                     payload_size,
+                    fanout,
                 );
                 // Telemetry gauge (#4440): post-dispatch outcome — a drop,
                 // dropped completion oneshot, or completion timeout is the
@@ -1167,6 +1225,7 @@ pub(super) async fn broadcast_to_single_peer(
                 our_summary.as_ref(),
                 new_state.size(),
                 payload_size,
+                fanout,
             );
         }
         res
@@ -1371,6 +1430,18 @@ mod tests {
 
             // Drive the REAL production gate. `sent_delta = true` so the summary
             // cache (`update_peer_summary`) is exercised on the delivered arm.
+            //
+            // A real tally rides along (#4923): the per-fan-out counters are
+            // written from inside this same gate, so a drop that must not
+            // refresh interest must equally not be counted as a send. A tally
+            // that counted drops would report a fan-out as having put payloads
+            // on the wire that never landed.
+            let tally = crate::node::network_bridge::broadcast_fanout_tally::FanoutTally::new(
+                crate::message::Transaction::new::<crate::operations::update::UpdateMsg>(),
+                contract,
+                1024,
+                1,
+            );
             let delivered = record_streaming_delivery(
                 &manager,
                 completion,
@@ -1380,11 +1451,30 @@ mod tests {
                 Some(&our_summary),
                 /* state_size */ 1024,
                 /* payload_size */ 64,
+                Some(&tally),
             );
             assert_eq!(
                 delivered, expect_delivered,
                 "[{name}] classification mismatch"
             );
+
+            assert_eq!(tally.finish_one(), None, "creation guard still held");
+            let summary = tally.finish_one().expect("guard retirement completes");
+            if expect_delivered {
+                assert_eq!(
+                    (summary.delta_sends, summary.full_state_sends),
+                    (1, 0),
+                    "[{name}] a real delivery MUST be counted in the fan-out tally"
+                );
+                assert_eq!(summary.bytes_saved, 1024 - 64);
+            } else {
+                assert_eq!(
+                    (summary.delta_sends, summary.full_state_sends),
+                    (0, 0),
+                    "[{name}] a dropped send MUST NOT be counted in the fan-out tally"
+                );
+                assert_eq!(summary.bytes_saved, 0);
+            }
 
             let interest = manager
                 .get_peer_interest(&contract, &peer)
@@ -1460,6 +1550,7 @@ mod tests {
             Some(&our_summary),
             /* state_size */ 4096,
             /* payload_size */ 4096,
+            None,
         );
         assert!(delivered, "a Delivered outcome must classify as delivered");
 
@@ -1524,6 +1615,7 @@ mod tests {
                 Some(&our_summary),
                 /* state_size */ 4096,
                 /* payload_size */ 4096,
+                None,
             );
             assert!(
                 !delivered,
@@ -2202,6 +2294,151 @@ mod tests {
                 && body.contains("DeltaUnavailable::ComputeFailed"),
             "the delta-failure arm must keep the typed NotEfficient vs \
              ComputeFailed split — collapsing them re-blinds the measurement"
+        );
+    }
+
+    /// Source-scrape pin for the per-fan-out tally's co-location with the
+    /// canonical `InterestManager` counters (#4923).
+    ///
+    /// The tally duplicates information the `InterestManager` counters already
+    /// hold — necessarily, because those are process-lifetime totals across
+    /// every contract and peer and cannot attribute a send to a fan-out. A
+    /// duplicate that drifts is the failure in the "Manually-mirrored telemetry
+    /// counters" row of `.claude/rules/bug-prevention-patterns.md` (#4009 /
+    /// #4010): the mirror silently rots when the path is refactored, every test
+    /// stays green, and the rot surfaces months later as a counter stuck at
+    /// zero. The defence is that the two writes are physically adjacent, so pin
+    /// exactly that — the tally write must sit inside
+    /// `record_delivery_to_interest`, in the same branch as the counter it
+    /// shadows, and nowhere else in this file.
+    #[test]
+    fn fanout_tally_is_recorded_beside_the_canonical_counters_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("fn record_delivery_to_interest<")
+            .expect("record_delivery_to_interest not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\npub(super) async fn broadcast_to_single_peer(")
+            .expect("end of record_delivery_to_interest not found");
+        let body = &after[..fn_end];
+
+        // The delta branch records BOTH, in that order.
+        let canonical_delta = body
+            .find("record_delta_send(state_size, payload_size)")
+            .expect(
+                "record_delivery_to_interest must call \
+                 InterestManager::record_delta_send — it is the canonical counter",
+            );
+        let tally_delta = body.find("record_delta(state_size, payload_size)").expect(
+            "the per-fan-out tally must record the delta send inside \
+                 record_delivery_to_interest, beside the canonical counter — a \
+                 tally written anywhere else drifts from it (#4009/#4010)",
+        );
+        assert!(
+            tally_delta > canonical_delta,
+            "the tally's delta write must sit immediately after the canonical \
+             record_delta_send, so the pair is impossible to miss when editing"
+        );
+
+        // Same for the full-state branch.
+        let canonical_full = body.find("record_full_state_send()").expect(
+            "record_delivery_to_interest must call \
+             InterestManager::record_full_state_send",
+        );
+        let tally_full = body.find("record_full_state()").expect(
+            "the per-fan-out tally must record the full-state send inside \
+             record_delivery_to_interest, beside the canonical counter",
+        );
+        assert!(
+            tally_full > canonical_full,
+            "the tally's full-state write must sit immediately after the \
+             canonical record_full_state_send"
+        );
+
+        // Both writes are gated on the delivery the canonical counters are
+        // gated on. `record_delivery_to_interest` runs only on a real delivery
+        // (streaming `Delivered` / inline send Ok), so a tally write that
+        // escaped this function would count phantom fan-out — the same mistake
+        // the #4903 review round-3 Fix 4 corrected for the cost axis.
+        //
+        // Needles are split with `concat!` so they do not appear verbatim in
+        // this test's own source, which `include_str!` pulls back in.
+        let delta_needle = concat!("tally.record_", "delta(");
+        let full_needle = concat!("tally.record_", "full_state()");
+        assert_eq!(
+            src.matches(delta_needle).count(),
+            1,
+            "the tally's delta write must appear exactly once in this file — \
+             inside record_delivery_to_interest. A second write site is the \
+             drift this pin exists to prevent; zero means it was refactored away"
+        );
+        assert_eq!(
+            src.matches(full_needle).count(),
+            1,
+            "the tally's full-state write must appear exactly once in this file"
+        );
+    }
+
+    /// Source-scrape pin: the production queue must CARRY a fan-out target
+    /// through every entry and retire it by `Drop` (#4923).
+    ///
+    /// A `BroadcastEntry` leaves the queue three ways — sent, superseded by
+    /// replace-on-dedup, or evicted at capacity — and `broadcast_to_single_peer`
+    /// itself has several early returns. If retirement were an explicit call
+    /// instead of a `Drop` obligation, any path that forgot it would strand the
+    /// fan-out so its `BroadcastComplete` never fired, silently and with no
+    /// behavioral symptom. Pin that the entry owns the target (so `Drop` covers
+    /// every exit) rather than the tally directly.
+    #[test]
+    fn broadcast_entry_owns_a_droppable_fanout_target_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        let entry_start = src
+            .find("struct BroadcastEntry {")
+            .expect("BroadcastEntry not found");
+        let entry_end = src[entry_start..]
+            .find('}')
+            .expect("end of BroadcastEntry not found");
+        let entry = &src[entry_start..entry_start + entry_end];
+        assert!(
+            entry.contains("fanout: Option<FanoutTarget>"),
+            "BroadcastEntry must own an Option<FanoutTarget>, NOT an \
+             Arc<FanoutTally>: retirement has to be a Drop obligation so every \
+             queue exit path (send, replace-on-dedup, capacity eviction) retires \
+             the target without a bespoke call at each site"
+        );
+
+        // Replace-on-dedup must SWAP the target rather than leaving the old one
+        // in place: the entry now carries the newer fan-out's state, so its send
+        // belongs to the newer fan-out, and the superseded one must retire
+        // having contributed nothing for this peer.
+        assert!(
+            src.contains("std::mem::replace(&mut existing.fanout, fanout)"),
+            "replace-on-dedup must swap the entry's FanoutTarget so the send is \
+             attributed to the fan-out whose state it now carries, and the \
+             superseded fan-out retires this target"
+        );
+
+        // Retirement must happen outside the queue lock: completing a fan-out
+        // spawns the telemetry emission, and every broadcast contends on this
+        // lock.
+        let enqueue_start = src
+            .find("pub(crate) async fn enqueue(")
+            .expect("enqueue not found");
+        let enqueue = &src[enqueue_start..];
+        let drop_queue = enqueue
+            .find("drop(queue);")
+            .expect("enqueue must release the queue lock explicitly");
+        let drop_retired = enqueue.find("drop(retired);").expect(
+            "enqueue must drop superseded/evicted FanoutTargets explicitly, \
+                 after the lock",
+        );
+        assert!(
+            drop_retired > drop_queue,
+            "superseded/evicted FanoutTargets must be dropped AFTER the queue \
+             lock is released — retiring one can complete a fan-out and spawn \
+             its telemetry emission, which must not happen under the lock every \
+             broadcast contends on"
         );
     }
 }
