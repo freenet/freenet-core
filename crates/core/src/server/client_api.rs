@@ -33,7 +33,20 @@ use super::{
 ///     violation every few seconds and permission prompts never surfaced.
 ///   - `ws:` / `wss:`: the bridge opens the real WebSocket on behalf of the
 ///     sandboxed iframe.
-const SHELL_PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src 'self' ws: wss:";
+///
+/// `worker-src 'self'` allows the shell to register the same-origin
+/// notification service worker (`/freenet-notify-sw.js`). Without it the
+/// registration falls back through `child-src` to `script-src 'unsafe-inline'`,
+/// which does not permit a script URL, so `navigator.serviceWorker.register`
+/// is blocked and notifications can never show on mobile (where the page-level
+/// `Notification` constructor is unsupported).
+const SHELL_PAGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; frame-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src 'self' ws: wss:; worker-src 'self'";
+
+/// The notification service worker, served at `/freenet-notify-sw.js`. See the
+/// file header for why a service worker is required: mobile browsers reject the
+/// page-level `new Notification()` constructor, so the shell must show
+/// notifications via `ServiceWorkerRegistration.showNotification()` instead.
+const NOTIFY_SW_JS: &str = include_str!("path_handlers/assets/notify_sw.js");
 
 /// Content-Security-Policy served with the sandboxed iframe that actually
 /// runs a webapp. The iframe has an opaque (null) origin because the
@@ -214,6 +227,14 @@ impl HttpClientApi {
                 "/peer/{address}",
                 axum::routing::get(home_page::peer_detail),
             )
+            // Notification service worker, served at the origin root so its
+            // default scope (`/`) covers every contract shell page. The shell
+            // registers it to show notifications via showNotification() — the
+            // only path that works on mobile browsers (#see notify_sw.js).
+            .route(
+                "/freenet-notify-sw.js",
+                axum::routing::get(notify_service_worker),
+            )
             // Local peer's migration confirmation page (#4592). First-party
             // origin so its POST to `pull-import` passes the import gate; it
             // never auto-pulls (an explicit click is required).
@@ -273,6 +294,33 @@ struct Config {
 #[instrument(level = "debug")]
 async fn home() -> axum::response::Response {
     axum::response::Response::default()
+}
+
+/// `GET /freenet-notify-sw.js` — serves the notification service worker.
+///
+/// The gateway shell registers this worker so it can call
+/// `ServiceWorkerRegistration.showNotification()`, which is the ONLY way to
+/// display a web notification on mobile browsers (they reject the page-level
+/// `new Notification()` constructor). It is served at the ORIGIN ROOT on
+/// purpose: a service worker's default scope is the directory of its script, so
+/// `/freenet-notify-sw.js` gets scope `/`, which covers every
+/// `/v{1,2}/contract/web/<key>/` shell page with a single registration. The
+/// worker has no `fetch` handler, so it never intercepts or alters any request.
+async fn notify_service_worker() -> impl IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/javascript; charset=utf-8",
+            ),
+            // Modest cache; a new binary rolls out an updated worker within the
+            // hour, and the browser also revalidates the worker script on
+            // navigation regardless of this header.
+            (axum::http::header::CACHE_CONTROL, "max-age=3600"),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        NOTIFY_SW_JS,
+    )
 }
 
 async fn web_home(
@@ -921,6 +969,116 @@ mod tests {
         assert!(
             csp.contains("default-src 'none'"),
             "default-src should stay 'none' for defence in depth; got: {csp}"
+        );
+    }
+
+    /// The shell registers a same-origin notification service worker (the only
+    /// way to show notifications on mobile). With `default-src 'none'` and no
+    /// `worker-src`, the registration would fall back to `script-src`
+    /// (`'unsafe-inline'`, which forbids a script URL) and be CSP-blocked. So
+    /// the shell CSP must grant `worker-src 'self'`.
+    #[test]
+    fn shell_page_csp_allows_service_worker() {
+        let csp = SHELL_PAGE_CSP;
+        let worker_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("worker-src"))
+            .expect("worker-src directive present so the SW registration isn't CSP-blocked");
+        assert!(
+            worker_src.contains("'self'"),
+            "worker-src must include 'self' so /freenet-notify-sw.js can register; got: {worker_src}"
+        );
+    }
+
+    /// `GET /freenet-notify-sw.js` must serve the notification service worker as
+    /// JavaScript. The worker is the only way to show notifications on mobile
+    /// (the page-level `Notification` constructor is unsupported there), and it
+    /// MUST NOT carry a `fetch` handler — that would silently intercept every
+    /// request on the origin.
+    #[tokio::test]
+    async fn notify_service_worker_route_serves_js() {
+        use axum::body::to_bytes;
+
+        let response = notify_service_worker().await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("service worker must set a Content-Type")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("javascript"),
+            "service worker must be served as JavaScript so the browser accepts it; got: {content_type}"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let src = std::str::from_utf8(&body).unwrap();
+        assert!(
+            src.contains("notificationclick"),
+            "worker must route notification clicks"
+        );
+        assert!(
+            src.contains("skipWaiting") && src.contains("clients.claim"),
+            "worker must activate and claim clients so the first notification shows without a reload"
+        );
+        assert!(
+            src.contains("__freenet_notify_click__"),
+            "worker must post clicks back to the shell for iframe routing"
+        );
+        // A fetch handler would make this worker intercept every request on the
+        // origin. Its ABSENCE is a hard invariant — the worker exists only to
+        // own showNotification() and click routing.
+        assert!(
+            !src.contains("'fetch'") && !src.contains("\"fetch\""),
+            "worker must NOT register a fetch handler (it must not intercept requests)"
+        );
+    }
+
+    /// The worker must be REACHABLE at the origin root `/freenet-notify-sw.js`.
+    /// Root path matters: a service worker's scope defaults to its script's
+    /// directory, so serving it at `/` gives it scope `/`, covering every
+    /// `/v{1,2}/contract/web/<key>/` shell page with one registration. This
+    /// drives the real `as_router` router so a mis-registered or shadowed route
+    /// fails the test, not just production.
+    #[tokio::test]
+    async fn notify_service_worker_route_is_wired() {
+        use axum::body::to_bytes;
+        use tower::ServiceExt;
+
+        let (api, router) = HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+        drop(api);
+
+        let req = axum::http::Request::builder()
+            .uri("/freenet-notify-sw.js")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET /freenet-notify-sw.js must route to the service worker handler"
+        );
+        let content_type = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("service worker must set a Content-Type")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.contains("javascript"),
+            "must be served as JavaScript so the browser accepts it as a worker; got: {content_type}"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("notificationclick"),
+            "the served script must be the notification worker"
         );
     }
 

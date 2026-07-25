@@ -562,6 +562,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
       return;
     }
     if (Notification.permission === 'granted' && contractHasConsent()) {
+      // Returning user who already opted in: pre-warm the notification service
+      // worker now so it's active before the first message arrives (mobile
+      // needs it to show anything; racing its activation would drop the first).
+      ensureNotifyServiceWorker();
       notifyStatusToIframe('granted');
       return;
     }
@@ -609,6 +613,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
         if (called) return; // some browsers fire BOTH the callback and promise
         called = true;
         if (perm === 'granted' && setContractConsent()) {
+          // Pre-warm the notification service worker the instant the user opts
+          // in, so it's active by the time the first message arrives (mobile
+          // needs it to show anything at all).
+          ensureNotifyServiceWorker();
           notifyStatusToIframe('granted');
         } else if (perm === 'granted') {
           // Granted but no contract key to gate on — nothing would deliver.
@@ -643,6 +651,103 @@ function freenetBridge(authToken, userToken, hostedMode) {
     document.body.appendChild(bar);
   }
 
+  // --- Service-worker fallback for notifications (mobile) ----------------
+  // Desktop browsers show notifications with the page-level `new
+  // Notification(...)` constructor (used unchanged in showAppNotification).
+  // Mobile browsers (Chrome / Firefox on Android) REFUSE that constructor — it
+  // throws, and the ONLY supported way to show a notification there is
+  // ServiceWorkerRegistration.showNotification(). So we register a tiny
+  // same-origin service worker (served at NOTIFY_SW_URL) and use it ONLY as the
+  // fallback when the constructor throws. Desktop behavior is therefore
+  // unchanged; the worker path exists solely to make mobile work.
+  //
+  // The worker also routes a notification click back to this shell: the click
+  // fires in the worker (not the page), so the worker posts it to the shell,
+  // which forwards it to the iframe as the same `notification_click` the
+  // page-level onclick path emits. Registration is lazy — only users who have
+  // enabled notifications install the worker (see maybeOfferNotifications).
+  var NOTIFY_SW_URL = '/freenet-notify-sw.js';
+  var notifySwPromise = null;
+  function ensureNotifyServiceWorker() {
+    if (notifySwPromise) return notifySwPromise;
+    if (
+      typeof navigator === 'undefined' ||
+      !('serviceWorker' in navigator) ||
+      !window.isSecureContext
+    ) {
+      // No SW support, or an insecure (plain-http, non-localhost) origin where
+      // registration would fail. Fall back to the page-level constructor path.
+      notifySwPromise = Promise.resolve(null);
+      return notifySwPromise;
+    }
+    try {
+      // The worker posts a notification click to the shell; forward it to the
+      // iframe as the same message the page-level n.onclick path sends.
+      navigator.serviceWorker.addEventListener('message', function (event) {
+        var d = event && event.data;
+        if (!d || d.__freenet_notify_click__ !== true) return;
+        try {
+          window.focus();
+        } catch (e) {}
+        sendToIframe({
+          __freenet_shell__: true,
+          type: 'notification_click',
+          tag: typeof d.tag === 'string' ? d.tag : null,
+        });
+      });
+      notifySwPromise = navigator.serviceWorker.register(NOTIFY_SW_URL).then(
+        function (reg) {
+          return reg;
+        },
+        function () {
+          return null;
+        },
+      );
+    } catch (e) {
+      notifySwPromise = Promise.resolve(null);
+    }
+    return notifySwPromise;
+  }
+
+  // Resolve to a ServiceWorkerRegistration able to showNotification(), or null
+  // if unavailable within `timeoutMs`. Bounded so a slow/never-activating worker
+  // never stalls a notification — the caller reports it undeliverable instead.
+  function notifyRegistrationReady(timeoutMs) {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+      return Promise.resolve(null);
+    }
+    return ensureNotifyServiceWorker().then(function (reg) {
+      if (!reg) return null;
+      if (reg.active) return reg;
+      // Registered but not yet active (first visit): wait briefly for it.
+      return new Promise(function (resolve) {
+        var settled = false;
+        var t = setTimeout(function () {
+          if (!settled) {
+            settled = true;
+            resolve(null);
+          }
+        }, timeoutMs);
+        navigator.serviceWorker.ready.then(
+          function (ready) {
+            if (!settled) {
+              settled = true;
+              clearTimeout(t);
+              resolve(ready || null);
+            }
+          },
+          function () {
+            if (!settled) {
+              settled = true;
+              clearTimeout(t);
+              resolve(null);
+            }
+          },
+        );
+      });
+    });
+  }
+
   function showAppNotification(msg) {
     if (typeof Notification === 'undefined') return;
     // Gate on BOTH the browser permission and this contract's own consent.
@@ -661,30 +766,55 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // Per-tag throttle + rolling global cap: distinct rooms aren't dropped, but
     // a consented contract can't flood with unique tags.
     if (!notifyLimiter.ok(opts.tag, Date.now())) return;
-    var n;
+    var routeTag = typeof msg.tag === 'string' ? msg.tag : null;
+    // Carry the room tag so the worker's notificationclick can post it back to
+    // the shell for iframe routing. Harmless on the page-level path (which
+    // routes via n.onclick). No attacker-controlled fields beyond the tag, which
+    // is already the room key the app itself supplied.
+    opts.data = { fnTag: routeTag };
+
+    // Desktop: use the page-level constructor, UNCHANGED. Mobile: it throws
+    // (unsupported), so we fall through to the service-worker path below — the
+    // only way to show a notification on mobile.
     try {
-      n = new Notification(title, opts);
-    } catch (e) {
-      // e.g. mobile Chrome, where non-persistent `new Notification()` throws
-      // (it requires ServiceWorkerRegistration.showNotification). Tell the app
-      // so it need not keep sending; the in-app unread badge is the fallback.
-      notifyStatusToIframe('undeliverable');
+      var n = new Notification(title, opts);
+      n.onclick = function () {
+        try {
+          window.focus();
+        } catch (e) {}
+        // Tell the app which notification was clicked so it can route to the room.
+        sendToIframe({
+          __freenet_shell__: true,
+          type: 'notification_click',
+          tag: routeTag,
+        });
+        try {
+          n.close();
+        } catch (e) {}
+      };
       return;
+    } catch (e) {
+      // Mobile Chrome/Firefox: the non-persistent `new Notification()`
+      // constructor is unsupported and throws. Deliver via the service worker.
     }
-    n.onclick = function () {
-      try {
-        window.focus();
-      } catch (e) {}
-      // Tell the app which notification was clicked so it can route to the room.
-      sendToIframe({
-        __freenet_shell__: true,
-        type: 'notification_click',
-        tag: typeof msg.tag === 'string' ? msg.tag : null,
-      });
-      try {
-        n.close();
-      } catch (e) {}
-    };
+
+    notifyRegistrationReady(1500).then(function (reg) {
+      if (reg && typeof reg.showNotification === 'function') {
+        reg.showNotification(title, opts).then(
+          function () {},
+          function () {
+            // The worker exists but the show failed — nothing else can display
+            // it; tell the app so it can rely on the in-app unread badge.
+            notifyStatusToIframe('undeliverable');
+          },
+        );
+      } else {
+        // No usable service worker (e.g. an insecure-context http origin) AND
+        // the page-level constructor threw: nothing can display it. Tell the app
+        // so it need not keep sending; the in-app unread badge is the fallback.
+        notifyStatusToIframe('undeliverable');
+      }
+    });
   }
 
   window.addEventListener('message', function (event) {

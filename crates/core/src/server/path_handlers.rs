@@ -3498,6 +3498,50 @@ mod tests {
         );
     }
 
+    /// Mobile browsers reject the page-level `new Notification()` constructor, so
+    /// the shell must show notifications via a service worker's
+    /// `showNotification()`. Pin the wiring by source so a refactor can't
+    /// silently drop it and re-break mobile notifications.
+    #[test]
+    fn bridge_js_registers_notification_service_worker() {
+        // The shell registers the same-origin notification service worker.
+        assert!(
+            SHELL_BRIDGE_JS.contains("NOTIFY_SW_URL = '/freenet-notify-sw.js'")
+                && SHELL_BRIDGE_JS.contains("navigator.serviceWorker.register(NOTIFY_SW_URL)"),
+            "shell must register the /freenet-notify-sw.js service worker"
+        );
+        // It falls back to showNotification() — the only path that works on
+        // mobile, where `new Notification()` throws.
+        assert!(
+            SHELL_BRIDGE_JS.contains("reg.showNotification("),
+            "shell must show notifications via the service worker on mobile"
+        );
+        // Desktop is UNCHANGED: the page-level constructor is still used, under
+        // the same length cap. (The service worker only engages when it throws.)
+        assert!(
+            SHELL_BRIDGE_JS.contains("new Notification(title, opts)"),
+            "desktop must still use the page-level Notification constructor"
+        );
+        // When neither the constructor nor the worker can display it, the app is
+        // told so it can rely on the in-app unread badge.
+        assert!(
+            SHELL_BRIDGE_JS.contains("notifyStatusToIframe('undeliverable')"),
+            "must report 'undeliverable' when neither the constructor nor the worker can show it"
+        );
+        // The worker's click (which fires in the worker, not the page) is
+        // forwarded to the iframe as the same `notification_click` message.
+        assert!(
+            SHELL_BRIDGE_JS.contains("__freenet_notify_click__"),
+            "the worker's notification click must be forwarded to the iframe"
+        );
+        // Registration is gated on a secure context, since it fails on a plain
+        // http (non-localhost) origin — the desktop constructor covers that.
+        assert!(
+            SHELL_BRIDGE_JS.contains("window.isSecureContext"),
+            "service worker registration must be gated on a secure context"
+        );
+    }
+
     /// Regression for #4849: the notification-proxy flood-cap (the rolling
     /// global window in `makeNotifyRateLimiter`) must be PERSISTED per-contract
     /// so a full page reload can't reset it. Without this, a consented contract
