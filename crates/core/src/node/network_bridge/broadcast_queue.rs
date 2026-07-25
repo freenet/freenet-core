@@ -855,7 +855,16 @@ pub(super) async fn broadcast_to_single_peer(
     // tag is carried to the real-delivery sites below and recorded there, so
     // the mix counts bytes that actually reached the wire.
     let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
-        _ if deltas_suppressed => (
+        // Scoped to the both-summaries-present case ON PURPOSE. When a summary
+        // is missing a delta was impossible regardless of the memo, so letting
+        // the suppression guard win there would credit the memo for a full
+        // state it did not cause — overstating `FullDeltaSuppressed` and
+        // undercounting `FullNoSummary`, which is exactly the distinction this
+        // instrumentation exists to draw. Behavior is unchanged either way (a
+        // missing summary falls to the `_` arm, which also sends full state and
+        // also never reaches `compute_delta`), so this is purely about
+        // attributing the bytes to the right cause.
+        (Some(_), Some(_)) if deltas_suppressed => (
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
             PayloadArm::FullDeltaSuppressed,
@@ -1632,11 +1641,24 @@ mod tests {
              doomed delta is still computed and sent"
         );
         assert!(
-            body.contains("_ if deltas_suppressed => ("),
+            body.contains("if deltas_suppressed => ("),
             "suppression must short-circuit the payload match to FullState"
         );
-        // The guard arm must be FIRST in the payload match: Rust evaluates
-        // arms in order, so `_ if deltas_suppressed` has to precede the
+        // The guard is deliberately scoped to `(Some(_), Some(_))` rather than
+        // `_`: with a summary missing a delta was impossible anyway, so a
+        // wildcard guard would credit the memo for a full state it did not
+        // cause and skew the #3335 payload-mix attribution. Safety is
+        // unaffected — `compute_delta` lives only in the `(Some(ours),
+        // Some(theirs))` arm, so a suppressed contract cannot reach it via
+        // either path.
+        assert!(
+            body.contains("(Some(_), Some(_)) if deltas_suppressed => ("),
+            "the suppression guard must be scoped to the both-summaries-present \
+             case — a wildcard guard mis-attributes missing-summary full states \
+             to FullDeltaSuppressed (#3335 payload-mix accuracy)"
+        );
+        // The guard arm must still be FIRST in the payload match: Rust
+        // evaluates arms in order, so it has to precede the
         // `(Some(ours), Some(theirs))` compute_delta arm — otherwise a
         // suppressed contract with both summaries present would compute and
         // send the doomed delta (or, post-#4901, hit the Ok(None) converged
@@ -1644,7 +1666,7 @@ mod tests {
         // above precedes the match regardless, so only this arm-ordering
         // assertion catches a reordering regression.
         let guard_arm = body
-            .find("_ if deltas_suppressed => (")
+            .find("if deltas_suppressed => (")
             .expect("guard arm not found");
         let compute_arm = body
             .find("(Some(ours), Some(theirs)) => {")
