@@ -73,8 +73,9 @@ const ROLLUP_WINDOW: Duration = Duration::from_secs(60);
 /// beyond the cap are still counted in the per-arm totals; only their
 /// per-contract attribution is dropped, and both the count and the BYTE total
 /// of those unattributed sends are reported (`attribution_dropped_sends` /
-/// `attribution_dropped_bytes`) so a truncated window is never mistaken for a
-/// complete one.
+/// `attribution_dropped_bytes`) so a capped window is never mistaken for a
+/// complete one. Truncation of the reported top-N is a DIFFERENT omission,
+/// published separately as `other_contracts_bytes`.
 const MAX_TRACKED_CONTRACTS: usize = 256;
 
 /// How many contracts the emitted rollup names.
@@ -159,9 +160,13 @@ struct Window {
     /// dropped" misreading; distinct-contract cardinality would need an
     /// unbounded set, which is exactly what the cap exists to prevent.
     attribution_dropped_sends: u64,
-    /// Bytes behind those unattributed sends. This is the field that says
-    /// how much of `full_state_bytes` the top-N list cannot account for, so
-    /// a truncated window is never mistaken for a complete one.
+    /// Bytes behind those unattributed sends.
+    ///
+    /// This covers only contracts the cap refused to TRACK. Contracts that
+    /// were tracked but fell outside the reported top-N are a separate
+    /// omission, published as `other_contracts_bytes`; conflating the two made
+    /// an 11-contract window look perfectly reconciled while 10 % of its bytes
+    /// were unaccounted for.
     attribution_dropped_bytes: u64,
 }
 
@@ -297,6 +302,8 @@ impl Window {
 fn payload_mix_json(
     arms: &[(PayloadArm, u64, u64)],
     contracts: &[(ContractInstanceId, u64)],
+    tracked_full_state_bytes: u64,
+    contracts_tracked: u64,
     attribution_dropped_sends: u64,
     attribution_dropped_bytes: u64,
     window_secs: u64,
@@ -341,9 +348,26 @@ fn payload_mix_json(
                 .collect(),
         ),
     );
-    // Sends (not distinct contracts) that missed attribution, and the bytes
-    // behind them: `attribution_dropped_bytes` is what tells an analyst how
-    // much of `full_state_bytes` the top-N list cannot account for.
+    // The published schema must ADD UP, using only fields it publishes:
+    //
+    //   sum(top_contracts) + other_contracts_bytes + attribution_dropped_bytes
+    //     == full_state_bytes
+    //
+    // Two DIFFERENT kinds of omission have to be reported separately, and an
+    // earlier revision conflated them:
+    //   * `other_contracts_bytes` — contracts we DID track but that fell
+    //     outside the reported top-N. With 11..=MAX_TRACKED_CONTRACTS
+    //     contracts this is non-zero while nothing was ever dropped.
+    //   * `attribution_dropped_bytes` — contracts never tracked at all
+    //     because the cap was already full.
+    // Reporting only the second made an 11-contract window look perfectly
+    // reconciled while 10 % of its bytes were unaccounted for.
+    let top_sum: u64 = contracts.iter().map(|(_, b)| *b).sum();
+    let other_contracts_bytes = tracked_full_state_bytes.saturating_sub(top_sum);
+    obj.insert("other_contracts_bytes".into(), other_contracts_bytes.into());
+    obj.insert("contracts_tracked".into(), contracts_tracked.into());
+    // Sends (not distinct contracts) that missed attribution entirely, and the
+    // bytes behind them.
     obj.insert(
         "attribution_dropped_sends".into(),
         attribution_dropped_sends.into(),
@@ -367,6 +391,8 @@ pub(crate) fn emit_payload_mix_rollup(local_peer_id: &str, window_secs: u64) -> 
     let payload = payload_mix_json(
         &window.arms(),
         &window.top_contracts(),
+        window.contract_full_state_bytes.values().sum(),
+        window.contract_full_state_bytes.len() as u64,
         window.attribution_dropped_sends,
         window.attribution_dropped_bytes,
         window_secs,
@@ -490,21 +516,109 @@ mod tests {
             .filter(|(arm, _, _)| arm.is_full_state())
             .map(|(_, _, bytes)| bytes)
             .sum();
-        let attributed: u64 = window.contract_full_state_bytes.values().sum();
         assert_eq!(
             full_state_total, 1000,
             "full-state arm bytes should exclude the delta send"
         );
-        assert_eq!(
-            attributed + window.attribution_dropped_bytes,
-            full_state_total,
-            "every full-state byte must be either attributed to a contract or \
-             counted as dropped attribution — otherwise the top-N list cannot \
-             be reconciled against full_state_bytes"
-        );
         // Contract 1 accumulated across two different full-state arms.
         assert_eq!(window.contract_full_state_bytes[&contract(1)], 700);
         assert_eq!(window.contract_full_state_bytes[&contract(2)], 300);
+        assert_reconciles(&window);
+    }
+
+    /// The reconciliation invariant, asserted against the EMITTED JSON rather
+    /// than the in-memory window.
+    ///
+    /// This distinction is the whole point: an earlier revision checked the
+    /// internal map and passed, while the PUBLISHED schema silently failed to
+    /// add up for any window holding 11..=MAX_TRACKED_CONTRACTS contracts —
+    /// the top-N truncation dropped bytes that no emitted field accounted
+    /// for. A consumer can only use the fields actually present in the event,
+    /// so that is what the test must check.
+    fn assert_reconciles(window: &Window) {
+        let json = payload_mix_json(
+            &window.arms(),
+            &window.top_contracts(),
+            window.contract_full_state_bytes.values().sum(),
+            window.contract_full_state_bytes.len() as u64,
+            window.attribution_dropped_sends,
+            window.attribution_dropped_bytes,
+            60,
+        );
+        let top_sum: u64 = json["top_contracts_by_full_state_bytes"]
+            .as_array()
+            .expect("top contracts must be an array")
+            .iter()
+            .map(|e| e["bytes"].as_u64().expect("bytes must be a number"))
+            .sum();
+        let other = json["other_contracts_bytes"].as_u64().unwrap();
+        let dropped = json["attribution_dropped_bytes"].as_u64().unwrap();
+        let full_state = json["full_state_bytes"].as_u64().unwrap();
+        assert_eq!(
+            top_sum + other + dropped,
+            full_state,
+            "published schema must add up: sum(top_contracts) + \
+             other_contracts_bytes + attribution_dropped_bytes == \
+             full_state_bytes (got {top_sum} + {other} + {dropped} != \
+             {full_state})"
+        );
+    }
+
+    /// A window with more contracts than the top-N limit must still reconcile:
+    /// the untruncated remainder has to appear in `other_contracts_bytes`.
+    ///
+    /// Regression for the external-review finding — eleven 100-byte contracts
+    /// previously reported full_state_bytes = 1100, a top-list summing to
+    /// 1000, and zero dropped bytes.
+    #[test]
+    fn window_with_more_contracts_than_top_n_still_reconciles() {
+        let mix = PayloadMix::new();
+        for i in 0..(TOP_CONTRACTS_REPORTED + 1) {
+            mix.record_delivered(PayloadArm::FullNotEfficient, &contract(i as u8), 100);
+        }
+        let window = mix.take_window();
+        assert_reconciles(&window);
+
+        let json = payload_mix_json(
+            &window.arms(),
+            &window.top_contracts(),
+            window.contract_full_state_bytes.values().sum(),
+            window.contract_full_state_bytes.len() as u64,
+            window.attribution_dropped_sends,
+            window.attribution_dropped_bytes,
+            60,
+        );
+        assert_eq!(json["full_state_bytes"], 1100);
+        assert_eq!(
+            json["other_contracts_bytes"], 100,
+            "the 11th contract's bytes must be reported as the untruncated \
+             remainder, not silently lost"
+        );
+        assert_eq!(
+            json["attribution_dropped_bytes"], 0,
+            "nothing was DROPPED here — the cap was never reached; this is \
+             truncation, which is a different field"
+        );
+        assert_eq!(json["contracts_tracked"], 11);
+    }
+
+    /// Over-cap drops and top-N truncation are different omissions and must
+    /// reconcile together.
+    #[test]
+    fn truncation_and_over_cap_drops_reconcile_together() {
+        let mix = PayloadMix::new();
+        for i in 0..(MAX_TRACKED_CONTRACTS + 5) {
+            let mut raw = [0u8; 32];
+            raw[0] = (i % 256) as u8;
+            raw[1] = (i / 256) as u8;
+            mix.record_delivered(PayloadArm::FullNoSummary, &ContractInstanceId::new(raw), 10);
+        }
+        let window = mix.take_window();
+        assert!(
+            window.attribution_dropped_bytes > 0,
+            "cap must have been hit"
+        );
+        assert_reconciles(&window);
     }
 
     /// Concurrent recorders racing a rollup must not lose or double-count
@@ -580,7 +694,7 @@ mod tests {
             (PayloadArm::FullComputeFailed, 0, 0),
             (PayloadArm::FullNoSummary, 0, 0),
         ];
-        let json = payload_mix_json(&arms, &[], 0, 0, 60);
+        let json = payload_mix_json(&arms, &[], 0, 0, 0, 0, 60);
         assert_eq!(json["total_bytes"], 1000);
         assert_eq!(json["full_state_bytes"], 700);
         assert_eq!(json["full_state_byte_share"], 0.7);
@@ -593,7 +707,7 @@ mod tests {
     #[test]
     fn empty_window_reports_zero_share_not_nan() {
         let arms: Vec<_> = PayloadArm::ALL.iter().map(|a| (*a, 0, 0)).collect();
-        let json = payload_mix_json(&arms, &[], 0, 0, 60);
+        let json = payload_mix_json(&arms, &[], 0, 0, 0, 0, 60);
         assert_eq!(json["full_state_byte_share"], 0.0);
         assert_eq!(json["total_bytes"], 0);
     }
