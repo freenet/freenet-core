@@ -3569,6 +3569,19 @@ mod tests {
             SHELL_BRIDGE_JS.contains("function installNotifyClickListener("),
             "the SW click-forward listener must be a standalone, eagerly-installed function"
         );
+        // It must be CALLED at BOTH sites: lazily inside ensureNotifyServiceWorker
+        // AND eagerly at shell startup. Assert two call sites by count, so
+        // removing the eager call — reverting to lazy-only installation and
+        // reintroducing the "click lost after reload" bug this fixes — fails
+        // this test. (The `function installNotifyClickListener() {` definition
+        // is `…()` + ` {`, not `…();`, so it isn't counted here.)
+        assert!(
+            SHELL_BRIDGE_JS
+                .matches("installNotifyClickListener();")
+                .count()
+                >= 2,
+            "installNotifyClickListener() must be called BOTH lazily and eagerly at startup"
+        );
     }
 
     /// Regression for #4849: the notification-proxy flood-cap (the rolling

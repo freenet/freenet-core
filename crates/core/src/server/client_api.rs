@@ -1023,6 +1023,17 @@ mod tests {
             content_type.contains("javascript"),
             "service worker must be served as JavaScript so the browser accepts it; got: {content_type}"
         );
+        // The worker makes no network requests, so its own execution context is
+        // locked to `default-src 'none'` (defense-in-depth). Pin the header so a
+        // refactor can't silently drop it. Read before consuming the body below.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("default-src 'none'"),
+            "the served worker must carry a locked-down CSP"
+        );
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let src = std::str::from_utf8(&body).unwrap();
