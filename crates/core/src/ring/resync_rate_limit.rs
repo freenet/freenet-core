@@ -348,6 +348,33 @@ impl OutstandingResyncRequests {
         }
     }
 
+    /// Read-only: is there a NON-EXPIRED outstanding request for
+    /// `(contract, peer)`?
+    ///
+    /// Unlike [`Self::consume`] this does NOT remove the entry, so the receive
+    /// arm's one-shot authorization stays intact.
+    ///
+    /// This is the "did our `ResyncRequest` land?" signal for the queue-full
+    /// resync retry (#4863). The entry is removed exactly when a matching
+    /// `ResyncResponse` is accepted at the receive arm, so `false` means one of:
+    ///
+    /// - the response already arrived and was applied — the heal is DONE and
+    ///   re-sending the request would only make the sender clear its summary and
+    ///   ship full state again, onto a receiver whose queue was just full;
+    /// - the request was never correlated (a brand-new key dropped at the strict
+    ///   cap in [`Self::record`]) — then the eventual response would be rejected
+    ///   as unsolicited anyway, so re-sending cannot heal anything either;
+    /// - the entry expired (TTL) — same rejection, same conclusion.
+    ///
+    /// In every case a re-dispatch is pointless, so the retry skips. `true`
+    /// (request still outstanding) is the only case where a retry can help.
+    pub fn is_outstanding(&self, contract: ContractInstanceId, peer: SocketAddr) -> bool {
+        let now = self.time_source.now();
+        self.entries
+            .get(&(contract, peer))
+            .is_some_and(|emitted| now.saturating_duration_since(*emitted) <= self.ttl)
+    }
+
     /// Drop entries older than the TTL. Call from the Ring reaper so a burst of
     /// requests whose responses never arrive cannot pin memory past the TTL.
     pub fn cleanup(&self) {
@@ -423,6 +450,56 @@ mod tests {
         );
     }
 
+    /// #4863: `is_outstanding` is the queue-full retry's "did our request land?"
+    /// signal. It must be READ-ONLY (leaving the receive arm's one-shot
+    /// authorization intact), scoped per `(contract, peer)`, and TTL-aware — an
+    /// expired entry's response would be rejected anyway, so it is not a live
+    /// request.
+    #[test]
+    fn outstanding_resync_is_outstanding_is_read_only_and_ttl_aware() {
+        let ts = SharedMockTimeSource::new();
+        let m = new_outstanding_resync_requests(Arc::new(ts.clone()));
+        let c = mk_contract(1);
+        let peer = mk_peer(1);
+
+        // Nothing recorded → not outstanding.
+        assert!(!m.is_outstanding(c, peer));
+
+        m.record(c, peer);
+        assert!(m.is_outstanding(c, peer), "a fresh record is outstanding");
+
+        // Scoped per (contract, peer) — a different peer or contract is unrelated.
+        assert!(!m.is_outstanding(c, mk_peer(2)));
+        assert!(!m.is_outstanding(mk_contract(2), peer));
+
+        // READ-ONLY: repeated checks must not remove the entry, so the receive
+        // arm's require-and-consume still succeeds afterwards.
+        assert!(m.is_outstanding(c, peer));
+        assert_eq!(m.len(), 1, "is_outstanding must not remove the entry");
+        assert!(
+            m.consume(c, peer),
+            "the receive arm's one-shot authorization must survive is_outstanding"
+        );
+
+        // Once consumed (the ResyncResponse landed and was applied), the request
+        // is no longer outstanding — this is what makes the retry skip.
+        assert!(
+            !m.is_outstanding(c, peer),
+            "a consumed request must read as landed so the #4863 retry skips"
+        );
+
+        // TTL-aware: an entry past the TTL is not a live request (its response
+        // would be rejected as unsolicited, so re-dispatching cannot heal).
+        m.record(c, peer);
+        ts.advance_time(OUTSTANDING_RESYNC_TTL - Duration::from_millis(1));
+        assert!(
+            m.is_outstanding(c, peer),
+            "just under the TTL is still live"
+        );
+        ts.advance_time(Duration::from_millis(2));
+        assert!(!m.is_outstanding(c, peer), "past the TTL is not live");
+    }
+
     #[test]
     fn outstanding_resync_is_scoped_per_contract_and_peer() {
         let ts = SharedMockTimeSource::new();
@@ -487,6 +564,10 @@ mod tests {
         assert_eq!(m.len(), MAX_TRACKED_KEYS, "over-cap insert is dropped");
         // Its response is therefore treated as unsolicited.
         assert!(!m.consume(overflow_c, overflow_peer));
+        // ...and it reads as NOT outstanding, so the #4863 queue-full retry skips
+        // it: an un-correlated request's response would be dropped without
+        // applying, so re-dispatching it could not heal anything either.
+        assert!(!m.is_outstanding(overflow_c, overflow_peer));
     }
 
     #[test]

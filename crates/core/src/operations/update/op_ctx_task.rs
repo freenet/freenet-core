@@ -1206,6 +1206,22 @@ async fn send_queue_full_resync_request(
         reason = "queue_full",
         "UPDATE relay: sending rate-limited ResyncRequest after queue-full drop (#4857)"
     );
+    // #4864 round-8: record the outstanding request so the matching ResyncResponse
+    // from this peer is authorized ONCE at the receive arm; an unsolicited or
+    // replayed response finds no entry and is dropped without running WASM.
+    //
+    // #4863: this MUST stay ABOVE the retry spawn below. The retry's conditional
+    // gate READS this record to decide whether the first request already landed
+    // (the receive arm consumes it on a matching ResyncResponse), so a retry task
+    // that could observe a not-yet-written record would conclude "landed" and skip
+    // the heal. Recording first makes that race structurally impossible; pinned by
+    // `queue_full_resync_retry_is_bounded_and_reservation_scoped`. Recording is a
+    // non-blocking map insert, so it does not delay the spawn (#4862 P2).
+    op_manager
+        .ring
+        .outstanding_resync_requests
+        .record(*key.id(), sender_addr);
+
     // #4862 (P2): the immediate ResyncRequest below rides a LOSSY path
     // (`notify_node_event` → event loop → `P2pBridge::try_send`), which can drop
     // it under the SAME backpressure that caused the queue-full drop. If dropped,
@@ -1222,8 +1238,11 @@ async fn send_queue_full_resync_request(
     // throttle's own clock) so it can NEVER spill into a new reservation. The
     // retries re-deliver the ONE already-authorized emit, so they do NOT
     // re-consult the per-sender throttle or the global emit cap and do NOT
-    // re-record the outstanding request (a redundant response for an
-    // already-consumed record is correctly dropped by #4864 before WASM).
+    // re-record the correlation entry recorded above.
+    //
+    // #4863: each attempt is CONDITIONAL on that correlation entry still being
+    // outstanding, so a retry fires only while the first request is NOT observed
+    // to have landed.
     //
     // #4862 P1: gate the spawn on a node-wide retry-task slot so the throttle LRU
     // evicting active reservations under key churn cannot spawn unbounded
@@ -1244,18 +1263,10 @@ async fn send_queue_full_resync_request(
         });
     }
 
-    // #4864 round-8: record the outstanding request (immediately before the emit
-    // so the round-8 pin's proximity check holds) so the matching ResyncResponse
-    // from this peer is authorized ONCE at the receive arm; an unsolicited or
-    // replayed response finds no entry and is dropped without running WASM. The
-    // #4862 trailing retry above re-sends the SAME request and relies on THIS one
-    // record — see `resend_queue_full_resync_request`.
-    op_manager
-        .ring
-        .outstanding_resync_requests
-        .record(*key.id(), sender_addr);
-
-    // Immediate (first) ResyncRequest — blocking best-effort enqueue.
+    // Immediate (first) ResyncRequest — blocking best-effort enqueue. The
+    // #4862 trailing retry above re-sends the SAME request and relies on the ONE
+    // correlation record made before the spawn — see
+    // `resend_queue_full_resync_request`.
     if let Err(e) = op_manager
         .notify_node_event(NodeEvent::SendInterestMessage {
             target: sender_addr,
@@ -1348,12 +1359,22 @@ fn jittered_resync_retry_delay(attempt: u32) -> Duration {
 /// clocks coincide and the injected stop fires first, so the floor is a no-op;
 /// it only takes effect when the injected clock stalls.
 ///
+/// Conditional (#4863): each attempt re-dispatches ONLY while the caller's
+/// request is still outstanding in the correlation map. The `ResyncResponse`
+/// receive arm consumes that entry before applying, so its absence means the
+/// heal already landed end-to-end — and re-dispatching then would make the sender
+/// clear its summary and ship FULL STATE again onto a receiver whose queue was
+/// just full (up to [`QUEUE_FULL_RESYNC_MAX_RETRIES`] redundant full-state
+/// responses per drop). The check is READ-ONLY (`is_outstanding`, never
+/// `consume`): consuming the entry here would make the genuine response look
+/// unsolicited and be dropped without applying.
+///
 /// Storm bound (#4251 / #4864 cap): this fn RE-DELIVERS the one already-authorized
 /// emit — it deliberately does NOT call `begin_resync_request` (no new
 /// reservation), does NOT consume a `resync_emit_limiter` token (no new global
-/// emit), and does NOT re-record `outstanding_resync_requests` (the initial
-/// record authorizes the eventual response once; a redundant response is dropped
-/// by #4864 before WASM). All its sends belong to the single reservation already
+/// emit), and does NOT re-record the correlation entry (the caller's one record
+/// authorizes the eventual response once; a redundant response is dropped by
+/// #4864 before WASM). All its sends belong to the single reservation already
 /// granted by the caller. Combined with the deadline stop, steady-state stays
 /// capped at one reservation (≤ `1 + MAX` sends) per (contract, peer) per window.
 ///
@@ -1436,6 +1457,49 @@ async fn resend_queue_full_resync_request(
                 return;
             }
             tokio::time::sleep(QUEUE_FULL_RESYNC_RETRY_POLL_INTERVAL).await;
+        }
+
+        // #4863: CONDITIONAL re-dispatch. Every ResyncRequest makes the sender
+        // clear its cached summary of us and re-send FULL contract state, so a
+        // BLIND retry lands up to MAX redundant full-state ResyncResponses on a
+        // receiver whose queue was full moments ago. Re-dispatch only while the
+        // request is NOT observed to have landed.
+        //
+        // The signal is the #4864 round-8 correlation record: the ResyncResponse
+        // receive arm (node.rs) require-and-CONSUMES the (contract, sender) entry
+        // before applying, so its absence is an END-TO-END confirmation — the
+        // request landed, the sender answered, and we authorized the answer. Any
+        // other reason the entry is gone (never recorded at the strict cap, or
+        // TTL-expired) means the eventual response would be dropped as
+        // unsolicited, so a re-dispatch could not heal anything either way. See
+        // `OutstandingResyncRequests::is_outstanding`.
+        //
+        // Read-only on purpose: the retry must NOT consume the entry — that
+        // authorization belongs to the receive arm, and consuming it here would
+        // make the real response look unsolicited (dropped without applying).
+        //
+        // Return, don't continue: once the heal has landed every REMAINING
+        // attempt is redundant too, and returning frees the node-wide retry slot
+        // (#4862 P1) via its RAII guard instead of holding it for the rest of the
+        // window. The residual case this cannot cover is a request that landed but
+        // whose response is still in flight — bounded by the same `1 + MAX` cap as
+        // before, never worse than the blind retry it replaces.
+        if !op_manager
+            .ring
+            .outstanding_resync_requests
+            .is_outstanding(*key.id(), sender_addr)
+        {
+            tracing::debug!(
+                tx = %incoming_tx,
+                contract = %key,
+                target = %sender_addr,
+                attempt,
+                event = "queue_full_resync_retry_skipped_landed",
+                "UPDATE relay: queue-full ResyncRequest already landed (its \
+                 ResyncResponse was consumed), skipping the redundant \
+                 full-state re-dispatch (#4863)"
+            );
+            return;
         }
 
         match op_manager.try_notify_node_event(NodeEvent::SendInterestMessage {
@@ -4510,14 +4574,26 @@ mod tests {
                 continue;
             }
             emits += 1;
-            // Look back a bounded window for the record call that authorizes the
-            // ResyncResponse this emit will provoke (fmt-robust: match the field
-            // identifier, which survives line-wrapping of the method chain).
-            let window_start = pos.saturating_sub(600);
+            // Look back to the start of the ENCLOSING production fn for the record
+            // call that authorizes the ResyncResponse this emit will provoke
+            // (fmt-robust: match the field identifier, which survives
+            // line-wrapping of the method chain).
+            //
+            // This was a fixed 600-byte lookback until #4863 moved the queue-full
+            // helper's record ABOVE the retry spawn — the retry's conditional gate
+            // reads that record, so it must exist before the task can observe it —
+            // which pushed the record out of a byte window that was always an
+            // arbitrary proxy for "same statement sequence". Scoping to the
+            // enclosing fn keeps the real guarantee (an emit is preceded by its
+            // record, on the same code path) without the brittle distance.
+            let fn_start = prod[..pos]
+                .rfind("\nasync fn ")
+                .max(prod[..pos].rfind("\nfn "))
+                .unwrap_or(0);
             assert!(
-                prod[window_start..pos].contains("outstanding_resync_requests"),
+                prod[fn_start..pos].contains("outstanding_resync_requests"),
                 "a production ResyncRequest emit at byte {pos} is NOT preceded by an \
-                 outstanding_resync_requests.record(...) within 600 bytes — the \
+                 outstanding_resync_requests.record(...) in the same fn — the \
                  receive arm would drop its response as unsolicited (#4864 round-8)"
             );
         }
@@ -5163,6 +5239,178 @@ mod tests {
         );
     }
 
+    /// Issue #4863: the #4862 trailing retry must be CONDITIONAL — it must NOT
+    /// re-dispatch once the first queue-full `ResyncRequest` is observed to have
+    /// landed. Every `ResyncRequest` makes the sender clear its cached summary
+    /// of us and re-send FULL contract state, so a blind retry lands up to
+    /// `QUEUE_FULL_RESYNC_MAX_RETRIES` redundant full-state `ResyncResponse`s on
+    /// a receiver whose queue was full moments ago — the exact amplification the
+    /// #4251 storm bound exists to avoid.
+    ///
+    /// The observed-landed signal is the #4864 round-8 correlation record: the
+    /// `ResyncResponse` receive arm (`node.rs`) require-and-CONSUMES the
+    /// `(contract, sender)` entry before applying, so the entry's absence is an
+    /// END-TO-END confirmation that the request landed, the sender answered, and
+    /// we authorized the answer.
+    ///
+    /// This drives ONE queue-full drop, then simulates the response landing
+    /// exactly the way the receive arm does (consume the record), then advances
+    /// the throttle's clock across the whole retry burst window. NO retry may
+    /// fire. It also asserts the node-wide retry slot (#4862 P1) is RELEASED on
+    /// the skip rather than burned.
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_skipped_once_response_landed() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4863-landed").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([17u8; 32]),
+            CodeHash::new([18u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12700".parse().unwrap();
+
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "the immediate (pre-retry) ResyncRequest must fire exactly once"
+        );
+
+        // The sender's `ResyncResponse` arrives: `node.rs`'s receive arm
+        // require-and-consumes the outstanding correlation record before applying
+        // the full state. Doing exactly that here IS the "first request landed"
+        // event, from the retry's point of view.
+        assert!(
+            op_manager
+                .ring
+                .outstanding_resync_requests
+                .consume(*key.id(), sender_addr),
+            "the helper must have recorded the outstanding request, so the \
+             matching ResyncResponse is authorized once (#4864 round-8)"
+        );
+
+        // Advance the throttle's clock across the whole retry burst (20s, under
+        // the 30s reservation deadline) — the same pacing the blind-retry test
+        // uses to observe both retries.
+        let mut retries = Vec::new();
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            retries.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+
+        assert!(
+            retries.is_empty(),
+            "the first ResyncRequest already landed (its ResyncResponse was \
+             received and consumed), so the trailing retry MUST NOT re-dispatch \
+             — each redundant request costs another full-state ResyncResponse \
+             onto a just-saturated receiver (#4863). Got {retries:?}"
+        );
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "skipping the retry must RELEASE the node-wide retry slot (the task \
+             returns and its RAII guard drops), never burn it (#4862 P1)"
+        );
+    }
+
+    /// Issue #4863 (edge case): the conditional gate is re-evaluated on EVERY
+    /// attempt, not just the first. When the `ResyncResponse` lands between
+    /// retry 1 and retry 2, retry 1 legitimately fired (nothing had landed yet)
+    /// but retry 2 MUST be skipped.
+    ///
+    /// This is the partial-heal case a first-attempt-only check would miss, and
+    /// it also proves the gate stops the burst rather than merely delaying it.
+    #[tokio::test(start_paused = true)]
+    async fn queue_full_resync_retry_stops_at_the_attempt_after_response_lands() {
+        let (op_manager, mut notification_rx, _guard) =
+            build_queue_full_test_node("queue-full-resync-4863-midburst").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([19u8; 32]),
+            CodeHash::new([20u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12800".parse().unwrap();
+
+        let r1 = drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 2, 3]),
+            Vec::new(),
+            sender_addr,
+        )
+        .await;
+        assert!(
+            r1.as_ref()
+                .err()
+                .is_some_and(|e| e.is_contract_queue_full()),
+            "expected a queue-full error from the stand-in handler, got {r1:?}"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, key),
+            vec![sender_addr],
+            "the immediate (pre-retry) ResyncRequest must fire exactly once"
+        );
+
+        // Nothing has landed yet → the FIRST retry must still fire (the #4857
+        // heal for a genuinely bridge-dropped request is preserved).
+        let mut retries = Vec::new();
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            retries.extend(drain_resync_targets(&mut notification_rx, key));
+            if !retries.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            retries.len(),
+            1,
+            "with nothing landed, the first trailing retry MUST still fire \
+             (preserves the #4857 heal), got {retries:?}"
+        );
+
+        // NOW the response lands (receive arm consumes the correlation record).
+        assert!(
+            op_manager
+                .ring
+                .outstanding_resync_requests
+                .consume(*key.id(), sender_addr),
+            "the outstanding record must still be present before the response lands"
+        );
+
+        // Advance across the remaining burst window; retry 2 must be skipped.
+        for _ in 0..30 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            retries.extend(drain_resync_targets(&mut notification_rx, key));
+        }
+        assert_eq!(
+            retries.len(),
+            1,
+            "once the response lands mid-burst, every REMAINING attempt must be \
+             skipped — the gate is re-evaluated per attempt (#4863). Got {retries:?}"
+        );
+        assert_eq!(
+            op_manager.interest_manager.outstanding_resync_retries(),
+            0,
+            "the retry task must exit and free its node-wide slot (#4862 P1)"
+        );
+    }
+
     /// Issue #4857 (P2, review P2-A): the trailing retry burst is anchored to
     /// the reservation deadline on the throttle's OWN clock. If the injected
     /// clock crosses that deadline before a retry's target is reached, the retry
@@ -5257,6 +5505,16 @@ mod tests {
         // so `now >= target` and `now >= reservation_deadline` never hold and
         // only the tokio backstop can stop the task.
         let reservation_deadline = op_manager.interest_manager.now() + Duration::from_secs(30);
+
+        // This test drives the retry DIRECTLY, so it must first do what the real
+        // caller (`send_queue_full_resync_request`) does: record the outstanding
+        // request. Without it the #4863 landed-gate would short-circuit every
+        // attempt and this test would pass for the WRONG reason (skipped, not
+        // stopped by the liveness backstop).
+        op_manager
+            .ring
+            .outstanding_resync_requests
+            .record(*key.id(), sender_addr);
 
         let op_mgr = op_manager.clone();
         let handle = tokio::spawn(async move {
@@ -5381,6 +5639,14 @@ mod tests {
         // Deadline only 500ms out — much less than jittered_resync_retry_delay(1)
         // (~1.6-2.4s), so a fixed first target would exceed it.
         let reservation_deadline = op_manager.interest_manager.now() + Duration::from_millis(500);
+        // Driving the retry DIRECTLY, so record the outstanding request the way
+        // the real caller (`send_queue_full_resync_request`) does — otherwise the
+        // #4863 landed-gate skips every attempt and this test would fail for a
+        // reason unrelated to the clamp it is pinning.
+        op_manager
+            .ring
+            .outstanding_resync_requests
+            .record(*key.id(), sender_addr);
         let op_mgr = op_manager.clone();
         let handle = tokio::spawn(async move {
             resend_queue_full_resync_request(
@@ -5500,20 +5766,58 @@ mod tests {
              begin_resync_request into the retry (anchor to the window, P2-A)"
         );
 
+        // (1d) #4863: the correlation record MUST be written BEFORE the retry
+        // spawn. The retry's conditional gate READS that record to decide whether
+        // the first request already landed; a task spawned before the record
+        // exists could observe "absent", conclude "landed", and skip the heal.
+        let record = helper.find(".record(*key.id(), sender_addr)").expect(
+            "helper must record the outstanding request for receive-arm \
+             correlation (#4864 round-8)",
+        );
+        assert!(
+            record < spawn,
+            "the outstanding-request record ({record}) MUST precede the retry \
+             spawn ({spawn}) — the retry's #4863 conditional gate reads it, and a \
+             task that could observe a not-yet-written record would skip the heal"
+        );
+
         // (2) The retry body RE-DELIVERS the one already-authorized emit: it must
         // NOT re-consult the per-sender throttle (begin_resync_request), the
-        // global emit cap (resync_emit_limiter), or re-record the outstanding
-        // request (outstanding_resync_requests) — so it creates no new reservation
-        // and consumes no extra global token (storm bound #4251 / #4864 cap).
+        // global emit cap (resync_emit_limiter), re-record the correlation entry
+        // (`.record(`), or CONSUME it (`.consume(` — that one-shot authorization
+        // belongs to the receive arm; consuming it here would make the genuine
+        // ResyncResponse look unsolicited). So the retry creates no new
+        // reservation and consumes no extra global token (storm bound #4251 /
+        // #4864 cap).
         let retry = fn_body("async fn resend_queue_full_resync_request(");
         assert!(
             !retry.contains("begin_resync_request")
                 && !retry.contains("resync_emit_limiter")
-                && !retry.contains("outstanding_resync_requests"),
-            "resend_queue_full_resync_request must NOT re-consult the throttle, the \
-             global emit cap, or re-record the outstanding request — its sends \
-             belong to the caller's single granted reservation (storm bound \
-             #4251 / #4864 cap)"
+                && !retry.contains(".record(")
+                && !retry.contains(".consume("),
+            "resend_queue_full_resync_request must NOT re-consult the throttle or \
+             the global emit cap, and must neither re-record NOR consume the \
+             outstanding-request entry — its sends belong to the caller's single \
+             granted reservation, and the entry's consumption belongs to the \
+             ResyncResponse receive arm (storm bound #4251 / #4864 cap)"
+        );
+
+        // (2a) #4863: every re-dispatch is GATED on the outstanding-request entry
+        // still being present (read-only). A blind retry re-sends a request that
+        // already landed, which makes the sender clear its summary and ship FULL
+        // STATE again onto a receiver whose queue was just full.
+        let landed_gate = retry.find("is_outstanding(").expect(
+            "the retry must gate each re-dispatch on \
+             outstanding_resync_requests.is_outstanding(...) (#4863)",
+        );
+        let retry_emit = retry
+            .find("try_notify_node_event(")
+            .expect("the retry must emit via the non-blocking try_notify_node_event");
+        assert!(
+            landed_gate < retry_emit,
+            "the #4863 landed-gate ({landed_gate}) MUST be checked BEFORE the \
+             re-dispatch ({retry_emit}) — checking after would send the redundant \
+             request anyway"
         );
         assert!(
             retry.contains("in 1..=QUEUE_FULL_RESYNC_MAX_RETRIES"),
