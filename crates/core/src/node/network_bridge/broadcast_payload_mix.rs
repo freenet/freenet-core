@@ -249,6 +249,26 @@ struct NotEfficientSizes {
     /// two have completely different causes and the ratio cannot distinguish
     /// them (anything over zero state is ">= 50 %").
     zero_state_samples: u64,
+    /// Refusals whose recorded sizes say the gate should have PASSED:
+    /// `state_size != 0 && summary_size * 2 < state_size`.
+    ///
+    /// By [`is_delta_efficient`][ide]'s own logic this is impossible — those
+    /// are exactly the inputs it returns `true` for, which would have produced
+    /// a delta rather than this arm. **A non-zero value here is therefore
+    /// proof that the sizes reaching this arm are not the sizes the gate
+    /// evaluated**, i.e. the arm is mis-attributed at the classification site
+    /// and the efficiency gate is not the cause at all.
+    ///
+    /// That is the one candidate explanation a fix would most easily be built
+    /// in the wrong direction against, and it is the one the min/max fields
+    /// cannot settle on their own: they are computed independently across the
+    /// two dimensions, so a large `summary_max` and a small `state_min` may
+    /// come from different sends and must not be combined into a ratio. This
+    /// counter evaluates the predicate per sample, where the pair is still
+    /// together, so it is unambiguous.
+    ///
+    /// [ide]: crate::ring::interest::is_delta_efficient
+    ratio_would_have_passed: u64,
 }
 
 impl NotEfficientSizes {
@@ -274,6 +294,12 @@ impl NotEfficientSizes {
         self.state_sum = self.state_sum.saturating_add(state);
         if state == 0 {
             self.zero_state_samples = self.zero_state_samples.saturating_add(1);
+        } else if summary.saturating_mul(2) < state {
+            // Impossible per `is_delta_efficient` — see the field's rustdoc.
+            // Deliberately mirrors the gate's predicate verbatim rather than
+            // calling it, so this stays a check on the RECORDED sizes even if
+            // the gate's own definition later changes.
+            self.ratio_would_have_passed = self.ratio_would_have_passed.saturating_add(1);
         }
     }
 }
@@ -515,6 +541,12 @@ fn payload_mix_json(
     obj.insert(
         "not_efficient_zero_state_sends".into(),
         not_efficient.zero_state_samples.into(),
+    );
+    // Tripwire: must be 0. Any other value proves the sizes recorded on this
+    // arm are not the sizes the gate evaluated. See the field's rustdoc.
+    obj.insert(
+        "not_efficient_ratio_would_have_passed".into(),
+        not_efficient.ratio_would_have_passed.into(),
     );
     let mean = |sum: u64| -> serde_json::Value {
         if not_efficient.samples == 0 {
@@ -1168,6 +1200,71 @@ mod tests {
              and must be countable on its own"
         );
         assert_eq!(json["not_efficient_state_bytes_min"], 0);
+        assert_eq!(
+            json["not_efficient_ratio_would_have_passed"], 0,
+            "a zero-state refusal is the gate's explicit early return, NOT a \
+             ratio that would have passed — conflating them would point the \
+             tripwire at the wrong cause"
+        );
+    }
+
+    /// The mis-attribution tripwire. `is_delta_efficient` returns `true` for
+    /// `summary * 2 < state` with non-zero state, so such a send should have
+    /// produced a DELTA, never this arm. If it lands here anyway, the sizes
+    /// recorded are not the sizes the gate evaluated — the arm is
+    /// mis-attributed at the classification site and the gate is not the cause.
+    ///
+    /// This is the hypothesis a fix would most easily be built in the wrong
+    /// direction against, and the one the independent min/max fields cannot
+    /// settle: they may draw their extremes from different sends, so a large
+    /// `summary_max` and a small `state_min` must not be combined into a ratio.
+    /// Evaluating the predicate per sample, while the pair is still together,
+    /// is what makes it unambiguous.
+    #[test]
+    fn sizes_that_should_have_passed_the_gate_trip_the_misattribution_counter() {
+        let mix = PayloadMix::new();
+        // The River room's measured shape: 33,804 B summary on a 251,887 B
+        // state is 13.4 %, far under the 50 % threshold. The gate would have
+        // returned true, so reaching FullNotEfficient with these sizes is
+        // self-contradictory.
+        mix.record_delivered(
+            PayloadArm::FullNotEfficient,
+            &contract(1),
+            254_000,
+            Some(sizes(33_804, 251_887)),
+        );
+        let json = json_of(&mix);
+        assert_eq!(
+            json["not_efficient_ratio_would_have_passed"], 1,
+            "sizes the gate would have passed must trip the mis-attribution \
+             tripwire — that is the whole point of recording them"
+        );
+        assert_eq!(json["not_efficient_zero_state_sends"], 0);
+    }
+
+    /// The tripwire must stay silent on inputs the gate genuinely refuses,
+    /// including the exact boundary. `summary * 2 < state` is strict, so
+    /// `summary * 2 == state` is a real refusal, not a mis-attribution.
+    #[test]
+    fn genuine_refusals_including_the_boundary_do_not_trip_the_counter() {
+        for (summary, state) in [
+            (127_000usize, 250_000usize), // summary > 50 % — a real refusal
+            (125_000, 250_000),           // exactly 50 % — boundary, still refused
+        ] {
+            let mix = PayloadMix::new();
+            mix.record_delivered(
+                PayloadArm::FullNotEfficient,
+                &contract(1),
+                10,
+                Some(sizes(summary, state)),
+            );
+            let json = json_of(&mix);
+            assert_eq!(
+                json["not_efficient_ratio_would_have_passed"], 0,
+                "summary={summary} state={state} is a genuine refusal by the \
+                 gate's own predicate and must not read as mis-attribution"
+            );
+        }
     }
 
     /// An idle window must publish `null`, not `0`. A zero minimum summary is a
