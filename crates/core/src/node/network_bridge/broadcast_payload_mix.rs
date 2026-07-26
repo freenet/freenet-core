@@ -379,9 +379,24 @@ impl PayloadMix {
         let mut w = self.window.lock();
         if arm == PayloadArm::FullNoTheirSummaryTracked {
             if let Some(reason) = missing_reason {
+                // Fallible indexing, NOT `[r]`. Adding a variant to
+                // `SummaryMissingReason` forces `index()` and `as_str()` to be
+                // updated (both are exhaustive matches) but does NOT force
+                // `ALL` to be extended, and `ALL.len()` sizes these arrays. So
+                // the plausible sequence "add variant, fix the two compile
+                // errors, forget ALL" yields an out-of-range index — which as
+                // `[r]` would PANIC inside a held mutex on the broadcast send
+                // path. Degrading to the unattributed residual instead is
+                // strictly better: the miss stays visible (the per-reason sums
+                // no longer cover the arm total) and no send path dies for a
+                // telemetry bookkeeping slip.
+                // One bounds check covers both arrays: they are declared with
+                // the same `ALL.len()` const expression, so they cannot differ.
                 let r = reason.index();
-                w.tracked_missing_sends[r] = w.tracked_missing_sends[r].saturating_add(1);
-                w.tracked_missing_bytes[r] = w.tracked_missing_bytes[r].saturating_add(bytes);
+                if r < w.tracked_missing_sends.len() {
+                    w.tracked_missing_sends[r] = w.tracked_missing_sends[r].saturating_add(1);
+                    w.tracked_missing_bytes[r] = w.tracked_missing_bytes[r].saturating_add(bytes);
+                }
             }
         }
         if arm == PayloadArm::FullNotEfficient {

@@ -990,10 +990,16 @@ pub(super) async fn broadcast_to_single_peer(
                 .interest_manager
                 .get_peer_interest(&key, &peer_key)
             {
-                // The entry is tracked and (by this match arm) summaryless, so
-                // the reason tag is always readable here — #4961 needs it to
-                // tell the three clear paths apart, since they have three
-                // different fixes and this is the largest broadcast-byte arm.
+                // #4961 needs this to tell the three clear paths apart, since
+                // they have three different fixes and this is the largest
+                // broadcast-byte arm.
+                //
+                // Usually `Some`: this match arm means `their_summary` was
+                // `None`. But that was read further up, before an `.await`, so
+                // a concurrent upsert in between leaves the entry holding a
+                // summary and this reads `None`. That send is then counted in
+                // `tracked_missing_unattributed_*` rather than being charged to
+                // a cause that did not produce it.
                 tracked_missing_reason = interest.summary_missing_reason();
                 PayloadArm::FullNoTheirSummaryTracked
             } else {
