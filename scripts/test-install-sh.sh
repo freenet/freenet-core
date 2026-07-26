@@ -41,32 +41,103 @@ check_eq() {
     fi
 }
 
-# Call the pure decide function: decide_linux_service_mode AM_ROOT CAN_ELEVATE
+# Call the pure decide function: decide_linux_service_mode AM_ROOT CAN_ELEVATE [INSTALL_DIR]
 decide() {
     FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
         . "$INSTALL"
-        decide_linux_service_mode "$1" "$2"
-    ' _ "$1" "$2"
+        decide_linux_service_mode "$1" "$2" "$3"
+    ' _ "$1" "$2" "${3:-/usr/local/bin}"
+}
+
+# Call decide with a custom HOME so ${HOME:-} matching can be exercised.
+#   $1: am_root, $2: can_elevate, $3: install_dir, $4: HOME override
+decide_with_home() {
+    HOME="$4" FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+        export HOME
+        . "$INSTALL"
+        decide_linux_service_mode "$1" "$2" "$3"
+    ' _ "$1" "$2" "$3"
 }
 
 # Call resolve_service_action with a snippet of helper overrides applied first.
-#   $1: override snippet (shell code), $2: interactive flag ("1"/"0")
+#   $1: override snippet (shell code), $2: interactive flag ("1"/"0"),
+#   $3: install_dir (optional, defaults to /usr/local/bin)
 resolve_with() {
     overrides=$1
     inter=$2
+    install_dir=${3:-/usr/local/bin}
     FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
         . "$INSTALL"
         '"$overrides"'
-        resolve_service_action "$1"
+        resolve_service_action "$1" "'"$install_dir"'"
     ' _ "$inter"
 }
 
 # ── decide_linux_service_mode: pure system-vs-user policy ──────────────────
 
-check_eq "decide: root + elevate -> system"      "system" "$(decide 1 1)"
-check_eq "decide: root, no-elevate -> system"    "system" "$(decide 1 0)"
-check_eq "decide: non-root + elevate -> system"  "system" "$(decide 0 1)"
-check_eq "decide: non-root, no-elevate -> user"  "user"   "$(decide 0 0)"
+check_eq "decide: root + elevate + system dir -> system"      "system" "$(decide 1 1 /usr/local/bin)"
+check_eq "decide: root, no-elevate + system dir -> system"    "system" "$(decide 1 0 /usr/local/bin)"
+check_eq "decide: non-root + elevate + system dir -> system"  "system" "$(decide 0 1 /usr/local/bin)"
+check_eq "decide: non-root, no-elevate + system dir -> user"  "user"   "$(decide 0 0 /usr/local/bin)"
+
+# User-local directories (e.g. ~/.local/bin) should always use user service
+# to avoid SELinux init_t denials (#4924).
+check_eq "decide: root + elevate + ~/.local/bin -> user"      "user"   "$(decide 1 1 /home/alice/.local/bin)"
+check_eq "decide: non-root + elevate + ~/.local/bin -> user"  "user"   "$(decide 0 1 /home/alice/.local/bin)"
+check_eq "decide: root + elevate + ~/projects -> user"        "user"   "$(decide_with_home 1 1 /home/alice/projects /home/alice)"
+
+# Path must require a separator after $HOME: /home/aliceproject should NOT
+# match $HOME=/home/alice (prefix-only match bug, fixed with "${HOME}/"*).
+check_eq "decide: /home/aliceproject/bin with HOME=/home/alice -> system" "system" \
+    "$(decide_with_home 1 1 /home/aliceproject/bin /home/alice)"
+check_eq "decide: /home/alice/project with HOME=/home/alice -> user"     "user" \
+    "$(decide_with_home 1 1 /home/alice/project /home/alice)"
+
+# HOME unset: should NOT match-everything — fall through to elevate logic.
+check_eq "decide: root + elevate + /usr/local/bin, HOME unset -> system" "system" \
+    "$(HOME= FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+        unset HOME
+        . "$INSTALL"
+        decide_linux_service_mode "$1" "$2" "$3"
+    ' _ 1 1 /usr/local/bin)"
+
+# ── restore_install_context: SELinux restorecon integration ────────────────
+
+# When restorecon is available, it must be called on the installed binaries.
+check_eq "restore: has_cmd restorecon -> calls restorecon" "called" \
+    "$(FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+        . "$INSTALL"
+        has_cmd() { case "$1" in restorecon) return 0 ;; *) return 1 ;; esac; }
+        restorecon() { printf "called"; }
+        restore_install_context /tmp/freenet-install
+    ')"
+
+# When restorecon is not available, it must NOT be called.
+_check_restore_skip() {
+    rm -f /tmp/.freenet-restore-test
+    FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+        . "$INSTALL"
+        has_cmd() { return 1; }
+        restorecon() { touch /tmp/.freenet-restore-test; }
+        restore_install_context /tmp/freenet-install
+    '
+    if [ -f /tmp/.freenet-restore-test ]; then
+        printf "called"
+    else
+        printf "not_called"
+    fi
+    rm -f /tmp/.freenet-restore-test
+}
+check_eq "restore: no restorecon cmd -> skip" "not_called" "$(_check_restore_skip)"
+
+# Verify restorecon receives the correct binary paths.
+check_eq "restore: restorecon args match install_dir" "-v /tmp/freenet-install/freenet /tmp/freenet-install/fdev" \
+    "$(FREENET_INSTALL_SH_LIB=1 INSTALL="$INSTALL" sh -c '
+        . "$INSTALL"
+        has_cmd() { case "$1" in restorecon) return 0 ;; *) return 1 ;; esac; }
+        restorecon() { printf "%s" "$*"; }
+        restore_install_context /tmp/freenet-install
+    ')"
 
 # ── resolve_service_action: existing-install routing wins ──────────────────
 
@@ -92,23 +163,23 @@ check_eq "resolve: existing user unit -> user" "user" \
 
 # ── resolve_service_action: fresh install, elevation detection ─────────────
 
-check_eq "resolve: fresh + root -> system" "system" \
+check_eq "resolve: fresh + root + system dir -> system" "system" \
     "$(resolve_with '
         is_root() { return 0; }
         sudo_noninteractive_ok() { return 1; }
         has_cmd() { return 1; }
         has_system_unit() { return 1; }
         has_user_unit() { return 1; }
-    ' 0)"
+    ' 0 /usr/local/bin)"
 
-check_eq "resolve: fresh + passwordless sudo -> system" "system" \
+check_eq "resolve: fresh + passwordless sudo + system dir -> system" "system" \
     "$(resolve_with '
         is_root() { return 1; }
         sudo_noninteractive_ok() { return 0; }
         has_cmd() { return 1; }
         has_system_unit() { return 1; }
         has_user_unit() { return 1; }
-    ' 0)"
+    ' 0 /usr/local/bin)"
 
 # Non-interactive, no root, no passwordless sudo -> user (safe supervised
 # fallback rather than leaving the node unsupervised).
@@ -119,7 +190,7 @@ check_eq "resolve: fresh + non-root + no sudo + non-interactive -> user" "user" 
         has_cmd() { return 1; }
         has_system_unit() { return 1; }
         has_user_unit() { return 1; }
-    ' 0)"
+    ' 0 /usr/local/bin)"
 
 # Interactive but sudo not installed -> user.
 check_eq "resolve: fresh + interactive + no sudo cmd -> user" "user" \
@@ -129,20 +200,33 @@ check_eq "resolve: fresh + interactive + no sudo cmd -> user" "user" \
         has_cmd() { return 1; }
         has_system_unit() { return 1; }
         has_user_unit() { return 1; }
-    ' 1)"
+    ' 1 /usr/local/bin)"
 
 # Interactive, sudo present but needs a password -> system (we can prompt).
 # SC2016: the `$1` below is intentionally literal — it is the argument of the
 # overriding has_cmd inside the sourced subshell, not a variable to expand here.
 # shellcheck disable=SC2016
-check_eq "resolve: fresh + interactive + sudo present -> system" "system" \
+check_eq "resolve: fresh + interactive + sudo present + system dir -> system" "system" \
     "$(resolve_with '
         is_root() { return 1; }
         sudo_noninteractive_ok() { return 1; }
         has_cmd() { case "$1" in sudo) return 0 ;; *) return 1 ;; esac; }
         has_system_unit() { return 1; }
         has_user_unit() { return 1; }
-    ' 1)"
+    ' 1 /usr/local/bin)"
+
+# ── resolve_service_action: user-local directory prefers user service ──────
+
+# Even with elevation available, a user-local install dir should use user
+# service to avoid SELinux init_t denials (#4924).
+check_eq "resolve: fresh + root + ~/.local/bin -> user" "user" \
+    "$(resolve_with '
+        is_root() { return 0; }
+        sudo_noninteractive_ok() { return 1; }
+        has_cmd() { return 1; }
+        has_system_unit() { return 1; }
+        has_user_unit() { return 1; }
+    ' 0 /home/alice/.local/bin)"
 
 # ── should_refresh_system_unit: same-user refresh guard ────────────────────
 
