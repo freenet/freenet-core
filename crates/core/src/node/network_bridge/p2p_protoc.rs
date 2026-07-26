@@ -2975,17 +2975,33 @@ enum ProtocolStatus {
 async fn handle_peer_channel_message(
     conn: &mut Box<dyn PeerConnectionApi>,
     msg: Either<NetMessage, ConnEvent>,
+    outbound_mix: &crate::node::network_bridge::outbound_message_mix::OutboundMix,
 ) -> Result<(), TransportError> {
     match msg {
         Left(msg) => {
             tracing::debug!(to=%conn.remote_addr() ,"Sending message to peer. Msg: {msg}");
-            if let Err(error) = conn.send_message(msg).await {
-                tracing::error!(
-                    to = %conn.remote_addr(),
-                    ?error,
-                    "[CONN_LIFECYCLE] Failed to send message to peer"
-                );
-                return Err(error);
+            // Classify BEFORE the send moves `msg`. Classification only reads
+            // the enum discriminant, so it costs nothing on this hot path.
+            let kind =
+                crate::node::network_bridge::outbound_message_mix::OutboundKind::classify(&msg);
+            match conn.send_message(msg).await {
+                Ok(serialized_len) => {
+                    // #4956: attribute the bytes to the message kind that
+                    // produced them. `send_message` returns the length it
+                    // already computed, so nothing is serialized twice.
+                    // Recorded only on a successful hand-off to the transport,
+                    // matching the payload mix's real-delivery accounting rule
+                    // so a failed send never inflates the census.
+                    outbound_mix.record_sent(kind, serialized_len);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        to = %conn.remote_addr(),
+                        ?error,
+                        "[CONN_LIFECYCLE] Failed to send message to peer"
+                    );
+                    return Err(error);
+                }
             }
             tracing::debug!(
                 to = %conn.remote_addr(),
@@ -3113,11 +3129,12 @@ async fn drain_pending_before_shutdown(
     rx: &mut PeerConnChannelRecv,
     conn: &mut Box<dyn PeerConnectionApi>,
     remote_addr: SocketAddr,
+    outbound_mix: &crate::node::network_bridge::outbound_message_mix::OutboundMix,
 ) -> usize {
     let mut drained = 0;
     while let Ok(msg) = rx.try_recv() {
         // Best-effort send - connection may already be degraded
-        if let Err(e) = handle_peer_channel_message(conn, msg).await {
+        if let Err(e) = handle_peer_channel_message(conn, msg, outbound_mix).await {
             tracing::debug!(
                 to = %remote_addr,
                 ?e,
@@ -3154,6 +3171,7 @@ async fn peer_connection_listener(
     peer_addr: SocketAddr,
     conn_events: Sender<ConnEvent>,
     connection_id: u64,
+    outbound_mix: std::sync::Arc<crate::node::network_bridge::outbound_message_mix::OutboundMix>,
 ) {
     let remote_addr = conn.remote_addr();
     tracing::debug!(
@@ -3182,7 +3200,9 @@ async fn peer_connection_listener(
             match rx.try_recv() {
                 Ok(msg) => {
                     drained += 1;
-                    if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
+                    if let Err(error) =
+                        handle_peer_channel_message(&mut conn, msg, &outbound_mix).await
+                    {
                         if error.is_transient_send_failure() {
                             tracing::warn!(
                                 to = %remote_addr,
@@ -3197,7 +3217,13 @@ async fn peer_connection_listener(
                             );
                             // Drain any messages that arrived after our try_recv() but before
                             // handle_peer_channel_message returned an error
-                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
+                            drain_pending_before_shutdown(
+                                &mut rx,
+                                &mut conn,
+                                remote_addr,
+                                &outbound_mix,
+                            )
+                            .await;
                             notify_transport_closed(
                                 &conn_events,
                                 remote_addr,
@@ -3237,7 +3263,7 @@ async fn peer_connection_listener(
             msg = rx.recv() => {
                 match msg {
                     Some(msg) => {
-                        if let Err(error) = handle_peer_channel_message(&mut conn, msg).await {
+                        if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix).await {
                             if error.is_transient_send_failure() {
                                 tracing::warn!(
                                     to = %remote_addr,
@@ -3251,7 +3277,7 @@ async fn peer_connection_listener(
                                     "[CONN_LIFECYCLE] Connection closed after channel command"
                                 );
                                 // Drain any messages that arrived while we were processing this one
-                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
+                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
                                 notify_transport_closed(&conn_events, remote_addr, error, connection_id).await;
                                 return;
                             }
@@ -3300,7 +3326,7 @@ async fn peer_connection_listener(
                                 );
                                 // Drain pending messages - they may still be sendable even if
                                 // the conn_events channel is closed
-                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
+                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
                                 return;
                             }
                         }
@@ -3311,7 +3337,7 @@ async fn peer_connection_listener(
                                 "[CONN_LIFECYCLE] Failed to deserialize inbound message; closing connection"
                             );
                             // Drain pending outbound messages before closing - they may still succeed
-                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
+                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
                             let transport_error = TransportError::Other(anyhow!(
                                 "Failed to deserialize inbound message from {remote_addr}: {error:?}"
                             ));
@@ -3338,7 +3364,7 @@ async fn peer_connection_listener(
                         // CRITICAL: Drain pending outbound messages before exiting.
                         // Messages may have been queued to the channel while we were
                         // waiting in select!, and they would be lost without this drain.
-                        drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr).await;
+                        drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
                         notify_transport_closed(&conn_events, remote_addr, error, connection_id).await;
                         return;
                     }

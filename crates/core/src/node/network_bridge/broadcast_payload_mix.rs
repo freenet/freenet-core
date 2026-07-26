@@ -210,6 +210,15 @@ struct Window {
     /// Per-contract full-state byte attribution, bounded at
     /// [`MAX_TRACKED_CONTRACTS`].
     contract_full_state_bytes: HashMap<ContractInstanceId, u64>,
+    /// Per-contract bytes for the [`PayloadArm::FullNotEfficient`] arm ONLY.
+    ///
+    /// #4956: the aggregate gate-input ratio came back at 1.000 (summary size
+    /// == state size, max 839 KB each), which means some contract is feeding
+    /// state-sized bytes in as a "summary". `contract_full_state_bytes` mixes
+    /// every full-state arm together, so it cannot say WHICH contract, and the
+    /// culprit stayed unidentifiable. This narrows it to the one arm that
+    /// matters.
+    contract_not_efficient_bytes: HashMap<ContractInstanceId, u64>,
     /// Full-state sends that could not be attributed to a contract because
     /// the cap was already reached. This counts SENDS, not distinct
     /// contracts: one over-cap contract broadcasting 1,000 times contributes
@@ -259,6 +268,7 @@ impl Default for Window {
             sends: [0; PayloadArm::COUNT],
             bytes: [0; PayloadArm::COUNT],
             contract_full_state_bytes: HashMap::new(),
+            contract_not_efficient_bytes: HashMap::new(),
             attribution_dropped_sends: 0,
             attribution_dropped_bytes: 0,
             not_efficient_summary_bytes_sum: 0,
@@ -360,6 +370,16 @@ impl PayloadMix {
         // what this measurement is for.
         w.sends[idx] = w.sends[idx].saturating_add(1);
         w.bytes[idx] = w.bytes[idx].saturating_add(bytes);
+        if arm == PayloadArm::FullNotEfficient {
+            // Same cap discipline as the wider map: the key is
+            // contract-controlled, so it must not grow unbounded. Overflow is
+            // covered by the existing attribution_dropped_* counters below.
+            if let Some(tally) = w.contract_not_efficient_bytes.get_mut(contract) {
+                *tally = tally.saturating_add(bytes);
+            } else if w.contract_not_efficient_bytes.len() < MAX_TRACKED_CONTRACTS {
+                w.contract_not_efficient_bytes.insert(*contract, bytes);
+            }
+        }
         if arm.is_full_state() {
             if let Some(tally) = w.contract_full_state_bytes.get_mut(contract) {
                 *tally = tally.saturating_add(bytes);
@@ -403,6 +423,23 @@ impl Window {
         }
     }
 
+    /// The top [`TOP_CONTRACTS_REPORTED`] contracts in the
+    /// [`PayloadArm::FullNotEfficient`] arm, i.e. the ones whose delta the
+    /// gate refused. Same stable ordering as [`Self::top_contracts`].
+    fn top_not_efficient_contracts(&self) -> Vec<(ContractInstanceId, u64)> {
+        let mut tallies: Vec<(ContractInstanceId, u64)> = self
+            .contract_not_efficient_bytes
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        tallies.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+        });
+        tallies.truncate(TOP_CONTRACTS_REPORTED);
+        tallies
+    }
+
     /// The top [`TOP_CONTRACTS_REPORTED`] contracts by full-state bytes.
     fn top_contracts(&self) -> Vec<(ContractInstanceId, u64)> {
         let mut tallies: Vec<(ContractInstanceId, u64)> = self
@@ -444,6 +481,7 @@ struct NotEfficientGateStats {
 fn payload_mix_json(
     arms: &[(PayloadArm, u64, u64)],
     contracts: &[(ContractInstanceId, u64)],
+    not_efficient_contracts: &[(ContractInstanceId, u64)],
     tracked_full_state_bytes: u64,
     contracts_tracked: u64,
     attribution_dropped_sends: u64,
@@ -560,6 +598,19 @@ fn payload_mix_json(
     //     because the cap was already full.
     // Reporting only the second made an 11-contract window look perfectly
     // reconciled while 10 % of its bytes were unaccounted for.
+    // #4956: which contracts the gate actually refused on. The aggregate
+    // ratio says a state-sized "summary" is being fed in; this says by whom.
+    obj.insert(
+        "top_contracts_by_not_efficient_bytes".into(),
+        serde_json::Value::Array(
+            not_efficient_contracts
+                .iter()
+                .map(
+                    |(id, bytes)| serde_json::json!({ "contract": id.to_string(), "bytes": bytes }),
+                )
+                .collect(),
+        ),
+    );
     let top_sum: u64 = contracts.iter().map(|(_, b)| *b).sum();
     let other_contracts_bytes = tracked_full_state_bytes.saturating_sub(top_sum);
     obj.insert("other_contracts_bytes".into(), other_contracts_bytes.into());
@@ -593,6 +644,7 @@ pub(crate) fn emit_payload_mix_rollup(
     let payload = payload_mix_json(
         &window.arms(),
         &window.top_contracts(),
+        &window.top_not_efficient_contracts(),
         window.contract_full_state_bytes.values().sum(),
         window.contract_full_state_bytes.len() as u64,
         window.attribution_dropped_sends,
@@ -659,6 +711,42 @@ mod tests {
 
     fn contract(byte: u8) -> ContractInstanceId {
         ContractInstanceId::new([byte; 32])
+    }
+
+    /// #4956: the refused-delta arm must be attributable to a CONTRACT, not
+    /// just counted in aggregate. The aggregate gate ratio proved a
+    /// state-sized "summary" is being fed in; without this the culprit stays
+    /// anonymous. Only `FullNotEfficient` may land in the narrow map — a
+    /// different full-state arm sharing it would re-create the ambiguity.
+    #[test]
+    fn not_efficient_bytes_are_attributed_to_their_contract() {
+        let mix = PayloadMix::new();
+        mix.record_delivered(
+            PayloadArm::FullNotEfficient,
+            &contract(7),
+            600,
+            Some((600, 600)),
+        );
+        mix.record_delivered(
+            PayloadArm::FullNotEfficient,
+            &contract(7),
+            400,
+            Some((400, 400)),
+        );
+        // A different full-state arm must NOT pollute the narrow map.
+        mix.record_delivered(
+            PayloadArm::FullNoTheirSummaryUntracked,
+            &contract(8),
+            999,
+            None,
+        );
+        let w = mix.take_window();
+        let top = w.top_not_efficient_contracts();
+        assert_eq!(top.len(), 1, "only the refused arm belongs here: {top:?}");
+        assert_eq!(top[0].0, contract(7));
+        assert_eq!(top[0].1, 1000, "per-contract bytes must accumulate");
+        // The wider map still sees both, so the two views stay consistent.
+        assert_eq!(w.contract_full_state_bytes[&contract(8)], 999);
     }
 
     /// Taking the window leaves the accumulator empty so consecutive rollups
@@ -751,6 +839,7 @@ mod tests {
         let json = payload_mix_json(
             &window.arms(),
             &window.top_contracts(),
+            &window.top_not_efficient_contracts(),
             window.contract_full_state_bytes.values().sum(),
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
@@ -795,6 +884,7 @@ mod tests {
         let json = payload_mix_json(
             &window.arms(),
             &window.top_contracts(),
+            &window.top_not_efficient_contracts(),
             window.contract_full_state_bytes.values().sum(),
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
@@ -918,7 +1008,17 @@ mod tests {
             (PayloadArm::FullComputeFailed, 0, 0),
             (PayloadArm::FullNoTheirSummaryUntracked, 0, 0),
         ];
-        let json = payload_mix_json(&arms, &[], 0, 0, 0, 0, NotEfficientGateStats::default(), 60);
+        let json = payload_mix_json(
+            &arms,
+            &[],
+            &[],
+            0,
+            0,
+            0,
+            0,
+            NotEfficientGateStats::default(),
+            60,
+        );
         assert_eq!(json["total_bytes"], 1000);
         assert_eq!(json["full_state_bytes"], 700);
         assert_eq!(json["full_state_byte_share"], 0.7);
@@ -961,6 +1061,7 @@ mod tests {
         let json = payload_mix_json(
             &window.arms(),
             &window.top_contracts(),
+            &window.top_not_efficient_contracts(),
             window.contract_full_state_bytes.values().sum(),
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
@@ -1022,6 +1123,7 @@ mod tests {
         let json = payload_mix_json(
             &window.arms(),
             &window.top_contracts(),
+            &window.top_not_efficient_contracts(),
             window.contract_full_state_bytes.values().sum(),
             window.contract_full_state_bytes.len() as u64,
             window.attribution_dropped_sends,
@@ -1048,6 +1150,7 @@ mod tests {
         let json = payload_mix_json(
             &window.arms(),
             &window.top_contracts(),
+            &window.top_not_efficient_contracts(),
             0,
             0,
             0,
@@ -1063,7 +1166,17 @@ mod tests {
     #[test]
     fn empty_window_reports_zero_share_not_nan() {
         let arms: Vec<_> = PayloadArm::ALL.iter().map(|a| (*a, 0, 0)).collect();
-        let json = payload_mix_json(&arms, &[], 0, 0, 0, 0, NotEfficientGateStats::default(), 60);
+        let json = payload_mix_json(
+            &arms,
+            &[],
+            &[],
+            0,
+            0,
+            0,
+            0,
+            NotEfficientGateStats::default(),
+            60,
+        );
         assert_eq!(json["full_state_byte_share"], 0.0);
         assert_eq!(json["total_bytes"], 0);
     }

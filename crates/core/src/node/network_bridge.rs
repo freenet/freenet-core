@@ -20,6 +20,7 @@ pub(crate) mod broadcast_payload_mix;
 pub(crate) mod broadcast_queue;
 mod handshake;
 pub(crate) mod in_memory;
+pub(crate) mod outbound_message_mix;
 pub(crate) mod p2p_protoc;
 pub(crate) mod priority_select;
 
