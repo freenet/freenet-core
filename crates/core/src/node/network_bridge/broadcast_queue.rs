@@ -2361,6 +2361,20 @@ mod tests {
             );
         }
 
+        // #4961: the tracked arm must READ the reason where it is decided, not
+        // merely pass the variable along. Dropping the assignment leaves it at
+        // `None` forever, so every tracked send lands in
+        // `tracked_missing_unattributed_*` — the split still emits, still
+        // reconciles, and answers nothing. That mutation passes every other
+        // test here, so it needs its own pin.
+        assert!(
+            body.contains("tracked_missing_reason = interest.summary_missing_reason()"),
+            "the FullNoTheirSummaryTracked arm must read the peer's \
+             summary_missing_reason where the arm is decided — without it the \
+             per-reason split is uniformly unattributed and #4961 stays \
+             unanswered"
+        );
+
         // The mix is recorded at exactly the two real-delivery sites, the same
         // gate as BroadcastFanoutCost, so the two axes always agree on what
         // "sent" means. Recording up-front would count phantom fan-out.
