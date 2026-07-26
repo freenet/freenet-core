@@ -14,11 +14,14 @@
 //! 1. [`PayloadArm::FullDeltaSuppressed`] — the `delta_incompat` memo is armed
 //!    (#4904): the contract is known to reject every delta, so full state is
 //!    sent deliberately.
-//! 2. [`PayloadArm::FullNotEfficient`] — the wire-efficiency gate
-//!    ([`crate::ring::interest::is_delta_efficient`]) refused *before*
-//!    computing anything, because the peer's summary is >= 50 % of our state
-//!    size. Note the fallback is full state, which is never smaller than the
-//!    delta the gate declined to compute.
+//! 2. [`PayloadArm::FullNotEfficient`] — the delta WAS computed but came back
+//!    not smaller than our full state, so full state is the (equal or
+//!    smaller) optimal payload. Until #4923 this arm instead meant the
+//!    pre-compute [`crate::ring::interest::is_delta_efficient`] summary-size
+//!    gate refused before computing anything — a fallback that was never
+//!    smaller than the delta it declined, and 41 % of all wire bytes in the
+//!    2026-07-24 measurement. Interpret pre-/post-#4923 telemetry for this
+//!    arm accordingly.
 //! 3. [`PayloadArm::FullComputeFailed`] — the contract's WASM failed, timed
 //!    out, or answered unexpectedly.
 //! 4. [`PayloadArm::FullNoOurSummary`] — *our* summary is missing, so there
@@ -102,7 +105,8 @@ pub(crate) enum PayloadArm {
     Delta,
     /// Full state: the `delta_incompat` memo is armed for this contract.
     FullDeltaSuppressed,
-    /// Full state: the wire-efficiency gate refused to compute a delta.
+    /// Full state: the computed delta was not smaller than the full state
+    /// (post-#4923; previously: the pre-compute gate refused to compute one).
     FullNotEfficient,
     /// Full state: delta computation was attempted and failed.
     FullComputeFailed,
@@ -217,21 +221,28 @@ struct Window {
     /// an 11-contract window look perfectly reconciled while 10 % of its bytes
     /// were unaccounted for.
     attribution_dropped_bytes: u64,
-    /// The wire-efficiency gate's actual INPUTS, summed and maxed over the
+    /// The efficiency gate's observed INPUTS, summed and maxed over the
     /// window's [`PayloadArm::FullNotEfficient`] sends.
     ///
     /// `DeltaUnavailable::NotEfficient` has always carried `summary_size` and
     /// `state_size`, but its only consumer was a `tracing::debug!`, which is
     /// compiled out in release (`max_level_info`) — so in production the gate
-    /// refused deltas with nobody able to see on what. That matters because
-    /// the field measurement and the assumed inputs disagree: the gate refuses
-    /// only when `summary * 2 >= state`, yet the contracts observed tripping it
-    /// are ones whose summaries are believed to be a small fraction of state.
-    /// One of those two beliefs is wrong; these four numbers say which.
+    /// refused deltas with nobody able to see on what. Both sizes are the
+    /// real observed values at refusal time.
     ///
-    /// Sum + max rather than a histogram: the mean ratio answers "is the gate
-    /// firing on genuinely summary-heavy contracts", and the maxima bound the
-    /// worst case, at four `u64`s instead of a bucket array.
+    /// Semantics shifted with #4923 and the split is exactly what these
+    /// numbers field-validate. PRE-#4923 a refusal fired when
+    /// `summary * 2 >= state` without computing anything, so the ratio
+    /// restated the trigger. POST-#4923 a refusal means the contract's
+    /// COMPUTED delta was not smaller than the state, so `FullNotEfficient`
+    /// sends should collapse to the rare genuinely-incompressible cases —
+    /// and the summary:state ratio now tells whether the OLD proxy would
+    /// have refused sends the new gate happily serves as deltas (the
+    /// wire-vs-CPU inversion the fix removes).
+    ///
+    /// Sum + max rather than a histogram: the mean ratio answers "were these
+    /// genuinely summary-heavy contracts", and the maxima bound the worst
+    /// case, at four `u64`s instead of a bucket array.
     not_efficient_summary_bytes_sum: u64,
     not_efficient_state_bytes_sum: u64,
     not_efficient_summary_bytes_max: u64,
@@ -968,16 +979,17 @@ mod tests {
         assert_eq!(json["full_no_summary_sends"], 4);
     }
 
-    /// The wire-efficiency gate's inputs are reported, so `full_not_efficient`
+    /// The efficiency gate's inputs are reported, so `full_not_efficient`
     /// stops being a black box.
     ///
-    /// This is the arm with a measured contradiction behind it: the gate only
-    /// refuses when `summary * 2 >= state`, yet it fires hardest on contracts
-    /// whose summaries are believed to be a small fraction of state. The mean
-    /// ratio is what settles which of those two beliefs is wrong. The sizes
-    /// were always carried by `DeltaUnavailable::NotEfficient` and always
-    /// thrown away, because its only reader was a `debug!` that is compiled
-    /// out in release builds.
+    /// The sizes were always carried by `DeltaUnavailable::NotEfficient` and
+    /// always thrown away, because its only reader was a `debug!` that is
+    /// compiled out in release builds. Post-#4923 the refusal is post-compute
+    /// (the COMPUTED delta was not smaller than the state), and the reported
+    /// summary:state ratio is what field-validates that change: it says
+    /// whether the sends the old `summary * 2 >= state` proxy refused were
+    /// genuinely summary-heavy, and the arm's volume says how rare a
+    /// genuinely incompressible delta actually is.
     #[test]
     fn not_efficient_reports_the_gate_inputs_it_refused_on() {
         let mix = PayloadMix::new();

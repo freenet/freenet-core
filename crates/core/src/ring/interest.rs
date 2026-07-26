@@ -310,11 +310,25 @@ pub fn contract_hash(contract: &ContractKey) -> u32 {
     hash
 }
 
-/// Check if a delta would be efficient compared to sending full state.
+/// Heuristic: would a delta *probably* be efficient compared to sending full
+/// state, judging only by the peer's summary size?
 ///
 /// Returns true if summary size is less than 50% of state size.
 ///
+/// History (#4923): this used to be a PRE-compute gate inside
+/// [`InterestManager::compute_delta`] — a refusal to even ask the contract for
+/// a delta when the peer's summary was large. That inverted the trade-off:
+/// the fallback to a refused delta is sending FULL STATE, which is never
+/// smaller than the delta the gate declined to compute, and in production the
+/// resulting full-state sends were 41% of ALL network wire bytes (87.4% for
+/// the hottest contract). `compute_delta` now always computes and gates on
+/// the ACTUAL delta size afterwards, so this summary-size proxy has no
+/// production caller. It is deliberately kept (not deleted) as the documented
+/// wire-efficiency heuristic with its unit tests — do not re-wire it as a
+/// pre-compute refusal.
+///
 /// This is a standalone function to avoid requiring type parameters when called.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_delta_efficient(summary_size: usize, state_size: usize) -> bool {
     if state_size == 0 {
         return false;
@@ -331,9 +345,17 @@ pub fn is_delta_efficient(summary_size: usize, state_size: usize) -> bool {
 /// never smaller than the delta that was declined — see #3335.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeltaUnavailable {
-    /// The wire-efficiency gate ([`is_delta_efficient`]) refused *before* any
-    /// delta was computed, because the peer's summary is >= 50 % of our state
-    /// size. No contract code ran.
+    /// The delta WAS computed (or found cached) but is not smaller than our
+    /// full state, so the caller's full-state fallback is the genuinely
+    /// optimal payload (equal or smaller bytes, and no delta-apply on the
+    /// receiver).
+    ///
+    /// History (#4923): this variant used to mean the [`is_delta_efficient`]
+    /// summary-size proxy refused *before* any delta was computed ("no
+    /// contract code ran"). That pre-compute refusal is gone — the gate now
+    /// runs POST-compute on the actual delta size. The variant name and
+    /// field shape are unchanged on purpose: the #4938 payload-mix telemetry
+    /// keys off them.
     NotEfficient {
         summary_size: usize,
         state_size: usize,
@@ -1400,9 +1422,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// (`BROADCAST_CH_TIMEOUT`) `GetQuery` against the contract handler,
     /// returning the stored state's `size()` or `None` if it can't be read.
     /// Used by the summary-first PUT reverse leg to feed
-    /// [`compute_delta`](Self::compute_delta)'s efficiency gate with the
-    /// holder's own state size (the holder-side mirror of the originator's
-    /// `merged_value.size()`).
+    /// [`compute_delta`](Self::compute_delta)'s post-compute efficiency check
+    /// with the holder's own state size (the holder-side mirror of the
+    /// originator's `merged_value.size()`).
     pub async fn get_contract_state_size(
         &self,
         op_manager: &crate::node::OpManager,
@@ -1456,16 +1478,29 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Compute a state delta for a peer given their cached summary.
     ///
     /// Uses the contract handler to compute the delta via the contract's
-    /// `get_state_delta` method. Results are cached to avoid recomputation
+    /// `get_state_delta` method (bounded by `BROADCAST_CH_TIMEOUT`). Results
+    /// are cached (keyed by contract + both summaries) to avoid recomputation
     /// for peers with the same summary.
     ///
     /// Returns `Ok(None)` when the contract returns an empty delta (zero bytes),
     /// meaning the peer's state is logically equivalent to ours despite differing
     /// summary bytes (e.g., due to non-deterministic serialization order).
     ///
+    /// Returns [`DeltaUnavailable::NotEfficient`] when the COMPUTED delta is
+    /// not smaller than our full state (`delta.len() >= our_state_size`), so
+    /// the caller's full-state fallback is genuinely optimal. Until #4923 this
+    /// refusal fired BEFORE computing anything, off the [`is_delta_efficient`]
+    /// summary-size proxy (`summary * 2 >= state`) — but the fallback to a
+    /// refused delta is sending FULL STATE, which is never smaller than the
+    /// delta that was declined, so the pre-compute gate could only ever trade
+    /// one bounded WASM call for strictly more wire bytes. In production that
+    /// arm was 41% of ALL network wire bytes. The gate now runs post-compute,
+    /// on the real delta size, on both the cache-hit and fresh-compute paths.
+    ///
     /// # Arguments
     /// * `our_summary` - Our current state summary (used for cache key)
-    /// * `our_state_size` - Size of our current state (for efficiency check)
+    /// * `our_state_size` - Size of our current state (for the post-compute
+    ///   efficiency check)
     pub async fn compute_delta(
         &self,
         op_manager: &crate::node::OpManager,
@@ -1487,19 +1522,20 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 return Ok(None);
             }
             tracing::trace!(contract = %key, "Using cached delta");
-            return Ok(Some(cached));
+            // The post-compute wire gate applies to cached deltas too: an
+            // oversized delta cached here (or by the staleness probe, which
+            // shares this cache and never gates) must produce the same
+            // NotEfficient refusal a fresh computation would — otherwise a
+            // cache hit would hand the caller a payload larger than the full
+            // state it exists to avoid.
+            return Self::gate_delta_size(cached, their_summary_bytes.len(), our_state_size);
         }
 
-        // Check if delta would be efficient
-        // (summary > 50% of state size means delta probably won't help)
-        if !is_delta_efficient(their_summary_bytes.len(), our_state_size) {
-            return Err(DeltaUnavailable::NotEfficient {
-                summary_size: their_summary_bytes.len(),
-                state_size: our_state_size,
-            });
-        }
-
-        // Compute delta via contract handler (short timeout for broadcast path)
+        // Compute delta via contract handler (short timeout for broadcast
+        // path). No pre-compute size gate here — see the method docs (#4923):
+        // refusing to compute forces a full-state send that is never smaller
+        // than the delta being declined, so the only correct place to judge
+        // efficiency is on the ACTUAL computed delta, below.
         match op_manager
             .notify_contract_handler_with_timeout(
                 ContractHandlerEvent::GetDeltaQuery {
@@ -1521,9 +1557,22 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     );
                     Ok(None)
                 } else {
-                    // Cache the result (includes contract key to prevent cross-contract pollution)
+                    // Cache the result (includes contract key to prevent
+                    // cross-contract pollution) BEFORE the size gate, even when
+                    // the delta is oversized — deliberately:
+                    // 1. `cached_staleness_verdict` maps any NON-EMPTY cached
+                    //    delta to "peer is stale", which is correct here: an
+                    //    oversized delta is still a genuine divergence, so the
+                    //    fan-out must still send (it will just send full state).
+                    //    Not caching would instead force the staleness path
+                    //    back through a WASM probe.
+                    // 2. Memoization: the next compute_delta for the same
+                    //    (contract, summaries) pair hits the cache above and
+                    //    re-applies the same gate — a consistent NotEfficient
+                    //    verdict with zero further WASM work, instead of
+                    //    re-running the contract on every fan-out target.
                     self.cache_delta(key, their_summary_bytes, our_summary_bytes, d.clone());
-                    Ok(Some(d))
+                    Self::gate_delta_size(d, their_summary_bytes.len(), our_state_size)
                 }
             }
             Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => Err(
@@ -1537,6 +1586,34 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 "Error computing delta: {}",
                 e
             ))),
+        }
+    }
+
+    /// Post-compute wire-efficiency gate (#4923): hand back the computed
+    /// (non-empty) delta only when it is strictly smaller than our full state;
+    /// otherwise refuse with [`DeltaUnavailable::NotEfficient`] so the
+    /// caller's full-state fallback — equal or smaller bytes, and no
+    /// delta-apply on the receiver — is taken as the genuinely optimal
+    /// payload. `>=` on purpose: a delta exactly the size of the state loses
+    /// the tie (full state is simpler and immune to delta-apply failures).
+    fn gate_delta_size(
+        delta: StateDelta<'static>,
+        summary_size: usize,
+        our_state_size: usize,
+    ) -> Result<Option<StateDelta<'static>>, DeltaUnavailable> {
+        if delta.as_ref().len() >= our_state_size {
+            tracing::trace!(
+                delta_size = delta.as_ref().len(),
+                state_size = our_state_size,
+                "Computed delta is not smaller than full state — caller \
+                 should send full state"
+            );
+            Err(DeltaUnavailable::NotEfficient {
+                summary_size,
+                state_size: our_state_size,
+            })
+        } else {
+            Ok(Some(delta))
         }
     }
 
@@ -1572,11 +1649,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// comparison via [`summary_indicates_stale_peer`]).
     ///
     /// Unlike [`compute_delta`](Self::compute_delta) this deliberately does NOT
-    /// apply the wire-efficiency gate ([`is_delta_efficient`]): staleness
-    /// detection wants the semantic answer even for contracts where a delta
-    /// would be larger than full state, because the alternative it replaces is a
-    /// spurious FULL-STATE heal on every heartbeat — strictly more expensive
-    /// than one delta computation.
+    /// apply the post-compute wire-efficiency gate: staleness detection wants
+    /// the semantic answer (empty vs non-empty) regardless of the delta's
+    /// SIZE, because the alternative it replaces is a spurious FULL-STATE heal
+    /// on every heartbeat — strictly more expensive than one delta
+    /// computation. (Since #4923 `compute_delta` also always runs the
+    /// contract; the remaining difference is only that it refuses to RETURN a
+    /// delta that is not smaller than full state, while this probe has no
+    /// notion of size at all.)
     ///
     /// Steady-state cost: the result rides the SAME delta cache as
     /// `compute_delta` (keyed by contract + both summary hashes). Note that
@@ -2181,6 +2261,12 @@ mod tests {
         assert!(hashes.contains(&contract_hash(&contract2)));
     }
 
+    /// Pins the [`is_delta_efficient`] heuristic itself. Since #4923 the
+    /// function is no longer consulted by `compute_delta` (the efficiency
+    /// gate moved POST-compute, onto the actual delta size — see
+    /// `oversized_computed_delta_returns_not_efficient`); it is kept as the
+    /// documented summary-size heuristic, and these assertions pin its
+    /// boundary behavior.
     #[test]
     fn test_delta_efficiency_check() {
         // Small summary relative to state - efficient
@@ -2650,10 +2736,15 @@ mod tests {
 
     #[test]
     fn test_delta_vs_full_state_decision() {
-        // This test verifies the decision logic for when to send delta vs full state.
-        // The decision is based on:
+        // This test verifies the inputs to the delta-vs-full-state decision:
         // 1. Whether we have peer's summary (None = full state)
-        // 2. Whether delta is efficient (summary < 50% of state size)
+        // 2. The is_delta_efficient summary-size heuristic's boundaries.
+        //
+        // NOTE (#4923): the heuristic is no longer a pre-compute refusal in
+        // `compute_delta` — a large summary now still gets a real delta
+        // computed, and only a delta that is not smaller than the full state
+        // is refused (post-compute). The assertions below pin the heuristic
+        // function itself, not the (removed) gate wiring.
 
         let (manager, _time) = make_manager();
         let contract = make_contract_key(1);
@@ -3884,6 +3975,256 @@ mod tests {
         assert_eq!(
             manager.cached_staleness_verdict(&contract, theirs.as_ref(), ours.as_ref()),
             Some(true)
+        );
+    }
+
+    // ---- Post-compute efficiency gate (#4923) ------------------------------
+    //
+    // Production incident: `compute_delta` refused to even ASK the contract
+    // for a delta whenever the peer's summary was >= 50% of our state size
+    // (the pre-compute `is_delta_efficient` gate), and every caller answers
+    // that refusal by sending FULL STATE — which is never smaller than the
+    // delta that was declined. On the live network that arm was 41% of ALL
+    // wire bytes (87.4% for the hottest contract), flat over time. The gate
+    // now runs POST-compute, on the actual delta size. These tests drive the
+    // real `compute_delta` against a real `OpManager` whose contract-handler
+    // side is a mock responder task, so the whole path (cache lookup →
+    // `GetDeltaQuery` → post-compute gate) is exercised.
+
+    /// Build a real `OpManager` backed by a temp-dir `Config` (mirrors
+    /// `summarize_delta_cache_tests::build_op_manager`) and spawn a mock
+    /// contract handler that answers every `GetDeltaQuery` with
+    /// `delta_bytes`, counting the queries it serves. The returned guard
+    /// bundle keeps the other channel receivers + task monitor alive for the
+    /// whole test (dropping them mid-run would tear down the OpManager's
+    /// channels).
+    async fn op_manager_with_mock_delta_handler(
+        id: &str,
+        delta_bytes: Vec<u8>,
+    ) -> (
+        std::sync::Arc<crate::node::OpManager>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        Box<dyn std::any::Any>,
+    ) {
+        use crate::contract::ContractHandlerEvent;
+
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        // The mock contract handler: serve `delta_bytes` for every
+        // GetDeltaQuery, exactly as a real handler would after running the
+        // contract's `get_state_delta`.
+        let queries_served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = queries_served.clone();
+        let responder = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                if let ContractHandlerEvent::GetDeltaQuery { key, .. } = ev {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let sent = ch_channel
+                        .send_to_sender(
+                            id,
+                            ContractHandlerEvent::GetDeltaResponse {
+                                key,
+                                delta: Ok(StateDelta::from(delta_bytes.clone())),
+                            },
+                        )
+                        .await;
+                    if sent.is_err() {
+                        // The querying side dropped (test teardown) — stop.
+                        break;
+                    }
+                }
+            }
+        });
+
+        let guards: Box<dyn std::any::Any> = Box::new((
+            notification_rx,
+            wait_for_event,
+            result_router_rx,
+            task_monitor,
+            responder,
+        ));
+        (op_manager, queries_served, guards)
+    }
+
+    /// THE incident pin (#4923): a peer whose cached summary is large (here
+    /// state-sized, so the removed pre-compute gate would refuse outright:
+    /// `1000 * 2 >= 1000`) must no longer force a full-state fallback when
+    /// the contract's ACTUAL delta is small. Pre-fix this returned
+    /// `Err(NotEfficient)` without running any contract code, and the caller
+    /// (`broadcast_to_single_peer`) shipped the entire state — 41% of all
+    /// network wire bytes in production. Post-fix the delta is computed and
+    /// returned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_peer_summary_no_longer_forces_full_state_when_delta_is_small() {
+        let small_delta = vec![42u8, 43, 44]; // 3 bytes vs a 1000-byte state
+        let (op_manager, queries_served, _guards) =
+            op_manager_with_mock_delta_handler("post_gate_incident_pin", small_delta.clone()).await;
+
+        let key = make_contract_key(101);
+        let our_state_size = 1000usize;
+        // State-sized peer summary: the exact shape production saw for the
+        // hot contract (their_summary.len() * 2 >= our_state_size).
+        let their_summary = StateSummary::from(vec![7u8; 1000]);
+        let our_summary = StateSummary::from(vec![1u8, 2, 3]);
+
+        let result = op_manager
+            .interest_manager
+            .compute_delta(
+                &op_manager,
+                &key,
+                &their_summary,
+                &our_summary,
+                our_state_size,
+            )
+            .await;
+
+        let delta = result
+            .expect(
+                "an oversized peer summary must no longer refuse the delta \
+                 pre-compute — the fallback (full state) is never smaller than \
+                 the delta being declined (#4923)",
+            )
+            .expect("the contract returned a non-empty delta");
+        assert_eq!(
+            delta.as_ref(),
+            small_delta.as_slice(),
+            "the computed small delta must be handed back verbatim"
+        );
+        assert_eq!(
+            queries_served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the contract handler must have been consulted exactly once"
+        );
+        // The result is memoized in the shared delta cache.
+        assert!(
+            op_manager
+                .interest_manager
+                .get_cached_delta(&key, their_summary.as_ref(), our_summary.as_ref())
+                .is_some(),
+            "the computed delta must be cached for subsequent fan-out targets"
+        );
+    }
+
+    /// The post-compute gate: a delta that comes back NOT smaller than our
+    /// full state still yields `NotEfficient` — so the caller's full-state
+    /// fallback is taken exactly when it is genuinely optimal. Also pins the
+    /// deliberate cache interaction: the oversized delta IS cached (so
+    /// `cached_staleness_verdict` still reports genuine divergence and no
+    /// WASM re-runs), and a second `compute_delta` call answers from the
+    /// cache — same refusal, zero additional contract queries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_computed_delta_returns_not_efficient() {
+        let oversized_delta = vec![9u8; 10]; // 10 bytes vs a 4-byte state
+        let (op_manager, queries_served, _guards) =
+            op_manager_with_mock_delta_handler("post_gate_oversized_delta", oversized_delta).await;
+
+        let key = make_contract_key(102);
+        let our_state_size = 4usize;
+        // Small peer summary: the OLD pre-compute gate would have let this
+        // through (1 * 2 < 4), so this failure mode is reachable only via the
+        // post-compute check.
+        let their_summary = StateSummary::from(vec![5u8]);
+        let our_summary = StateSummary::from(vec![6u8, 6, 6]);
+
+        for pass in 1..=2u32 {
+            let result = op_manager
+                .interest_manager
+                .compute_delta(
+                    &op_manager,
+                    &key,
+                    &their_summary,
+                    &our_summary,
+                    our_state_size,
+                )
+                .await;
+            assert_eq!(
+                result,
+                Err(DeltaUnavailable::NotEfficient {
+                    summary_size: their_summary.as_ref().len(),
+                    state_size: our_state_size,
+                }),
+                "pass {pass}: a computed delta >= full state must refuse with \
+                 NotEfficient so the caller's full-state fallback is optimal"
+            );
+        }
+        assert_eq!(
+            queries_served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second call must be served from the delta cache (memoized \
+             refusal), not a second WASM run"
+        );
+        // The oversized delta is cached ON PURPOSE: it is still a genuine
+        // divergence, so the staleness machinery must keep reporting "peer is
+        // stale" (the fan-out then heals with full state).
+        assert_eq!(
+            op_manager.interest_manager.cached_staleness_verdict(
+                &key,
+                their_summary.as_ref(),
+                our_summary.as_ref()
+            ),
+            Some(true),
+            "an oversized (non-empty) cached delta must still read as genuine \
+             divergence for the staleness verdict"
+        );
+    }
+
+    /// Converged-peer companion to the incident pin: with the SAME oversized
+    /// peer summary the pre-compute gate used to refuse before the contract
+    /// could report an EMPTY delta, so a logically-converged peer was
+    /// re-flooded with full state. Post-#4923 the empty delta is seen and
+    /// `Ok(None)` lets the caller skip the send entirely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_peer_summary_with_empty_delta_reports_converged() {
+        let (op_manager, queries_served, _guards) =
+            op_manager_with_mock_delta_handler("post_gate_empty_delta", Vec::new()).await;
+
+        let key = make_contract_key(103);
+        let their_summary = StateSummary::from(vec![8u8; 1000]); // state-sized
+        let our_summary = StateSummary::from(vec![4u8, 2]);
+
+        let result = op_manager
+            .interest_manager
+            .compute_delta(&op_manager, &key, &their_summary, &our_summary, 1000)
+            .await;
+        assert_eq!(
+            result,
+            Ok(None),
+            "an empty delta behind an oversized peer summary must report \
+             converged (skip), not NotEfficient (full-state re-flood)"
+        );
+        assert_eq!(
+            queries_served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the contract must have been consulted for the verdict"
         );
     }
 }

@@ -3772,9 +3772,9 @@ async fn relay_probe_send_response(
 /// mirror of the originator's forward delta — the holder already has both
 /// inputs (the originator's summary arrived on the `ProbeRequest`, and it has
 /// its own state) — so it reuses `InterestManager::compute_delta`, and
-/// therefore the SAME `is_delta_efficient` gate the forward leg uses (a
-/// summary-size proxy for delta size: the delta is skipped when the
-/// originator's summary is ≥ ~50% of the holder's state size).
+/// therefore the SAME post-compute efficiency gate the forward leg uses
+/// (#4923: the delta is always computed, and refused only when the ACTUAL
+/// delta is not smaller than the holder's state size).
 ///
 /// Returns `None` (skip the reverse leg — the originator heals via a normal
 /// GET / anti-entropy rather than receiving a bloated or absent delta) when:
@@ -4353,8 +4353,8 @@ mod tests {
     /// - `Ok(Some)` → ship the delta (holder ahead),
     /// - `Ok(None)` (originator already current — contract returned an empty
     ///   delta) → ship NOTHING,
-    /// - `Err` (delta inefficient / uncomputable — SAME gate as the forward
-    ///   leg) → ship NOTHING.
+    /// - `Err` (computed delta not smaller than full state / uncomputable —
+    ///   SAME post-compute gate as the forward leg, #4923) → ship NOTHING.
     ///
     /// The two `None` arms are the "originator already current / heal via a
     /// normal GET or anti-entropy" fallback: the reconcile must not emit a
@@ -4384,8 +4384,8 @@ mod tests {
         // heals via a normal GET / anti-entropy instead of receiving a
         // bloated or absent delta.
         // Both Err variants must behave identically here: the reverse leg
-        // ships nothing whether the wire-efficiency gate refused up front or
-        // the contract's delta computation failed.
+        // ships nothing whether the post-compute gate refused an oversized
+        // delta (#4923) or the contract's delta computation failed.
         let inefficient = reverse_delta_from_compute_result(Err(
             crate::ring::interest::DeltaUnavailable::NotEfficient {
                 summary_size: 600,
@@ -4394,7 +4394,8 @@ mod tests {
         ));
         assert!(
             inefficient.is_none(),
-            "Err (gate refused as inefficient) must send NO reverse delta"
+            "Err (computed delta not smaller than full state) must send NO \
+             reverse delta"
         );
         let uncomputable = reverse_delta_from_compute_result(Err(
             crate::ring::interest::DeltaUnavailable::ComputeFailed("wasm exploded".into()),
