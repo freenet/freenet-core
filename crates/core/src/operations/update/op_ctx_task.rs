@@ -285,12 +285,7 @@ async fn drive_client_update(
             // eviction). Surface the missing-params case explicitly
             // so operators can correlate the inconsistency, instead
             // of letting it bubble as an opaque OpError.
-            let UpdateExecution {
-                value: _,
-                summary,
-                changed,
-                ..
-            } = match super::update_contract(
+            let UpdateExecution { value: _, changed } = match super::update_contract(
                 op_manager,
                 key,
                 update_data,
@@ -365,11 +360,23 @@ async fn drive_client_update(
 
             // BroadcastStateChange is emitted automatically by the executor
             // inside update_contract → commit_state_update.
+            //
+            // #4923: fetch the contract's REAL summary for the client
+            // response — never the state relabeled as a summary. Fetched
+            // AFTER the update committed, so under concurrency it may
+            // describe a state slightly NEWER than the one this update
+            // produced (another update can land between commit and
+            // summarize). Harmless for consumers: the summary is an opaque
+            // advisory snapshot of "current state after your update", not a
+            // receipt for the exact merged bytes.
+            let summary = super::contract_summary_or_empty(
+                op_manager,
+                key,
+                crate::contract::Priority::ClientLocal,
+            )
+            .await;
             let host_result: HostResult = Ok(HostResponse::ContractResponse(
-                ContractResponse::UpdateResponse {
-                    key,
-                    summary: summary.clone(),
-                },
+                ContractResponse::UpdateResponse { key, summary },
             ));
             Ok(DriverOutcome::Publish(host_result))
         }
@@ -407,9 +414,7 @@ async fn drive_client_update(
 
             let UpdateExecution {
                 value: updated_value,
-                summary,
                 changed: _,
-                ..
             } = match local_apply {
                 Ok(execution) => {
                     // Successful client-local DELTA merge on the remote-target
@@ -569,11 +574,18 @@ async fn drive_client_update(
                 "update: forwarded to target, operation complete"
             );
 
+            // #4923: same as the local-only arm — fetch the contract's REAL
+            // summary post-commit for the client response (may describe a
+            // slightly newer state under concurrency; harmless, see the
+            // local-only arm's comment).
+            let summary = super::contract_summary_or_empty(
+                op_manager,
+                key,
+                crate::contract::Priority::ClientLocal,
+            )
+            .await;
             let host_result: HostResult = Ok(HostResponse::ContractResponse(
-                ContractResponse::UpdateResponse {
-                    key,
-                    summary: summary.clone(),
-                },
+                ContractResponse::UpdateResponse { key, summary },
             ));
             Ok(DriverOutcome::Publish(host_result))
         }
@@ -956,9 +968,7 @@ async fn drive_relay_request_update(
         // update and needs to receive the result via subscription.
         let UpdateExecution {
             value: updated_value,
-            summary: _,
             changed,
-            ..
         } = super::update_contract(
             op_manager,
             key,
@@ -1589,9 +1599,7 @@ async fn drive_relay_broadcast_to(
 
     let UpdateExecution {
         value: updated_value,
-        summary: update_summary,
         changed,
-        ..
     } = match update_result {
         Ok(result) => {
             // Reset the merge-failure backoff ONLY on a successful DELTA merge
@@ -1861,11 +1869,11 @@ async fn drive_relay_broadcast_to(
     // BackgroundTaskMonitor to match legacy timing semantics
     // (per-broadcast spawn, dies when complete). Per-broadcast
     // amplification is bounded by `should_send_summary_notification`'s
-    // 100ms-per-contract throttle inside the task.
+    // 100ms-per-contract throttle inside the task. The helper fetches the
+    // contract's REAL summary itself (#4923) — no caller-supplied value.
     let op_mgr = op_manager.clone();
-    let summary = update_summary.clone();
     GlobalExecutor::spawn(async move {
-        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr, summary).await;
+        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr).await;
     });
 
     Ok(())
@@ -2240,9 +2248,7 @@ async fn drive_relay_request_update_streaming(
     // Step 4: apply update. BroadcastStateChange propagates automatically.
     let UpdateExecution {
         value: updated_value,
-        summary: _,
         changed,
-        ..
     } = super::update_contract(
         op_manager,
         key,
@@ -2501,9 +2507,7 @@ async fn apply_streaming_broadcast(
 
     let UpdateExecution {
         value: updated_value,
-        summary: streaming_update_summary,
         changed,
-        ..
     } = match update_result {
         Ok(exec) => {
             // Strictly delta-only reset (#4861): a streaming full-state broadcast
@@ -2627,10 +2631,11 @@ async fn apply_streaming_broadcast(
         "UPDATE relay (driver streaming): BroadcastToStreaming applied (state changed)"
     );
 
+    // The helper fetches the contract's REAL summary itself (#4923) — no
+    // caller-supplied value.
     let op_mgr = op_manager.clone();
-    let summary = streaming_update_summary.clone();
     GlobalExecutor::spawn(async move {
-        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr, summary).await;
+        super::send_proactive_summary_notification(&op_mgr, &key, sender_addr).await;
     });
 
     Ok(())
