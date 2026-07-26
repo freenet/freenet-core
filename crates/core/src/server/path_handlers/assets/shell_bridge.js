@@ -674,6 +674,25 @@ function freenetBridge(authToken, userToken, hostedMode) {
   var notifySwPromise = null;
   var notifySwMsgListenerAdded = false;
 
+  // Reading the serviceWorker property off navigator THROWS a SecurityError in
+  // a sandboxed document without 'allow-same-origin' — the property EXISTS on
+  // Navigator
+  // (so an `in`-operator feature-check passes) but its getter
+  // throws. A feature-check must therefore attempt the read itself. The shell
+  // top page is not sandboxed today, but this bridge must never assume that:
+  // in 0.2.107 an unguarded read here threw during the eager
+  // installNotifyClickListener() call and killed freenetBridge before its
+  // message handlers installed, breaking every locally-served web app (#4945).
+  function serviceWorkerOrNull() {
+    try {
+      return typeof navigator !== 'undefined'
+        ? navigator.serviceWorker || null
+        : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   // Forward a worker-posted notification click to the iframe. Installed at most
   // once, and EAGERLY at shell startup (see the call below) — NOT only on lazy
   // SW registration: a persistent notification can outlive a shell reload, and
@@ -683,11 +702,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // registered, so it doesn't require a secure context.
   function installNotifyClickListener() {
     if (notifySwMsgListenerAdded) return;
-    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+    var sw = serviceWorkerOrNull();
+    if (!sw) {
       return;
     }
     notifySwMsgListenerAdded = true;
-    navigator.serviceWorker.addEventListener('message', function (event) {
+    sw.addEventListener('message', function (event) {
       var d = event && event.data;
       if (!d || d.__freenet_notify_click__ !== true) return;
       try {
@@ -703,11 +723,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
 
   function ensureNotifyServiceWorker() {
     if (notifySwPromise) return notifySwPromise;
-    if (
-      typeof navigator === 'undefined' ||
-      !('serviceWorker' in navigator) ||
-      !window.isSecureContext
-    ) {
+    if (!serviceWorkerOrNull() || !window.isSecureContext) {
       // No SW support, or an insecure (plain-http, non-localhost) origin where
       // registration would fail. This is permanent for the page, so cache it —
       // the page-level constructor path covers these (desktop) cases.
@@ -740,7 +756,8 @@ function freenetBridge(authToken, userToken, hostedMode) {
   // if unavailable within `timeoutMs`. Bounded so a slow/never-activating worker
   // never stalls a notification — the caller reports it undeliverable instead.
   function notifyRegistrationReady(timeoutMs) {
-    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+    var swContainer = serviceWorkerOrNull();
+    if (!swContainer) {
       return Promise.resolve(null);
     }
     return ensureNotifyServiceWorker().then(function (reg) {
@@ -755,7 +772,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
             resolve(null);
           }
         }, timeoutMs);
-        navigator.serviceWorker.ready.then(
+        swContainer.ready.then(
           function (ready) {
             if (!settled) {
               settled = true;

@@ -3498,6 +3498,45 @@ mod tests {
         );
     }
 
+    /// Reading `navigator.serviceWorker` throws a SecurityError in a sandboxed
+    /// document without 'allow-same-origin': the property exists on Navigator
+    /// (so an `'serviceWorker' in navigator` feature-check passes) but its
+    /// GETTER throws. In 0.2.107 the eager installNotifyClickListener() call
+    /// read it unguarded; the uncaught throw killed freenetBridge before its
+    /// message handlers installed and every locally-served web app hung
+    /// (#4945). All serviceWorker access must go through the try/catch
+    /// accessor.
+    #[test]
+    fn bridge_js_service_worker_reads_survive_sandboxed_navigator() {
+        assert!(
+            SHELL_BRIDGE_JS.contains("function serviceWorkerOrNull()"),
+            "the try/catch serviceWorker accessor must exist"
+        );
+        let body_start = SHELL_BRIDGE_JS
+            .find("function serviceWorkerOrNull()")
+            .unwrap();
+        let body = &SHELL_BRIDGE_JS[body_start..body_start + 400];
+        assert!(
+            body.contains("try {") && body.contains("catch"),
+            "serviceWorkerOrNull must guard the navigator.serviceWorker read with try/catch"
+        );
+        // Outside the accessor, `navigator.serviceWorker` may appear only as
+        // the (already try-guarded) register call pinned by the mobile test
+        // below — any new access must route through serviceWorkerOrNull().
+        assert_eq!(
+            SHELL_BRIDGE_JS.matches("navigator.serviceWorker").count(),
+            2,
+            "raw navigator.serviceWorker reads outside serviceWorkerOrNull() and \
+             the try-guarded register call reintroduce the #4945 sandbox crash"
+        );
+        // The `in`-operator feature check is exactly the pattern that passed in
+        // the sandbox and then blew up on read — it must not come back.
+        assert!(
+            !SHELL_BRIDGE_JS.contains("'serviceWorker' in navigator"),
+            "feature-detect by attempting the read (serviceWorkerOrNull), not via `in`"
+        );
+    }
+
     /// Mobile browsers reject the page-level `new Notification()` constructor, so
     /// the shell must show notifications via a service worker's
     /// `showNotification()`. Pin the wiring by source so a refactor can't
