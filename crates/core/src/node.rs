@@ -2810,11 +2810,23 @@ async fn handle_interest_sync_message(
                             _ => false,
                         };
 
-                        op_manager.interest_manager.update_peer_summary(
-                            &contract,
-                            &pk,
-                            their_summary,
-                        );
+                        // #4952: upsert (not update) when the peer reported a
+                        // real summary, so the ~5-min anti-entropy exchange can
+                        // seed a summary for an advertised co-host we don't
+                        // interest-track — otherwise those peers stay full-state
+                        // broadcast targets forever. A `None` report keeps the
+                        // old clear-only semantics (no entry is created just to
+                        // hold `None`).
+                        match their_summary {
+                            Some(theirs) => {
+                                op_manager
+                                    .interest_manager
+                                    .upsert_peer_summary(&contract, &pk, theirs);
+                            }
+                            None => op_manager
+                                .interest_manager
+                                .update_peer_summary(&contract, &pk, None),
+                        }
 
                         if is_stale && !stale_contracts.contains(&contract) {
                             stale_contracts.push(contract);
@@ -3946,6 +3958,37 @@ mod tests {
     /// `ResyncRequest` arm, which is already state-gated (returns early when
     /// `get_contract_state` is `None`) and is not heartbeat-driven, so it is
     /// excluded by slicing up to that arm.
+    /// #4952 pin: the `Summaries` handler must UPSERT a reported summary so
+    /// the ~5-min anti-entropy exchange can seed one for an advertised
+    /// co-host we don't interest-track (`update_peer_summary` no-ops for
+    /// untracked peers — the full-state fixed point). A `None` report keeps
+    /// the clear-only `update_` semantics: no entry is created just to hold
+    /// `None`. Matches whitespace-stripped source (rustfmt-proof).
+    #[test]
+    fn summaries_arm_upserts_reported_summary_pin() {
+        let src = include_str!("node.rs");
+        let handler_start = src
+            .find("async fn handle_interest_sync_message")
+            .expect("handle_interest_sync_message not found");
+        let handler_end = handler_start
+            + src[handler_start..]
+                .find("\nmod tests {")
+                .or_else(|| src[handler_start..].find("\n#[cfg(test)]"))
+                .expect("end of handler region not found");
+        let body: String = src[handler_start..handler_end].split_whitespace().collect();
+        assert!(
+            body.contains("upsert_peer_summary(&contract,&pk,theirs)"),
+            "Summaries arm must upsert a Some(summary) report (seeds untracked \
+             co-hosts, #4952)"
+        );
+        assert!(
+            body.contains("update_peer_summary(&contract,&pk,None"),
+            "Summaries arm must keep clear-only update semantics for a None \
+             report — creating an entry just to hold None would relabel \
+             untracked traffic as tracked without enabling deltas"
+        );
+    }
+
     #[test]
     fn interest_sync_periodic_arms_summarize_only_hosted_or_in_use_pin() {
         let src = include_str!("node.rs");

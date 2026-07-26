@@ -703,8 +703,14 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // by those backstops rather than by an end-to-end ack here. Caching lets the
     // NEXT broadcast to this peer be a small delta instead of full state.
     // (Telemetry above still records delta-vs-full-state separately.)
+    // #4952: this MUST be the upsert, not `update_peer_summary` — the latter
+    // silently no-ops for a peer with no interest entry, which turned every
+    // advertised co-host (fan-out targets come from NeighborHosting, a
+    // population that never registers protocol interest) into a full-state
+    // fixed point: full state on every update, forever. The upsert creates the
+    // entry (capped, no demand-counter writes) so the next send is a delta.
     if let Some(summary) = our_summary {
-        interest_manager.update_peer_summary(key, peer_key, Some(summary.clone()));
+        interest_manager.upsert_peer_summary(key, peer_key, summary.clone());
     }
 }
 
@@ -1675,6 +1681,35 @@ mod tests {
     /// window); if the attribution recording is dropped, the memo's
     /// sender-side arm signal (`note_resync_request`) can never fire.
     /// See `crate::ring::delta_incompat`.
+    /// #4952 pin: the post-delivery summary cache must route through
+    /// `upsert_peer_summary`, never `update_peer_summary`. The latter is a
+    /// silent no-op for a peer with no interest entry, and fan-out targets
+    /// come from `neighbor_hosting` (advertised co-hosts) — a population that
+    /// never registers interest — so an `update_` call here re-opens the
+    /// full-state-forever fixed point that was 58% of fleet broadcast bytes.
+    /// Matches whitespace-stripped source so a rustfmt reflow can't dodge it.
+    #[test]
+    fn record_delivery_routes_summary_cache_through_upsert() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("fn record_delivery_to_interest<")
+            .expect("record_delivery_to_interest not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\npub(super) async fn broadcast_to_single_peer(")
+            .expect("end of record_delivery_to_interest not found");
+        let body: String = after[..fn_end].split_whitespace().collect();
+        assert!(
+            body.contains("interest_manager.upsert_peer_summary(key,peer_key,summary.clone())"),
+            "post-delivery cache must upsert (create-if-absent) the peer summary"
+        );
+        assert!(
+            !body.contains("interest_manager.update_peer_summary("),
+            "update_peer_summary silently no-ops for untracked peers — the \
+             #4952 fixed point. Use upsert_peer_summary here."
+        );
+    }
+
     #[test]
     fn broadcast_to_single_peer_gates_deltas_on_incompat_memo() {
         let src = include_str!("broadcast_queue.rs");
