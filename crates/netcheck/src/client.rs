@@ -11,11 +11,20 @@ use freenet_stdlib::client_api::{
 use freenet_stdlib::prelude::*;
 use tokio_tungstenite::connect_async;
 
+/// URL of a node's client command endpoint.
 pub fn command_url(base_ws: &str) -> String {
     format!(
         "{}/v1/contract/command?encodingProtocol=native",
         base_ws.trim_end_matches('/')
     )
+}
+
+/// A poll interval with ±20% jitter. One check polling its own node has no
+/// herd to stampede, but several vantage points polling the same gateway
+/// would, and a nightly is exactly the kind of thing that ends up running
+/// from more than one place.
+fn jittered(base: Duration) -> Duration {
+    base.mul_f64(0.8 + rand::random::<f64>() * 0.4)
 }
 
 /// Connect to a node's websocket API, retrying while it comes up.
@@ -27,13 +36,15 @@ pub async fn connect(base_ws: &str, timeout: Duration) -> Result<WebApi> {
             Ok((stream, _)) => return Ok(WebApi::start(stream)),
             Err(e) if Instant::now() < deadline => {
                 eprintln!("ws at {base_ws} not ready yet ({e}), retrying...");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(jittered(Duration::from_secs(1))).await;
             }
             Err(e) => bail!("could not connect to websocket API at {url}: {e}"),
         }
     }
 }
 
+/// Close the client session. Best effort: a node that already went away needs
+/// no goodbye.
 pub async fn disconnect(client: &mut WebApi) {
     let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
 }
@@ -169,6 +180,6 @@ pub async fn wait_for_ring_join(client: &mut WebApi, timeout: Duration) -> Resul
             Instant::now() < deadline,
             "ephemeral node did not join the ring within {timeout:?}"
         );
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(jittered(Duration::from_secs(2))).await;
     }
 }

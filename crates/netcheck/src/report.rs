@@ -97,6 +97,8 @@ pub struct Report {
 }
 
 impl Report {
+    /// Record an operation and print its line as it happens, so a run that
+    /// dies half way still leaves the operations it completed.
     pub fn push(&mut self, op: OpReport) {
         print_line(op_line(&op), "report");
         if !op.ok {
@@ -112,10 +114,12 @@ impl Report {
         self.ops.push(op);
     }
 
+    /// Whether every recorded operation succeeded.
     pub fn all_ok(&self) -> bool {
         self.ops.iter().all(|o| o.ok)
     }
 
+    /// One human-readable line on stderr, separate from the JSON on stdout.
     pub fn print_summary(&self) {
         let total = self.ops.len();
         let failed = self.ops.iter().filter(|o| !o.ok).count();

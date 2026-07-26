@@ -1,7 +1,7 @@
 //! Boots the ephemeral getter node (and, for local testing, an isolated
 //! gateway) as `freenet` child processes. The ephemeral node starts from an
 //! empty data dir every run, so it cannot hold any replica and its GETs are
-//! forced to route over the network — the whole point of netcheck.
+//! forced to route over the network, the whole point of netcheck.
 //!
 //! The node is addressed only through its own dirs and ports, and killed by
 //! process handle, never by name: on a host that also runs a real node,
@@ -25,6 +25,27 @@ pub struct EphemeralNode {
     _tmp: Option<tempfile::TempDir>,
 }
 
+impl EphemeralNode {
+    /// Last lines of the node's log, for failure diagnostics.
+    pub fn log_tail(&self) -> String {
+        let path = self.dir.join("node.log");
+        match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                let lines: Vec<&str> = s.lines().collect();
+                let start = lines.len().saturating_sub(40);
+                lines[start..].join("\n")
+            }
+            Err(e) => format!("(could not read node log: {e})"),
+        }
+    }
+
+    /// Kill the node by process handle. Never by name: on a host that also
+    /// runs a real node, netcheck must be incapable of touching it.
+    pub async fn shutdown(mut self) {
+        let _ = self.child.kill().await;
+    }
+}
+
 /// Version of the `freenet` binary running the ephemeral node. Recorded in
 /// the report: it separates "the network broke" from "last night's release
 /// broke", and cannot be recovered after the fact.
@@ -40,6 +61,8 @@ pub async fn binary_version(freenet_bin: &Path) -> String {
     }
 }
 
+/// Boot the ephemeral getter node. It joins through `gateway_specs` when
+/// given any, and from the public index otherwise.
 pub async fn spawn_ephemeral(
     freenet_bin: &Path,
     network_port: u16,
@@ -93,25 +116,6 @@ pub async fn spawn_ephemeral(
         dir,
         _tmp: tmp,
     })
-}
-
-impl EphemeralNode {
-    /// Last lines of the node's log, for failure diagnostics.
-    pub fn log_tail(&self) -> String {
-        let path = self.dir.join("node.log");
-        match std::fs::read_to_string(&path) {
-            Ok(s) => {
-                let lines: Vec<&str> = s.lines().collect();
-                let start = lines.len().saturating_sub(40);
-                lines[start..].join("\n")
-            }
-            Err(e) => format!("(could not read node log: {e})"),
-        }
-    }
-
-    pub async fn shutdown(mut self) {
-        let _ = self.child.kill().await;
-    }
 }
 
 /// Run a local gateway in the foreground for local testing. Generates a

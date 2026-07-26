@@ -42,6 +42,8 @@ pub struct ContractRecord {
 }
 
 impl Manifest {
+    /// Read the manifest, treating a missing file as an empty one: the
+    /// first night has no history to load.
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -51,6 +53,8 @@ impl Manifest {
         }
     }
 
+    /// Write via a temp file and rename, so an interrupted run cannot leave
+    /// a truncated manifest behind and lose every retention target.
     pub fn save(&self, path: &Path) -> Result<()> {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
