@@ -9,6 +9,7 @@
 
 mod client;
 mod contracts;
+mod emit;
 mod ephemeral;
 mod manifest;
 mod report;
@@ -27,6 +28,34 @@ enum Cli {
     /// Run an isolated local gateway for testing netcheck on one machine.
     /// Prints the `--gateway-spec` value to pass to `put-get`.
     LocalGateway(LocalGatewayArgs),
+    /// Read a run's report on stdin and publish it to an OTLP collector.
+    Emit(EmitArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct EmitArgs {
+    /// Base URL of the OTLP/HTTP collector.
+    #[arg(long, default_value = "http://127.0.0.1:4318")]
+    pub endpoint: String,
+
+    /// Where the check ran from: a hostname, `ci`, a datacentre.
+    #[arg(long, default_value = "unknown")]
+    pub vantage: String,
+
+    /// Fallback only. The scenario is read from the report's run line
+    /// whenever it has one, so a check cannot be filed under another's name
+    /// because a flag was forgotten.
+    #[arg(long, default_value = "put_get")]
+    pub scenario: String,
+
+    /// The check's exit status, so a run that never started is published as
+    /// an error rather than a silent pass.
+    #[arg(long, default_value_t = 0)]
+    pub exit_code: i32,
+
+    /// Print the payload instead of sending it.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -125,6 +154,7 @@ async fn main() -> ExitCode {
     let result = match cli {
         Cli::PutGet(args) => scenarios::put_get::run(args).await,
         Cli::LocalGateway(args) => ephemeral::run_local_gateway(args).await.map(|()| true),
+        Cli::Emit(args) => emit::run(args).await,
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,

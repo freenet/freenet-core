@@ -4126,6 +4126,7 @@ dependencies = [
  "freenet-stdlib 0.8.4",
  "hex",
  "rand 0.9.4",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",

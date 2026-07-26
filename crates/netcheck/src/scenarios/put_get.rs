@@ -11,7 +11,12 @@ use crate::manifest::{ContractRecord, Manifest, RunRecord};
 use crate::report::{OpReport, Report, RunMeta};
 use crate::{PutGetArgs, client, contracts, ephemeral};
 
+/// Name this scenario publishes under. A new check is a new value here,
+/// never a new event type.
+pub const SCENARIO: &str = "put_get";
+
 pub async fn run(args: PutGetArgs) -> Result<bool> {
+    let started = std::time::Instant::now();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock before epoch")?
@@ -21,6 +26,7 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
 
     eprintln!("netcheck put-get: run {run_id}");
     let mut meta = RunMeta::new(
+        SCENARIO,
         run_id.clone(),
         args.gateway_ws.clone(),
         ephemeral::binary_version(&args.freenet_bin).await,
@@ -65,8 +71,8 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
         {
             Ok(latency) => {
                 report.push(OpReport {
-                    op: "put",
-                    age: "0h",
+                    op: "put".to_string(),
+                    age: "0h".to_string(),
                     label: c.label.clone(),
                     key: key.to_string(),
                     ok: true,
@@ -77,8 +83,8 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
                 put_ok.push(c);
             }
             Err(e) => report.push(OpReport {
-                op: "put",
-                age: "0h",
+                op: "put".to_string(),
+                age: "0h".to_string(),
                 label: c.label.clone(),
                 key: key.to_string(),
                 ok: false,
@@ -113,6 +119,7 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
         Ok(p) => p,
         Err(e) => {
             eprintln!("ephemeral node log tail:\n{}", node.log_tail());
+            meta.duration_ms = started.elapsed().as_millis();
             meta.print();
             node.shutdown().await;
             return Err(e.context("connecting to ephemeral node ws api"));
@@ -122,12 +129,12 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
         Ok(peers) => meta.ephemeral_peers = peers,
         Err(e) => {
             eprintln!("ephemeral node log tail:\n{}", node.log_tail());
+            meta.duration_ms = started.elapsed().as_millis();
             meta.print();
             node.shutdown().await;
             return Err(e);
         }
     }
-    meta.print();
 
     // Today's contracts: full byte-identity check against what we just PUT.
     for c in &put_ok {
@@ -210,6 +217,8 @@ pub async fn run(args: PutGetArgs) -> Result<bool> {
         manifest.save(&args.manifest)?;
     }
 
+    meta.duration_ms = started.elapsed().as_millis();
+    meta.print();
     report.print_summary();
     Ok(report.all_ok())
 }
@@ -225,8 +234,8 @@ fn push_get_report(
 ) {
     match outcome {
         Ok(latency) => report.push(OpReport {
-            op: "get",
-            age,
+            op: "get".to_string(),
+            age: age.to_string(),
             label: label.to_string(),
             key,
             ok: true,
@@ -235,8 +244,8 @@ fn push_get_report(
             error: None,
         }),
         Err(e) => report.push(OpReport {
-            op: "get",
-            age,
+            op: "get".to_string(),
+            age: age.to_string(),
             label: label.to_string(),
             key,
             ok: false,

@@ -14,6 +14,7 @@ clap = { workspace = true, features = ["derive"] }
 freenet-stdlib = { workspace = true, features = ["net"] }
 hex = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
