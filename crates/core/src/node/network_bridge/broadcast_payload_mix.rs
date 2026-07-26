@@ -34,6 +34,13 @@
 //!    persistent residual implicates the seeding/heartbeat chain instead.
 //! 6. [`PayloadArm::FullNoTheirSummaryTracked`] — the peer's summary is
 //!    missing but the peer IS tracked, so the next delivery repairs it.
+//!    Measured at 26.9 % of broadcast bytes (357 KB mean) on the aged 0.2.109
+//!    fleet — the largest remaining arm — so #4961 splits it AGAIN, by
+//!    [`SummaryMissingReason`]: never seeded vs cleared by the peer's own
+//!    `None` report vs cleared by a resync or a delta-apply failure. Those
+//!    have three different fixes, published as
+//!    `tracked_missing_<reason>_{sends,bytes}` plus a
+//!    `tracked_missing_unattributed_*` residual that must stay at zero.
 //!
 //! Arms 4-6 were a single `full_no_summary` bucket when #4922 first shipped.
 //! The 2026-07-25 measurement then found that bucket was the LARGEST single
