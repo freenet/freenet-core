@@ -248,12 +248,11 @@ fn emit_outbound_mix_rollup(mix: &OutboundMix, local_peer_id: &str, window_secs:
     let w = mix.take_window();
     let total_msgs: u64 = w.msgs.iter().sum();
     let total_bytes: u64 = w.bytes.iter().sum();
-    if total_msgs == 0 {
-        // Still emit: a silent node is a data point (it distinguishes "no
-        // traffic" from "telemetry stopped"), and the payload mix emits when
-        // idle too, so the two stay joinable per node-minute.
-    }
 
+    // Emitted unconditionally, including for an idle window: a silent node is
+    // a data point (it distinguishes "no traffic" from "telemetry stopped"),
+    // and the payload mix emits when idle too, so the two stay joinable per
+    // node-minute.
     let mut body = serde_json::Map::new();
     body.insert("window_secs".into(), window_secs.into());
     body.insert("total_msgs".into(), total_msgs.into());
