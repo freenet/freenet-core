@@ -310,6 +310,18 @@ pub fn contract_hash(contract: &ContractKey) -> u32 {
     hash
 }
 
+/// How much smaller full state must be before the post-compute gate
+/// ([`InterestManager::gate_delta_size`]) abandons a computed delta for it.
+///
+/// Switching payload kinds is not free: a delta keeps the receiver's
+/// peer-summary cache warm and keeps fan-out off the full-state path that
+/// #4233 / #4956 are about. Below this margin the byte win is a rounding
+/// error and not worth those costs — at 1 KiB, a small CRDT contract whose
+/// delta marginally exceeds its state keeps sending deltas, while the
+/// poisoned-summary population this gate targets (state-sized deltas at
+/// 550-840 KB) still refuses by a wide margin.
+const MIN_FULL_STATE_SAVING_BYTES: usize = 1024;
+
 /// Heuristic: would a delta *probably* be efficient compared to sending full
 /// state, judging only by the peer's summary size?
 ///
@@ -1654,23 +1666,45 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     }
 
     /// Post-compute wire-efficiency gate (#4923): hand back the computed
-    /// (non-empty) delta only when it is strictly smaller than our full state;
-    /// otherwise refuse with [`DeltaUnavailable::NotEfficient`] so the
-    /// caller's full-state fallback — equal or smaller bytes, and no
-    /// delta-apply on the receiver — is taken as the genuinely optimal
-    /// payload. `>=` on purpose: a delta exactly the size of the state loses
-    /// the tie (full state is simpler and immune to delta-apply failures).
+    /// (non-empty) delta unless full state would be smaller by at least
+    /// [`MIN_FULL_STATE_SAVING_BYTES`], in which case refuse with
+    /// [`DeltaUnavailable::NotEfficient`] so the caller's full-state fallback
+    /// is taken as the genuinely cheaper payload.
+    ///
+    /// The margin is load-bearing, not slop. A bare `delta.len() >=
+    /// state_size` comparison is byte-optimal but behaviorally wrong at small
+    /// sizes: a 144-byte delta against a 136-byte state would flip the payload
+    /// to full state to save EIGHT bytes, and doing that for every small
+    /// contract re-creates the full-state fan-out shape that #4233 exists to
+    /// prevent (`test_sustained_update_fanout_no_full_state_storm` pins
+    /// `delta_sends > full_state_sends` and catches exactly this). Deltas are
+    /// also what keeps a receiver's peer-summary cache warm, so trading them
+    /// away for a rounding error is a bad deal even ignoring the pin.
+    ///
+    /// So the rule is: prefer the delta by default, and switch to full state
+    /// only when that genuinely saves bandwidth worth the switch. The
+    /// pathological case this gate exists for — a contract whose summary (and
+    /// therefore delta) is state-sized, the #4956 poisoned-summary population
+    /// running at 550-840 KB — clears a 1 KiB margin by orders of magnitude.
+    ///
+    /// Note for callers whose fallback is NOT full state: a refusal here means
+    /// the summary-first PUT reverse leg
+    /// (`put::op_ctx_task::reverse_delta_from_compute_result`) ships NOTHING,
+    /// not full state, and the originator heals later via GET/anti-entropy.
+    /// That asymmetry predates this change (the old pre-compute gate refused
+    /// the same way) but the margin makes it much rarer.
     fn gate_delta_size(
         delta: StateDelta<'static>,
         summary_size: usize,
         our_state_size: usize,
     ) -> Result<Option<StateDelta<'static>>, DeltaUnavailable> {
-        if delta.as_ref().len() >= our_state_size {
+        if delta.as_ref().len() >= our_state_size.saturating_add(MIN_FULL_STATE_SAVING_BYTES) {
             tracing::trace!(
                 delta_size = delta.as_ref().len(),
                 state_size = our_state_size,
-                "Computed delta is not smaller than full state — caller \
-                 should send full state"
+                margin = MIN_FULL_STATE_SAVING_BYTES,
+                "Computed delta exceeds full state by more than the switch \
+                 margin — caller should send full state"
             );
             Err(DeltaUnavailable::NotEfficient {
                 summary_size,
@@ -4357,7 +4391,9 @@ mod tests {
     /// cache — same refusal, zero additional contract queries.
     #[tokio::test(flavor = "current_thread")]
     async fn oversized_computed_delta_returns_not_efficient() {
-        let oversized_delta = vec![9u8; 10]; // 10 bytes vs a 4-byte state
+        // Must exceed the state by more than MIN_FULL_STATE_SAVING_BYTES for
+        // the switch to full state to be worth making.
+        let oversized_delta = vec![9u8; 4 + MIN_FULL_STATE_SAVING_BYTES + 1];
         let (op_manager, queries_served, _guards) =
             op_manager_with_mock_delta_handler("post_gate_oversized_delta", oversized_delta).await;
 
@@ -4411,24 +4447,29 @@ mod tests {
         );
     }
 
-    /// Boundary pin for the documented tie-break: the gate is `>=`, so a delta
-    /// EXACTLY the size of our state loses the tie and refuses. Sending full
-    /// state is preferred at equal bytes because it costs the receiver no
-    /// delta-apply. The sibling tests only cover strictly-smaller (accepted)
-    /// and strictly-larger (refused), which leaves an off-by-one in the
-    /// comparison operator (`>` instead of `>=`) undetected.
+    /// Boundary pin for the switch margin. A delta merely EQUAL to (or a few
+    /// bytes larger than) our state must still be SHIPPED: flipping to full
+    /// state there buys nothing and re-creates the #4233 full-state fan-out
+    /// shape for every small contract. Only a delta that clears
+    /// `state + MIN_FULL_STATE_SAVING_BYTES` refuses.
+    ///
+    /// The 144-vs-136 case is the real one observed in
+    /// `test_summary_first_put_holder_found_ships_delta`: a bare `>=`
+    /// comparison abandoned the delta to save 8 bytes and broke both the
+    /// summary-first PUT reverse leg and the storm pin.
     #[tokio::test(flavor = "current_thread")]
-    async fn equal_sized_delta_returns_not_efficient() {
-        let our_state_size = 8usize;
-        let equal_delta = vec![3u8; 8]; // exactly our_state_size
-        let (op_manager, queries_served, _guards) =
-            op_manager_with_mock_delta_handler("post_gate_equal_delta", equal_delta).await;
+    async fn delta_slightly_larger_than_state_is_still_shipped() {
+        let our_state_size = 136usize;
+        let slightly_larger = vec![3u8; 144]; // the observed real-world pair
+        let (op_manager, _queries_served, _guards) =
+            op_manager_with_mock_delta_handler("post_gate_margin_delta", slightly_larger.clone())
+                .await;
 
         let key = make_contract_key(103);
         let their_summary = StateSummary::from(vec![4u8]);
         let our_summary = StateSummary::from(vec![5u8, 5]);
 
-        let result = op_manager
+        let delta = op_manager
             .interest_manager
             .compute_delta(
                 &op_manager,
@@ -4437,22 +4478,58 @@ mod tests {
                 &our_summary,
                 our_state_size,
             )
-            .await;
+            .await
+            .expect(
+                "a delta only 8 bytes larger than the state must NOT be \
+                 refused — switching to full state to save 8 bytes is the \
+                 #4233 full-state fan-out shape",
+            )
+            .expect("the contract returned a non-empty delta");
+        assert_eq!(delta.as_ref(), slightly_larger.as_slice());
+    }
 
+    /// The exact refusal threshold: `state + MIN_FULL_STATE_SAVING_BYTES` is
+    /// the first size that loses. One byte under it must still ship, so an
+    /// off-by-one in the margin comparison is caught in both directions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn delta_at_margin_threshold_refuses_but_one_byte_under_ships() {
+        let our_state_size = 100usize;
+        let key = make_contract_key(104);
+        let their_summary = StateSummary::from(vec![4u8]);
+        let our_summary = StateSummary::from(vec![5u8, 5]);
+
+        // One byte UNDER the threshold: still shipped.
+        let under = vec![1u8; 100 + MIN_FULL_STATE_SAVING_BYTES - 1];
+        let (op_under, _q, _g) =
+            op_manager_with_mock_delta_handler("post_gate_margin_under", under).await;
+        assert!(
+            op_under
+                .interest_manager
+                .compute_delta(
+                    &op_under,
+                    &key,
+                    &their_summary,
+                    &our_summary,
+                    our_state_size
+                )
+                .await
+                .is_ok(),
+            "one byte under the switch margin must still ship the delta"
+        );
+
+        // Exactly AT the threshold: refused.
+        let at = vec![1u8; 100 + MIN_FULL_STATE_SAVING_BYTES];
+        let (op_at, _q2, _g2) = op_manager_with_mock_delta_handler("post_gate_margin_at", at).await;
         assert_eq!(
-            result,
+            op_at
+                .interest_manager
+                .compute_delta(&op_at, &key, &their_summary, &our_summary, our_state_size)
+                .await,
             Err(DeltaUnavailable::NotEfficient {
                 summary_size: their_summary.as_ref().len(),
                 state_size: our_state_size,
             }),
-            "a delta exactly the size of the state must lose the tie (the gate \
-             is `>=`): full state is preferred at equal bytes because it costs \
-             the receiver no delta-apply"
-        );
-        assert_eq!(
-            queries_served.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the contract must still have been consulted exactly once"
+            "a delta at state + MIN_FULL_STATE_SAVING_BYTES must refuse"
         );
     }
 
