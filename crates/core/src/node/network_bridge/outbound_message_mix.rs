@@ -41,11 +41,30 @@
 //! which is the point — it is reported as a residual rather than silently
 //! folded into a message arm.
 //!
-//! Operations-level STREAM bytes are deliberately NOT counted here. They do
-//! not pass through this call site (they go out via `send_stream` /
-//! `outbound_stream`), and they already have their own accounting through
-//! `transfer_completed`. Double-counting them would break the "arms sum to
-//! message traffic" property this module exists to provide.
+//! ### Relationship to `transfer_completed` — do NOT sum the two
+//!
+//! There are two different kinds of "stream" here and conflating them
+//! produces a double count:
+//!
+//! * **Operations-level streams** (`send_stream` / `StreamId::next_operations`,
+//!   used for full-state broadcast and large op payloads) do NOT reach this
+//!   call site and are NOT counted here. They are covered by
+//!   `transfer_completed`.
+//! * **Transport-level streams** are just a big `NetMessage`: anything over
+//!   `MAX_DATA_SIZE` (~1.2 KB) that goes through [`PeerConnection::send`][send]
+//!   is fragmented by `outbound_stream`. Those messages DO pass through this
+//!   call site, so their bytes ARE counted here — deliberately, since that
+//!   population includes the delta broadcasts. They ALSO emit
+//!   `transfer_completed`.
+//!
+//! So this rollup and `transfer_completed` OVERLAP on transport-level streams.
+//! Each is internally consistent; adding them together is not. Use this
+//! rollup for "which subsystem spent the bytes" and `transfer_completed` for
+//! per-transfer transport behaviour.
+//!
+//! The arms here still partition *message* traffic (every non-stream-op
+//! `NetMessage` lands in exactly one arm), which is the property the residual
+//! against `cumulative_bytes_sent` relies on.
 //!
 //! [bpm]: super::broadcast_payload_mix
 //! [send]: crate::transport::peer_connection::PeerConnection::send
