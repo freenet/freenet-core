@@ -1490,9 +1490,13 @@ async fn drive_relay_broadcast_to(
         .get_peer_by_addr(sender_addr)
     {
         let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+        // #4952: upsert — the sender self-reported this summary, and the
+        // fan-out sender population is by definition co-hosts we often don't
+        // interest-track. Seeding here lets OUR next broadcast to them be a
+        // delta without waiting for a delivered send.
         op_manager
             .interest_manager
-            .update_peer_summary(&key, &sender_key, Some(sender_summary));
+            .upsert_peer_summary(&key, &sender_key, sender_summary);
     }
 
     let (update_data, payload_bytes) = match &payload {
@@ -2428,11 +2432,11 @@ async fn apply_streaming_broadcast(
         .get_peer_by_addr(sender_addr)
     {
         let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
-        op_manager.interest_manager.update_peer_summary(
-            &key,
-            &sender_key,
-            Some(sender_summary.clone()),
-        );
+        // #4952: upsert — same self-reported provenance as the non-streaming
+        // BroadcastTo arm above.
+        op_manager
+            .interest_manager
+            .upsert_peer_summary(&key, &sender_key, sender_summary.clone());
     }
 
     // Step 5: dedup cache BEFORE merge (mirrors non-streaming slice A

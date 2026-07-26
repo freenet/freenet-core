@@ -654,6 +654,70 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         }
     }
 
+    /// Cache a peer's known summary, creating the interest entry when absent.
+    ///
+    /// [`Self::update_peer_summary`] deliberately no-ops for an untracked peer
+    /// (pinned by `update_peer_summary_is_a_silent_noop_for_an_untracked_peer`)
+    /// so summary writes of unknown provenance cannot grow the map. This upsert
+    /// exists for the callers that KNOW the peer holds the summarized state:
+    /// the post-delivery cache in `broadcast_queue::record_delivery_to_interest`
+    /// (we just delivered exactly that state to them) and the InterestSync
+    /// `Summaries` handler (the peer itself reported the summary). Without it,
+    /// an advertised co-host that is untracked at broadcast time is a
+    /// full-state fixed point: every broadcast to it ships full state, the
+    /// post-delivery summary write silently no-ops, and the next broadcast
+    /// ships full state again (#4952 — 58% of fleet broadcast bytes).
+    ///
+    /// The insert respects [`MAX_INTERESTED_PEERS_PER_CONTRACT`] (returns
+    /// `false` at cap with no side writes, same shape as
+    /// [`Self::register_peer_interest`]) and creates the entry with
+    /// `is_upstream = false`. It does NOT touch the demand counters
+    /// (`downstream_subscriber_count` / `local_client_count`) that feed
+    /// eviction's demand ranking — an upserted entry is summary bookkeeping
+    /// plus fan-out of the small `Summaries` notifications, never a state
+    /// broadcast target (Source-2 removal, `update.rs::get_broadcast_targets_update`).
+    pub fn upsert_peer_summary(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        summary: StateSummary<'static>,
+    ) -> bool {
+        let now = self.time_source.now();
+        // Hold the `interested_peers` shard guard across the `peer_contracts`
+        // and hash-index writes — same #4129/#4171 discipline as
+        // `register_peer_interest`, preventing a concurrent remover from
+        // leaving a zombie reverse-index entry.
+        let mut entry = self.interested_peers.entry(*contract).or_default();
+        if let Some(interest) = entry.get_mut(peer) {
+            interest.update_summary(Some(summary), now);
+            return true;
+        }
+        if entry.len() >= MAX_INTERESTED_PEERS_PER_CONTRACT {
+            // At cap the entry is non-empty, so no cleanup is needed; the
+            // caller simply keeps sending full state to this peer (pre-upsert
+            // behavior), bounded per contract. debug! (compiled out of
+            // release) rather than register_peer_interest's warn!: this runs
+            // per delivered broadcast, and the condition is near-unreachable
+            // in practice (entries require connected peers, and
+            // max_connections < the 512 cap), but a stuck-at-cap contract
+            // should be diagnosable in a dev build.
+            tracing::debug!(
+                contract = %contract,
+                limit = MAX_INTERESTED_PEERS_PER_CONTRACT,
+                "upsert_peer_summary: at interested-peer cap, peer stays untracked (full-state sends continue)"
+            );
+            return false;
+        }
+        entry.insert(peer.clone(), PeerInterest::new(Some(summary), false, now));
+        self.peer_contracts
+            .entry(peer.clone())
+            .or_default()
+            .insert(*contract);
+        self.index_contract_hash(contract);
+        drop(entry);
+        true
+    }
+
     /// Refresh the TTL for a peer's interest.
     pub fn refresh_peer_interest(&self, contract: &ContractKey, peer: &PeerKey) {
         let now = self.time_source.now();
@@ -2526,7 +2590,11 @@ mod tests {
     /// `get_peer_summary` returns None (the fan-out sends FULL STATE) and the
     /// post-delivery `update_peer_summary` that is supposed to fix that
     /// (#4442's fix for exactly this chicken-and-egg) silently does nothing —
-    /// so the pair never escapes to deltas. This is a fixed point, not a cold
+    /// so the pair never escapes to deltas via THIS method. This was a fixed
+    /// point until #4952 routed the delivery path (and the Summaries handler)
+    /// through `upsert_peer_summary`, which creates the entry; the no-op
+    /// semantics pinned here remain correct and load-bearing for writes of
+    /// unknown provenance. Historically it was a fixed point, not a cold
     /// start.
     ///
     /// The pre-existing broadcast-path tests all `register_peer_interest`
@@ -2578,6 +2646,152 @@ mod tests {
              is what makes the untracked case a distinct bug rather than cold \
              start"
         );
+    }
+
+    /// #4952 regression: `upsert_peer_summary` closes the untracked-co-host
+    /// full-state fixed point that `update_peer_summary` (pinned no-op above)
+    /// cannot. The post-delivery cache in
+    /// `broadcast_queue::record_delivery_to_interest` routes through the
+    /// upsert, so one delivered full state seeds the summary and every later
+    /// broadcast to the same peer can be a delta.
+    #[test]
+    fn upsert_peer_summary_seeds_summary_for_untracked_peer() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        assert!(
+            manager.get_peer_interest(&contract, &peer).is_none(),
+            "precondition: the peer must be untracked"
+        );
+
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![1u8, 2])));
+
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![1u8, 2]),
+            "the upsert must CREATE the entry so the pair escapes to deltas"
+        );
+        let interest = manager
+            .get_peer_interest(&contract, &peer)
+            .expect("entry created");
+        assert!(
+            !interest.is_upstream,
+            "a delivery-seeded entry is not our upstream"
+        );
+
+        // Later deliveries keep the cached summary current.
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![9u8])));
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![9u8]),
+        );
+
+        // The reverse index is maintained, so peer-disconnect cleanup works.
+        assert!(manager.get_contracts_for_peer(&peer).contains(&contract));
+        assert!(manager.remove_peer_interest(&contract, &peer));
+        assert!(manager.get_peer_summary(&contract, &peer).is_none());
+        assert!(!manager.get_contracts_for_peer(&peer).contains(&contract));
+
+        // Summary bookkeeping must not fabricate local demand (invariant 3):
+        // no local-interest entry appears as a side effect.
+        assert!(
+            !manager.has_local_interest(&contract),
+            "upsert must not create local interest / demand state"
+        );
+    }
+
+    /// #4952: at the per-contract cap the upsert must reject a NEW peer (no
+    /// amplification vector, no zombie side-writes) while still updating a
+    /// peer that is already tracked.
+    #[test]
+    fn upsert_peer_summary_respects_interested_peer_cap() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+
+        for i in 0..MAX_INTERESTED_PEERS_PER_CONTRACT {
+            assert!(manager.register_peer_interest(
+                &contract,
+                make_unique_peer_key(i as u32),
+                None,
+                false
+            ));
+        }
+
+        let newcomer = make_unique_peer_key(u32::MAX);
+        assert!(
+            !manager.upsert_peer_summary(&contract, &newcomer, StateSummary::from(vec![1u8])),
+            "a new peer at cap must be rejected"
+        );
+        assert!(manager.get_peer_interest(&contract, &newcomer).is_none());
+        assert!(
+            !manager
+                .get_contracts_for_peer(&newcomer)
+                .contains(&contract),
+            "a rejected upsert must leave no reverse-index zombie"
+        );
+
+        // An EXISTING peer at cap must still take the update path — the
+        // get_mut-before-cap-check branch order is load-bearing: popular
+        // 512-peer contracts are exactly the #4952 population, and a
+        // register_peer_interest-shaped refactor (cap check first) would
+        // silently freeze summary refreshes for all of them.
+        let existing = make_unique_peer_key(0);
+        assert!(
+            manager.upsert_peer_summary(&contract, &existing, StateSummary::from(vec![42u8])),
+            "an already-tracked peer at cap must still update"
+        );
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &existing)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![42u8]),
+        );
+    }
+
+    /// #4952: upserting an already-tracked peer takes the update path —
+    /// summary replaced, `is_upstream` preserved.
+    #[test]
+    fn upsert_peer_summary_updates_existing_entry_preserving_upstream_flag() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, true);
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![5u8])));
+
+        let interest = manager
+            .get_peer_interest(&contract, &peer)
+            .expect("tracked");
+        assert!(
+            interest.is_upstream,
+            "upsert on an existing entry must not clobber the upstream flag"
+        );
+        assert_eq!(
+            interest.summary.map(|s| s.as_ref().to_vec()),
+            Some(vec![5u8])
+        );
+    }
+
+    /// #4952: an upsert-created entry is ordinary interest state — the TTL
+    /// sweep removes it (entry + reverse index) with no GC exemption, per the
+    /// cleanup-exemptions-must-be-time-bounded rule.
+    #[test]
+    fn upsert_created_entry_expires_via_ttl_sweep() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![1u8])));
+        time.advance_time(INTEREST_TTL + Duration::from_secs(60));
+        manager.sweep_expired_interests();
+
+        assert!(manager.get_peer_interest(&contract, &peer).is_none());
+        assert!(!manager.get_contracts_for_peer(&peer).contains(&contract));
     }
 
     #[test]
