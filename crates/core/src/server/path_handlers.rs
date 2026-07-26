@@ -4879,9 +4879,11 @@ mod tests {
     ///
     /// The shell `open_url` handler must accept `http:` URLs in addition to
     /// `https:`. The original https-only check silently dropped clicks on
-    /// markdown links to plain-HTTP services (e.g. the Network Telemetry
-    /// dashboard `http://nova.locut.us:3133/` linked from the Freenet River
-    /// channel header) — the user clicked the link and nothing happened, no
+    /// markdown links to plain-HTTP services (the trigger was the Network
+    /// Telemetry dashboard linked from the Freenet River channel header,
+    /// plain HTTP at the time and since moved to
+    /// `https://telemetry.freenet.org/`) — the user clicked the link and
+    /// nothing happened, no
     /// console output, no popup, no error. The localhost block stays so a
     /// pasted `http://127.0.0.1:NNNN/` link can't be used to target services
     /// running on the reader's machine.

@@ -1206,9 +1206,12 @@ function freenetBridge(authToken, userToken, hostedMode) {
         // is what blocks `javascript:` / `data:` / `file:` etc.
         //
         // Both http and https are accepted because user-pasted markdown
-        // links commonly target plain-HTTP self-hosted services (e.g.
-        // nova.locut.us:3133, the Freenet network telemetry dashboard,
-        // no TLS configured). Auth tokens never travel through this path
+        // links commonly target self-hosted services with no TLS
+        // configured. freenet/river#231 was exactly that: the network
+        // telemetry dashboard was plain HTTP at the time (it has since
+        // moved to https://telemetry.freenet.org/), and an https-only
+        // filter silently swallowed every click on it.
+        // Auth tokens never travel through this path
         // — the only operation is `window.open(url, '_blank',
         // 'noopener,noreferrer')` — so HTTP doesn't expose credentials.
         // See freenet/river#231.
