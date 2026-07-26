@@ -4411,6 +4411,51 @@ mod tests {
         );
     }
 
+    /// Boundary pin for the documented tie-break: the gate is `>=`, so a delta
+    /// EXACTLY the size of our state loses the tie and refuses. Sending full
+    /// state is preferred at equal bytes because it costs the receiver no
+    /// delta-apply. The sibling tests only cover strictly-smaller (accepted)
+    /// and strictly-larger (refused), which leaves an off-by-one in the
+    /// comparison operator (`>` instead of `>=`) undetected.
+    #[tokio::test(flavor = "current_thread")]
+    async fn equal_sized_delta_returns_not_efficient() {
+        let our_state_size = 8usize;
+        let equal_delta = vec![3u8; 8]; // exactly our_state_size
+        let (op_manager, queries_served, _guards) =
+            op_manager_with_mock_delta_handler("post_gate_equal_delta", equal_delta).await;
+
+        let key = make_contract_key(103);
+        let their_summary = StateSummary::from(vec![4u8]);
+        let our_summary = StateSummary::from(vec![5u8, 5]);
+
+        let result = op_manager
+            .interest_manager
+            .compute_delta(
+                &op_manager,
+                &key,
+                &their_summary,
+                &our_summary,
+                our_state_size,
+            )
+            .await;
+
+        assert_eq!(
+            result,
+            Err(DeltaUnavailable::NotEfficient {
+                summary_size: their_summary.as_ref().len(),
+                state_size: our_state_size,
+            }),
+            "a delta exactly the size of the state must lose the tie (the gate \
+             is `>=`): full state is preferred at equal bytes because it costs \
+             the receiver no delta-apply"
+        );
+        assert_eq!(
+            queries_served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the contract must still have been consulted exactly once"
+        );
+    }
+
     /// Converged-peer companion to the incident pin: with the SAME oversized
     /// peer summary the pre-compute gate used to refuse before the contract
     /// could report an EMPTY delta, so a logically-converged peer was
