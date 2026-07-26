@@ -24,16 +24,20 @@
 //! 4. [`PayloadArm::FullNoOurSummary`] — *our* summary is missing, so there
 //!    was nothing to diff from.
 //! 5. [`PayloadArm::FullNoTheirSummaryUntracked`] — the peer's summary is
-//!    missing AND the peer is not tracked in `interested_peers` at all, so the
-//!    cache write that would fix it is a silent no-op. Permanent.
+//!    missing AND the peer is not tracked in `interested_peers` at all. Before
+//!    #4952 the cache write that would fix it was a silent no-op (permanent
+//!    full state); since #4952 the delivery path upserts, so this arm is
+//!    transient (first send per pair) and should decay toward zero — a
+//!    persistent residual implicates the seeding/heartbeat chain instead.
 //! 6. [`PayloadArm::FullNoTheirSummaryTracked`] — the peer's summary is
 //!    missing but the peer IS tracked, so the next delivery repairs it.
 //!
 //! Arms 4-6 were a single `full_no_summary` bucket when #4922 first shipped.
 //! The 2026-07-25 measurement then found that bucket was the LARGEST single
 //! consumer of wire bytes on the network, with no way to tell a contract-handler
-//! failure (4, a load problem) from a peer-tracking gap (5, a structural bug)
-//! from ordinary cold start (6, self-healing). Those three have nothing in
+//! failure (4, a load problem) from a peer-tracking gap (5, structural until
+//! the #4952 upsert made it self-healing) from ordinary cold start (6,
+//! self-healing). Those three have nothing in
 //! common except the symptom, so the split is what makes the number actionable.
 //! The pre-split `full_no_summary_sends` / `_bytes` fields are still published
 //! as the sum of the three.

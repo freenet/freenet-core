@@ -706,7 +706,7 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // #4952: this MUST be the upsert, not `update_peer_summary` — the latter
     // silently no-ops for a peer with no interest entry, which turned every
     // advertised co-host (fan-out targets come from NeighborHosting, a
-    // population that never registers protocol interest) into a full-state
+    // population frequently untracked at broadcast time) into a full-state
     // fixed point: full state on every update, forever. The upsert creates the
     // entry (capped, no demand-counter writes) so the next send is a delta.
     if let Some(summary) = our_summary {
@@ -953,17 +953,22 @@ pub(super) async fn broadcast_to_single_peer(
         //     summary as ours with no way to tell it from a real one.
         //
         //   * theirs missing -> a peer-summary CACHE gap, and the two
-        //     sub-cases are not alike. `update_peer_summary` writes through
-        //     `interested_peers`, so it is a silent no-op for a peer with no
-        //     `PeerInterest` entry for this contract. Broadcast targets come
+        //     sub-cases differ in HOW they self-heal. Broadcast targets come
         //     from `neighbor_hosting` (advertised co-hosts) since #4642 step 9
-        //     dropped the interest-manager fan-out arm, so a target that the
-        //     ~5-min InterestSync heartbeat has not registered can NEVER cache
-        //     a summary from a delivery — every broadcast to it is full state,
-        //     permanently. That is the #4442 chicken-and-egg re-opened for a
-        //     different peer population, and it is a different bug from an
-        //     ordinary cold-start peer that IS tracked and repairs itself on
-        //     the next delivery. Splitting them is the whole point.
+        //     dropped the interest-manager fan-out arm, so a target is often
+        //     untracked in `interested_peers` at broadcast time (the
+        //     heartbeat-registration chain exists — register_local_hosting →
+        //     Interests → register — but frequently hasn't fired or was
+        //     full-replace-wiped for this pair). Pre-#4952 that population
+        //     was a fixed point: the post-delivery cache write was a silent
+        //     `update_peer_summary` no-op, so every broadcast stayed full
+        //     state, permanently. Since #4952 the delivery path UPSERTS, so
+        //     untracked is transient (one full state seeds the summary) and
+        //     this arm should decay toward first-send-only levels — a
+        //     persistent residual now implicates the seeding/heartbeat chain
+        //     (e.g. an Interests full-replace wiping the pair each ~5 min),
+        //     not the old structural trap. Tracked-but-summaryless (arm 6)
+        //     repairs on the next delivery, same as before.
         //
         // `get_peer_interest` is an in-memory DashMap read — no contract
         // handler round-trip — so this classification costs nothing on a path
@@ -1546,6 +1551,93 @@ mod tests {
             "#4145: with a cached peer summary the next broadcast takes the delta \
              path (compute_delta), not another full state"
         );
+    }
+
+    /// #4952 — the untracked-co-host counterpart of the #4145 test above,
+    /// driven through the REAL production gate. The peer is a fan-out target
+    /// from `neighbor_hosting` with NO interest entry at all (not merely no
+    /// summary). Pre-#4952 the post-delivery cache write was a silent
+    /// `update_peer_summary` no-op, so this test FAILS on that code; it also
+    /// fails on the semantic dodge the source pin can't catch (e.g. re-gating
+    /// the upsert on prior tracking), because it asserts through the gate, not
+    /// the source text.
+    #[tokio::test]
+    async fn untracked_peer_delivery_seeds_interest_and_summary() {
+        let our_summary = StateSummary::from(vec![5, 6, 7, 8]);
+
+        let time_source = SharedMockTimeSource::new();
+        let manager = InterestManager::new(time_source.clone());
+        let contract = make_contract_key(11);
+        let peer = make_peer_key();
+
+        // NO register_peer_interest: an advertised co-host untracked at
+        // broadcast time — the #4952 population.
+        assert!(
+            manager.get_peer_interest(&contract, &peer).is_none(),
+            "precondition: the peer must be untracked"
+        );
+
+        let delivered = record_streaming_delivery(
+            &manager,
+            Ok(Ok(BroadcastDeliveryOutcome::Delivered)),
+            /* sent_delta */ false,
+            &contract,
+            &peer,
+            Some(&our_summary),
+            /* state_size */ 4096,
+            /* payload_size */ 4096,
+        );
+        assert!(delivered);
+
+        assert_eq!(
+            manager.get_peer_summary(&contract, &peer),
+            Some(our_summary),
+            "#4952: a delivered full-state broadcast to an UNTRACKED peer must \
+             seed the interest entry + summary, so the next broadcast is a \
+             delta — otherwise the pair is a full-state fixed point"
+        );
+    }
+
+    /// #4952 divergence guard for the untracked population: a NON-delivered
+    /// full-state send must not fabricate an interest entry carrying a summary
+    /// the peer never received (which would suppress the summary-mismatch
+    /// resend — the #4235 failure mode, now newly reachable because the
+    /// delivery path can create entries).
+    #[tokio::test]
+    async fn untracked_peer_drop_outcome_does_not_fabricate_interest() {
+        let our_summary = StateSummary::from(vec![3, 3, 3]);
+        let dropped = dropped_oneshot().await;
+        let timed_out = elapsed_timeout().await;
+        let cases: Vec<(&str, super::StreamCompletionResult)> = vec![
+            ("explicit-drop", Ok(Ok(BroadcastDeliveryOutcome::Dropped))),
+            ("dropped-oneshot", Ok(dropped)),
+            ("timeout", Err(timed_out)),
+        ];
+
+        for (name, completion) in cases {
+            let time_source = SharedMockTimeSource::new();
+            let manager = InterestManager::new(time_source.clone());
+            let contract = make_contract_key(12);
+            let peer = make_peer_key();
+
+            let delivered = record_streaming_delivery(
+                &manager,
+                completion,
+                /* sent_delta */ false,
+                &contract,
+                &peer,
+                Some(&our_summary),
+                /* state_size */ 2048,
+                /* payload_size */ 2048,
+            );
+            assert!(!delivered, "[{name}] must not classify as delivered");
+            assert!(
+                manager.get_peer_interest(&contract, &peer).is_none(),
+                "[{name}] a non-delivered send must NOT fabricate an interest \
+                 entry for an untracked peer — a summary the peer never \
+                 received would suppress the mismatch resend (#4235)"
+            );
+        }
     }
 
     /// Issue #4145 / #2763 — divergence guard preserved. The #4145 fix caches on
@@ -2317,7 +2409,8 @@ mod tests {
             collapsed.contains("get_peer_interest(&key,&peer_key)"),
             "the missing-their-summary arm must consult get_peer_interest to \
              separate an UNTRACKED peer (whose update_peer_summary write is a \
-             silent no-op, so it is stuck on full state permanently) from a \
+             silent no-op — permanent full state until the #4952 upsert; now \
+             transient, first send per pair) from a \
              TRACKED cold-start peer (which repairs itself on next delivery)"
         );
     }

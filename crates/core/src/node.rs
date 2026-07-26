@@ -3418,9 +3418,12 @@ async fn handle_interest_sync_message(
             let peer_key = get_peer_key_from_addr(op_manager, source);
             if let Some(pk) = peer_key {
                 let summary = freenet_stdlib::prelude::StateSummary::from(summary_bytes);
+                // #4952: upsert — a ResyncResponse sender self-reported the
+                // summary of the full state it just shipped us; seed it even
+                // when we don't interest-track that co-host.
                 op_manager
                     .interest_manager
-                    .update_peer_summary(&key, &pk, Some(summary));
+                    .upsert_peer_summary(&key, &pk, summary);
             }
 
             // No response needed
@@ -3980,6 +3983,11 @@ mod tests {
             body.contains("upsert_peer_summary(&contract,&pk,theirs)"),
             "Summaries arm must upsert a Some(summary) report (seeds untracked \
              co-hosts, #4952)"
+        );
+        assert!(
+            !body.contains("update_peer_summary(&contract,&pk,Some"),
+            "a Some(summary) report must go through the upsert, not the \
+             untracked-no-op update path (#4952)"
         );
         assert!(
             body.contains("update_peer_summary(&contract,&pk,None"),
