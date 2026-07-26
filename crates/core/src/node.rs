@@ -2823,9 +2823,11 @@ async fn handle_interest_sync_message(
                                     .interest_manager
                                     .upsert_peer_summary(&contract, &pk, theirs);
                             }
-                            None => op_manager
-                                .interest_manager
-                                .update_peer_summary(&contract, &pk, None),
+                            None => op_manager.interest_manager.clear_peer_summary(
+                                &contract,
+                                &pk,
+                                crate::ring::interest::SummaryMissingReason::ClearedByNoneReport,
+                            ),
                         }
 
                         if is_stale && !stale_contracts.contains(&contract) {
@@ -3173,9 +3175,11 @@ async fn handle_interest_sync_message(
             // Clear cached summary for this peer
             let peer_key = get_peer_key_from_addr(op_manager, source);
             if let Some(ref pk) = peer_key {
-                op_manager
-                    .interest_manager
-                    .update_peer_summary(&key, pk, None);
+                op_manager.interest_manager.clear_peer_summary(
+                    &key,
+                    pk,
+                    crate::ring::interest::SummaryMissingReason::ClearedByResync,
+                );
             }
 
             // Get PeerKeyLocation for telemetry
@@ -3990,10 +3994,13 @@ mod tests {
              untracked-no-op update path (#4952)"
         );
         assert!(
-            body.contains("update_peer_summary(&contract,&pk,None"),
-            "Summaries arm must keep clear-only update semantics for a None \
-             report — creating an entry just to hold None would relabel \
-             untracked traffic as tracked without enabling deltas"
+            body.contains("clear_peer_summary(&contract,&pk,")
+                && body.contains("SummaryMissingReason::ClearedByNoneReport"),
+            "Summaries arm must keep clear-only semantics for a None report \
+             (creating an entry just to hold None would relabel untracked \
+             traffic as tracked without enabling deltas), and must tag the \
+             clear ClearedByNoneReport so #4961 can attribute the \
+             full_no_their_summary_tracked arm to this path"
         );
     }
 
@@ -6632,22 +6639,27 @@ mod tests {
         fn resync_request_handler_clears_cached_peer_summary() {
             let arm = resync_request_arm();
             assert!(
-                arm.contains("update_peer_summary"),
-                "ResyncRequest handler no longer calls update_peer_summary. \
+                arm.contains("clear_peer_summary"),
+                "ResyncRequest handler no longer calls clear_peer_summary. \
                  #4145 caching relies on this handler clearing the sender's \
                  cached summary so a delta-apply failure forces a fresh \
                  full-state resend instead of looping on unappliable deltas."
             );
-            // The clear MUST pass `None` (clear), not a `Some(summary)` cache.
-            // Strip whitespace so the multi-line call (`op_manager\n
-            // .interest_manager\n .update_peer_summary(&key, pk, None);`)
-            // matches regardless of formatting.
+            // The clear MUST go through the tagged clear API, not a
+            // `update_peer_summary` cache-write. Strip whitespace so the
+            // multi-line call matches regardless of formatting.
             let collapsed: String = arm.chars().filter(|c| !c.is_whitespace()).collect();
             assert!(
-                collapsed.contains("update_peer_summary(&key,pk,None)"),
-                "ResyncRequest handler must clear the cached summary with \
-                 `update_peer_summary(&key, pk, None)` (the `None` clears it). \
-                 Caching a summary here instead would defeat the #4145 backstop."
+                collapsed.contains("clear_peer_summary(&key,pk,"),
+                "ResyncRequest handler must clear the cached summary via \
+                 `clear_peer_summary`. Caching a summary here instead would \
+                 defeat the #4145 backstop."
+            );
+            assert!(
+                collapsed.contains("SummaryMissingReason::ClearedByResync"),
+                "the clear must be tagged ClearedByResync — #4961 needs the \
+                 full_no_their_summary_tracked arm attributed per clear path, \
+                 and an untagged clear would silently land in another bucket"
             );
         }
 

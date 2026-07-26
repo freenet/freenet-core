@@ -169,11 +169,85 @@ impl From<TransportPublicKey> for PeerKey {
     }
 }
 
+/// Why a tracked peer's cached summary is absent.
+///
+/// A tracked peer with no cached summary forces a FULL STATE broadcast
+/// (`PayloadArm::FullNoTheirSummaryTracked`). On the aged 0.2.109 fleet that
+/// arm was 26.9% of broadcast bytes at a 357 KB mean — the single largest
+/// remaining bandwidth arm and the main cause of the 4-20s propagation
+/// latency in #4961 — but the rollup could not say WHICH of the paths below
+/// produced it, and the three have completely different fixes. This tag is
+/// what makes that distinguishable; see #4961.
+///
+/// The tag is only meaningful while `summary` is `None`; read it through
+/// [`PeerInterest::summary_missing_reason`], which enforces that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SummaryMissingReason {
+    /// The entry was created without a summary and has never had one written.
+    ///
+    /// The interest-registration chain (`register_local_hosting` → `Interests`
+    /// → `register_peer_interest`) creates entries with `summary: None`; they
+    /// stay that way until a delivery or a `Summaries` report seeds one. A
+    /// large share here means the seeding chain isn't firing (or an
+    /// `Interests` full-replace is wiping seeded entries every ~5 min).
+    NeverPopulated,
+
+    /// The peer itself reported `None` in an InterestSync `Summaries` message,
+    /// so we dropped what we had cached.
+    ///
+    /// Suspect path: we may be discarding a summary we seeded from an actual
+    /// delivery because the peer's own report raced ahead of its state write.
+    ClearedByNoneReport,
+
+    /// We received a `ResyncRequest` from the peer, which invalidates our
+    /// cached view of what they hold.
+    ClearedByResync,
+
+    /// A delta we sent failed to apply on the peer, so our cached summary for
+    /// them was provably wrong.
+    ClearedByDeltaApplyFailure,
+}
+
+impl SummaryMissingReason {
+    /// Every reason, in telemetry field order.
+    pub const ALL: [SummaryMissingReason; 4] = [
+        SummaryMissingReason::NeverPopulated,
+        SummaryMissingReason::ClearedByNoneReport,
+        SummaryMissingReason::ClearedByResync,
+        SummaryMissingReason::ClearedByDeltaApplyFailure,
+    ];
+
+    /// Dense index into a per-reason counter array.
+    pub fn index(self) -> usize {
+        match self {
+            SummaryMissingReason::NeverPopulated => 0,
+            SummaryMissingReason::ClearedByNoneReport => 1,
+            SummaryMissingReason::ClearedByResync => 2,
+            SummaryMissingReason::ClearedByDeltaApplyFailure => 3,
+        }
+    }
+
+    /// Stable label for telemetry field names.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SummaryMissingReason::NeverPopulated => "never_populated",
+            SummaryMissingReason::ClearedByNoneReport => "none_report",
+            SummaryMissingReason::ClearedByResync => "resync",
+            SummaryMissingReason::ClearedByDeltaApplyFailure => "delta_apply_failed",
+        }
+    }
+}
+
 /// Tracking information for a peer's interest in a specific contract.
 #[derive(Clone, Debug)]
 pub struct PeerInterest {
     /// The peer's current state summary. None if interested but has no state yet.
     pub summary: Option<StateSummary<'static>>,
+
+    /// Why [`Self::summary`] is absent. Stale (and unread) whenever `summary`
+    /// is `Some` — always read it via [`Self::summary_missing_reason`], which
+    /// returns `None` in that case rather than a misleading last-clear cause.
+    summary_absence: SummaryMissingReason,
 
     /// When this interest entry was last refreshed.
     /// Used for TTL-based expiration.
@@ -186,9 +260,14 @@ pub struct PeerInterest {
 
 impl PeerInterest {
     /// Create a new peer interest entry with the given timestamp.
+    ///
+    /// A `None` summary here is [`SummaryMissingReason::NeverPopulated`] by
+    /// construction — this is the only constructor, so an entry cannot come
+    /// into existence summaryless without carrying that tag.
     pub fn new(summary: Option<StateSummary<'static>>, is_upstream: bool, now: Instant) -> Self {
         Self {
             summary,
+            summary_absence: SummaryMissingReason::NeverPopulated,
             last_refreshed: now,
             is_upstream,
         }
@@ -204,9 +283,26 @@ impl PeerInterest {
         now.saturating_duration_since(self.last_refreshed) > INTEREST_TTL
     }
 
-    /// Update the peer's summary and refresh TTL.
-    pub fn update_summary(&mut self, summary: Option<StateSummary<'static>>, now: Instant) {
-        self.summary = summary;
+    /// Why this peer has no cached summary, or `None` when one IS cached.
+    pub fn summary_missing_reason(&self) -> Option<SummaryMissingReason> {
+        self.summary.is_none().then_some(self.summary_absence)
+    }
+
+    /// Cache a summary for this peer and refresh TTL.
+    pub fn set_summary(&mut self, summary: StateSummary<'static>, now: Instant) {
+        self.summary = Some(summary);
+        self.refresh(now);
+    }
+
+    /// Drop the cached summary, recording why, and refresh TTL.
+    ///
+    /// Taking `reason` by value (rather than accepting an `Option` summary) is
+    /// deliberate: it makes an untagged clear unrepresentable, so a future
+    /// clear site cannot silently land in the `NeverPopulated` bucket and
+    /// mis-aim the next fix.
+    pub fn clear_summary(&mut self, reason: SummaryMissingReason, now: Instant) {
+        self.summary = None;
+        self.summary_absence = reason;
         self.refresh(now);
     }
 }
@@ -678,12 +774,37 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         &self,
         contract: &ContractKey,
         peer: &PeerKey,
-        summary: Option<StateSummary<'static>>,
+        summary: StateSummary<'static>,
     ) {
         let now = self.time_source.now();
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
             if let Some(interest) = entry.get_mut(peer) {
-                interest.update_summary(summary, now);
+                interest.set_summary(summary, now);
+            }
+        }
+    }
+
+    /// Drop a peer's cached summary for a contract, recording why.
+    ///
+    /// Every clear MUST name its cause: a tracked peer with no cached summary
+    /// is what forces a full-state broadcast, and #4961 could not tell the
+    /// three clear paths apart in the rollup. The `reason` is surfaced on the
+    /// `FullNoTheirSummaryTracked` arm of `broadcast_payload_mix`.
+    ///
+    /// Like [`Self::update_peer_summary`], this is a silent no-op for an
+    /// untracked peer — clearing something we never cached is a no-op by
+    /// definition, and creating an entry just to hold `None` would inflate the
+    /// map from unauthenticated input.
+    pub fn clear_peer_summary(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        reason: SummaryMissingReason,
+    ) {
+        let now = self.time_source.now();
+        if let Some(mut entry) = self.interested_peers.get_mut(contract) {
+            if let Some(interest) = entry.get_mut(peer) {
+                interest.clear_summary(reason, now);
             }
         }
     }
@@ -723,7 +844,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // leaving a zombie reverse-index entry.
         let mut entry = self.interested_peers.entry(*contract).or_default();
         if let Some(interest) = entry.get_mut(peer) {
-            interest.update_summary(Some(summary), now);
+            interest.set_summary(summary, now);
             return true;
         }
         if entry.len() >= MAX_INTERESTED_PEERS_PER_CONTRACT {
@@ -2145,7 +2266,7 @@ mod tests {
 
         // Update with summary
         let summary = StateSummary::from(vec![1, 2, 3]);
-        manager.update_peer_summary(&contract, &peer, Some(summary.clone()));
+        manager.update_peer_summary(&contract, &peer, summary.clone());
 
         let retrieved = manager.get_peer_summary(&contract, &peer);
         assert!(retrieved.is_some());
@@ -2598,7 +2719,7 @@ mod tests {
         assert_eq!(cached_summary.unwrap().as_ref(), summary2.as_ref());
 
         // Step 4: A sends its summary back
-        manager_b.update_peer_summary(&contract2, &peer_a, Some(summary1.clone()));
+        manager_b.update_peer_summary(&contract2, &peer_a, summary1.clone());
 
         // Verify B has A's summary
         let cached_summary = manager_b.get_peer_summary(&contract2, &peer_a);
@@ -2680,7 +2801,7 @@ mod tests {
         assert!(cached.is_some());
 
         // Simulate ResyncRequest: clear the summary
-        manager.update_peer_summary(&contract, &peer, None);
+        manager.clear_peer_summary(&contract, &peer, SummaryMissingReason::ClearedByResync);
 
         // Verify summary is now None
         let cached = manager.get_peer_summary(&contract, &peer);
@@ -2692,6 +2813,104 @@ mod tests {
                 .get_interested_peers(&contract)
                 .iter()
                 .any(|(pk, _)| pk == &peer)
+        );
+    }
+
+    /// #4961: an entry that never had a summary written reports
+    /// `NeverPopulated`, and one that HAS a summary reports no reason at all.
+    ///
+    /// The second half is the load-bearing one: `summary_absence` keeps its
+    /// last value once a summary is cached, so a naive field read would
+    /// attribute a live, summary-holding peer to whichever path last cleared
+    /// it. Only the accessor's `is_none()` guard prevents that, and that is
+    /// exactly the mis-attribution this instrumentation exists to avoid.
+    #[test]
+    fn summary_missing_reason_is_never_populated_until_cleared_and_absent_when_cached() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert_eq!(
+            manager
+                .get_peer_interest(&contract, &peer)
+                .and_then(|i: PeerInterest| i.summary_missing_reason()),
+            Some(SummaryMissingReason::NeverPopulated),
+            "a fresh summaryless entry must report NeverPopulated"
+        );
+
+        manager.update_peer_summary(&contract, &peer, StateSummary::from(vec![1u8, 2, 3]));
+        assert_eq!(
+            manager
+                .get_peer_interest(&contract, &peer)
+                .and_then(|i: PeerInterest| i.summary_missing_reason()),
+            None,
+            "a peer WITH a cached summary must report no missing-reason — \
+             reading the raw field here would mis-attribute it"
+        );
+    }
+
+    /// #4961: each clear path is distinguishable, and a re-cached summary
+    /// hides the reason again.
+    ///
+    /// Without the per-path tag the `full_no_their_summary_tracked` arm (26.9%
+    /// of broadcast bytes on the aged 0.2.109 fleet) is one number covering
+    /// three causes with three different fixes.
+    #[test]
+    fn clear_peer_summary_records_the_distinguishing_reason() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        let summary = StateSummary::from(vec![1u8, 2, 3]);
+
+        for reason in SummaryMissingReason::ALL {
+            manager.register_peer_interest(&contract, peer.clone(), Some(summary.clone()), false);
+            manager.clear_peer_summary(&contract, &peer, reason);
+            assert_eq!(
+                manager
+                    .get_peer_interest(&contract, &peer)
+                    .and_then(|i: PeerInterest| i.summary_missing_reason()),
+                Some(reason),
+                "clear must record {reason:?}, not a different path's tag"
+            );
+
+            // Re-caching hides the reason; the arm no longer applies.
+            manager.update_peer_summary(&contract, &peer, summary.clone());
+            assert_eq!(
+                manager
+                    .get_peer_interest(&contract, &peer)
+                    .and_then(|i: PeerInterest| i.summary_missing_reason()),
+                None
+            );
+        }
+    }
+
+    /// Every reason has a distinct index and label — a collision would silently
+    /// merge two causes into one telemetry bucket, which is the exact failure
+    /// this split exists to prevent.
+    #[test]
+    fn summary_missing_reason_indices_and_labels_are_distinct() {
+        let indices: std::collections::HashSet<_> = SummaryMissingReason::ALL
+            .iter()
+            .map(|r| r.index())
+            .collect();
+        assert_eq!(
+            indices.len(),
+            SummaryMissingReason::ALL.len(),
+            "duplicate index would merge two causes into one counter"
+        );
+        assert!(
+            indices.iter().all(|i| *i < SummaryMissingReason::ALL.len()),
+            "index must stay in bounds of the counter array"
+        );
+        let labels: std::collections::HashSet<_> = SummaryMissingReason::ALL
+            .iter()
+            .map(|r| r.as_str())
+            .collect();
+        assert_eq!(
+            labels.len(),
+            SummaryMissingReason::ALL.len(),
+            "duplicate label would collide as a JSON field name"
         );
     }
 
@@ -2733,7 +2952,7 @@ mod tests {
             "precondition: the peer must be untracked"
         );
 
-        manager.update_peer_summary(&contract, &peer, Some(summary));
+        manager.update_peer_summary(&contract, &peer, summary);
 
         assert!(
             manager.get_peer_summary(&contract, &peer).is_none(),
@@ -2746,7 +2965,7 @@ mod tests {
 
         // And it stays that way no matter how many deliveries land.
         for _ in 0..5 {
-            manager.update_peer_summary(&contract, &peer, Some(StateSummary::from(vec![9u8])));
+            manager.update_peer_summary(&contract, &peer, StateSummary::from(vec![9u8]));
         }
         assert!(
             manager.get_peer_summary(&contract, &peer).is_none(),
@@ -2756,7 +2975,7 @@ mod tests {
 
         // Contrast: once the peer IS tracked, the very same call sticks.
         manager.register_peer_interest(&contract, peer.clone(), None, false);
-        manager.update_peer_summary(&contract, &peer, Some(StateSummary::from(vec![7u8])));
+        manager.update_peer_summary(&contract, &peer, StateSummary::from(vec![7u8]));
         assert_eq!(
             manager
                 .get_peer_summary(&contract, &peer)
@@ -2948,7 +3167,7 @@ mod tests {
 
         // Step 1: A sends ResyncRequest
         // B receives it and clears A's cached summary
-        manager_b.update_peer_summary(&contract, &peer_a, None);
+        manager_b.clear_peer_summary(&contract, &peer_a, SummaryMissingReason::ClearedByResync);
 
         // Verify B cleared A's summary
         let cached = manager_b.get_peer_summary(&contract, &peer_a);
@@ -2956,7 +3175,7 @@ mod tests {
 
         // Step 2: B sends ResyncResponse with full state and summary
         // A receives it and updates B's summary
-        manager_a.update_peer_summary(&contract, &peer_b, Some(new_summary.clone()));
+        manager_a.update_peer_summary(&contract, &peer_b, new_summary.clone());
 
         // Verify A has B's new summary
         let cached = manager_a.get_peer_summary(&contract, &peer_b);

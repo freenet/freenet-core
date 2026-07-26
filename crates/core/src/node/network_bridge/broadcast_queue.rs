@@ -869,6 +869,9 @@ pub(super) async fn broadcast_to_single_peer(
     // smaller than the state), so the ratio of these two inputs field-checks
     // the old pre-compute proxy rather than restating the trigger. See #3335.
     let mut not_efficient_gate_inputs: Option<(usize, usize)> = None;
+    // #4961: WHY a tracked peer has no cached summary. Set only on the
+    // `FullNoTheirSummaryTracked` arm below, where the entry exists to be read.
+    let mut tracked_missing_reason: Option<crate::ring::interest::SummaryMissingReason> = None;
     let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
         // Scoped to the both-summaries-present case ON PURPOSE. When a summary
         // is missing a delta was impossible regardless of the memo, so letting
@@ -983,11 +986,15 @@ pub(super) async fn broadcast_to_single_peer(
             PayloadArm::FullNoOurSummary,
         ),
         (Some(_), None) => {
-            let arm = if op_manager
+            let arm = if let Some(interest) = op_manager
                 .interest_manager
                 .get_peer_interest(&key, &peer_key)
-                .is_some()
             {
+                // The entry is tracked and (by this match arm) summaryless, so
+                // the reason tag is always readable here — #4961 needs it to
+                // tell the three clear paths apart, since they have three
+                // different fixes and this is the largest broadcast-byte arm.
+                tracked_missing_reason = interest.summary_missing_reason();
                 PayloadArm::FullNoTheirSummaryTracked
             } else {
                 PayloadArm::FullNoTheirSummaryUntracked
@@ -1167,6 +1174,7 @@ pub(super) async fn broadcast_to_single_peer(
                         key.id(),
                         payload_size,
                         not_efficient_gate_inputs,
+                        tracked_missing_reason,
                     );
                     tracing::debug!(
                         tx = %update_tx,
@@ -1216,6 +1224,7 @@ pub(super) async fn broadcast_to_single_peer(
                 key.id(),
                 payload_size,
                 not_efficient_gate_inputs,
+                tracked_missing_reason,
             );
             // Delta-incompat attribution (HQk7 resync loop): remember that we
             // just delivered a DELTA to this peer so a prompt `ResyncRequest`
@@ -2366,7 +2375,7 @@ mod tests {
         let collapsed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
         let record_needle = concat!(
             ".record_",
-            "delivered(payload_arm,key.id(),payload_size,not_efficient_gate_inputs,)"
+            "delivered(payload_arm,key.id(),payload_size,not_efficient_gate_inputs,tracked_missing_reason,)"
         );
         assert_eq!(
             collapsed.matches(record_needle).count(),
