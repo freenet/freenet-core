@@ -903,6 +903,19 @@ impl NodeP2P {
         // global would let one node's ticker drain another's records.
         crate::node::network_bridge::broadcast_payload_mix::spawn_payload_mix_aggregator(
             op_manager.payload_mix.clone(),
+            payload_mix_peer_id.clone(),
+            &background_task_monitor,
+        );
+
+        // Outbound message-kind census (#4956): the payload mix above covers
+        // only update fan-out, which a paired measurement against
+        // `resource_utilization` found to be roughly a quarter of what a node
+        // actually sends. This one covers every non-stream message, so the
+        // arms SUM to the node's message traffic and the residual against
+        // `cumulative_bytes_sent` names the transport overhead instead of
+        // hiding it. Same per-`op_manager` reasoning as above.
+        crate::node::network_bridge::outbound_message_mix::spawn_outbound_mix_aggregator(
+            op_manager.outbound_mix.clone(),
             payload_mix_peer_id,
             &background_task_monitor,
         );

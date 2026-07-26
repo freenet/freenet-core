@@ -172,6 +172,10 @@ pub(crate) struct OpManager {
     /// ticker steal every other node's records and publish them under its own
     /// peer id. See [`PayloadMix`](crate::node::network_bridge::broadcast_payload_mix::PayloadMix).
     pub payload_mix: Arc<crate::node::network_bridge::broadcast_payload_mix::PayloadMix>,
+    /// Outbound bytes by message kind (#4956). Per-`OpManager` rather than a
+    /// global so simulation runs, which host many nodes in one process, keep
+    /// each node's census separate.
+    pub outbound_mix: Arc<crate::node::network_bridge::outbound_message_mix::OutboundMix>,
     /// Interest manager for delta-based state synchronization.
     ///
     /// Its clock comes from the same injectable
@@ -326,6 +330,7 @@ impl Clone for OpManager {
             contract_waiters: self.contract_waiters.clone(),
             neighbor_hosting: self.neighbor_hosting.clone(),
             payload_mix: self.payload_mix.clone(),
+            outbound_mix: self.outbound_mix.clone(),
             interest_manager: self.interest_manager.clone(),
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
             update_propagation_stats: self.update_propagation_stats.clone(),
@@ -529,6 +534,9 @@ impl OpManager {
             is_gateway,
             contract_waiters,
             neighbor_hosting,
+            outbound_mix: Arc::new(
+                crate::node::network_bridge::outbound_message_mix::OutboundMix::new(),
+            ),
             payload_mix: Arc::new(
                 crate::node::network_bridge::broadcast_payload_mix::PayloadMix::new(),
             ),

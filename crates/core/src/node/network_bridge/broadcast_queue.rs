@@ -213,13 +213,13 @@ pub(super) struct SummaryPair<'a> {
 /// finding): a contract whose `summarize_state` serializes
 /// non-deterministically (HashMap/HashSet iteration order, per-process
 /// `RandomState`) yields different summary bytes for the SAME logical state on
-/// different peers. The byte compare then never skips, `compute_delta` either
-/// returns an empty delta (which the pre-fix arm "fell back" from by sending
-/// FULL STATE) or is refused outright by the `is_delta_efficient` gate on
-/// big-summary contracts — so a fully-converged pair re-flooded full state on
-/// every heartbeat-driven sync and every fan-out (the nondeterministic-summary
-/// heal storm; e.g. the `Eumk9HNQ` contract that "healed" hard while its state
-/// never changed).
+/// different peers. The byte compare then never skips, and `compute_delta`
+/// either returned an empty delta (which the pre-fix arm "fell back" from by
+/// sending FULL STATE) or — before #4923 removed the pre-compute
+/// `is_delta_efficient` gate — was refused outright on big-summary contracts,
+/// so a fully-converged pair re-flooded full state on every heartbeat-driven
+/// sync and every fan-out (the nondeterministic-summary heal storm; e.g. the
+/// `Eumk9HNQ` contract that "healed" hard while its state never changed).
 ///
 /// This helper reuses the #4894 machinery: byte-equal summaries short-circuit
 /// to [`FanoutSendPlan::Skip`]; byte-differing summaries consult the shared
@@ -284,13 +284,13 @@ pub(super) fn plan_fanout_send<T: crate::util::time_source::TimeSource + Sync>(
 /// fan-out pass can issue. Probe results land in the shared delta cache, so
 /// repeated fan-outs for an unchanged pair cost no further WASM.
 ///
-/// Note the probe deliberately bypasses the [`is_delta_efficient`] wire gate
-/// (see `peer_summary_has_pending_state`): staleness detection wants the
-/// semantic answer even for big-summary contracts, because the alternative it
+/// Note the probe deliberately has no notion of delta SIZE (see
+/// `peer_summary_has_pending_state`): staleness detection wants only the
+/// semantic answer (empty vs non-empty delta), because the alternative it
 /// replaces is a spurious FULL-STATE send on every fan-out — strictly more
-/// expensive than one delta computation.
-///
-/// [`is_delta_efficient`]: crate::ring::interest::is_delta_efficient
+/// expensive than one delta computation. (`compute_delta` shares the same
+/// always-compute behavior since #4923; it additionally refuses to RETURN a
+/// delta that is not smaller than full state.)
 pub(super) async fn fanout_send_needed(
     op_manager: &OpManager,
     key: &ContractKey,
@@ -861,21 +861,24 @@ pub(super) async fn broadcast_to_single_peer(
     // tag is carried to the real-delivery sites below and recorded there, so
     // the mix counts bytes that actually reached the wire.
     // Gate inputs for the `FullNotEfficient` arm, carried to the delivery site
-    // so the payload-mix rollup can report what the wire-efficiency gate
-    // actually refused on. `DeltaUnavailable::NotEfficient` has always carried
-    // these, but its only reader was a `debug!` — compiled out in release — so
-    // in production the refusals were unattributable. See #3335.
+    // so the payload-mix rollup can report the real (summary_size, state_size)
+    // each refusal was observed under. `DeltaUnavailable::NotEfficient` has
+    // always carried these, but its only reader was a `debug!` — compiled out
+    // in release — so in production the refusals were unattributable. Since
+    // #4923 the refusal itself is POST-compute (the computed delta was not
+    // smaller than the state), so the ratio of these two inputs field-checks
+    // the old pre-compute proxy rather than restating the trigger. See #3335.
     let mut not_efficient_gate_inputs: Option<(usize, usize)> = None;
     let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
         // Scoped to the both-summaries-present case ON PURPOSE. When a summary
         // is missing a delta was impossible regardless of the memo, so letting
         // the suppression guard win there would credit the memo for a full
         // state it did not cause — overstating `FullDeltaSuppressed` and
-        // undercounting `FullNoSummary`, which is exactly the distinction this
-        // instrumentation exists to draw. Behavior is unchanged either way (a
-        // missing summary falls to the `_` arm, which also sends full state and
-        // also never reaches `compute_delta`), so this is purely about
-        // attributing the bytes to the right cause.
+        // undercounting the no-summary arms, which is exactly the distinction
+        // this instrumentation exists to draw. Behavior is unchanged either way
+        // (a missing summary falls to the no-summary arms below, which also
+        // send full state and also never reach `compute_delta`), so this is
+        // purely about attributing the bytes to the right cause.
         (Some(_), Some(_)) if deltas_suppressed => (
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
@@ -919,9 +922,10 @@ pub(super) async fn broadcast_to_single_peer(
                         "Delta computation failed, falling back to full state"
                     );
                     // Split the refusal from a genuine failure: `NotEfficient`
-                    // means no contract code ran at all — the gate declined a
-                    // delta because the peer's summary is >= 50 % of our state,
-                    // and we then send the whole state, which is never smaller.
+                    // means the contract DID compute a delta but it was not
+                    // smaller than our full state (post-#4923 semantics), so
+                    // the full state sent here is the genuinely optimal
+                    // payload — equal or fewer bytes than the refused delta.
                     let arm = match err {
                         crate::ring::interest::DeltaUnavailable::NotEfficient {
                             summary_size,
@@ -1944,10 +1948,11 @@ mod tests {
     // (HashMap/HashSet order) yields different bytes for the SAME logical
     // state across peers, so the byte compare never skipped; the delta path
     // then either returned an empty delta (which the pre-fix arm answered by
-    // sending FULL STATE) or was refused by the `is_delta_efficient` gate on
-    // big-summary contracts — so a fully-converged pair re-flooded full state
-    // on every fan-out (contracts like `Eumk9HNQ` healing hard while their
-    // state never changed). These tests exercise the cache-only decision core
+    // sending FULL STATE) or — before #4923 removed the pre-compute
+    // `is_delta_efficient` gate — was refused outright on big-summary
+    // contracts, so a fully-converged pair re-flooded full state on every
+    // fan-out (contracts like `Eumk9HNQ` healing hard while their state never
+    // changed). These tests exercise the cache-only decision core
     // `plan_fanout_send`; the wiring is pinned by
     // `fanout_path_uses_semantic_delta_skip_pin`.
 

@@ -1589,8 +1589,18 @@ impl Ring {
                 }
             }
 
-            crate::tracing::telemetry::send_standalone_event(
+            // #4956: tag with the local peer so this can be JOINED per-peer
+            // against `resource_utilization` / `outbound_message_mix`. Without
+            // it the event reports fleet-wide distributions only, which is why
+            // the InterestSync cost hypothesis could not be confirmed by
+            // correlation and had to stay an estimate.
+            crate::tracing::telemetry::send_standalone_event_with_peer_id(
                 "interest_heartbeat_cycle",
+                &op_manager
+                    .ring
+                    .connection_manager
+                    .own_location()
+                    .to_string(),
                 serde_json::json!({
                     "peers_sent": peers_sent,
                     "interest_hashes": hashes.len(),
