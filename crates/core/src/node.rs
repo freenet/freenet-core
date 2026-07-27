@@ -4152,24 +4152,23 @@ mod tests {
              measurement; without it the identical/differing rollup is \
              silently always zero"
         );
-        // Structural, not presence: assert the call sits INSIDE the dedup
-        // guard's block. Two independent `contains` checks would pass a
-        // regression that kept both identifiers but moved the call out from
-        // behind the `if` — which is precisely the mutation that silently
-        // re-opens the skew. Slice from the guard to the end of its block.
-        let guard_off = summaries_arm
-            .find(concat!("compared_", "contracts.insert("))
-            .expect("the per-message dedup guard must exist in the Summaries arm");
-        let guard_block_end = summaries_arm[guard_off..]
-            .find("\n                                }")
-            .expect("dedup guard block end not found");
-        let guard_block = &summaries_arm[guard_off..guard_off + guard_block_end];
-        assert!(
-            guard_block.contains(concat!("record_summary", "_comparison")),
-            "the measurement call must sit INSIDE the per-message dedup guard, \
-             or a peer repeating a hash can inflate the ratio that gates the \
-             wire-format decision. Guard block was:\n{guard_block}"
-        );
+        // What is deliberately NOT pinned: the per-message dedup that stops a
+        // peer inflating the ratio by repeating a hash.
+        //
+        // A structural pin for it — slice the guard's block, assert the call
+        // is inside — was written and then DELETED because mutation testing
+        // showed it GREEN when the call was moved out from behind the `if`:
+        // the sliced block ran on to a later brace that still contained the
+        // call. A presence check on the guard identifier is no better; it
+        // survives any mutation that keeps the declaration. Text matching
+        // cannot decide nesting, and a guard that looks like protection but
+        // isn't is worse than none, because it stops the next person adding
+        // real protection.
+        //
+        // So the dedup BYPASS has no coverage. Closing it needs a test that
+        // drives this handler with a duplicate entry, which needs hosted state
+        // and an executor — disproportionate for observation-only telemetry,
+        // but the gap is real and stated here rather than papered over.
 
         assert!(
             summaries_arm.contains("peer_summary_has_pending_state"),
