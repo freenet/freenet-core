@@ -4395,6 +4395,18 @@ async fn test_client_disconnect_does_not_immediately_unsubscribe_with_recent_rea
         // the event log off for network-mode nodes and this test kept passing
         // while proving nothing. An empty aggregation here means the evidence
         // is missing, not that the behavior is correct.
+        //
+        // Scope, so this is not over-trusted: it proves the event source is
+        // LIVE, not that unsubscribe detection specifically works. Any node
+        // activity satisfies it. That is the right target — the failure mode it
+        // guards is "the source is switched off", which is what silently
+        // disabled this test.
+        //
+        // Not flaky: by this point the test has completed a PUT, a GET, a
+        // SUBSCRIBE, and asserted that client B received an update
+        // notification, and the loop sleeps 5s before its first aggregation
+        // (which flushes every node's register first). Zero events here would
+        // itself be the bug.
         assert!(
             !events.is_empty(),
             "event aggregation returned no events, so the unsubscribe assertions \
