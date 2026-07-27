@@ -2453,8 +2453,11 @@ impl<T: TimeSource> HostingCache<T> {
                     },
                 )
                 .collect();
-            // Same comparator as the eviction sort above, so `reported[0]` is
-            // the contract the eviction loop acted on first.
+            // Same comparator as the eviction sort above, so the victims among
+            // these appear in the order they were shed. `reported[0]` is the
+            // highest-RATE probe, which is not necessarily a victim — an immune
+            // contract can outrank the one actually shed. See
+            // `CostAxisDecision::offenders`.
             reported.sort_by(|a, b| {
                 b.rate
                     .partial_cmp(&a.rate)
