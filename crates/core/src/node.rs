@@ -4972,10 +4972,13 @@ mod tests {
 
         // Seed the outstanding entry: WE sent a ResyncRequest to `source` for
         // `key`, so the incoming response is solicited.
-        op_manager
-            .ring
-            .outstanding_resync_requests
-            .record(*key.id(), source);
+        assert!(
+            op_manager
+                .ring
+                .outstanding_resync_requests
+                .record(*key.id(), source),
+            "seeding the outstanding entry must correlate (map is empty here)"
+        );
         assert_eq!(
             op_manager.ring.outstanding_resync_requests.len(),
             1,
