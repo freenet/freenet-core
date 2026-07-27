@@ -103,9 +103,28 @@ jobs:
           STALE_MIN=90
           now=$(date -u +%s)
 
+          # Distinguish "no such release" (a real signal — the release either
+          # has not been created yet, or never was) from ANY other gh failure
+          # (rate limit, 5xx, network). Collapsing both into "" would make a
+          # transient API blip on a normal night fall through to the staleness
+          # branch below, where a long-published version is far past STALE_MIN
+          # and would hard-fail — re-introducing exactly the false page this
+          # workflow change exists to remove. A transient failure is not
+          # evidence about the release, so skip and let the next nightly decide.
+          set +e
           release_json=$(gh release view "$TAG" \
             --repo "${{ github.repository }}" \
-            --json isDraft,createdAt 2>/dev/null) || release_json=""
+            --json isDraft,createdAt 2>release_err.txt)
+          gh_rc=$?
+          set -e
+          if [ "$gh_rc" -ne 0 ]; then
+            release_json=""
+            if ! grep -qi "release not found\|not found\|no release found" release_err.txt; then
+              echo "::warning::gh release view $TAG failed transiently (exit ${gh_rc}): $(tr '\n' ' ' < release_err.txt). Not evidence about the release — skipping this run; the next nightly re-checks."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
 
           if [ -z "$release_json" ]; then
             # crates.io has the version but no GitHub release tag exists yet
