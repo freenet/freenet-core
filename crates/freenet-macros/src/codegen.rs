@@ -799,23 +799,35 @@ mod tests {
     /// counts stay at 2. Unreached-arm coverage is a property of the FIXTURE,
     /// and no token count against a single fixture can establish it.
     ///
-    /// **That hole is NOT covered anywhere.** A source-scrape guard for it was
-    /// written and then deleted: text matching cannot tell a field from prose,
-    /// so five separate mutations defeated it (opt-in named in a trailing
-    /// comment, in a block comment, in a `///` doc comment; a literal in
-    /// another function; and — worst — an innocuous production comment
-    /// containing the words `mod tests`, which truncated the scraped region
-    /// before the peer arm so the guard went green on exactly the bug it
-    /// existed to catch). A guard that looks like protection but isn't is worse
-    /// than none, because it stops the next person adding real protection.
+    /// **That hole is not covered by any test.** A source-scrape guard for it
+    /// was written and then deleted, because text matching cannot tell a field
+    /// from prose. Three mutations defeated the final version: the opt-in named
+    /// in a trailing comment, in a `/* block comment */`, and — worst — an
+    /// innocuous production comment containing the words `mod tests`, which
+    /// truncated the scraped region before the peer arm so the guard went green
+    /// on exactly the bug it existed to catch.
+    ///
+    /// Two more defeated earlier or alternative versions: a literal in another
+    /// function (beat the single-function slice, later widened), and the opt-in
+    /// in a `///` doc comment (beat a `proc_macro2` lexer variant, since `///`
+    /// becomes `#[doc = "..."]` and the phrase survives in the string literal).
+    /// Each fix drew a new shape — which is the point: the problem is the
+    /// approach, not any one bug. A guard that looks like protection but isn't
+    /// is worse than none, because it stops the next person adding real
+    /// protection.
+    ///
+    /// (`warn_if_no_events` would still surface a TOTAL runtime blackout, but
+    /// it prints rather than fails, and would not catch a partial one where
+    /// only a new arm's nodes lack the opt-in.)
     ///
     /// So: **if you add a node-config arm here, add a fixture node that reaches
-    /// it.** If that ever needs enforcing, parse rather than match
-    /// (`syn::parse_file`, walking for an `ExprStruct` whose path ends in
-    /// `ConfigArgs` — fields and doc attributes are structurally distinct
-    /// there), or better, remove the duplication so both arms build their
-    /// `ConfigArgs` through one shared helper and there is only one place to
-    /// forget.
+    /// it.** If that ever needs enforcing, parse rather than match —
+    /// `syn::parse_file`, walking for an `ExprStruct` whose path ends in
+    /// `ConfigArgs`, since fields and doc attributes are structurally distinct
+    /// there (note the walk needs manual recursion or syn's `visit` feature,
+    /// which is not currently enabled). Better still, remove the duplication so
+    /// both arms build their `ConfigArgs` through one shared helper and there
+    /// is only one place to forget.
     #[test]
     fn every_harness_node_enables_the_event_log() {
         let args: FreenetTestArgs = syn::parse2(quote! { nodes = ["gateway", "peer-1"] }).unwrap();
