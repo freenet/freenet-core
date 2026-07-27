@@ -1689,7 +1689,7 @@ pub struct EventFlushHandle {
 
 impl EventFlushHandle {
     /// A handle whose [`Self::flush`] is a no-op, for nodes running with the
-    /// event log disabled (#4966) — there is no `EventRegister` to drain.
+    /// event log disabled (#4968) — there is no `EventRegister` to drain.
     ///
     /// The receiver is dropped immediately and deliberately. `send` on a
     /// *closed* channel returns `Err` at once, so `flush` short-circuits

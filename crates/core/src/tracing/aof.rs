@@ -602,7 +602,7 @@ impl LogFile {
     /// readers see it immediately; the kernel then writes it back on its own
     /// schedule instead of one journal commit per five events.
     ///
-    /// do NOT re-add a per-batch fsync here — see #4966.
+    /// do NOT re-add a per-batch fsync here — see #4968.
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         let _guard = FILE_LOCK.lock().await;
         let file = self.file.as_mut().unwrap();
@@ -652,7 +652,7 @@ mod tests {
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
     }
 
-    /// Source pin (#4966): `write_all` must NOT fsync on every batch.
+    /// Source pin (#4968): `write_all` must NOT fsync on every batch.
     ///
     /// A `sync_all()` used to run after each `BATCH_SIZE` (5) events. Because
     /// an append also changes the file size, that forced a full filesystem
@@ -694,7 +694,7 @@ mod tests {
 
         assert!(
             !body.contains(concat!("sync", "_all")),
-            "write_all must NOT fsync per batch (#4966). Durability is already \
+            "write_all must NOT fsync per batch (#4968). Durability is already \
              covered by rotate_segment's fsync and the torn-tail truncation on \
              load; a per-batch fsync costs ~5x write amplification on every user \
              peer for a purely diagnostic log. Offending body:\n{body}"

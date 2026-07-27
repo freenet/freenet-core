@@ -197,7 +197,7 @@ pub struct ConfigArgs {
     ///
     /// Measured on a live 0.2.111 peer, writing it costs ~61 MiB/hour of
     /// appends and accounted for 95% of every fsync the process issued
-    /// (#4966). Enable it on nodes you operate and want to post-mortem.
+    /// (#4968). Enable it on nodes you operate and want to post-mortem.
     #[arg(
         long = "enable-event-log",
         env = "FREENET_ENABLE_EVENT_LOG",
@@ -563,7 +563,7 @@ impl ConfigArgs {
             // these are new fields, so a plain get_or_insert is correct.
             self.hosting_disk_pct.get_or_insert(cfg.hosting_disk_pct);
             self.max_hosting_disk.get_or_insert(cfg.max_hosting_disk);
-            // #4966. `cfg.enable_event_log` is itself an Option, so an older
+            // #4968. `cfg.enable_event_log` is itself an Option, so an older
             // config.toml with no such key merges as `None` and leaves the
             // mode-dependent default intact rather than pinning `false`.
             if let Some(persisted) = cfg.enable_event_log {
@@ -1296,7 +1296,7 @@ pub struct Config {
     /// mode-dependent default.
     ///
     /// NOT related to the telemetry that feeds telemetry.freenet.org; see the
-    /// `ConfigArgs::enable_event_log` docs (#4966).
+    /// `ConfigArgs::enable_event_log` docs (#4968).
     #[serde(
         default,
         rename = "enable-event-log",
@@ -2776,7 +2776,7 @@ impl Config {
     ///
     /// This does NOT gate the telemetry that feeds telemetry.freenet.org —
     /// that is a separate `TelemetryReporter` sink fed in-memory off the same
-    /// event stream (#4966).
+    /// event stream (#4968).
     pub fn event_log_enabled(&self) -> bool {
         self.enable_event_log
             .unwrap_or(matches!(self.mode, OperationMode::Local))
@@ -4019,7 +4019,7 @@ mod tests {
     }
 
     /// Build a `ConfigArgs` rooted at `dir` in the given mode. Shared by the
-    /// #4966 event-log default tests so each case differs only in what it sets.
+    /// #4968 event-log default tests so each case differs only in what it sets.
     fn event_log_args(dir: &std::path::Path, mode: OperationMode) -> ConfigArgs {
         ConfigArgs {
             mode: Some(mode),
@@ -4047,7 +4047,7 @@ mod tests {
         }
     }
 
-    /// #4966: a network-mode node (what end users run) must NOT write the local
+    /// #4968: a network-mode node (what end users run) must NOT write the local
     /// diagnostic event log by default. On a live 0.2.111 peer that log was
     /// ~61 MiB/hour of appends and 95% of every fsync the process issued.
     #[tokio::test]
@@ -4063,7 +4063,7 @@ mod tests {
         );
     }
 
-    /// #4966: local mode is a single-node dev mode where the log is the point,
+    /// #4968: local mode is a single-node dev mode where the log is the point,
     /// and `fdev verify-state` consumes `_EVENT_LOG_LOCAL`. It stays ON.
     #[tokio::test]
     async fn event_log_defaults_on_in_local_mode() {
@@ -4099,12 +4099,12 @@ mod tests {
         );
     }
 
-    /// Regression (#4966, the #3890/#4275 silent-revert class): building twice
+    /// Regression (#4968, the #3890/#4275 silent-revert class): building twice
     /// against the SAME config dir must not flip local mode's default off.
     ///
     /// The first build persists a `config.toml`. Because `enable_event_log` is
     /// `None` it is `skip_serializing_if`-omitted, so that file is byte-identical
-    /// in this respect to one written by a pre-#4966 release. If the merge step
+    /// in this respect to one written by a pre-#4968 release. If the merge step
     /// treated the absent key as an explicit `false`, the second build would
     /// silently strip the event log from every upgrading local-mode node and
     /// break `fdev verify-state`. It must still resolve to ON.
@@ -4124,7 +4124,7 @@ mod tests {
         assert!(
             !persisted.contains("enable-event-log"),
             "precondition: an unset event-log flag must be omitted from config.toml, \
-             otherwise this test is not exercising the pre-#4966 upgrade shape. Got:\n{persisted}"
+             otherwise this test is not exercising the pre-#4968 upgrade shape. Got:\n{persisted}"
         );
 
         let second = event_log_args(temp_dir.path(), OperationMode::Local)
@@ -4950,7 +4950,7 @@ mod tests {
             per_user_inactive_ttl_secs: 1_234_567,
             inactive_user_sweep_interval_secs: 7_200,
             module_cache_budget_bytes: 987_654_321,
-            // Non-default on purpose: the seed is Local mode, where the #4966
+            // Non-default on purpose: the seed is Local mode, where the #4968
             // default is ON, so `Some(false)` fails this test if the merge
             // drops the field (it would come back as `None`).
             enable_event_log: Some(false),
@@ -5035,7 +5035,7 @@ mod tests {
         );
         assert_eq!(
             enable_event_log, seed.enable_event_log,
-            "enable_event_log (#4966) — an explicit setting must survive the \
+            "enable_event_log (#4968) — an explicit setting must survive the \
              config.toml merge, or an operator's opt-in is silently reverted"
         );
         assert_eq!(

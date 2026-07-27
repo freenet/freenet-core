@@ -680,7 +680,7 @@ impl NodeConfig {
             let mut registers: Vec<Box<dyn NetEventRegister>> = Vec::new();
 
             // The local append-only diagnostic log (`_EVENT_LOG`) is opt-in on
-            // network nodes (#4966). Measured on a live 0.2.111 peer it cost
+            // network nodes (#4968). Measured on a live 0.2.111 peer it cost
             // ~61 MiB/hour of appends and accounted for 95% of every fsync the
             // process issued, for a forensic record nothing currently harvests
             // (no `freenet service report` path reads it; `fdev verify-state`
