@@ -1519,16 +1519,27 @@ impl TestContext {
             .collect()
     }
 
-    /// Get the path to a node's event log.
+    /// Base path for a node's event log. This is a segment *prefix*, not a file:
+    /// records live in `_EVENT_LOG.NNNNNNNNNN` segments, which is what
+    /// `read_all_events` scans for. Do not `.exists()`-check the returned path.
+    ///
+    /// Nodes run in Network mode, so the base name is `_EVENT_LOG`, not
+    /// `_EVENT_LOG_LOCAL`. Network mode is also the mode where the event log is
+    /// OFF by default (#4968), so the harness must opt in explicitly for these
+    /// segments to exist at all — `#[freenet_test]` does that via
+    /// `enable_event_log: Some(true)`.
+    ///
+    /// If that opt-in is ever dropped, this does NOT start returning a missing
+    /// path: `ConfigPathsArgs::build` writes a zero-length `_EVENT_LOG` stub
+    /// unconditionally, so the path resolves to a file that exists and is
+    /// empty. That is exactly why the breakage is silent — aggregation yields
+    /// zero events and every consumer reads that as "nothing happened" rather
+    /// than "the source is switched off". (With the opt-in present the stub is
+    /// deleted by `LogFile::migrate_legacy`, so the base path is absent while
+    /// the segments beside it hold the records — the inverse of what an
+    /// existence check would suggest.) See #4972.
     pub fn event_log_path(&self, node_label: &str) -> anyhow::Result<PathBuf> {
         let node = self.node(node_label)?;
-        // Nodes run in Network mode, so they create _EVENT_LOG not _EVENT_LOG_LOCAL.
-        // Network mode is also the mode where the event log is OFF by default
-        // (#4968), so the harness must opt in explicitly for this path to
-        // resolve to a file with anything in it — `#[freenet_test]` does that
-        // via `enable_event_log: Some(true)`. If that opt-in is ever dropped,
-        // this returns a path to an absent file and every failure report goes
-        // silently empty rather than failing loudly. See #4972.
         Ok(node.temp_dir_path.join("_EVENT_LOG"))
     }
 
@@ -1575,6 +1586,27 @@ impl TestContext {
                 match aggregator.get_all_events().await {
                     Ok(events) => {
                         writeln!(&mut report, "\nTotal events: {}", events.len()).unwrap();
+
+                        // An empty aggregation is almost never "nothing
+                        // happened" — it means the evidence source is missing,
+                        // and it reads identically to a genuinely quiet run.
+                        // Say so, or the reader silently draws the wrong
+                        // conclusion (#4972). A warning rather than an error on
+                        // purpose: `record_logs` sleeps briefly before creating
+                        // segment 0, so a fast failure legitimately has none.
+                        if events.is_empty() {
+                            writeln!(
+                                &mut report,
+                                "\n  ⚠️  NO EVENTS AGGREGATED across all nodes. This is very \
+                                 likely a missing evidence source rather than a quiet run — \
+                                 check that the event log is enabled for harness nodes \
+                                 (`enable_event_log: Some(true)`, #4972), that the test \
+                                 didn't fail before any events were written, and that \
+                                 `record_logs` could open the log. Treat assert-absence \
+                                 checks in this test as unproven."
+                            )
+                            .unwrap();
+                        }
 
                         // Group by peer_id
                         let mut by_peer: HashMap<String, Vec<_>> = HashMap::new();

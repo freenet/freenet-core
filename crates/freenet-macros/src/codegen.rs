@@ -786,12 +786,19 @@ mod tests {
     /// happened" rather than "this diagnostic is switched off".
     ///
     /// Asserts against the GENERATED TOKENS rather than the source text, so
-    /// reformatting cannot quietly make it vacuous, and counts both nodes so
-    /// that dropping the opt-in from only the gateway arm or only the peer arm
+    /// reformatting cannot quietly make it vacuous, and expects one opt-in per
+    /// node so that dropping it from only the gateway arm or only the peer arm
     /// still trips it.
+    ///
+    /// The expected count is derived from `args.nodes.len()`, not hardcoded:
+    /// the invariant is "one per node", and writing the number literally would
+    /// mean a fixture that never reaches a newly-added config arm keeps passing
+    /// while that arm ships without the opt-in — the same silent-blind-spot
+    /// shape as the bug being fixed.
     #[test]
     fn every_harness_node_enables_the_event_log() {
         let args: FreenetTestArgs = syn::parse2(quote! { nodes = ["gateway", "peer-1"] }).unwrap();
+        let expected = args.nodes.len();
 
         let generated = generate_node_setup(&args).to_string();
         let normalized: String = generated.chars().filter(|c| !c.is_whitespace()).collect();
@@ -804,15 +811,22 @@ mod tests {
             "pin guard: generated node setup does not build ConfigArgs, so this \
              test is asserting against the wrong thing. Generated:\n{generated}"
         );
+        // Guard the guard: if the fixture ever stops generating one ConfigArgs
+        // per node, the count below stops meaning "one opt-in per node".
+        assert_eq!(
+            normalized.matches("ConfigArgs{").count(),
+            expected,
+            "pin guard: expected one ConfigArgs per node. Generated:\n{generated}"
+        );
 
         let count = normalized.matches("enable_event_log:Some(true)").count();
         assert_eq!(
-            count, 2,
-            "each of the 2 harness nodes must set `enable_event_log: Some(true)` \
-             (found {count}). Network-mode nodes have the event log off by \
-             default (#4968) and #[freenet_test] reads it back for failure \
-             reports, so dropping this silently empties the event section of \
-             every failing test's report. See #4972.\nGenerated:\n{generated}"
+            count, expected,
+            "each of the {expected} harness nodes must set \
+             `enable_event_log: Some(true)` (found {count}). Network-mode nodes \
+             have the event log off by default (#4968) and #[freenet_test] reads \
+             it back for failure reports and for assert-absence tests, so \
+             dropping this silently empties both. See #4972.\nGenerated:\n{generated}"
         );
     }
 }

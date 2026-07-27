@@ -4389,6 +4389,21 @@ async fn test_client_disconnect_does_not_immediately_unsubscribe_with_recent_rea
         let aggregator = ctx.aggregate_events().await?;
         let events = aggregator.get_all_events().await?;
 
+        // Non-vacuity guard (#4972). The two assertions below assert the
+        // ABSENCE of an event, so they pass unconditionally whenever the event
+        // source is empty — which is exactly what happened when #4969 turned
+        // the event log off for network-mode nodes and this test kept passing
+        // while proving nothing. An empty aggregation here means the evidence
+        // is missing, not that the behavior is correct.
+        assert!(
+            !events.is_empty(),
+            "event aggregation returned no events, so the unsubscribe assertions \
+             below would pass vacuously. Either the event log is disabled for \
+             harness nodes (see #4972 — `#[freenet_test]` must set \
+             `enable_event_log: Some(true)`) or `record_logs` failed to open it. \
+             This is a broken fixture, not a passing test."
+        );
+
         let unsubscribe_sent_count = events
             .iter()
             .filter(|e| {
