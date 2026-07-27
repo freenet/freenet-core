@@ -1226,6 +1226,61 @@ mod tests {
         );
     }
 
+    /// Pin: both saturation signals stay visible in release builds.
+    ///
+    /// `crates/core/Cargo.toml` sets `release_max_level_info`, so
+    /// anything logged at `debug!` is compiled out of shipped binaries.
+    /// That is half of why #4981 went unnoticed for so long: a
+    /// production node dropped legitimate relayed UPDATEs and left no
+    /// greppable evidence, so the only signal was a dashboard tile a
+    /// user happened to ask about. Behavioural tests cannot see a log
+    /// level, so this scrapes the source instead — a silent downgrade to
+    /// `debug!` would otherwise restore the invisibility with every
+    /// other test still green.
+    ///
+    /// Needles are split with `concat!` so they do not match their own
+    /// source through `include_str!`, and both haystacks are compared
+    /// with whitespace stripped so rustfmt reflowing a call cannot make
+    /// the pin vacuous.
+    #[test]
+    fn capacity_signals_are_logged_above_debug_level() {
+        fn strip_ws(s: &str) -> String {
+            s.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+
+        // The limiter's own saturation line, in this file.
+        let this_file = strip_ws(include_str!("update_rate_limit.rs"));
+        let eviction_marker = strip_ws(concat!("UPDATE rate limiter at ", "capacity: evicted"));
+        let pos = this_file.find(&eviction_marker).expect(
+            "the eviction log line must exist; if it was renamed, update this pin rather than \
+             deleting it",
+        );
+        let preamble = &this_file[pos.saturating_sub(200)..pos];
+        assert!(
+            preamble.contains(&strip_ws("tracing::info!")),
+            "the eviction log must be emitted at info! or higher; debug! is compiled out of \
+             release builds by release_max_level_info (#4981)"
+        );
+
+        // The residual capacity drop, in the UPDATE dispatch path.
+        let node_rs = strip_ws(include_str!("../node.rs"));
+        let drop_marker = strip_ws(concat!("update_dispatch_", "capacity_dropped"));
+        let pos = node_rs.find(&drop_marker).expect(
+            "the capacity-drop log phase must exist in node.rs; if it was renamed, update this \
+             pin rather than deleting it",
+        );
+        let preamble = &node_rs[pos.saturating_sub(200)..pos];
+        assert!(
+            preamble.contains(&strip_ws("tracing::info!")),
+            "dropping an UPDATE for capacity must be logged at info! or higher, so the drop is \
+             greppable on a production node (#4981)"
+        );
+        assert!(
+            !preamble.contains(&strip_ws("tracing::debug!")),
+            "the capacity-drop branch must not fall back to debug!"
+        );
+    }
+
     /// Pin: cleanup decrements the `size` counter by the number of
     /// dropped entries. After all entries roll off, the cap should
     /// be fully available again — strict-cap accounting tracks the
