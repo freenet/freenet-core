@@ -790,11 +790,19 @@ mod tests {
     /// node so that dropping it from only the gateway arm or only the peer arm
     /// still trips it.
     ///
-    /// The expected count is derived from `args.nodes.len()`, not hardcoded:
-    /// the invariant is "one per node", and writing the number literally would
-    /// mean a fixture that never reaches a newly-added config arm keeps passing
-    /// while that arm ships without the opt-in — the same silent-blind-spot
-    /// shape as the bug being fixed.
+    /// The expected count is derived from `args.nodes.len()` rather than
+    /// hardcoded, but be precise about what that buys: only that editing the
+    /// fixture's node count keeps working without a manual literal bump. It
+    /// does NOT cover a newly-added config arm that this two-node fixture never
+    /// reaches — verified by mutation: adding a third arm without the opt-in
+    /// leaves this test green, because both the node count and both match
+    /// counts stay at 2. Unreached-arm coverage is a property of the FIXTURE,
+    /// and no token count against a single fixture can establish it.
+    ///
+    /// That hole is closed separately by
+    /// `every_config_args_literal_in_the_source_sets_the_opt_in`, which scrapes
+    /// the source of `generate_node_setup` and so sees arms this fixture never
+    /// exercises.
     #[test]
     fn every_harness_node_enables_the_event_log() {
         let args: FreenetTestArgs = syn::parse2(quote! { nodes = ["gateway", "peer-1"] }).unwrap();
@@ -803,20 +811,15 @@ mod tests {
         let generated = generate_node_setup(&args).to_string();
         let normalized: String = generated.chars().filter(|c| !c.is_whitespace()).collect();
 
-        // Vacuity guard: prove we actually generated node-config code. Without
-        // this, a refactor that renamed or emptied `generate_node_setup` would
-        // leave the assertion below passing against an empty string.
-        assert!(
-            normalized.contains("ConfigArgs"),
-            "pin guard: generated node setup does not build ConfigArgs, so this \
-             test is asserting against the wrong thing. Generated:\n{generated}"
-        );
-        // Guard the guard: if the fixture ever stops generating one ConfigArgs
-        // per node, the count below stops meaning "one opt-in per node".
+        // Vacuity guard: if the fixture ever stops generating one ConfigArgs per
+        // node, the count below stops meaning "one opt-in per node". This also
+        // subsumes a bare "did we generate anything" check — a count of
+        // `expected` implies the literal is present.
         assert_eq!(
             normalized.matches("ConfigArgs{").count(),
             expected,
-            "pin guard: expected one ConfigArgs per node. Generated:\n{generated}"
+            "pin guard: expected one ConfigArgs per node, so this test is \
+             asserting against the wrong thing. Generated:\n{generated}"
         );
 
         let count = normalized.matches("enable_event_log:Some(true)").count();
@@ -827,6 +830,62 @@ mod tests {
              have the event log off by default (#4968) and #[freenet_test] reads \
              it back for failure reports and for assert-absence tests, so \
              dropping this silently empties both. See #4972.\nGenerated:\n{generated}"
+        );
+    }
+
+    /// Every `ConfigArgs` literal in `generate_node_setup` sets the opt-in —
+    /// including arms no fixture reaches (#4972).
+    ///
+    /// This is the guard `every_harness_node_enables_the_event_log` cannot be:
+    /// that test runs a two-node fixture, so a third config arm added later is
+    /// simply never generated and its missing opt-in stays invisible. Verified
+    /// by mutation during review — adding an unreached arm without the opt-in
+    /// left the token-count test green.
+    ///
+    /// Reading the SOURCE is what makes unreached arms visible, so this
+    /// deliberately accepts source-scrape brittleness in exchange for coverage
+    /// the token check structurally cannot provide.
+    #[test]
+    fn every_config_args_literal_in_the_source_sets_the_opt_in() {
+        let src = include_str!("codegen.rs");
+        // Cut at `mod tests` so the needles below cannot match this test's own
+        // source text (which contains both of them as string literals).
+        let prod = src.split("mod tests").next().unwrap();
+
+        let start = prod
+            .find(concat!("fn generate_", "node_setup"))
+            .expect("pin guard: generate_node_setup not found in the production slice");
+        let after = &prod[start..];
+        // Ends at the next top-level item.
+        let end = after.find("\nfn ").unwrap_or(after.len());
+        let body = &after[..end];
+
+        // Vacuity guard: prove the slice is the real function body rather than
+        // an empty or mis-sliced range, which would make the check below pass
+        // no matter what the code does.
+        assert!(
+            body.contains("NetworkArgs"),
+            "pin guard: the extracted slice does not look like generate_node_setup, \
+             so this pin proves nothing. Slice:\n{body}"
+        );
+
+        let literals = body.matches("ConfigArgs {").count();
+        let opt_ins = body
+            .matches(concat!("enable_event_log", ": Some(true)"))
+            .count();
+
+        assert!(
+            literals > 0,
+            "pin guard: no ConfigArgs literal found in generate_node_setup"
+        );
+        assert_eq!(
+            literals, opt_ins,
+            "every ConfigArgs literal in generate_node_setup must set \
+             `enable_event_log: Some(true)` — found {literals} literal(s) but \
+             {opt_ins} opt-in(s). A node-config arm without the opt-in writes no \
+             event log, which silently empties failure reports AND makes \
+             assert-absence tests pass vacuously (#4972). Unlike the token-count \
+             test, this one sees arms no fixture reaches."
         );
     }
 }

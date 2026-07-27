@@ -1587,26 +1587,7 @@ impl TestContext {
                     Ok(events) => {
                         writeln!(&mut report, "\nTotal events: {}", events.len()).unwrap();
 
-                        // An empty aggregation is almost never "nothing
-                        // happened" — it means the evidence source is missing,
-                        // and it reads identically to a genuinely quiet run.
-                        // Say so, or the reader silently draws the wrong
-                        // conclusion (#4972). A warning rather than an error on
-                        // purpose: `record_logs` sleeps briefly before creating
-                        // segment 0, so a fast failure legitimately has none.
-                        if events.is_empty() {
-                            writeln!(
-                                &mut report,
-                                "\n  ⚠️  NO EVENTS AGGREGATED across all nodes. This is very \
-                                 likely a missing evidence source rather than a quiet run — \
-                                 check that the event log is enabled for harness nodes \
-                                 (`enable_event_log: Some(true)`, #4972), that the test \
-                                 didn't fail before any events were written, and that \
-                                 `record_logs` could open the log. Treat assert-absence \
-                                 checks in this test as unproven."
-                            )
-                            .unwrap();
-                        }
+                        Self::warn_if_no_events(&mut report, events.len());
 
                         // Group by peer_id
                         let mut by_peer: HashMap<String, Vec<_>> = HashMap::new();
@@ -1820,6 +1801,36 @@ impl TestContext {
         Ok(report_dir)
     }
 
+    /// Append a loud warning when event aggregation came back empty.
+    ///
+    /// An empty aggregation is almost never "nothing happened" — it means the
+    /// evidence source is missing, and it reads identically to a genuinely
+    /// quiet run. Say so, or the reader silently draws the wrong conclusion
+    /// (#4972).
+    ///
+    /// Shared by the failure report AND the success summary on purpose: the
+    /// failure this guards is a test that PASSES vacuously, which never reaches
+    /// the failure report.
+    ///
+    /// A warning rather than an error deliberately: `record_logs` sleeps
+    /// briefly before creating segment 0, so a very fast test legitimately has
+    /// no segments and a hard error would be flaky.
+    fn warn_if_no_events(report: &mut String, event_count: usize) {
+        use std::fmt::Write;
+        if event_count == 0 {
+            writeln!(
+                report,
+                "\n  ⚠️  NO EVENTS AGGREGATED across all nodes. This is very likely a \
+                 missing evidence source rather than a quiet run — check that the event \
+                 log is enabled for harness nodes (`enable_event_log: Some(true)`, \
+                 #4972), that the test didn't fail before any events were written, and \
+                 that `record_logs` could open the log. Treat any assert-absence check \
+                 in this test as UNPROVEN."
+            )
+            .unwrap();
+        }
+    }
+
     pub async fn generate_success_summary(&self) -> String {
         use std::fmt::Write;
 
@@ -1834,6 +1845,14 @@ impl TestContext {
                 Ok(mut events) => {
                     writeln!(&mut report, "\n📊 Event Statistics:").unwrap();
                     writeln!(&mut report, "  Total events: {}", events.len()).unwrap();
+
+                    // This is the path that matters most for #4972: the failure
+                    // being guarded is a test that PASSES vacuously, and a
+                    // passing test with `aggregate_events = "always"` comes
+                    // through here, not through the failure report. (The macro
+                    // also does not catch panics, so an `assert!` failure skips
+                    // the failure report entirely.)
+                    Self::warn_if_no_events(&mut report, events.len());
 
                     // Count by event type
                     let mut by_type: HashMap<String, usize> = HashMap::new();
