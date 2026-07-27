@@ -247,6 +247,17 @@ struct Window {
     /// attributed — the identical side needs no diagnosis, and tracking it
     /// would double the map for no decision.
     differing_by_contract: HashMap<ContractInstanceId, u64>,
+    /// Differing comparisons that could NOT be attributed because
+    /// [`Window::differing_by_contract`] was already at
+    /// [`MAX_TRACKED_CONTRACTS`].
+    ///
+    /// Mirrors `broadcast_payload_mix`'s `attribution_dropped_*`, and exists
+    /// for the same reason it does: without it a capped window is
+    /// indistinguishable from "no further contracts diverged", which is the
+    /// exact misreading this attribution was added to prevent. Non-zero also
+    /// means the named list below is a partial view, so the reader should not
+    /// treat it as the full set of offenders.
+    differing_attribution_dropped: u64,
 }
 
 /// Per-message-kind outbound byte accumulator.
@@ -310,18 +321,43 @@ impl OutboundMix {
     /// interpolation), and the telemetry budget has room for exactly one more
     /// aligned rollup stream (`telemetry.rs`, `MAX_SHADOW_EVENTS_PER_SECOND`),
     /// which this measurement does not deserve to consume.
-    pub(crate) fn record_summary_comparison(&self, contract: &ContractInstanceId, identical: bool) {
+    pub(crate) fn record_summary_comparison(
+        &self,
+        contract: &ContractInstanceId,
+        ours: &[u8],
+        theirs: &[u8],
+    ) {
+        // The comparison lives HERE rather than at the call site on purpose.
+        // Passing a pre-computed `identical: bool` put the one bit this whole
+        // measurement rests on outside the tested unit, where an inverted
+        // operand would compile, pass every test, and quietly invert the
+        // finding that gates a wire-format redesign. Taking the operands makes
+        // that failure unrepresentable instead of merely covered.
+        let identical = ours == theirs;
         let mut w = self.window.lock();
         if identical {
             w.summary_entries_identical = w.summary_entries_identical.saturating_add(1);
             return;
         }
         w.summary_entries_differing = w.summary_entries_differing.saturating_add(1);
+        let mut dropped = false;
         // Bounded for the same reason the payload mix bounds its attribution:
         // the key is contract-controlled, so an unbounded map here would be an
-        // amplification surface. Over the cap we keep counting the aggregate
-        // above and stop adding NEW keys — an existing key still accrues, so
-        // the top offenders (the ones worth naming) stay accurate.
+        // amplification surface. Over the cap the aggregate above keeps
+        // counting and an already-tracked key keeps accruing; only NEW keys are
+        // refused, and each refusal is counted.
+        //
+        // What this does NOT give you, stated plainly because the obvious
+        // reading is wrong: once the cap binds, the named set is NOT the top
+        // offenders. Slots are first-come-first-served, and arrival order is
+        // not random — `get_matching_contracts` sorts by contract id ascending
+        // (`ring/interest.rs`), so entries are processed in id order on every
+        // peer and every window. Under sustained cap pressure the same
+        // low-id contracts hold the slots and a higher-diverging high-id
+        // contract stays invisible indefinitely. Read a non-zero
+        // `differing_attribution_dropped` as "this list is a biased sample,
+        // use the aggregate"; a fair top-N would need a replace-if-larger
+        // policy, which is more machinery than this measurement warrants.
         let len = w.differing_by_contract.len();
         match w.differing_by_contract.entry(*contract) {
             std::collections::hash_map::Entry::Occupied(mut e) => {
@@ -330,8 +366,13 @@ impl OutboundMix {
             std::collections::hash_map::Entry::Vacant(e) => {
                 if len < MAX_TRACKED_CONTRACTS {
                     e.insert(1);
+                } else {
+                    dropped = true;
                 }
             }
+        }
+        if dropped {
+            w.differing_attribution_dropped = w.differing_attribution_dropped.saturating_add(1);
         }
     }
 
@@ -350,8 +391,15 @@ fn rollup_window_secs(elapsed: Duration) -> u64 {
     elapsed.as_secs().max(1)
 }
 
-fn emit_outbound_mix_rollup(mix: &OutboundMix, local_peer_id: &str, window_secs: u64) {
-    let w = mix.take_window();
+/// Build the rollup body for one drained window.
+///
+/// Split out of [`emit_outbound_mix_rollup`] and returning the `Value` so the
+/// shaping — field names, the descending sort, the top-N truncation — is
+/// directly testable, the way `broadcast_payload_mix::payload_mix_json`
+/// already is. Inlined in the emitter there was no seam: an inverted
+/// comparator would have reported the LEAST-diverging contracts as "top" and
+/// shipped silently.
+fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
     let total_msgs: u64 = w.msgs.iter().sum();
     let total_bytes: u64 = w.bytes.iter().sum();
 
@@ -382,6 +430,10 @@ fn emit_outbound_mix_rollup(mix: &OutboundMix, local_peer_id: &str, window_secs:
         "summary_entries_differing".into(),
         w.summary_entries_differing.into(),
     );
+    body.insert(
+        "differing_attribution_dropped".into(),
+        w.differing_attribution_dropped.into(),
+    );
     // Top differing contracts by count, so a low identical rate can be read as
     // "specific contracts are non-deterministic" vs "the design is wrong".
     // Capped in the emitted body as well as in the map: the map bound stops
@@ -408,12 +460,17 @@ fn emit_outbound_mix_rollup(mix: &OutboundMix, local_peer_id: &str, window_secs:
         ),
     );
 
+    serde_json::Value::Object(body)
+}
+
+fn emit_outbound_mix_rollup(mix: &OutboundMix, local_peer_id: &str, window_secs: u64) {
+    let w = mix.take_window();
     // Shadow priority, matching the payload mix: one event per node-minute is
     // negligible volume, but it is observation rather than operational signal.
     crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "outbound_message_mix",
         local_peer_id,
-        serde_json::Value::Object(body),
+        outbound_mix_json(&w, window_secs),
     );
 }
 
@@ -573,10 +630,10 @@ mod tests {
         let a = test_instance_id(1);
         let b = test_instance_id(2);
 
-        mix.record_summary_comparison(&a, true);
-        mix.record_summary_comparison(&a, false);
-        mix.record_summary_comparison(&b, false);
-        mix.record_summary_comparison(&a, true);
+        mix.record_summary_comparison(&a, b"same", b"same");
+        mix.record_summary_comparison(&a, b"ours", b"theirs");
+        mix.record_summary_comparison(&b, b"ours", b"theirs");
+        mix.record_summary_comparison(&a, b"same", b"same");
 
         let w = mix.take_window();
         assert_eq!(w.summary_entries_identical, 2);
@@ -598,14 +655,14 @@ mod tests {
     fn differing_attribution_is_bounded_but_keeps_accruing_known_contracts() {
         let mix = OutboundMix::new();
         let tracked = test_instance_id(0);
-        mix.record_summary_comparison(&tracked, false);
+        mix.record_summary_comparison(&tracked, b"ours", b"theirs");
 
         // Fill well past the cap with distinct ids.
         for i in 1..(MAX_TRACKED_CONTRACTS as u32 + 300) {
-            mix.record_summary_comparison(&test_instance_id(i), false);
+            mix.record_summary_comparison(&test_instance_id(i), b"ours", b"theirs");
         }
         // ...then hit the already-tracked one again.
-        mix.record_summary_comparison(&tracked, false);
+        mix.record_summary_comparison(&tracked, b"ours", b"theirs");
 
         let w = mix.take_window();
         assert!(
@@ -622,6 +679,83 @@ mod tests {
         assert_eq!(
             w.summary_entries_differing,
             MAX_TRACKED_CONTRACTS as u64 + 301
+        );
+    }
+
+    /// The emitted body ranks differing contracts by count, DESCENDING, and
+    /// truncates to the top N.
+    ///
+    /// Worth its own test because an inverted comparator is invisible: it
+    /// still emits a plausible, well-formed list of contracts — just the
+    /// LEAST-diverging ones, labelled as the top offenders. Nothing downstream
+    /// would flag that, and the wrong contracts would get investigated.
+    #[test]
+    fn rollup_body_ranks_differing_contracts_descending_and_truncates() {
+        let mix = OutboundMix::new();
+        // Contract i gets i differing comparisons, so the expected ranking is
+        // exactly the reverse of insertion order.
+        let n = TOP_DIFFERING_CONTRACTS_REPORTED as u32 + 5;
+        for i in 1..=n {
+            for _ in 0..i {
+                mix.record_summary_comparison(&test_instance_id(i), b"ours", b"theirs");
+            }
+        }
+        let w = mix.take_window();
+        let body = outbound_mix_json(&w, 60);
+
+        let listed = body
+            .get("summary_differing_contracts")
+            .and_then(|v| v.as_array())
+            .expect("summary_differing_contracts must be an array");
+        assert_eq!(
+            listed.len(),
+            TOP_DIFFERING_CONTRACTS_REPORTED,
+            "the list must be truncated to the top N"
+        );
+
+        let counts: Vec<u64> = listed
+            .iter()
+            .map(|e| e.get("count").and_then(|c| c.as_u64()).expect("count"))
+            .collect();
+        let mut descending = counts.clone();
+        descending.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(counts, descending, "counts must be ranked descending");
+        assert_eq!(
+            counts[0], n as u64,
+            "the highest-diverging contract must rank first"
+        );
+        assert_eq!(
+            *counts.last().expect("non-empty"),
+            (n - TOP_DIFFERING_CONTRACTS_REPORTED as u32 + 1) as u64,
+            "the Nth-ranked count must be the Nth largest, not the smallest"
+        );
+    }
+
+    /// A capped window reports HOW MANY attributions it dropped.
+    ///
+    /// Without this the named list is indistinguishable from the complete set,
+    /// which is the exact misreading the attribution exists to prevent — and
+    /// the sibling `broadcast_payload_mix` reports its drops for the same
+    /// reason. Under cap pressure the list is a biased sample (slots are
+    /// first-come, and entries arrive in contract-id order), so a reader needs
+    /// this number to know not to trust the ranking.
+    #[test]
+    fn capped_attribution_reports_its_drops() {
+        let mix = OutboundMix::new();
+        let overflow = 7u32;
+        for i in 0..(MAX_TRACKED_CONTRACTS as u32 + overflow) {
+            mix.record_summary_comparison(&test_instance_id(i), b"ours", b"theirs");
+        }
+        let w = mix.take_window();
+        assert_eq!(w.differing_by_contract.len(), MAX_TRACKED_CONTRACTS);
+        assert_eq!(w.differing_attribution_dropped, overflow as u64);
+
+        let body = outbound_mix_json(&w, 60);
+        assert_eq!(
+            body.get("differing_attribution_dropped")
+                .and_then(|v| v.as_u64()),
+            Some(overflow as u64),
+            "the drop count must reach the rollup, not just the window"
         );
     }
 

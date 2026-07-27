@@ -2740,6 +2740,13 @@ async fn handle_interest_sync_message(
                 // sending novel summary bytes for every hosted contract. See
                 // `MAX_STALENESS_PROBES_PER_SUMMARIES` / `plan_staleness_probe`.
                 let mut staleness_probes_used = 0usize;
+                // Contracts already counted by the #4965 summary-comparison
+                // measurement in THIS message. Bounded by the message's entry
+                // count, which the transport already bounds; it holds contract
+                // ids only, no state.
+                let mut compared_contracts: std::collections::HashSet<
+                    freenet_stdlib::prelude::ContractKey,
+                > = std::collections::HashSet::new();
                 for entry in entries {
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         if !op_manager.interest_manager.has_local_interest(&contract) {
@@ -2784,9 +2791,22 @@ async fn handle_interest_sync_message(
                                 // at the send site because only the receiver can
                                 // compare, and only in this arm because a `None` on
                                 // either side is not a comparison at all.
-                                op_manager
-                                    .outbound_mix
-                                    .record_summary_comparison(contract.id(), identical);
+                                //
+                                // Counted once per contract per message: `entries`
+                                // is peer-supplied and may repeat a hash, and
+                                // without this a peer could inflate either bucket
+                                // at will — corrupting the very ratio that decides
+                                // whether the wire change is worth building. The
+                                // dedup guards ONLY the measurement; the staleness
+                                // logic below still runs per entry exactly as
+                                // before, so this changes no behavior.
+                                if compared_contracts.insert(contract) {
+                                    op_manager.outbound_mix.record_summary_comparison(
+                                        contract.id(),
+                                        ours.as_ref(),
+                                        theirs.as_ref(),
+                                    );
+                                }
                                 let delta_verdict = if identical {
                                     // Byte-identical => converged; skip the probe.
                                     None
@@ -4116,6 +4136,25 @@ mod tests {
             .find("InterestMessage::ChangeInterests")
             .expect("ChangeInterests arm not found");
         let summaries_arm = &src[handler_start + summaries_off..handler_start + change_off];
+
+        // #4965: the measurement call must stay wired into this arm. It is
+        // pure observation, so deleting it breaks no test and no behavior —
+        // the rollup would simply report zero comparisons forever, which reads
+        // as "nothing to save here" and would retire the hash-first redesign
+        // for the wrong reason. Needle split so this assertion's own source
+        // cannot satisfy the scrape.
+        assert!(
+            summaries_arm.contains(concat!("record_summary", "_comparison")),
+            "the Summaries arm must record the #4965 summary-comparison \
+             measurement; without it the identical/differing rollup is \
+             silently always zero"
+        );
+        assert!(
+            summaries_arm.contains(concat!("compared_", "contracts")),
+            "the measurement call must stay behind the per-message dedup set, \
+             or a peer repeating a hash can inflate the ratio that gates the \
+             wire-format decision"
+        );
 
         assert!(
             summaries_arm.contains("peer_summary_has_pending_state"),
