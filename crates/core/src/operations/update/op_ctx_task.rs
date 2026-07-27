@@ -1756,9 +1756,11 @@ async fn drive_relay_broadcast_to(
                         .get_peer_by_addr(sender_addr)
                     {
                         let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
-                        op_manager
-                            .interest_manager
-                            .update_peer_summary(&key, &sender_key, None);
+                        op_manager.interest_manager.clear_peer_summary(
+                            &key,
+                            &sender_key,
+                            crate::ring::interest::SummaryMissingReason::ClearedByDeltaApplyFailure,
+                        );
                     }
 
                     tracing::info!(
@@ -3186,8 +3188,14 @@ mod tests {
             .find("resync_emit_limiter")
             .expect("ResyncRequest emit must be gated by resync_emit_limiter");
         let summary_clear_pos = driver_src
-            .find("update_peer_summary(&key, &sender_key, None)")
+            .find("clear_peer_summary(")
             .expect("sender summary-clear missing");
+        assert!(
+            driver_src.contains("SummaryMissingReason::ClearedByDeltaApplyFailure"),
+            "the sender summary-clear must be tagged ClearedByDeltaApplyFailure \
+             so #4961 can attribute the full_no_their_summary_tracked arm to \
+             this path"
+        );
         let resync_pos = driver_src
             .find("InterestMessage::ResyncRequest")
             .expect("ResyncRequest emission missing");

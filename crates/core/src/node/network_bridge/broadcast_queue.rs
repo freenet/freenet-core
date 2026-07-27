@@ -869,6 +869,9 @@ pub(super) async fn broadcast_to_single_peer(
     // smaller than the state), so the ratio of these two inputs field-checks
     // the old pre-compute proxy rather than restating the trigger. See #3335.
     let mut not_efficient_gate_inputs: Option<(usize, usize)> = None;
+    // #4961: WHY a tracked peer has no cached summary. Set only on the
+    // `FullNoTheirSummaryTracked` arm below, where the entry exists to be read.
+    let mut tracked_missing_reason: Option<crate::ring::interest::SummaryMissingReason> = None;
     let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
         // Scoped to the both-summaries-present case ON PURPOSE. When a summary
         // is missing a delta was impossible regardless of the memo, so letting
@@ -983,11 +986,21 @@ pub(super) async fn broadcast_to_single_peer(
             PayloadArm::FullNoOurSummary,
         ),
         (Some(_), None) => {
-            let arm = if op_manager
+            let arm = if let Some(interest) = op_manager
                 .interest_manager
                 .get_peer_interest(&key, &peer_key)
-                .is_some()
             {
+                // #4961 needs this to tell the three clear paths apart, since
+                // they have three different fixes and this is the largest
+                // broadcast-byte arm.
+                //
+                // Usually `Some`: this match arm means `their_summary` was
+                // `None`. But that was read further up, before an `.await`, so
+                // a concurrent upsert in between leaves the entry holding a
+                // summary and this reads `None`. That send is then counted in
+                // `tracked_missing_unattributed_*` rather than being charged to
+                // a cause that did not produce it.
+                tracked_missing_reason = interest.summary_missing_reason();
                 PayloadArm::FullNoTheirSummaryTracked
             } else {
                 PayloadArm::FullNoTheirSummaryUntracked
@@ -1167,6 +1180,7 @@ pub(super) async fn broadcast_to_single_peer(
                         key.id(),
                         payload_size,
                         not_efficient_gate_inputs,
+                        tracked_missing_reason,
                     );
                     tracing::debug!(
                         tx = %update_tx,
@@ -1216,6 +1230,7 @@ pub(super) async fn broadcast_to_single_peer(
                 key.id(),
                 payload_size,
                 not_efficient_gate_inputs,
+                tracked_missing_reason,
             );
             // Delta-incompat attribution (HQk7 resync loop): remember that we
             // just delivered a DELTA to this peer so a prompt `ResyncRequest`
@@ -2352,6 +2367,20 @@ mod tests {
             );
         }
 
+        // #4961: the tracked arm must READ the reason where it is decided, not
+        // merely pass the variable along. Dropping the assignment leaves it at
+        // `None` forever, so every tracked send lands in
+        // `tracked_missing_unattributed_*` — the split still emits, still
+        // reconciles, and answers nothing. That mutation passes every other
+        // test here, so it needs its own pin.
+        assert!(
+            body.contains("tracked_missing_reason = interest.summary_missing_reason()"),
+            "the FullNoTheirSummaryTracked arm must read the peer's \
+             summary_missing_reason where the arm is decided — without it the \
+             per-reason split is uniformly unattributed and #4961 stays \
+             unanswered"
+        );
+
         // The mix is recorded at exactly the two real-delivery sites, the same
         // gate as BroadcastFanoutCost, so the two axes always agree on what
         // "sent" means. Recording up-front would count phantom fan-out.
@@ -2366,7 +2395,7 @@ mod tests {
         let collapsed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
         let record_needle = concat!(
             ".record_",
-            "delivered(payload_arm,key.id(),payload_size,not_efficient_gate_inputs,)"
+            "delivered(payload_arm,key.id(),payload_size,not_efficient_gate_inputs,tracked_missing_reason,)"
         );
         assert_eq!(
             collapsed.matches(record_needle).count(),
