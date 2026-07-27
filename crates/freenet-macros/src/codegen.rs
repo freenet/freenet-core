@@ -833,61 +833,66 @@ mod tests {
         );
     }
 
-    /// Every `ConfigArgs` literal in `generate_node_setup` sets the opt-in —
-    /// including arms no fixture reaches (#4972).
+    /// Every `ConfigArgs` literal in this file's production code sets the
+    /// opt-in — including arms no fixture reaches (#4972).
     ///
     /// This is the guard `every_harness_node_enables_the_event_log` cannot be:
-    /// that test runs a two-node fixture, so a third config arm added later is
-    /// simply never generated and its missing opt-in stays invisible. Verified
-    /// by mutation during review — adding an unreached arm without the opt-in
-    /// left the token-count test green.
+    /// that test runs a two-node fixture, so a config arm added later is simply
+    /// never generated and its missing opt-in stays invisible. Verified by
+    /// mutation during review — adding an unreached arm without the opt-in left
+    /// the token-count test green.
     ///
-    /// Reading the SOURCE is what makes unreached arms visible, so this
-    /// deliberately accepts source-scrape brittleness in exchange for coverage
-    /// the token check structurally cannot provide.
+    /// Scoped to the whole pre-`mod tests` region rather than to
+    /// `generate_node_setup` alone. That is deliberate and was arrived at by
+    /// mutation, not taste: slicing a single function needed a name needle, an
+    /// end boundary, and a vacuity guard, and all three were defeatable. In
+    /// particular `NetworkArgs` appears in BOTH config arms, so a slice
+    /// truncated after the first one still passed its own guard while the
+    /// second arm sat outside the scrape entirely. Scanning the whole region
+    /// deletes all three mechanisms and also covers a `ConfigArgs` added in a
+    /// different function.
     ///
-    /// Scope, stated so it is not over-trusted (this file has already shipped
-    /// two comments claiming protection the code did not provide): it covers
-    /// only the body of `generate_node_setup`. A `ConfigArgs` literal added in
-    /// a DIFFERENT function is invisible to it — confirmed by mutation. That
-    /// is an accepted bound rather than an oversight, since node configs belong
-    /// in this function; if that ever stops being true, widen the slice.
+    /// If some future function legitimately needs a `ConfigArgs` without the
+    /// opt-in, this fails loudly and a human decides — the right default for a
+    /// guard whose entire job is catching a silent omission.
     #[test]
     fn every_config_args_literal_in_the_source_sets_the_opt_in() {
         let src = include_str!("codegen.rs");
         // Cut at `mod tests` so the needles below cannot match this test's own
-        // source text (which contains both of them as string literals).
+        // source text, which contains both of them as string literals.
         let prod = src.split("mod tests").next().unwrap();
 
-        let start = prod
-            .find(concat!("fn generate_", "node_setup"))
-            .expect("pin guard: generate_node_setup not found in the production slice");
-        let after = &prod[start..];
-        // Ends at the next top-level item.
-        let end = after.find("\nfn ").unwrap_or(after.len());
-        let body = &after[..end];
+        // Strip `//` lines before counting. Without this, a comment MENTIONING
+        // the opt-in satisfies the count for an arm that never sets it —
+        // demonstrated by mutation, and not hypothetical: `test_utils.rs`
+        // already carries the prose "via `enable_event_log: Some(true)`", so a
+        // developer adding an arm and bringing the surrounding comment along
+        // reproduces it. Stripping also closes the inverse cry-wolf case, where
+        // a comment containing `ConfigArgs {` inflates the literal count on
+        // correct code.
+        let code_only: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        // Vacuity guard: prove the slice is the real function body rather than
-        // an empty or mis-sliced range, which would make the check below pass
-        // no matter what the code does.
-        assert!(
-            body.contains("NetworkArgs"),
-            "pin guard: the extracted slice does not look like generate_node_setup, \
-             so this pin proves nothing. Slice:\n{body}"
-        );
-
-        let literals = body.matches("ConfigArgs {").count();
-        let opt_ins = body
+        let literals = code_only.matches("ConfigArgs {").count();
+        let opt_ins = code_only
             .matches(concat!("enable_event_log", ": Some(true)"))
             .count();
 
+        // Vacuity guard: a truncated or mis-cut slice yields zero literals, so
+        // this catches the case where the scrape silently stops looking at
+        // anything. (`ConfigPathsArgs {` cannot inflate the count — the char
+        // after `Config` is `P`, never `A`.)
         assert!(
             literals > 0,
-            "pin guard: no ConfigArgs literal found in generate_node_setup"
+            "pin guard: no ConfigArgs literal found in the production slice, so \
+             this pin proves nothing"
         );
         assert_eq!(
             literals, opt_ins,
-            "every ConfigArgs literal in generate_node_setup must set \
+            "every ConfigArgs literal in this file must set \
              `enable_event_log: Some(true)` — found {literals} literal(s) but \
              {opt_ins} opt-in(s). A node-config arm without the opt-in writes no \
              event log, which silently empties failure reports AND makes \

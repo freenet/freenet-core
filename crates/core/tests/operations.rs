@@ -4399,11 +4399,19 @@ async fn test_client_disconnect_does_not_immediately_unsubscribe_with_recent_rea
         // `!events.is_empty()` alone is satisfiable by node-startup records
         // (`Lifecycle(Startup)` is written unconditionally per node), so it
         // would hold with 3 events and nothing subscription-related present.
-        // Also require a Subscribe event: this test's whole subject is the
-        // subscription lifecycle, so if no Subscribe was captured, an
-        // Unsubscribe would not have been captured either and the counts below
-        // prove nothing. Measured margin on healthy runs: ~140-190 events with
-        // Subscribe: 5, against the 1 required here.
+        // Also require a Subscribe event, and note this is a structural
+        // requirement rather than a thematic one: `UnsubscribeSent` and
+        // `UnsubscribeReceived` are variants of `SubscribeEvent`, wrapped as
+        // `EventKind::Subscribe(..)` (see `tracing/event_kind.rs`). So this
+        // demands an event from the EXACT enum arm the two counts below look
+        // inside — if the pipeline that would carry an `UnsubscribeSent` is
+        // dead, `EventKind::Subscribe` is absent too.
+        //
+        // The margin is structural as well: the test asserts `subscribed ==
+        // true` above before reaching this loop, so a successful SUBSCRIBE
+        // (which emits `SubscribeEvent::SubscribeSuccess`) has definitely
+        // completed. Measured on healthy runs: ~140-190 events with Subscribe:
+        // 5, against the 1 required here.
         //
         // Not flaky: by this point the node has been up ~45-60s
         // (`startup_wait_secs = 40` plus PUT/GET/subscribe/disconnect), well
