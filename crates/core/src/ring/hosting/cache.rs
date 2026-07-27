@@ -3585,9 +3585,24 @@ mod tests {
                 cost_axis(5_000.0, 50_000.0, &[(&quiet, 5_000.0)]),
             ];
             let counts = |key: &ContractKey| if *key == subscribed { (0, 1) } else { (0, 0) };
-            let before = cache.last_cost_decision_log_at;
+            // Move the clock (in BOTH branches, so the runs stay identical)
+            // before sweeping. Without this the emit signal is blind: an emit
+            // rewrites `last_cost_decision_log_at` to the same `now` it was
+            // primed with, so a summary that DID fire looks exactly like one
+            // that stayed silent. Still far inside COST_DECISION_LOG_INTERVAL,
+            // so the periodic branch does not open.
+            clock.advance_time(Duration::from_secs(1));
+            let before = (
+                cache.last_cost_decision_log_at,
+                cache.last_cost_decision_digest,
+            );
             let evicted = cache.evict_cost_pressure(&counts, &axes);
-            let emitted = cache.last_cost_decision_log_at != before;
+            // Both fields, so neither a same-timestamp nor a same-digest
+            // coincidence can disguise an emit.
+            let emitted = (
+                cache.last_cost_decision_log_at,
+                cache.last_cost_decision_digest,
+            ) != before;
             (
                 (
                     evicted
