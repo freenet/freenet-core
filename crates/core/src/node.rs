@@ -2775,7 +2775,19 @@ async fn handle_interest_sync_message(
                         // `summary_indicates_stale_peer`.
                         let is_stale = match (our_summary.as_ref(), their_summary.as_ref()) {
                             (Some(ours), Some(theirs)) => {
-                                let delta_verdict = if ours.as_ref() == theirs.as_ref() {
+                                let identical = ours.as_ref() == theirs.as_ref();
+                                // #4965 falsifier: how often are the two sides
+                                // byte-identical? That fraction is exactly what a
+                                // hash-first `Summaries` exchange would save, since
+                                // `SummaryEntry` ships full summary bytes
+                                // unconditionally today. Recorded here rather than
+                                // at the send site because only the receiver can
+                                // compare, and only in this arm because a `None` on
+                                // either side is not a comparison at all.
+                                op_manager
+                                    .outbound_mix
+                                    .record_summary_comparison(contract.id(), identical);
+                                let delta_verdict = if identical {
                                     // Byte-identical => converged; skip the probe.
                                     None
                                 } else {
