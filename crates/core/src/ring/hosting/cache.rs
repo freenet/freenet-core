@@ -3810,6 +3810,74 @@ mod tests {
         );
     }
 
+    /// The DELIVERABLE is the log line, so pin that it still exists.
+    ///
+    /// Every other test here asserts on `CostAxisDecision` values or on the
+    /// emit bookkeeping, all of which keep passing if the `tracing::info!` call
+    /// is deleted outright — leaving this PR's entire purpose unpinned.
+    ///
+    /// A subscriber-capture test was tried first and REJECTED as inherently
+    /// flaky, not merely inconvenient: `tracing::subscriber::set_default` is
+    /// thread-local while `tracing`'s callsite `Interest` cache is GLOBAL, so
+    /// sibling tests hitting these same callsites concurrently with no
+    /// subscriber cache them as `never` process-wide, and the `info!` macro
+    /// then short-circuits before ever consulting the capture. Measured under
+    /// `cargo test --lib cost`: 1 of 2 expected events captured, passing when
+    /// run alone. `tracing::callsite::rebuild_interest_cache()` narrows the
+    /// window but does not close it — any sibling thread can re-poison the
+    /// cache between the rebuild and the emit. A test that passes alone and
+    /// fails in the suite is a broken test, so this scrapes the source instead,
+    /// the same idiom as `ring.rs`'s `*_source_tests` modules. It cannot prove
+    /// runtime delivery, but it catches the failure mode that matters here: the
+    /// emit being deleted, downgraded to `debug!`, or stripped of its fields.
+    #[test]
+    fn log_cost_decision_still_emits_an_info_event_with_its_fields() {
+        const FULL: &str = include_str!("cache.rs");
+        // Cut at `mod tests`, NOT at a bare `#[cfg(test)]`: cutting at the
+        // attribute would stop at the first inline `#[cfg(test)]` item and
+        // could leave the scraped region empty, silently vacating this pin.
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("cache.rs must have a top-level `mod tests`");
+        let production = &FULL[..cutoff];
+        let start = production
+            .find("fn log_cost_decision")
+            .expect("log_cost_decision must exist");
+        // Whitespace-stripped so a rustfmt reflow of the macro's arguments
+        // cannot vacate the needles.
+        let body: String = production[start..]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        assert!(
+            body.contains(concat!("tracing::", "info!(")),
+            "the cost-decision summary must still be emitted"
+        );
+        assert!(
+            !body.contains(concat!("tracing::", "debug!(")),
+            "the summary must NOT be `debug!`: release builds compile that out \
+             via max_level_info, so it would be invisible in exactly the \
+             environment it exists for"
+        );
+        for field in [
+            "axes_armed=",
+            "hosted_contracts=",
+            "cost_evictions_total=",
+            "axes=%rendered",
+        ] {
+            assert!(
+                body.contains(field),
+                "the summary lost its `{field}` field — operators grep these"
+            );
+        }
+        // Message text, whitespace-stripped like the rest of the scrape.
+        assert!(
+            body.contains(concat!("\"cost-pressureeviction", "decision")),
+            "the summary's grep-able message must survive"
+        );
+    }
+
     /// The anti-drift pin driven through the REAL sweep, not a transcription.
     ///
     /// `cost_reject_classification_matches_eviction_decision` compares the
