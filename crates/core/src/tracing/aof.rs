@@ -574,6 +574,35 @@ impl LogFile {
         }
     }
 
+    /// Append an encoded batch to the active segment.
+    ///
+    /// Deliberately does NOT `fsync`. The event log is a local diagnostic
+    /// record, not authoritative state: nothing in the node reads it back to
+    /// make decisions, and losing the last few records to a power cut costs
+    /// nothing. A per-batch `sync_all()` (data *and* metadata) used to run here,
+    /// and because an append also changes the file size it forced a full
+    /// filesystem journal commit every `BATCH_SIZE` (5) events. Measured on a
+    /// live 0.2.111 peer that was 95% of ALL fsyncs the process issued and the
+    /// dominant source of a 4-6x write amplification, turning ~61 MiB/hour of
+    /// logical appends into hundreds of MiB/hour of real disk writes.
+    ///
+    /// Durability that actually matters is preserved elsewhere:
+    /// [`Self::rotate_segment`] still fsyncs the active segment before closing
+    /// it, so a completed segment is on disk before the next one opens, and
+    /// [`Self::load_segment_records`] already truncates a torn tail at the last
+    /// good record offset on startup. Readers are unaffected either way —
+    /// `read_all_events` sees written bytes through the page cache immediately;
+    /// fsync is about surviving power loss, not visibility.
+    ///
+    /// It DOES still `flush`. That is not a durability barrier: `tokio::fs::File`
+    /// keeps an internal buffer and hands writes to a background pool, so
+    /// without an explicit flush the bytes may not reach the OS at all and a
+    /// reader (or `std::fs::metadata`) can observe a zero-length segment. The
+    /// flush issues the `write(2)`, putting the data in the page cache where
+    /// readers see it immediately; the kernel then writes it back on its own
+    /// schedule instead of one journal commit per five events.
+    ///
+    /// do NOT re-add a per-batch fsync here — see #4966.
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         let _guard = FILE_LOCK.lock().await;
         let file = self.file.as_mut().unwrap();
@@ -582,8 +611,8 @@ impl LogFile {
             return Err(err);
         }
 
-        if let Err(err) = file.get_mut().sync_all().await {
-            tracing::error!("Failed syncing event log: {err}");
+        if let Err(err) = file.get_mut().flush().await {
+            tracing::error!("Failed flushing event log: {err}");
             return Err(err);
         }
         Ok(())
@@ -621,6 +650,55 @@ mod tests {
 
     fn ensure_records_ts() {
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
+    }
+
+    /// Source pin (#4966): `write_all` must NOT fsync on every batch.
+    ///
+    /// A `sync_all()` used to run after each `BATCH_SIZE` (5) events. Because
+    /// an append also changes the file size, that forced a full filesystem
+    /// journal commit per batch: measured on a live 0.2.111 peer it was 95% of
+    /// every fsync the process issued and the dominant source of a 4-6x write
+    /// amplification. Durability that matters is preserved by the fsync in
+    /// `rotate_segment` (a completed segment is on disk before the next opens)
+    /// and by the torn-tail truncation on load, both of which this pin leaves
+    /// free to keep syncing.
+    ///
+    /// A behavioral test can't catch a re-added fsync (it changes only I/O
+    /// scheduling, not observable output), so the pin reads the source.
+    #[test]
+    fn write_all_does_not_fsync_per_batch() {
+        let src = include_str!("aof.rs");
+        // Cut at `mod tests`, NOT at the first `#[cfg(test)]` — there are
+        // `#[cfg(test)]` constants near the top of this file, so cutting there
+        // would drop nearly all production code and make this pin vacuous.
+        let prod = src.split("mod tests").next().unwrap();
+
+        // Built with `concat!` so this needle cannot match its own source text.
+        let sig = concat!("pub async fn ", "write_all");
+        let start = prod
+            .find(sig)
+            .expect("pin guard: write_all not found in the production slice");
+        let after = &prod[start..];
+        // The next same-level item is `pub fn encode_batch`.
+        let end = after.find("\n    pub fn ").unwrap_or(after.len());
+        let body = &after[..end];
+
+        // Vacuity guard: prove we actually extracted the real function body
+        // rather than an empty or mis-sliced range, which would make the
+        // assertion below pass no matter what the code does.
+        assert!(
+            body.contains("write_all(data)"),
+            "pin guard: the extracted slice does not contain the append call, so \
+             the extraction is wrong and this pin proves nothing. Slice:\n{body}"
+        );
+
+        assert!(
+            !body.contains(concat!("sync", "_all")),
+            "write_all must NOT fsync per batch (#4966). Durability is already \
+             covered by rotate_segment's fsync and the torn-tail truncation on \
+             load; a per-batch fsync costs ~5x write amplification on every user \
+             peer for a purely diagnostic log. Offending body:\n{body}"
+        );
     }
 
     /// Count the `Route` records the log surfaces through its public reader.

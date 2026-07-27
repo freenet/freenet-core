@@ -677,10 +677,25 @@ impl NodeConfig {
         let (event_register, flush_handle) = {
             use super::tracing::{DynamicRegister, TelemetryReporter};
 
-            let event_reg = EventRegister::new(self.config.event_log());
-            let flush_handle = event_reg.flush_handle();
+            let mut registers: Vec<Box<dyn NetEventRegister>> = Vec::new();
 
-            let mut registers: Vec<Box<dyn NetEventRegister>> = vec![Box::new(event_reg)];
+            // The local append-only diagnostic log (`_EVENT_LOG`) is opt-in on
+            // network nodes (#4966). Measured on a live 0.2.111 peer it cost
+            // ~61 MiB/hour of appends and accounted for 95% of every fsync the
+            // process issued, for a forensic record nothing currently harvests
+            // (no `freenet service report` path reads it; `fdev verify-state`
+            // reads the Local-mode `_EVENT_LOG_LOCAL`, which stays on by
+            // default). This gate does NOT affect the `TelemetryReporter`
+            // added below — that is a separate sink fed in-memory off the same
+            // event stream, and it is what feeds telemetry.freenet.org.
+            let flush_handle = if self.config.event_log_enabled() {
+                let event_reg = EventRegister::new(self.config.event_log());
+                let handle = event_reg.flush_handle();
+                registers.push(Box::new(event_reg));
+                handle
+            } else {
+                crate::tracing::EventFlushHandle::noop()
+            };
 
             // Add OpenTelemetry register if feature enabled
             #[cfg(feature = "trace-ot")]
