@@ -731,6 +731,40 @@ mod tests {
         );
     }
 
+    /// The two headline counters survive the trip into the emitted body under
+    /// the RIGHT keys.
+    ///
+    /// They were only ever checked on the `Window` struct. A swapped key in
+    /// the body construction — emitting `summary_entries_differing` under the
+    /// `summary_entries_identical` name — would ship an exactly inverted ratio
+    /// to telemetry and send the hash-first decision the wrong way, with every
+    /// other test still green. Distinguishable counts (3 vs 5) so a swap
+    /// cannot pass.
+    #[test]
+    fn headline_counters_reach_the_rollup_body_under_the_right_keys() {
+        let mix = OutboundMix::new();
+        let c = test_instance_id(1);
+        for _ in 0..3 {
+            mix.record_summary_comparison(&c, b"same", b"same");
+        }
+        for _ in 0..5 {
+            mix.record_summary_comparison(&c, b"ours", b"theirs");
+        }
+        let body = outbound_mix_json(&mix.take_window(), 60);
+        assert_eq!(
+            body.get("summary_entries_identical")
+                .and_then(|v| v.as_u64()),
+            Some(3),
+            "identical count must reach the body under its own key"
+        );
+        assert_eq!(
+            body.get("summary_entries_differing")
+                .and_then(|v| v.as_u64()),
+            Some(5),
+            "differing count must reach the body under its own key"
+        );
+    }
+
     /// A capped window reports HOW MANY attributions it dropped.
     ///
     /// Without this the named list is indistinguishable from the complete set,
