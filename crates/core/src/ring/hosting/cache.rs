@@ -1174,9 +1174,10 @@ pub(crate) struct CostAxisDecision {
     /// `total_rate > floor` (NaN-safe) — whether the axis could shed at all.
     pub armed: bool,
     /// How many contracts the meter attributed SUSTAINED work to on this axis
-    /// (`axis.rates.len()`) — network-wide from this node's meter, NOT
-    /// restricted to contracts this node hosts. `0` on an unarmed axis, which
-    /// is not scanned.
+    /// (`axis.rates.len()`) — METER-wide, i.e. every contract THIS NODE
+    /// attributed work to, whether or not it hosts them. Not a fleet-wide
+    /// figure: reading it as one would suggest the network is storming when
+    /// only this box is. `0` on an unarmed axis, which is not scanned.
     ///
     /// This is the field that makes "cost eviction never fired" diagnosable,
     /// because `total_rate` and the per-contract rates come from DIFFERENT
@@ -1185,7 +1186,7 @@ pub(crate) struct CostAxisDecision {
     ///
     /// | `attributed` | `offenders` | Diagnosis |
     /// |---|---|---|
-    /// | 0 | empty | No SINGLE contract is individually above the axis floor — the load is DIFFUSE and the axis armed only on the sum. Nothing here is shed-able; this is an aggregate-budget question, not a per-contract one. (A genuinely bursty contract lands here too: its above-floor run keeps resetting.) |
+    /// | 0 | empty | No contract has SUSTAINED an above-floor rate. Two different situations, so check `total_rate` across consecutive sweeps before acting: (a) DIFFUSE — many sub-floor contributors, the axis armed only on their sum, nothing here is shed-able and this is an aggregate-budget question; (b) NOT YET SUSTAINED — a real offender exists but its above-floor run is younger than `min_window / 2` (150s), or a gap reset it, so wait a sweep or two and it will appear. A steady total with no offender ever appearing is (a); a total that climbed recently is (b). |
     /// | >0 | empty | Work IS attributed to individually-expensive contracts, but this node hosts none of them. Not this node's to shed. |
     /// | >0 | non-empty, all `rejected` | The offenders are immune BY DESIGN (invariant 3) — read each `outcome`. |
     ///
@@ -1294,7 +1295,9 @@ impl std::fmt::Display for CostAxisDecision {
 /// digest, re-admitting exactly the rate wobble this function excludes. Sorting
 /// means only a real change in a real gate moves it. Hashing the whole multiset
 /// rather than just the first offender's outcome means a SECONDARY offender
-/// changing why it was spared still surfaces within one sweep.
+/// changing why it was spared still surfaces within one sweep. `attributed` is
+/// included only as a BOOLEAN (was anything attributed at all), which is the
+/// decision-table-row crossing rather than the wobbling count.
 ///
 /// The volume bound does not depend on any of this — [`HostingCache::log_cost_decision`]
 /// is called once per sweep, so the hard ceiling is one line per sweep either
@@ -1324,6 +1327,14 @@ fn cost_decision_digest(decisions: &[CostAxisDecision]) -> u64 {
             .collect();
         outcomes.sort_unstable();
         outcomes.hash(&mut hasher);
+        // Whether ANYTHING was attributed, as a boolean rather than the count.
+        // The count wobbles; the 0 <-> non-0 crossing does not, and it is the
+        // transition that flips `CostAxisDecision::attributed`'s decision table
+        // from row 1 (diffuse / not-yet-sustained: an aggregate-budget
+        // question) to row 2 (attributed, but not to anything hosted here) —
+        // two situations with completely different fixes. Without this that
+        // change waits up to COST_DECISION_LOG_INTERVAL to surface.
+        (decision.attributed > 0).hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -2223,6 +2234,14 @@ impl<T: TimeSource> HostingCache<T> {
     /// `subscriber_counts(key)` is the caller's genuine-demand split, read
     /// once per candidate and captured atomically with the decision (same
     /// discipline as [`Self::evict_over_budget`]).
+    ///
+    /// SIDE EFFECT beyond eviction: every call also emits the rate-limited
+    /// operator summary and advances its bookkeeping (see
+    /// [`Self::log_cost_decision`]). This is the entry point production uses,
+    /// so the summary's ~60s cadence is this function's call cadence. The
+    /// bookkeeping is write-only with respect to the decision — it is read
+    /// solely to rate-limit the log, never to choose a victim (pinned by
+    /// `cost_decision_logging_state_does_not_change_evictions`).
     pub fn evict_cost_pressure<G>(
         &mut self,
         subscriber_counts: &G,
@@ -2285,8 +2304,10 @@ impl<T: TimeSource> HostingCache<T> {
                 let rate = axis.rates.get(key.id()).copied().unwrap_or(0.0);
                 // Highest rate wins; equal rates fall back to the SAME
                 // ascending key-byte tiebreak the eviction sort below uses, so
-                // the reported offender is deterministic and matches the first
-                // victim when there is one.
+                // the reported contract is deterministic. `top_rate` never
+                // feeds the victim path: it is consulted only in the
+                // `reported.is_empty()` fallback, which by construction means
+                // nothing cleared the cutoff, so there is no victim to match.
                 //
                 // `rate > 0.0` is a CORRECTNESS gate, not an optimization: it
                 // excludes NaN (which would otherwise be an unbeatable maximum,
@@ -2519,6 +2540,12 @@ impl<T: TimeSource> HostingCache<T> {
             .map(CostAxisDecision::to_string)
             .collect::<Vec<_>>()
             .join("; ");
+        // `axes` MUST stay the LAST field. Its value contains spaces and `=`
+        // characters, so the record only parses as key=value at all because
+        // nothing follows it; inserting a field after `axes` would silently
+        // corrupt every downstream parse. `hosted_contracts` is the
+        // POST-eviction count, since this runs after the removal loop — pair it
+        // with the per-axis `evicted=` to reconstruct the pre-sweep total.
         tracing::info!(
             axes_armed = decisions.iter().filter(|decision| decision.armed).count(),
             hosted_contracts = self.contracts.len(),
@@ -3843,9 +3870,18 @@ mod tests {
         let start = production
             .find("fn log_cost_decision")
             .expect("log_cost_decision must exist");
+        // Bound the window to THIS function. Scraping to the end of the
+        // production region would swallow every later function, which both
+        // false-REDS (a `debug!` added to any later function would trip the
+        // no-debug assertion below, with a message about the cost summary) and
+        // false-GREENS (another function's `info!` would satisfy the emit
+        // assertion even if this one were deleted).
+        let end = production[start..]
+            .find("\n    /// Load a contract entry")
+            .expect("log_cost_decision must be followed by load_persisted_entry_with_demand");
         // Whitespace-stripped so a rustfmt reflow of the macro's arguments
         // cannot vacate the needles.
-        let body: String = production[start..]
+        let body: String = production[start..start + end]
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
@@ -3875,6 +3911,24 @@ mod tests {
         assert!(
             body.contains(concat!("\"cost-pressureeviction", "decision")),
             "the summary's grep-able message must survive"
+        );
+        // `axes` must remain the LAST field. Its value contains spaces and `=`,
+        // so the record only parses as key=value because nothing follows it.
+        // A comment alone would not survive a future field being appended.
+        let fields_start = body
+            .find(concat!("tracing::", "info!("))
+            .expect("emit exists");
+        let after_axes = body[fields_start..]
+            .find("axes=%rendered,")
+            .map(|i| &body[fields_start + i + "axes=%rendered,".len()..])
+            .expect("axes field exists");
+        let next_field_end = after_axes.find(");").unwrap_or(after_axes.len());
+        assert!(
+            !after_axes[..next_field_end].contains('='),
+            "`axes` must be the LAST field in the summary: its value contains \
+             spaces and `=`, so appending a field after it silently corrupts \
+             every downstream key=value parse — found {:?} after it",
+            &after_axes[..next_field_end]
         );
     }
 
@@ -4112,6 +4166,28 @@ mod tests {
             cache.last_cost_decision_digest, digest_local,
             "has_local_subs -> has_downstream_subs is a real gate change and \
              must surface within one sweep, not wait for the heartbeat"
+        );
+
+        // `attributed` crossing 0 -> non-0 must also re-trigger. It flips the
+        // decision table from "diffuse / not yet sustained, an aggregate-budget
+        // question" to "attributed, but not to anything hosted here" — two
+        // situations with completely different fixes, so waiting out the 300s
+        // heartbeat to learn it is the wrong trade.
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let hosted = make_key(1);
+        let elsewhere = make_key(2);
+        cache.record_access(hosted, 121, AccessType::Put, 1, |_| (0, 0));
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let nothing_attributed = [cost_axis(100_000.0, 50_000.0, &[])];
+        let attributed_elsewhere = [cost_axis(100_000.0, 50_000.0, &[(&elsewhere, 90_000.0)])];
+        cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &nothing_attributed);
+        let digest_none = cache.last_cost_decision_digest;
+        cache.evict_cost_pressure(&|_: &ContractKey| (0, 0), &attributed_elsewhere);
+        assert_ne!(
+            cache.last_cost_decision_digest, digest_none,
+            "attributed 0 -> non-0 changes the diagnosis and must surface \
+             within one sweep (both sweeps report no offender, so only the \
+             `attributed` bit distinguishes them)"
         );
     }
 
