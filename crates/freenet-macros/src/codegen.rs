@@ -314,6 +314,16 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             transport_keypair: Some(transport_keypair),
                             ..Default::default()
                         },
+                        // Harness nodes run in Network mode, where the local
+                        // event log is OFF by default (#4968). The failure
+                        // report this macro emits reads that log back
+                        // (`generate_failure_report` -> `aggregate_events` ->
+                        // `event_log_path`), so without this opt-in the event
+                        // section of every failing test's report is silently
+                        // empty. Diagnostics are the whole point of the log in
+                        // a test, and a temp-dir node pays none of the disk
+                        // cost that made it opt-in for real peers. See #4972.
+                        enable_event_log: Some(true),
                         ..Default::default()
                     };
 
@@ -456,6 +466,16 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             transport_keypair: Some(transport_keypair),
                             ..Default::default()
                         },
+                        // Harness nodes run in Network mode, where the local
+                        // event log is OFF by default (#4968). The failure
+                        // report this macro emits reads that log back
+                        // (`generate_failure_report` -> `aggregate_events` ->
+                        // `event_log_path`), so without this opt-in the event
+                        // section of every failing test's report is silently
+                        // empty. Diagnostics are the whole point of the log in
+                        // a test, and a temp-dir node pays none of the disk
+                        // cost that made it opt-in for real peers. See #4972.
+                        enable_event_log: Some(true),
                         ..Default::default()
                     };
 
@@ -747,5 +767,52 @@ fn generate_tokio_attr(args: &FreenetTestArgs) -> TokenStream {
                 #[tokio::test(flavor = #flavor)]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    /// Every harness node must opt in to the local event log (#4972).
+    ///
+    /// Harness nodes run in Network mode, which is exactly the mode where the
+    /// event log is OFF by default (#4968). But this macro's failure report
+    /// reads that log back — `generate_failure_report` -> `aggregate_events`
+    /// -> `event_log_path`. Drop the opt-in and the report does not fail, it
+    /// just stops saying anything: the event section of every failing test's
+    /// report goes silently empty, which reads like "nothing interesting
+    /// happened" rather than "this diagnostic is switched off".
+    ///
+    /// Asserts against the GENERATED TOKENS rather than the source text, so
+    /// reformatting cannot quietly make it vacuous, and counts both nodes so
+    /// that dropping the opt-in from only the gateway arm or only the peer arm
+    /// still trips it.
+    #[test]
+    fn every_harness_node_enables_the_event_log() {
+        let args: FreenetTestArgs = syn::parse2(quote! { nodes = ["gateway", "peer-1"] }).unwrap();
+
+        let generated = generate_node_setup(&args).to_string();
+        let normalized: String = generated.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Vacuity guard: prove we actually generated node-config code. Without
+        // this, a refactor that renamed or emptied `generate_node_setup` would
+        // leave the assertion below passing against an empty string.
+        assert!(
+            normalized.contains("ConfigArgs"),
+            "pin guard: generated node setup does not build ConfigArgs, so this \
+             test is asserting against the wrong thing. Generated:\n{generated}"
+        );
+
+        let count = normalized.matches("enable_event_log:Some(true)").count();
+        assert_eq!(
+            count, 2,
+            "each of the 2 harness nodes must set `enable_event_log: Some(true)` \
+             (found {count}). Network-mode nodes have the event log off by \
+             default (#4968) and #[freenet_test] reads it back for failure \
+             reports, so dropping this silently empties the event section of \
+             every failing test's report. See #4972.\nGenerated:\n{generated}"
+        );
     }
 }

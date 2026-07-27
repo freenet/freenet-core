@@ -1522,7 +1522,13 @@ impl TestContext {
     /// Get the path to a node's event log.
     pub fn event_log_path(&self, node_label: &str) -> anyhow::Result<PathBuf> {
         let node = self.node(node_label)?;
-        // Nodes run in Network mode, so they create _EVENT_LOG not _EVENT_LOG_LOCAL
+        // Nodes run in Network mode, so they create _EVENT_LOG not _EVENT_LOG_LOCAL.
+        // Network mode is also the mode where the event log is OFF by default
+        // (#4968), so the harness must opt in explicitly for this path to
+        // resolve to a file with anything in it — `#[freenet_test]` does that
+        // via `enable_event_log: Some(true)`. If that opt-in is ever dropped,
+        // this returns a path to an absent file and every failure report goes
+        // silently empty rather than failing loudly. See #4972.
         Ok(node.temp_dir_path.join("_EVENT_LOG"))
     }
 
