@@ -2539,9 +2539,28 @@ mod tests {
             ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
+        // Anchored to the LABEL, not just the value: asserting on
+        // `<div class="g-norm-value">42</div>` alone would be satisfied by any
+        // other tile that happened to render 42.
         assert!(
-            html.contains(r#"<div class="g-norm-value">42</div>"#),
-            "cost-eviction count must render — got:\n{html}"
+            html.contains(
+                r#"<div class="g-norm-label">Cost evictions</div><div class="g-norm-value">42</div>"#
+            ),
+            "cost-eviction count must render in the cost-eviction tile — got:\n{html}"
+        );
+        // The #4338 demand-miscalibration alarm must stay ahead of the new
+        // tile: `.g-norms` is a 5-column grid shared by five cards, so the
+        // sixth tile wraps to its own row and that must not be this alarm.
+        let alarm = html
+            .find("Evicted w/ demand")
+            .expect("demand-miscalibration tile present");
+        let cost = html
+            .find("Cost evictions")
+            .expect("cost-eviction tile present");
+        assert!(
+            alarm < cost,
+            "the new cost tile must be appended AFTER 'Evicted w/ demand' so the \
+             alarm keeps its first-row slot"
         );
     }
 

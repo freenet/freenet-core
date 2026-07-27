@@ -1352,8 +1352,13 @@ pub fn build_hosting_card(snap: &Option<network_status::NetworkStatusSnapshot>) 
                     <div class="g-norm"><div class="g-norm-label">Headroom</div><div class="g-norm-value">{headroom}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Hosted</div><div class="g-norm-value">{count}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Budget evictions</div><div class="g-norm-value">{budget_evictions}</div></div>
-                    <div class="g-norm" title="Zero-demand contracts shed because their attributed update-work (WASM CPU, broadcast fan-out bytes, or broadcast message count) dominated this node's total on a cost axis — a separate trigger from the byte budget (#4861)."><div class="g-norm-label">Cost evictions</div><div class="g-norm-value">{cost_evictions}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Evicted w/ demand</div><div class="g-norm-value">{recently_read}</div></div>
+                    <!-- APPENDED LAST on purpose: `.g-norms` is `repeat(5, 1fr)` (assets/style.css)
+                         and is shared by five cards, so it must not be widened here. A sixth tile
+                         wraps to its own row; the one that wraps should be this new counter, not
+                         "Evicted w/ demand" — that tile is the #4338 demand-miscalibration alarm
+                         and needs to stay on the first row where an operator scans. -->
+                    <div class="g-norm" title="Zero-demand contracts shed because their attributed update-work (WASM CPU, broadcast fan-out bytes, or broadcast message count) dominated this node's total on a cost axis — a separate trigger from the byte budget (#4861)."><div class="g-norm-label">Cost evictions</div><div class="g-norm-value">{cost_evictions}</div></div>
                 </div>
             </div>
             <div class="g-verdict-row">
