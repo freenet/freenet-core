@@ -845,6 +845,13 @@ mod tests {
     /// Reading the SOURCE is what makes unreached arms visible, so this
     /// deliberately accepts source-scrape brittleness in exchange for coverage
     /// the token check structurally cannot provide.
+    ///
+    /// Scope, stated so it is not over-trusted (this file has already shipped
+    /// two comments claiming protection the code did not provide): it covers
+    /// only the body of `generate_node_setup`. A `ConfigArgs` literal added in
+    /// a DIFFERENT function is invisible to it — confirmed by mutation. That
+    /// is an accepted bound rather than an oversight, since node configs belong
+    /// in this function; if that ever stops being true, widen the slice.
     #[test]
     fn every_config_args_literal_in_the_source_sets_the_opt_in() {
         let src = include_str!("codegen.rs");
