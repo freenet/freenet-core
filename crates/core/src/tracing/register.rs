@@ -1688,6 +1688,20 @@ pub struct EventFlushHandle {
 }
 
 impl EventFlushHandle {
+    /// A handle whose [`Self::flush`] is a no-op, for nodes running with the
+    /// event log disabled (#4968) — there is no `EventRegister` to drain.
+    ///
+    /// The receiver is dropped immediately and deliberately. `send` on a
+    /// *closed* channel returns `Err` at once, so `flush` short-circuits
+    /// through its `is_ok()` guard without waiting. This is NOT the
+    /// "bounded channel whose receiver is never read" anti-pattern from
+    /// `bug-prevention-patterns.md` — that one blocks forever once the buffer
+    /// fills, whereas a closed channel can never block.
+    pub fn noop() -> Self {
+        let (sender, _receiver) = mpsc::channel(1);
+        Self { sender }
+    }
+
     /// Request a flush and wait for completion
     pub async fn flush(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
