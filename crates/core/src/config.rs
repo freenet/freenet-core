@@ -4167,6 +4167,71 @@ mod tests {
         );
     }
 
+    /// `--enable-event-log` uses clap's `num_args = 0..=1` +
+    /// `default_missing_value` form, which is easy to get subtly wrong (a bare
+    /// flag silently parsing as `None`, or `=false` being rejected). The
+    /// identical `--hosted-mode` pattern carries the same test for that reason.
+    ///
+    /// Without this, every other event-log test would still pass while the
+    /// operator-facing flag did nothing — the tests set the field directly.
+    #[test]
+    fn enable_event_log_cli_accepts_bare_flag_and_explicit_value() {
+        use clap::Parser;
+
+        // The arg also reads FREENET_ENABLE_EVENT_LOG via clap's `env`. Clear it
+        // for the duration of this test so the runner's environment can't mask
+        // the CLI-form assertions, then restore it.
+        let saved = std::env::var_os("FREENET_ENABLE_EVENT_LOG");
+        // SAFETY: this is the only test that touches FREENET_ENABLE_EVENT_LOG,
+        // and it restores the prior value below; nextest per-process isolation
+        // means no other thread observes the transient unset.
+        unsafe {
+            std::env::remove_var("FREENET_ENABLE_EVENT_LOG");
+        }
+
+        // Absent => None, so the mode-dependent default applies.
+        let absent = ConfigArgs::try_parse_from(["freenet"]).expect("bare argv should parse");
+        assert_eq!(
+            absent.enable_event_log, None,
+            "an absent flag must stay None so the mode default can apply"
+        );
+
+        // Bare `--enable-event-log` => Some(true) via default_missing_value.
+        let bare = ConfigArgs::try_parse_from(["freenet", "--enable-event-log"])
+            .expect("bare --enable-event-log should parse");
+        assert_eq!(
+            bare.enable_event_log,
+            Some(true),
+            "bare --enable-event-log must mean Some(true)"
+        );
+
+        // `--enable-event-log=false` => Some(false), the explicit opt-out.
+        let explicit_false = ConfigArgs::try_parse_from(["freenet", "--enable-event-log=false"])
+            .expect("--enable-event-log=false should parse");
+        assert_eq!(
+            explicit_false.enable_event_log,
+            Some(false),
+            "--enable-event-log=false must mean Some(false)"
+        );
+
+        // Space-separated value form.
+        let spaced = ConfigArgs::try_parse_from(["freenet", "--enable-event-log", "true"])
+            .expect("--enable-event-log true should parse");
+        assert_eq!(
+            spaced.enable_event_log,
+            Some(true),
+            "--enable-event-log true must mean Some(true)"
+        );
+
+        // SAFETY: restoring the value captured above; same rationale as the
+        // remove_var at the top of this test.
+        unsafe {
+            if let Some(v) = saved {
+                std::env::set_var("FREENET_ENABLE_EVENT_LOG", v);
+            }
+        }
+    }
+
     /// When explicitly enabled, hosted mode resolves to `true` and survives a
     /// TOML round-trip (so it works from a config file, not just the CLI flag).
     #[tokio::test]
