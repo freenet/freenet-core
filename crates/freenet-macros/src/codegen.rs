@@ -799,10 +799,23 @@ mod tests {
     /// counts stay at 2. Unreached-arm coverage is a property of the FIXTURE,
     /// and no token count against a single fixture can establish it.
     ///
-    /// That hole is closed separately by
-    /// `every_config_args_literal_in_the_source_sets_the_opt_in`, which scrapes
-    /// the source of `generate_node_setup` and so sees arms this fixture never
-    /// exercises.
+    /// **That hole is NOT covered anywhere.** A source-scrape guard for it was
+    /// written and then deleted: text matching cannot tell a field from prose,
+    /// so five separate mutations defeated it (opt-in named in a trailing
+    /// comment, in a block comment, in a `///` doc comment; a literal in
+    /// another function; and — worst — an innocuous production comment
+    /// containing the words `mod tests`, which truncated the scraped region
+    /// before the peer arm so the guard went green on exactly the bug it
+    /// existed to catch). A guard that looks like protection but isn't is worse
+    /// than none, because it stops the next person adding real protection.
+    ///
+    /// So: **if you add a node-config arm here, add a fixture node that reaches
+    /// it.** If that ever needs enforcing, parse rather than match
+    /// (`syn::parse_file`, walking for an `ExprStruct` whose path ends in
+    /// `ConfigArgs` — fields and doc attributes are structurally distinct
+    /// there), or better, remove the duplication so both arms build their
+    /// `ConfigArgs` through one shared helper and there is only one place to
+    /// forget.
     #[test]
     fn every_harness_node_enables_the_event_log() {
         let args: FreenetTestArgs = syn::parse2(quote! { nodes = ["gateway", "peer-1"] }).unwrap();
@@ -830,74 +843,6 @@ mod tests {
              have the event log off by default (#4968) and #[freenet_test] reads \
              it back for failure reports and for assert-absence tests, so \
              dropping this silently empties both. See #4972.\nGenerated:\n{generated}"
-        );
-    }
-
-    /// Every `ConfigArgs` literal in this file's production code sets the
-    /// opt-in — including arms no fixture reaches (#4972).
-    ///
-    /// This is the guard `every_harness_node_enables_the_event_log` cannot be:
-    /// that test runs a two-node fixture, so a config arm added later is simply
-    /// never generated and its missing opt-in stays invisible. Verified by
-    /// mutation during review — adding an unreached arm without the opt-in left
-    /// the token-count test green.
-    ///
-    /// Scoped to the whole pre-`mod tests` region rather than to
-    /// `generate_node_setup` alone. That is deliberate and was arrived at by
-    /// mutation, not taste: slicing a single function needed a name needle, an
-    /// end boundary, and a vacuity guard, and all three were defeatable. In
-    /// particular `NetworkArgs` appears in BOTH config arms, so a slice
-    /// truncated after the first one still passed its own guard while the
-    /// second arm sat outside the scrape entirely. Scanning the whole region
-    /// deletes all three mechanisms and also covers a `ConfigArgs` added in a
-    /// different function.
-    ///
-    /// If some future function legitimately needs a `ConfigArgs` without the
-    /// opt-in, this fails loudly and a human decides — the right default for a
-    /// guard whose entire job is catching a silent omission.
-    #[test]
-    fn every_config_args_literal_in_the_source_sets_the_opt_in() {
-        let src = include_str!("codegen.rs");
-        // Cut at `mod tests` so the needles below cannot match this test's own
-        // source text, which contains both of them as string literals.
-        let prod = src.split("mod tests").next().unwrap();
-
-        // Strip `//` lines before counting. Without this, a comment MENTIONING
-        // the opt-in satisfies the count for an arm that never sets it —
-        // demonstrated by mutation, and not hypothetical: `test_utils.rs`
-        // already carries the prose "via `enable_event_log: Some(true)`", so a
-        // developer adding an arm and bringing the surrounding comment along
-        // reproduces it. Stripping also closes the inverse cry-wolf case, where
-        // a comment containing `ConfigArgs {` inflates the literal count on
-        // correct code.
-        let code_only: String = prod
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let literals = code_only.matches("ConfigArgs {").count();
-        let opt_ins = code_only
-            .matches(concat!("enable_event_log", ": Some(true)"))
-            .count();
-
-        // Vacuity guard: a truncated or mis-cut slice yields zero literals, so
-        // this catches the case where the scrape silently stops looking at
-        // anything. (`ConfigPathsArgs {` cannot inflate the count — the char
-        // after `Config` is `P`, never `A`.)
-        assert!(
-            literals > 0,
-            "pin guard: no ConfigArgs literal found in the production slice, so \
-             this pin proves nothing"
-        );
-        assert_eq!(
-            literals, opt_ins,
-            "every ConfigArgs literal in this file must set \
-             `enable_event_log: Some(true)` — found {literals} literal(s) but \
-             {opt_ins} opt-in(s). A node-config arm without the opt-in writes no \
-             event log, which silently empties failure reports AND makes \
-             assert-absence tests pass vacuously (#4972). Unlike the token-count \
-             test, this one sees arms no fixture reaches."
         );
     }
 }
