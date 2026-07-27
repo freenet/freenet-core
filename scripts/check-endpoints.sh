@@ -40,7 +40,7 @@ printf "  %-30s  %s  %s\n" "--------" "----" "-------"
     check_endpoint "vega gateway (HTTP)"      "http://vega.locut.us:31337" &
     check_endpoint "river.freenet.org"        "https://river.freenet.org" &
     check_endpoint "nova telemetry health"    "http://5.9.111.215:13133/health" &
-    check_endpoint "nova telemetry dashboard" "http://nova.locut.us:3133" &
+    check_endpoint "telemetry dashboard"      "https://telemetry.freenet.org" &
     wait
 }
 

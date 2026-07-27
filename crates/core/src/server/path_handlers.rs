@@ -2601,7 +2601,11 @@ mod tests {
         );
         assert!(
             !html.contains("freenet.org"),
-            "shell page must not reference external origins (CORS)"
+            "shell page must not reference external origins (CORS). This is a \
+             plain substring check over the whole rendered page, including the \
+             inlined shell_bridge.js — so a COMMENT that merely mentions a \
+             freenet.org host trips it too. If that is what you hit, drop the \
+             hostname from the comment rather than loosening this assertion."
         );
         // Shell message handler must be present in bridge JS
         assert!(
@@ -4879,12 +4883,13 @@ mod tests {
     ///
     /// The shell `open_url` handler must accept `http:` URLs in addition to
     /// `https:`. The original https-only check silently dropped clicks on
-    /// markdown links to plain-HTTP services (e.g. the Network Telemetry
-    /// dashboard `http://nova.locut.us:3133/` linked from the Freenet River
-    /// channel header) — the user clicked the link and nothing happened, no
-    /// console output, no popup, no error. The localhost block stays so a
-    /// pasted `http://127.0.0.1:NNNN/` link can't be used to target services
-    /// running on the reader's machine.
+    /// markdown links to plain-HTTP services (the trigger was the Network
+    /// Telemetry dashboard linked from the Freenet River channel header,
+    /// plain HTTP at the time and since moved to
+    /// `https://telemetry.freenet.org/`) — the user clicked the link and
+    /// nothing happened, no console output, no popup, no error. The
+    /// localhost block stays so a pasted `http://127.0.0.1:NNNN/` link
+    /// can't be used to target services running on the reader's machine.
     #[test]
     fn shell_open_url_handler_accepts_http_and_https_but_blocks_localhost() {
         let js = SHELL_BRIDGE_JS;
