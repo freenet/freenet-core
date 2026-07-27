@@ -1209,12 +1209,18 @@ function freenetBridge(authToken, userToken, hostedMode) {
         // links commonly target self-hosted services with no TLS
         // configured. freenet/river#231 was exactly that: the network
         // telemetry dashboard was plain HTTP at the time (it has since
-        // moved to https://telemetry.freenet.org/), and an https-only
-        // filter silently swallowed every click on it.
-        // Auth tokens never travel through this path
+        // moved to HTTPS), and an https-only filter silently swallowed
+        // every click on it. Auth tokens never travel through this path
         // — the only operation is `window.open(url, '_blank',
         // 'noopener,noreferrer')` — so HTTP doesn't expose credentials.
         // See freenet/river#231.
+        //
+        // Do NOT name the dashboard's host here: this file is inlined
+        // verbatim into the shell page, and
+        // `shell_page_contains_iframe_and_bridge` greps the rendered page
+        // for the project's public domain and fails on ANY occurrence,
+        // comments included (external-origin / CORS guard). The live URL
+        // lives in scripts/check-endpoints.sh.
         //
         // Private networks (RFC1918 192.168/16, 10/8, 172.16-31/12 and
         // RFC4193 fc00::/7, link-local fe80::/10) are deliberately NOT
