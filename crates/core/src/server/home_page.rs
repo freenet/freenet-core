@@ -2524,9 +2524,16 @@ mod tests {
             ..Default::default()
         };
         let html = build_hosting_card(&Some(snap));
+        // Zero must render as a real "0", not be blanked out: "the cost trigger
+        // has never fired" and "the counter is missing" are different answers,
+        // and the adjacent `recently_read_value` in cards.rs does conditionally
+        // blank itself, so this is a live failure mode rather than a
+        // hypothetical. Anchored to the label so only THIS tile satisfies it.
         assert!(
-            html.contains("Cost evictions"),
-            "cost-eviction tile label present — got:\n{html}"
+            html.contains(
+                r#"<div class="g-norm-label">Cost evictions</div><div class="g-norm-value">0</div>"#
+            ),
+            "a never-fired cost trigger must render a real 0 — got:\n{html}"
         );
 
         let mut snap = base_snapshot();

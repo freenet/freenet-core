@@ -8710,3 +8710,71 @@ pub(crate) enum RingError {
     #[error("Peer has not joined the network yet (no ring location established)")]
     PeerNotJoined,
 }
+
+#[cfg(test)]
+mod dashboard_hosting_counter_source_tests {
+    //! Source-scrape pin for the dashboard hosting-counter mapping.
+    //!
+    //! `.claude/rules/bug-prevention-patterns.md` calls out "manually-mirrored
+    //! telemetry counters / dashboard providers" as a recurring silent-rot
+    //! pattern (#4009, #4010): a counter is wired to a card once, a later
+    //! refactor re-points or drops the mapping line, and the tile keeps
+    //! rendering a plausible-looking number from the wrong source with every
+    //! test still green.
+    //!
+    //! `dashboard_hosting_snapshot` is only reachable from `p2p_impl.rs`'s
+    //! provider registration and needs a live `Ring` to exercise, which this
+    //! suite has no scaffolding for. So — mirroring the other `*_source_tests`
+    //! modules in this file — pin the mapping in source instead.
+
+    /// Production source only: everything before the first top-level test
+    /// module. This module is itself `#[cfg(test)]` and declared last, so the
+    /// needles below cannot match this file's own test text.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    #[test]
+    fn dashboard_hosting_snapshot_maps_each_eviction_counter_from_its_own_source() {
+        // Whitespace-stripped so a rustfmt reflow of the struct literal cannot
+        // silently vacate the pin.
+        let src: String = production_source()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        // Each counter must come from the IDENTICALLY-named field on `stats`.
+        // Cross-wiring any two (the #4009/#4010 failure) breaks the matching
+        // needle. Needles are split so they do not appear contiguously in this
+        // file's own source.
+        for (counter, needle) in [
+            (
+                "cost_evictions_total",
+                concat!("cost_evictions_total:stats.", "cost_evictions_total,"),
+            ),
+            (
+                "budget_evictions_total",
+                concat!("budget_evictions_total:stats.", "budget_evictions_total,"),
+            ),
+            (
+                "evictions_of_recently_read_total",
+                concat!(
+                    "evictions_of_recently_read_total:stats.",
+                    "evictions_of_recently_read_total,"
+                ),
+            ),
+        ] {
+            assert!(
+                src.contains(needle),
+                "`dashboard_hosting_snapshot` must map {counter} from \
+                 `stats.{counter}` — the local dashboard is the only \
+                 hosting-counter view an operator gets with no telemetry \
+                 collector in the loop, so a cross-wired tile is silent"
+            );
+        }
+    }
+}

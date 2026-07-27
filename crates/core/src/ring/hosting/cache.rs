@@ -1020,10 +1020,12 @@ pub(crate) fn cost_eviction_candidate(
 ///
 /// The HARD BOUND is one line per sweep, i.e. **60 lines/hour**, not the
 /// steady-state 12: the change-trigger fires whenever an axis whose total
-/// hovers at its floor flips `armed`, or the top offender's reject reason
-/// alternates across sweeps. At ~750 bytes for a fully-armed three-axis line
-/// that worst case is ~45 KB/hour/node against a measured ~35 MB/hour main log
-/// (0.13%), so the bound is what matters, and it is safe.
+/// hovers at its floor flips `armed`, or an offender's reject reason changes
+/// across sweeps. The line is size-bounded too: three axes, each naming at most
+/// ~3 offenders (see [`CostAxisDecision::offenders`]) at ~90 bytes apiece, so
+/// ~1.2 KB at the absolute maximum and ~450 bytes in the realistic armed case.
+/// Worst case is therefore ~70 KB/hour/node against a measured ~35 MB/hour main
+/// log (~0.2%), so the bound is what matters, and it is safe.
 ///
 /// This line is LOCAL ONLY. Nothing in the tracing-subscriber stack forwards
 /// events to the central OTLP collector — `tracing/tracer.rs` wires only
@@ -1049,15 +1051,23 @@ pub(crate) enum CostRejectReason {
     /// "this contract holds less than the share" are DIFFERENT diagnoses with
     /// different fixes.
     ///
-    /// CAUTION for anyone reading this reason in the field: a zero rate does
-    /// NOT mean "the meter attributed nothing to this contract". The axis
-    /// `total_rate` sums EVERY positive per-contract rate, while the
-    /// per-contract `rates` map is the SUSTAINED subset — a rate is only
-    /// inserted when `activity_span >= min_window / 2`
-    /// (`topology/meter.rs::contract_cost_rates_multi`). So a contract whose
-    /// work is real but bursty reads as zero here. The rendered summary
-    /// carries [`CostAxisDecision::attributed`] alongside precisely so those
-    /// cases can be told apart; see that field's docs for the decision table.
+    /// You will NOT see this reason in a log line, and that is deliberate: a
+    /// rendered offender always has a positive rate (see
+    /// [`CostAxisDecision::offenders`]), so the field-facing form of this
+    /// diagnosis is `top=none` plus [`CostAxisDecision::attributed`], not an
+    /// `outcome=zero_rate` token. The variant exists so
+    /// [`classify_cost_rejection`] stays total over its input domain, which is
+    /// what lets `cost_reject_classification_matches_eviction_decision` pin the
+    /// classifier against the sweep across every rate including zero and NaN.
+    ///
+    /// Note for anyone tempted to render it anyway: a zero rate does NOT mean
+    /// "the meter attributed nothing to this contract". The axis `total_rate`
+    /// sums EVERY positive per-contract rate, while the per-contract `rates`
+    /// map is the SUSTAINED subset — inserted only when `activity_span >=
+    /// min_window / 2` (`topology/meter.rs::contract_cost_rates_multi`), where
+    /// that span is a run ABOVE THE AXIS FLOOR rather than mere sample
+    /// continuity. A contract carrying real but individually-sub-floor load
+    /// reads as zero here.
     ZeroRate,
     /// Attributed rate did not exceed `COST_SHARE_THRESHOLD × total_rate`.
     UnderShare,
@@ -1175,13 +1185,38 @@ pub(crate) struct CostAxisDecision {
     ///
     /// | `attributed` | `offenders` | Diagnosis |
     /// |---|---|---|
-    /// | 0 | empty | Work is real but BURSTY — every contract failed the meter's sustained gate. Not a hosting problem. |
-    /// | >0 | empty | Work IS attributed, but to contracts this node does not host (or none clears 25%). Not this node's to shed. |
-    /// | >0 | non-empty, all `rejected` | The offenders are immune BY DESIGN (invariant 3) — read the per-offender `outcome`. |
+    /// | 0 | empty | No SINGLE contract is individually above the axis floor — the load is DIFFUSE and the axis armed only on the sum. Nothing here is shed-able; this is an aggregate-budget question, not a per-contract one. (A genuinely bursty contract lands here too: its above-floor run keeps resetting.) |
+    /// | >0 | empty | Work IS attributed to individually-expensive contracts, but this node hosts none of them. Not this node's to shed. |
+    /// | >0 | non-empty, all `rejected` | The offenders are immune BY DESIGN (invariant 3) — read each `outcome`. |
+    ///
+    /// The middle row cannot mean "a hosted contract is close but under 25%":
+    /// such a contract has a positive rate, so it takes the
+    /// highest-positive-rate fallback and renders with an `under_share`
+    /// outcome, making `offenders` non-empty.
+    ///
+    /// "Above the axis floor" is meant literally, and is the subtle part: the
+    /// meter's sustained gate keys on a run of samples whose rate exceeds the
+    /// axis's own node-wide floor (`RunningAverage::new_cost_sustained`,
+    /// `topology/meter.rs`), NOT on sample continuity. Twenty contracts at
+    /// 1.5 msgs/s arm the 10 msgs/s broadcast axis on their 30 msgs/s sum while
+    /// every one of them reports `attributed = 0`.
     pub attributed: usize,
-    /// Hosted contracts that cleared the share cutoff, in the SAME order the
-    /// eviction loop acted on them (descending rate, ascending key bytes), so
-    /// `offenders[0]` is the first victim when there is one.
+    /// Hosted contracts that cleared the share cutoff, sorted by the SAME
+    /// comparator the eviction loop sorts its victims with (descending rate,
+    /// ascending key bytes), so the victims among them appear in the order they
+    /// were shed.
+    ///
+    /// `offenders[0]` is the highest-rate PROBE, NOT necessarily a victim: the
+    /// eviction loop iterates the candidacy-filtered subset, so when the
+    /// highest-rate contract is immune and a lower-ranked one is shed, slot 0
+    /// holds the immune contract with its `rejected` reason and the shed one
+    /// appears below it as `outcome=evicted`. Read the outcome, not the rank.
+    ///
+    /// Every entry has a POSITIVE, non-NaN rate: the probe filter rejects NaN
+    /// and anything at or below the cutoff, and the fallback below only fires
+    /// for `rate > 0.0`. That is what bounds this vector at ~3 entries (the
+    /// per-contract rates are a subset of `total_rate`, so at most three can
+    /// each exceed 25% of it) and what makes the sort comparator a total order.
     ///
     /// When nothing cleared the cutoff this falls back to the single
     /// highest-POSITIVE-rate hosted contract, so the line still names the
@@ -1246,29 +1281,49 @@ impl std::fmt::Display for CostAxisDecision {
 /// immediately when the DECISION changes rather than waiting out
 /// [`COST_DECISION_LOG_INTERVAL`].
 ///
-/// Deliberately covers only each axis's name, armed flag, and the SEQUENCE of
+/// Deliberately covers only each axis's name, armed flag, and the MULTISET of
 /// its offenders' outcomes — NOT their identities, the rates, or
 /// [`CostAxisDecision::attributed`]. Rates wobble every sweep and the top
 /// offender can swap between two near-equal contracts, so including any of
 /// those would turn the change-trigger into a per-sweep line. Those details
 /// still appear in the next periodic summary.
 ///
-/// Hashing the outcome sequence (rather than only the first offender's) means
-/// a secondary offender changing why it was spared also surfaces within one
-/// sweep. The vector is bounded at ~3 entries, so this cannot make the digest
-/// churn: it takes a real change in a real gate to move it.
+/// The outcomes are SORTED before hashing, which is what makes that claim
+/// true. `offenders` is ordered by rate, so hashing it in order would let two
+/// near-equal contracts crossing ranks — with both gates unchanged — flip the
+/// digest, re-admitting exactly the rate wobble this function excludes. Sorting
+/// means only a real change in a real gate moves it. Hashing the whole multiset
+/// rather than just the first offender's outcome means a SECONDARY offender
+/// changing why it was spared still surfaces within one sweep.
+///
+/// The volume bound does not depend on any of this — [`HostingCache::log_cost_decision`]
+/// is called once per sweep, so the hard ceiling is one line per sweep either
+/// way (see [`COST_DECISION_LOG_INTERVAL`]). Sorting buys a quieter steady
+/// state and an honest rationale, not safety.
 fn cost_decision_digest(decisions: &[CostAxisDecision]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for decision in decisions {
         decision.axis.hash(&mut hasher);
         decision.armed.hash(&mut hasher);
-        // Length + per-offender `Option<_>` distinguishes no-offender / shed /
-        // rejected(why) at each rank.
-        decision.offenders.len().hash(&mut hasher);
-        for offender in &decision.offenders {
-            offender.rejected.hash(&mut hasher);
-        }
+        // Map to a small tag so the multiset can be sorted: `0` is "shed", and
+        // each reject reason gets its own stable tag. `offenders` is bounded at
+        // ~3 entries, so the sort is trivial. The `Vec`'s own `Hash` writes the
+        // length, so a changed offender COUNT still moves the digest.
+        let mut outcomes: Vec<u8> = decision
+            .offenders
+            .iter()
+            .map(|offender| match offender.rejected {
+                None => 0,
+                Some(CostRejectReason::ZeroRate) => 1,
+                Some(CostRejectReason::UnderShare) => 2,
+                Some(CostRejectReason::HasLocalSubs) => 3,
+                Some(CostRejectReason::HasDownstreamSubs) => 4,
+                Some(CostRejectReason::RecentlyAccessed) => 5,
+            })
+            .collect();
+        outcomes.sort_unstable();
+        outcomes.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -2256,11 +2311,23 @@ impl<T: TimeSource> HostingCache<T> {
                 // every sweep where any axis is over its floor (a busy
                 // gateway: always), across every hosted contract, so paying
                 // the subscriber lookup only for the handful over the cutoff
-                // matters. `rate <= cutoff` rejects rate == 0 and negatives;
-                // a NaN rate (defensive: meter math) is not <= cutoff so it
-                // falls through here, but `cost_eviction_candidate` then
-                // rejects it (its `attributed_rate > 0.0` is false for NaN).
-                if rate <= share_cutoff {
+                // matters. `rate <= cutoff` rejects rate == 0 and negatives.
+                //
+                // NaN is rejected EXPLICITLY rather than left to fall through
+                // to `cost_eviction_candidate` (whose `attributed_rate > 0.0`
+                // is false for NaN, so the victim set is identical either way).
+                // Letting it through would corrupt the REPORTING that now reads
+                // `probed`: `NaN <= cutoff` is false, so a NaN would (a) defeat
+                // the "at most 3 contracts can exceed 25% of the total" bound
+                // that keeps `probed` — and the rendered log line — small, since
+                // every hosted contract could pass, and (b) make the
+                // `partial_cmp`-based sort below a non-total order (NaN
+                // compares `Equal` to everything via the `unwrap_or`, creating
+                // ordering cycles), whose result `slice::sort_by` leaves
+                // unspecified. The meter cannot currently produce NaN
+                // (`Meter::contract_cost_rates_multi` inserts only
+                // `per_second > 0.0`), so this is defence in depth.
+                if rate.is_nan() || rate <= share_cutoff {
                     continue;
                 }
                 let (local, downstream) = subscriber_counts(key);
@@ -2434,6 +2501,14 @@ impl<T: TimeSource> HostingCache<T> {
         if !due && self.last_cost_decision_digest == Some(digest) {
             return;
         }
+        // Bookkeeping is committed BEFORE the emit because `tracing` gives no
+        // signal about whether an event survived the subscriber's filters. The
+        // node's global limiter is 1000 events/s (`util/rate_limit_layer.rs`)
+        // against this call site's peak of one per 60s sweep, so a drop needs
+        // the whole node to be saturated — plausible during exactly the storm
+        // this line diagnoses. The cost of a drop is bounded and self-healing:
+        // that one change-transition goes unreported, and the next periodic
+        // heartbeat re-states the current decision in full.
         self.last_cost_decision_log_at = Some(now);
         self.last_cost_decision_digest = Some(digest);
         // One line for all axes rather than one per axis: `tracing` field
@@ -3378,6 +3453,12 @@ mod tests {
             rendered.contains("armed=false") && rendered.contains("floor=50000"),
             "the unarmed line must carry total vs floor — got: {rendered}"
         );
+        assert!(
+            !rendered.contains("top=") && !rendered.contains("attributed="),
+            "an unarmed axis reports NOTHING past total-vs-floor: it is never \
+             scanned, so `top=none attributed=0` would be an unearned claim \
+             about hosted contracts — got: {rendered}"
+        );
     }
 
     /// The armed-axis summary names the top attributed-cost contract, its
@@ -3726,6 +3807,284 @@ mod tests {
         assert_eq!(
             decisions[0].offenders[0].key, lower,
             "the reported top offender uses the SAME tiebreak as the eviction sort"
+        );
+    }
+
+    /// The anti-drift pin driven through the REAL sweep, not a transcription.
+    ///
+    /// `cost_reject_classification_matches_eviction_decision` compares the
+    /// classifier against a hand-copied `rate.is_nan() || rate > cutoff` gate,
+    /// so it stays green if `evict_cost_pressure`'s own share filter drifts
+    /// (e.g. `<=` becoming `<`) — the classifier and its twin would agree with
+    /// each other while both disagreed with the code. This drives the same grid
+    /// through `evict_cost_pressure_observed` and asserts the reported outcome
+    /// matches what the sweep actually did.
+    #[test]
+    fn cost_reject_classification_matches_the_real_sweep() {
+        let total = 100_000.0;
+        let cutoff = COST_SHARE_THRESHOLD * total;
+        let rates = [
+            f64::NAN,
+            f64::NEG_INFINITY,
+            -1.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.0,
+            cutoff - 0.1,
+            cutoff,
+            cutoff + 0.1,
+            90_000.0,
+        ];
+        for &rate in &rates {
+            for local in [0usize, 1] {
+                for downstream in [0usize, 1] {
+                    for recent in [false, true] {
+                        let (mut cache, clock) = make_cache(1024 * 1024);
+                        let key = make_key(1);
+                        cache.record_access(key, 121, AccessType::Put, 1, |_| (0, 0));
+                        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+                        if recent {
+                            cache.touch(&key);
+                        }
+                        let axes = [cost_axis(total, 50_000.0, &[(&key, rate)])];
+                        let (evicted, decisions) = cache.evict_cost_pressure_observed(
+                            &|_: &ContractKey| (local, downstream),
+                            &axes,
+                        );
+
+                        let shed = evicted.len() == 1;
+                        let reported = decisions[0].offenders.first();
+                        assert_eq!(
+                            reported.is_some_and(|offender| offender.rejected.is_none()),
+                            shed,
+                            "the sweep and its own explanation disagree for rate={rate} \
+                             local={local} downstream={downstream} recent={recent}: \
+                             evicted={} reported={reported:?}",
+                            evicted.len()
+                        );
+                        // The standalone classifier agrees with both, so drift
+                        // in any one of the three is caught here.
+                        assert_eq!(
+                            classify_cost_rejection(local, downstream, rate, cutoff, recent)
+                                .is_none(),
+                            shed,
+                            "classifier disagrees with the sweep for rate={rate} \
+                             local={local} downstream={downstream} recent={recent}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A NaN attributed rate must not reach the reporting vector.
+    ///
+    /// NaN is not `<= cutoff`, so without the explicit guard it passes the
+    /// share pre-filter into `probed`. That was harmless while `probed` only
+    /// fed `cost_eviction_candidate` (which rejects NaN), but the reporting
+    /// pass SORTS that vector: `partial_cmp` returns `None` for NaN, the
+    /// `unwrap_or(Equal)` turns it into "equal to everything", and the result
+    /// is an ordering cycle whose sort output `slice::sort_by` leaves
+    /// unspecified. NaN also defeats the share-based bound that keeps the
+    /// vector — and the rendered line — small, since every hosted contract
+    /// could then pass.
+    #[test]
+    fn cost_decision_nan_rate_never_enters_the_report() {
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let poisoned = make_key(1);
+        let real = make_key(2);
+        for (key, generation) in [(poisoned, 1), (real, 2)] {
+            cache.record_access(key, 121, AccessType::Put, generation, |_| (0, 0));
+        }
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        let axes = [cost_axis(
+            100_000.0,
+            50_000.0,
+            &[(&poisoned, f64::NAN), (&real, 60_000.0)],
+        )];
+        let (evicted, decisions) =
+            cache.evict_cost_pressure_observed(&|_: &ContractKey| (0, 0), &axes);
+
+        assert_eq!(
+            evicted.len(),
+            1,
+            "only the real offender is shed — NaN was never a candidate"
+        );
+        assert_eq!(evicted[0].key, real);
+        assert_eq!(
+            decisions[0].offenders.len(),
+            1,
+            "the NaN contract must not be reported — got {:?}",
+            decisions[0].offenders
+        );
+        assert_eq!(decisions[0].offenders[0].key, real);
+        assert!(
+            decisions[0].offenders.iter().all(|o| !o.rate.is_nan()),
+            "no reported offender may carry a NaN rate"
+        );
+        assert!(
+            !decisions[0].to_string().contains("NaN"),
+            "rendered: {}",
+            decisions[0]
+        );
+    }
+
+    /// The rank-vs-outcome distinction, and per-axis eviction attribution.
+    ///
+    /// `offenders[0]` is the highest-rate PROBE, not necessarily a victim. When
+    /// an immune contract outranks the one actually shed, the summary must
+    /// still report both — `top=` carrying the immune contract's reason and
+    /// `also=` carrying `outcome=evicted` — because an operator greps `top=`
+    /// and would otherwise conclude the shed contract had been spared.
+    ///
+    /// Also pins `evicted` as a PER-AXIS count: the second axis sheds nothing,
+    /// so reporting the running total there would show 1 instead of 0.
+    #[test]
+    fn cost_decision_top_rank_may_be_immune_while_a_lower_rank_is_shed() {
+        let (mut cache, clock) = make_cache(1024 * 1024);
+        let immune = make_key(1);
+        let shed = make_key(2);
+        for (key, generation) in [(immune, 1), (shed, 2)] {
+            cache.record_access(key, 121, AccessType::Put, generation, |_| (0, 0));
+        }
+        clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+        // `immune` has the HIGHER rate but a downstream subscriber; `shed` is
+        // second by rate and zero-demand. The second axis is armed but
+        // attributes everything to the already-immune contract, so it sheds
+        // nothing.
+        let axes = [
+            cost_axis(
+                100_000.0,
+                50_000.0,
+                &[(&immune, 45_000.0), (&shed, 40_000.0)],
+            ),
+            cost_axis(80_000.0, 50_000.0, &[(&immune, 70_000.0)]),
+        ];
+        let counts = |key: &ContractKey| if *key == immune { (0, 3) } else { (0, 0) };
+        let (evicted, decisions) = cache.evict_cost_pressure_observed(&counts, &axes);
+
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].key, shed);
+        let axis0 = &decisions[0];
+        assert_eq!(axis0.offenders.len(), 2);
+        assert_eq!(
+            axis0.offenders[0].key, immune,
+            "slot 0 is the highest RATE, even though it was not the victim"
+        );
+        assert_eq!(
+            axis0.offenders[0].rejected,
+            Some(CostRejectReason::HasDownstreamSubs)
+        );
+        assert_eq!(axis0.offenders[1].key, shed);
+        assert_eq!(
+            axis0.offenders[1].rejected, None,
+            "the lower-ranked contract is the one that was shed"
+        );
+        let rendered = axis0.to_string();
+        assert!(
+            rendered.contains("outcome=has_downstream_subs")
+                && rendered.contains("also=")
+                && rendered.contains("outcome=evicted"),
+            "both the immune top and the shed runner-up must appear: {rendered}"
+        );
+        assert_eq!(
+            decisions.iter().map(|d| d.evicted).collect::<Vec<_>>(),
+            vec![1, 0],
+            "`evicted` counts THIS axis's victims, so the second armed axis \
+             reports 0 rather than inheriting the first axis's eviction"
+        );
+    }
+
+    /// The change-trigger must fire on a REASON change and stay quiet on rate
+    /// wobble — the two properties `cost_decision_digest`'s docs claim and the
+    /// steady-state volume figure depends on.
+    ///
+    /// The rate-limit test flips `armed`, the offender count, and a reason all
+    /// at once, so deleting any single digest component still passes it. These
+    /// isolate one component at a time.
+    #[test]
+    fn cost_decision_digest_tracks_reasons_not_rates() {
+        let build = |rate: f64| {
+            let (mut cache, clock) = make_cache(1024 * 1024);
+            let key = make_key(1);
+            cache.record_access(key, 121, AccessType::Put, 1, |_| (0, 0));
+            clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+            let axis = cost_axis(100_000.0, 50_000.0, &[(&key, rate)]);
+            (cache, axis)
+        };
+
+        // Rate wobble with an UNCHANGED outcome must not move the digest —
+        // otherwise the change-trigger fires every sweep and the ~12 lines/hour
+        // steady state becomes the 60/hour worst case.
+        let (mut cache, axis_a) = build(58_000.0);
+        let (_, axis_b) = build(58_500.0);
+        let immune = |_: &ContractKey| (1usize, 0usize);
+        cache.evict_cost_pressure(&immune, std::slice::from_ref(&axis_a));
+        let after_first = (
+            cache.last_cost_decision_log_at,
+            cache.last_cost_decision_digest,
+        );
+        cache.evict_cost_pressure(&immune, std::slice::from_ref(&axis_b));
+        assert_eq!(
+            (
+                cache.last_cost_decision_log_at,
+                cache.last_cost_decision_digest
+            ),
+            after_first,
+            "a different rate with the same outcome must not re-trigger the log"
+        );
+
+        // A REASON change with the same armed flag and the same offender count
+        // must re-trigger within one sweep.
+        let (mut cache, axis) = build(58_000.0);
+        cache.evict_cost_pressure(&|_: &ContractKey| (1, 0), std::slice::from_ref(&axis));
+        let digest_local = cache.last_cost_decision_digest;
+        cache.evict_cost_pressure(&|_: &ContractKey| (0, 1), std::slice::from_ref(&axis));
+        assert_ne!(
+            cache.last_cost_decision_digest, digest_local,
+            "has_local_subs -> has_downstream_subs is a real gate change and \
+             must surface within one sweep, not wait for the heartbeat"
+        );
+    }
+
+    /// Two offenders swapping RANK with both gates unchanged must not
+    /// re-trigger. `cost_decision_digest` sorts its outcome multiset precisely
+    /// so this rate-driven reshuffle does not re-admit the wobble it excludes.
+    #[test]
+    fn cost_decision_digest_ignores_offender_rank_swaps() {
+        let scenario = |rate_a: f64, rate_b: f64| {
+            let (mut cache, clock) = make_cache(1024 * 1024);
+            let a = make_key(1);
+            let b = make_key(2);
+            for (key, generation) in [(a, 1), (b, 2)] {
+                cache.record_access(key, 121, AccessType::Put, generation, |_| (0, 0));
+            }
+            clock.advance_time(COST_RATE_MIN_WINDOW + Duration::from_secs(1));
+            // `b` is spared by recency, `a` by its local subscription, so the
+            // two outcomes are DIFFERENT and an order-sensitive digest would
+            // notice the swap.
+            cache.touch(&b);
+            let axes = [cost_axis(
+                100_000.0,
+                50_000.0,
+                &[(&a, rate_a), (&b, rate_b)],
+            )];
+            let counts = |key: &ContractKey| if *key == a { (1, 0) } else { (0, 0) };
+            let (evicted, decisions) = cache.evict_cost_pressure_observed(&counts, &axes);
+            assert!(evicted.is_empty(), "both are immune in this fixture");
+            assert_eq!(decisions[0].offenders.len(), 2);
+            (
+                cost_decision_digest(&decisions),
+                decisions[0].offenders[0].key,
+            )
+        };
+
+        let (digest_a_first, top_a) = scenario(40_000.0, 35_000.0);
+        let (digest_b_first, top_b) = scenario(35_000.0, 40_000.0);
+        assert_ne!(top_a, top_b, "the fixture really does swap the ranks");
+        assert_eq!(
+            digest_a_first, digest_b_first,
+            "a rank swap with both gates unchanged is not a decision change"
         );
     }
 
