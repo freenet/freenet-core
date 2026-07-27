@@ -69,7 +69,7 @@
 //! [bpm]: super::broadcast_payload_mix
 //! [send]: crate::transport::peer_connection::PeerConnection::send
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use freenet_stdlib::prelude::ContractInstanceId;
@@ -326,7 +326,18 @@ impl OutboundMix {
         contract: &ContractInstanceId,
         ours: &[u8],
         theirs: &[u8],
+        counted_this_message: &mut HashSet<ContractInstanceId>,
     ) {
+        // The per-message dedup lives HERE, not at the call site, for the same
+        // reason the byte comparison does: `Summaries.entries` is peer-supplied
+        // and may repeat a hash, so without it a peer can inflate either bucket
+        // at will and skew the ratio that gates the wire-format redesign.
+        // Taking the set makes bypassing it impossible rather than merely
+        // discouraged — an earlier version guarded the CALL SITE with an `if`,
+        // which mutation testing showed no source pin could protect.
+        if !counted_this_message.insert(*contract) {
+            return;
+        }
         // The comparison lives HERE rather than at the call site on purpose.
         // Passing a pre-computed `identical: bool` put the one bit this whole
         // measurement rests on outside the tested unit, where an inverted
@@ -630,10 +641,10 @@ mod tests {
         let a = test_instance_id(1);
         let b = test_instance_id(2);
 
-        mix.record_summary_comparison(&a, b"same", b"same");
-        mix.record_summary_comparison(&a, b"ours", b"theirs");
-        mix.record_summary_comparison(&b, b"ours", b"theirs");
-        mix.record_summary_comparison(&a, b"same", b"same");
+        mix.record_summary_comparison(&a, b"same", b"same", &mut HashSet::new());
+        mix.record_summary_comparison(&a, b"ours", b"theirs", &mut HashSet::new());
+        mix.record_summary_comparison(&b, b"ours", b"theirs", &mut HashSet::new());
+        mix.record_summary_comparison(&a, b"same", b"same", &mut HashSet::new());
 
         let w = mix.take_window();
         assert_eq!(w.summary_entries_identical, 2);
@@ -655,14 +666,19 @@ mod tests {
     fn differing_attribution_is_bounded_but_keeps_accruing_known_contracts() {
         let mix = OutboundMix::new();
         let tracked = test_instance_id(0);
-        mix.record_summary_comparison(&tracked, b"ours", b"theirs");
+        mix.record_summary_comparison(&tracked, b"ours", b"theirs", &mut HashSet::new());
 
         // Fill well past the cap with distinct ids.
         for i in 1..(MAX_TRACKED_CONTRACTS as u32 + 300) {
-            mix.record_summary_comparison(&test_instance_id(i), b"ours", b"theirs");
+            mix.record_summary_comparison(
+                &test_instance_id(i),
+                b"ours",
+                b"theirs",
+                &mut HashSet::new(),
+            );
         }
         // ...then hit the already-tracked one again.
-        mix.record_summary_comparison(&tracked, b"ours", b"theirs");
+        mix.record_summary_comparison(&tracked, b"ours", b"theirs", &mut HashSet::new());
 
         let w = mix.take_window();
         assert!(
@@ -697,7 +713,12 @@ mod tests {
         let n = TOP_DIFFERING_CONTRACTS_REPORTED as u32 + 5;
         for i in 1..=n {
             for _ in 0..i {
-                mix.record_summary_comparison(&test_instance_id(i), b"ours", b"theirs");
+                mix.record_summary_comparison(
+                    &test_instance_id(i),
+                    b"ours",
+                    b"theirs",
+                    &mut HashSet::new(),
+                );
             }
         }
         let w = mix.take_window();
@@ -745,10 +766,10 @@ mod tests {
         let mix = OutboundMix::new();
         let c = test_instance_id(1);
         for _ in 0..3 {
-            mix.record_summary_comparison(&c, b"same", b"same");
+            mix.record_summary_comparison(&c, b"same", b"same", &mut HashSet::new());
         }
         for _ in 0..5 {
-            mix.record_summary_comparison(&c, b"ours", b"theirs");
+            mix.record_summary_comparison(&c, b"ours", b"theirs", &mut HashSet::new());
         }
         let body = outbound_mix_json(&mix.take_window(), 60);
         assert_eq!(
@@ -765,6 +786,78 @@ mod tests {
         );
     }
 
+    /// Within ONE message a contract is counted once, however many times the
+    /// peer repeats it; across messages it counts again.
+    ///
+    /// `Summaries.entries` is peer-supplied, so without this a peer inflates
+    /// either bucket at will and skews the exact ratio that decides whether
+    /// the hash-first wire change gets built. The dedup lives inside this
+    /// function rather than behind an `if` at the call site precisely so this
+    /// property is testable — mutation testing showed no source pin could
+    /// protect a call-site guard.
+    #[test]
+    fn a_contract_is_counted_once_per_message_however_often_repeated() {
+        let mix = OutboundMix::new();
+        let c = test_instance_id(1);
+        let other = test_instance_id(2);
+
+        // One message that repeats `c` five times and names `other` once.
+        let mut first_message = HashSet::new();
+        for _ in 0..5 {
+            mix.record_summary_comparison(&c, b"ours", b"theirs", &mut first_message);
+        }
+        mix.record_summary_comparison(&other, b"same", b"same", &mut first_message);
+
+        // A second message names `c` again — a genuinely new observation.
+        let mut second_message = HashSet::new();
+        mix.record_summary_comparison(&c, b"ours", b"theirs", &mut second_message);
+
+        let w = mix.take_window();
+        assert_eq!(
+            w.summary_entries_differing, 2,
+            "five repeats in one message count once; the second message counts again"
+        );
+        assert_eq!(w.summary_entries_identical, 1);
+        assert_eq!(
+            w.differing_by_contract.get(&c).copied(),
+            Some(2),
+            "per-contract attribution must dedup the same way as the aggregate"
+        );
+    }
+
+    /// An untouched window emits the measurement fields as explicit zeros and
+    /// an empty list, rather than omitting them.
+    ///
+    /// A missing field and a zero field look identical to a naive query but
+    /// mean different things — "nothing diverged" vs "this build does not
+    /// report it". The rollup emits when idle for exactly that reason.
+    #[test]
+    fn idle_window_emits_zeroed_measurement_fields() {
+        let body = outbound_mix_json(&Window::default(), 60);
+        assert_eq!(
+            body.get("summary_entries_identical")
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            body.get("summary_entries_differing")
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            body.get("differing_attribution_dropped")
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            body.get("summary_differing_contracts")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(0),
+            "an idle window must emit an empty list, not omit the field"
+        );
+    }
+
     /// A capped window reports HOW MANY attributions it dropped.
     ///
     /// Without this the named list is indistinguishable from the complete set,
@@ -778,7 +871,12 @@ mod tests {
         let mix = OutboundMix::new();
         let overflow = 7u32;
         for i in 0..(MAX_TRACKED_CONTRACTS as u32 + overflow) {
-            mix.record_summary_comparison(&test_instance_id(i), b"ours", b"theirs");
+            mix.record_summary_comparison(
+                &test_instance_id(i),
+                b"ours",
+                b"theirs",
+                &mut HashSet::new(),
+            );
         }
         let w = mix.take_window();
         assert_eq!(w.differing_by_contract.len(), MAX_TRACKED_CONTRACTS);

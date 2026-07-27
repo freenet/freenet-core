@@ -2747,9 +2747,7 @@ async fn handle_interest_sync_message(
                 // resolve to — `lookup_by_hash` only yields contracts this node
                 // already tracks, so a peer cannot grow it with unknown ids —
                 // and it holds contract ids only, no state.
-                let mut compared_contracts: std::collections::HashSet<
-                    freenet_stdlib::prelude::ContractKey,
-                > = std::collections::HashSet::new();
+                let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
                 for entry in entries {
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         if !op_manager.interest_manager.has_local_interest(&contract) {
@@ -2803,13 +2801,12 @@ async fn handle_interest_sync_message(
                                 // dedup guards ONLY the measurement; the staleness
                                 // logic below still runs per entry exactly as
                                 // before, so this changes no behavior.
-                                if compared_contracts.insert(contract) {
-                                    op_manager.outbound_mix.record_summary_comparison(
-                                        contract.id(),
-                                        ours.as_ref(),
-                                        theirs.as_ref(),
-                                    );
-                                }
+                                op_manager.outbound_mix.record_summary_comparison(
+                                    contract.id(),
+                                    ours.as_ref(),
+                                    theirs.as_ref(),
+                                    &mut compared_contracts,
+                                );
                                 let delta_verdict = if identical {
                                     // Byte-identical => converged; skip the probe.
                                     None
@@ -4152,23 +4149,14 @@ mod tests {
              measurement; without it the identical/differing rollup is \
              silently always zero"
         );
-        // What is deliberately NOT pinned: the per-message dedup that stops a
-        // peer inflating the ratio by repeating a hash.
-        //
-        // A structural pin for it — slice the guard's block, assert the call
-        // is inside — was written and then DELETED because mutation testing
-        // showed it GREEN when the call was moved out from behind the `if`:
-        // the sliced block ran on to a later brace that still contained the
-        // call. A presence check on the guard identifier is no better; it
-        // survives any mutation that keeps the declaration. Text matching
-        // cannot decide nesting, and a guard that looks like protection but
-        // isn't is worse than none, because it stops the next person adding
-        // real protection.
-        //
-        // So the dedup BYPASS has no coverage. Closing it needs a test that
-        // drives this handler with a duplicate entry, which needs hosted state
-        // and an executor — disproportionate for observation-only telemetry,
-        // but the gap is real and stated here rather than papered over.
+        // The per-message dedup needs no pin: `record_summary_comparison` takes
+        // the seen-set as an argument, so there is no way to call it without
+        // deduping. That replaced a call-site `if` guard which no source pin
+        // could protect — a structural pin for it was written and deleted after
+        // mutation testing showed it green when the call was moved out from
+        // behind the guard. Making the bypass unrepresentable beat testing for
+        // it; the repeated-call behavior is covered directly in
+        // `outbound_message_mix::tests`.
 
         assert!(
             summaries_arm.contains("peer_summary_has_pending_state"),
