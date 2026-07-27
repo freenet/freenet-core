@@ -1598,14 +1598,36 @@ where
                     .update_rate_limiter
                     .check_and_record(sender_addr, *key.id());
                 if !rate_decision.is_allowed() {
-                    tracing::debug!(
-                        tx = %op.id(),
-                        %key,
-                        %sender_addr,
-                        ?rate_decision,
-                        phase = "update_dispatch_rate_limited",
-                        "UPDATE dispatch: rejected by per-(sender, contract) rate limit"
-                    );
+                    if matches!(
+                        rate_decision,
+                        crate::ring::update_rate_limit::RateLimitDecision::CapacityExceeded
+                    ) {
+                        // `info!` because `debug!` is compiled out of release
+                        // builds by `release_max_level_info`, which is how this
+                        // path came to drop legitimate relayed UPDATEs with no
+                        // greppable evidence on a production node (#4981).
+                        // Since that fix the limiter evicts instead of refusing,
+                        // so reaching here means the map was full AND every
+                        // admission attempt lost its freed slot to a concurrent
+                        // caller — rare, and worth seeing when it happens.
+                        tracing::info!(
+                            tx = %op.id(),
+                            %key,
+                            %sender_addr,
+                            phase = "update_dispatch_capacity_dropped",
+                            "UPDATE dispatch: dropped, rate-limiter map at capacity and \
+                             contended (see ring::update_rate_limit)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            tx = %op.id(),
+                            %key,
+                            %sender_addr,
+                            ?rate_decision,
+                            phase = "update_dispatch_rate_limited",
+                            "UPDATE dispatch: rejected by per-(sender, contract) rate limit"
+                        );
+                    }
                     return Ok(());
                 }
 

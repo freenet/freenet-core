@@ -79,9 +79,16 @@ pub struct RingStatsSnapshot {
     /// may be getting dropped — operators should watch this.
     pub updates_rate_limited: u64,
     /// Total relayed UPDATEs dropped because the limiter's tracking map
-    /// was at capacity (`MAX_TRACKED_PAIRS`). A non-zero value suggests
-    /// identity churn / admission pressure, distinct from per-pair rate.
+    /// was at capacity (`MAX_TRACKED_PAIRS`) and eviction could not free
+    /// a slot. Since #4981 this means the map is full *and* contended;
+    /// ordinary saturation shows up in `updates_capacity_evicted`.
     pub updates_capacity_dropped: u64,
+    /// Total tracked `(sender, contract)` pairs evicted to admit new
+    /// ones at capacity. This is the saturation signal: a busy node
+    /// relaying for more pairs than `MAX_TRACKED_PAIRS` shows this
+    /// climbing while `updates_capacity_dropped` stays flat, and no
+    /// legitimate UPDATE is dropped for it.
+    pub updates_capacity_evicted: u64,
     /// Nearest-neighbor ring lattice completeness (the "is greedy routing's base
     /// lattice present" signal). `lattice_has_successor` / `_predecessor` are
     /// whether this peer currently HOLDS (a side is FILLED with) its
