@@ -115,11 +115,24 @@
 //! less like a fresh-id bound and more like a per-peer aggregate
 //! ceiling.
 //!
-//! That is why the sustained rate is set well ABOVE
-//! [`MIN_UPDATE_INTERVAL`]'s per-pair ceiling rather than at it: a peer
-//! would have to sustain [`NEW_PAIR_BURST`] and then 200 UPDATEs/s to
-//! this node, continuously, before any of it is dropped. If that ever
-//! binds on real traffic it is visible as
+//! How high that miss rate goes depends on the access pattern, not
+//! just the working-set size: measured at ~16 500 pairs against the
+//! 16 384 cap, uniform-random access misses 1.33% of the time but
+//! round-robin misses 96.77% — LRU's worst case, since every entry is
+//! evicted exactly before it is next used. So the miss rate is NOT
+//! reliably small, and the safety of this control does not rest on it
+//! being small.
+//!
+//! What it rests on is the binding condition, which is generous
+//! regardless of miss rate: **one peer must sustain ~210 UPDATE/s to
+//! this node, continuously**, before anything is dropped (the 200/s
+//! refill plus the burst amortised). Real gateway load is ~3.15/s on
+//! nova and ~2.84/s on vega NODE-WIDE, across all peers — roughly two
+//! orders of magnitude below the threshold for a single one of them.
+//! That is why the sustained rate is set well above
+//! [`MIN_UPDATE_INTERVAL`]'s per-pair ceiling rather than at it.
+//!
+//! If it ever does bind on real traffic it is visible as
 //! `new_pair_budget_rejected_total` climbing on a node with no attacker,
 //! which is the signal to raise the rate — the counter is on the
 //! dashboard for exactly that reason.
@@ -202,6 +215,24 @@ pub(crate) const CLEANUP_AGE: Duration = Duration::from_secs(5 * 60);
 /// influenced keys" rule from `.claude/rules/code-style.md`. At 64
 /// bytes/entry, 16 384 pairs ≈ 1 MB — tiny — but bounds the worst case
 /// where an attacker chooses fresh contract ids.
+///
+/// # Re-measure the eviction scan before raising this
+///
+/// Memory is not the binding cost. An eviction pass holds
+/// [`UpdateRateLimiter::eviction_lock`] across a scan that is LINEAR in
+/// this constant — measured 41 ns per entry, so **672 µs at 16 384 but
+/// 10.8 ms at 163 840**. At the current value that is a ~0.001% duty
+/// cycle against real gateway load (~3.15 UPDATE/s on nova, ~2.84/s on
+/// vega) and irrelevant; ten times larger it is a 10 ms blocking
+/// section on a tokio worker.
+///
+/// This warning is here because the PR that added eviction also
+/// installed the operator story "evictions climbing means saturation",
+/// and the obvious response to that reading is to raise this constant.
+/// Doing so is fine — but re-measure the hold time first, and if it
+/// grows past a millisecond or two, the scan wants a different shape
+/// (sampled victim selection, or a maintained ordering) rather than a
+/// longer lock.
 ///
 /// On reaching the cap the oldest entries are evicted to admit the
 /// newcomer (see the module docs for why rejecting instead starved new
@@ -821,9 +852,14 @@ impl UpdateRateLimiter {
             // batch size relative to the number of concurrent callers:
             // at the production cap (batch 256, 16 threads) it nearly
             // always wins, but at a 1024 cap the batch is 16 and callers
-            // lose a freed slot often enough to drop ~2 admissions in
+            // lose a freed slot often enough to drop ~0.19 admissions in
             // 1000. Keeping a slot makes "a caller that frees room gets
             // to use it" true by construction instead of by margin.
+            //
+            // That residual is small because the serialised scan already
+            // removed most of it; this closes the rest and, more to the
+            // point, makes the property independent of the batch/caller
+            // ratio rather than true only at the production cap.
             //
             // The strict cap is unaffected: `size` counts map entries
             // plus outstanding reservations, and every insert still
@@ -974,6 +1010,16 @@ impl UpdateRateLimiter {
     /// traffic for contracts already being tracked.
     pub fn new_pair_budget_rejected_total(&self) -> u64 {
         self.new_pair_budget_rejected_total.load(Ordering::Relaxed)
+    }
+
+    /// Total new pairs admitted WITHOUT a budget check because the
+    /// sender map was full. Surfaced on the dashboard
+    /// ("Fresh-id-unmetered") because a safety valve nobody can see
+    /// firing is the #4981 failure mode: this should be zero, and a
+    /// non-zero value means `max_tracked_senders` is undersized for this
+    /// node, so the budget is not actually bounding those senders.
+    pub fn new_pair_budget_untracked_total(&self) -> u64 {
+        self.new_pair_budget_untracked_total.load(Ordering::Relaxed)
     }
 
     /// Number of senders tracked by the new-pair budget.
@@ -1513,8 +1559,19 @@ mod tests {
     /// The sender map is bounded, and by a space the attacker does not
     /// choose: `sender` is the immediate upstream hop, so only a peer
     /// that has completed a handshake can occupy an entry.
+    ///
+    /// And — the half that matters — a sender arriving at a FULL map is
+    /// still admitted. Bounding alone is not the property: a bounded map
+    /// that refuses newcomers once full is #4981 exactly, one map over,
+    /// inside the control added to fix #4981. `Bucket::refill` restamps
+    /// on every check including denied ones, so an active sender's entry
+    /// never ages out and a refused newcomer would never recover.
+    ///
+    /// Asserting only `tracked_senders() <= MAX` did not catch that: a
+    /// fail-CLOSED implementation passed the whole suite 15/15 (#4997
+    /// re-review).
     #[test]
-    fn the_new_pair_budget_map_is_bounded() {
+    fn the_new_pair_budget_map_is_bounded_and_fails_open_when_full() {
         const MAX_SENDERS: usize = 4;
         let ts = SharedMockTimeSource::new();
         let limiter = UpdateRateLimiter::with_new_pair_budget(
@@ -1526,13 +1583,93 @@ mod tests {
         );
 
         for i in 0..(MAX_SENDERS * 4) {
-            limiter.check_and_record(mk_sender(i as u8), mk_contract(1));
+            let d = limiter.check_and_record(mk_sender(i as u8), mk_contract(1));
+            assert_eq!(
+                d,
+                RateLimitDecision::Allowed,
+                "sender {i}: a full sender map must fail OPEN — refusing here is \
+                 #4981 one map over, and this sender has spent nothing"
+            );
             assert!(
                 limiter.tracked_senders() <= MAX_SENDERS,
                 "sender {i}: the budget map must never exceed its cap"
             );
         }
         assert_eq!(limiter.tracked_senders(), MAX_SENDERS);
+
+        // The untracked admissions are counted, so an undersized map is
+        // an operator-visible condition rather than a silent one.
+        assert_eq!(
+            limiter.new_pair_budget_untracked_total(),
+            (MAX_SENDERS * 3) as u64,
+            "every admission past the cap must be counted as untracked"
+        );
+        assert_eq!(
+            limiter.new_pair_budget_rejected_total(),
+            0,
+            "a full map is a sizing accident, not evidence about any sender"
+        );
+    }
+
+    /// Source-scrape pin: `evict_oldest` has exactly ONE terminal exit,
+    /// and it is the zero-cap guard. Every other way out must be a
+    /// retry.
+    ///
+    /// This exists because no behavioural test can reach the
+    /// `removed == 0` exit any more. Once the scan is serialised,
+    /// concurrent evictors stop stealing each other's victims, so
+    /// turning that exit terminal survives the entire suite (verified:
+    /// 29/29, and 15/15 on the concurrency fixture that looks like it
+    /// would catch it).
+    ///
+    /// The exit must nonetheless stay a retry, for a cause no evictor
+    /// creates: **`cleanup` does not take the eviction lock**, and it
+    /// removes entries older than `CLEANUP_AGE` — precisely the oldest
+    /// entries, which is precisely what `select_nth_unstable_by_key`
+    /// selects. A reaper sweep landing between the collect and the
+    /// removes takes the whole batch out from under the evictor, and
+    /// that is a once-a-minute window on every node. Making it terminal
+    /// would drop a legitimate UPDATE there, silently, with the retry
+    /// budget untouched — the #4981 shape again.
+    ///
+    /// A source pin rather than a behavioural one, because the window is
+    /// a race between a reaper tick and a receive-path scan that no
+    /// fixture can schedule. Pinning the SHAPE (one terminal exit,
+    /// guarded by the cap) is what is actually available.
+    #[test]
+    fn evict_oldest_has_exactly_one_terminal_exit() {
+        const THIS_FILE: &str = include_str!("update_rate_limit.rs");
+
+        let start = THIS_FILE
+            .find(concat!("fn evict_", "oldest("))
+            .expect("evict_oldest must exist; if renamed, update this pin");
+        let tail = &THIS_FILE[start..];
+        // Bound to this function: the next item at impl indentation.
+        let end = tail[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .unwrap_or(tail.len());
+        let body = &tail[..end];
+
+        let terminal = concat!("EvictionOutcome::", "CapIsZero");
+        assert_eq!(
+            body.matches(terminal).count(),
+            1,
+            "evict_oldest must have exactly ONE terminal exit. Every other way out \
+             means slots are, or are about to be, free — including an empty map, \
+             which `cleanup` can produce mid-scan — and dropping there loses a \
+             legitimate UPDATE without spending the retry budget (#4981, #4997)."
+        );
+
+        let guard_pos = body
+            .find("self.max_tracked_pairs == 0")
+            .expect("the terminal exit must be guarded by the cap being zero");
+        let terminal_pos = body.find(terminal).expect("checked above");
+        assert!(
+            guard_pos < terminal_pos,
+            "the one terminal exit must be the zero-cap guard, not a condition \
+             inferred from the map's contents"
+        );
     }
 
     /// An empty map is NOT a reason to give up, even though the map
@@ -1616,7 +1753,7 @@ mod tests {
     /// limiter still refuses a new pair outright, and it must terminate
     /// rather than spin.
     ///
-    /// This is the one path `EvictionOutcome::MapEmpty` exists for. It
+    /// This is the one path `EvictionOutcome::CapIsZero` exists for. It
     /// was untested, which mattered because the eviction rework turned
     /// "evicted nothing" into a retry: had that retry not distinguished
     /// an empty map from a contended one, a zero cap would loop through
@@ -2373,13 +2510,25 @@ mod tests {
     /// affected, 100% of them from that branch, retry budget untouched.
     /// After the fix, 7 in 320 000 (0.002%).
     ///
-    /// The threshold sits an order of magnitude above what the fixed
-    /// implementation produces and well below what the bug produces:
-    /// reintroducing the bug takes this fixture to 671 drops in 6 400
-    /// against a threshold of 6, so it is neither flaky nor vacuous. It
-    /// is a bound rather than zero because losing a freed slot to a
-    /// concurrent caller on every attempt is genuinely possible — that
-    /// is what `CapacityExceeded` is documented to mean.
+    /// What it actually pins, stated precisely because an earlier
+    /// version of this comment credited the wrong fix: making the
+    /// caller's `EvictionOutcome::Retry` arm terminal takes this fixture
+    /// to 671 drops in 6 400 against a threshold of 6. That arm covers
+    /// the early-out and the under-lock re-check, which is where the
+    /// measured drops came from — so this pins the caller's handling of
+    /// a non-terminal eviction, and with it the serialised scan.
+    ///
+    /// It does NOT pin the `removed == 0` exit inside `evict_oldest`.
+    /// Making that one terminal survives this fixture 15/15 and the
+    /// whole suite 29/29, because once the scan is serialised concurrent
+    /// evictors no longer steal each other's victims, so `removed == 0`
+    /// never occurs here. That exit is real for a different reason and
+    /// is pinned by source scrape instead — see
+    /// `evict_oldest_has_exactly_one_terminal_exit`.
+    ///
+    /// The threshold is a bound rather than zero because losing a freed
+    /// slot to a concurrent caller on every attempt is genuinely
+    /// possible — that is what `CapacityExceeded` is documented to mean.
     #[test]
     fn concurrent_admission_at_capacity_almost_never_drops() {
         use std::sync::{Arc as StdArc, Barrier};

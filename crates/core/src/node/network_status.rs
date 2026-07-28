@@ -96,6 +96,12 @@ pub struct RingStatsSnapshot {
     /// being tracked, so a non-zero value really does mean one peer is
     /// presenting unfamiliar contract ids faster than the budget allows.
     pub updates_sender_budget_dropped: u64,
+    /// Total relayed UPDATEs admitted for a brand-new pair WITHOUT a
+    /// budget check, because the per-sender budget's own map was full.
+    /// Should be zero. A non-zero value means the budget map is
+    /// undersized for this node's peer churn, so those senders are not
+    /// actually being bounded — the safety valve is firing.
+    pub updates_sender_budget_unmetered: u64,
     /// Nearest-neighbor ring lattice completeness (the "is greedy routing's base
     /// lattice present" signal). `lattice_has_successor` / `_predecessor` are
     /// whether this peer currently HOLDS (a side is FILLED with) its
