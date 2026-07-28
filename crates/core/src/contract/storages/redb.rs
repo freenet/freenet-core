@@ -9,6 +9,76 @@ use redb::{
 
 use crate::wasm_runtime::StateStorage;
 
+/// Minimum reclaimable bytes before a startup compaction is worth the whole-file
+/// rewrite it costs. Paired with [`MIN_COMPACTION_RECLAIM_FRACTION`].
+const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Minimum reclaimable share of the file before compaction runs, so a large
+/// database with proportionally trivial dead space is left alone.
+const MIN_COMPACTION_RECLAIM_FRACTION: f64 = 0.25;
+
+/// What the startup reclaim pass decided. Returned so the decision itself is
+/// observable: asserting on the resulting file size cannot distinguish "the gate
+/// declined" from "compaction ran and happened to reclaim little", which made an
+/// earlier round of these tests pass with the gate entirely disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReclaimOutcome {
+    /// File is below the absolute floor; skipped without measuring.
+    BelowFloor,
+    /// Measured, but the dead space did not clear both gates.
+    NotWorthwhile,
+    /// Trailing slack accounted for it; the free trim sufficed, no rewrite.
+    TrimSufficed,
+    /// A full compaction ran.
+    Compacted,
+    /// Could not be determined (stat, stats or transaction failure); skipped.
+    Undetermined,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_RECLAIM: std::cell::Cell<Option<ReclaimOutcome>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Record the reclaim decision so tests can assert on it. Compiled out of
+/// non-test builds.
+fn record_reclaim(outcome: ReclaimOutcome) -> ReclaimOutcome {
+    #[cfg(test)]
+    LAST_RECLAIM.with(|c| c.set(Some(outcome)));
+    outcome
+}
+
+#[cfg(test)]
+fn last_reclaim() -> Option<ReclaimOutcome> {
+    LAST_RECLAIM.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn clear_last_reclaim() {
+    LAST_RECLAIM.with(|c| c.set(None));
+}
+
+/// Whether reclaiming `file_bytes - in_use_bytes` justifies rewriting the whole
+/// database file.
+///
+/// BOTH gates must pass. The absolute floor stops a small file being rewritten
+/// for a small win; the fraction stops a multi-GB file being rewritten when its
+/// dead space is proportionally trivial. Without them, a node in a restart loop
+/// would rewrite its entire database on every start.
+///
+/// Pure so the boundary cases are unit-testable without building a real
+/// database, following the same split as `budget_for_ram` /
+/// `disk_budget_for_clamped`.
+fn compaction_is_worthwhile(file_bytes: u64, in_use_bytes: u64) -> bool {
+    let reclaimable = file_bytes.saturating_sub(in_use_bytes);
+    let meets_floor = reclaimable >= MIN_COMPACTION_RECLAIM_BYTES;
+    // Multiply rather than divide so a zero-length file can't produce a NaN.
+    let meets_fraction =
+        (reclaimable as f64) >= (file_bytes as f64) * MIN_COMPACTION_RECLAIM_FRACTION;
+    meets_floor && meets_fraction
+}
+
 const CONTRACT_PARAMS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("contract_params");
 const STATE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("state");
@@ -381,7 +451,10 @@ impl ReDb {
         );
 
         match Database::create(&db_path) {
-            Ok(db) => Self::initialize_database(db),
+            Ok(db) => {
+                let db = Self::reclaim_free_pages(db, &db_path)?;
+                Self::initialize_database(db)
+            }
             Err(e) if Self::is_version_mismatch(&e) => {
                 tracing::warn!(
                     db_path = ?db_path,
@@ -400,6 +473,7 @@ impl ReDb {
                     "Creating new database"
                 );
                 let db = Database::create(&db_path)?;
+                // No reclaim pass here: the database was just created empty.
                 Self::initialize_database(db)
             }
             Err(e) => {
@@ -410,6 +484,260 @@ impl ReDb {
                     "Failed to load contract store"
                 );
                 Err(e.into())
+            }
+        }
+    }
+
+    /// Return free pages left behind by redb's copy-on-write writes to the OS.
+    ///
+    /// redb reuses freed pages for later writes but keeps the file at its
+    /// all-time high-water mark: an ordinary commit only truncates *trailing*
+    /// free space, so the *interior* dead space a long-running peer accumulates
+    /// is unreclaimable by any normal operation. Measured on production peers
+    /// (2026-07): a gateway holding 1.38 GB of live pages in a 2.59 GB file;
+    /// compacting returned it to 1.41 GB with every row intact.
+    ///
+    /// Runs at startup because that is the one point where no transaction is
+    /// live ([`Database::compact`] refuses otherwise) and the store is not
+    /// serving anything yet. It is also the only point where a `&mut Database`
+    /// exists at all: after `initialize_database` the handle is behind an `Arc`
+    /// shared with every pool executor, so a background or on-eviction variant
+    /// is not merely awkward, it is unrepresentable without reworking that
+    /// sharing.
+    ///
+    /// Three stages, cheapest first, so an already-healthy node pays almost
+    /// nothing:
+    ///
+    /// 1. Skip outright when the file is below the absolute floor; reclaimable
+    ///    can never exceed the file, so no measurement is needed.
+    /// 2. Measure, and skip unless the dead space clears both gates.
+    /// 3. Close and reopen before compacting. Dropping the handle runs redb's
+    ///    maximum-shrink trim, which returns *trailing* slack for free. That
+    ///    slack is not dead space: it re-grows on the next write, and a node
+    ///    that exits uncleanly (this binary calls `std::process::exit`, so the
+    ///    destructor is skipped) can present 40% of it with zero fragmentation.
+    ///    Re-measuring after the trim keeps a crash-restart loop from paying a
+    ///    full rewrite for space a `ftruncate` already recovered.
+    ///
+    /// Returns the handle to use, reopening it if the file was touched. A
+    /// compaction error is not fatal, but the handle is NOT reusable after one:
+    /// redb latches an I/O failure and every later `begin_write` returns
+    /// `PreviousIo`, which would turn a survivable compaction failure into a
+    /// node that cannot start. So the handle is always reopened on that path.
+    fn reclaim_free_pages(db: Database, db_path: &Path) -> Result<Database, redb::Error> {
+        let file_bytes = match std::fs::metadata(db_path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    "Could not stat the contract database; skipping compaction"
+                );
+                record_reclaim(ReclaimOutcome::Undetermined);
+                return Ok(db);
+            }
+        };
+
+        // Reclaimable can never exceed the file, so anything under the floor is
+        // decided without paying for a stats read.
+        if file_bytes < MIN_COMPACTION_RECLAIM_BYTES {
+            tracing::info!(
+                db_path = ?db_path,
+                file_bytes,
+                phase = "compaction_skipped",
+                "Contract database below the compaction floor; skipping"
+            );
+            record_reclaim(ReclaimOutcome::BelowFloor);
+            return Ok(db);
+        }
+
+        let Some(in_use_bytes) = Self::pages_in_use_bytes(&db, db_path) else {
+            record_reclaim(ReclaimOutcome::Undetermined);
+            return Ok(db);
+        };
+        if !compaction_is_worthwhile(file_bytes, in_use_bytes) {
+            tracing::info!(
+                db_path = ?db_path,
+                file_bytes,
+                in_use_bytes,
+                phase = "compaction_skipped",
+                "Contract database compaction not worthwhile; skipping"
+            );
+            record_reclaim(ReclaimOutcome::NotWorthwhile);
+            return Ok(db);
+        }
+
+        // Trim trailing slack for free, then re-measure. Dropping the handle is
+        // the only public route to redb's maximum-shrink (`set_shrink_policy` is
+        // crate-private). Reaching here already means we were about to rewrite
+        // the whole file, so the close/reopen is cheap by comparison — and a
+        // healthy node never gets here, because the gate above declines first.
+        drop(db);
+        let db = Self::reopen_after_trim(db_path)?;
+        let trimmed_bytes = match std::fs::metadata(db_path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                // Fall back to skipping rather than to the pre-trim size: an
+                // unknown size must not push us toward the expensive rewrite.
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    "Could not stat the contract database after trimming; skipping compaction"
+                );
+                record_reclaim(ReclaimOutcome::Undetermined);
+                return Ok(db);
+            }
+        };
+        let Some(in_use_bytes) = Self::pages_in_use_bytes(&db, db_path) else {
+            record_reclaim(ReclaimOutcome::Undetermined);
+            return Ok(db);
+        };
+        if !compaction_is_worthwhile(trimmed_bytes, in_use_bytes) {
+            tracing::info!(
+                db_path = ?db_path,
+                was_bytes = file_bytes,
+                now_bytes = trimmed_bytes,
+                in_use_bytes,
+                phase = "compaction_trim_sufficed",
+                "Trailing slack trimmed; full compaction not needed"
+            );
+            record_reclaim(ReclaimOutcome::TrimSufficed);
+            return Ok(db);
+        }
+
+        // Logged either side rather than timed: `std::time::Instant` is barred
+        // in this crate (see .claude/rules/code-style.md). The pair also makes
+        // an interrupted compaction diagnosable — redb's `compact` is not
+        // resumable, so a kill in this window forces a repair on next open
+        // (two-phase commit throughout, so no data is lost).
+        tracing::info!(
+            db_path = ?db_path,
+            was_bytes = file_bytes,
+            now_bytes = trimmed_bytes,
+            in_use_bytes,
+            phase = "compaction_start",
+            "Compacting contract database to reclaim free pages"
+        );
+
+        let mut db = db;
+        match db.compact() {
+            Ok(compacted) => {
+                let now_bytes = std::fs::metadata(db_path)
+                    .map(|m| m.len())
+                    .unwrap_or(trimmed_bytes);
+                tracing::info!(
+                    db_path = ?db_path,
+                    was_bytes = file_bytes,
+                    now_bytes,
+                    compacted,
+                    phase = "compaction_done",
+                    "Contract database compaction finished"
+                );
+                record_reclaim(ReclaimOutcome::Compacted);
+                Ok(db)
+            }
+            Err(e) => {
+                // Deliberately NOT routed through `storage_error_is_poison` /
+                // `abort_process_on_redb_poison` like the store's other I/O
+                // errors: aborting here would loop the supervisor at startup.
+                // Reopening clears redb's per-instance `io_failed` latch, which
+                // would otherwise make every later `begin_write` return
+                // `PreviousIo` and turn a survivable compaction failure into a
+                // node that cannot boot. It does NOT rescue a persistent cause
+                // (a full disk fails the reopen's repair too) — it converts the
+                // transient case from fatal to survivable, nothing more.
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    phase = "compaction_failed",
+                    "Contract database compaction failed; reopening and continuing"
+                );
+                drop(db);
+                record_reclaim(ReclaimOutcome::Undetermined);
+                Self::reopen_after_trim(db_path)
+            }
+        }
+    }
+
+    /// Reopen the database after the handle was deliberately dropped.
+    ///
+    /// The drop released the file lock, so a competing opener can briefly win
+    /// it; retry rather than failing startup over a microseconds-wide race.
+    /// A failure here IS fatal (there is no handle left to fall back on), so it
+    /// is logged with a phase before propagating — otherwise it would surface as
+    /// a bare redb error with no hint that compaction was involved.
+    fn reopen_after_trim(db_path: &Path) -> Result<Database, redb::Error> {
+        const ATTEMPTS: usize = 5;
+        let mut last_err = None;
+        for attempt in 1..=ATTEMPTS {
+            match Database::create(db_path) {
+                Ok(db) => return Ok(db),
+                Err(e) => {
+                    tracing::warn!(
+                        db_path = ?db_path,
+                        error = %e,
+                        attempt,
+                        phase = "compaction_reopen_retry",
+                        "Could not reopen the contract database after trimming; retrying"
+                    );
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        let e = last_err.expect("loop runs at least once");
+        tracing::error!(
+            db_path = ?db_path,
+            error = %e,
+            phase = "compaction_reopen_failed",
+            "Could not reopen the contract database after trimming; cannot continue"
+        );
+        Err(e.into())
+    }
+
+    /// Bytes held by pages the btrees actually occupy, or `None` if it could not
+    /// be determined (in which case the caller skips compaction).
+    ///
+    /// `stats` lives on the write transaction, so one is opened purely to read
+    /// it and explicitly aborted. `WriteTransaction::new` performs no disk
+    /// writes and `abort` consumes the transaction, so nothing is left behind;
+    /// redb's own `Database::new` uses the same begin/read/abort shape.
+    fn pages_in_use_bytes(db: &Database, db_path: &Path) -> Option<u64> {
+        let txn = match db.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    "Could not open a transaction to size the contract database; skipping compaction"
+                );
+                return None;
+            }
+        };
+        let stats = txn.stats();
+        // Abort regardless of the stats outcome so no transaction is left live
+        // to block the compaction below.
+        if let Err(e) = txn.abort() {
+            tracing::warn!(
+                db_path = ?db_path,
+                error = %e,
+                "Could not abort the sizing transaction; skipping compaction"
+            );
+            return None;
+        }
+        match stats {
+            Ok(stats) => Some(
+                stats
+                    .allocated_pages()
+                    .saturating_mul(stats.page_size() as u64),
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    "Could not read contract database stats; skipping compaction"
+                );
+                None
             }
         }
     }
@@ -1651,6 +1979,253 @@ mod tests {
     // 1. The backup tests below (verify backup logic works)
     // 2. Integration tests with actual v2 databases (verify migration works)
     // 3. Manual testing with actual version mismatches
+
+    /// Write `count` entries of `size` bytes, then delete all but every
+    /// `keep_every`-th (always retaining the last, so the tail stays pinned).
+    ///
+    /// The scattering matters. redb truncates *trailing* free space on commit,
+    /// so deleting a contiguous tail would simply shrink the file and prove
+    /// nothing. Real peers accumulate *interior* dead space, which no ordinary
+    /// commit can return to the OS — that is the state compaction exists to
+    /// fix, and the state this fixture reproduces.
+    ///
+    /// Returns the number of rows left alive.
+    fn bloat_database(db_path: &Path, count: usize, size: usize, keep_every: usize) -> usize {
+        let keep = |i: usize| i % keep_every == 0 || i == count - 1;
+        let db = Database::create(db_path).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE_TABLE).unwrap();
+                let value = vec![0xABu8; size];
+                for i in 0..count {
+                    table
+                        .insert(&i.to_be_bytes()[..], value.as_slice())
+                        .unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(STATE_TABLE).unwrap();
+                for i in 0..count {
+                    if !keep(i) {
+                        table.remove(&i.to_be_bytes()[..]).unwrap();
+                    }
+                }
+            }
+            txn.commit().unwrap();
+        }
+        drop(db);
+        (0..count).filter(|i| keep(*i)).count()
+    }
+
+    /// Exact surviving contents: every key plus a digest of its value, so a
+    /// compaction that corrupted, truncated or swapped values is caught. A bare
+    /// row count would pass through all of those.
+    fn state_contents(db_path: &Path) -> Vec<(Vec<u8>, usize, u64)> {
+        let db = Database::open(db_path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(STATE_TABLE).unwrap();
+        let mut out = Vec::new();
+        for entry in table.iter().unwrap() {
+            let (k, v) = entry.unwrap();
+            let bytes = v.value();
+            // Cheap order-sensitive digest; full equality would hold 190 MiB.
+            let digest = bytes
+                .iter()
+                .enumerate()
+                .fold(1469598103934665603u64, |h, (i, b)| {
+                    (h ^ ((*b as u64).wrapping_add(i as u64))).wrapping_mul(1099511628211)
+                });
+            out.push((k.value().to_vec(), bytes.len(), digest));
+        }
+        drop(txn);
+        drop(db);
+        out
+    }
+
+    /// Regression test for the unbounded on-disk growth: redb never returns
+    /// freed pages to the OS, so a long-running peer's file keeps its all-time
+    /// high-water mark. Production peers were sitting at 84% dead space.
+    ///
+    /// Fails without `reclaim_free_pages` (the file stays at its bloated size).
+    #[tokio::test]
+    async fn startup_compaction_reclaims_dead_pages_and_preserves_rows() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+
+        // ~192 MiB written (redb doubles, so the file lands near 386 MiB), every
+        // 16th row kept: clears both gates with the dead space interior.
+        let live_rows = bloat_database(&db_path, 192, 1024 * 1024, 16);
+        let expected = state_contents(&db_path);
+        assert_eq!(expected.len(), live_rows);
+
+        let before = std::fs::metadata(&db_path).unwrap().len();
+
+        // Opening the store is what triggers the reclaim pass.
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(
+            last_reclaim(),
+            Some(ReclaimOutcome::Compacted),
+            "the fixture should have been compacted"
+        );
+
+        let after = std::fs::metadata(&db_path).unwrap().len();
+        // The live rows are ~13 MiB, so a correct compaction lands far below
+        // this. A loose `before / 2` would let a compaction that reclaimed only
+        // part of the dead space pass silently.
+        assert!(
+            after < 64 * 1024 * 1024,
+            "compaction should reclaim nearly all dead pages: {before} -> {after}"
+        );
+        assert_eq!(
+            state_contents(&db_path),
+            expected,
+            "compaction must preserve every key and value byte-for-byte"
+        );
+
+        // Restart idempotence: the gate must DECLINE on the compacted file, or
+        // the node would rewrite its whole database on every start forever.
+        // Asserting the decision, not the size: re-compacting an already
+        // compacted file also leaves it the same size, so a size assertion
+        // would pass even if it recompacted every time.
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_ne!(
+            last_reclaim(),
+            Some(ReclaimOutcome::Compacted),
+            "a second open must NOT recompact; got {:?}",
+            last_reclaim()
+        );
+        assert_eq!(state_contents(&db_path), expected);
+    }
+
+    /// The gate must leave a healthy database alone, so a restart loop never
+    /// rewrites a multi-GB file for a trivial gain.
+    #[tokio::test]
+    async fn startup_compaction_skips_database_without_meaningful_dead_space() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+
+        // Aim for the discriminating case: enough dead space that the FRACTION
+        // gate passes, but under the 64 MiB absolute floor. The precondition is
+        // asserted below rather than assumed, because redb's doubling makes the
+        // resulting file size awkward to predict.
+        let live_rows = bloat_database(&db_path, 60, 1024 * 1024, 2);
+        let expected = state_contents(&db_path);
+        assert_eq!(expected.len(), live_rows);
+
+        let before = std::fs::metadata(&db_path).unwrap().len();
+        let in_use = {
+            let db = Database::create(&db_path).unwrap();
+            let n = ReDb::pages_in_use_bytes(&db, &db_path).unwrap();
+            drop(db);
+            n
+        };
+        let reclaimable = before.saturating_sub(in_use);
+
+        // Precondition: only the floor may be what declines here, otherwise the
+        // test would pass for the wrong reason (nothing to reclaim at all).
+        assert!(
+            (reclaimable as f64) >= (before as f64) * MIN_COMPACTION_RECLAIM_FRACTION,
+            "fixture must clear the fraction gate so the FLOOR is what declines; \
+             file={before} in_use={in_use} reclaimable={reclaimable}"
+        );
+        assert!(
+            reclaimable < MIN_COMPACTION_RECLAIM_BYTES,
+            "fixture must sit below the floor; file={before} reclaimable={reclaimable}"
+        );
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+
+        assert_eq!(
+            last_reclaim(),
+            Some(ReclaimOutcome::NotWorthwhile),
+            "the absolute floor should be what declines here"
+        );
+        let after = std::fs::metadata(&db_path).unwrap().len();
+        assert!(
+            after >= before,
+            "a declined compaction must not shrink the file: {before} -> {after}"
+        );
+        assert_eq!(state_contents(&db_path), expected);
+    }
+
+    /// A healthy, never-deleted database must NOT be compacted. redb grows by
+    /// doubling, so a freshly-grown file has ~50% never-allocated slack that
+    /// `allocated_pages` reports as free — if the gate keys on that, every
+    /// healthy node rewrites its whole database on every restart.
+    #[tokio::test]
+    async fn startup_compaction_skips_large_healthy_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+
+        // Nothing deleted: zero dead pages, only growth slack. ~386 MiB file.
+        let live_rows = bloat_database(&db_path, 192, 1024 * 1024, 1);
+        let before = std::fs::metadata(&db_path).unwrap().len();
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+
+        // Assert the DECISION, not the size: compacting a healthy database
+        // barely changes its length, so a size assertion cannot tell "declined"
+        // from "compacted and reclaimed almost nothing".
+        assert_ne!(
+            last_reclaim(),
+            Some(ReclaimOutcome::Compacted),
+            "a healthy database must not be compacted; got {:?}",
+            last_reclaim()
+        );
+        let after = std::fs::metadata(&db_path).unwrap().len();
+        assert!(
+            after <= before,
+            "a healthy database must not grow: {before} -> {after}"
+        );
+        assert_eq!(state_contents(&db_path).len(), live_rows);
+    }
+
+    #[test]
+    fn compaction_gate_requires_both_floor_and_fraction() {
+        const MIB: u64 = 1024 * 1024;
+
+        // Huge absolute reclaim but a trivial share of the file: skip.
+        assert!(!compaction_is_worthwhile(10_000 * MIB, 9_000 * MIB));
+        // Huge share but below the absolute floor: skip.
+        assert!(!compaction_is_worthwhile(60 * MIB, 0));
+        // Both satisfied: compact. This is the production shape (84% dead).
+        assert!(compaction_is_worthwhile(2_680 * MIB, 430 * MIB));
+
+        // Boundaries. The pair below sits where BOTH gates land simultaneously,
+        // so on its own it cannot attribute a decision to either constant.
+        assert!(compaction_is_worthwhile(256 * MIB, 192 * MIB));
+        assert!(!compaction_is_worthwhile(256 * MIB, 193 * MIB));
+
+        // Isolate the FLOOR: fraction comfortably satisfied (~91%), so only the
+        // 64 MiB floor can decide. Pins MIN_COMPACTION_RECLAIM_BYTES.
+        assert!(compaction_is_worthwhile(70 * MIB, 6 * MIB)); // exactly 64 MiB
+        assert!(!compaction_is_worthwhile(70 * MIB, 7 * MIB)); // 63 MiB
+
+        // Isolate the FRACTION: floor comfortably satisfied (250 MiB), so only
+        // the 25% share can decide. Pins MIN_COMPACTION_RECLAIM_FRACTION.
+        assert!(compaction_is_worthwhile(1000 * MIB, 750 * MIB)); // exactly 25%
+        assert!(!compaction_is_worthwhile(1000 * MIB, 751 * MIB));
+
+        // Degenerate inputs must not divide by zero or panic.
+        assert!(!compaction_is_worthwhile(0, 0));
+        assert!(
+            !compaction_is_worthwhile(100, 500),
+            "in_use > file saturates"
+        );
+    }
 
     #[tokio::test]
     async fn test_backup_nonexistent_database() {
