@@ -127,9 +127,13 @@ pub(crate) enum PayloadArm {
     /// handler timed out (`BROADCAST_CH_TIMEOUT`, 10 s), errored, or answered
     /// unexpectedly. A load/contract problem, not a peer-tracking one.
     ///
-    /// Note this arm also poisons the *receiver*: the wire field
-    /// `sender_summary_bytes` is `unwrap_or_default()`, so the peer caches an
-    /// EMPTY summary as ours and cannot tell it from a real one.
+    /// This arm still ships an EMPTY `sender_summary_bytes` on the wire (the
+    /// field is `unwrap_or_default()` and cannot express "absent"), but that
+    /// no longer poisons the receiver: both broadcast receive paths route
+    /// through `update::op_ctx_task::seed_sender_summary_from_broadcast`,
+    /// which refuses to cache an empty summary. The peer therefore keeps a
+    /// truthful `None` (visible to `tracked_missing_*`) instead of a
+    /// `Some(empty)` that looked healthy while being wrong.
     FullNoOurSummary,
     /// Full state: we have our summary but none for the peer, **and the peer
     /// has no `PeerInterest` entry for this contract at all**.
