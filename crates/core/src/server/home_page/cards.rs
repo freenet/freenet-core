@@ -644,7 +644,7 @@ pub fn build_ring_svg(
     // (x2,y2) with the control point pulled toward the SVG centre.
     // `bend_base` is the maximum bend for antipodal points; chord
     // length scales bend so short hops look flat and long hops arc
-    // through the interior. Matches the nova.locut.us:3133 ring
+    // through the interior. Matches the telemetry.freenet.org ring
     // routing visualization.
     let curve_path = |x1: f64, y1: f64, x2: f64, y2: f64, bend_base: f64| -> String {
         let dx = x2 - x1;

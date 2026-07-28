@@ -548,8 +548,10 @@ mod messages {
             ///
             /// `Some(D_rev)` only when `holder_found == true`, the holder is
             /// genuinely ahead, AND the reverse delta passes the SAME
-            /// efficiency gate the forward delta uses (`compute_delta` /
-            /// `is_delta_efficient`). `None` when no holder was found, when
+            /// post-compute efficiency gate the forward delta uses
+            /// (`compute_delta`, #4923: refused only when the computed delta
+            /// is not smaller than the holder's state). `None` when no
+            /// holder was found, when
             /// the originator is already current (empty delta), or when the
             /// reverse delta would be inefficient / uncomputable — in the
             /// last two the originator falls back to healing via a normal

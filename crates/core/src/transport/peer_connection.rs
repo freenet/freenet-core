@@ -709,7 +709,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     }
 
     #[instrument(name = "peer_connection", skip_all)]
-    pub async fn send<D>(&mut self, data: D) -> Result
+    /// Serialize `data` and hand it to the transport.
+    ///
+    /// Returns the SERIALIZED byte length, so callers that already know the
+    /// message kind can attribute outbound bytes without a second
+    /// serialization pass just to measure it (see
+    /// [`outbound_message_mix`][omm]).
+    ///
+    /// [omm]: crate::node::network_bridge::outbound_message_mix
+    pub async fn send<D>(&mut self, data: D) -> Result<usize>
     where
         D: Serialize + Send + std::fmt::Debug,
     {
@@ -723,15 +731,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 total_size_bytes = data.len(),
                 "Sending as stream"
             );
+            let len = data.len();
             self.outbound_stream(data).await;
+            return Ok(len);
         } else {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
                 "Sending as short message"
             );
+            let len = data.len();
             self.outbound_short_message(data).await?;
+            return Ok(len);
         }
-        Ok(())
     }
 
     #[instrument(name = "peer_connection", skip(self))]
@@ -2413,7 +2424,7 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         &mut self,
         msg: crate::message::NetMessage,
     ) -> std::pin::Pin<
-        Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
+        Box<dyn futures::Future<Output = Result<usize, super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move { self.send(msg).await })
     }

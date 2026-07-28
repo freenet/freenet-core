@@ -25,7 +25,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 pub use hosting::{
-    AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult,
+    AddClientSubscriptionResult, AddSubscriberOutcome, ClientDisconnectResult, SubscribeResult,
     SubscribedContractSnapshot,
 };
 
@@ -1589,8 +1589,18 @@ impl Ring {
                 }
             }
 
-            crate::tracing::telemetry::send_standalone_event(
+            // #4956: tag with the local peer so this can be JOINED per-peer
+            // against `resource_utilization` / `outbound_message_mix`. Without
+            // it the event reports fleet-wide distributions only, which is why
+            // the InterestSync cost hypothesis could not be confirmed by
+            // correlation and had to stay an estimate.
+            crate::tracing::telemetry::send_standalone_event_with_peer_id(
                 "interest_heartbeat_cycle",
+                &op_manager
+                    .ring
+                    .connection_manager
+                    .own_location()
+                    .to_string(),
                 serde_json::json!({
                     "peers_sent": peers_sent,
                     "interest_hashes": hashes.len(),
@@ -3625,10 +3635,11 @@ impl Ring {
 
     // ==================== Downstream Subscriber Tracking ====================
 
-    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) -> bool {
-        let outcome = self
-            .hosting_manager
-            .add_downstream_subscriber(contract, peer);
+    pub fn add_downstream_subscriber(
+        &self,
+        contract: &ContractKey,
+        peer: PeerKey,
+    ) -> crate::ring::hosting::AddSubscriberOutcome {
         // No governance demand is ingested here anymore. Benefit is a
         // LIVE SNAPSHOT read fresh each reaper tick from the hosting
         // manager's standing subscriber count (see
@@ -3645,12 +3656,15 @@ impl Ring {
         // are attacker-rotatable: without an identity layer a single
         // attacker can spin up many peers that each "subscribe", so each
         // forwarded subscriber is worth one tenth of a real local client.
-        // Caller-facing bool preserved for backward compat: Rejected
-        // → false; NewAdd or Renewal → true (the peer is tracked).
-        !matches!(
-            outcome,
-            crate::ring::hosting::AddSubscriberOutcome::Rejected
-        )
+        // The NewAdd/Renewal distinction is load-bearing for the caller
+        // (#4952 follow-through): the demand-counter increment in
+        // `register_downstream_subscriber` must key on HOSTING-map newness,
+        // not on `interested_peers` newness — summary-upserted entries make
+        // the latter unreliable (a delivery-seeded co-host that later
+        // genuinely subscribes is not "new" in the interest map but IS new
+        // demand).
+        self.hosting_manager
+            .add_downstream_subscriber(contract, peer)
     }
 
     #[allow(dead_code)] // Only used in tests
@@ -8517,11 +8531,14 @@ mod cost_pressure_seam_tests {
         // Demand: `subscribed` gains a downstream subscriber (lease outlives
         // this test's remaining ~3 virtual minutes); `read_hot` is genuinely
         // GET-read now (within the cost window of the final sweep).
-        assert!(ring.add_downstream_subscriber(
-            &subscribed,
-            crate::ring::interest::PeerKey(crate::transport::TransportPublicKey::from_bytes(
-                [9u8; 32]
-            )),
+        assert!(!matches!(
+            ring.add_downstream_subscriber(
+                &subscribed,
+                crate::ring::interest::PeerKey(crate::transport::TransportPublicKey::from_bytes(
+                    [9u8; 32]
+                )),
+            ),
+            crate::ring::hosting::AddSubscriberOutcome::Rejected
         ));
         let _ = ring.record_get_access(read_hot, 121);
 

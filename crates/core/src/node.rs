@@ -677,10 +677,25 @@ impl NodeConfig {
         let (event_register, flush_handle) = {
             use super::tracing::{DynamicRegister, TelemetryReporter};
 
-            let event_reg = EventRegister::new(self.config.event_log());
-            let flush_handle = event_reg.flush_handle();
+            let mut registers: Vec<Box<dyn NetEventRegister>> = Vec::new();
 
-            let mut registers: Vec<Box<dyn NetEventRegister>> = vec![Box::new(event_reg)];
+            // The local append-only diagnostic log (`_EVENT_LOG`) is opt-in on
+            // network nodes (#4968). Measured on a live 0.2.111 peer it cost
+            // ~61 MiB/hour of appends and accounted for 95% of every fsync the
+            // process issued, for a forensic record nothing currently harvests
+            // (no `freenet service report` path reads it; `fdev verify-state`
+            // reads the Local-mode `_EVENT_LOG_LOCAL`, which stays on by
+            // default). This gate does NOT affect the `TelemetryReporter`
+            // added below — that is a separate sink fed in-memory off the same
+            // event stream, and it is what feeds telemetry.freenet.org.
+            let flush_handle = if self.config.event_log_enabled() {
+                let event_reg = EventRegister::new(self.config.event_log());
+                let handle = event_reg.flush_handle();
+                registers.push(Box::new(event_reg));
+                handle
+            } else {
+                crate::tracing::EventFlushHandle::noop()
+            };
 
             // Add OpenTelemetry register if feature enabled
             #[cfg(feature = "trace-ot")]
@@ -2725,6 +2740,14 @@ async fn handle_interest_sync_message(
                 // sending novel summary bytes for every hosted contract. See
                 // `MAX_STALENESS_PROBES_PER_SUMMARIES` / `plan_staleness_probe`.
                 let mut staleness_probes_used = 0usize;
+                // Contracts already counted by the #4965 summary-comparison
+                // measurement in THIS message. Scoped to one message, so it
+                // cannot accumulate across a connection. Its size is bounded by
+                // the number of DISTINCT locally-known contracts the entries
+                // resolve to — `lookup_by_hash` only yields contracts this node
+                // already tracks, so a peer cannot grow it with unknown ids —
+                // and it holds contract ids only, no state.
+                let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
                 for entry in entries {
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         if !op_manager.interest_manager.has_local_interest(&contract) {
@@ -2760,7 +2783,31 @@ async fn handle_interest_sync_message(
                         // `summary_indicates_stale_peer`.
                         let is_stale = match (our_summary.as_ref(), their_summary.as_ref()) {
                             (Some(ours), Some(theirs)) => {
-                                let delta_verdict = if ours.as_ref() == theirs.as_ref() {
+                                let identical = ours.as_ref() == theirs.as_ref();
+                                // #4965 falsifier: how often are the two sides
+                                // byte-identical? That fraction is exactly what a
+                                // hash-first `Summaries` exchange would save, since
+                                // `SummaryEntry` ships full summary bytes
+                                // unconditionally today. Recorded here rather than
+                                // at the send site because only the receiver can
+                                // compare, and only in this arm because a `None` on
+                                // either side is not a comparison at all.
+                                //
+                                // Counted once per contract per message: `entries`
+                                // is peer-supplied and may repeat a hash, and
+                                // without this a peer could inflate either bucket
+                                // at will — corrupting the very ratio that decides
+                                // whether the wire change is worth building. The
+                                // dedup guards ONLY the measurement; the staleness
+                                // logic below still runs per entry exactly as
+                                // before, so this changes no behavior.
+                                op_manager.outbound_mix.record_summary_comparison(
+                                    contract.id(),
+                                    ours.as_ref(),
+                                    theirs.as_ref(),
+                                    &mut compared_contracts,
+                                );
+                                let delta_verdict = if identical {
                                     // Byte-identical => converged; skip the probe.
                                     None
                                 } else {
@@ -2810,11 +2857,25 @@ async fn handle_interest_sync_message(
                             _ => false,
                         };
 
-                        op_manager.interest_manager.update_peer_summary(
-                            &contract,
-                            &pk,
-                            their_summary,
-                        );
+                        // #4952: upsert (not update) when the peer reported a
+                        // real summary, so the ~5-min anti-entropy exchange can
+                        // seed a summary for an advertised co-host we don't
+                        // interest-track — otherwise those peers stay full-state
+                        // broadcast targets forever. A `None` report keeps the
+                        // old clear-only semantics (no entry is created just to
+                        // hold `None`).
+                        match their_summary {
+                            Some(theirs) => {
+                                op_manager
+                                    .interest_manager
+                                    .upsert_peer_summary(&contract, &pk, theirs);
+                            }
+                            None => op_manager.interest_manager.clear_peer_summary(
+                                &contract,
+                                &pk,
+                                crate::ring::interest::SummaryMissingReason::ClearedByNoneReport,
+                            ),
+                        }
 
                         if is_stale && !stale_contracts.contains(&contract) {
                             stale_contracts.push(contract);
@@ -3161,9 +3222,11 @@ async fn handle_interest_sync_message(
             // Clear cached summary for this peer
             let peer_key = get_peer_key_from_addr(op_manager, source);
             if let Some(ref pk) = peer_key {
-                op_manager
-                    .interest_manager
-                    .update_peer_summary(&key, pk, None);
+                op_manager.interest_manager.clear_peer_summary(
+                    &key,
+                    pk,
+                    crate::ring::interest::SummaryMissingReason::ClearedByResync,
+                );
             }
 
             // Get PeerKeyLocation for telemetry
@@ -3406,9 +3469,12 @@ async fn handle_interest_sync_message(
             let peer_key = get_peer_key_from_addr(op_manager, source);
             if let Some(pk) = peer_key {
                 let summary = freenet_stdlib::prelude::StateSummary::from(summary_bytes);
+                // #4952: upsert — a ResyncResponse sender self-reported the
+                // summary of the full state it just shipped us; seed it even
+                // when we don't interest-track that co-host.
                 op_manager
                     .interest_manager
-                    .update_peer_summary(&key, &pk, Some(summary));
+                    .upsert_peer_summary(&key, &pk, summary);
             }
 
             // No response needed
@@ -3946,6 +4012,45 @@ mod tests {
     /// `ResyncRequest` arm, which is already state-gated (returns early when
     /// `get_contract_state` is `None`) and is not heartbeat-driven, so it is
     /// excluded by slicing up to that arm.
+    /// #4952 pin: the `Summaries` handler must UPSERT a reported summary so
+    /// the ~5-min anti-entropy exchange can seed one for an advertised
+    /// co-host we don't interest-track (`update_peer_summary` no-ops for
+    /// untracked peers — the full-state fixed point). A `None` report keeps
+    /// the clear-only `update_` semantics: no entry is created just to hold
+    /// `None`. Matches whitespace-stripped source (rustfmt-proof).
+    #[test]
+    fn summaries_arm_upserts_reported_summary_pin() {
+        let src = include_str!("node.rs");
+        let handler_start = src
+            .find("async fn handle_interest_sync_message")
+            .expect("handle_interest_sync_message not found");
+        let handler_end = handler_start
+            + src[handler_start..]
+                .find("\nmod tests {")
+                .or_else(|| src[handler_start..].find("\n#[cfg(test)]"))
+                .expect("end of handler region not found");
+        let body: String = src[handler_start..handler_end].split_whitespace().collect();
+        assert!(
+            body.contains("upsert_peer_summary(&contract,&pk,theirs)"),
+            "Summaries arm must upsert a Some(summary) report (seeds untracked \
+             co-hosts, #4952)"
+        );
+        assert!(
+            !body.contains("update_peer_summary(&contract,&pk,Some"),
+            "a Some(summary) report must go through the upsert, not the \
+             untracked-no-op update path (#4952)"
+        );
+        assert!(
+            body.contains("clear_peer_summary(&contract,&pk,")
+                && body.contains("SummaryMissingReason::ClearedByNoneReport"),
+            "Summaries arm must keep clear-only semantics for a None report \
+             (creating an entry just to hold None would relabel untracked \
+             traffic as tracked without enabling deltas), and must tag the \
+             clear ClearedByNoneReport so #4961 can attribute the \
+             full_no_their_summary_tracked arm to this path"
+        );
+    }
+
     #[test]
     fn interest_sync_periodic_arms_summarize_only_hosted_or_in_use_pin() {
         let src = include_str!("node.rs");
@@ -4031,6 +4136,27 @@ mod tests {
             .find("InterestMessage::ChangeInterests")
             .expect("ChangeInterests arm not found");
         let summaries_arm = &src[handler_start + summaries_off..handler_start + change_off];
+
+        // #4965: the measurement call must stay wired into this arm. It is
+        // pure observation, so deleting it breaks no test and no behavior —
+        // the rollup would simply report zero comparisons forever, which reads
+        // as "nothing to save here" and would retire the hash-first redesign
+        // for the wrong reason. Needle split so this assertion's own source
+        // cannot satisfy the scrape.
+        assert!(
+            summaries_arm.contains(concat!("record_summary", "_comparison")),
+            "the Summaries arm must record the #4965 summary-comparison \
+             measurement; without it the identical/differing rollup is \
+             silently always zero"
+        );
+        // The per-message dedup needs no pin: `record_summary_comparison` takes
+        // the seen-set as an argument, so there is no way to call it without
+        // deduping. That replaced a call-site `if` guard which no source pin
+        // could protect — a structural pin for it was written and deleted after
+        // mutation testing showed it green when the call was moved out from
+        // behind the guard. Making the bypass unrepresentable beat testing for
+        // it; the repeated-call behavior is covered directly in
+        // `outbound_message_mix::tests`.
 
         assert!(
             summaries_arm.contains("peer_summary_has_pending_state"),
@@ -4902,10 +5028,13 @@ mod tests {
 
         // Seed the outstanding entry: WE sent a ResyncRequest to `source` for
         // `key`, so the incoming response is solicited.
-        op_manager
-            .ring
-            .outstanding_resync_requests
-            .record(*key.id(), source);
+        assert!(
+            op_manager
+                .ring
+                .outstanding_resync_requests
+                .record(*key.id(), source),
+            "seeding the outstanding entry must correlate (map is empty here)"
+        );
         assert_eq!(
             op_manager.ring.outstanding_resync_requests.len(),
             1,
@@ -6584,22 +6713,27 @@ mod tests {
         fn resync_request_handler_clears_cached_peer_summary() {
             let arm = resync_request_arm();
             assert!(
-                arm.contains("update_peer_summary"),
-                "ResyncRequest handler no longer calls update_peer_summary. \
+                arm.contains("clear_peer_summary"),
+                "ResyncRequest handler no longer calls clear_peer_summary. \
                  #4145 caching relies on this handler clearing the sender's \
                  cached summary so a delta-apply failure forces a fresh \
                  full-state resend instead of looping on unappliable deltas."
             );
-            // The clear MUST pass `None` (clear), not a `Some(summary)` cache.
-            // Strip whitespace so the multi-line call (`op_manager\n
-            // .interest_manager\n .update_peer_summary(&key, pk, None);`)
-            // matches regardless of formatting.
+            // The clear MUST go through the tagged clear API, not a
+            // `update_peer_summary` cache-write. Strip whitespace so the
+            // multi-line call matches regardless of formatting.
             let collapsed: String = arm.chars().filter(|c| !c.is_whitespace()).collect();
             assert!(
-                collapsed.contains("update_peer_summary(&key,pk,None)"),
-                "ResyncRequest handler must clear the cached summary with \
-                 `update_peer_summary(&key, pk, None)` (the `None` clears it). \
-                 Caching a summary here instead would defeat the #4145 backstop."
+                collapsed.contains("clear_peer_summary(&key,pk,"),
+                "ResyncRequest handler must clear the cached summary via \
+                 `clear_peer_summary`. Caching a summary here instead would \
+                 defeat the #4145 backstop."
+            );
+            assert!(
+                collapsed.contains("SummaryMissingReason::ClearedByResync"),
+                "the clear must be tagged ClearedByResync — #4961 needs the \
+                 full_no_their_summary_tracked arm attributed per clear path, \
+                 and an untagged clear would silently land in another bucket"
             );
         }
 

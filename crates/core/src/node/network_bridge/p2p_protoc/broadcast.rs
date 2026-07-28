@@ -954,11 +954,14 @@ impl P2pConnManager {
                 // sender-side completion, not a receiver ack, so a lost stream
                 // tail is covered by the same two backstops.
                 // (Telemetry above still records delta-vs-full-state separately.)
+                // #4952: upsert so the sim path mirrors production
+                // (`record_delivery_to_interest`) — an untracked co-host must
+                // escape full state after one delivered broadcast in sims too.
                 if let Some(summary) = &our_summary {
-                    op_manager.interest_manager.update_peer_summary(
+                    op_manager.interest_manager.upsert_peer_summary(
                         &key,
                         &peer_key,
-                        Some(summary.clone()),
+                        summary.clone(),
                     );
                 }
             }

@@ -314,20 +314,27 @@ impl OutstandingResyncRequests {
     /// response is then treated as unsolicited, so we forgo one heal that
     /// anti-entropy recovers — never a correctness loss, and the cap keeps an
     /// attacker from growing the map by inducing our emissions.
-    pub fn record(&self, contract: ContractInstanceId, target: SocketAddr) {
+    /// Returns `true` iff the request is now CORRELATED (an entry exists). A
+    /// `false` return means the strict cap rejected a brand-new key, so no
+    /// entry was stored — callers that later read [`Self::is_outstanding`] as a
+    /// "did it land?" signal MUST NOT treat that absence as "landed" (#4863).
+    #[must_use]
+    pub fn record(&self, contract: ContractInstanceId, target: SocketAddr) -> bool {
         let now = self.time_source.now();
         use dashmap::mapref::entry::Entry;
         match self.entries.entry((contract, target)) {
             Entry::Occupied(mut occ) => {
                 *occ.get_mut() = now;
+                true
             }
             Entry::Vacant(vac) => {
                 let prev = self.size.fetch_add(1, Ordering::Relaxed);
                 if prev >= self.max_tracked {
                     self.size.fetch_sub(1, Ordering::Relaxed);
-                    return;
+                    return false;
                 }
                 vac.insert(now);
+                true
             }
         }
     }
@@ -346,6 +353,50 @@ impl OutstandingResyncRequests {
             }
             None => false,
         }
+    }
+
+    /// Read-only: is there a NON-EXPIRED outstanding request for
+    /// `(contract, peer)`?
+    ///
+    /// Unlike [`Self::consume`] this does NOT remove the entry, so the receive
+    /// arm's one-shot authorization stays intact.
+    ///
+    /// This is the "did our `ResyncRequest` land?" signal for the queue-full
+    /// resync retry (#4863). The entry is removed exactly when a matching
+    /// `ResyncResponse` is accepted at the receive arm.
+    ///
+    /// ONLY MEANINGFUL FOR A CORRELATED REQUEST. Callers must gate on
+    /// [`Self::record`] having returned `true`; for an UNCORRELATED request
+    /// (brand-new key rejected by the strict cap) this returns `false`
+    /// immediately and forever, which must NOT be read as "landed". A
+    /// re-dispatch still heals in that case: the responder clears its cached
+    /// summary of us on receiving the `ResyncRequest` itself (`node.rs`,
+    /// `update_peer_summary(.., None)`), which is the #4857 heal and does not
+    /// depend on our correlation record at all. Only the full-state
+    /// `ResyncResponse` needs the record. Treating the cap rejection as
+    /// "landed" would silently disable the retry node-wide while the map is
+    /// full.
+    ///
+    /// So for a correlated request `false` means one of:
+    ///
+    /// - the response arrived and was authorized at the receive arm — the
+    ///   redundant re-dispatch would only make the sender clear its summary and
+    ///   ship full state again, onto a receiver whose queue was just full;
+    /// - the entry expired (TTL) — unreachable inside the retry window, which
+    ///   is bounded by one reservation interval well under the TTL.
+    ///
+    /// `true` (request still outstanding) is the case where a retry can help.
+    ///
+    /// Note this observes AUTHORIZATION, not application: the receive arm
+    /// consumes the entry BEFORE applying the state, and the apply can still
+    /// fail (including with another `ContractQueueFull`). Absence therefore
+    /// means "the response arrived and we authorized it", not "the state
+    /// merged".
+    pub fn is_outstanding(&self, contract: ContractInstanceId, peer: SocketAddr) -> bool {
+        let now = self.time_source.now();
+        self.entries
+            .get(&(contract, peer))
+            .is_some_and(|emitted| now.saturating_duration_since(*emitted) <= self.ttl)
     }
 
     /// Drop entries older than the TTL. Call from the Ring reaper so a burst of
@@ -408,7 +459,7 @@ mod tests {
         );
 
         // We emit a request → the response from that peer is authorized ONCE.
-        m.record(c, peer);
+        assert!(m.record(c, peer), "record must correlate under the cap");
         assert_eq!(m.len(), 1);
         assert!(
             m.consume(c, peer),
@@ -423,12 +474,65 @@ mod tests {
         );
     }
 
+    /// #4863: `is_outstanding` is the queue-full retry's "did our request land?"
+    /// signal. It must be READ-ONLY (leaving the receive arm's one-shot
+    /// authorization intact), scoped per `(contract, peer)`, and TTL-aware — an
+    /// expired entry's response would be rejected anyway, so it is not a live
+    /// request.
+    #[test]
+    fn outstanding_resync_is_outstanding_is_read_only_and_ttl_aware() {
+        let ts = SharedMockTimeSource::new();
+        let m = new_outstanding_resync_requests(Arc::new(ts.clone()));
+        let c = mk_contract(1);
+        let peer = mk_peer(1);
+
+        // Nothing recorded → not outstanding.
+        assert!(!m.is_outstanding(c, peer));
+
+        assert!(m.record(c, peer), "record must correlate under the cap");
+        assert!(m.is_outstanding(c, peer), "a fresh record is outstanding");
+
+        // Scoped per (contract, peer) — a different peer or contract is unrelated.
+        assert!(!m.is_outstanding(c, mk_peer(2)));
+        assert!(!m.is_outstanding(mk_contract(2), peer));
+
+        // READ-ONLY: repeated checks must not remove the entry, so the receive
+        // arm's require-and-consume still succeeds afterwards.
+        assert!(m.is_outstanding(c, peer));
+        assert_eq!(m.len(), 1, "is_outstanding must not remove the entry");
+        assert!(
+            m.consume(c, peer),
+            "the receive arm's one-shot authorization must survive is_outstanding"
+        );
+
+        // Once consumed (the ResyncResponse landed and was applied), the request
+        // is no longer outstanding — this is what makes the retry skip.
+        assert!(
+            !m.is_outstanding(c, peer),
+            "a consumed request must read as landed so the #4863 retry skips"
+        );
+
+        // TTL-aware: an entry past the TTL is not a live request (its response
+        // would be rejected as unsolicited, so re-dispatching cannot heal).
+        assert!(m.record(c, peer), "record must correlate under the cap");
+        ts.advance_time(OUTSTANDING_RESYNC_TTL - Duration::from_millis(1));
+        assert!(
+            m.is_outstanding(c, peer),
+            "just under the TTL is still live"
+        );
+        ts.advance_time(Duration::from_millis(2));
+        assert!(!m.is_outstanding(c, peer), "past the TTL is not live");
+    }
+
     #[test]
     fn outstanding_resync_is_scoped_per_contract_and_peer() {
         let ts = SharedMockTimeSource::new();
         let m = new_outstanding_resync_requests(Arc::new(ts.clone()));
         let c = mk_contract(1);
-        m.record(c, mk_peer(1));
+        assert!(
+            m.record(c, mk_peer(1)),
+            "record must correlate under the cap"
+        );
         // A response for the SAME contract from a DIFFERENT peer is unsolicited.
         assert!(!m.consume(c, mk_peer(2)));
         // A response for a DIFFERENT contract from the recorded peer is unsolicited.
@@ -445,7 +549,7 @@ mod tests {
         let peer = mk_peer(1);
 
         // Just UNDER the TTL → still accepted.
-        m.record(c, peer);
+        assert!(m.record(c, peer), "record must correlate under the cap");
         ts.advance_time(OUTSTANDING_RESYNC_TTL - Duration::from_millis(1));
         assert!(
             m.consume(c, peer),
@@ -453,7 +557,7 @@ mod tests {
         );
 
         // Past the TTL → the stale entry is consumed-and-REJECTED.
-        m.record(c, peer);
+        assert!(m.record(c, peer), "record must correlate under the cap");
         ts.advance_time(OUTSTANDING_RESYNC_TTL + Duration::from_millis(1));
         assert!(
             !m.consume(c, peer),
@@ -462,7 +566,10 @@ mod tests {
         assert_eq!(m.len(), 0, "a consumed (even if stale) entry is removed");
 
         // cleanup() reaps expired entries whose response never arrived.
-        m.record(mk_contract(9), mk_peer(9));
+        assert!(
+            m.record(mk_contract(9), mk_peer(9)),
+            "record must correlate under the cap"
+        );
         assert_eq!(m.len(), 1);
         ts.advance_time(OUTSTANDING_RESYNC_TTL + Duration::from_secs(1));
         m.cleanup();
@@ -477,14 +584,25 @@ mod tests {
         for i in 0..MAX_TRACKED_KEYS {
             let c = ContractInstanceId::new([(i % 256) as u8; 32]);
             let peer = SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 40000));
-            m.record(c, peer);
+            assert!(m.record(c, peer), "under-cap record must correlate");
         }
         assert_eq!(m.len(), MAX_TRACKED_KEYS, "map fills to exactly the cap");
         // One more distinct key is dropped (fail-closed), not admitted.
         let overflow_c = ContractInstanceId::new([0xAB; 32]);
         let overflow_peer = SocketAddr::from(([172, 16, 0, 1], 41000));
-        m.record(overflow_c, overflow_peer);
+        // #4863: the over-cap record must REPORT the rejection. This bool is what
+        // stops the queue-full retry from mistaking a never-correlated request for
+        // a landed one and disabling itself node-wide while the map is full.
+        assert!(
+            !m.record(overflow_c, overflow_peer),
+            "over-cap record must report the request as UNCORRELATED so the \
+             queue-full retry falls back to unconditional re-dispatch (#4863)"
+        );
         assert_eq!(m.len(), MAX_TRACKED_KEYS, "over-cap insert is dropped");
+        // It reads as NOT outstanding — which is exactly why the retry must not
+        // gate on `is_outstanding` alone for an uncorrelated request. Assert this
+        // BEFORE the mutating `consume` below so the read is unambiguous.
+        assert!(!m.is_outstanding(overflow_c, overflow_peer));
         // Its response is therefore treated as unsolicited.
         assert!(!m.consume(overflow_c, overflow_peer));
     }

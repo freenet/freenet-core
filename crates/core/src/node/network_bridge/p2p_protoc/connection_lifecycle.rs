@@ -1078,8 +1078,17 @@ impl P2pConnManager {
         // Use tokio::spawn directly instead of GlobalExecutor::spawn.
         // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
         // reliably poll tasks in certain test contexts (see issue #2709).
+        let outbound_mix = self.bridge.op_manager.outbound_mix.clone();
         tokio::spawn(async move {
-            peer_connection_listener(rx, connection, peer_addr, conn_events, conn_id).await;
+            peer_connection_listener(
+                rx,
+                connection,
+                peer_addr,
+                conn_events,
+                conn_id,
+                outbound_mix,
+            )
+            .await;
         });
         // Yield to allow the spawned peer_connection_listener task to start.
         // This is important because on some runtimes (especially in tests with boxed_local

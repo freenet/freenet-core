@@ -169,11 +169,85 @@ impl From<TransportPublicKey> for PeerKey {
     }
 }
 
+/// Why a tracked peer's cached summary is absent.
+///
+/// A tracked peer with no cached summary forces a FULL STATE broadcast
+/// (`PayloadArm::FullNoTheirSummaryTracked`). On the aged 0.2.109 fleet that
+/// arm was 26.9% of broadcast bytes at a 357 KB mean — the single largest
+/// remaining bandwidth arm and the main cause of the 4-20s propagation
+/// latency in #4961 — but the rollup could not say WHICH of the paths below
+/// produced it, and the three have completely different fixes. This tag is
+/// what makes that distinguishable; see #4961.
+///
+/// The tag is only meaningful while `summary` is `None`; read it through
+/// [`PeerInterest::summary_missing_reason`], which enforces that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SummaryMissingReason {
+    /// The entry was created without a summary and has never had one written.
+    ///
+    /// The interest-registration chain (`register_local_hosting` → `Interests`
+    /// → `register_peer_interest`) creates entries with `summary: None`; they
+    /// stay that way until a delivery or a `Summaries` report seeds one. A
+    /// large share here means the seeding chain isn't firing (or an
+    /// `Interests` full-replace is wiping seeded entries every ~5 min).
+    NeverPopulated,
+
+    /// The peer itself reported `None` in an InterestSync `Summaries` message,
+    /// so we dropped what we had cached.
+    ///
+    /// Suspect path: we may be discarding a summary we seeded from an actual
+    /// delivery because the peer's own report raced ahead of its state write.
+    ClearedByNoneReport,
+
+    /// We received a `ResyncRequest` from the peer, which invalidates our
+    /// cached view of what they hold.
+    ClearedByResync,
+
+    /// A delta we sent failed to apply on the peer, so our cached summary for
+    /// them was provably wrong.
+    ClearedByDeltaApplyFailure,
+}
+
+impl SummaryMissingReason {
+    /// Every reason, in telemetry field order.
+    pub const ALL: [SummaryMissingReason; 4] = [
+        SummaryMissingReason::NeverPopulated,
+        SummaryMissingReason::ClearedByNoneReport,
+        SummaryMissingReason::ClearedByResync,
+        SummaryMissingReason::ClearedByDeltaApplyFailure,
+    ];
+
+    /// Dense index into a per-reason counter array.
+    pub fn index(self) -> usize {
+        match self {
+            SummaryMissingReason::NeverPopulated => 0,
+            SummaryMissingReason::ClearedByNoneReport => 1,
+            SummaryMissingReason::ClearedByResync => 2,
+            SummaryMissingReason::ClearedByDeltaApplyFailure => 3,
+        }
+    }
+
+    /// Stable label for telemetry field names.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SummaryMissingReason::NeverPopulated => "never_populated",
+            SummaryMissingReason::ClearedByNoneReport => "none_report",
+            SummaryMissingReason::ClearedByResync => "resync",
+            SummaryMissingReason::ClearedByDeltaApplyFailure => "delta_apply_failed",
+        }
+    }
+}
+
 /// Tracking information for a peer's interest in a specific contract.
 #[derive(Clone, Debug)]
 pub struct PeerInterest {
     /// The peer's current state summary. None if interested but has no state yet.
     pub summary: Option<StateSummary<'static>>,
+
+    /// Why [`Self::summary`] is absent. Stale (and unread) whenever `summary`
+    /// is `Some` — always read it via [`Self::summary_missing_reason`], which
+    /// returns `None` in that case rather than a misleading last-clear cause.
+    summary_absence: SummaryMissingReason,
 
     /// When this interest entry was last refreshed.
     /// Used for TTL-based expiration.
@@ -186,9 +260,14 @@ pub struct PeerInterest {
 
 impl PeerInterest {
     /// Create a new peer interest entry with the given timestamp.
+    ///
+    /// A `None` summary here is [`SummaryMissingReason::NeverPopulated`] by
+    /// construction — this is the only constructor, so an entry cannot come
+    /// into existence summaryless without carrying that tag.
     pub fn new(summary: Option<StateSummary<'static>>, is_upstream: bool, now: Instant) -> Self {
         Self {
             summary,
+            summary_absence: SummaryMissingReason::NeverPopulated,
             last_refreshed: now,
             is_upstream,
         }
@@ -204,9 +283,26 @@ impl PeerInterest {
         now.saturating_duration_since(self.last_refreshed) > INTEREST_TTL
     }
 
-    /// Update the peer's summary and refresh TTL.
-    pub fn update_summary(&mut self, summary: Option<StateSummary<'static>>, now: Instant) {
-        self.summary = summary;
+    /// Why this peer has no cached summary, or `None` when one IS cached.
+    pub fn summary_missing_reason(&self) -> Option<SummaryMissingReason> {
+        self.summary.is_none().then_some(self.summary_absence)
+    }
+
+    /// Cache a summary for this peer and refresh TTL.
+    pub fn set_summary(&mut self, summary: StateSummary<'static>, now: Instant) {
+        self.summary = Some(summary);
+        self.refresh(now);
+    }
+
+    /// Drop the cached summary, recording why, and refresh TTL.
+    ///
+    /// Taking `reason` by value (rather than accepting an `Option` summary) is
+    /// deliberate: it makes an untagged clear unrepresentable, so a future
+    /// clear site cannot silently land in the `NeverPopulated` bucket and
+    /// mis-aim the next fix.
+    pub fn clear_summary(&mut self, reason: SummaryMissingReason, now: Instant) {
+        self.summary = None;
+        self.summary_absence = reason;
         self.refresh(now);
     }
 }
@@ -310,16 +406,89 @@ pub fn contract_hash(contract: &ContractKey) -> u32 {
     hash
 }
 
-/// Check if a delta would be efficient compared to sending full state.
+/// How much smaller full state must be before the post-compute gate
+/// ([`InterestManager::gate_delta_size`]) abandons a computed delta for it.
+///
+/// Switching payload kinds is not free: a delta keeps the receiver's
+/// peer-summary cache warm and keeps fan-out off the full-state path that
+/// #4233 / #4956 are about. Below this margin the byte win is a rounding
+/// error and not worth those costs — at 1 KiB, a small CRDT contract whose
+/// delta marginally exceeds its state keeps sending deltas, while the
+/// poisoned-summary population this gate targets (state-sized deltas at
+/// 550-840 KB) still refuses by a wide margin.
+const MIN_FULL_STATE_SAVING_BYTES: usize = 1024;
+
+/// Heuristic: would a delta *probably* be efficient compared to sending full
+/// state, judging only by the peer's summary size?
 ///
 /// Returns true if summary size is less than 50% of state size.
 ///
+/// History (#4923): this used to be a PRE-compute gate inside
+/// [`InterestManager::compute_delta`] — a refusal to even ask the contract for
+/// a delta when the peer's summary was large. That inverted the trade-off:
+/// the fallback to a refused delta is sending FULL STATE, which is never
+/// smaller than the delta the gate declined to compute, and in production the
+/// resulting full-state sends were 41% of ALL network wire bytes (87.4% for
+/// the hottest contract). `compute_delta` now always computes and gates on
+/// the ACTUAL delta size afterwards, so this summary-size proxy has no
+/// production caller. It is deliberately kept (not deleted) as the documented
+/// wire-efficiency heuristic with its unit tests — do not re-wire it as a
+/// pre-compute refusal.
+///
 /// This is a standalone function to avoid requiring type parameters when called.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_delta_efficient(summary_size: usize, state_size: usize) -> bool {
     if state_size == 0 {
         return false;
     }
     summary_size * 2 < state_size
+}
+
+/// Why [`InterestManager::compute_delta`] could not hand back a delta.
+///
+/// Typed rather than a bare `String` so callers can tell the two cases apart:
+/// they have different remedies, and the fan-out's payload-mix telemetry
+/// ([`crate::node::network_bridge::broadcast_payload_mix`]) reports them as
+/// separate arms. Every caller falls back to sending FULL STATE, which is
+/// never smaller than the delta that was declined — see #3335.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaUnavailable {
+    /// The delta WAS computed (or found cached) but is not smaller than our
+    /// full state, so the caller's full-state fallback is the genuinely
+    /// optimal payload (equal or smaller bytes, and no delta-apply on the
+    /// receiver).
+    ///
+    /// History (#4923): this variant used to mean the [`is_delta_efficient`]
+    /// summary-size proxy refused *before* any delta was computed ("no
+    /// contract code ran"). That pre-compute refusal is gone — the gate now
+    /// runs POST-compute on the actual delta size. The variant name and
+    /// field shape are unchanged on purpose: the #4938 payload-mix telemetry
+    /// keys off them.
+    NotEfficient {
+        summary_size: usize,
+        state_size: usize,
+    },
+    /// A delta was attempted and the contract handler failed — WASM error,
+    /// timeout, or an unexpected response.
+    ComputeFailed(String),
+}
+
+impl std::fmt::Display for DeltaUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Keep the historical prefix so existing log greps still match;
+            // the sizes are additive.
+            DeltaUnavailable::NotEfficient {
+                summary_size,
+                state_size,
+            } => write!(
+                f,
+                "Delta not efficient for this contract (summary {summary_size} B, \
+                 state {state_size} B)"
+            ),
+            DeltaUnavailable::ComputeFailed(msg) => write!(f, "{msg}"),
+        }
+    }
 }
 
 /// Decide whether a peer that reported `their_summary` is stale relative to our
@@ -605,14 +774,103 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         &self,
         contract: &ContractKey,
         peer: &PeerKey,
-        summary: Option<StateSummary<'static>>,
+        summary: StateSummary<'static>,
     ) {
         let now = self.time_source.now();
         if let Some(mut entry) = self.interested_peers.get_mut(contract) {
             if let Some(interest) = entry.get_mut(peer) {
-                interest.update_summary(summary, now);
+                interest.set_summary(summary, now);
             }
         }
+    }
+
+    /// Drop a peer's cached summary for a contract, recording why.
+    ///
+    /// Every clear MUST name its cause: a tracked peer with no cached summary
+    /// is what forces a full-state broadcast, and #4961 could not tell the
+    /// three clear paths apart in the rollup. The `reason` is surfaced on the
+    /// `FullNoTheirSummaryTracked` arm of `broadcast_payload_mix`.
+    ///
+    /// Like [`Self::update_peer_summary`], this is a silent no-op for an
+    /// untracked peer — clearing something we never cached is a no-op by
+    /// definition, and creating an entry just to hold `None` would inflate the
+    /// map from unauthenticated input.
+    pub fn clear_peer_summary(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        reason: SummaryMissingReason,
+    ) {
+        let now = self.time_source.now();
+        if let Some(mut entry) = self.interested_peers.get_mut(contract) {
+            if let Some(interest) = entry.get_mut(peer) {
+                interest.clear_summary(reason, now);
+            }
+        }
+    }
+
+    /// Cache a peer's known summary, creating the interest entry when absent.
+    ///
+    /// [`Self::update_peer_summary`] deliberately no-ops for an untracked peer
+    /// (pinned by `update_peer_summary_is_a_silent_noop_for_an_untracked_peer`)
+    /// so summary writes of unknown provenance cannot grow the map. This upsert
+    /// exists for the callers that KNOW the peer holds the summarized state:
+    /// the post-delivery cache in `broadcast_queue::record_delivery_to_interest`
+    /// (we just delivered exactly that state to them) and the InterestSync
+    /// `Summaries` handler (the peer itself reported the summary). Without it,
+    /// an advertised co-host that is untracked at broadcast time is a
+    /// full-state fixed point: every broadcast to it ships full state, the
+    /// post-delivery summary write silently no-ops, and the next broadcast
+    /// ships full state again (#4952 — 58% of fleet broadcast bytes).
+    ///
+    /// The insert respects [`MAX_INTERESTED_PEERS_PER_CONTRACT`] (returns
+    /// `false` at cap with no side writes, same shape as
+    /// [`Self::register_peer_interest`]) and creates the entry with
+    /// `is_upstream = false`. It does NOT touch the demand counters
+    /// (`downstream_subscriber_count` / `local_client_count`) that feed
+    /// eviction's demand ranking — an upserted entry is summary bookkeeping
+    /// plus fan-out of the small `Summaries` notifications, never a state
+    /// broadcast target (Source-2 removal, `update.rs::get_broadcast_targets_update`).
+    pub fn upsert_peer_summary(
+        &self,
+        contract: &ContractKey,
+        peer: &PeerKey,
+        summary: StateSummary<'static>,
+    ) -> bool {
+        let now = self.time_source.now();
+        // Hold the `interested_peers` shard guard across the `peer_contracts`
+        // and hash-index writes — same #4129/#4171 discipline as
+        // `register_peer_interest`, preventing a concurrent remover from
+        // leaving a zombie reverse-index entry.
+        let mut entry = self.interested_peers.entry(*contract).or_default();
+        if let Some(interest) = entry.get_mut(peer) {
+            interest.set_summary(summary, now);
+            return true;
+        }
+        if entry.len() >= MAX_INTERESTED_PEERS_PER_CONTRACT {
+            // At cap the entry is non-empty, so no cleanup is needed; the
+            // caller simply keeps sending full state to this peer (pre-upsert
+            // behavior), bounded per contract. debug! (compiled out of
+            // release) rather than register_peer_interest's warn!: this runs
+            // per delivered broadcast, and the condition is near-unreachable
+            // in practice (entries require connected peers, and
+            // max_connections < the 512 cap), but a stuck-at-cap contract
+            // should be diagnosable in a dev build.
+            tracing::debug!(
+                contract = %contract,
+                limit = MAX_INTERESTED_PEERS_PER_CONTRACT,
+                "upsert_peer_summary: at interested-peer cap, peer stays untracked (full-state sends continue)"
+            );
+            return false;
+        }
+        entry.insert(peer.clone(), PeerInterest::new(Some(summary), false, now));
+        self.peer_contracts
+            .entry(peer.clone())
+            .or_default()
+            .insert(*contract);
+        self.index_contract_hash(contract);
+        drop(entry);
+        true
     }
 
     /// Refresh the TTL for a peer's interest.
@@ -1361,9 +1619,9 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// (`BROADCAST_CH_TIMEOUT`) `GetQuery` against the contract handler,
     /// returning the stored state's `size()` or `None` if it can't be read.
     /// Used by the summary-first PUT reverse leg to feed
-    /// [`compute_delta`](Self::compute_delta)'s efficiency gate with the
-    /// holder's own state size (the holder-side mirror of the originator's
-    /// `merged_value.size()`).
+    /// [`compute_delta`](Self::compute_delta)'s post-compute efficiency check
+    /// with the holder's own state size (the holder-side mirror of the
+    /// originator's `merged_value.size()`).
     pub async fn get_contract_state_size(
         &self,
         op_manager: &crate::node::OpManager,
@@ -1417,16 +1675,29 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Compute a state delta for a peer given their cached summary.
     ///
     /// Uses the contract handler to compute the delta via the contract's
-    /// `get_state_delta` method. Results are cached to avoid recomputation
+    /// `get_state_delta` method (bounded by `BROADCAST_CH_TIMEOUT`). Results
+    /// are cached (keyed by contract + both summaries) to avoid recomputation
     /// for peers with the same summary.
     ///
     /// Returns `Ok(None)` when the contract returns an empty delta (zero bytes),
     /// meaning the peer's state is logically equivalent to ours despite differing
     /// summary bytes (e.g., due to non-deterministic serialization order).
     ///
+    /// Returns [`DeltaUnavailable::NotEfficient`] when the COMPUTED delta is
+    /// not smaller than our full state (`delta.len() >= our_state_size`), so
+    /// the caller's full-state fallback is genuinely optimal. Until #4923 this
+    /// refusal fired BEFORE computing anything, off the [`is_delta_efficient`]
+    /// summary-size proxy (`summary * 2 >= state`) — but the fallback to a
+    /// refused delta is sending FULL STATE, which is never smaller than the
+    /// delta that was declined, so the pre-compute gate could only ever trade
+    /// one bounded WASM call for strictly more wire bytes. In production that
+    /// arm was 41% of ALL network wire bytes. The gate now runs post-compute,
+    /// on the real delta size, on both the cache-hit and fresh-compute paths.
+    ///
     /// # Arguments
     /// * `our_summary` - Our current state summary (used for cache key)
-    /// * `our_state_size` - Size of our current state (for efficiency check)
+    /// * `our_state_size` - Size of our current state (for the post-compute
+    ///   efficiency check)
     pub async fn compute_delta(
         &self,
         op_manager: &crate::node::OpManager,
@@ -1434,7 +1705,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         their_summary: &StateSummary<'static>,
         our_summary: &StateSummary<'static>,
         our_state_size: usize,
-    ) -> Result<Option<StateDelta<'static>>, String> {
+    ) -> Result<Option<StateDelta<'static>>, DeltaUnavailable> {
         use crate::contract::ContractHandlerEvent;
 
         // Use slices directly - cache methods hash internally, no allocation needed
@@ -1448,16 +1719,20 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                 return Ok(None);
             }
             tracing::trace!(contract = %key, "Using cached delta");
-            return Ok(Some(cached));
+            // The post-compute wire gate applies to cached deltas too: an
+            // oversized delta cached here (or by the staleness probe, which
+            // shares this cache and never gates) must produce the same
+            // NotEfficient refusal a fresh computation would — otherwise a
+            // cache hit would hand the caller a payload larger than the full
+            // state it exists to avoid.
+            return Self::gate_delta_size(cached, their_summary_bytes.len(), our_state_size);
         }
 
-        // Check if delta would be efficient
-        // (summary > 50% of state size means delta probably won't help)
-        if !is_delta_efficient(their_summary_bytes.len(), our_state_size) {
-            return Err("Delta not efficient for this contract".to_string());
-        }
-
-        // Compute delta via contract handler (short timeout for broadcast path)
+        // Compute delta via contract handler (short timeout for broadcast
+        // path). No pre-compute size gate here — see the method docs (#4923):
+        // refusing to compute forces a full-state send that is never smaller
+        // than the delta being declined, so the only correct place to judge
+        // efficiency is on the ACTUAL computed delta, below.
         match op_manager
             .notify_contract_handler_with_timeout(
                 ContractHandlerEvent::GetDeltaQuery {
@@ -1479,16 +1754,85 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     );
                     Ok(None)
                 } else {
-                    // Cache the result (includes contract key to prevent cross-contract pollution)
+                    // Cache the result (includes contract key to prevent
+                    // cross-contract pollution) BEFORE the size gate, even when
+                    // the delta is oversized — deliberately:
+                    // 1. `cached_staleness_verdict` maps any NON-EMPTY cached
+                    //    delta to "peer is stale", which is correct here: an
+                    //    oversized delta is still a genuine divergence, so the
+                    //    fan-out must still send (it will just send full state).
+                    //    Not caching would instead force the staleness path
+                    //    back through a WASM probe.
+                    // 2. Memoization: the next compute_delta for the same
+                    //    (contract, summaries) pair hits the cache above and
+                    //    re-applies the same gate — a consistent NotEfficient
+                    //    verdict with zero further WASM work, instead of
+                    //    re-running the contract on every fan-out target.
                     self.cache_delta(key, their_summary_bytes, our_summary_bytes, d.clone());
-                    Ok(Some(d))
+                    Self::gate_delta_size(d, their_summary_bytes.len(), our_state_size)
                 }
             }
-            Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => {
-                Err(format!("Delta computation failed: {}", e))
-            }
-            Ok(other) => Err(format!("Unexpected response to GetDeltaQuery: {:?}", other)),
-            Err(e) => Err(format!("Error computing delta: {}", e)),
+            Ok(ContractHandlerEvent::GetDeltaResponse { delta: Err(e), .. }) => Err(
+                DeltaUnavailable::ComputeFailed(format!("Delta computation failed: {}", e)),
+            ),
+            Ok(other) => Err(DeltaUnavailable::ComputeFailed(format!(
+                "Unexpected response to GetDeltaQuery: {:?}",
+                other
+            ))),
+            Err(e) => Err(DeltaUnavailable::ComputeFailed(format!(
+                "Error computing delta: {}",
+                e
+            ))),
+        }
+    }
+
+    /// Post-compute wire-efficiency gate (#4923): hand back the computed
+    /// (non-empty) delta unless full state would be smaller by at least
+    /// [`MIN_FULL_STATE_SAVING_BYTES`], in which case refuse with
+    /// [`DeltaUnavailable::NotEfficient`] so the caller's full-state fallback
+    /// is taken as the genuinely cheaper payload.
+    ///
+    /// The margin is load-bearing, not slop. A bare `delta.len() >=
+    /// state_size` comparison is byte-optimal but behaviorally wrong at small
+    /// sizes: a 144-byte delta against a 136-byte state would flip the payload
+    /// to full state to save EIGHT bytes, and doing that for every small
+    /// contract re-creates the full-state fan-out shape that #4233 exists to
+    /// prevent (`test_sustained_update_fanout_no_full_state_storm` pins
+    /// `delta_sends > full_state_sends` and catches exactly this). Deltas are
+    /// also what keeps a receiver's peer-summary cache warm, so trading them
+    /// away for a rounding error is a bad deal even ignoring the pin.
+    ///
+    /// So the rule is: prefer the delta by default, and switch to full state
+    /// only when that genuinely saves bandwidth worth the switch. The
+    /// pathological case this gate exists for — a contract whose summary (and
+    /// therefore delta) is state-sized, the #4956 poisoned-summary population
+    /// running at 550-840 KB — clears a 1 KiB margin by orders of magnitude.
+    ///
+    /// Note for callers whose fallback is NOT full state: a refusal here means
+    /// the summary-first PUT reverse leg
+    /// (`put::op_ctx_task::reverse_delta_from_compute_result`) ships NOTHING,
+    /// not full state, and the originator heals later via GET/anti-entropy.
+    /// That asymmetry predates this change (the old pre-compute gate refused
+    /// the same way) but the margin makes it much rarer.
+    fn gate_delta_size(
+        delta: StateDelta<'static>,
+        summary_size: usize,
+        our_state_size: usize,
+    ) -> Result<Option<StateDelta<'static>>, DeltaUnavailable> {
+        if delta.as_ref().len() >= our_state_size.saturating_add(MIN_FULL_STATE_SAVING_BYTES) {
+            tracing::trace!(
+                delta_size = delta.as_ref().len(),
+                state_size = our_state_size,
+                margin = MIN_FULL_STATE_SAVING_BYTES,
+                "Computed delta exceeds full state by more than the switch \
+                 margin — caller should send full state"
+            );
+            Err(DeltaUnavailable::NotEfficient {
+                summary_size,
+                state_size: our_state_size,
+            })
+        } else {
+            Ok(Some(delta))
         }
     }
 
@@ -1524,11 +1868,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// comparison via [`summary_indicates_stale_peer`]).
     ///
     /// Unlike [`compute_delta`](Self::compute_delta) this deliberately does NOT
-    /// apply the wire-efficiency gate ([`is_delta_efficient`]): staleness
-    /// detection wants the semantic answer even for contracts where a delta
-    /// would be larger than full state, because the alternative it replaces is a
-    /// spurious FULL-STATE heal on every heartbeat — strictly more expensive
-    /// than one delta computation.
+    /// apply the post-compute wire-efficiency gate: staleness detection wants
+    /// the semantic answer (empty vs non-empty) regardless of the delta's
+    /// SIZE, because the alternative it replaces is a spurious FULL-STATE heal
+    /// on every heartbeat — strictly more expensive than one delta
+    /// computation. (Since #4923 `compute_delta` also always runs the
+    /// contract; the remaining difference is only that it refuses to RETURN a
+    /// delta that is not smaller than full state, while this probe has no
+    /// notion of size at all.)
     ///
     /// Steady-state cost: the result rides the SAME delta cache as
     /// `compute_delta` (keyed by contract + both summary hashes). Note that
@@ -1919,7 +2266,7 @@ mod tests {
 
         // Update with summary
         let summary = StateSummary::from(vec![1, 2, 3]);
-        manager.update_peer_summary(&contract, &peer, Some(summary.clone()));
+        manager.update_peer_summary(&contract, &peer, summary.clone());
 
         let retrieved = manager.get_peer_summary(&contract, &peer);
         assert!(retrieved.is_some());
@@ -2133,6 +2480,12 @@ mod tests {
         assert!(hashes.contains(&contract_hash(&contract2)));
     }
 
+    /// Pins the [`is_delta_efficient`] heuristic itself. Since #4923 the
+    /// function is no longer consulted by `compute_delta` (the efficiency
+    /// gate moved POST-compute, onto the actual delta size — see
+    /// `oversized_computed_delta_returns_not_efficient`); it is kept as the
+    /// documented summary-size heuristic, and these assertions pin its
+    /// boundary behavior.
     #[test]
     fn test_delta_efficiency_check() {
         // Small summary relative to state - efficient
@@ -2366,7 +2719,7 @@ mod tests {
         assert_eq!(cached_summary.unwrap().as_ref(), summary2.as_ref());
 
         // Step 4: A sends its summary back
-        manager_b.update_peer_summary(&contract2, &peer_a, Some(summary1.clone()));
+        manager_b.update_peer_summary(&contract2, &peer_a, summary1.clone());
 
         // Verify B has A's summary
         let cached_summary = manager_b.get_peer_summary(&contract2, &peer_a);
@@ -2448,7 +2801,7 @@ mod tests {
         assert!(cached.is_some());
 
         // Simulate ResyncRequest: clear the summary
-        manager.update_peer_summary(&contract, &peer, None);
+        manager.clear_peer_summary(&contract, &peer, SummaryMissingReason::ClearedByResync);
 
         // Verify summary is now None
         let cached = manager.get_peer_summary(&contract, &peer);
@@ -2461,6 +2814,323 @@ mod tests {
                 .iter()
                 .any(|(pk, _)| pk == &peer)
         );
+    }
+
+    /// #4961: an entry that never had a summary written reports
+    /// `NeverPopulated`, and one that HAS a summary reports no reason at all.
+    ///
+    /// The second half is the load-bearing one: `summary_absence` keeps its
+    /// last value once a summary is cached, so a naive field read would
+    /// attribute a live, summary-holding peer to whichever path last cleared
+    /// it. Only the accessor's `is_none()` guard prevents that, and that is
+    /// exactly the mis-attribution this instrumentation exists to avoid.
+    #[test]
+    fn summary_missing_reason_is_never_populated_until_cleared_and_absent_when_cached() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert_eq!(
+            manager
+                .get_peer_interest(&contract, &peer)
+                .and_then(|i: PeerInterest| i.summary_missing_reason()),
+            Some(SummaryMissingReason::NeverPopulated),
+            "a fresh summaryless entry must report NeverPopulated"
+        );
+
+        manager.update_peer_summary(&contract, &peer, StateSummary::from(vec![1u8, 2, 3]));
+        assert_eq!(
+            manager
+                .get_peer_interest(&contract, &peer)
+                .and_then(|i: PeerInterest| i.summary_missing_reason()),
+            None,
+            "a peer WITH a cached summary must report no missing-reason — \
+             reading the raw field here would mis-attribute it"
+        );
+    }
+
+    /// #4961: each clear path is distinguishable, and a re-cached summary
+    /// hides the reason again.
+    ///
+    /// Without the per-path tag the `full_no_their_summary_tracked` arm (26.9%
+    /// of broadcast bytes on the aged 0.2.109 fleet) is one number covering
+    /// three causes with three different fixes.
+    #[test]
+    fn clear_peer_summary_records_the_distinguishing_reason() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        let summary = StateSummary::from(vec![1u8, 2, 3]);
+
+        for reason in SummaryMissingReason::ALL {
+            manager.register_peer_interest(&contract, peer.clone(), Some(summary.clone()), false);
+            manager.clear_peer_summary(&contract, &peer, reason);
+            assert_eq!(
+                manager
+                    .get_peer_interest(&contract, &peer)
+                    .and_then(|i: PeerInterest| i.summary_missing_reason()),
+                Some(reason),
+                "clear must record {reason:?}, not a different path's tag"
+            );
+
+            // Re-caching hides the reason; the arm no longer applies.
+            manager.update_peer_summary(&contract, &peer, summary.clone());
+            assert_eq!(
+                manager
+                    .get_peer_interest(&contract, &peer)
+                    .and_then(|i: PeerInterest| i.summary_missing_reason()),
+                None
+            );
+        }
+    }
+
+    /// Every reason has a distinct index and label — a collision would silently
+    /// merge two causes into one telemetry bucket, which is the exact failure
+    /// this split exists to prevent.
+    #[test]
+    fn summary_missing_reason_indices_and_labels_are_distinct() {
+        let indices: std::collections::HashSet<_> = SummaryMissingReason::ALL
+            .iter()
+            .map(|r| r.index())
+            .collect();
+        assert_eq!(
+            indices.len(),
+            SummaryMissingReason::ALL.len(),
+            "duplicate index would merge two causes into one counter"
+        );
+        assert!(
+            indices.iter().all(|i| *i < SummaryMissingReason::ALL.len()),
+            "index must stay in bounds of the counter array"
+        );
+        let labels: std::collections::HashSet<_> = SummaryMissingReason::ALL
+            .iter()
+            .map(|r| r.as_str())
+            .collect();
+        assert_eq!(
+            labels.len(),
+            SummaryMissingReason::ALL.len(),
+            "duplicate label would collide as a JSON field name"
+        );
+    }
+
+    /// `update_peer_summary` is a SILENT no-op for a peer that has no
+    /// `PeerInterest` entry for the contract — it cannot create one.
+    ///
+    /// This is the mechanism behind the `FullNoTheirSummaryUntracked` payload
+    /// arm, and it is load-bearing rather than incidental. Since #4642 step 9
+    /// removed the interest-manager fan-out arm, live broadcast targets are
+    /// resolved from `neighbor_hosting` (advertised co-hosts) while the
+    /// peer-summary cache still lives here, keyed on interest registration.
+    /// The two populations are maintained by independent mechanisms — the
+    /// advertisement exchange never touches `InterestManager`.
+    ///
+    /// So for a target present in one and absent from the other,
+    /// `get_peer_summary` returns None (the fan-out sends FULL STATE) and the
+    /// post-delivery `update_peer_summary` that is supposed to fix that
+    /// (#4442's fix for exactly this chicken-and-egg) silently does nothing —
+    /// so the pair never escapes to deltas via THIS method. This was a fixed
+    /// point until #4952 routed the delivery path (and the Summaries handler)
+    /// through `upsert_peer_summary`, which creates the entry; the no-op
+    /// semantics pinned here remain correct and load-bearing for writes of
+    /// unknown provenance. Historically it was a fixed point, not a cold
+    /// start.
+    ///
+    /// The pre-existing broadcast-path tests all `register_peer_interest`
+    /// first, so none of them exercise this state.
+    #[test]
+    fn update_peer_summary_is_a_silent_noop_for_an_untracked_peer() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+        let summary = StateSummary::from(vec![1u8, 2, 3]);
+
+        // No register_peer_interest: this peer is an advertised co-host that
+        // the InterestSync heartbeat has not registered.
+        assert!(
+            manager.get_peer_interest(&contract, &peer).is_none(),
+            "precondition: the peer must be untracked"
+        );
+
+        manager.update_peer_summary(&contract, &peer, summary);
+
+        assert!(
+            manager.get_peer_summary(&contract, &peer).is_none(),
+            "update_peer_summary silently dropped the write for an untracked \
+             peer. A broadcast target in this state can never cache a summary, \
+             so every broadcast to it is FULL STATE forever — if this ever \
+             starts passing, the structural full-state trap is closed and the \
+             FullNoTheirSummaryUntracked arm should go to zero in production."
+        );
+
+        // And it stays that way no matter how many deliveries land.
+        for _ in 0..5 {
+            manager.update_peer_summary(&contract, &peer, StateSummary::from(vec![9u8]));
+        }
+        assert!(
+            manager.get_peer_summary(&contract, &peer).is_none(),
+            "repeated deliveries must not accumulate a summary either — the \
+             trap is a fixed point, not a slow warm-up"
+        );
+
+        // Contrast: once the peer IS tracked, the very same call sticks.
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        manager.update_peer_summary(&contract, &peer, StateSummary::from(vec![7u8]));
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![7u8]),
+            "a TRACKED peer caches the summary, so it escapes to deltas — this \
+             is what makes the untracked case a distinct bug rather than cold \
+             start"
+        );
+    }
+
+    /// #4952 regression: `upsert_peer_summary` closes the untracked-co-host
+    /// full-state fixed point that `update_peer_summary` (pinned no-op above)
+    /// cannot. The post-delivery cache in
+    /// `broadcast_queue::record_delivery_to_interest` routes through the
+    /// upsert, so one delivered full state seeds the summary and every later
+    /// broadcast to the same peer can be a delta.
+    #[test]
+    fn upsert_peer_summary_seeds_summary_for_untracked_peer() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        assert!(
+            manager.get_peer_interest(&contract, &peer).is_none(),
+            "precondition: the peer must be untracked"
+        );
+
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![1u8, 2])));
+
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![1u8, 2]),
+            "the upsert must CREATE the entry so the pair escapes to deltas"
+        );
+        let interest = manager
+            .get_peer_interest(&contract, &peer)
+            .expect("entry created");
+        assert!(
+            !interest.is_upstream,
+            "a delivery-seeded entry is not our upstream"
+        );
+
+        // Later deliveries keep the cached summary current.
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![9u8])));
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &peer)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![9u8]),
+        );
+
+        // The reverse index is maintained, so peer-disconnect cleanup works.
+        assert!(manager.get_contracts_for_peer(&peer).contains(&contract));
+        assert!(manager.remove_peer_interest(&contract, &peer));
+        assert!(manager.get_peer_summary(&contract, &peer).is_none());
+        assert!(!manager.get_contracts_for_peer(&peer).contains(&contract));
+
+        // Summary bookkeeping must not fabricate local demand (invariant 3):
+        // no local-interest entry appears as a side effect.
+        assert!(
+            !manager.has_local_interest(&contract),
+            "upsert must not create local interest / demand state"
+        );
+    }
+
+    /// #4952: at the per-contract cap the upsert must reject a NEW peer (no
+    /// amplification vector, no zombie side-writes) while still updating a
+    /// peer that is already tracked.
+    #[test]
+    fn upsert_peer_summary_respects_interested_peer_cap() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+
+        for i in 0..MAX_INTERESTED_PEERS_PER_CONTRACT {
+            assert!(manager.register_peer_interest(
+                &contract,
+                make_unique_peer_key(i as u32),
+                None,
+                false
+            ));
+        }
+
+        let newcomer = make_unique_peer_key(u32::MAX);
+        assert!(
+            !manager.upsert_peer_summary(&contract, &newcomer, StateSummary::from(vec![1u8])),
+            "a new peer at cap must be rejected"
+        );
+        assert!(manager.get_peer_interest(&contract, &newcomer).is_none());
+        assert!(
+            !manager
+                .get_contracts_for_peer(&newcomer)
+                .contains(&contract),
+            "a rejected upsert must leave no reverse-index zombie"
+        );
+
+        // An EXISTING peer at cap must still take the update path — the
+        // get_mut-before-cap-check branch order is load-bearing: popular
+        // 512-peer contracts are exactly the #4952 population, and a
+        // register_peer_interest-shaped refactor (cap check first) would
+        // silently freeze summary refreshes for all of them.
+        let existing = make_unique_peer_key(0);
+        assert!(
+            manager.upsert_peer_summary(&contract, &existing, StateSummary::from(vec![42u8])),
+            "an already-tracked peer at cap must still update"
+        );
+        assert_eq!(
+            manager
+                .get_peer_summary(&contract, &existing)
+                .map(|s| s.as_ref().to_vec()),
+            Some(vec![42u8]),
+        );
+    }
+
+    /// #4952: upserting an already-tracked peer takes the update path —
+    /// summary replaced, `is_upstream` preserved.
+    #[test]
+    fn upsert_peer_summary_updates_existing_entry_preserving_upstream_flag() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        manager.register_peer_interest(&contract, peer.clone(), None, true);
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![5u8])));
+
+        let interest = manager
+            .get_peer_interest(&contract, &peer)
+            .expect("tracked");
+        assert!(
+            interest.is_upstream,
+            "upsert on an existing entry must not clobber the upstream flag"
+        );
+        assert_eq!(
+            interest.summary.map(|s| s.as_ref().to_vec()),
+            Some(vec![5u8])
+        );
+    }
+
+    /// #4952: an upsert-created entry is ordinary interest state — the TTL
+    /// sweep removes it (entry + reverse index) with no GC exemption, per the
+    /// cleanup-exemptions-must-be-time-bounded rule.
+    #[test]
+    fn upsert_created_entry_expires_via_ttl_sweep() {
+        let (manager, time) = make_manager();
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(1);
+
+        assert!(manager.upsert_peer_summary(&contract, &peer, StateSummary::from(vec![1u8])));
+        time.advance_time(INTEREST_TTL + Duration::from_secs(60));
+        manager.sweep_expired_interests();
+
+        assert!(manager.get_peer_interest(&contract, &peer).is_none());
+        assert!(!manager.get_contracts_for_peer(&peer).contains(&contract));
     }
 
     #[test]
@@ -2497,7 +3167,7 @@ mod tests {
 
         // Step 1: A sends ResyncRequest
         // B receives it and clears A's cached summary
-        manager_b.update_peer_summary(&contract, &peer_a, None);
+        manager_b.clear_peer_summary(&contract, &peer_a, SummaryMissingReason::ClearedByResync);
 
         // Verify B cleared A's summary
         let cached = manager_b.get_peer_summary(&contract, &peer_a);
@@ -2505,7 +3175,7 @@ mod tests {
 
         // Step 2: B sends ResyncResponse with full state and summary
         // A receives it and updates B's summary
-        manager_a.update_peer_summary(&contract, &peer_b, Some(new_summary.clone()));
+        manager_a.update_peer_summary(&contract, &peer_b, new_summary.clone());
 
         // Verify A has B's new summary
         let cached = manager_a.get_peer_summary(&contract, &peer_b);
@@ -2533,10 +3203,15 @@ mod tests {
 
     #[test]
     fn test_delta_vs_full_state_decision() {
-        // This test verifies the decision logic for when to send delta vs full state.
-        // The decision is based on:
+        // This test verifies the inputs to the delta-vs-full-state decision:
         // 1. Whether we have peer's summary (None = full state)
-        // 2. Whether delta is efficient (summary < 50% of state size)
+        // 2. The is_delta_efficient summary-size heuristic's boundaries.
+        //
+        // NOTE (#4923): the heuristic is no longer a pre-compute refusal in
+        // `compute_delta` — a large summary now still gets a real delta
+        // computed, and only a delta that is not smaller than the full state
+        // is refused (post-compute). The assertions below pin the heuristic
+        // function itself, not the (removed) gate wiring.
 
         let (manager, _time) = make_manager();
         let contract = make_contract_key(1);
@@ -3767,6 +4442,344 @@ mod tests {
         assert_eq!(
             manager.cached_staleness_verdict(&contract, theirs.as_ref(), ours.as_ref()),
             Some(true)
+        );
+    }
+
+    // ---- Post-compute efficiency gate (#4923) ------------------------------
+    //
+    // Production incident: `compute_delta` refused to even ASK the contract
+    // for a delta whenever the peer's summary was >= 50% of our state size
+    // (the pre-compute `is_delta_efficient` gate), and every caller answers
+    // that refusal by sending FULL STATE — which is never smaller than the
+    // delta that was declined. On the live network that arm was 41% of ALL
+    // wire bytes (87.4% for the hottest contract), flat over time. The gate
+    // now runs POST-compute, on the actual delta size. These tests drive the
+    // real `compute_delta` against a real `OpManager` whose contract-handler
+    // side is a mock responder task, so the whole path (cache lookup →
+    // `GetDeltaQuery` → post-compute gate) is exercised.
+
+    /// Build a real `OpManager` backed by a temp-dir `Config` (mirrors
+    /// `summarize_delta_cache_tests::build_op_manager`) and spawn a mock
+    /// contract handler that answers every `GetDeltaQuery` with
+    /// `delta_bytes`, counting the queries it serves. The returned guard
+    /// bundle keeps the other channel receivers + task monitor alive for the
+    /// whole test (dropping them mid-run would tear down the OpManager's
+    /// channels).
+    async fn op_manager_with_mock_delta_handler(
+        id: &str,
+        delta_bytes: Vec<u8>,
+    ) -> (
+        std::sync::Arc<crate::node::OpManager>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        Box<dyn std::any::Any>,
+    ) {
+        use crate::contract::ContractHandlerEvent;
+
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+
+        // The mock contract handler: serve `delta_bytes` for every
+        // GetDeltaQuery, exactly as a real handler would after running the
+        // contract's `get_state_delta`.
+        let queries_served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = queries_served.clone();
+        let responder = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                if let ContractHandlerEvent::GetDeltaQuery { key, .. } = ev {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let sent = ch_channel
+                        .send_to_sender(
+                            id,
+                            ContractHandlerEvent::GetDeltaResponse {
+                                key,
+                                delta: Ok(StateDelta::from(delta_bytes.clone())),
+                            },
+                        )
+                        .await;
+                    if sent.is_err() {
+                        // The querying side dropped (test teardown) — stop.
+                        break;
+                    }
+                }
+            }
+        });
+
+        let guards: Box<dyn std::any::Any> = Box::new((
+            notification_rx,
+            wait_for_event,
+            result_router_rx,
+            task_monitor,
+            responder,
+        ));
+        (op_manager, queries_served, guards)
+    }
+
+    /// THE incident pin (#4923): a peer whose cached summary is large (here
+    /// state-sized, so the removed pre-compute gate would refuse outright:
+    /// `1000 * 2 >= 1000`) must no longer force a full-state fallback when
+    /// the contract's ACTUAL delta is small. Pre-fix this returned
+    /// `Err(NotEfficient)` without running any contract code, and the caller
+    /// (`broadcast_to_single_peer`) shipped the entire state — 41% of all
+    /// network wire bytes in production. Post-fix the delta is computed and
+    /// returned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_peer_summary_no_longer_forces_full_state_when_delta_is_small() {
+        let small_delta = vec![42u8, 43, 44]; // 3 bytes vs a 1000-byte state
+        let (op_manager, queries_served, _guards) =
+            op_manager_with_mock_delta_handler("post_gate_incident_pin", small_delta.clone()).await;
+
+        let key = make_contract_key(101);
+        let our_state_size = 1000usize;
+        // State-sized peer summary: the exact shape production saw for the
+        // hot contract (their_summary.len() * 2 >= our_state_size).
+        let their_summary = StateSummary::from(vec![7u8; 1000]);
+        let our_summary = StateSummary::from(vec![1u8, 2, 3]);
+
+        let result = op_manager
+            .interest_manager
+            .compute_delta(
+                &op_manager,
+                &key,
+                &their_summary,
+                &our_summary,
+                our_state_size,
+            )
+            .await;
+
+        let delta = result
+            .expect(
+                "an oversized peer summary must no longer refuse the delta \
+                 pre-compute — the fallback (full state) is never smaller than \
+                 the delta being declined (#4923)",
+            )
+            .expect("the contract returned a non-empty delta");
+        assert_eq!(
+            delta.as_ref(),
+            small_delta.as_slice(),
+            "the computed small delta must be handed back verbatim"
+        );
+        assert_eq!(
+            queries_served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the contract handler must have been consulted exactly once"
+        );
+        // The result is memoized in the shared delta cache.
+        assert!(
+            op_manager
+                .interest_manager
+                .get_cached_delta(&key, their_summary.as_ref(), our_summary.as_ref())
+                .is_some(),
+            "the computed delta must be cached for subsequent fan-out targets"
+        );
+    }
+
+    /// The post-compute gate: a delta that comes back NOT smaller than our
+    /// full state still yields `NotEfficient` — so the caller's full-state
+    /// fallback is taken exactly when it is genuinely optimal. Also pins the
+    /// deliberate cache interaction: the oversized delta IS cached (so
+    /// `cached_staleness_verdict` still reports genuine divergence and no
+    /// WASM re-runs), and a second `compute_delta` call answers from the
+    /// cache — same refusal, zero additional contract queries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_computed_delta_returns_not_efficient() {
+        // Must exceed the state by more than MIN_FULL_STATE_SAVING_BYTES for
+        // the switch to full state to be worth making.
+        let oversized_delta = vec![9u8; 4 + MIN_FULL_STATE_SAVING_BYTES + 1];
+        let (op_manager, queries_served, _guards) =
+            op_manager_with_mock_delta_handler("post_gate_oversized_delta", oversized_delta).await;
+
+        let key = make_contract_key(102);
+        let our_state_size = 4usize;
+        // Small peer summary: the OLD pre-compute gate would have let this
+        // through (1 * 2 < 4), so this failure mode is reachable only via the
+        // post-compute check.
+        let their_summary = StateSummary::from(vec![5u8]);
+        let our_summary = StateSummary::from(vec![6u8, 6, 6]);
+
+        for pass in 1..=2u32 {
+            let result = op_manager
+                .interest_manager
+                .compute_delta(
+                    &op_manager,
+                    &key,
+                    &their_summary,
+                    &our_summary,
+                    our_state_size,
+                )
+                .await;
+            assert_eq!(
+                result,
+                Err(DeltaUnavailable::NotEfficient {
+                    summary_size: their_summary.as_ref().len(),
+                    state_size: our_state_size,
+                }),
+                "pass {pass}: a computed delta >= full state must refuse with \
+                 NotEfficient so the caller's full-state fallback is optimal"
+            );
+        }
+        assert_eq!(
+            queries_served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second call must be served from the delta cache (memoized \
+             refusal), not a second WASM run"
+        );
+        // The oversized delta is cached ON PURPOSE: it is still a genuine
+        // divergence, so the staleness machinery must keep reporting "peer is
+        // stale" (the fan-out then heals with full state).
+        assert_eq!(
+            op_manager.interest_manager.cached_staleness_verdict(
+                &key,
+                their_summary.as_ref(),
+                our_summary.as_ref()
+            ),
+            Some(true),
+            "an oversized (non-empty) cached delta must still read as genuine \
+             divergence for the staleness verdict"
+        );
+    }
+
+    /// Boundary pin for the switch margin. A delta merely EQUAL to (or a few
+    /// bytes larger than) our state must still be SHIPPED: flipping to full
+    /// state there buys nothing and re-creates the #4233 full-state fan-out
+    /// shape for every small contract. Only a delta that clears
+    /// `state + MIN_FULL_STATE_SAVING_BYTES` refuses.
+    ///
+    /// The 144-vs-136 case is the real one observed in
+    /// `test_summary_first_put_holder_found_ships_delta`: a bare `>=`
+    /// comparison abandoned the delta to save 8 bytes and broke both the
+    /// summary-first PUT reverse leg and the storm pin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn delta_slightly_larger_than_state_is_still_shipped() {
+        let our_state_size = 136usize;
+        let slightly_larger = vec![3u8; 144]; // the observed real-world pair
+        let (op_manager, _queries_served, _guards) =
+            op_manager_with_mock_delta_handler("post_gate_margin_delta", slightly_larger.clone())
+                .await;
+
+        let key = make_contract_key(103);
+        let their_summary = StateSummary::from(vec![4u8]);
+        let our_summary = StateSummary::from(vec![5u8, 5]);
+
+        let delta = op_manager
+            .interest_manager
+            .compute_delta(
+                &op_manager,
+                &key,
+                &their_summary,
+                &our_summary,
+                our_state_size,
+            )
+            .await
+            .expect(
+                "a delta only 8 bytes larger than the state must NOT be \
+                 refused — switching to full state to save 8 bytes is the \
+                 #4233 full-state fan-out shape",
+            )
+            .expect("the contract returned a non-empty delta");
+        assert_eq!(delta.as_ref(), slightly_larger.as_slice());
+    }
+
+    /// The exact refusal threshold: `state + MIN_FULL_STATE_SAVING_BYTES` is
+    /// the first size that loses. One byte under it must still ship, so an
+    /// off-by-one in the margin comparison is caught in both directions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn delta_at_margin_threshold_refuses_but_one_byte_under_ships() {
+        let our_state_size = 100usize;
+        let key = make_contract_key(104);
+        let their_summary = StateSummary::from(vec![4u8]);
+        let our_summary = StateSummary::from(vec![5u8, 5]);
+
+        // One byte UNDER the threshold: still shipped.
+        let under = vec![1u8; 100 + MIN_FULL_STATE_SAVING_BYTES - 1];
+        let (op_under, _q, _g) =
+            op_manager_with_mock_delta_handler("post_gate_margin_under", under).await;
+        assert!(
+            op_under
+                .interest_manager
+                .compute_delta(
+                    &op_under,
+                    &key,
+                    &their_summary,
+                    &our_summary,
+                    our_state_size
+                )
+                .await
+                .is_ok(),
+            "one byte under the switch margin must still ship the delta"
+        );
+
+        // Exactly AT the threshold: refused.
+        let at = vec![1u8; 100 + MIN_FULL_STATE_SAVING_BYTES];
+        let (op_at, _q2, _g2) = op_manager_with_mock_delta_handler("post_gate_margin_at", at).await;
+        assert_eq!(
+            op_at
+                .interest_manager
+                .compute_delta(&op_at, &key, &their_summary, &our_summary, our_state_size)
+                .await,
+            Err(DeltaUnavailable::NotEfficient {
+                summary_size: their_summary.as_ref().len(),
+                state_size: our_state_size,
+            }),
+            "a delta at state + MIN_FULL_STATE_SAVING_BYTES must refuse"
+        );
+    }
+
+    /// Converged-peer companion to the incident pin: with the SAME oversized
+    /// peer summary the pre-compute gate used to refuse before the contract
+    /// could report an EMPTY delta, so a logically-converged peer was
+    /// re-flooded with full state. Post-#4923 the empty delta is seen and
+    /// `Ok(None)` lets the caller skip the send entirely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_peer_summary_with_empty_delta_reports_converged() {
+        let (op_manager, queries_served, _guards) =
+            op_manager_with_mock_delta_handler("post_gate_empty_delta", Vec::new()).await;
+
+        let key = make_contract_key(103);
+        let their_summary = StateSummary::from(vec![8u8; 1000]); // state-sized
+        let our_summary = StateSummary::from(vec![4u8, 2]);
+
+        let result = op_manager
+            .interest_manager
+            .compute_delta(&op_manager, &key, &their_summary, &our_summary, 1000)
+            .await;
+        assert_eq!(
+            result,
+            Ok(None),
+            "an empty delta behind an oversized peer summary must report \
+             converged (skip), not NotEfficient (full-state re-flood)"
+        );
+        assert_eq!(
+            queries_served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the contract must have been consulted for the verdict"
         );
     }
 }

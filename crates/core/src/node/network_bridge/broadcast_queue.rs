@@ -20,6 +20,7 @@ use crate::node::OpManager;
 use crate::ring::PeerKeyLocation;
 use crate::transport::BroadcastDeliveryOutcome;
 
+use super::broadcast_payload_mix::PayloadArm;
 use super::p2p_protoc::P2pBridge;
 
 /// Timeout for awaiting stream completion signal before releasing the permit
@@ -212,13 +213,13 @@ pub(super) struct SummaryPair<'a> {
 /// finding): a contract whose `summarize_state` serializes
 /// non-deterministically (HashMap/HashSet iteration order, per-process
 /// `RandomState`) yields different summary bytes for the SAME logical state on
-/// different peers. The byte compare then never skips, `compute_delta` either
-/// returns an empty delta (which the pre-fix arm "fell back" from by sending
-/// FULL STATE) or is refused outright by the `is_delta_efficient` gate on
-/// big-summary contracts — so a fully-converged pair re-flooded full state on
-/// every heartbeat-driven sync and every fan-out (the nondeterministic-summary
-/// heal storm; e.g. the `Eumk9HNQ` contract that "healed" hard while its state
-/// never changed).
+/// different peers. The byte compare then never skips, and `compute_delta`
+/// either returned an empty delta (which the pre-fix arm "fell back" from by
+/// sending FULL STATE) or — before #4923 removed the pre-compute
+/// `is_delta_efficient` gate — was refused outright on big-summary contracts,
+/// so a fully-converged pair re-flooded full state on every heartbeat-driven
+/// sync and every fan-out (the nondeterministic-summary heal storm; e.g. the
+/// `Eumk9HNQ` contract that "healed" hard while its state never changed).
 ///
 /// This helper reuses the #4894 machinery: byte-equal summaries short-circuit
 /// to [`FanoutSendPlan::Skip`]; byte-differing summaries consult the shared
@@ -283,13 +284,13 @@ pub(super) fn plan_fanout_send<T: crate::util::time_source::TimeSource + Sync>(
 /// fan-out pass can issue. Probe results land in the shared delta cache, so
 /// repeated fan-outs for an unchanged pair cost no further WASM.
 ///
-/// Note the probe deliberately bypasses the [`is_delta_efficient`] wire gate
-/// (see `peer_summary_has_pending_state`): staleness detection wants the
-/// semantic answer even for big-summary contracts, because the alternative it
+/// Note the probe deliberately has no notion of delta SIZE (see
+/// `peer_summary_has_pending_state`): staleness detection wants only the
+/// semantic answer (empty vs non-empty delta), because the alternative it
 /// replaces is a spurious FULL-STATE send on every fan-out — strictly more
-/// expensive than one delta computation.
-///
-/// [`is_delta_efficient`]: crate::ring::interest::is_delta_efficient
+/// expensive than one delta computation. (`compute_delta` shares the same
+/// always-compute behavior since #4923; it additionally refuses to RETURN a
+/// delta that is not smaller than full state.)
 pub(super) async fn fanout_send_needed(
     op_manager: &OpManager,
     key: &ContractKey,
@@ -702,8 +703,14 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // by those backstops rather than by an end-to-end ack here. Caching lets the
     // NEXT broadcast to this peer be a small delta instead of full state.
     // (Telemetry above still records delta-vs-full-state separately.)
+    // #4952: this MUST be the upsert, not `update_peer_summary` — the latter
+    // silently no-ops for a peer with no interest entry, which turned every
+    // advertised co-host (fan-out targets come from NeighborHosting, a
+    // population frequently untracked at broadcast time) into a full-state
+    // fixed point: full state on every update, forever. The upsert creates the
+    // entry (capped, no demand-counter writes) so the next send is a delta.
     if let Some(summary) = our_summary {
-        interest_manager.update_peer_summary(key, peer_key, Some(summary.clone()));
+        interest_manager.upsert_peer_summary(key, peer_key, summary.clone());
     }
 }
 
@@ -845,11 +852,40 @@ pub(super) async fn broadcast_to_single_peer(
         );
     }
 
-    // Compute delta if we have their summary
-    let (payload, sent_delta) = match (&our_summary, &their_summary) {
-        _ if deltas_suppressed => (
+    // Compute delta if we have their summary.
+    //
+    // Every arm below is tagged with the `PayloadArm` that produced it. The
+    // three full-state arms have completely different remedies, and until
+    // #3335 none of them were separately instrumented — the production
+    // measurement could see that large states go out whole but not why. The
+    // tag is carried to the real-delivery sites below and recorded there, so
+    // the mix counts bytes that actually reached the wire.
+    // Gate inputs for the `FullNotEfficient` arm, carried to the delivery site
+    // so the payload-mix rollup can report the real (summary_size, state_size)
+    // each refusal was observed under. `DeltaUnavailable::NotEfficient` has
+    // always carried these, but its only reader was a `debug!` — compiled out
+    // in release — so in production the refusals were unattributable. Since
+    // #4923 the refusal itself is POST-compute (the computed delta was not
+    // smaller than the state), so the ratio of these two inputs field-checks
+    // the old pre-compute proxy rather than restating the trigger. See #3335.
+    let mut not_efficient_gate_inputs: Option<(usize, usize)> = None;
+    // #4961: WHY a tracked peer has no cached summary. Set only on the
+    // `FullNoTheirSummaryTracked` arm below, where the entry exists to be read.
+    let mut tracked_missing_reason: Option<crate::ring::interest::SummaryMissingReason> = None;
+    let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
+        // Scoped to the both-summaries-present case ON PURPOSE. When a summary
+        // is missing a delta was impossible regardless of the memo, so letting
+        // the suppression guard win there would credit the memo for a full
+        // state it did not cause — overstating `FullDeltaSuppressed` and
+        // undercounting the no-summary arms, which is exactly the distinction
+        // this instrumentation exists to draw. Behavior is unchanged either way
+        // (a missing summary falls to the no-summary arms below, which also
+        // send full state and also never reach `compute_delta`), so this is
+        // purely about attributing the bytes to the right cause.
+        (Some(_), Some(_)) if deltas_suppressed => (
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
+            PayloadArm::FullDeltaSuppressed,
         ),
         (Some(ours), Some(theirs)) => {
             match op_manager
@@ -857,7 +893,11 @@ pub(super) async fn broadcast_to_single_peer(
                 .compute_delta(op_manager, &key, theirs, ours, new_state.size())
                 .await
             {
-                Ok(Some(delta)) => (DeltaOrFullState::Delta(delta.as_ref().to_vec()), true),
+                Ok(Some(delta)) => (
+                    DeltaOrFullState::Delta(delta.as_ref().to_vec()),
+                    true,
+                    PayloadArm::Delta,
+                ),
                 Ok(None) => {
                     // The contract computed an EMPTY delta against the peer's
                     // summary: the peer is logically converged despite the
@@ -884,17 +924,93 @@ pub(super) async fn broadcast_to_single_peer(
                         error = %err,
                         "Delta computation failed, falling back to full state"
                     );
+                    // Split the refusal from a genuine failure: `NotEfficient`
+                    // means the contract DID compute a delta but it was not
+                    // smaller than our full state (post-#4923 semantics), so
+                    // the full state sent here is the genuinely optimal
+                    // payload — equal or fewer bytes than the refused delta.
+                    let arm = match err {
+                        crate::ring::interest::DeltaUnavailable::NotEfficient {
+                            summary_size,
+                            state_size,
+                        } => {
+                            not_efficient_gate_inputs = Some((summary_size, state_size));
+                            PayloadArm::FullNotEfficient
+                        }
+                        crate::ring::interest::DeltaUnavailable::ComputeFailed(_) => {
+                            PayloadArm::FullComputeFailed
+                        }
+                    };
                     (
                         DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
                         false,
+                        arm,
                     )
                 }
             }
         }
-        _ => (
+        // No summary on one side, so no delta was possible. Which side is
+        // missing decides the remedy, and until #3335's follow-up they were
+        // indistinguishable in the rollup:
+        //
+        //   * ours missing  -> `get_contract_summary` failed (contract-handler
+        //     timeout at BROADCAST_CH_TIMEOUT, WASM error, unexpected reply).
+        //     A LOAD problem. It also poisons the peer: `sender_summary_bytes`
+        //     below is `unwrap_or_default()`, so the peer caches an EMPTY
+        //     summary as ours with no way to tell it from a real one.
+        //
+        //   * theirs missing -> a peer-summary CACHE gap, and the two
+        //     sub-cases differ in HOW they self-heal. Broadcast targets come
+        //     from `neighbor_hosting` (advertised co-hosts) since #4642 step 9
+        //     dropped the interest-manager fan-out arm, so a target is often
+        //     untracked in `interested_peers` at broadcast time (the
+        //     heartbeat-registration chain exists — register_local_hosting →
+        //     Interests → register — but frequently hasn't fired or was
+        //     full-replace-wiped for this pair). Pre-#4952 that population
+        //     was a fixed point: the post-delivery cache write was a silent
+        //     `update_peer_summary` no-op, so every broadcast stayed full
+        //     state, permanently. Since #4952 the delivery path UPSERTS, so
+        //     untracked is transient (one full state seeds the summary) and
+        //     this arm should decay toward first-send-only levels — a
+        //     persistent residual now implicates the seeding/heartbeat chain
+        //     (e.g. an Interests full-replace wiping the pair each ~5 min),
+        //     not the old structural trap. Tracked-but-summaryless (arm 6)
+        //     repairs on the next delivery, same as before.
+        //
+        // `get_peer_interest` is an in-memory DashMap read — no contract
+        // handler round-trip — so this classification costs nothing on a path
+        // that has already decided to put a whole state on the wire.
+        (None, _) => (
             DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
             false,
+            PayloadArm::FullNoOurSummary,
         ),
+        (Some(_), None) => {
+            let arm = if let Some(interest) = op_manager
+                .interest_manager
+                .get_peer_interest(&key, &peer_key)
+            {
+                // #4961 needs this to tell the three clear paths apart, since
+                // they have three different fixes and this is the largest
+                // broadcast-byte arm.
+                //
+                // Usually `Some`: this match arm means `their_summary` was
+                // `None`. But that was read further up, before an `.await`, so
+                // a concurrent upsert in between leaves the entry holding a
+                // summary and this reads `None`. That send is then counted in
+                // `tracked_missing_unattributed_*` rather than being charged to
+                // a cause that did not produce it.
+                tracked_missing_reason = interest.summary_missing_reason();
+                PayloadArm::FullNoTheirSummaryTracked
+            } else {
+                PayloadArm::FullNoTheirSummaryUntracked
+            };
+            (
+                DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+                false,
+                arm,
+            )
+        }
     };
     let payload_size = payload.size();
     // Attribute the summarize + delta WASM (CPU) burned to produce this send.
@@ -1057,6 +1173,15 @@ pub(super) async fn broadcast_to_single_peer(
                         crate::topology::meter::ResourceType::BroadcastFanoutCost,
                         payload_size as f64,
                     );
+                    // Same delivery gate as the cost axis above, so the mix and
+                    // the cost axis always agree on what "sent" means (#3335).
+                    op_manager.payload_mix.record_delivered(
+                        payload_arm,
+                        key.id(),
+                        payload_size,
+                        not_efficient_gate_inputs,
+                        tracked_missing_reason,
+                    );
                     tracing::debug!(
                         tx = %update_tx,
                         peer = %peer_addr,
@@ -1097,6 +1222,15 @@ pub(super) async fn broadcast_to_single_peer(
                 *key.id(),
                 crate::topology::meter::ResourceType::BroadcastFanoutCost,
                 payload_size as f64,
+            );
+            // Same delivery gate as the cost axis above, so the mix and the
+            // cost axis always agree on what "sent" means (#3335).
+            op_manager.payload_mix.record_delivered(
+                payload_arm,
+                key.id(),
+                payload_size,
+                not_efficient_gate_inputs,
+                tracked_missing_reason,
             );
             // Delta-incompat attribution (HQk7 resync loop): remember that we
             // just delivered a DELTA to this peer so a prompt `ResyncRequest`
@@ -1438,6 +1572,93 @@ mod tests {
         );
     }
 
+    /// #4952 — the untracked-co-host counterpart of the #4145 test above,
+    /// driven through the REAL production gate. The peer is a fan-out target
+    /// from `neighbor_hosting` with NO interest entry at all (not merely no
+    /// summary). Pre-#4952 the post-delivery cache write was a silent
+    /// `update_peer_summary` no-op, so this test FAILS on that code; it also
+    /// fails on the semantic dodge the source pin can't catch (e.g. re-gating
+    /// the upsert on prior tracking), because it asserts through the gate, not
+    /// the source text.
+    #[tokio::test]
+    async fn untracked_peer_delivery_seeds_interest_and_summary() {
+        let our_summary = StateSummary::from(vec![5, 6, 7, 8]);
+
+        let time_source = SharedMockTimeSource::new();
+        let manager = InterestManager::new(time_source.clone());
+        let contract = make_contract_key(11);
+        let peer = make_peer_key();
+
+        // NO register_peer_interest: an advertised co-host untracked at
+        // broadcast time — the #4952 population.
+        assert!(
+            manager.get_peer_interest(&contract, &peer).is_none(),
+            "precondition: the peer must be untracked"
+        );
+
+        let delivered = record_streaming_delivery(
+            &manager,
+            Ok(Ok(BroadcastDeliveryOutcome::Delivered)),
+            /* sent_delta */ false,
+            &contract,
+            &peer,
+            Some(&our_summary),
+            /* state_size */ 4096,
+            /* payload_size */ 4096,
+        );
+        assert!(delivered);
+
+        assert_eq!(
+            manager.get_peer_summary(&contract, &peer),
+            Some(our_summary),
+            "#4952: a delivered full-state broadcast to an UNTRACKED peer must \
+             seed the interest entry + summary, so the next broadcast is a \
+             delta — otherwise the pair is a full-state fixed point"
+        );
+    }
+
+    /// #4952 divergence guard for the untracked population: a NON-delivered
+    /// full-state send must not fabricate an interest entry carrying a summary
+    /// the peer never received (which would suppress the summary-mismatch
+    /// resend — the #4235 failure mode, now newly reachable because the
+    /// delivery path can create entries).
+    #[tokio::test]
+    async fn untracked_peer_drop_outcome_does_not_fabricate_interest() {
+        let our_summary = StateSummary::from(vec![3, 3, 3]);
+        let dropped = dropped_oneshot().await;
+        let timed_out = elapsed_timeout().await;
+        let cases: Vec<(&str, super::StreamCompletionResult)> = vec![
+            ("explicit-drop", Ok(Ok(BroadcastDeliveryOutcome::Dropped))),
+            ("dropped-oneshot", Ok(dropped)),
+            ("timeout", Err(timed_out)),
+        ];
+
+        for (name, completion) in cases {
+            let time_source = SharedMockTimeSource::new();
+            let manager = InterestManager::new(time_source.clone());
+            let contract = make_contract_key(12);
+            let peer = make_peer_key();
+
+            let delivered = record_streaming_delivery(
+                &manager,
+                completion,
+                /* sent_delta */ false,
+                &contract,
+                &peer,
+                Some(&our_summary),
+                /* state_size */ 2048,
+                /* payload_size */ 2048,
+            );
+            assert!(!delivered, "[{name}] must not classify as delivered");
+            assert!(
+                manager.get_peer_interest(&contract, &peer).is_none(),
+                "[{name}] a non-delivered send must NOT fabricate an interest \
+                 entry for an untracked peer — a summary the peer never \
+                 received would suppress the mismatch resend (#4235)"
+            );
+        }
+    }
+
     /// Issue #4145 / #2763 — divergence guard preserved. The #4145 fix caches on
     /// any *delivered* broadcast, but a DROPPED full-state stream (peer never
     /// received the state) MUST still NOT cache the summary — otherwise the next
@@ -1571,6 +1792,35 @@ mod tests {
     /// window); if the attribution recording is dropped, the memo's
     /// sender-side arm signal (`note_resync_request`) can never fire.
     /// See `crate::ring::delta_incompat`.
+    /// #4952 pin: the post-delivery summary cache must route through
+    /// `upsert_peer_summary`, never `update_peer_summary`. The latter is a
+    /// silent no-op for a peer with no interest entry, and fan-out targets
+    /// come from `neighbor_hosting` (advertised co-hosts) — a population that
+    /// never registers interest — so an `update_` call here re-opens the
+    /// full-state-forever fixed point that was 58% of fleet broadcast bytes.
+    /// Matches whitespace-stripped source so a rustfmt reflow can't dodge it.
+    #[test]
+    fn record_delivery_routes_summary_cache_through_upsert() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("fn record_delivery_to_interest<")
+            .expect("record_delivery_to_interest not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\npub(super) async fn broadcast_to_single_peer(")
+            .expect("end of record_delivery_to_interest not found");
+        let body: String = after[..fn_end].split_whitespace().collect();
+        assert!(
+            body.contains("interest_manager.upsert_peer_summary(key,peer_key,summary.clone())"),
+            "post-delivery cache must upsert (create-if-absent) the peer summary"
+        );
+        assert!(
+            !body.contains("interest_manager.update_peer_summary("),
+            "update_peer_summary silently no-ops for untracked peers — the \
+             #4952 fixed point. Use upsert_peer_summary here."
+        );
+    }
+
     #[test]
     fn broadcast_to_single_peer_gates_deltas_on_incompat_memo() {
         let src = include_str!("broadcast_queue.rs");
@@ -1599,11 +1849,24 @@ mod tests {
              doomed delta is still computed and sent"
         );
         assert!(
-            body.contains("_ if deltas_suppressed => ("),
+            body.contains("if deltas_suppressed => ("),
             "suppression must short-circuit the payload match to FullState"
         );
-        // The guard arm must be FIRST in the payload match: Rust evaluates
-        // arms in order, so `_ if deltas_suppressed` has to precede the
+        // The guard is deliberately scoped to `(Some(_), Some(_))` rather than
+        // `_`: with a summary missing a delta was impossible anyway, so a
+        // wildcard guard would credit the memo for a full state it did not
+        // cause and skew the #3335 payload-mix attribution. Safety is
+        // unaffected — `compute_delta` lives only in the `(Some(ours),
+        // Some(theirs))` arm, so a suppressed contract cannot reach it via
+        // either path.
+        assert!(
+            body.contains("(Some(_), Some(_)) if deltas_suppressed => ("),
+            "the suppression guard must be scoped to the both-summaries-present \
+             case — a wildcard guard mis-attributes missing-summary full states \
+             to FullDeltaSuppressed (#3335 payload-mix accuracy)"
+        );
+        // The guard arm must still be FIRST in the payload match: Rust
+        // evaluates arms in order, so it has to precede the
         // `(Some(ours), Some(theirs))` compute_delta arm — otherwise a
         // suppressed contract with both summaries present would compute and
         // send the doomed delta (or, post-#4901, hit the Ok(None) converged
@@ -1611,7 +1874,7 @@ mod tests {
         // above precedes the match regardless, so only this arm-ordering
         // assertion catches a reordering regression.
         let guard_arm = body
-            .find("_ if deltas_suppressed => (")
+            .find("if deltas_suppressed => (")
             .expect("guard arm not found");
         let compute_arm = body
             .find("(Some(ours), Some(theirs)) => {")
@@ -1700,10 +1963,11 @@ mod tests {
     // (HashMap/HashSet order) yields different bytes for the SAME logical
     // state across peers, so the byte compare never skipped; the delta path
     // then either returned an empty delta (which the pre-fix arm answered by
-    // sending FULL STATE) or was refused by the `is_delta_efficient` gate on
-    // big-summary contracts — so a fully-converged pair re-flooded full state
-    // on every fan-out (contracts like `Eumk9HNQ` healing hard while their
-    // state never changed). These tests exercise the cache-only decision core
+    // sending FULL STATE) or — before #4923 removed the pre-compute
+    // `is_delta_efficient` gate — was refused outright on big-summary
+    // contracts, so a fully-converged pair re-flooded full state on every
+    // fan-out (contracts like `Eumk9HNQ` healing hard while their state never
+    // changed). These tests exercise the cache-only decision core
     // `plan_fanout_send`; the wiring is pinned by
     // `fanout_path_uses_semantic_delta_skip_pin`.
 
@@ -2058,6 +2322,130 @@ mod tests {
             2,
             "each delivery-gated bytes report must charge the selected \
              payload_size (delta or full state), not the pre-delta full-state size"
+        );
+    }
+
+    /// Source-scrape pin for the payload-mix arm tagging (#3335).
+    ///
+    /// Same precedent as the cost-report pin above (the "Manually-mirrored
+    /// telemetry counters" row in `.claude/rules/bug-prevention-patterns.md`):
+    /// a refactor that drops an arm tag, or re-tags a full-state fallback as
+    /// `Delta`, silently corrupts the measurement that decides which fan-out
+    /// fix to build — and every behavioral test stays green, because the
+    /// fan-out still works. The whole point of this instrumentation is that
+    /// the four full-state causes are distinguishable, so pin that each one
+    /// is constructed exactly where it is decided.
+    #[test]
+    fn broadcast_to_single_peer_tags_every_payload_arm_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer (start of tests module) not found");
+        let body = &after[..fn_end];
+
+        // Every arm must be constructed in the selection match. A missing arm
+        // means some payload is attributed to the wrong cause (or to none).
+        for arm in [
+            "PayloadArm::Delta",
+            "PayloadArm::FullDeltaSuppressed",
+            "PayloadArm::FullNotEfficient",
+            "PayloadArm::FullComputeFailed",
+            "PayloadArm::FullNoOurSummary",
+            "PayloadArm::FullNoTheirSummaryUntracked",
+            "PayloadArm::FullNoTheirSummaryTracked",
+        ] {
+            assert!(
+                body.contains(arm),
+                "broadcast_to_single_peer must tag the {arm} arm — an untagged \
+                 fallback makes the #3335 payload-mix measurement attribute \
+                 bytes to the wrong cause"
+            );
+        }
+
+        // #4961: the tracked arm must READ the reason where it is decided, not
+        // merely pass the variable along. Dropping the assignment leaves it at
+        // `None` forever, so every tracked send lands in
+        // `tracked_missing_unattributed_*` — the split still emits, still
+        // reconciles, and answers nothing. That mutation passes every other
+        // test here, so it needs its own pin.
+        assert!(
+            body.contains("tracked_missing_reason = interest.summary_missing_reason()"),
+            "the FullNoTheirSummaryTracked arm must read the peer's \
+             summary_missing_reason where the arm is decided — without it the \
+             per-reason split is uniformly unattributed and #4961 stays \
+             unanswered"
+        );
+
+        // The mix is recorded at exactly the two real-delivery sites, the same
+        // gate as BroadcastFanoutCost, so the two axes always agree on what
+        // "sent" means. Recording up-front would count phantom fan-out.
+        // Match against a whitespace-stripped copy of the body. rustfmt
+        // re-wraps this call whenever its argument list changes width (adding
+        // the gate-inputs argument split it across five lines), so any needle
+        // carrying literal spacing silently rots into a false failure — or,
+        // worse, a false PASS if the count happens to still match. Collapsing
+        // first makes the pin depend on the code rather than on the formatter;
+        // this is the same `collapsed` shape node.rs uses for its
+        // `update_peer_summary(&key,pk,None)` pin.
+        let collapsed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let record_needle = concat!(
+            ".record_",
+            "delivered(payload_arm,key.id(),payload_size,not_efficient_gate_inputs,tracked_missing_reason,)"
+        );
+        assert_eq!(
+            collapsed.matches(record_needle).count(),
+            2,
+            "payload mix must be recorded at exactly the two real-delivery \
+             sites (streaming Delivered + inline send Ok) — recording up-front \
+             would count dropped/failed sends as bytes on the wire"
+        );
+        // ...and it must be THIS node's accumulator, never a process global:
+        // several nodes share a process in the simulation harness and the
+        // aggregator drains destructively, so a global would let one node's
+        // ticker steal another's records.
+        assert_eq!(
+            collapsed
+                .matches(concat!("op_manager.payload_mix.record_", "delivered("))
+                .count(),
+            2,
+            "the payload mix must be recorded on op_manager.payload_mix (the \
+             per-node accumulator), not a process-global static"
+        );
+
+        // The `NotEfficient` / `ComputeFailed` split is the load-bearing one:
+        // the first means no contract code ran and we shipped a whole state
+        // anyway, the second means the WASM failed. Collapsing them back into
+        // one arm loses the distinction the measurement exists to make.
+        assert!(
+            body.contains("DeltaUnavailable::NotEfficient")
+                && body.contains("DeltaUnavailable::ComputeFailed"),
+            "the delta-failure arm must keep the typed NotEfficient vs \
+             ComputeFailed split — collapsing them re-blinds the measurement"
+        );
+
+        // The no-summary split must stay decided by WHICH side is missing, and
+        // the untracked/tracked sub-split must keep consulting the interest
+        // map. Collapsing either one re-creates the single `full_no_summary`
+        // bucket that the 2026-07-25 measurement could not act on: it was the
+        // largest consumer of wire bytes on the network with no way to tell a
+        // contract-handler failure from a permanent peer-tracking gap.
+        assert!(
+            collapsed.contains("(None,_)=>") && collapsed.contains("(Some(_),None)=>"),
+            "the no-summary arms must branch on WHICH side of the pair is \
+             missing — a catch-all `_` arm re-blinds the split"
+        );
+        assert!(
+            collapsed.contains("get_peer_interest(&key,&peer_key)"),
+            "the missing-their-summary arm must consult get_peer_interest to \
+             separate an UNTRACKED peer (whose update_peer_summary write is a \
+             silent no-op — permanent full state until the #4952 upsert; now \
+             transient, first send per pair) from a \
+             TRACKED cold-start peer (which repairs itself on next delivery)"
         );
     }
 }

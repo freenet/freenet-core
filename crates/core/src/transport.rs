@@ -645,10 +645,19 @@ pub(crate) trait PeerConnectionApi: Send {
     /// Sends a network message to the remote peer.
     ///
     /// The message is serialized and sent over the transport connection.
+    ///
+    /// Returns the SERIALIZED length of the message. Callers use it to
+    /// attribute outbound bytes by message kind
+    /// ([`outbound_message_mix`][omm]) without serializing a second time just
+    /// to measure. It is the payload the transport was asked to move, not the
+    /// on-wire total (no framing, ACKs or retransmits) — see that module for
+    /// what the difference means.
+    ///
+    /// [omm]: crate::node::network_bridge::outbound_message_mix
     fn send_message(
         &mut self,
         msg: NetMessage,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<usize, TransportError>> + Send + '_>>;
 
     /// Receives raw bytes from the remote peer.
     ///

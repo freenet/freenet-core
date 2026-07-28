@@ -382,7 +382,7 @@ pub(super) async fn contract_home(
     sub_path: Option<&str>,
     hosted_mode: bool,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
-    let instance_id = ContractInstanceId::from_bytes(&key).map_err(|err| {
+    let instance_id = ContractInstanceId::from_base58(&key).map_err(|err| {
         debug!("contract_home: Failed to parse contract key: {}", err);
         WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
@@ -649,7 +649,7 @@ pub(super) async fn variable_content(
     );
     // compose the correct absolute path
     let instance_id =
-        ContractInstanceId::from_bytes(&key).map_err(|err| WebSocketApiError::InvalidParam {
+        ContractInstanceId::from_base58(&key).map_err(|err| WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
         })?;
     let base_path = contract_web_path(&instance_id);
@@ -949,7 +949,7 @@ pub(super) async fn serve_sandbox_content(
     let page = sub_path.unwrap_or("index.html");
     debug!("serve_sandbox_content: serving iframe content for key: {key}, page: {page}");
     let instance_id =
-        ContractInstanceId::from_bytes(&key).map_err(|err| WebSocketApiError::InvalidParam {
+        ContractInstanceId::from_base58(&key).map_err(|err| WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
         })?;
 
@@ -2601,7 +2601,11 @@ mod tests {
         );
         assert!(
             !html.contains("freenet.org"),
-            "shell page must not reference external origins (CORS)"
+            "shell page must not reference external origins (CORS). This is a \
+             plain substring check over the whole rendered page, including the \
+             inlined shell_bridge.js — so a COMMENT that merely mentions a \
+             freenet.org host trips it too. If that is what you hit, drop the \
+             hostname from the comment rather than loosening this assertion."
         );
         // Shell message handler must be present in bridge JS
         assert!(
@@ -3495,6 +3499,131 @@ mod tests {
         assert!(
             SHELL_BRIDGE_JS.contains("Notification.requestPermission(done)"),
             "permission prompt must be requested from the shell affordance click"
+        );
+    }
+
+    /// Reading `navigator.serviceWorker` throws a SecurityError in a sandboxed
+    /// document without 'allow-same-origin': the property exists on Navigator
+    /// (so an `'serviceWorker' in navigator` feature-check passes) but its
+    /// GETTER throws. In 0.2.107 the eager installNotifyClickListener() call
+    /// read it unguarded; the uncaught throw killed freenetBridge before its
+    /// message handlers installed and every locally-served web app hung
+    /// (#4945). All serviceWorker access must go through the try/catch
+    /// accessor.
+    #[test]
+    fn bridge_js_service_worker_reads_survive_sandboxed_navigator() {
+        assert!(
+            SHELL_BRIDGE_JS.contains("function serviceWorkerOrNull()"),
+            "the try/catch serviceWorker accessor must exist"
+        );
+        let body_start = SHELL_BRIDGE_JS
+            .find("function serviceWorkerOrNull()")
+            .unwrap();
+        let body = &SHELL_BRIDGE_JS[body_start..body_start + 400];
+        assert!(
+            body.contains("try {") && body.contains("catch"),
+            "serviceWorkerOrNull must guard the navigator.serviceWorker read with try/catch"
+        );
+        // Outside the accessor, `navigator.serviceWorker` may appear only as
+        // the (already try-guarded) register call pinned by the mobile test
+        // below — any new access must route through serviceWorkerOrNull().
+        assert_eq!(
+            SHELL_BRIDGE_JS.matches("navigator.serviceWorker").count(),
+            2,
+            "raw navigator.serviceWorker reads outside serviceWorkerOrNull() and \
+             the try-guarded register call reintroduce the #4945 sandbox crash"
+        );
+        // The `in`-operator feature check is exactly the pattern that passed in
+        // the sandbox and then blew up on read — it must not come back.
+        assert!(
+            !SHELL_BRIDGE_JS.contains("'serviceWorker' in navigator"),
+            "feature-detect by attempting the read (serviceWorkerOrNull), not via `in`"
+        );
+    }
+
+    /// Mobile browsers reject the page-level `new Notification()` constructor, so
+    /// the shell must show notifications via a service worker's
+    /// `showNotification()`. Pin the wiring by source so a refactor can't
+    /// silently drop it and re-break mobile notifications.
+    #[test]
+    fn bridge_js_registers_notification_service_worker() {
+        // The shell registers the same-origin notification service worker.
+        assert!(
+            SHELL_BRIDGE_JS.contains("NOTIFY_SW_URL = '/freenet-notify-sw.js'")
+                && SHELL_BRIDGE_JS.contains("navigator.serviceWorker.register(NOTIFY_SW_URL)"),
+            "shell must register the /freenet-notify-sw.js service worker"
+        );
+        // It falls back to showNotification() — the only path that works on
+        // mobile, where `new Notification()` throws.
+        assert!(
+            SHELL_BRIDGE_JS.contains("reg.showNotification("),
+            "shell must show notifications via the service worker on mobile"
+        );
+        // Desktop is UNCHANGED: the page-level constructor is still used, under
+        // the same length cap. (The service worker only engages when it throws.)
+        assert!(
+            SHELL_BRIDGE_JS.contains("new Notification(title, opts)"),
+            "desktop must still use the page-level Notification constructor"
+        );
+        // Constructor-FIRST ordering: the page-level constructor must appear
+        // BEFORE the showNotification fallback. A refactor that inverts them
+        // (SW-first) would silently switch desktop to SW-shown notifications and
+        // onto the click-forwarding path — this catches it.
+        let ctor = SHELL_BRIDGE_JS
+            .find("new Notification(title, opts)")
+            .expect("constructor call present");
+        let sw_show = SHELL_BRIDGE_JS
+            .find("reg.showNotification(")
+            .expect("showNotification fallback present");
+        assert!(
+            ctor < sw_show,
+            "the page-level constructor must be tried BEFORE the service-worker fallback"
+        );
+        // Click-routing tag contract: the shell writes the routing tag as
+        // `fnTag` in notification data; the worker reads `data.fnTag` (pinned in
+        // client_api.rs). A rename on the shell side silently breaks routing.
+        assert!(
+            SHELL_BRIDGE_JS.contains("fnTag: routeTag"),
+            "shell must put the routing tag in notification data as fnTag"
+        );
+        // When neither the constructor nor the worker can display it, the app is
+        // told so it can rely on the in-app unread badge.
+        assert!(
+            SHELL_BRIDGE_JS.contains("notifyStatusToIframe('undeliverable')"),
+            "must report 'undeliverable' when neither the constructor nor the worker can show it"
+        );
+        // The worker's click (which fires in the worker, not the page) is
+        // forwarded to the iframe as the same `notification_click` message.
+        assert!(
+            SHELL_BRIDGE_JS.contains("__freenet_notify_click__"),
+            "the worker's notification click must be forwarded to the iframe"
+        );
+        // Registration is gated on a secure context, since it fails on a plain
+        // http (non-localhost) origin — the desktop constructor covers that.
+        assert!(
+            SHELL_BRIDGE_JS.contains("window.isSecureContext"),
+            "service worker registration must be gated on a secure context"
+        );
+        // The click-forward listener is a standalone function installed EAGERLY
+        // at startup (not only on lazy registration), so a click on a persistent
+        // notification that outlived a shell reload is still delivered. Pinned so
+        // a refactor can't fold it back into ensureNotifyServiceWorker only.
+        assert!(
+            SHELL_BRIDGE_JS.contains("function installNotifyClickListener("),
+            "the SW click-forward listener must be a standalone, eagerly-installed function"
+        );
+        // It must be CALLED at BOTH sites: lazily inside ensureNotifyServiceWorker
+        // AND eagerly at shell startup. Assert two call sites by count, so
+        // removing the eager call — reverting to lazy-only installation and
+        // reintroducing the "click lost after reload" bug this fixes — fails
+        // this test. (The `function installNotifyClickListener() {` definition
+        // is `…()` + ` {`, not `…();`, so it isn't counted here.)
+        assert!(
+            SHELL_BRIDGE_JS
+                .matches("installNotifyClickListener();")
+                .count()
+                >= 2,
+            "installNotifyClickListener() must be called BOTH lazily and eagerly at startup"
         );
     }
 
@@ -4754,12 +4883,13 @@ mod tests {
     ///
     /// The shell `open_url` handler must accept `http:` URLs in addition to
     /// `https:`. The original https-only check silently dropped clicks on
-    /// markdown links to plain-HTTP services (e.g. the Network Telemetry
-    /// dashboard `http://nova.locut.us:3133/` linked from the Freenet River
-    /// channel header) — the user clicked the link and nothing happened, no
-    /// console output, no popup, no error. The localhost block stays so a
-    /// pasted `http://127.0.0.1:NNNN/` link can't be used to target services
-    /// running on the reader's machine.
+    /// markdown links to plain-HTTP services (the trigger was the Network
+    /// Telemetry dashboard linked from the Freenet River channel header,
+    /// plain HTTP at the time and since moved to
+    /// `https://telemetry.freenet.org/`) — the user clicked the link and
+    /// nothing happened, no console output, no popup, no error. The
+    /// localhost block stays so a pasted `http://127.0.0.1:NNNN/` link
+    /// can't be used to target services running on the reader's machine.
     #[test]
     fn shell_open_url_handler_accepts_http_and_https_but_blocks_localhost() {
         let js = SHELL_BRIDGE_JS;

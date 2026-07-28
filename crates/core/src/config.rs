@@ -181,6 +181,31 @@ pub struct ConfigArgs {
     #[arg(long, env = "FREENET_MODULE_CACHE_BUDGET_BYTES")]
     pub module_cache_budget_bytes: Option<usize>,
 
+    /// Write the local append-only diagnostic event log (`_EVENT_LOG`).
+    ///
+    /// Default: ON in `local` mode, OFF in `network` mode. Local mode is a
+    /// single-node development mode where the log is the point (and where
+    /// `fdev verify-state` consumes `_EVENT_LOG_LOCAL`); network mode is what
+    /// end users run, where the log costs real disk for a capability nothing
+    /// currently harvests.
+    ///
+    /// This log is a PURELY LOCAL forensic record. It is NOT the telemetry that
+    /// feeds telemetry.freenet.org — that is a separate `TelemetryReporter`
+    /// sink fed in-memory off the same event stream, and it is unaffected by
+    /// this flag. Nothing in the node reads this log back to make decisions,
+    /// and `freenet service report` does not include it.
+    ///
+    /// Measured on a live 0.2.111 peer, writing it costs ~61 MiB/hour of
+    /// appends and accounted for 95% of every fsync the process issued
+    /// (#4968). Enable it on nodes you operate and want to post-mortem.
+    #[arg(
+        long = "enable-event-log",
+        env = "FREENET_ENABLE_EVENT_LOG",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub enable_event_log: Option<bool>,
+
     /// Seconds to wait on graceful shutdown for in-flight client
     /// PUT/GET/UPDATE/SUBSCRIBE operations to finish before tearing
     /// down peer connections. Set to 0 to disable. Default: 30s. See
@@ -265,6 +290,7 @@ impl Default for ConfigArgs {
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
+            enable_event_log: None,
             shutdown_drain_secs: None,
             disable_auto_update: false,
             telemetry: Default::default(),
@@ -537,6 +563,12 @@ impl ConfigArgs {
             // these are new fields, so a plain get_or_insert is correct.
             self.hosting_disk_pct.get_or_insert(cfg.hosting_disk_pct);
             self.max_hosting_disk.get_or_insert(cfg.max_hosting_disk);
+            // #4968. `cfg.enable_event_log` is itself an Option, so an older
+            // config.toml with no such key merges as `None` and leaves the
+            // mode-dependent default intact rather than pinning `false`.
+            if let Some(persisted) = cfg.enable_event_log {
+                self.enable_event_log.get_or_insert(persisted);
+            }
             self.per_user_secret_quota_bytes
                 .get_or_insert(cfg.per_user_secret_quota_bytes);
             self.per_user_inactive_ttl_secs
@@ -1014,6 +1046,11 @@ impl ConfigArgs {
             max_blocking_threads: self
                 .max_blocking_threads
                 .unwrap_or_else(default_max_blocking_threads),
+            // Passed through un-resolved on purpose: `None` must stay `None` so
+            // `Config::event_log_enabled` can apply the mode-dependent default
+            // (ON in Local, OFF in Network) and an upgrading local node whose
+            // config.toml predates this key keeps its log.
+            enable_event_log: self.enable_event_log,
             max_hosting_storage: self
                 .max_hosting_storage
                 .unwrap_or_else(crate::ring::default_hosting_budget_bytes),
@@ -1241,6 +1278,32 @@ pub struct Config {
         rename = "module-cache-budget-bytes"
     )]
     pub module_cache_budget_bytes: usize,
+
+    /// Whether to write the local append-only diagnostic event log
+    /// (`_EVENT_LOG`). Resolved in [`ConfigArgs::build`], where the operation
+    /// mode is known: defaults ON in `local` mode and OFF in `network` mode,
+    /// with an explicit `--enable-event-log` / `FREENET_ENABLE_EVENT_LOG` /
+    /// `enable-event-log` setting always winning.
+    ///
+    /// Deliberately `Option<bool>` rather than `bool`: a config.toml written by
+    /// an older release has NO `enable-event-log` key, and a plain
+    /// `#[serde(default)] bool` would deserialize that absence to `false`,
+    /// indistinguishable from an operator's explicit `false`. The merge in
+    /// [`ConfigArgs::build`] would then pin that `false` forever and silently
+    /// strip the event log from upgrading `local`-mode nodes (breaking
+    /// `fdev verify-state`) — the #3890/#4275 silent-revert class. Keeping the
+    /// absence as `None` lets [`Config::event_log_enabled`] re-derive the
+    /// mode-dependent default.
+    ///
+    /// NOT related to the telemetry that feeds telemetry.freenet.org; see the
+    /// `ConfigArgs::enable_event_log` docs (#4968).
+    #[serde(
+        default,
+        rename = "enable-event-log",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enable_event_log: Option<bool>,
+
     /// Telemetry configuration
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
@@ -2702,6 +2765,23 @@ impl Config {
         self.config_paths.event_log(self.mode)
     }
 
+    /// Whether this node should write the local append-only diagnostic event
+    /// log at [`Self::event_log`].
+    ///
+    /// Resolves the mode-dependent default: ON in `local` mode (a single-node
+    /// dev mode where the log is the point, and where `fdev verify-state`
+    /// consumes `_EVENT_LOG_LOCAL`), OFF in `network` mode (what end users
+    /// run). An explicit `--enable-event-log` flag, `FREENET_ENABLE_EVENT_LOG`
+    /// env var, or `enable-event-log` config key always wins.
+    ///
+    /// This does NOT gate the telemetry that feeds telemetry.freenet.org —
+    /// that is a separate `TelemetryReporter` sink fed in-memory off the same
+    /// event stream (#4968).
+    pub fn event_log_enabled(&self) -> bool {
+        self.enable_event_log
+            .unwrap_or(matches!(self.mode, OperationMode::Local))
+    }
+
     pub fn config_dir(&self) -> PathBuf {
         self.config_paths.config_dir()
     }
@@ -3938,6 +4018,220 @@ mod tests {
         );
     }
 
+    /// Build a `ConfigArgs` rooted at `dir` in the given mode. Shared by the
+    /// #4968 event-log default tests so each case differs only in what it sets.
+    fn event_log_args(dir: &std::path::Path, mode: OperationMode) -> ConfigArgs {
+        ConfigArgs {
+            mode: Some(mode),
+            // A non-gateway network node with no gateways is rejected by
+            // `build()`, so the network-mode cases build as a gateway. That is
+            // the realistic shape anyway: a gateway IS a network-mode node, and
+            // it is exactly the kind of node we operate and want the log on.
+            network_api: {
+                let is_network = matches!(mode, OperationMode::Network);
+                NetworkArgs {
+                    is_gateway: is_network,
+                    // A gateway must declare a public address.
+                    public_address: is_network.then(|| "203.0.113.1".parse().unwrap()),
+                    public_port: is_network.then_some(31337),
+                    skip_load_from_network: true,
+                    ..Default::default()
+                }
+            },
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(dir.to_path_buf()),
+                data_dir: Some(dir.to_path_buf()),
+                log_dir: Some(dir.to_path_buf()),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// #4968: a network-mode node (what end users run) must NOT write the local
+    /// diagnostic event log by default. On a live 0.2.111 peer that log was
+    /// ~61 MiB/hour of appends and 95% of every fsync the process issued.
+    #[tokio::test]
+    async fn event_log_defaults_off_in_network_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg = event_log_args(temp_dir.path(), OperationMode::Network)
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            !cfg.event_log_enabled(),
+            "network mode must default to event log OFF"
+        );
+    }
+
+    /// #4968: local mode is a single-node dev mode where the log is the point,
+    /// and `fdev verify-state` consumes `_EVENT_LOG_LOCAL`. It stays ON.
+    #[tokio::test]
+    async fn event_log_defaults_on_in_local_mode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg = event_log_args(temp_dir.path(), OperationMode::Local)
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            cfg.event_log_enabled(),
+            "local mode must default to event log ON so fdev verify-state keeps working"
+        );
+    }
+
+    /// An explicit setting overrides the mode-dependent default in BOTH
+    /// directions — on for a network node we operate, off for a local one.
+    #[tokio::test]
+    async fn event_log_explicit_setting_overrides_mode_default() {
+        let on_dir = tempfile::tempdir().unwrap();
+        let mut on = event_log_args(on_dir.path(), OperationMode::Network);
+        on.enable_event_log = Some(true);
+        assert!(
+            on.build().await.unwrap().event_log_enabled(),
+            "explicit true must enable the log on a network node"
+        );
+
+        let off_dir = tempfile::tempdir().unwrap();
+        let mut off = event_log_args(off_dir.path(), OperationMode::Local);
+        off.enable_event_log = Some(false);
+        assert!(
+            !off.build().await.unwrap().event_log_enabled(),
+            "explicit false must disable the log even in local mode"
+        );
+    }
+
+    /// Regression (#4968, the #3890/#4275 silent-revert class): building twice
+    /// against the SAME config dir must not flip local mode's default off.
+    ///
+    /// The first build persists a `config.toml`. Because `enable_event_log` is
+    /// `None` it is `skip_serializing_if`-omitted, so that file is byte-identical
+    /// in this respect to one written by a pre-#4968 release. If the merge step
+    /// treated the absent key as an explicit `false`, the second build would
+    /// silently strip the event log from every upgrading local-mode node and
+    /// break `fdev verify-state`. It must still resolve to ON.
+    #[tokio::test]
+    async fn event_log_absent_config_key_does_not_pin_local_mode_off() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let first = event_log_args(temp_dir.path(), OperationMode::Local)
+            .build()
+            .await
+            .unwrap();
+        assert!(first.event_log_enabled(), "precondition: first build is ON");
+
+        let persisted = tokio::fs::read_to_string(temp_dir.path().join("config.toml"))
+            .await
+            .expect("first build must persist a config.toml");
+        assert!(
+            !persisted.contains("enable-event-log"),
+            "precondition: an unset event-log flag must be omitted from config.toml, \
+             otherwise this test is not exercising the pre-#4968 upgrade shape. Got:\n{persisted}"
+        );
+
+        let second = event_log_args(temp_dir.path(), OperationMode::Local)
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            second.event_log_enabled(),
+            "a config.toml with no enable-event-log key must NOT pin local mode to OFF"
+        );
+    }
+
+    /// The opposite direction of the merge: an operator who sets
+    /// `enable-event-log = true` in config.toml (rather than passing the CLI
+    /// flag every start) must have it honored on the next boot.
+    #[tokio::test]
+    async fn event_log_persisted_true_is_honored_on_reboot() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut args = event_log_args(temp_dir.path(), OperationMode::Network);
+        args.enable_event_log = Some(true);
+        assert!(args.build().await.unwrap().event_log_enabled());
+
+        let persisted = tokio::fs::read_to_string(temp_dir.path().join("config.toml"))
+            .await
+            .unwrap();
+        assert!(
+            persisted.contains("enable-event-log"),
+            "an explicit setting must be written to config.toml. Got:\n{persisted}"
+        );
+
+        // Reboot with NO CLI flag: the persisted value must survive.
+        let rebooted = event_log_args(temp_dir.path(), OperationMode::Network)
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            rebooted.event_log_enabled(),
+            "enable-event-log = true in config.toml must survive a reboot without the CLI flag"
+        );
+    }
+
+    /// `--enable-event-log` uses clap's `num_args = 0..=1` +
+    /// `default_missing_value` form, which is easy to get subtly wrong (a bare
+    /// flag silently parsing as `None`, or `=false` being rejected). The
+    /// identical `--hosted-mode` pattern carries the same test for that reason.
+    ///
+    /// Without this, every other event-log test would still pass while the
+    /// operator-facing flag did nothing — the tests set the field directly.
+    #[test]
+    fn enable_event_log_cli_accepts_bare_flag_and_explicit_value() {
+        use clap::Parser;
+
+        // The arg also reads FREENET_ENABLE_EVENT_LOG via clap's `env`. Clear it
+        // for the duration of this test so the runner's environment can't mask
+        // the CLI-form assertions, then restore it.
+        let saved = std::env::var_os("FREENET_ENABLE_EVENT_LOG");
+        // SAFETY: this is the only test that touches FREENET_ENABLE_EVENT_LOG,
+        // and it restores the prior value below; nextest per-process isolation
+        // means no other thread observes the transient unset.
+        unsafe {
+            std::env::remove_var("FREENET_ENABLE_EVENT_LOG");
+        }
+
+        // Absent => None, so the mode-dependent default applies.
+        let absent = ConfigArgs::try_parse_from(["freenet"]).expect("bare argv should parse");
+        assert_eq!(
+            absent.enable_event_log, None,
+            "an absent flag must stay None so the mode default can apply"
+        );
+
+        // Bare `--enable-event-log` => Some(true) via default_missing_value.
+        let bare = ConfigArgs::try_parse_from(["freenet", "--enable-event-log"])
+            .expect("bare --enable-event-log should parse");
+        assert_eq!(
+            bare.enable_event_log,
+            Some(true),
+            "bare --enable-event-log must mean Some(true)"
+        );
+
+        // `--enable-event-log=false` => Some(false), the explicit opt-out.
+        let explicit_false = ConfigArgs::try_parse_from(["freenet", "--enable-event-log=false"])
+            .expect("--enable-event-log=false should parse");
+        assert_eq!(
+            explicit_false.enable_event_log,
+            Some(false),
+            "--enable-event-log=false must mean Some(false)"
+        );
+
+        // Space-separated value form.
+        let spaced = ConfigArgs::try_parse_from(["freenet", "--enable-event-log", "true"])
+            .expect("--enable-event-log true should parse");
+        assert_eq!(
+            spaced.enable_event_log,
+            Some(true),
+            "--enable-event-log true must mean Some(true)"
+        );
+
+        // SAFETY: restoring the value captured above; same rationale as the
+        // remove_var at the top of this test.
+        unsafe {
+            if let Some(v) = saved {
+                std::env::set_var("FREENET_ENABLE_EVENT_LOG", v);
+            }
+        }
+    }
+
     /// When explicitly enabled, hosted mode resolves to `true` and survives a
     /// TOML round-trip (so it works from a config file, not just the CLI flag).
     #[tokio::test]
@@ -4607,6 +4901,7 @@ mod tests {
             per_user_inactive_ttl_secs: None,
             inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
+            enable_event_log: None,
             shutdown_drain_secs: None,
             disable_auto_update: false,
             telemetry: Default::default(),
@@ -4720,6 +5015,10 @@ mod tests {
             per_user_inactive_ttl_secs: 1_234_567,
             inactive_user_sweep_interval_secs: 7_200,
             module_cache_budget_bytes: 987_654_321,
+            // Non-default on purpose: the seed is Local mode, where the #4968
+            // default is ON, so `Some(false)` fails this test if the merge
+            // drops the field (it would come back as `None`).
+            enable_event_log: Some(false),
             telemetry: TelemetryConfig {
                 enabled: false,
                 endpoint: "http://example.invalid:4318".to_string(),
@@ -4760,6 +5059,7 @@ mod tests {
             per_user_inactive_ttl_secs,
             inactive_user_sweep_interval_secs,
             module_cache_budget_bytes,
+            enable_event_log,
             telemetry,
             shutdown_drain_secs,
             // #[serde(skip)] runtime CLI/env flag — set from --disable-auto-update
@@ -4797,6 +5097,11 @@ mod tests {
         assert_eq!(
             module_cache_budget_bytes, seed.module_cache_budget_bytes,
             "module_cache_budget_bytes"
+        );
+        assert_eq!(
+            enable_event_log, seed.enable_event_log,
+            "enable_event_log (#4968) — an explicit setting must survive the \
+             config.toml merge, or an operator's opt-in is silently reverted"
         );
         assert_eq!(
             shutdown_drain_secs, seed.shutdown_drain_secs,

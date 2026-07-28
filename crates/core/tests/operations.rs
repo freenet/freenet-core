@@ -4389,6 +4389,55 @@ async fn test_client_disconnect_does_not_immediately_unsubscribe_with_recent_rea
         let aggregator = ctx.aggregate_events().await?;
         let events = aggregator.get_all_events().await?;
 
+        // Non-vacuity guard (#4972). The two assertions below assert the
+        // ABSENCE of an event, so they pass unconditionally whenever the event
+        // source is empty — which is exactly what happened when #4969 turned
+        // the event log off for network-mode nodes and this test kept passing
+        // while proving nothing. An empty aggregation here means the evidence
+        // is missing, not that the behavior is correct.
+        //
+        // `!events.is_empty()` alone is satisfiable by node-startup records
+        // (`Lifecycle(Startup)` is written unconditionally per node), so it
+        // would hold with 3 events and nothing subscription-related present.
+        // Also require a Subscribe event, and note this is a structural
+        // requirement rather than a thematic one: `UnsubscribeSent` and
+        // `UnsubscribeReceived` are variants of `SubscribeEvent`, wrapped as
+        // `EventKind::Subscribe(..)` (see `tracing/event_kind.rs`). So this
+        // demands an event from the EXACT enum arm the two counts below look
+        // inside — if the pipeline that would carry an `UnsubscribeSent` is
+        // dead, `EventKind::Subscribe` is absent too.
+        //
+        // The margin is structural as well: the test asserts `subscribed ==
+        // true` above before reaching this loop, so a successful SUBSCRIBE
+        // (which emits `SubscribeEvent::SubscribeSuccess`) has definitely
+        // completed. Measured on healthy runs: ~140-190 events with Subscribe:
+        // 5, against the 1 required here.
+        //
+        // Not flaky: by this point the node has been up ~45-60s
+        // (`startup_wait_secs = 40` plus PUT/GET/subscribe/disconnect), well
+        // past `record_logs`' 200ms delay before creating segment 0, and
+        // `aggregate_events` flushes every register (blocking send + 2s reply
+        // wait) before reading, so sub-batch events are on disk.
+        //
+        // `ensure!` rather than `assert!` on purpose: it returns Err, which
+        // routes through `generate_failure_report` and so prints the NO-EVENTS
+        // warning alongside this message. A panic would bypass that report
+        // entirely, since the macro does not catch panics.
+        let subscribe_events = events
+            .iter()
+            .filter(|e| matches!(e.kind, freenet::tracing::EventKind::Subscribe(..)))
+            .count();
+        ensure!(
+            !events.is_empty() && subscribe_events > 0,
+            "event aggregation returned {} event(s) with {} Subscribe event(s), so the \
+             unsubscribe assertions below would pass vacuously. Either the event log is \
+             disabled for harness nodes (see #4972 — `#[freenet_test]` must set \
+             `enable_event_log: Some(true)`) or `record_logs` failed to open it. This is \
+             a broken fixture, not a passing test.",
+            events.len(),
+            subscribe_events
+        );
+
         let unsubscribe_sent_count = events
             .iter()
             .filter(|e| {

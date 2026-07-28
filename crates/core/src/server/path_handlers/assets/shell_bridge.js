@@ -562,6 +562,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
       return;
     }
     if (Notification.permission === 'granted' && contractHasConsent()) {
+      // Returning user who already opted in: pre-warm the notification service
+      // worker now so it's active before the first message arrives (mobile
+      // needs it to show anything; racing its activation would drop the first).
+      ensureNotifyServiceWorker();
       notifyStatusToIframe('granted');
       return;
     }
@@ -609,6 +613,10 @@ function freenetBridge(authToken, userToken, hostedMode) {
         if (called) return; // some browsers fire BOTH the callback and promise
         called = true;
         if (perm === 'granted' && setContractConsent()) {
+          // Pre-warm the notification service worker the instant the user opts
+          // in, so it's active by the time the first message arrives (mobile
+          // needs it to show anything at all).
+          ensureNotifyServiceWorker();
           notifyStatusToIframe('granted');
         } else if (perm === 'granted') {
           // Granted but no contract key to gate on — nothing would deliver.
@@ -643,6 +651,147 @@ function freenetBridge(authToken, userToken, hostedMode) {
     document.body.appendChild(bar);
   }
 
+  // --- Service-worker fallback for notifications (mobile) ----------------
+  // Desktop browsers show notifications with the page-level `new
+  // Notification(...)` constructor (used unchanged in showAppNotification).
+  // Mobile browsers (Chrome / Firefox on Android) REFUSE that constructor — it
+  // throws, and the ONLY supported way to show a notification there is
+  // ServiceWorkerRegistration.showNotification(). So we register a tiny
+  // same-origin service worker (served at NOTIFY_SW_URL) and use it ONLY as the
+  // fallback when the constructor throws. Desktop behavior is therefore
+  // unchanged; the worker path exists solely to make mobile work.
+  //
+  // The worker also routes a notification click back to this shell: the click
+  // fires in the worker (not the page), so the worker posts it to the shell,
+  // which forwards it to the iframe as the same `notification_click` the
+  // page-level onclick path emits. Registration is lazy — only users who have
+  // enabled notifications register the worker (pre-warmed on opt-in in
+  // maybeOfferNotifications). On DESKTOP the constructor succeeds first, so the
+  // worker is never used to display: desktop's notification DISPLAY and CLICK
+  // path are unchanged, and only a dormant same-origin worker is registered so
+  // mobile has it ready.
+  var NOTIFY_SW_URL = '/freenet-notify-sw.js';
+  var notifySwPromise = null;
+  var notifySwMsgListenerAdded = false;
+
+  // Reading the serviceWorker property off navigator THROWS a SecurityError in
+  // a sandboxed document without 'allow-same-origin' — the property EXISTS on
+  // Navigator
+  // (so an `in`-operator feature-check passes) but its getter
+  // throws. A feature-check must therefore attempt the read itself. The shell
+  // top page is not sandboxed today, but this bridge must never assume that:
+  // in 0.2.107 an unguarded read here threw during the eager
+  // installNotifyClickListener() call and killed freenetBridge before its
+  // message handlers installed, breaking every locally-served web app (#4945).
+  function serviceWorkerOrNull() {
+    try {
+      return typeof navigator !== 'undefined'
+        ? navigator.serviceWorker || null
+        : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Forward a worker-posted notification click to the iframe. Installed at most
+  // once, and EAGERLY at shell startup (see the call below) — NOT only on lazy
+  // SW registration: a persistent notification can outlive a shell reload, and
+  // if it's clicked before the reloaded app triggers notification setup, the
+  // worker posts the click to this (matching) client and we must already be
+  // listening or the click is lost. Listening is harmless when no worker is
+  // registered, so it doesn't require a secure context.
+  function installNotifyClickListener() {
+    if (notifySwMsgListenerAdded) return;
+    var sw = serviceWorkerOrNull();
+    if (!sw) {
+      return;
+    }
+    notifySwMsgListenerAdded = true;
+    sw.addEventListener('message', function (event) {
+      var d = event && event.data;
+      if (!d || d.__freenet_notify_click__ !== true) return;
+      try {
+        window.focus();
+      } catch (e) {}
+      sendToIframe({
+        __freenet_shell__: true,
+        type: 'notification_click',
+        tag: typeof d.tag === 'string' ? d.tag : null,
+      });
+    });
+  }
+
+  function ensureNotifyServiceWorker() {
+    if (notifySwPromise) return notifySwPromise;
+    if (!serviceWorkerOrNull() || !window.isSecureContext) {
+      // No SW support, or an insecure (plain-http, non-localhost) origin where
+      // registration would fail. This is permanent for the page, so cache it —
+      // the page-level constructor path covers these (desktop) cases.
+      notifySwPromise = Promise.resolve(null);
+      return notifySwPromise;
+    }
+    installNotifyClickListener();
+    try {
+      notifySwPromise = navigator.serviceWorker.register(NOTIFY_SW_URL).then(
+        function (reg) {
+          return reg;
+        },
+        function () {
+          // Don't cache a TRANSIENT failure (e.g. the script fetch failing
+          // during a node restart) for the whole page lifetime — clear the memo
+          // so a later notification retries registration.
+          notifySwPromise = null;
+          return null;
+        },
+      );
+    } catch (e) {
+      // A synchronous throw from register() is unusual; allow a retry too.
+      notifySwPromise = null;
+      return Promise.resolve(null);
+    }
+    return notifySwPromise;
+  }
+
+  // Resolve to a ServiceWorkerRegistration able to showNotification(), or null
+  // if unavailable within `timeoutMs`. Bounded so a slow/never-activating worker
+  // never stalls a notification — the caller reports it undeliverable instead.
+  function notifyRegistrationReady(timeoutMs) {
+    var swContainer = serviceWorkerOrNull();
+    if (!swContainer) {
+      return Promise.resolve(null);
+    }
+    return ensureNotifyServiceWorker().then(function (reg) {
+      if (!reg) return null;
+      if (reg.active) return reg;
+      // Registered but not yet active (first visit): wait briefly for it.
+      return new Promise(function (resolve) {
+        var settled = false;
+        var t = setTimeout(function () {
+          if (!settled) {
+            settled = true;
+            resolve(null);
+          }
+        }, timeoutMs);
+        swContainer.ready.then(
+          function (ready) {
+            if (!settled) {
+              settled = true;
+              clearTimeout(t);
+              resolve(ready || null);
+            }
+          },
+          function () {
+            if (!settled) {
+              settled = true;
+              clearTimeout(t);
+              resolve(null);
+            }
+          },
+        );
+      });
+    });
+  }
+
   function showAppNotification(msg) {
     if (typeof Notification === 'undefined') return;
     // Gate on BOTH the browser permission and this contract's own consent.
@@ -661,31 +810,70 @@ function freenetBridge(authToken, userToken, hostedMode) {
     // Per-tag throttle + rolling global cap: distinct rooms aren't dropped, but
     // a consented contract can't flood with unique tags.
     if (!notifyLimiter.ok(opts.tag, Date.now())) return;
-    var n;
+    // Cap the routing tag like opts.tag — it's attacker-controlled (the app
+    // supplies msg.tag) and is echoed back into the iframe on click.
+    var routeTag = typeof msg.tag === 'string' ? msg.tag.slice(0, 64) : null;
+    // Carry the room tag AND this shell's own URL so the worker's
+    // notificationclick routes the click back to THIS contract's shell (and
+    // reopens it if closed) — never another contract's tab. fnUrl is the shell's
+    // own same-origin location; the framed app can influence its subpath/hash
+    // (via the navigate proxy) but NOT the leading /v[12]/contract/web/<key>/
+    // segment, which is the only part the worker routes on. Harmless on the
+    // page-level path (which routes via n.onclick).
+    // Cap fnUrl length too (2048, matching the clipboard cap). Deliberately a
+    // different cap than the 8192 hash limit; a 1024-char cap is avoided here
+    // because the hash-limit guard test forbids that exact literal file-wide.
+    opts.data = { fnTag: routeTag, fnUrl: location.href.slice(0, 2048) };
+
+    // Desktop: use the page-level constructor, UNCHANGED. Mobile: it throws
+    // (unsupported), so we fall through to the service-worker path below — the
+    // only way to show a notification on mobile.
     try {
-      n = new Notification(title, opts);
-    } catch (e) {
-      // e.g. mobile Chrome, where non-persistent `new Notification()` throws
-      // (it requires ServiceWorkerRegistration.showNotification). Tell the app
-      // so it need not keep sending; the in-app unread badge is the fallback.
-      notifyStatusToIframe('undeliverable');
+      var n = new Notification(title, opts);
+      n.onclick = function () {
+        try {
+          window.focus();
+        } catch (e) {}
+        // Tell the app which notification was clicked so it can route to the room.
+        sendToIframe({
+          __freenet_shell__: true,
+          type: 'notification_click',
+          tag: routeTag,
+        });
+        try {
+          n.close();
+        } catch (e) {}
+      };
       return;
+    } catch (e) {
+      // Mobile Chrome/Firefox: the non-persistent `new Notification()`
+      // constructor is unsupported and throws. Deliver via the service worker.
     }
-    n.onclick = function () {
-      try {
-        window.focus();
-      } catch (e) {}
-      // Tell the app which notification was clicked so it can route to the room.
-      sendToIframe({
-        __freenet_shell__: true,
-        type: 'notification_click',
-        tag: typeof msg.tag === 'string' ? msg.tag : null,
-      });
-      try {
-        n.close();
-      } catch (e) {}
-    };
+
+    notifyRegistrationReady(1500).then(function (reg) {
+      if (reg && typeof reg.showNotification === 'function') {
+        reg.showNotification(title, opts).then(
+          function () {},
+          function () {
+            // The worker exists but the show failed — nothing else can display
+            // it; tell the app so it can rely on the in-app unread badge.
+            notifyStatusToIframe('undeliverable');
+          },
+        );
+      } else {
+        // No usable service worker (e.g. an insecure-context http origin) AND
+        // the page-level constructor threw: nothing can display it. Tell the app
+        // so it need not keep sending; the in-app unread badge is the fallback.
+        notifyStatusToIframe('undeliverable');
+      }
+    });
   }
+
+  // Install the click-forward listener eagerly on every shell load (see
+  // installNotifyClickListener) so a click on a persistent notification that
+  // outlived a reload is still delivered even before the reloaded app triggers
+  // notification setup. Cheap and inert when no worker ever posts.
+  installNotifyClickListener();
 
   window.addEventListener('message', function (event) {
     if (event.source !== iframe.contentWindow) return;
@@ -1018,12 +1206,21 @@ function freenetBridge(authToken, userToken, hostedMode) {
         // is what blocks `javascript:` / `data:` / `file:` etc.
         //
         // Both http and https are accepted because user-pasted markdown
-        // links commonly target plain-HTTP self-hosted services (e.g.
-        // nova.locut.us:3133, the Freenet network telemetry dashboard,
-        // no TLS configured). Auth tokens never travel through this path
+        // links commonly target self-hosted services with no TLS
+        // configured. freenet/river#231 was exactly that: the network
+        // telemetry dashboard was plain HTTP at the time (it has since
+        // moved to HTTPS), and an https-only filter silently swallowed
+        // every click on it. Auth tokens never travel through this path
         // — the only operation is `window.open(url, '_blank',
         // 'noopener,noreferrer')` — so HTTP doesn't expose credentials.
         // See freenet/river#231.
+        //
+        // Do NOT name the dashboard's host here: this file is inlined
+        // verbatim into the shell page, and
+        // `shell_page_contains_iframe_and_bridge` greps the rendered page
+        // for the project's public domain and fails on ANY occurrence,
+        // comments included (external-origin / CORS guard). The live URL
+        // lives in scripts/check-endpoints.sh.
         //
         // Private networks (RFC1918 192.168/16, 10/8, 172.16-31/12 and
         // RFC4193 fc00::/7, link-local fe80::/10) are deliberately NOT

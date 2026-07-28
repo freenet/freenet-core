@@ -162,6 +162,20 @@ pub(crate) struct OpManager {
         Arc<Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>>,
     /// Neighbor hosting manager for tracking neighbor contract hosting
     pub neighbor_hosting: Arc<NeighborHostingManager>,
+    /// Fan-out payload-mix accumulator (#3335): which arm of the broadcast
+    /// payload selection put bytes on the wire, and which contracts those
+    /// full states belong to.
+    ///
+    /// Owned PER NODE rather than as a process global on purpose — several
+    /// `NodeP2P` instances share a process in the simulation harness, and the
+    /// aggregator drains this destructively, so a global would let one node's
+    /// ticker steal every other node's records and publish them under its own
+    /// peer id. See [`PayloadMix`](crate::node::network_bridge::broadcast_payload_mix::PayloadMix).
+    pub payload_mix: Arc<crate::node::network_bridge::broadcast_payload_mix::PayloadMix>,
+    /// Outbound bytes by message kind (#4956). Per-`OpManager` rather than a
+    /// global so simulation runs, which host many nodes in one process, keep
+    /// each node's census separate.
+    pub outbound_mix: Arc<crate::node::network_bridge::outbound_message_mix::OutboundMix>,
     /// Interest manager for delta-based state synchronization.
     ///
     /// Its clock comes from the same injectable
@@ -315,6 +329,8 @@ impl Clone for OpManager {
             is_gateway: self.is_gateway,
             contract_waiters: self.contract_waiters.clone(),
             neighbor_hosting: self.neighbor_hosting.clone(),
+            payload_mix: self.payload_mix.clone(),
+            outbound_mix: self.outbound_mix.clone(),
             interest_manager: self.interest_manager.clone(),
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
             update_propagation_stats: self.update_propagation_stats.clone(),
@@ -518,6 +534,12 @@ impl OpManager {
             is_gateway,
             contract_waiters,
             neighbor_hosting,
+            outbound_mix: Arc::new(
+                crate::node::network_bridge::outbound_message_mix::OutboundMix::new(),
+            ),
+            payload_mix: Arc::new(
+                crate::node::network_bridge::broadcast_payload_mix::PayloadMix::new(),
+            ),
             interest_manager,
             broadcast_dedup_cache: Arc::new(crate::operations::update::BroadcastDedupCache::new()),
             update_propagation_stats,
