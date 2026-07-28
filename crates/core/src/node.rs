@@ -2740,6 +2740,14 @@ async fn handle_interest_sync_message(
                 // sending novel summary bytes for every hosted contract. See
                 // `MAX_STALENESS_PROBES_PER_SUMMARIES` / `plan_staleness_probe`.
                 let mut staleness_probes_used = 0usize;
+                // Contracts already counted by the #4965 summary-comparison
+                // measurement in THIS message. Scoped to one message, so it
+                // cannot accumulate across a connection. Its size is bounded by
+                // the number of DISTINCT locally-known contracts the entries
+                // resolve to — `lookup_by_hash` only yields contracts this node
+                // already tracks, so a peer cannot grow it with unknown ids —
+                // and it holds contract ids only, no state.
+                let mut compared_contracts: HashSet<ContractInstanceId> = HashSet::new();
                 for entry in entries {
                     for contract in op_manager.interest_manager.lookup_by_hash(entry.hash) {
                         if !op_manager.interest_manager.has_local_interest(&contract) {
@@ -2775,7 +2783,31 @@ async fn handle_interest_sync_message(
                         // `summary_indicates_stale_peer`.
                         let is_stale = match (our_summary.as_ref(), their_summary.as_ref()) {
                             (Some(ours), Some(theirs)) => {
-                                let delta_verdict = if ours.as_ref() == theirs.as_ref() {
+                                let identical = ours.as_ref() == theirs.as_ref();
+                                // #4965 falsifier: how often are the two sides
+                                // byte-identical? That fraction is exactly what a
+                                // hash-first `Summaries` exchange would save, since
+                                // `SummaryEntry` ships full summary bytes
+                                // unconditionally today. Recorded here rather than
+                                // at the send site because only the receiver can
+                                // compare, and only in this arm because a `None` on
+                                // either side is not a comparison at all.
+                                //
+                                // Counted once per contract per message: `entries`
+                                // is peer-supplied and may repeat a hash, and
+                                // without this a peer could inflate either bucket
+                                // at will — corrupting the very ratio that decides
+                                // whether the wire change is worth building. The
+                                // dedup guards ONLY the measurement; the staleness
+                                // logic below still runs per entry exactly as
+                                // before, so this changes no behavior.
+                                op_manager.outbound_mix.record_summary_comparison(
+                                    contract.id(),
+                                    ours.as_ref(),
+                                    theirs.as_ref(),
+                                    &mut compared_contracts,
+                                );
+                                let delta_verdict = if identical {
                                     // Byte-identical => converged; skip the probe.
                                     None
                                 } else {
@@ -4104,6 +4136,27 @@ mod tests {
             .find("InterestMessage::ChangeInterests")
             .expect("ChangeInterests arm not found");
         let summaries_arm = &src[handler_start + summaries_off..handler_start + change_off];
+
+        // #4965: the measurement call must stay wired into this arm. It is
+        // pure observation, so deleting it breaks no test and no behavior —
+        // the rollup would simply report zero comparisons forever, which reads
+        // as "nothing to save here" and would retire the hash-first redesign
+        // for the wrong reason. Needle split so this assertion's own source
+        // cannot satisfy the scrape.
+        assert!(
+            summaries_arm.contains(concat!("record_summary", "_comparison")),
+            "the Summaries arm must record the #4965 summary-comparison \
+             measurement; without it the identical/differing rollup is \
+             silently always zero"
+        );
+        // The per-message dedup needs no pin: `record_summary_comparison` takes
+        // the seen-set as an argument, so there is no way to call it without
+        // deduping. That replaced a call-site `if` guard which no source pin
+        // could protect — a structural pin for it was written and deleted after
+        // mutation testing showed it green when the call was moved out from
+        // behind the guard. Making the bypass unrepresentable beat testing for
+        // it; the repeated-call behavior is covered directly in
+        // `outbound_message_mix::tests`.
 
         assert!(
             summaries_arm.contains("peer_summary_has_pending_state"),
