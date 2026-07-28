@@ -98,7 +98,7 @@ pub struct PutGetArgs {
     /// through (`--gateway-ws`): a GET answered by the node that just stored
     /// the PUT proves transfer, not findability. Left empty, the node
     /// bootstraps from the public index and may pick either gateway, so the
-    /// check silently degrades — the report records which peers it actually
+    /// check silently degrades: the report records which peers it actually
     /// connected to.
     #[arg(long)]
     pub gateway_spec: Vec<String>,

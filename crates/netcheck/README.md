@@ -1,8 +1,8 @@
 # netcheck
 
 Synthetic end-to-end check against the **live** Freenet network (issue
-#4665). It behaves like a normal client — it only talks to node WebSocket
-APIs and never links `freenet-core` — so it measures what a real user
+#4665). It behaves like a normal client (it only talks to node WebSocket
+APIs and never links `freenet-core`) so it measures what a real user
 experiences, and it keeps working across core refactors.
 
 Each `put-get` run:
@@ -29,7 +29,7 @@ subscriptions) are new modules under `src/scenarios/`.
 Every hop that handles a PUT stores the state locally, so a GET answered by
 the gateway the PUT went through proves only that the node can hand back a
 file it already has. That is why the getter enters through a different
-gateway — but the guarantee is narrower than it looks, and it is worth
+gateway, but the guarantee is narrower than it looks, and it is worth
 being precise about it:
 
 **`--gateway-spec` pins the join, not the steady-state connection set.**
@@ -39,7 +39,7 @@ them (`--min-number-of-connections` defaults to 10, and the public index
 lists only two gateways). A local two-gateway run shows this directly: the
 peer was pinned to gateway B and reported connections to *both* B and A.
 No client-side setting can force the answering peer to be someone else, so
-netcheck records what happened instead of pretending otherwise — the
+netcheck records what happened instead of pretending otherwise: the
 `ephemeral_peers` field of the run report carries the addresses actually
 connected to. When `--gateway-spec` is omitted entirely, netcheck also
 warns on stderr.
@@ -68,14 +68,14 @@ One `"event":"run"` line with the conditions of the run, then one
 ```
 
 `freenet_version` is what separates "the network broke" from "the release
-that landed last night broke" — without it a failure cannot be attributed
+that landed last night broke". Without it a failure cannot be attributed
 after the fact.
 
 ## Production use (nova)
 
 nova runs the primary gateway; the ephemeral peer is pinned to vega (the
 secondary) so the GETs are routed. Resolve the address and key from the
-public index rather than hardcoding them — the IP and the key can rotate:
+public index rather than hardcoding them, since the IP and the key can rotate:
 
 ```bash
 VEGA_IP=$(getent hosts vega.locut.us | awk '{print $1}')
@@ -102,7 +102,7 @@ gateway, and the guarantees are structural rather than conventional:
 
 - The ephemeral node gets its own `--config-dir`/`--data-dir` and its own
   ports; it never reads or writes the real node's state.
-- Child processes are killed **by process handle**, never by name — there
+- Child processes are killed **by process handle**, never by name: there
   is no `pkill` anywhere in this crate.
 - The node's own single-instance check is read-only and scoped to its
   configured WS port: if the port is busy it logs and exits, it never
@@ -122,13 +122,26 @@ Two things the caller is responsible for:
 - **Disk headroom.** Check free space before running on a shared host and
   skip the run rather than filling the disk out from under the real node.
 
+### Nightly
+
+`scripts/netcheck-nightly.sh` is the production recipe above with both of
+those responsibilities handled, and it publishes the report through
+`netcheck emit`. `.github/workflows/netcheck-nightly.yml` runs it at 04:00
+UTC on the self-hosted runner and does nothing else: the logic lives in the
+script so it can be run by hand over ssh, which a workflow file cannot be
+until it reaches the default branch.
+
+Every path and port is overridable by environment variable
+(`NETCHECK_GATEWAY_WS`, `NETCHECK_STATE_DIR`, `NETCHECK_OTLP_ENDPOINT`, ...),
+so a second vantage point needs no edit to the script.
+
 ## Local testing, fully isolated
 
 Nothing needs the live network to exercise the code path. Two local
 gateways reproduce the nova/vega topology on one machine: PUT through A,
 join the ephemeral peer through B.
 
-Terminal A — gateway that receives the PUTs:
+Terminal A, gateway that receives the PUTs:
 
 ```bash
 cargo build -p freenet
@@ -136,14 +149,14 @@ cargo run -p netcheck -- local-gateway \
   --freenet-bin target/debug/freenet --network-port 31338 --ws-port 7609
 ```
 
-Terminal B — the gateway the getter joins through:
+Terminal B, the gateway the getter joins through:
 
 ```bash
 cargo run -p netcheck -- local-gateway \
   --freenet-bin target/debug/freenet --network-port 31339 --ws-port 7610
 ```
 
-Terminal C — netcheck, PUTting via A and getting via B:
+Terminal C, netcheck, PUTting via A and getting via B:
 
 ```bash
 cargo run -p netcheck -- put-get \
@@ -162,8 +175,8 @@ Note: if a Freenet desktop app or node is already running on the machine,
 keep every `--ws-port` away from 7509 or the node's single-instance check
 will refuse to start.
 
-Caveat on what a local run proves: it validates the harness end to end —
-compilation, PUT, join, routed GET, manifest, report — but not the signal.
+Caveat on what a local run proves: it validates the harness end to end,
+compilation, PUT, join, routed GET, manifest, report, but not the signal.
 Retention and findability on a two-node local network are trivially
 satisfied; only the live network has the storage pressure and topology
 that make those properties interesting.
