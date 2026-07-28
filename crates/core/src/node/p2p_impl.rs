@@ -550,6 +550,7 @@ impl NodeP2P {
                 updates_rate_limited: rate_limiter.rejected_total(),
                 updates_capacity_dropped: rate_limiter.capacity_rejected_total(),
                 updates_capacity_evicted: rate_limiter.capacity_evicted_total(),
+                updates_sender_budget_dropped: rate_limiter.new_pair_budget_rejected_total(),
                 lattice_has_successor: succ.is_some(),
                 lattice_has_predecessor: pred.is_some(),
                 lattice_successor_distance: succ,

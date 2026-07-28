@@ -68,17 +68,47 @@
 //! that assumes the newcomer is hostile penalises the ordinary case of
 //! a healthy node outgrowing the bound.
 //!
-//! What eviction costs, stated plainly: an evicted pair's next UPDATE
-//! is treated as new and therefore allowed, so an attacker churning
-//! fresh contract ids gets one UPDATE through per id instead of being
-//! cut off after the first 16 384. That ceiling was incidental rather
-//! than designed — the cap exists to bound *memory* — and per-(sender,
-//! contract) rate limiting cannot stop a fresh-id attacker regardless,
-//! since a pair the map has never seen is always allowed once. Paying
-//! it buys back the availability of every legitimate relayed UPDATE on
-//! a saturated node. Sustained floods from a *stable* pair, which is
-//! the pattern this limiter exists for, are unaffected: that entry is
-//! the most recently used, so it is the last thing evicted.
+//! What eviction costs: an evicted pair's next UPDATE is treated as new
+//! and therefore allowed, so an attacker churning fresh contract ids
+//! gets one UPDATE through per id instead of being cut off after the
+//! first 16 384. That ceiling was incidental rather than designed — the
+//! cap exists to bound *memory* — but it was not nothing, and nothing
+//! else in the node replaced it: the ban list is keyed by contract, the
+//! MAD outlier detector is off by default and excludes contracts younger
+//! than its ramp-up anyway, and the transport rate-limits handshakes
+//! rather than traffic on an established connection. Since a node
+//! forwards an UPDATE for a contract it does not host, an unbounded
+//! fresh-id stream would make it a relay amplifier. So the ceiling is
+//! replaced deliberately rather than dropped — see below.
+//!
+//! Sustained floods from a *stable* pair, which is the pattern this
+//! limiter exists for, are unaffected by eviction: that entry is the
+//! most recently used, so it is the last thing evicted.
+//!
+//! ### The fresh-pair budget, keyed by sender alone
+//!
+//! Eviction removes the *incidental* bound on fresh-id churn, so a
+//! deliberate one takes its place: a token bucket keyed by `sender_addr`
+//! ALONE ([`NEW_PAIR_BURST`], [`NEW_PAIR_REFILL_INTERVAL`]) that a
+//! sender spends from only when it presents a `(sender, contract)` pair
+//! this limiter has never seen.
+//!
+//! Two properties make this the right shape:
+//!
+//! - **Established traffic never touches it.** A token is spent on the
+//!   new-pair path only, so a peer relaying heavily for contracts the
+//!   limiter already tracks is bounded by [`MIN_UPDATE_INTERVAL`] per
+//!   pair and by nothing else — the availability this fix exists to
+//!   restore is not clawed back.
+//! - **It is charged before eviction, not after.** A sender past its
+//!   budget is refused *before* a slot is reserved or anything is
+//!   evicted, so churning fresh ids cannot push other peers' entries out
+//!   of the map on the way to being throttled.
+//!
+//! Its own map is bounded by [`MAX_TRACKED_SENDERS`], which is a
+//! multiple of the node's connection cap rather than an attacker-chosen
+//! space: `sender` is the immediate upstream hop, so only a connected
+//! peer can occupy an entry.
 //!
 //! ## Semantic note: `sender_addr` is the immediate upstream hop
 //!
@@ -128,6 +158,8 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::ContractInstanceId;
 use tokio::time::Instant;
 
+use super::Ring;
+use super::resync_rate_limit::TokenBucketLimiter;
 use crate::util::time_source::TimeSource;
 
 /// Minimum interval between accepted UPDATEs for the same
@@ -188,13 +220,115 @@ const EVICTION_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Bound on admission attempts before giving up with `CapacityExceeded`.
 ///
-/// One attempt, one eviction, one retry is the expected path. The bound
-/// exists because the slot freed by eviction is not reserved: another
-/// thread may take it between the eviction and the retry, and an
-/// unbounded retry loop would let sustained contention spin here on the
-/// receive path. Giving up is safe — the competing thread's UPDATE went
-/// through, and this sender retries.
-const MAX_ADMISSION_ATTEMPTS: usize = 3;
+/// One attempt, one eviction, one insert is the expected path. The bound
+/// exists because an admission can lose its slot to a concurrent caller,
+/// and an unbounded retry loop would let sustained contention spin here
+/// on the receive path.
+///
+/// Six rather than three. An attempt is consumed whenever the map went
+/// from full to not-full and back between this caller's cap check and
+/// its eviction — no work is done, but the attempt is spent — and the
+/// last attempt cannot evict (there would be no attempt left to use the
+/// slot), so the budget buys one fewer eviction than it looks like.
+/// Measured on the worst ratio in the suite, a 1024 cap whose 16-entry
+/// batch matches the 16 concurrent callers: at three attempts 7-26 of
+/// 6 400 admissions were dropped across a dozen runs, at four 0-3, at
+/// five 0-2, and at six none at all. Extra attempts are nearly free now
+/// that the scan is serialised — a waiter blocks on the eviction lock
+/// instead of running its own redundant scan.
+const MAX_ADMISSION_ATTEMPTS: usize = 6;
+
+/// Burst of brand-new `(sender, contract)` pairs a single sender may
+/// introduce before [`NEW_PAIR_REFILL_INTERVAL`] starts to bind.
+///
+/// Sized to absorb the legitimate bursty cases — a peer that reconnects
+/// and re-subscribes, or one that starts relaying for a batch of
+/// contracts at once — with room to spare over the ~330 pairs per peer
+/// implied by the saturation #4981 reported (≈16 500 pairs across ≈50
+/// peers). A sender only spends a token when it presents a pair the
+/// limiter has never seen, so established traffic never touches this.
+const NEW_PAIR_BURST: f64 = 512.0;
+
+/// Sustained rate at which one sender may introduce brand-new pairs once
+/// its burst is spent: one per interval.
+///
+/// Deliberately [`MIN_UPDATE_INTERVAL`], so both ceilings read the same
+/// way: a sender may introduce new pairs no faster than it may repeat an
+/// UPDATE on a single pair (10/s at the defaults).
+const NEW_PAIR_REFILL_INTERVAL: Duration = MIN_UPDATE_INTERVAL;
+
+/// Cap on the senders tracked by the new-pair budget.
+///
+/// One entry per peer address that has presented a new pair. `sender` is
+/// the immediate upstream hop, so the live set is bounded by this node's
+/// connection count; the multiple over [`Ring::DEFAULT_MAX_CONNECTIONS`]
+/// is headroom for address churn (reconnects, NAT rebinding) between
+/// [`CLEANUP_AGE`] sweeps. At ~48 bytes an entry the whole map is well
+/// under 100 KB.
+const MAX_TRACKED_SENDERS: usize = 8 * Ring::DEFAULT_MAX_CONNECTIONS;
+
+/// How often an exhausted new-pair budget may write a log line.
+///
+/// Shares [`EVICTION_LOG_INTERVAL`]'s reasoning: a sender that is being
+/// throttled is being throttled continuously, so this must be throttled
+/// too or it becomes the log flood it is meant to report.
+const NEW_PAIR_LOG_INTERVAL: Duration = EVICTION_LOG_INTERVAL;
+
+/// Outcome of an at-capacity eviction pass.
+///
+/// This is an enum rather than a count of removed entries because
+/// "removed nothing" is almost never a reason to give up, and reading it
+/// as one silently dropped legitimate UPDATEs. A pass removes nothing in
+/// three situations, only the last of which is terminal:
+///
+/// 1. Another caller already freed capacity, so the cap no longer binds.
+/// 2. Every victim this pass selected was removed concurrently — under
+///    contention the likeliest case, since concurrent callers all
+///    partition the *same* map and therefore select nearly the same
+///    oldest entries.
+/// 3. The map is empty, so there is nothing to evict and never will be.
+///
+/// 1 and 2 mean a slot is, or may already be, free: the right move is to
+/// retry the admission, which is what [`MAX_ADMISSION_ATTEMPTS`] exists
+/// for. Only 3 is a configuration problem. Conflating them dropped ~0.9%
+/// of admissions at the production cap under 16-thread contention, none
+/// of them for the documented reason, and without consuming a single
+/// retry attempt (#4997 review).
+enum EvictionOutcome {
+    /// This pass freed slots and kept one of them for the caller, which
+    /// therefore does not have to win the cap check again — it inserts
+    /// directly. See [`UpdateRateLimiter::evict_oldest`].
+    Reserved,
+    /// A slot is, or may already be, free, but this caller did not free
+    /// it and holds no claim on it. Retry the admission.
+    Retry,
+    /// The map is empty — reachable only with `max_tracked_pairs == 0`.
+    /// Terminal.
+    MapEmpty,
+}
+
+/// Whether a throttled log line is due, stamping `slot` when it is.
+///
+/// Both saturation signals in this module fire continuously once they
+/// fire at all, so both need this; sharing it keeps the two throttles
+/// from drifting apart.
+fn log_due(slot: &Mutex<Option<Instant>>, now: Instant, interval: Duration) -> bool {
+    let mut last = match slot.lock() {
+        Ok(guard) => guard,
+        // Poisoned only if a previous holder panicked while formatting a
+        // log line. Losing the throttle is not worth propagating a panic
+        // onto the UPDATE receive path.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let due = match *last {
+        Some(prev) => now.saturating_duration_since(prev) >= interval,
+        None => true,
+    };
+    if due {
+        *last = Some(now);
+    }
+    due
+}
 
 /// Outcome of an UPDATE rate-limit check. Callers must treat any
 /// non-`Allowed` variant as "drop this message at the receive
@@ -223,6 +357,15 @@ pub(crate) enum RateLimitDecision {
     /// something sharper than it used to: not merely that the map is
     /// full, but that it is full *and* contended.
     CapacityExceeded,
+    /// Rejected because the sender has spent its budget for introducing
+    /// brand-new `(sender, contract)` pairs (see the module docs).
+    ///
+    /// Only a pair this limiter has never seen can land here, so a
+    /// sender's established traffic never does, however much of it there
+    /// is. A rising count means one peer is presenting unfamiliar
+    /// contract ids faster than [`NEW_PAIR_REFILL_INTERVAL`] — the
+    /// fresh-id churn pattern.
+    SenderNewPairBudget,
 }
 
 impl RateLimitDecision {
@@ -278,6 +421,29 @@ pub(crate) struct UpdateRateLimiter {
     /// eviction path, which already walks the map, so the lock is not
     /// on the common path.
     last_eviction_log: Mutex<Option<Instant>>,
+    /// Held across the eviction scan so only one caller selects victims
+    /// at a time — see [`UpdateRateLimiter::evict_oldest`] for why
+    /// concurrent evictors otherwise collide on the same victims. This
+    /// is the outermost lock in the module: nothing else acquires it,
+    /// and no shard guard is held when it is taken, so it cannot
+    /// participate in a lock cycle.
+    eviction_lock: Mutex<()>,
+    /// Per-sender budget for introducing brand-new pairs — the
+    /// deliberate replacement for the fresh-id ceiling eviction removed
+    /// (see the module docs).
+    ///
+    /// Consulted only from the new-pair branch of `check_and_record`,
+    /// while that branch holds a `last_accepted` shard guard. That is
+    /// the only place either map is touched under the other's guard, so
+    /// the lock order (`last_accepted` then `new_pair_budget`) has no
+    /// counterpart to invert against.
+    new_pair_budget: TokenBucketLimiter<SocketAddr>,
+    /// Total UPDATEs dropped because the sender was over its new-pair
+    /// budget.
+    new_pair_budget_rejected_total: AtomicU64,
+    /// When the last new-pair-budget log line was written, for
+    /// [`NEW_PAIR_LOG_INTERVAL`] throttling.
+    last_new_pair_log: Mutex<Option<Instant>>,
 }
 
 impl UpdateRateLimiter {
@@ -290,7 +456,35 @@ impl UpdateRateLimiter {
         min_interval: Duration,
         max_tracked_pairs: usize,
     ) -> Self {
+        Self::with_new_pair_budget(
+            time_source,
+            min_interval,
+            max_tracked_pairs,
+            NEW_PAIR_BURST,
+            MAX_TRACKED_SENDERS,
+        )
+    }
+
+    /// [`Self::with_config`] with the per-sender new-pair budget sized
+    /// explicitly. Fixtures that deliberately flood fresh pairs from one
+    /// sender to exercise the capacity/eviction path pass a burst large
+    /// enough that the budget cannot be what they observe.
+    pub fn with_new_pair_budget(
+        time_source: Arc<dyn TimeSource + Send + Sync>,
+        min_interval: Duration,
+        max_tracked_pairs: usize,
+        new_pair_burst: f64,
+        max_tracked_senders: usize,
+    ) -> Self {
         Self {
+            new_pair_budget: TokenBucketLimiter::new(
+                time_source.clone(),
+                new_pair_burst,
+                NEW_PAIR_REFILL_INTERVAL,
+                max_tracked_senders,
+            ),
+            new_pair_budget_rejected_total: AtomicU64::new(0),
+            last_new_pair_log: Mutex::new(None),
             last_accepted: DashMap::new(),
             size: AtomicUsize::new(0),
             min_interval,
@@ -301,6 +495,7 @@ impl UpdateRateLimiter {
             capacity_rejected_total: AtomicU64::new(0),
             capacity_evicted_total: AtomicU64::new(0),
             last_eviction_log: Mutex::new(None),
+            eviction_lock: Mutex::new(()),
         }
     }
 
@@ -338,11 +533,27 @@ impl UpdateRateLimiter {
         let key = (sender, contract);
 
         use dashmap::mapref::entry::Entry;
+        // Whether this call has already spent one of `sender`'s new-pair
+        // tokens. A retry after eviction re-enters the Vacant branch, and
+        // one admission must cost one token, not one per attempt.
+        let mut budget_spent = false;
+        // Whether this call is holding a slot it freed by evicting (see
+        // `EvictionOutcome::Reserved`). It is counted in `size`, so every
+        // path out of the loop must either consume it with an insert or
+        // hand it back.
+        let mut reserved = false;
         // Each iteration either decides, or frees capacity and retries.
         // See `MAX_ADMISSION_ATTEMPTS` for why this is bounded.
-        for _ in 0..MAX_ADMISSION_ATTEMPTS {
+        for attempt in 0..MAX_ADMISSION_ATTEMPTS {
             match self.last_accepted.entry(key) {
                 Entry::Occupied(mut entry) => {
+                    if reserved {
+                        // The pair turned up while we were evicting, so
+                        // the slot we kept is not needed. Hand it back
+                        // now: both exits below return, so this is the
+                        // only chance to.
+                        self.size.fetch_sub(1, Ordering::Relaxed);
+                    }
                     // Existing pair: atomic compare-and-stamp under
                     // shard guard.
                     let last = *entry.get();
@@ -359,29 +570,67 @@ impl UpdateRateLimiter {
                     return RateLimitDecision::Allowed;
                 }
                 Entry::Vacant(entry) => {
-                    // New pair: reserve a slot via the authoritative
-                    // counter BEFORE inserting. `fetch_add` is the
-                    // serialization point — concurrent new-key inserts
-                    // strictly serialize, no overshoot beyond the cap.
-                    let prev = self.size.fetch_add(1, Ordering::Relaxed);
-                    if prev >= self.max_tracked_pairs {
-                        // Cap reached. Roll back the reservation and
-                        // release the shard guard BEFORE evicting:
-                        // `evict_oldest` walks every shard, and holding
-                        // a guard across that deadlocks (the same hazard
-                        // documented on `size`). The freed slot is not
-                        // reserved across the retry — another thread may
-                        // take it, in which case the next iteration
-                        // evicts again or falls through.
-                        self.size.fetch_sub(1, Ordering::Relaxed);
-                        drop(entry);
-                        if self.evict_oldest(now) > 0 {
-                            continue;
+                    // Already holding a slot we freed by evicting: skip
+                    // the cap check and spend it.
+                    if !reserved {
+                        // Brand-new pair. Charge the sender's new-pair
+                        // budget BEFORE reserving a slot or evicting
+                        // anything, so a sender churning fresh contract
+                        // ids cannot push other peers' entries out of the
+                        // map on its way to being throttled. See the
+                        // module docs.
+                        if !budget_spent {
+                            if !self.new_pair_budget.check_and_record(sender) {
+                                drop(entry);
+                                self.new_pair_budget_rejected_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                self.log_new_pair_budget(now, sender);
+                                return RateLimitDecision::SenderNewPairBudget;
+                            }
+                            budget_spent = true;
                         }
-                        // Nothing to evict: the map is empty, so the cap
-                        // is 0. Configuration, not saturation.
-                        self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
-                        return RateLimitDecision::CapacityExceeded;
+                        // Reserve a slot via the authoritative counter
+                        // BEFORE inserting. `fetch_add` is the
+                        // serialization point — concurrent new-key
+                        // inserts strictly serialize, no overshoot beyond
+                        // the cap.
+                        let prev = self.size.fetch_add(1, Ordering::Relaxed);
+                        if prev >= self.max_tracked_pairs {
+                            // Cap reached. Roll back and release the
+                            // shard guard BEFORE evicting: `evict_oldest`
+                            // walks every shard, and holding a guard
+                            // across that deadlocks (the same hazard
+                            // documented on `size`).
+                            self.size.fetch_sub(1, Ordering::Relaxed);
+                            drop(entry);
+                            // On the final attempt there is no retry left
+                            // to spend a freed slot on, so evicting now
+                            // would throw away an O(map) scan and shrink
+                            // the map for no admission.
+                            if attempt + 1 == MAX_ADMISSION_ATTEMPTS {
+                                break;
+                            }
+                            match self.evict_oldest(now) {
+                                // We freed the room and kept a slot: the
+                                // next iteration inserts into it without
+                                // re-running the cap check.
+                                EvictionOutcome::Reserved => {
+                                    reserved = true;
+                                    continue;
+                                }
+                                // Someone else freed room, or may have.
+                                // Spend a retry attempt rather than
+                                // dropping.
+                                EvictionOutcome::Retry => continue,
+                                // Nothing to evict and nothing ever will
+                                // be: the cap is 0. Configuration, not
+                                // saturation.
+                                EvictionOutcome::MapEmpty => {
+                                    self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
+                                    return RateLimitDecision::CapacityExceeded;
+                                }
+                            }
+                        }
                     }
                     entry.insert(now);
                     self.accepted_total.fetch_add(1, Ordering::Relaxed);
@@ -390,13 +639,21 @@ impl UpdateRateLimiter {
             }
         }
 
+        if reserved {
+            // Unreachable by construction: a slot is only kept on a
+            // non-final attempt, and the attempt after it either inserts
+            // into it or hands it back. Returning it anyway means a
+            // future restructuring cannot leak one — a leaked
+            // reservation is never reclaimed and permanently shrinks the
+            // effective cap.
+            self.size.fetch_sub(1, Ordering::Relaxed);
+        }
         // Every attempt lost its freed slot to a concurrent caller.
         self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
         RateLimitDecision::CapacityExceeded
     }
 
-    /// Evict the oldest tracked pairs to make room for a new one,
-    /// returning how many were removed.
+    /// Evict the oldest tracked pairs to make room for a new one.
     ///
     /// Must be called with no shard guard held — it walks every shard.
     ///
@@ -411,7 +668,44 @@ impl UpdateRateLimiter {
     /// entries stamped within the same clock tick (and, in tests, from a
     /// mock clock that has not advanced) share an `Instant`, and a
     /// cutoff comparison would take every tied entry with it.
-    fn evict_oldest(&self, now: Instant) -> usize {
+    fn evict_oldest(&self, now: Instant) -> EvictionOutcome {
+        // Another caller already made room, so there is nothing to evict
+        // and the admission should simply retry. Without this early
+        // return every concurrent newcomer pays the full
+        // O(max_tracked_pairs) scan even though the cap no longer binds.
+        // The authoritative cap check is still the `fetch_add`
+        // reservation in `check_and_record`, so a stale read here can
+        // never let the map exceed the cap; the worst case is one wasted
+        // retry.
+        if self.size.load(Ordering::Relaxed) < self.max_tracked_pairs {
+            return EvictionOutcome::Retry;
+        }
+
+        // One evictor at a time. Concurrent evictors partition the SAME
+        // map, so they select nearly the SAME victims and then race to
+        // remove entries each other has already taken: measured at the
+        // production cap under 16-thread contention, 44% of passes
+        // removed nothing at all and the average pass removed 24 entries
+        // for a full 16 384-entry scan — against a 256-entry batch. That
+        // defeats the amortisation the batch exists for AND starves the
+        // callers whose victims were stolen, which is what the retry
+        // budget was being spent on. Serialising costs a waiter nothing
+        // it was not already paying (it was running its own redundant
+        // scan), and the re-check below means a waiter that arrives
+        // after the batch is freed does no scan at all.
+        let _evicting = match self.eviction_lock.lock() {
+            Ok(guard) => guard,
+            // Poisoned only if a previous holder panicked mid-scan. The
+            // map is still consistent — `remove` is atomic per entry —
+            // so recover rather than propagate a panic onto the UPDATE
+            // receive path.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // The holder we queued behind may have freed the room we needed.
+        if self.size.load(Ordering::Relaxed) < self.max_tracked_pairs {
+            return EvictionOutcome::Retry;
+        }
+
         let batch = (self.max_tracked_pairs / EVICTION_BATCH_DIVISOR).max(1);
         let mut entries: Vec<(Instant, (SocketAddr, ContractInstanceId))> = self
             .last_accepted
@@ -419,7 +713,7 @@ impl UpdateRateLimiter {
             .map(|e| (*e.value(), *e.key()))
             .collect();
         if entries.is_empty() {
-            return 0;
+            return EvictionOutcome::MapEmpty;
         }
         let batch = batch.min(entries.len());
         entries.select_nth_unstable_by_key(batch - 1, |(stamped, _)| *stamped);
@@ -434,12 +728,33 @@ impl UpdateRateLimiter {
             }
         }
         if removed > 0 {
-            self.size.fetch_sub(removed, Ordering::Relaxed);
+            // Return `removed - 1` slots and KEEP one for the caller.
+            //
+            // Without this the caller has to win the cap check again
+            // against everyone else, and whether it does depends on the
+            // batch size relative to the number of concurrent callers:
+            // at the production cap (batch 256, 16 threads) it nearly
+            // always wins, but at a 1024 cap the batch is 16 and callers
+            // lose a freed slot often enough to drop ~2 admissions in
+            // 1000. Keeping a slot makes "a caller that frees room gets
+            // to use it" true by construction instead of by margin.
+            //
+            // The strict cap is unaffected: `size` counts map entries
+            // plus outstanding reservations, and every insert still
+            // passes the `fetch_add` gate. Batching is unaffected too —
+            // the batch still leaves `removed - 1` slots of headroom for
+            // the admissions that follow, which is what amortises the
+            // scan.
+            self.size.fetch_sub(removed - 1, Ordering::Relaxed);
             self.capacity_evicted_total
                 .fetch_add(removed as u64, Ordering::Relaxed);
             self.log_eviction(now, removed);
+            return EvictionOutcome::Reserved;
         }
-        removed
+        // Every victim this pass selected was taken by a concurrent
+        // caller — slots were freed, just not by us — which is a reason
+        // to retry, not to drop.
+        EvictionOutcome::Retry
     }
 
     /// Emit the saturation log line, at most once per
@@ -450,23 +765,9 @@ impl UpdateRateLimiter {
     /// old drop path left no greppable evidence on a production node
     /// (#4981).
     fn log_eviction(&self, now: Instant, removed: usize) {
-        let mut last = match self.last_eviction_log.lock() {
-            Ok(guard) => guard,
-            // Poisoned only if a previous holder panicked while
-            // formatting a log line. Losing the throttle is not worth
-            // propagating a panic from the UPDATE receive path.
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let due = match *last {
-            Some(prev) => now.saturating_duration_since(prev) >= EVICTION_LOG_INTERVAL,
-            None => true,
-        };
-        if !due {
+        if !log_due(&self.last_eviction_log, now, EVICTION_LOG_INTERVAL) {
             return;
         }
-        *last = Some(now);
-        drop(last);
-
         tracing::info!(
             evicted = removed,
             evicted_total = self.capacity_evicted_total.load(Ordering::Relaxed),
@@ -476,6 +777,31 @@ impl UpdateRateLimiter {
              (sender, contract) pairs to admit new ones. Expected on a node \
              relaying for many peers and contracts; an evicted pair's next \
              UPDATE is treated as new. Throttled to one line per minute."
+        );
+    }
+
+    /// Emit the fresh-id-churn log line, at most once per
+    /// [`NEW_PAIR_LOG_INTERVAL`].
+    ///
+    /// Throttled for the same reason the drop is worth logging at all: a
+    /// sender over its budget is over it on every message, so an
+    /// unthrottled line here would be a steady stream on exactly the
+    /// node under load. `info!` for the #4981 reason — `debug!` is
+    /// compiled out of release builds.
+    fn log_new_pair_budget(&self, now: Instant, sender: SocketAddr) {
+        if !log_due(&self.last_new_pair_log, now, NEW_PAIR_LOG_INTERVAL) {
+            return;
+        }
+
+        tracing::info!(
+            %sender,
+            dropped_total = self.new_pair_budget_rejected_total.load(Ordering::Relaxed),
+            burst = NEW_PAIR_BURST,
+            refill_interval_ms = NEW_PAIR_REFILL_INTERVAL.as_millis() as u64,
+            "UPDATE rate limiter: peer is introducing brand-new (sender, contract) \
+             pairs faster than its budget allows, so its UPDATEs for unfamiliar \
+             contracts are being dropped. Its traffic for already-tracked contracts \
+             is unaffected. Throttled to one line per minute."
         );
     }
 
@@ -502,6 +828,10 @@ impl UpdateRateLimiter {
         if removed > 0 {
             self.size.fetch_sub(removed, Ordering::Relaxed);
         }
+        // Same cadence for the per-sender new-pair budget: reclaims the
+        // entries of peers that have gone quiet (and whose buckets have
+        // fully refilled, so dropping one cannot change a decision).
+        self.new_pair_budget.cleanup();
     }
 
     /// Total accepted UPDATEs since creation. Surfaced on the node
@@ -518,12 +848,18 @@ impl UpdateRateLimiter {
         self.rejected_total.load(Ordering::Relaxed)
     }
 
-    /// Total UPDATEs rejected because the tracking map was at capacity
-    /// (a new `(sender, contract)` pair tried to register when the map
-    /// already held [`MAX_TRACKED_PAIRS`] pairs). A non-zero value
-    /// suggests an attacker is churning identities — surfaced separately
-    /// from `rejected_total` on the dashboard ("Capacity-dropped") for
-    /// that reason.
+    /// Total UPDATEs dropped because the tracking map was at capacity
+    /// and eviction could not free a slot for a new `(sender, contract)`
+    /// pair. Surfaced separately from `rejected_total` on the dashboard
+    /// ("Capacity-dropped").
+    ///
+    /// Since #4981 a full map is no longer sufficient to land here — the
+    /// oldest entries are evicted instead — so a rising value means the
+    /// map is full *and* contended: every admission attempt lost its
+    /// freed slot to a concurrent caller. Saturation itself now reads on
+    /// [`Self::capacity_evicted_total`]. It is emphatically NOT an
+    /// attacker signal: an ordinary node relaying for enough peers and
+    /// contracts saturates this map on its own.
     pub fn capacity_rejected_total(&self) -> u64 {
         self.capacity_rejected_total.load(Ordering::Relaxed)
     }
@@ -535,6 +871,25 @@ impl UpdateRateLimiter {
     /// a busy node and no longer costs those pairs their UPDATEs.
     pub fn capacity_evicted_total(&self) -> u64 {
         self.capacity_evicted_total.load(Ordering::Relaxed)
+    }
+
+    /// Total UPDATEs dropped because the sending peer was over its
+    /// budget for introducing brand-new `(sender, contract)` pairs.
+    /// Surfaced on the dashboard ("Fresh-id-dropped").
+    ///
+    /// This is the fresh-id-churn signal, and it is the one counter here
+    /// that genuinely does suggest a peer is churning identities — the
+    /// role `capacity_rejected_total` used to be given before eviction
+    /// made saturation an ordinary condition. It never counts a peer's
+    /// traffic for contracts already being tracked.
+    pub fn new_pair_budget_rejected_total(&self) -> u64 {
+        self.new_pair_budget_rejected_total.load(Ordering::Relaxed)
+    }
+
+    /// Number of senders tracked by the new-pair budget.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn tracked_senders(&self) -> usize {
+        self.new_pair_budget.len()
     }
 
     /// Number of tracked `(sender, contract)` pairs. Used by tests and
@@ -826,65 +1181,429 @@ mod tests {
         );
     }
 
-    /// The victim is the least recently used pair, not an arbitrary one.
+    /// The compensating control for what eviction gave up: a sender
+    /// churning brand-new contract ids is cut off once it has spent its
+    /// burst, instead of getting one UPDATE through per id forever.
+    ///
+    /// Before eviction, a full map refused every fresh pair outright,
+    /// which stopped this pattern as a side effect. Nothing else in the
+    /// node does (the ban list is keyed by contract, the MAD detector is
+    /// off by default, and the transport rate-limits handshakes rather
+    /// than established traffic), so the ceiling is replaced here rather
+    /// than dropped (#4997 review).
+    #[test]
+    fn a_sender_churning_fresh_contract_ids_is_cut_off_after_its_burst() {
+        const BURST: usize = 8;
+        let ts = SharedMockTimeSource::new();
+        let limiter = UpdateRateLimiter::with_new_pair_budget(
+            Arc::new(ts.clone()),
+            MIN_UPDATE_INTERVAL,
+            MAX_TRACKED_PAIRS,
+            BURST as f64,
+            MAX_TRACKED_SENDERS,
+        );
+        let attacker = mk_sender(1);
+
+        // The burst gets through: these are the pairs a legitimate peer
+        // would be introducing when it starts relaying for a batch of
+        // contracts.
+        for i in 0..BURST {
+            assert_eq!(
+                limiter.check_and_record(attacker, mk_contract(i as u8)),
+                RateLimitDecision::Allowed,
+                "fresh id {i} is within the burst"
+            );
+        }
+
+        // Past it, fresh ids are refused — and refused for a reason that
+        // says so, not as a capacity drop.
+        for i in BURST..(BURST + 32) {
+            assert_eq!(
+                limiter.check_and_record(attacker, mk_contract(i as u8)),
+                RateLimitDecision::SenderNewPairBudget,
+                "fresh id {i} is past the burst and must be refused"
+            );
+        }
+        assert_eq!(limiter.new_pair_budget_rejected_total(), 32);
+        assert_eq!(
+            limiter.len(),
+            BURST,
+            "a throttled sender must not have grown the tracking map"
+        );
+        assert_eq!(
+            limiter.capacity_evicted_total(),
+            0,
+            "a throttled sender must not have evicted anything — the budget is \
+             charged BEFORE the capacity path so churn cannot push other peers out"
+        );
+
+        // The budget refills, so this throttles rather than bans: after
+        // one interval the sender may introduce one more pair.
+        ts.advance(NEW_PAIR_REFILL_INTERVAL);
+        assert_eq!(
+            limiter.check_and_record(attacker, mk_contract(200)),
+            RateLimitDecision::Allowed,
+            "one refill interval must buy exactly one more fresh pair"
+        );
+        assert_eq!(
+            limiter.check_and_record(attacker, mk_contract(201)),
+            RateLimitDecision::SenderNewPairBudget,
+            "and only one"
+        );
+    }
+
+    /// The budget must never touch a sender's ESTABLISHED traffic, which
+    /// is the availability the #4981 fix exists to restore. A peer that
+    /// keeps updating contracts the limiter already tracks is bounded by
+    /// `min_interval` per pair and by nothing else, however long it goes
+    /// on.
+    #[test]
+    fn the_new_pair_budget_never_throttles_established_pairs() {
+        const BURST: usize = 4;
+        let ts = SharedMockTimeSource::new();
+        let limiter = UpdateRateLimiter::with_new_pair_budget(
+            Arc::new(ts.clone()),
+            MIN_UPDATE_INTERVAL,
+            MAX_TRACKED_PAIRS,
+            BURST as f64,
+            MAX_TRACKED_SENDERS,
+        );
+        let peer = mk_sender(1);
+
+        for i in 0..BURST {
+            assert_eq!(
+                limiter.check_and_record(peer, mk_contract(i as u8)),
+                RateLimitDecision::Allowed
+            );
+        }
+        // Budget fully spent: a fresh pair is refused from here on.
+        assert_eq!(
+            limiter.check_and_record(peer, mk_contract(99)),
+            RateLimitDecision::SenderNewPairBudget
+        );
+
+        // 200 rounds over the same established pairs — far more traffic
+        // than the burst — and not one of them is budget-throttled.
+        for round in 0..200 {
+            ts.advance(MIN_UPDATE_INTERVAL + Duration::from_millis(1));
+            for i in 0..BURST {
+                assert_eq!(
+                    limiter.check_and_record(peer, mk_contract(i as u8)),
+                    RateLimitDecision::Allowed,
+                    "round {round}, established pair {i} must be unaffected by the \
+                     new-pair budget"
+                );
+            }
+        }
+        assert_eq!(
+            limiter.new_pair_budget_rejected_total(),
+            1,
+            "only the one fresh pair was refused; established traffic never \
+             touches the budget"
+        );
+        assert_eq!(limiter.accepted_total(), (BURST + BURST * 200) as u64);
+    }
+
+    /// The budget is per sender: one peer churning fresh ids must not
+    /// throttle anyone else.
+    #[test]
+    fn the_new_pair_budget_is_scoped_per_sender() {
+        const BURST: usize = 2;
+        let ts = SharedMockTimeSource::new();
+        let limiter = UpdateRateLimiter::with_new_pair_budget(
+            Arc::new(ts.clone()),
+            MIN_UPDATE_INTERVAL,
+            MAX_TRACKED_PAIRS,
+            BURST as f64,
+            MAX_TRACKED_SENDERS,
+        );
+        let noisy = mk_sender(1);
+        let quiet = mk_sender(2);
+
+        for i in 0..BURST {
+            assert_eq!(
+                limiter.check_and_record(noisy, mk_contract(i as u8)),
+                RateLimitDecision::Allowed
+            );
+        }
+        assert_eq!(
+            limiter.check_and_record(noisy, mk_contract(50)),
+            RateLimitDecision::SenderNewPairBudget
+        );
+
+        for i in 0..BURST {
+            assert_eq!(
+                limiter.check_and_record(quiet, mk_contract(i as u8)),
+                RateLimitDecision::Allowed,
+                "a second sender has its own budget, untouched by the first"
+            );
+        }
+        assert_eq!(limiter.tracked_senders(), 2);
+    }
+
+    /// The sender map is bounded, and by a space the attacker does not
+    /// choose: `sender` is the immediate upstream hop, so only a peer
+    /// that has completed a handshake can occupy an entry.
+    #[test]
+    fn the_new_pair_budget_map_is_bounded() {
+        const MAX_SENDERS: usize = 4;
+        let ts = SharedMockTimeSource::new();
+        let limiter = UpdateRateLimiter::with_new_pair_budget(
+            Arc::new(ts.clone()),
+            MIN_UPDATE_INTERVAL,
+            MAX_TRACKED_PAIRS,
+            NEW_PAIR_BURST,
+            MAX_SENDERS,
+        );
+
+        for i in 0..(MAX_SENDERS * 4) {
+            limiter.check_and_record(mk_sender(i as u8), mk_contract(1));
+            assert!(
+                limiter.tracked_senders() <= MAX_SENDERS,
+                "sender {i}: the budget map must never exceed its cap"
+            );
+        }
+        assert_eq!(limiter.tracked_senders(), MAX_SENDERS);
+    }
+
+    /// Boundary case: a zero cap is the ONLY configuration in which the
+    /// limiter still refuses a new pair outright, and it must terminate
+    /// rather than spin.
+    ///
+    /// This is the one path `EvictionOutcome::MapEmpty` exists for. It
+    /// was untested, which mattered because the eviction rework turned
+    /// "evicted nothing" into a retry: had that retry not distinguished
+    /// an empty map from a contended one, a zero cap would loop through
+    /// its whole attempt budget on every call forever.
+    #[test]
+    fn a_zero_cap_refuses_every_pair_without_spinning() {
+        let ts = SharedMockTimeSource::new();
+        let limiter = UpdateRateLimiter::with_config(Arc::new(ts.clone()), MIN_UPDATE_INTERVAL, 0);
+
+        for i in 1..=4u8 {
+            assert_eq!(
+                limiter.check_and_record(mk_sender(i), mk_contract(i)),
+                RateLimitDecision::CapacityExceeded,
+                "with a zero cap there is no slot for pair {i} and nothing to evict"
+            );
+        }
+        assert_eq!(limiter.len(), 0);
+        assert_eq!(limiter.capacity_rejected_total(), 4);
+        assert_eq!(
+            limiter.capacity_evicted_total(),
+            0,
+            "an empty map has nothing to evict"
+        );
+        assert_eq!(limiter.accepted_total(), 0);
+    }
+
+    /// Cap used by the eviction-order tests. 128 gives an eviction batch
+    /// of `128 / EVICTION_BATCH_DIVISOR` = 2, and the size is what makes
+    /// these tests decisive: an arbitrary-victim implementation has to
+    /// pick the *exact* oldest pairs out of 128 candidates, three rounds
+    /// running, to survive. At the cap-8 fixtures used elsewhere the
+    /// batch clamps to 1 and an arbitrary victim is the right one 1 time
+    /// in 8, which is not a pin (measured: an implementation with the
+    /// ordering deleted passed 349 of 400 runs, #4997 review).
+    const ORDER_TEST_CAP: usize = 128;
+    /// Number of entries the eviction-order tests drive out: three
+    /// batches of two.
+    const ORDER_TEST_EVICTED: usize = 6;
+
+    /// Distinct `(sender, contract)` pairs indexed well past 256, which
+    /// is where the `u8`-keyed helpers above stop.
+    fn mk_pair(i: usize) -> (SocketAddr, ContractInstanceId) {
+        let sender = SocketAddr::from(([10, 1, (i >> 8) as u8, (i & 0xff) as u8], 30000));
+        (sender, ContractInstanceId::new([0xAB; 32]))
+    }
+
+    /// Admit fresh pairs, starting at index `from`, until the limiter has
+    /// evicted `ORDER_TEST_EVICTED` entries. Returns the next unused
+    /// index.
+    ///
+    /// Each newcomer at capacity evicts a batch of 2 and inserts 1, so
+    /// the map alternates between cap and cap-1 and only every other
+    /// newcomer triggers a batch.
+    fn admit_until_evicted(
+        limiter: &UpdateRateLimiter,
+        ts: &SharedMockTimeSource,
+        from: usize,
+    ) -> usize {
+        let mut i = from;
+        while limiter.capacity_evicted_total() < ORDER_TEST_EVICTED as u64 {
+            let (s, c) = mk_pair(i);
+            assert_eq!(
+                limiter.check_and_record(s, c),
+                RateLimitDecision::Allowed,
+                "newcomer {i} must be admitted"
+            );
+            i += 1;
+            ts.advance(Duration::from_micros(1));
+            assert!(
+                i < from + ORDER_TEST_CAP,
+                "newcomers should have driven {ORDER_TEST_EVICTED} evictions long before this"
+            );
+        }
+        assert_eq!(
+            limiter.capacity_evicted_total(),
+            ORDER_TEST_EVICTED as u64,
+            "batches of 2 must land exactly on {ORDER_TEST_EVICTED}"
+        );
+        i
+    }
+
+    /// The victims are the least recently used pairs, not arbitrary ones.
     ///
     /// Membership is observed through the limiter's own behaviour rather
     /// than a test-only accessor: a tracked pair stamped within
     /// `min_interval` answers `Rejected`, while an evicted pair is seen
     /// as new and answers `Allowed`. So "was it evicted?" is exactly
     /// "does an immediate re-check come back Allowed?".
+    ///
+    /// That discriminator only holds while EVERY pair's stamp is inside
+    /// `min_interval`, which is why the fixture advances by microseconds
+    /// and asserts the whole run stays inside the window. The previous
+    /// version of this test let the clock run 108ms before probing, so
+    /// the pair it checked for eviction was outside the window and
+    /// answered `Allowed` whether or not it had been evicted — the
+    /// assertion could not fail (#4997 review).
     #[test]
-    fn at_capacity_evicts_the_oldest_pair_not_an_arbitrary_one() {
+    fn at_capacity_evicts_the_oldest_pairs_not_arbitrary_ones() {
         let ts = SharedMockTimeSource::new();
-        let limiter = UpdateRateLimiter::with_config(Arc::new(ts.clone()), MIN_UPDATE_INTERVAL, 8);
+        let limiter = UpdateRateLimiter::with_config(
+            Arc::new(ts.clone()),
+            MIN_UPDATE_INTERVAL,
+            ORDER_TEST_CAP,
+        );
+        assert_eq!(
+            ORDER_TEST_CAP / EVICTION_BATCH_DIVISOR,
+            2,
+            "fixture assumes a 2-entry batch"
+        );
+        let start = ts.now();
 
-        // Fill, each pair stamped a millisecond apart so "oldest" is
-        // unambiguous. Pair 1 is the oldest, pair 8 the newest.
-        for i in 1..=8u8 {
-            assert!(
-                limiter
-                    .check_and_record(mk_sender(i), mk_contract(i))
-                    .is_allowed()
+        // Fill, one microsecond apart, so ages are strictly ordered:
+        // pair 0 is the oldest, pair 127 the newest.
+        for i in 0..ORDER_TEST_CAP {
+            let (s, c) = mk_pair(i);
+            assert_eq!(
+                limiter.check_and_record(s, c),
+                RateLimitDecision::Allowed,
+                "fill {i}"
             );
-            ts.advance(Duration::from_millis(1));
+            ts.advance(Duration::from_micros(1));
+        }
+        assert_eq!(limiter.len(), ORDER_TEST_CAP);
+
+        admit_until_evicted(&limiter, &ts, ORDER_TEST_CAP);
+
+        assert!(
+            ts.now().saturating_duration_since(start) < MIN_UPDATE_INTERVAL,
+            "the fixture must stay inside min_interval, or a surviving pair and an \
+             evicted one both answer Allowed and the assertions below are vacuous"
+        );
+
+        // Survivors first: a `Rejected` check does not mutate the map,
+        // whereas an `Allowed` one re-inserts and can evict again.
+        for i in ORDER_TEST_EVICTED..ORDER_TEST_CAP {
+            let (s, c) = mk_pair(i);
+            assert!(
+                matches!(
+                    limiter.check_and_record(s, c),
+                    RateLimitDecision::Rejected { .. }
+                ),
+                "pair {i} is newer than the {ORDER_TEST_EVICTED} oldest and must have survived"
+            );
+        }
+        for i in 0..ORDER_TEST_EVICTED {
+            let (s, c) = mk_pair(i);
+            assert_eq!(
+                limiter.check_and_record(s, c),
+                RateLimitDecision::Allowed,
+                "pair {i} is among the {ORDER_TEST_EVICTED} oldest and must have been evicted"
+            );
+        }
+    }
+
+    /// Accepting an UPDATE for a tracked pair restamps it, which moves it
+    /// to the BACK of the eviction order.
+    ///
+    /// This is the property the module's cost argument rests on: a
+    /// sustained flood from a *stable* pair is unaffected by eviction,
+    /// because that pair is the most recently used and therefore the last
+    /// thing evicted. It needs its own fixture because the refresh is
+    /// what destroys the membership discriminator — a pair refreshed past
+    /// `min_interval` leaves every un-refreshed pair outside the window,
+    /// so their membership stops being observable.
+    ///
+    /// The fixture works around that by refreshing all but a chosen few:
+    /// the 6 pairs left un-refreshed are the only ones outside the
+    /// window, and they are exactly the ones that must be evicted, so
+    /// every pair the test asserts on is inside the window.
+    #[test]
+    fn a_refreshed_pair_moves_to_the_back_of_the_eviction_order() {
+        let ts = SharedMockTimeSource::new();
+        let limiter = UpdateRateLimiter::with_config(
+            Arc::new(ts.clone()),
+            MIN_UPDATE_INTERVAL,
+            ORDER_TEST_CAP,
+        );
+
+        // Fill oldest-first, as above.
+        for i in 0..ORDER_TEST_CAP {
+            let (s, c) = mk_pair(i);
+            assert_eq!(
+                limiter.check_and_record(s, c),
+                RateLimitDecision::Allowed,
+                "fill {i}"
+            );
+            ts.advance(Duration::from_micros(1));
         }
 
-        // Refresh pair 1, making it the most recently used. If eviction
-        // ignored recency, this is the entry a naive "first one found"
-        // policy would still take.
+        // Past `min_interval`, refresh every pair EXCEPT indices
+        // 6..ORDER_TEST_EVICTED+6. Crucially that includes pairs 0..6 —
+        // the entries that were the oldest — so if eviction ignored the
+        // restamp it would take exactly those, and this test fails.
         ts.advance(MIN_UPDATE_INTERVAL);
-        assert!(
-            limiter
-                .check_and_record(mk_sender(1), mk_contract(1))
-                .is_allowed()
-        );
-
-        // Admit a newcomer: pair 2 is now the oldest and must be the
-        // victim.
-        assert!(
-            limiter
-                .check_and_record(mk_sender(99), mk_contract(99))
-                .is_allowed()
-        );
-        assert_eq!(limiter.capacity_evicted_total(), 1);
-
-        // Pair 1 was just refreshed, so it must still be tracked — a
-        // re-check inside min_interval is Rejected. Checked first
-        // because a Rejected check does not mutate the map.
-        assert!(
-            matches!(
-                limiter.check_and_record(mk_sender(1), mk_contract(1)),
-                RateLimitDecision::Rejected { .. }
-            ),
-            "the most recently used pair must survive eviction"
-        );
-
-        // Pair 2 was the oldest, so it is gone: it reads as new.
+        let victims = ORDER_TEST_EVICTED..(2 * ORDER_TEST_EVICTED);
+        let refreshed = ts.now();
+        for i in (0..ORDER_TEST_CAP).filter(|i| !victims.contains(i)) {
+            let (s, c) = mk_pair(i);
+            assert_eq!(
+                limiter.check_and_record(s, c),
+                RateLimitDecision::Allowed,
+                "refresh {i} must be accepted a full min_interval after the fill"
+            );
+        }
         assert_eq!(
-            limiter.check_and_record(mk_sender(2), mk_contract(2)),
-            RateLimitDecision::Allowed,
-            "the least recently used pair must be the eviction victim"
+            limiter.capacity_evicted_total(),
+            0,
+            "restamping tracked pairs must not evict anything — it never takes the \
+             capacity path"
         );
+
+        admit_until_evicted(&limiter, &ts, ORDER_TEST_CAP);
+
+        assert!(
+            ts.now().saturating_duration_since(refreshed) < MIN_UPDATE_INTERVAL,
+            "every refreshed pair must still be inside min_interval, or the \
+             assertions below are vacuous"
+        );
+
+        // Every refreshed pair survived — including 0..6, which were the
+        // oldest before the refresh. The only entries gone are the ones
+        // left un-refreshed.
+        for i in (0..ORDER_TEST_CAP).filter(|i| !victims.contains(i)) {
+            let (s, c) = mk_pair(i);
+            assert!(
+                matches!(
+                    limiter.check_and_record(s, c),
+                    RateLimitDecision::Rejected { .. }
+                ),
+                "pair {i} was refreshed, so it must be at the back of the eviction \
+                 order and must have survived"
+            );
+        }
     }
 
     /// The #4981 regression: a busy pair must not be able to hold its
@@ -1038,6 +1757,9 @@ mod tests {
                 RateLimitDecision::Allowed => allowed += 1,
                 RateLimitDecision::Rejected { .. } => rejected += 1,
                 RateLimitDecision::CapacityExceeded => panic!("unexpected cap"),
+                RateLimitDecision::SenderNewPairBudget => {
+                    panic!("one pair cannot exhaust a new-pair budget")
+                }
             }
         }
         assert_eq!(
@@ -1188,17 +1910,28 @@ mod tests {
                 RateLimitDecision::Allowed => allowed += 1,
                 RateLimitDecision::CapacityExceeded => cap_rejected += 1,
                 RateLimitDecision::Rejected { .. } => rate_rejected += 1,
+                RateLimitDecision::SenderNewPairBudget => {
+                    panic!("each thread uses a distinct sender, so no budget can be spent")
+                }
             }
         }
-        // Critical invariant, unchanged by #4981: the map size is
-        // EXACTLY the cap, not cap + overshoot. Eviction makes this a
-        // sharper test than it was — 64 threads now race to evict and
+        // Critical invariant, unchanged by #4981: the map never exceeds
+        // the cap, no matter how many callers race. Eviction makes this
+        // a sharper test than it was — 64 threads now race to evict and
         // insert concurrently, and the reservation counter still has to
         // hold the line.
-        assert_eq!(
-            limiter.len(),
-            CAP,
-            "strict cap: map size must equal CAP after a 64-thread \
+        //
+        // It is an upper bound, NOT an equality. Admissions are not
+        // conserved under eviction: a caller can free a slot and then
+        // lose it to another thread on every remaining attempt, so a run
+        // can legitimately end one or more entries BELOW the cap. Pinning
+        // `len() == CAP` made this test fail ~1 run in 100 (#4997
+        // review measured it at 44/800 before the eviction scan was
+        // serialised, 7/800 after) — a flaky test asserting something the
+        // implementation never promised.
+        assert!(
+            limiter.len() <= CAP,
+            "strict cap: map size must never exceed CAP after a 64-thread \
              concurrent flood of distinct keys, got {}",
             limiter.len()
         );
@@ -1219,10 +1952,23 @@ mod tests {
         // slot to another thread `MAX_ADMISSION_ATTEMPTS` times running,
         // so it is contention-dependent rather than a fixed count.
         assert_eq!(limiter.capacity_rejected_total(), cap_rejected as u64);
+        // Conservation, which IS exact: every `Allowed` inserted one
+        // entry and every eviction removed one, and nothing else mutates
+        // the map here (no `cleanup`, and distinct keys mean no caller
+        // ever takes the Occupied restamp path). So whatever the final
+        // size turns out to be, it must be exactly what was put in minus
+        // what was taken out.
+        //
+        // This replaces `evicted == allowed - CAP`, which assumed the map
+        // ends exactly full and was wrong for the same reason the size
+        // assertion above was.
         assert_eq!(
-            limiter.capacity_evicted_total(),
-            (allowed - CAP) as u64,
-            "every admission beyond the first CAP must have evicted exactly one entry"
+            limiter.len() as u64,
+            allowed as u64 - limiter.capacity_evicted_total(),
+            "inserts minus evictions must account for every tracked entry: \
+             len={} allowed={allowed} evicted={}",
+            limiter.len(),
+            limiter.capacity_evicted_total()
         );
     }
 
@@ -1260,6 +2006,27 @@ mod tests {
             preamble.contains(&strip_ws("tracing::info!")),
             "the eviction log must be emitted at info! or higher; debug! is compiled out of \
              release builds by release_max_level_info (#4981)"
+        );
+
+        // The fresh-id-churn line, also in this file. This one is the
+        // ONLY release-visible evidence of that drop — the dispatch site
+        // logs it at `debug!` on purpose, because a sender over its
+        // budget is over it on every message and an unthrottled line
+        // there would be a flood. Downgrading this one would make the
+        // whole signal invisible in release.
+        let churn_marker = strip_ws(concat!(
+            "UPDATE rate limiter: peer is introducing ",
+            "brand-new (sender, contract)"
+        ));
+        let pos = this_file.find(&churn_marker).expect(
+            "the new-pair-budget log line must exist; if it was renamed, update this pin rather \
+             than deleting it",
+        );
+        let preamble = &this_file[pos.saturating_sub(200)..pos];
+        assert!(
+            preamble.contains(&strip_ws("tracing::info!")),
+            "the new-pair-budget log must be emitted at info! or higher; debug! is compiled out \
+             of release builds by release_max_level_info (#4981)"
         );
 
         // The residual capacity drop, in the UPDATE dispatch path.
@@ -1321,5 +2088,84 @@ mod tests {
                 "after cleanup, new pair (sender={i}) should be admitted"
             );
         }
+    }
+
+    /// Regression pin for the spurious capacity drops #4997's review
+    /// measured: under concurrent admission of new pairs at a saturated
+    /// cap, `CapacityExceeded` must be vanishingly rare.
+    ///
+    /// The bug it pins: `evict_oldest` returning "removed nothing" was
+    /// read as "the map is empty, so the cap is 0" and the UPDATE was
+    /// dropped. Under contention that return means the opposite — every
+    /// victim this caller selected was taken by another caller, so slots
+    /// WERE just freed — and it did not even spend the retry budget that
+    /// exists for the race. Measured at the production cap with 16
+    /// threads: 2 699 drops in 320 000 admissions (0.84%), every trial
+    /// affected, 100% of them from that branch, retry budget untouched.
+    /// After the fix, 7 in 320 000 (0.002%).
+    ///
+    /// The threshold below sits between those two by more than an order
+    /// of magnitude in both directions, so it is neither flaky nor
+    /// vacuous. It is a bound rather than zero because losing a freed
+    /// slot to a concurrent caller on every attempt is genuinely
+    /// possible — that is what `CapacityExceeded` is documented to mean.
+    #[test]
+    fn concurrent_admission_at_capacity_almost_never_drops() {
+        use std::sync::{Arc as StdArc, Barrier};
+        use std::thread;
+
+        const CAP: usize = 1024;
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 400;
+        const ADMISSIONS: usize = THREADS * PER_THREAD;
+        /// One drop per this many admissions is the ceiling. The bug
+        /// produced ~8 per thousand; the fix produces ~0.02.
+        const MAX_DROPS_PER_THOUSAND: usize = 1;
+
+        let ts = SharedMockTimeSource::new();
+        let limiter = StdArc::new(UpdateRateLimiter::with_new_pair_budget(
+            Arc::new(ts.clone()),
+            MIN_UPDATE_INTERVAL,
+            CAP,
+            // The new-pair budget is not what this test is about, and a
+            // synthetic flood of fresh pairs would otherwise be stopped
+            // by it before reaching the capacity path.
+            f64::from(u32::MAX),
+            THREADS,
+        ));
+        let barrier = StdArc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for t in 0..THREADS {
+            let l = limiter.clone();
+            let b = barrier.clone();
+            handles.push(thread::spawn(move || {
+                b.wait();
+                for i in 0..PER_THREAD {
+                    // Distinct sender per thread, distinct contract per
+                    // iteration: every call takes the new-pair path.
+                    let sender = mk_sender(t as u8);
+                    let mut id = [0u8; 32];
+                    id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                    l.check_and_record(sender, ContractInstanceId::new(id));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(
+            limiter.capacity_evicted_total() > 0,
+            "fixture must actually saturate the cap, or it pins nothing"
+        );
+        let drops = limiter.capacity_rejected_total();
+        assert!(
+            drops as usize * 1000 <= ADMISSIONS * MAX_DROPS_PER_THOUSAND,
+            "at most {MAX_DROPS_PER_THOUSAND} drop per 1000 admissions, got {drops} \
+             in {ADMISSIONS}. An eviction that removed nothing means a concurrent \
+             caller freed the slots, so the admission must retry, not drop."
+        );
+        assert!(limiter.len() <= CAP);
     }
 }

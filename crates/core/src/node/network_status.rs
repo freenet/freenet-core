@@ -89,6 +89,13 @@ pub struct RingStatsSnapshot {
     /// climbing while `updates_capacity_dropped` stays flat, and no
     /// legitimate UPDATE is dropped for it.
     pub updates_capacity_evicted: u64,
+    /// Total relayed UPDATEs dropped because the sending peer was over
+    /// its budget for introducing brand-new `(sender, contract)` pairs.
+    /// This is the fresh-contract-id churn signal: unlike the counters
+    /// above it never counts a peer's traffic for contracts already
+    /// being tracked, so a non-zero value really does mean one peer is
+    /// presenting unfamiliar contract ids faster than the budget allows.
+    pub updates_sender_budget_dropped: u64,
     /// Nearest-neighbor ring lattice completeness (the "is greedy routing's base
     /// lattice present" signal). `lattice_has_successor` / `_predecessor` are
     /// whether this peer currently HOLDS (a side is FILLED with) its

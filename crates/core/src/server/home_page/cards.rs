@@ -220,6 +220,7 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         || snap.ring_stats.updates_rate_limited > 0
         || snap.ring_stats.updates_capacity_dropped > 0
         || snap.ring_stats.updates_capacity_evicted > 0
+        || snap.ring_stats.updates_sender_budget_dropped > 0
     {
         format!(
             r#"<div class="metrics-row">
@@ -239,11 +240,16 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
                 <span class="metric-value">{capacity_evicted}</span>
                 <span class="metric-label">Capacity-evicted</span>
             </div>
+            <div class="metric-tile">
+                <span class="metric-value">{sender_budget_dropped}</span>
+                <span class="metric-label">Fresh-id-dropped</span>
+            </div>
         </div>"#,
             accepted = snap.ring_stats.updates_accepted,
             rate_limited = snap.ring_stats.updates_rate_limited,
             capacity_dropped = snap.ring_stats.updates_capacity_dropped,
             capacity_evicted = snap.ring_stats.updates_capacity_evicted,
+            sender_budget_dropped = snap.ring_stats.updates_sender_budget_dropped,
         )
     } else {
         String::new()
