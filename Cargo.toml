@@ -154,7 +154,24 @@ zip = { version = "8", default-features = false, features = ["deflate", "time"] 
 # Freenet
 # 0.8.4 adds `DelegateRequest::RegisterDelegateWithPredecessors` (stdlib PR #86),
 # consumed by the #4117 delegate secret copy-forward.
-freenet-stdlib = "0.8.4"
+#
+# 0.8.5 fixes the FlatBuffers client-request boundary (stdlib #85/#87/#88).
+# Behaviour changes for FBS clients, none for native ones:
+#   - `ContractKey.code` must be exactly 32 bytes; a wrong length is now
+#     rejected at the boundary instead of being hashed into a key that
+#     matched nothing and failing later as "Contract not in store".
+#   - Paths that used to panic on malformed input (instance-id length,
+#     delegate key/cipher/nonce length, four union discriminants) now
+#     return errors, so a bad request no longer kills the client's
+#     connection task.
+#   - OUTBOUND: `HostResponse` now writes `related_to` as raw 32 bytes
+#     where 0.8.4 wrote base58 ASCII. This fixes browser clients (the TS
+#     SDK reads the field as raw bytes) but is a wire change in the
+#     node->client direction.
+# Exposure is FBS-only: `client_events/websocket.rs` falls back to
+# Flatbuffers when no encoding is specified, and every first-party client
+# (fdev, riverctl, River UI, the test harness) explicitly pins native.
+freenet-stdlib = "0.8.5"
 
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`

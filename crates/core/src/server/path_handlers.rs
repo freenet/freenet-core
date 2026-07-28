@@ -382,7 +382,7 @@ pub(super) async fn contract_home(
     sub_path: Option<&str>,
     hosted_mode: bool,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
-    let instance_id = ContractInstanceId::from_bytes(&key).map_err(|err| {
+    let instance_id = ContractInstanceId::from_base58(&key).map_err(|err| {
         debug!("contract_home: Failed to parse contract key: {}", err);
         WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
@@ -649,7 +649,7 @@ pub(super) async fn variable_content(
     );
     // compose the correct absolute path
     let instance_id =
-        ContractInstanceId::from_bytes(&key).map_err(|err| WebSocketApiError::InvalidParam {
+        ContractInstanceId::from_base58(&key).map_err(|err| WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
         })?;
     let base_path = contract_web_path(&instance_id);
@@ -949,7 +949,7 @@ pub(super) async fn serve_sandbox_content(
     let page = sub_path.unwrap_or("index.html");
     debug!("serve_sandbox_content: serving iframe content for key: {key}, page: {page}");
     let instance_id =
-        ContractInstanceId::from_bytes(&key).map_err(|err| WebSocketApiError::InvalidParam {
+        ContractInstanceId::from_base58(&key).map_err(|err| WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
         })?;
 
