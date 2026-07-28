@@ -91,7 +91,9 @@
 //! deliberate one takes its place: a token bucket keyed by `sender_addr`
 //! ALONE ([`NEW_PAIR_BURST`], [`NEW_PAIR_REFILL_INTERVAL`]) that a
 //! sender spends from only when it presents a `(sender, contract)` pair
-//! this limiter has never seen.
+//! the limiter is not currently tracking. Note "not currently tracking"
+//! rather than "has never seen" — the two differ once eviction is in
+//! play, and the difference is the caveat below.
 //!
 //! Two properties make this the right shape:
 //!
@@ -394,14 +396,17 @@ pub(crate) enum RateLimitDecision {
     /// something sharper than it used to: not merely that the map is
     /// full, but that it is full *and* contended.
     CapacityExceeded,
-    /// Rejected because the sender has spent its budget for introducing
-    /// brand-new `(sender, contract)` pairs (see the module docs).
+    /// Rejected because the sender has spent its budget for presenting
+    /// `(sender, contract)` pairs the limiter is not tracking (see the
+    /// module docs).
     ///
-    /// Only a pair this limiter has never seen can land here, so a
-    /// sender's established traffic never does, however much of it there
-    /// is. A rising count means one peer is presenting unfamiliar
-    /// contract ids faster than [`NEW_PAIR_REFILL_INTERVAL`] — the
-    /// fresh-id churn pattern.
+    /// Only a pair that is not currently in the map can land here, so a
+    /// sender's traffic for a tracked pair never does, however much of
+    /// it there is. Below saturation that is the same as "never seen"
+    /// and a rising count is the fresh-id churn pattern; once eviction
+    /// is recycling pairs faster than they return, it also counts
+    /// re-admissions, which is why the rate is set for aggregate traffic
+    /// rather than for genuinely-fresh ids.
     SenderNewPairBudget,
 }
 
@@ -882,10 +887,11 @@ impl UpdateRateLimiter {
             dropped_total = self.new_pair_budget_rejected_total.load(Ordering::Relaxed),
             burst = NEW_PAIR_BURST,
             refill_interval_ms = NEW_PAIR_REFILL_INTERVAL.as_millis() as u64,
-            "UPDATE rate limiter: peer is introducing brand-new (sender, contract) \
-             pairs faster than its budget allows, so its UPDATEs for unfamiliar \
-             contracts are being dropped. Its traffic for already-tracked contracts \
-             is unaffected. Throttled to one line per minute."
+            "UPDATE rate limiter: peer is presenting (sender, contract) pairs this \
+             node is not tracking faster than its budget allows, so those UPDATEs \
+             are being dropped. Its traffic for tracked pairs is unaffected. If this \
+             peer is not churning contract ids, the budget is set too low for this \
+             node's working set. Throttled to one line per minute."
         );
     }
 
@@ -2233,8 +2239,16 @@ mod tests {
     /// the pin vacuous.
     #[test]
     fn capacity_signals_are_logged_above_debug_level() {
+        // Backslashes go too, not just whitespace: these haystacks are
+        // SOURCE, so a long message carries `\` line continuations, and
+        // where they fall is rustfmt's choice. Stripping whitespace
+        // alone leaves the backslash behind and a needle spanning a
+        // continuation silently stops matching — which is the same
+        // reflow fragility the stripping exists to remove.
         fn strip_ws(s: &str) -> String {
-            s.chars().filter(|c| !c.is_whitespace()).collect()
+            s.chars()
+                .filter(|c| !c.is_whitespace() && *c != '\\')
+                .collect()
         }
 
         /// The macro invoked for the log line whose message contains
@@ -2279,8 +2293,8 @@ mod tests {
             level_of(
                 &this_file,
                 &strip_ws(concat!(
-                    "UPDATE rate limiter: peer is introducing ",
-                    "brand-new (sender, contract)"
+                    "UPDATE rate limiter: peer is presenting ",
+                    "(sender, contract) pairs this node is not tracking"
                 )),
                 "new-pair-budget",
             ),
