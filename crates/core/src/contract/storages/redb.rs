@@ -24,7 +24,7 @@ const MIN_COMPACTION_RECLAIM_FRACTION: f64 = 0.25;
 /// gateway settled at 1.9% but a laptop peer at 28.4%, which is above the
 /// gate's 25% fraction. Without this marker that peer re-ran a full (and
 /// entirely futile) compaction pass on every single restart.
-pub(crate) const COMPACTION_MARKER_TABLE: TableDefinition<&[u8], u64> =
+const COMPACTION_MARKER_TABLE: TableDefinition<&[u8], u64> =
     TableDefinition::new("compaction_marker");
 
 /// Key under which the post-compaction file size is stored.
@@ -674,9 +674,14 @@ impl ReDb {
                 // Record where it settled. Whatever free space remains at this
                 // size is unreclaimable, so the next start must not try again
                 // until the file has grown past it.
-                Self::write_compaction_marker(&db, db_path, now_bytes);
+                let healthy = Self::write_compaction_marker(&db, db_path, now_bytes);
                 record_reclaim(ReclaimOutcome::Compacted);
-                Ok(db)
+                if healthy {
+                    Ok(db)
+                } else {
+                    drop(db);
+                    Self::reopen_after_trim(db_path)
+                }
             }
             Err(e) => {
                 // Deliberately NOT routed through `storage_error_is_poison` /
@@ -748,10 +753,18 @@ impl ReDb {
         Some(value)
     }
 
-    /// Record where compaction bottomed out. Best-effort: failing to persist it
-    /// only means the next start re-evaluates from scratch, which is the
-    /// pre-marker behaviour, so a failure is logged and otherwise ignored.
-    fn write_compaction_marker(db: &Database, db_path: &Path, settled_bytes: u64) {
+    /// Record where compaction bottomed out.
+    ///
+    /// Returns `false` if the write failed in a way that may have poisoned the
+    /// handle, so the caller can reopen rather than hand a latched `Database` to
+    /// `initialize_database` — whose own `begin_write` would then return
+    /// `PreviousIo` and fail startup. That is the same failure mode the
+    /// compaction-error path reopens for, and this write runs immediately after
+    /// a whole-file rewrite, the highest-I/O-risk moment in the function.
+    ///
+    /// A benign failure (and there is no way to persist the marker) only costs
+    /// a re-evaluation on the next start, which is the pre-marker behaviour.
+    fn write_compaction_marker(db: &Database, db_path: &Path, settled_bytes: u64) -> bool {
         // Each redb call has its own error type, so this walks them explicitly
         // rather than chaining `?` through a single conversion.
         let result: Result<(), redb::Error> = (|| {
@@ -763,12 +776,20 @@ impl ReDb {
             txn.commit()?;
             Ok(())
         })();
-        if let Err(e) = result {
-            tracing::warn!(
-                db_path = ?db_path,
-                error = %e,
-                "Could not record the compaction marker; the next start will re-evaluate"
-            );
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                // redb latches an I/O failure on the instance, so anything in
+                // that class means the handle is no longer usable for writes.
+                let poisoned = redb_error_is_poison(&e);
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    poisoned,
+                    "Could not record the compaction marker; the next start will re-evaluate"
+                );
+                !poisoned
+            }
         }
     }
 
@@ -2255,6 +2276,31 @@ mod tests {
             marker.abs_diff(after) < 8 * 1024 * 1024,
             "marker {marker} should record the settled size {after}"
         );
+    }
+
+    /// Pin the exact `COMPACTION_REGROWTH_FACTOR` boundary. Without this the
+    /// constant survives mutation: the sibling tests sit far either side of it.
+    #[test]
+    fn compaction_marker_regrowth_boundary() {
+        // The decision the marker path makes is
+        //   file_bytes <= settled_bytes * COMPACTION_REGROWTH_FACTOR  -> skip
+        let settled: u64 = 400 * 1024 * 1024;
+        let threshold = (settled as f64) * COMPACTION_REGROWTH_FACTOR;
+        let skips = |file: u64| (file as f64) <= threshold;
+
+        // 1.25 x 400 MiB = exactly 500 MiB.
+        assert!(
+            skips(500 * 1024 * 1024),
+            "exactly at the threshold must skip"
+        );
+        assert!(
+            !skips(500 * 1024 * 1024 + 1),
+            "one byte past the threshold must re-evaluate"
+        );
+        // Well inside: a settled database at its own size.
+        assert!(skips(settled));
+        // Well past: genuine regrowth.
+        assert!(!skips(settled * 2));
     }
 
     /// The marker must not wedge compaction shut: once the file grows well past
