@@ -581,7 +581,7 @@ fn redirect_to_shell_root(
 /// `key` is interpolated into a `Location` header by the caller, so
 /// validation MUST reject CRLF-bearing input here before
 /// `HeaderValue::try_from` ever sees it. The check via
-/// `ContractInstanceId::from_bytes` also rejects path-traversal-style
+/// `ContractInstanceId::from_base58` also rejects path-traversal-style
 /// inputs like `../../etc/passwd` that would point the redirect at an
 /// attacker-chosen URL on the reader's gateway.
 ///
@@ -601,7 +601,7 @@ pub(super) fn build_canonical_shell_url(
         });
     }
     let _instance_id =
-        ContractInstanceId::from_bytes(key).map_err(|err| WebSocketApiError::InvalidParam {
+        ContractInstanceId::from_base58(key).map_err(|err| WebSocketApiError::InvalidParam {
             error_cause: format!("invalid contract key in redirect target: {err}"),
         })?;
 
@@ -1203,7 +1203,7 @@ mod tests {
     }
 
     /// A valid contract key used across redirect tests. Constructed from
-    /// 32 zero bytes so `ContractInstanceId::from_bytes` accepts it.
+    /// 32 zero bytes so `ContractInstanceId::from_base58` accepts it.
     fn valid_contract_key_b58() -> String {
         use freenet_stdlib::prelude::ContractInstanceId;
         let bytes = [0u8; 32];
@@ -1291,7 +1291,7 @@ mod tests {
     /// without key validation, a crafted path containing percent-encoded
     /// CRLF would reach `HeaderValue::try_from` inside `Redirect::to`,
     /// which panics on invalid header values. Validating via
-    /// `ContractInstanceId::from_bytes` first converts this into a
+    /// `ContractInstanceId::from_base58` first converts this into a
     /// structured 4xx response.
     #[test]
     fn redirect_to_shell_root_rejects_invalid_key_instead_of_panicking() {
