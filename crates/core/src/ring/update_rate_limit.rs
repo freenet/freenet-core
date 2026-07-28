@@ -2540,7 +2540,15 @@ mod tests {
         const ADMISSIONS: usize = THREADS * PER_THREAD;
         /// One drop per this many admissions is the ceiling. The bug
         /// produced ~8 per thousand; the fix produces ~0.02.
-        const MAX_DROPS_PER_THOUSAND: usize = 1;
+        ///
+        /// Widened from 1 to 2: review measured a worst case of 7 drops
+        /// against a threshold of 6 across 540 trials (~1 in 600), so the
+        /// old value was a known flake rather than the claimed order of
+        /// magnitude of headroom. Widening is the right fix here and a
+        /// retry would not be — the assertion bounds a genuinely
+        /// stochastic quantity (losing a freed slot to a concurrent
+        /// caller), not a deterministic property.
+        const MAX_DROPS_PER_THOUSAND: usize = 2;
 
         let ts = SharedMockTimeSource::new();
         let limiter = StdArc::new(UpdateRateLimiter::with_new_pair_budget(
