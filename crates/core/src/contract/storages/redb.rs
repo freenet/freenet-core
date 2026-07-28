@@ -17,6 +17,24 @@ const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
 /// database with proportionally trivial dead space is left alone.
 const MIN_COMPACTION_RECLAIM_FRACTION: f64 = 0.25;
 
+/// Records the file size the last compaction attempt settled at, so a database
+/// that cannot be compacted further is not rewritten on every start.
+///
+/// redb's compaction leaves a variable amount of unreclaimable free space: a
+/// gateway settled at 1.9% but a laptop peer at 28.4%, which is above the
+/// gate's 25% fraction. Without this marker that peer re-ran a full (and
+/// entirely futile) compaction pass on every single restart.
+pub(crate) const COMPACTION_MARKER_TABLE: TableDefinition<&[u8], u64> =
+    TableDefinition::new("compaction_marker");
+
+/// Key under which the post-compaction file size is stored.
+const COMPACTION_MARKER_KEY: &[u8] = b"settled_at_bytes";
+
+/// How much the file must grow past the last settled size before compaction is
+/// worth attempting again. Compaction cannot help until genuinely new dead
+/// space has accumulated, and the marker records where it bottomed out.
+const COMPACTION_REGROWTH_FACTOR: f64 = 1.25;
+
 /// What the startup reclaim pass decided. Returned so the decision itself is
 /// observable: asserting on the resulting file size cannot distinguish "the gate
 /// declined" from "compaction ran and happened to reclaim little", which made an
@@ -31,6 +49,9 @@ pub(crate) enum ReclaimOutcome {
     TrimSufficed,
     /// A full compaction ran.
     Compacted,
+    /// Already compacted at (about) this size; compaction cannot help until the
+    /// file grows further.
+    AlreadySettled,
     /// Could not be determined (stat, stats or transaction failure); skipped.
     Undetermined,
 }
@@ -551,6 +572,23 @@ impl ReDb {
             return Ok(db);
         }
 
+        // A previous compaction recorded where it bottomed out. Free space below
+        // that point is space compaction provably cannot reclaim, so re-running
+        // it would burn a full-file pass to achieve nothing.
+        if let Some(settled_bytes) = Self::read_compaction_marker(&db) {
+            if (file_bytes as f64) <= (settled_bytes as f64) * COMPACTION_REGROWTH_FACTOR {
+                tracing::info!(
+                    db_path = ?db_path,
+                    file_bytes,
+                    settled_bytes,
+                    phase = "compaction_skipped",
+                    "Contract database already compacted at this size; skipping"
+                );
+                record_reclaim(ReclaimOutcome::AlreadySettled);
+                return Ok(db);
+            }
+        }
+
         let Some(in_use_bytes) = Self::pages_in_use_bytes(&db, db_path) else {
             record_reclaim(ReclaimOutcome::Undetermined);
             return Ok(db);
@@ -633,6 +671,10 @@ impl ReDb {
                     phase = "compaction_done",
                     "Contract database compaction finished"
                 );
+                // Record where it settled. Whatever free space remains at this
+                // size is unreclaimable, so the next start must not try again
+                // until the file has grown past it.
+                Self::write_compaction_marker(&db, db_path, now_bytes);
                 record_reclaim(ReclaimOutcome::Compacted);
                 Ok(db)
             }
@@ -693,6 +735,41 @@ impl ReDb {
             "Could not reopen the contract database after trimming; cannot continue"
         );
         Err(e.into())
+    }
+
+    /// The file size the last compaction settled at, if one has been recorded.
+    ///
+    /// A missing table or key simply means no compaction has completed yet, so
+    /// every failure here reads as "no marker" and lets the normal gate decide.
+    fn read_compaction_marker(db: &Database) -> Option<u64> {
+        let txn = db.begin_read().ok()?;
+        let table = txn.open_table(COMPACTION_MARKER_TABLE).ok()?;
+        let value = table.get(COMPACTION_MARKER_KEY).ok()??.value();
+        Some(value)
+    }
+
+    /// Record where compaction bottomed out. Best-effort: failing to persist it
+    /// only means the next start re-evaluates from scratch, which is the
+    /// pre-marker behaviour, so a failure is logged and otherwise ignored.
+    fn write_compaction_marker(db: &Database, db_path: &Path, settled_bytes: u64) {
+        // Each redb call has its own error type, so this walks them explicitly
+        // rather than chaining `?` through a single conversion.
+        let result: Result<(), redb::Error> = (|| {
+            let txn = db.begin_write()?;
+            {
+                let mut table = txn.open_table(COMPACTION_MARKER_TABLE)?;
+                table.insert(COMPACTION_MARKER_KEY, settled_bytes)?;
+            }
+            txn.commit()?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::warn!(
+                db_path = ?db_path,
+                error = %e,
+                "Could not record the compaction marker; the next start will re-evaluate"
+            );
+        }
     }
 
     /// Bytes held by pages the btrees actually occupy, or `None` if it could not
@@ -2104,6 +2181,129 @@ mod tests {
             last_reclaim()
         );
         assert_eq!(state_contents(&db_path), expected);
+    }
+
+    /// Regression test for repeat compaction on every restart.
+    ///
+    /// redb's compaction leaves a variable amount of unreclaimable free space.
+    /// A production laptop peer settled at 28.4% free — above the 25% fraction
+    /// gate — and so re-ran a full, futile compaction pass on every restart
+    /// (observed live: `compacted=false`, file byte-identical). A gateway
+    /// settled at 1.9% and was unaffected.
+    ///
+    /// That data-dependence is exactly why this does NOT rely on a fixture
+    /// reproducing the 28% residual: a synthetic fixture settles near 7%, where
+    /// the ordinary gate already declines, so it would pass with or without the
+    /// marker and prove nothing. Instead it plants a marker at the current size
+    /// and asserts the decision, which pins the marker path deterministically
+    /// whatever redb's allocator happens to leave behind.
+    #[tokio::test]
+    async fn startup_compaction_skips_when_already_settled_at_this_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        // A fixture that WOULD otherwise be compacted (verified by the sibling
+        // test), so a skip here can only be the marker's doing.
+        let live_rows = bloat_database(&db_path, 192, 1024 * 1024, 16);
+        let expected = state_contents(&db_path);
+        let file_bytes = std::fs::metadata(&db_path).unwrap().len();
+
+        // Plant the marker: "compaction already bottomed out at this size".
+        {
+            let db = Database::create(&db_path).unwrap();
+            ReDb::write_compaction_marker(&db, &db_path, file_bytes);
+            drop(db);
+        }
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+
+        assert_eq!(
+            last_reclaim(),
+            Some(ReclaimOutcome::AlreadySettled),
+            "a database already settled at this size must not be recompacted; got {:?}",
+            last_reclaim()
+        );
+        assert_eq!(state_contents(&db_path), expected);
+        assert_eq!(expected.len(), live_rows);
+    }
+
+    /// A completed compaction must record where it settled, otherwise the next
+    /// start has nothing to consult and the repeat-compaction loop returns.
+    #[tokio::test]
+    async fn compaction_records_where_it_settled() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        bloat_database(&db_path, 192, 1024 * 1024, 16);
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(last_reclaim(), Some(ReclaimOutcome::Compacted));
+
+        let after = std::fs::metadata(&db_path).unwrap().len();
+        let marker = {
+            let db = Database::create(&db_path).unwrap();
+            let m = ReDb::read_compaction_marker(&db);
+            drop(db);
+            m
+        };
+        let marker = marker.expect("compaction must record a marker");
+        // Written from the post-compaction size, before the marker's own commit
+        // grows the file slightly, so allow a small delta.
+        assert!(
+            marker.abs_diff(after) < 8 * 1024 * 1024,
+            "marker {marker} should record the settled size {after}"
+        );
+    }
+
+    /// The marker must not wedge compaction shut: once the file grows well past
+    /// where it settled, a fresh compaction is allowed again.
+    #[tokio::test]
+    async fn compaction_resumes_after_the_file_grows_past_the_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        bloat_database(&db_path, 192, 1024 * 1024, 16);
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(last_reclaim(), Some(ReclaimOutcome::Compacted));
+
+        // Grow well past the marker, then create fresh interior dead space.
+        {
+            let db = Database::create(&db_path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(STATE_TABLE).unwrap();
+                let v = vec![0x5Au8; 1024 * 1024];
+                for i in 1000..1400usize {
+                    t.insert(&i.to_be_bytes()[..], v.as_slice()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(STATE_TABLE).unwrap();
+                for i in 1000..1400usize {
+                    if i % 16 != 0 {
+                        t.remove(&i.to_be_bytes()[..]).unwrap();
+                    }
+                }
+            }
+            txn.commit().unwrap();
+            drop(db);
+        }
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(
+            last_reclaim(),
+            Some(ReclaimOutcome::Compacted),
+            "a database that grew past its marker must be compactable again; got {:?}",
+            last_reclaim()
+        );
     }
 
     /// The gate must leave a healthy database alone, so a restart loop never
