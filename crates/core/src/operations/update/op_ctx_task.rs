@@ -1565,6 +1565,111 @@ async fn resend_queue_full_resync_request(
     }
 }
 
+/// Seed our cache of a broadcast sender's summary from the wire field.
+///
+/// # Why an EMPTY wire field is never usable evidence
+///
+/// `sender_summary_bytes` is a bare `Vec<u8>` on the wire, so it cannot
+/// express "absent". Empty bytes arrive from **two** different causes and the
+/// receiver cannot tell them apart:
+///
+/// 1. **The sender could not summarize itself.** Every producer builds the
+///    field as `our_summary…unwrap_or_default()` (both arms of
+///    `broadcast_queue.rs`, plus the sim-path twins in
+///    `p2p_protoc/broadcast.rs`), so a `get_contract_summary` that returned
+///    `None` (WASM `summarize_state` error, or a contract-handler timeout at
+///    `BROADCAST_CH_TIMEOUT` under load) ships empty rather than omitting the
+///    field. This is the `PayloadArm::FullNoOurSummary` arm.
+/// 2. **The contract's summary genuinely IS empty.** Real contracts in this
+///    tree do this: `tests/test-app-1`'s container and deps return
+///    `StateSummary::from(vec![])` unconditionally, and `website-contract` /
+///    `freenet-ping` return it for empty state.
+///
+/// Neither is worth caching, for different reasons that happen to agree:
+///
+/// - In case 1 the bytes say nothing about what the peer holds, so caching
+///   them is simply false. `PeerInterest::summary_missing_reason` reports no
+///   reason for a *populated* entry, so the cache would look healthy while
+///   being wrong, and it would be invisible to the `tracked_missing_*`
+///   telemetry built to find exactly this class of staleness.
+/// - In case 2 the summary is real but carries zero information, and the
+///   fan-out path compares cached summaries **by bytes**
+///   (`plan_fanout_send`'s equal-summaries short circuit). Two peers that
+///   both summarize to empty would compare equal and skip the broadcast
+///   entirely, which is a wrongful skip: matching zero-information summaries
+///   prove nothing about convergence. Declining to cache turns that silent
+///   skip into a correct full-state send.
+///
+/// So the rule is "an empty summary is not usable evidence about the peer",
+/// which is right under either cause.
+///
+/// The sender side already takes this care — `record_delivery_to_interest`
+/// gates its own write on `if let Some(summary)` — so this closes the
+/// receiving half of the same asymmetry.
+///
+/// # Why skip rather than clear
+///
+/// Declining to cache must not destroy what we already hold. This function
+/// only ever adds information; it never removes any. That is deliberately
+/// different from [`SummaryMissingReason::ClearedByNoneReport`], which belongs
+/// to a peer that explicitly reported `None` in an InterestSync `Summaries`
+/// message: there the wire type IS `Option<Vec<u8>>`, so the `None` is a real
+/// claim about that peer and clearing is the right response.
+///
+/// For the same reason the empty path still refreshes an existing entry's TTL.
+/// A broadcast did arrive from this peer, which is liveness evidence even when
+/// the summary is not; without the refresh, an entry kept alive solely by
+/// empty-summary broadcasts would age out at `INTEREST_TTL`.
+///
+/// # Sibling sites
+///
+/// `node.rs`'s `ResyncResponse` handler also stores a possibly-empty summary,
+/// and that one is CORRECT as-is: its producer bails when it cannot summarize,
+/// so empty there is unambiguously a genuine empty summary rather than a
+/// failure. Do not "fix" it to match this function.
+///
+/// Returns whether a summary was cached.
+fn seed_sender_summary_from_broadcast(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    sender_summary_bytes: &[u8],
+    sender_addr: SocketAddr,
+) -> bool {
+    let Some(sender_pkl) = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(sender_addr)
+    else {
+        return false;
+    };
+    let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
+
+    if sender_summary_bytes.is_empty() {
+        // Liveness without information: refresh an EXISTING entry's TTL, but
+        // never create one and never overwrite a good cached summary.
+        op_manager
+            .interest_manager
+            .refresh_peer_interest(key, &sender_key);
+        tracing::debug!(
+            contract = %key,
+            peer = %sender_addr,
+            "Broadcast carried an empty sender summary; refreshed the interest \
+             TTL but left the cached summary untouched"
+        );
+        return false;
+    }
+
+    // #4952: upsert — the sender self-reported this summary, and the fan-out
+    // sender population is by definition co-hosts we often don't
+    // interest-track. Seeding here lets OUR next broadcast to them be a delta
+    // without waiting for a delivered send.
+    op_manager.interest_manager.upsert_peer_summary(
+        key,
+        &sender_key,
+        StateSummary::from(sender_summary_bytes.to_vec()),
+    )
+}
+
 /// Inner driver for `BroadcastTo`. Mirrors `update.rs:595-825`.
 ///
 /// 1. Update sender's cached summary in `interest_manager`.
@@ -1584,23 +1689,10 @@ async fn drive_relay_broadcast_to(
 ) -> Result<(), OpError> {
     let self_location = op_manager.ring.connection_manager.own_location();
 
-    let sender_summary = StateSummary::from(sender_summary_bytes.clone());
-
     // ── Step 1: update sender's cached summary ────────────────────────────
-    if let Some(sender_pkl) = op_manager
-        .ring
-        .connection_manager
-        .get_peer_by_addr(sender_addr)
-    {
-        let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
-        // #4952: upsert — the sender self-reported this summary, and the
-        // fan-out sender population is by definition co-hosts we often don't
-        // interest-track. Seeding here lets OUR next broadcast to them be a
-        // delta without waiting for a delivered send.
-        op_manager
-            .interest_manager
-            .upsert_peer_summary(&key, &sender_key, sender_summary);
-    }
+    // Empty bytes mean the sender could not summarize itself, NOT that its
+    // summary is empty — see `seed_sender_summary_from_broadcast`.
+    seed_sender_summary_from_broadcast(op_manager, &key, &sender_summary_bytes, sender_addr);
 
     let (update_data, payload_bytes) = match &payload {
         DeltaOrFullState::Delta(bytes) => {
@@ -2534,20 +2626,10 @@ async fn apply_streaming_broadcast(
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
 ) -> Result<(), OpError> {
-    // Step 4: update sender's cached summary.
-    let sender_summary = StateSummary::from(sender_summary_bytes.clone());
-    if let Some(sender_pkl) = op_manager
-        .ring
-        .connection_manager
-        .get_peer_by_addr(sender_addr)
-    {
-        let sender_key = crate::ring::PeerKey::from(sender_pkl.pub_key().clone());
-        // #4952: upsert — same self-reported provenance as the non-streaming
-        // BroadcastTo arm above.
-        op_manager
-            .interest_manager
-            .upsert_peer_summary(&key, &sender_key, sender_summary.clone());
-    }
+    // Step 4: update sender's cached summary. Same self-reported provenance
+    // and the same empty-means-could-not-summarize guard as the non-streaming
+    // BroadcastTo arm above.
+    seed_sender_summary_from_broadcast(op_manager, &key, &sender_summary_bytes, sender_addr);
 
     // Step 5: dedup cache BEFORE merge (mirrors non-streaming slice A
     // ordering — skipping WASM merge on duplicate broadcast is the key
@@ -6491,5 +6573,256 @@ mod tests {
                  relayed request)"
             );
         }
+    }
+
+    // ── Empty `sender_summary_bytes` must not poison the peer-summary cache ──
+    //
+    // Regression coverage for the poisoning already documented on
+    // `PayloadArm::FullNoOurSummary`: every producer builds the wire field as
+    // `our_summary…unwrap_or_default()`, so a sender that could not summarize
+    // itself ships empty bytes, and the receiver used to cache `Some(empty)`
+    // as that peer's summary.
+
+    /// Register a connected peer and return `(addr, PeerKey)`.
+    fn connect_test_peer(
+        op_manager: &OpManager,
+        port: u16,
+        loc: f64,
+    ) -> (SocketAddr, crate::ring::PeerKey) {
+        let keypair = crate::transport::TransportKeypair::new();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(loc),
+            addr,
+            keypair.public().clone(),
+            false,
+        );
+        (addr, crate::ring::PeerKey::from(keypair.public().clone()))
+    }
+
+    #[tokio::test]
+    async fn broadcast_with_empty_sender_summary_does_not_cache_an_empty_summary() {
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-no-cache", None).await;
+        let key = crate::operations::test_utils::make_contract_key(7);
+        let (addr, peer_key) = connect_test_peer(&op_manager, 12401, 0.3);
+
+        let cached = seed_sender_summary_from_broadcast(&op_manager, &key, &[], addr);
+
+        assert!(!cached, "an empty wire summary must not be cached");
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&key, &peer_key),
+            None,
+            "caching Some(empty) is the #4965-review poisoning: the entry then \
+             reports no SummaryMissingReason and looks healthy while being wrong"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_with_real_sender_summary_is_cached() {
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-real-cached", None).await;
+        let key = crate::operations::test_utils::make_contract_key(8);
+        let (addr, peer_key) = connect_test_peer(&op_manager, 12402, 0.4);
+
+        let cached = seed_sender_summary_from_broadcast(&op_manager, &key, &[1, 2, 3], addr);
+
+        assert!(cached, "a real summary must still be cached (#4952)");
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&key, &peer_key),
+            Some(StateSummary::from(vec![1u8, 2, 3])),
+            "the #4952 seeding behaviour must survive the empty-bytes guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_sender_summary_preserves_a_previously_cached_summary() {
+        // The load-bearing case for "skip, don't clear": a peer that already
+        // has a good cached summary must not lose it because ONE broadcast
+        // arrived from a sender that transiently could not summarize itself.
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-preserves", None).await;
+        let key = crate::operations::test_utils::make_contract_key(9);
+        let (addr, peer_key) = connect_test_peer(&op_manager, 12403, 0.5);
+
+        assert!(seed_sender_summary_from_broadcast(
+            &op_manager,
+            &key,
+            &[9, 9],
+            addr
+        ));
+
+        let cached = seed_sender_summary_from_broadcast(&op_manager, &key, &[], addr);
+
+        assert!(!cached);
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&key, &peer_key),
+            Some(StateSummary::from(vec![9u8, 9])),
+            "an empty broadcast field says the SENDER could not summarize \
+             itself; it is not a claim about the peer, so it must never \
+             discard a good cached summary (contrast ClearedByNoneReport, \
+             where the peer explicitly reported None)"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_sender_summary_from_an_unknown_peer_is_a_no_op() {
+        // Boundary: empty bytes AND an unresolvable sender. Must not panic and
+        // must not create an entry.
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-unknown-peer", None).await;
+        let key = crate::operations::test_utils::make_contract_key(10);
+        let unknown: SocketAddr = "127.0.0.1:12499".parse().unwrap();
+
+        assert!(!seed_sender_summary_from_broadcast(
+            &op_manager,
+            &key,
+            &[],
+            unknown
+        ));
+        assert!(!seed_sender_summary_from_broadcast(
+            &op_manager,
+            &key,
+            &[4, 2],
+            unknown
+        ));
+        assert!(
+            op_manager
+                .interest_manager
+                .get_interested_peers(&key)
+                .is_empty()
+        );
+    }
+
+    /// Source pin: BOTH broadcast receive paths must go through the guard.
+    ///
+    /// The pure tests above cannot catch a driver that re-inlines a bare
+    /// `upsert_peer_summary(&key, &sender_key, StateSummary::from(bytes))`,
+    /// which is exactly the shape being removed here and exactly the
+    /// `.claude/rules/operations.md` failure mode (#3791): a data-layer test
+    /// that stays green after the dispatch site is reverted.
+    #[test]
+    fn both_broadcast_receive_paths_route_through_the_empty_summary_guard() {
+        let src = include_str!("op_ctx_task.rs");
+        // Cut at `mod tests` (NOT `#[cfg(test)]`) so these needles cannot
+        // match this test module via `include_str!`.
+        let prod = &src[..src.find("\nmod tests {").expect("tests module not found")];
+
+        for func in [
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
+        ] {
+            // Brace-matched, so the window is EXACTLY this function. An
+            // earlier version bounded it with `find("\nasync fn ")`, which
+            // over-read into the following functions: the positive needle
+            // could then be satisfied by a sibling's body, and the negative
+            // one could trip on unrelated code while naming the wrong function.
+            let body: String = extract_fn_body(prod, func)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+
+            assert!(
+                body.contains("seed_sender_summary_from_broadcast(op_manager,&key,&sender_summary_bytes,sender_addr)"),
+                "{func} must seed the sender summary through \
+                 seed_sender_summary_from_broadcast, which refuses EMPTY bytes \
+                 (not usable evidence about the peer under either cause) \
+                 instead of caching Some(empty)"
+            );
+            assert!(
+                !body.contains("upsert_peer_summary("),
+                "{func} must not re-inline a bare upsert_peer_summary — that \
+                 re-opens the empty-summary poisoning the guard exists to close"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_sender_summary_still_refreshes_an_existing_interest_ttl() {
+        // A broadcast arriving is liveness evidence even when its summary is
+        // not usable, so declining to cache must not let the entry age out at
+        // INTEREST_TTL. On main the unconditional upsert refreshed the TTL for
+        // free; this pins that we kept that side effect.
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-ttl", None).await;
+        let key = crate::operations::test_utils::make_contract_key(11);
+        let (addr, peer_key) = connect_test_peer(&op_manager, 12404, 0.6);
+
+        assert!(seed_sender_summary_from_broadcast(
+            &op_manager,
+            &key,
+            &[5, 5],
+            addr
+        ));
+        let before = op_manager
+            .interest_manager
+            .get_peer_interest(&key, &peer_key)
+            .expect("entry seeded")
+            .last_refreshed;
+
+        seed_sender_summary_from_broadcast(&op_manager, &key, &[], addr);
+
+        let entry = op_manager
+            .interest_manager
+            .get_peer_interest(&key, &peer_key)
+            .expect("entry must survive an empty-summary broadcast");
+        assert!(
+            entry.last_refreshed >= before,
+            "an empty-summary broadcast must still refresh the interest TTL"
+        );
+        assert_eq!(
+            entry.summary,
+            Some(StateSummary::from(vec![5u8, 5])),
+            "refreshing the TTL must not disturb the cached summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_sender_summary_does_not_create_an_interest_entry() {
+        // The other half: refresh what exists, never manufacture an entry from
+        // bytes that carry no information.
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-no-create", None).await;
+        let key = crate::operations::test_utils::make_contract_key(12);
+        let (addr, _peer_key) = connect_test_peer(&op_manager, 12405, 0.7);
+
+        seed_sender_summary_from_broadcast(&op_manager, &key, &[], addr);
+
+        assert!(
+            op_manager
+                .interest_manager
+                .get_interested_peers(&key)
+                .is_empty(),
+            "an empty summary must not manufacture an interest entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_byte_sender_summary_is_cached() {
+        // Boundary against the emptiness check: one byte is a real summary.
+        let (op_manager, _rx, _h) =
+            build_queue_full_test_node_with_clock("empty-summary-one-byte", None).await;
+        let key = crate::operations::test_utils::make_contract_key(13);
+        let (addr, peer_key) = connect_test_peer(&op_manager, 12406, 0.8);
+
+        assert!(seed_sender_summary_from_broadcast(
+            &op_manager,
+            &key,
+            &[0u8],
+            addr
+        ));
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&key, &peer_key),
+            Some(StateSummary::from(vec![0u8])),
+            "a single zero byte is a real summary, not an absent one"
+        );
     }
 }
