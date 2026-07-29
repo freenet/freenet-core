@@ -652,6 +652,7 @@ async fn serve_client_api_in_impl(
         &ws_socket,
         origin_contracts.clone(),
         crate::contract::user_input::pending_prompts(),
+        config.webapp_cache_dir.clone(),
     );
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_origin_contracts(gw_router, origin_contracts);
@@ -1396,5 +1397,105 @@ mod tests {
                 .unwrap();
             assert_eq!(body, MARKER, "wrong server answered {url}");
         }
+    }
+
+    /// The router must be built from the NODE'S configured webapp cache root.
+    ///
+    /// This one line is what makes every production node and every
+    /// `#[freenet_test]` node sweep its own directory. Substituting
+    /// `crate::config::default_webapp_cache_dir()` for
+    /// `config.webapp_cache_dir` here compiles, type-checks, and leaves the
+    /// whole suite green while silently reinstating a bug this change has
+    /// already fixed twice: `cargo test -p freenet` would go back to
+    /// LRU-EVICTING the developer's real `~/.cache/freenet/webapp_cache`, via
+    /// `tests/playwright_shell.rs`, which boots a real node and fetches a shell
+    /// page on a plain `cargo test`. A ready-made template for exactly that
+    /// substitution sits in `client_api.rs::as_router`, where the same call is
+    /// legitimate (standalone composition, `local_node::run_local_node`).
+    ///
+    /// The threading is a compile-time guarantee against OMISSION only: the
+    /// parameter is required and has no default anywhere in the chain, so a
+    /// caller that supplies nothing does not build. It says nothing about
+    /// SUBSTITUTION, and substitution is the mutation that matters, so the call
+    /// site needs a pin of its own. Nothing else can catch it: a test that
+    /// observed the wrong root would be observing the developer's real cache,
+    /// which is precisely what must not happen.
+    #[test]
+    fn serve_client_api_builds_the_router_with_the_configured_webapp_cache_dir() {
+        let src = production_source();
+
+        let call = concat!("as_router_with_origin", "_contracts(");
+        assert_eq!(
+            src.matches(call).count(),
+            1,
+            "pin guard: expected exactly one router-construction call in this \
+             file, so this test is asserting against the wrong thing"
+        );
+        let args = call_arguments(&src, call);
+        assert!(
+            args.contains(concat!("config.webapp", "_cache_dir")),
+            "the router must be built from the node's configured cache root; \
+             found arguments `{args}`"
+        );
+
+        // And the substitution template must not exist in this file at all.
+        // `as_router` (client_api.rs) legitimately resolves the process-wide
+        // default; nothing on the node's serve path may.
+        assert!(
+            !src.contains(concat!("default_webapp", "_cache_dir")),
+            "server.rs must never resolve the process-wide webapp cache \
+             default: the node's serve path owns a directory it DELETES from, \
+             and its root has to come from the config so test nodes sweep their \
+             own temp dirs"
+        );
+    }
+
+    /// Production half of this file, comment-stripped and whitespace-collapsed,
+    /// for the source pin above.
+    ///
+    /// Cut at `mod tests {`, NOT at `#[cfg(test)]`: that attribute also sits on
+    /// individual test-only items (`path_handlers.rs` has three above its test
+    /// module), so cutting there lands wherever the first one happens to be and
+    /// silently truncates the slice a pin reads, which turns the pin vacuous
+    /// rather than red. Comments are dropped before collapsing so a `//` line
+    /// cannot run into the code below it, and whitespace is collapsed so
+    /// rustfmt re-wrapping a call's arguments cannot rot a needle. The needle
+    /// for the cut is split so it cannot match its own source through
+    /// `include_str!`.
+    fn production_source() -> String {
+        const FULL: &str = include_str!("server.rs");
+        let cutoff = FULL
+            .find(concat!("mod ", "tests {"))
+            .expect("server.rs must have a test module");
+        FULL[..cutoff]
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// The balanced-parenthesis argument list of the (single) call to
+    /// `call_prefix` within `src`.
+    fn call_arguments(src: &str, call_prefix: &str) -> String {
+        let start = src
+            .find(call_prefix)
+            .unwrap_or_else(|| panic!("could not find {call_prefix}"))
+            + call_prefix.len();
+        let mut depth: i32 = 1;
+        for (offset, ch) in src[start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[start..start + offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated call to {call_prefix}");
     }
 }

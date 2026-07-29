@@ -1036,6 +1036,9 @@ impl ConfigArgs {
                 // Runtime-only: resolve the secrets dir for this mode so the WS
                 // serve layer can stamp per-user activity markers (#4561).
                 secrets_dir: config_paths.secrets_dir(mode),
+                // Runtime-only: resolve the unpacked-webapp cache so the HTTP
+                // layer knows which directory its LRU sweep may delete from.
+                webapp_cache_dir: default_webapp_cache_dir(),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -2329,6 +2332,110 @@ pub struct WebsocketApiConfig {
     /// has no secrets tree to mark.
     #[serde(skip)]
     pub secrets_dir: std::path::PathBuf,
+
+    /// Directory holding unpacked web-contract bundles, derived in `build()`
+    /// (see [`default_webapp_cache_dir`]). Runtime-only for the same reason as
+    /// `secrets_dir` above: it is a resolved path, not operator-authored TOML.
+    ///
+    /// The HTTP layer builds its `WebappCache` from this and threads it to the
+    /// web handlers. It is a config value rather than a process global on
+    /// purpose — the cache is size-bounded by LRU EVICTION, so whoever owns the
+    /// path owns a directory something will delete from. Two consequences:
+    /// a node pointed at a temp data dir (every `#[freenet_test]` node) gets an
+    /// isolated cache instead of sweeping the developer's real one, and two
+    /// nodes run by the same user can be given separate caches instead of
+    /// silently sharing one.
+    ///
+    /// # What isolation this actually guarantees
+    ///
+    /// Precisely: **every node built through [`ConfigArgs::build`] serves from
+    /// the directory its config names, and every `#[freenet_test]` node has that
+    /// config pointed at its own temp dir** (the harness assigns it; pinned by
+    /// `every_node_isolates_its_webapp_cache` in `freenet-macros`). That covers
+    /// production and every integration test that goes through the harness,
+    /// including `tests/playwright_shell.rs`, the one test that actually fetches
+    /// `/v1/contract/web/` and therefore the one that actually sweeps.
+    ///
+    /// It is NOT "no test can ever reach the real cache". Two standalone
+    /// composition paths deliberately resolve [`default_webapp_cache_dir`]
+    /// themselves, because both are real user-facing modes rather than test
+    /// scaffolding:
+    ///
+    /// - `HttpClientApi::as_router`, which `server::local_node::run_local_node`
+    ///   serves through. Its signature is public API and takes no cache root.
+    /// - `WebsocketApiConfig::default()` / `From<SocketAddr>`, the fallback for
+    ///   any serving config not produced by `build()`.
+    ///
+    /// Leaving those resolved is the deliberate choice (see
+    /// `standalone_websocket_api_config_resolves_the_real_webapp_cache_dir`):
+    /// the alternative, an empty `PathBuf` matching `secrets_dir`, is benign
+    /// only because *that* field's consumer reads empty as "stamping disabled".
+    /// This field has no such consumer semantics, so an empty root would instead
+    /// write cache entries under the process's working directory and skip the
+    /// size sweep entirely (`read_dir("")` fails), i.e. trade a shared but
+    /// bounded cache for an unbounded one somewhere unexpected. The residual
+    /// risk is made audible instead: `WebappCache::with_root` logs the resolved
+    /// root once at startup, so a composition that lands on the real user cache
+    /// says so.
+    ///
+    /// So: a NEW test that composes a server or router directly and fetches a
+    /// web contract must set this field (or use `#[freenet_test]`). Nothing
+    /// stops it from not doing so, and it would then sweep the developer's real
+    /// cache.
+    #[serde(skip)]
+    pub webapp_cache_dir: std::path::PathBuf,
+}
+
+/// Default directory for unpacked web-contract bundles.
+///
+/// The XDG cache dir (`~/.cache/freenet/webapp_cache` on Linux), which is where
+/// this cache has always lived — deliberately unchanged, because relocating it
+/// would strand every existing installation's directory with nothing left to
+/// sweep it, which is the opposite of what the size bound is for.
+///
+/// `FREENET_WEBAPP_CACHE_DIR` overrides it. That exists for operators running
+/// several nodes as one user: the cache is per-user by default but its eviction
+/// guards are per-process, so pointing each node at its own directory is the
+/// clean way to keep one node's sweep away from another's entries. Set but
+/// EMPTY reads as unset (see `resolve_webapp_cache_dir`).
+pub fn default_webapp_cache_dir() -> std::path::PathBuf {
+    resolve_webapp_cache_dir(std::env::var_os(WEBAPP_CACHE_DIR_ENV))
+}
+
+/// Operator override for [`default_webapp_cache_dir`].
+const WEBAPP_CACHE_DIR_ENV: &str = "FREENET_WEBAPP_CACHE_DIR";
+
+/// [`default_webapp_cache_dir`] with the environment read hoisted into a
+/// parameter, so the empty-value case is testable without mutating
+/// process-global state.
+///
+/// An override that is set but EMPTY is treated as unset, deliberately.
+/// `var_os` reports `FREENET_WEBAPP_CACHE_DIR=` as `Some("")` (an empty string
+/// is a legitimate environment value, not an absent one), and taking that at
+/// face value silently disables the very bound this directory now has: every
+/// entry path derived from an empty root is RELATIVE, so the cache is written
+/// under whatever directory the node happened to be started in, and the sweep's
+/// `read_dir("")` fails with `ENOENT` so it evicts nothing and the cache grows
+/// without limit again. Nothing is destroyed and nothing errors, so an operator
+/// who exports the variable without a value (a stray `=`, an unset shell
+/// variable expanded into it) gets an unbounded cache in an unexpected place
+/// and no indication that anything is wrong. Falling back to the default and
+/// saying so is the only outcome that is either correct or visible.
+fn resolve_webapp_cache_dir(override_dir: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    match override_dir {
+        Some(dir) if !dir.is_empty() => return std::path::PathBuf::from(dir),
+        Some(_) => tracing::warn!(
+            env = WEBAPP_CACHE_DIR_ENV,
+            "webapp cache: override is set but empty; ignoring it and using the \
+             default cache directory. An empty root would place the cache under \
+             the node's working directory and disable its size bound entirely."
+        ),
+        None => {}
+    }
+    directories::ProjectDirs::from("", "The Freenet Project Inc", "freenet")
+        .map(|dirs| dirs.cache_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("freenet"))
+        .join("webapp_cache")
 }
 
 #[inline]
@@ -2375,6 +2482,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             per_user_op_burst: default_per_user_op_burst(),
             per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
             secrets_dir: std::path::PathBuf::new(),
+            webapp_cache_dir: default_webapp_cache_dir(),
         }
     }
 }
@@ -2394,6 +2502,7 @@ impl Default for WebsocketApiConfig {
             per_user_op_burst: default_per_user_op_burst(),
             per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
             secrets_dir: std::path::PathBuf::new(),
+            webapp_cache_dir: default_webapp_cache_dir(),
         }
     }
 }
@@ -4999,6 +5108,7 @@ mod tests {
                 // serde-skip runtime field; repopulated by build() and not
                 // asserted in the round-trip (bound to `_` in the destructure).
                 secrets_dir: std::path::PathBuf::new(),
+                webapp_cache_dir: default_webapp_cache_dir(),
             },
             secrets: base.secrets.clone(),
             log_level: tracing::log::LevelFilter::Debug,
@@ -5205,6 +5315,9 @@ mod tests {
             per_user_op_burst,
             per_user_export_min_interval_secs,
             secrets_dir: _, // serde-skip runtime field, repopulated by build()
+            // serde-skip runtime field, repopulated by build() from
+            // `default_webapp_cache_dir()` (env-overridable).
+            webapp_cache_dir: _,
         } = ws_api;
         assert_eq!(ws_address, seed.ws_api.address, "ws_api.address");
         assert_eq!(ws_port, seed.ws_api.port, "ws_api.port");
@@ -6630,5 +6743,159 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "Key file should have 0600 permissions");
         }
+    }
+
+    // =========================================================================
+    // Webapp cache root resolution
+    // =========================================================================
+
+    /// A non-empty override wins; an EMPTY one reads as unset.
+    ///
+    /// `FREENET_WEBAPP_CACHE_DIR=` yields `Some("")` from `var_os`, and taking
+    /// that literally roots the cache at `PathBuf::new()`: every derived entry
+    /// path becomes relative (written under the node's working directory) and
+    /// the sweep's `read_dir("")` fails, so the size bound never runs. Silent,
+    /// non-destructive, and exactly the unbounded cache this whole change
+    /// exists to remove.
+    ///
+    /// Driven through `resolve_webapp_cache_dir` rather than by setting the
+    /// variable: `set_var` is `unsafe` in edition 2024 precisely because tests
+    /// share one process environment, and a racing writer here would be a
+    /// flake, not a finding.
+    #[test]
+    fn an_empty_webapp_cache_dir_override_reads_as_unset() {
+        let default = resolve_webapp_cache_dir(None);
+        assert!(
+            default.is_absolute() && default.ends_with("webapp_cache"),
+            "premise: with no override the resolved root is the absolute XDG \
+             default; got {}",
+            default.display()
+        );
+
+        let explicit = std::path::PathBuf::from("/tmp/freenet-webapp-cache-test");
+        assert_eq!(
+            resolve_webapp_cache_dir(Some(explicit.clone().into_os_string())),
+            explicit,
+            "a non-empty override must be honoured verbatim"
+        );
+
+        assert_eq!(
+            resolve_webapp_cache_dir(Some(std::ffi::OsString::new())),
+            default,
+            "an override that is set but EMPTY must fall back to the default \
+             root. Honouring it roots the cache at \"\", which writes entries \
+             under the process's working directory and disables the size sweep \
+             entirely (read_dir(\"\") fails), with nothing logged or returned to \
+             say so."
+        );
+    }
+
+    /// `default_webapp_cache_dir` must consult the environment THROUGH the
+    /// resolver above, not read it raw and not skip it.
+    ///
+    /// The test above proves the resolver's rule; this proves the rule is the
+    /// one production runs. Deleting the `var_os` read (the operator override
+    /// stops working) or bypassing `resolve_webapp_cache_dir` (the empty case
+    /// comes back) both leave every other test in this file green.
+    #[test]
+    fn default_webapp_cache_dir_resolves_the_env_override() {
+        let src = production_source();
+        let body = extract_fn_body(src, "pub fn default_webapp_cache_dir()");
+        let collapsed: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            collapsed.contains(concat!(
+                "resolve_webapp_cache_dir(std::env::var_os(",
+                "WEBAPP_CACHE_DIR_ENV))"
+            )),
+            "default_webapp_cache_dir must feed the environment read straight \
+             into the resolver; anything else means the operator override or \
+             the empty-value rule is no longer what production applies. Body: \
+             `{collapsed}`"
+        );
+    }
+
+    /// The standalone `WebsocketApiConfig` constructors resolve the REAL cache
+    /// directory, deliberately, and this pins that as a decision rather than an
+    /// accident.
+    ///
+    /// The obvious-looking alternative is to mirror `secrets_dir`, whose
+    /// `Default` is an empty `PathBuf`, so that a test composing a server from
+    /// `WebsocketApiConfig::default()` could not reach the developer's cache.
+    /// Rejected, for three reasons:
+    ///
+    /// 1. Empty is not benign here. It is benign for `secrets_dir` only because
+    ///    that field's consumer reads empty as "stamping disabled". This field's
+    ///    consumer has no such rule: an empty root writes cache entries under
+    ///    the process's working directory and skips the sweep (see
+    ///    `an_empty_webapp_cache_dir_override_reads_as_unset`). Copying the
+    ///    value without the consumer semantics copies the look of the
+    ///    precedent, not its safety.
+    /// 2. It would not close the door it is aimed at. `HttpClientApi::as_router`
+    ///    is the direct router-composition entry a test would reach for, and it
+    ///    resolves `default_webapp_cache_dir()` itself because
+    ///    `local_node::run_local_node` (a real user-facing mode) serves through
+    ///    it. Its signature is public API and carries no cache root.
+    /// 3. These constructors are the fallback for any future serving path that
+    ///    is not `ConfigArgs::build()`, where an unbounded cache under an
+    ///    arbitrary working directory would be strictly worse than a shared but
+    ///    bounded one in the canonical location.
+    ///
+    /// The residual risk is documented on the field and made audible by
+    /// `WebappCache::with_root`, which logs the resolved root once at startup.
+    #[test]
+    fn standalone_websocket_api_config_resolves_the_real_webapp_cache_dir() {
+        let expected = default_webapp_cache_dir();
+        assert_eq!(
+            WebsocketApiConfig::default().webapp_cache_dir,
+            expected,
+            "Default must resolve the real cache root; see this test's rustdoc \
+             before changing it to an empty path"
+        );
+        assert_eq!(
+            WebsocketApiConfig::from(SocketAddr::from(([127, 0, 0, 1], 50509))).webapp_cache_dir,
+            expected,
+            "From<SocketAddr> must agree with Default; a split between them is \
+             how one composition path silently gets a different cache"
+        );
+    }
+
+    /// Production half of this file, for the source pins above.
+    ///
+    /// Cut at `mod tests {`, NOT at `#[cfg(test)]`: the latter also sits on
+    /// individual test-only items elsewhere in the tree, so a future one landing
+    /// above this module would truncate the slice and quietly disarm every pin
+    /// that reads it. The needle is split so it cannot match its own source.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("config.rs");
+        let cutoff = FULL
+            .find(concat!("mod ", "tests {"))
+            .expect("config.rs must have a test module");
+        &FULL[..cutoff]
+    }
+
+    /// Body of the named function within `source`, brace-balanced.
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..].find('{').expect("fn signature has a body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unterminated body for {signature_prefix}");
     }
 }

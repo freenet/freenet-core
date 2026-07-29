@@ -14,9 +14,10 @@
 //! Sandbox content is protected from top-level access via Sec-Fetch-Dest checks in client_api.rs.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use axum::response::{Html, IntoResponse};
@@ -116,6 +117,638 @@ async fn acquire_refresh_lock(
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     mutex.lock_owned().await
+}
+
+/// Take `CONTRACT_CACHE_LOCKS[instance_id]` without waiting. `None` means an
+/// unpack for that contract is in flight, which is exactly when the eviction
+/// sweep must leave the entry alone.
+fn try_acquire_cache_lock(
+    instance_id: &ContractInstanceId,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    let mutex = CONTRACT_CACHE_LOCKS
+        .entry(*instance_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    mutex.try_lock_owned().ok()
+}
+
+// =============================================================================
+// Webapp cache size bound (LRU)
+// =============================================================================
+
+/// Total on-disk size the extracted webapp cache may occupy before the
+/// least-recently-used entries are evicted.
+///
+/// The cache is a pure, recomputable artifact — an unpacked web archive that
+/// `unpack_if_stale` re-extracts whenever the contract state hash changes — so
+/// a miss costs one re-unpack of state the node already has, and nothing else
+/// in the node depends on an entry existing. Until this bound existed the
+/// directory had per-contract staleness replacement but no global limit, so it
+/// grew by one entry for every webapp the user ever opened and never shrank
+/// (measured: 325 MB / 61 entries on one peer, 1.2 GB / 82 entries on another,
+/// with entries up to six months untouched).
+///
+/// 64 MiB is chosen against the observed per-entry distribution: a typical
+/// unpacked webapp is a few hundred KB to a few MB, so the budget keeps roughly
+/// the last 15-30 distinct webapps the user actually browsed — far more than a
+/// browsing session touches — while cutting >90% of the observed footprint.
+/// These bytes are additionally invisible to the node's disk accounting: the
+/// cache lives under the XDG *cache* dir, whereas `ring/hosting/disk_usage.rs`
+/// only walks `contracts_dir` + `wasmtime_cache_dir`, so nothing else bounds it.
+const WEBAPP_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How long an entry is protected from eviction after this process last served
+/// from it.
+///
+/// This is the in-flight-request guard: a request records an access before it
+/// touches the cache, so a sweep running concurrently skips the entry instead of
+/// competing with the request for it. It must therefore comfortably exceed the
+/// 30s network fetch timeout in `ensure_contract_cached` (a request may spend
+/// that long merely waiting on the node before reading the unpacked files).
+///
+/// The guard is a *strong preference*, not an interlock: the check and the
+/// `remove_dir_all` are not atomic, and the record is per-process while the
+/// directory is per-user, so an eviction racing a request remains possible in
+/// principle (see [`enforce_webapp_cache_budget`]). What that costs is bounded:
+/// on Unix an already-opened file survives unlinking, and `ServeFile` opens the
+/// descriptor before streaming, so a slow download cannot be truncated
+/// mid-flight; the worst case is a request that has not opened the file yet
+/// falling back to a 404 or a refetch of a cache that is recomputable anyway.
+///
+/// Being time-bounded is load-bearing (see the cleanup-exemption rule in
+/// AGENTS.md): the exemption always expires, so no entry can become permanently
+/// un-evictable by being touched once.
+const WEBAPP_CACHE_EVICTION_MIN_IDLE: Duration = Duration::from_secs(120);
+
+/// How often an entry's on-disk last-used marker (the `{key}.hash` mtime) is
+/// refreshed while it is being served.
+///
+/// Serving a webapp fans out many subresource requests, so refreshing the mtime
+/// on every one would add a filesystem timestamp update per request for no
+/// benefit. Throttling to one refresh per contract per 5 minutes keeps the
+/// on-disk LRU signal accurate to within 5 minutes, which is far finer than the
+/// horizon eviction actually discriminates on (hours to months).
+const WEBAPP_CACHE_ACCESS_TOUCH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Most entries one sweep will delete before giving up and leaving the rest to
+/// the next one.
+///
+/// Steady state evicts zero or one entry per unpack, so this never binds there.
+/// It exists for the ONE-OFF case this whole change is motivated by: the first
+/// sweep on a node that upgrades with an unbounded legacy cache. The 1.2 GB /
+/// 82-entry directory measured on a real peer would otherwise do ~78
+/// `remove_dir_all`s inline before the shell page returns — a visible stall on
+/// the first webapp load after an upgrade. Capped, that backlog drains over the
+/// next handful of unpacks (plus the debounced reconcile sweep) instead of
+/// landing on one request.
+///
+/// Note this bounds the *deletion* half only. The directory walk that precedes
+/// it is proportional to the tree and is not capped — it is the price of
+/// knowing the size at all, it runs on `spawn_blocking` rather than the
+/// reactor, and it shrinks with the cache over the first few sweeps.
+const WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP: usize = 8;
+
+/// Minimum interval between budget sweeps that were triggered by a *reconcile*
+/// rather than by an unpack.
+///
+/// An unpack is the only event that grows the cache, so it always sweeps. But a
+/// node upgrading with an already-oversized cache may reconcile contracts whose
+/// state hash never changes and therefore never unpack, so the reconcile path
+/// also gets a chance to sweep — debounced, because unlike an unpack it is not
+/// itself expensive and would otherwise pay for a directory walk on every
+/// 30-second refresh of every contract.
+const WEBAPP_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Per-contract record of how recently this process served from the entry.
+#[derive(Clone, Copy)]
+struct CacheAccess {
+    /// Last time any handler served (or attempted to serve) this contract.
+    /// Drives the in-flight eviction guard.
+    last_access: Instant,
+    /// Last time `last_access` was mirrored onto the `{key}.hash` mtime.
+    /// Drives the touch throttle only.
+    last_persisted: Instant,
+}
+
+/// In-memory last-access record, mirrored to disk at
+/// `WEBAPP_CACHE_ACCESS_TOUCH_INTERVAL` granularity.
+///
+/// Bounded by the number of entries actually on disk, which
+/// `WEBAPP_CACHE_MAX_BYTES` bounds in turn: it is only ever written where the
+/// cache entry is known to exist (a warm `{key}.hash`, or a fetch that just
+/// populated one), and the sweep drops the record when it evicts the entry.
+/// That gating is load-bearing, not incidental — `variable_content` is reachable
+/// unauthenticated with an arbitrary key, so recording an access before the
+/// #3945 presence gate has run would hand an attacker an unbounded per-key map
+/// (see the per-key-collection rule in `.claude/rules/code-style.md`).
+static WEBAPP_CACHE_ACCESS: LazyLock<DashMap<ContractInstanceId, CacheAccess>> =
+    LazyLock::new(DashMap::new);
+
+/// What caused a budget sweep to be considered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SweepTrigger {
+    /// The cache just grew — always sweep.
+    Unpack,
+    /// The cache was reconciled but not rewritten — sweep at most once per
+    /// `WEBAPP_CACHE_SWEEP_INTERVAL`.
+    Reconcile,
+}
+
+/// Sweep bookkeeping for one cache directory: when the last sweep ran (the
+/// reconcile debounce) and whether one is running right now.
+#[derive(Default, Debug)]
+struct SweepState {
+    last_sweep: Option<Instant>,
+    in_progress: bool,
+}
+
+/// Where the extracted webapp cache lives, how large it may grow, and how often
+/// that bound is enforced.
+///
+/// **Injected from the node's configuration, never read from a global.** Every
+/// path the handlers touch — `<key>/`, `<key>.hash`, and the sweep root — is
+/// derived from `root`, which the router builds once from
+/// `WebsocketApiConfig::webapp_cache_dir` and hands to every handler through the
+/// axum `State`.
+///
+/// That injection is a safety property, not a convenience, and it took two
+/// attempts to get right. The sweep DELETES, and several tests drive
+/// `unpack_if_stale` end to end, so a root read from a process global made
+/// `cargo test -p freenet` evict the developer's real
+/// `~/.cache/freenet/webapp_cache` down to the production budget — and, because
+/// the in-flight guards are per-process while the directory is per-user, it
+/// could evict entries a node running as the same user was actively serving.
+/// The first fix gated a temp-dir redirect on `#[cfg(test)]`, which covers unit
+/// tests only: `cfg(test)` is false when an integration test links the lib as an
+/// ordinary dependency, so `tests/playwright_shell.rs` — which boots a real node
+/// and fetches a shell page on a plain `cargo test` — still swept the real cache.
+/// Threading the root has no such blind spot: a caller that does not supply one
+/// does not compile.
+///
+/// Because the root comes from the node's config, a test node pointed at a
+/// `tempfile::tempdir()` data dir gets an isolated cache for free, and two nodes
+/// run by the same user no longer share one directory.
+#[derive(Clone, Debug)]
+pub(crate) struct WebappCache {
+    root: PathBuf,
+    max_bytes: u64,
+    sweep: Arc<parking_lot::Mutex<SweepState>>,
+}
+
+impl WebappCache {
+    /// The cache a node serves from, bounded by [`WEBAPP_CACHE_MAX_BYTES`].
+    ///
+    /// One instance per server, cloned into the router state, so the sweep
+    /// debounce and in-progress flag are shared across that node's requests.
+    ///
+    /// Creates the directory and names it in the log, once, here: this is where
+    /// the cache takes ownership of a path it will DELETE from, and nothing else
+    /// in the node identifies that path. An operator asking "what is removing
+    /// files from here" or "where did this disk go" otherwise has nowhere to
+    /// look, and a sweeper should say which directory it sweeps.
+    ///
+    /// Creating it eagerly also converts the two silent-misconfiguration shapes
+    /// into a startup warning: a root that exists as a FILE, or one that cannot
+    /// be created (permissions, read-only mount). Either leaves every unpack
+    /// failing and the sweep scanning nothing, i.e. a cache that never populates
+    /// and a bound that never runs, with no error surfaced anywhere because both
+    /// paths are best-effort by design. That failure is not fatal and must not
+    /// be, since the node serves everything except web contracts perfectly well,
+    /// so this warns and carries on rather than refusing to start.
+    pub(crate) fn with_root(root: PathBuf) -> Self {
+        match std::fs::create_dir_all(&root) {
+            Ok(()) => tracing::info!(
+                path = %root.display(),
+                max_bytes = WEBAPP_CACHE_MAX_BYTES,
+                "webapp cache: unpacked web contracts are cached here; \
+                 least-recently-used entries are DELETED from here to hold the \
+                 directory under its size bound"
+            ),
+            Err(err) => tracing::warn!(
+                path = %root.display(),
+                "webapp cache: cannot create the cache directory ({err}); web \
+                 contracts will fail to unpack and the size bound will not run. \
+                 Check that the path is a directory and is writable, or point \
+                 the node elsewhere with FREENET_WEBAPP_CACHE_DIR."
+            ),
+        }
+        Self {
+            root,
+            max_bytes: WEBAPP_CACHE_MAX_BYTES,
+            sweep: Arc::new(parking_lot::Mutex::new(SweepState::default())),
+        }
+    }
+
+    /// The directory this cache owns — i.e. the one its sweep deletes from.
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Directory the contract's web archive is unpacked into.
+    fn entry_dir(&self, instance_id: &ContractInstanceId) -> PathBuf {
+        self.root.join(instance_id.encode())
+    }
+
+    /// The `{key}.hash` sentinel: holds the unpacked state's hash, doubles as
+    /// the "cache is populated" marker and as the LRU last-used timestamp.
+    fn hash_path(&self, instance_id: &ContractInstanceId) -> PathBuf {
+        self.root.join(format!("{}.hash", instance_id.encode()))
+    }
+}
+
+/// Clears `in_progress` however the sweep ends, so a panic mid-sweep cannot
+/// wedge the flag on and suppress every future sweep.
+struct SweepInProgress(Arc<parking_lot::Mutex<SweepState>>);
+
+impl Drop for SweepInProgress {
+    fn drop(&mut self) {
+        self.0.lock().in_progress = false;
+    }
+}
+
+/// One `<instance_id>` entry of the webapp cache as seen by a sweep.
+struct WebappCacheEntry {
+    instance_id: ContractInstanceId,
+    /// The name as it appears on disk — the directory name and the `{key}.hash`
+    /// stem, which `scan_webapp_cache` has verified round-trips through
+    /// `ContractInstanceId`.
+    encoded: String,
+    /// Unpacked tree plus the sentinel hash file.
+    bytes: u64,
+    /// Last-used proxy — see `scan_webapp_cache`.
+    last_used: SystemTime,
+}
+
+/// Outcome of one sweep. Returned rather than logged-only so tests can assert
+/// on the decisions instead of on filesystem side effects alone.
+#[derive(Default, Debug)]
+struct WebappCacheSweep {
+    total_before: u64,
+    bytes_freed: u64,
+    evicted: Vec<ContractInstanceId>,
+}
+
+/// Record that `instance_id` is being served right now, and report whether the
+/// on-disk last-used marker is due for a refresh.
+///
+/// Pure in-memory and synchronous: this runs on every request, so it must not
+/// touch the filesystem. The (rare) disk refresh is the caller's job.
+fn record_cache_access(instance_id: ContractInstanceId) -> bool {
+    use dashmap::mapref::entry::Entry;
+
+    let now = Instant::now();
+    match WEBAPP_CACHE_ACCESS.entry(instance_id) {
+        Entry::Occupied(mut occupied) => {
+            let access = occupied.get_mut();
+            access.last_access = now;
+            if now.duration_since(access.last_persisted) >= WEBAPP_CACHE_ACCESS_TOUCH_INTERVAL {
+                access.last_persisted = now;
+                true
+            } else {
+                false
+            }
+        }
+        Entry::Vacant(vacant) => {
+            vacant.insert(CacheAccess {
+                last_access: now,
+                last_persisted: now,
+            });
+            true
+        }
+    }
+}
+
+/// True while `instance_id` is inside its post-access eviction grace window.
+fn accessed_recently(instance_id: &ContractInstanceId) -> bool {
+    WEBAPP_CACHE_ACCESS
+        .get(instance_id)
+        .map(|access| access.last_access.elapsed() < WEBAPP_CACHE_EVICTION_MIN_IDLE)
+        .unwrap_or(false)
+}
+
+/// Mirror the last-access time onto the `{key}.hash` mtime, which is what
+/// survives a restart and is what the sweep ranks on.
+///
+/// A timestamp-only update (`filetime::set_file_mtime`, which opens the file and
+/// calls `futimens`) rather than a rewrite: the sentinel's *contents* are the
+/// state hash that `unpack_if_stale` compares against, and rewriting them would
+/// race a concurrent unpack. Best effort — a missing file (cold cache) or a
+/// read-only cache dir must never fail a user request.
+async fn persist_cache_access_marker(hash_path: PathBuf) {
+    let result = tokio::task::spawn_blocking(move || {
+        filetime::set_file_mtime(&hash_path, filetime::FileTime::now())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => debug!("webapp cache: could not refresh last-used marker: {err}"),
+        Err(err) => debug!("webapp cache: last-used marker task failed: {err}"),
+    }
+}
+
+/// Note that a handler is serving `instance_id`, refreshing the on-disk LRU
+/// marker when due.
+///
+/// Only call this where the cache entry is known to exist — see the bounding
+/// note on [`WEBAPP_CACHE_ACCESS`].
+async fn note_cache_access(cache: &WebappCache, instance_id: ContractInstanceId) {
+    if record_cache_access(instance_id) {
+        persist_cache_access_marker(cache.hash_path(&instance_id)).await;
+    }
+}
+
+/// Recursively sum the size of every regular file under `dir`. Unreadable
+/// entries contribute 0 rather than erroring: an under-count only means the
+/// sweep evicts less than it could, which is the safe direction for a cache
+/// whose deletion is the destructive operation.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total = total.saturating_add(meta.len());
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Enumerate the webapp cache under `root`, pairing each `<instance_id>`
+/// directory with its `<instance_id>.hash` sentinel.
+///
+/// The last-used signal is the sentinel's mtime, which `note_cache_access`
+/// refreshes while a contract is being served and which `unpack_if_stale`
+/// rewrites on every re-extraction — so it tracks last USE, not creation.
+/// Entries with no sentinel (or an unreadable one) fall back to the directory's
+/// own mtime and finally to the epoch, i.e. they sort as the coldest.
+///
+/// Anything whose name is not a cache entry is ignored entirely: the sweep must
+/// never count or delete files it does not own. `from_base58` alone is not a
+/// sufficient filter — stdlib zero-pads a short decode instead of rejecting it
+/// (`contract_interface/key.rs`), so ordinary names like `tmp`, `data` or
+/// `assets` parse into well-formed but *wrong* ids. The name must therefore
+/// round-trip: parse, re-encode, and match what is actually on disk. Without
+/// that check the sweep would charge a stray directory's bytes to a phantom id,
+/// try to delete a path that does not exist, treat the resulting `NotFound` as
+/// success, and count bytes it never freed — stopping early, staying over
+/// budget, and reporting evictions that deleted nothing.
+///
+/// Blocking — call from `spawn_blocking`.
+fn scan_webapp_cache(root: &Path) -> Vec<WebappCacheEntry> {
+    /// Parse a cache-entry name, rejecting anything that does not re-encode to
+    /// itself. See the round-trip note on `scan_webapp_cache`.
+    fn parse_entry_name(name: &str) -> Option<ContractInstanceId> {
+        let instance_id = ContractInstanceId::from_base58(name).ok()?;
+        (instance_id.encode() == name).then_some(instance_id)
+    }
+
+    // (bytes, sentinel mtime, directory mtime)
+    let mut by_id: HashMap<ContractInstanceId, (u64, Option<SystemTime>, Option<SystemTime>)> =
+        HashMap::new();
+    let Ok(dir_entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    for dir_entry in dir_entries.flatten() {
+        let Ok(file_type) = dir_entry.file_type() else {
+            continue;
+        };
+        let file_name = dir_entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            let Some(instance_id) = parse_entry_name(name) else {
+                continue;
+            };
+            let slot = by_id.entry(instance_id).or_insert((0, None, None));
+            slot.0 = slot.0.saturating_add(dir_size(&dir_entry.path()));
+            slot.2 = dir_entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok());
+        } else if file_type.is_file() {
+            let Some(stem) = name.strip_suffix(".hash") else {
+                continue;
+            };
+            let Some(instance_id) = parse_entry_name(stem) else {
+                continue;
+            };
+            let meta = dir_entry.metadata().ok();
+            let slot = by_id.entry(instance_id).or_insert((0, None, None));
+            slot.0 = slot
+                .0
+                .saturating_add(meta.as_ref().map(|m| m.len()).unwrap_or(0));
+            slot.1 = meta.and_then(|meta| meta.modified().ok());
+        }
+    }
+
+    by_id
+        .into_iter()
+        .map(
+            |(instance_id, (bytes, hash_mtime, dir_mtime))| WebappCacheEntry {
+                // Equal to the on-disk name by construction: `parse_entry_name`
+                // admitted the id only because the two already matched.
+                encoded: instance_id.encode(),
+                instance_id,
+                bytes,
+                last_used: hash_mtime.or(dir_mtime).unwrap_or(SystemTime::UNIX_EPOCH),
+            },
+        )
+        .collect()
+}
+
+/// Delete one cache entry: sentinel first, then the unpacked tree.
+///
+/// The order is load-bearing. A directory with no `{key}.hash` reads as a COLD
+/// cache and is simply re-fetched; a `{key}.hash` with no directory reads as a
+/// WARM cache and would serve 404s until the contract's state happened to
+/// change. So an interrupted eviction must leave the first shape, never the
+/// second — and if the sentinel cannot be removed we leave the entry entirely
+/// alone rather than create the second shape deliberately.
+async fn remove_cache_entry(root: &Path, encoded: &str) -> std::io::Result<()> {
+    match tokio::fs::remove_file(root.join(format!("{encoded}.hash"))).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    match tokio::fs::remove_dir_all(root.join(encoded)).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Evict least-recently-used entries until `cache` fits in its budget.
+///
+/// `in_use` is the contract whose request triggered the sweep; it is never a
+/// victim of its own sweep. Two further guards steer eviction away from live
+/// requests: an entry served within `WEBAPP_CACHE_EVICTION_MIN_IDLE` is skipped,
+/// and an entry whose `CONTRACT_CACHE_LOCKS` mutex is held (an unpack is in
+/// flight) is skipped via `try_lock`.
+///
+/// Those guards are a strong preference, not an interlock — the check and the
+/// `remove_dir_all` are not atomic, and both guards are per-process while the
+/// directory is per-user, so a request in another process (or one that slipped
+/// between the check and the delete) can still lose its entry. That is
+/// survivable rather than merely unlikely: the cache is recomputable, and on
+/// Unix an already-opened file survives unlinking, so an in-flight `ServeFile`
+/// stream completes and the worst case is a 404 or a refetch. See
+/// `WEBAPP_CACHE_EVICTION_MIN_IDLE`.
+///
+/// The bound is best-effort in the other direction too: if every oversized entry
+/// is protected, if a single webapp is itself larger than the budget, or if the
+/// overage needs more than `WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP` deletions, the
+/// sweep leaves the cache over budget and the next one retries. It never deletes
+/// a protected entry to hit the number, and a failure to delete one entry never
+/// aborts the sweep or propagates to the request.
+///
+/// # Cost
+///
+/// Awaited inline by the caller, so it is on the request path. In steady state
+/// that is a directory walk plus at most one deletion, which is small change
+/// next to the `remove_dir_all` + `unpack` that triggered it. The one expensive
+/// case is the first sweep after upgrading a node with an unbounded legacy
+/// cache: the walk is proportional to the whole tree (on `spawn_blocking`, so
+/// it does not block the reactor) and the deletions are capped — see
+/// [`WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP`].
+async fn enforce_webapp_cache_budget(
+    cache: &WebappCache,
+    in_use: Option<ContractInstanceId>,
+) -> WebappCacheSweep {
+    let root = cache.root.clone();
+    let max_bytes = cache.max_bytes;
+    let scan_root = root.clone();
+    let entries = match tokio::task::spawn_blocking(move || scan_webapp_cache(&scan_root)).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!("webapp cache: size scan failed, skipping sweep: {err}");
+            return WebappCacheSweep::default();
+        }
+    };
+
+    let total: u64 = entries
+        .iter()
+        .fold(0u64, |acc, entry| acc.saturating_add(entry.bytes));
+    let mut sweep = WebappCacheSweep {
+        total_before: total,
+        ..Default::default()
+    };
+    if total <= max_bytes {
+        return sweep;
+    }
+
+    let mut entries = entries;
+    // Oldest use first; base58 key as a deterministic tiebreak so two entries
+    // sharing an mtime (common at 1s filesystem granularity) always evict in
+    // the same order.
+    entries.sort_by(|a, b| {
+        a.last_used
+            .cmp(&b.last_used)
+            .then_with(|| a.encoded.cmp(&b.encoded))
+    });
+
+    let mut live = total;
+    for entry in &entries {
+        if live <= max_bytes || sweep.evicted.len() >= WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP {
+            break;
+        }
+        if Some(entry.instance_id) == in_use || accessed_recently(&entry.instance_id) {
+            continue;
+        }
+        let Some(guard) = try_acquire_cache_lock(&entry.instance_id) else {
+            continue;
+        };
+        match remove_cache_entry(&root, &entry.encoded).await {
+            Ok(()) => {
+                live = live.saturating_sub(entry.bytes);
+                sweep.bytes_freed = sweep.bytes_freed.saturating_add(entry.bytes);
+                sweep.evicted.push(entry.instance_id);
+                WEBAPP_CACHE_ACCESS.remove(&entry.instance_id);
+                // Drop the reconcile timer too: `refresh_cache_if_due` returns
+                // early on a fresh timer alone, so an evicted contract with a
+                // live timer would serve 404s from the now-empty directory
+                // until the TTL expired.
+                CONTRACT_CACHE_REFRESH.remove(&entry.instance_id);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "webapp cache: could not evict {}: {err}",
+                    entry.encoded.as_str()
+                );
+            }
+        }
+        drop(guard);
+    }
+
+    if !sweep.evicted.is_empty() {
+        tracing::info!(
+            evicted = sweep.evicted.len(),
+            freed_bytes = sweep.bytes_freed,
+            total_before = sweep.total_before,
+            still_over_budget = live > max_bytes,
+            "webapp cache: evicted least-recently-used entries to fit the size bound"
+        );
+    } else if live > max_bytes {
+        debug!(
+            total_bytes = total,
+            max_bytes, "webapp cache: over budget but every entry is in use"
+        );
+    }
+    sweep
+}
+
+/// Whether a sweep with this `trigger` is due.
+///
+/// An unpack is the only thing that grows the cache, so it always sweeps.
+/// A reconcile rewrote nothing, so it sweeps at most once per
+/// `WEBAPP_CACHE_SWEEP_INTERVAL` — otherwise every contract's 30-second refresh
+/// would pay for a directory walk.
+fn sweep_is_due(trigger: SweepTrigger, last_sweep: Option<Instant>, now: Instant) -> bool {
+    match trigger {
+        SweepTrigger::Unpack => true,
+        SweepTrigger::Reconcile => {
+            last_sweep.is_none_or(|prev| now.duration_since(prev) >= WEBAPP_CACHE_SWEEP_INTERVAL)
+        }
+    }
+}
+
+/// Run a budget sweep if `trigger` calls for one and no sweep is already
+/// running.
+///
+/// The in-progress gate is not just an optimisation. Each sweep takes its own
+/// `live` snapshot and deletes until *it* has freed the deficit, so N concurrent
+/// unpacks would each evict a full deficit's worth and drive the cache well
+/// below budget, over-reporting `bytes_freed` as they went. One sweep at a time
+/// makes the eviction count match the actual overage.
+async fn maybe_enforce_webapp_cache_budget(
+    cache: &WebappCache,
+    in_use: ContractInstanceId,
+    trigger: SweepTrigger,
+) {
+    let _in_progress = {
+        // Scoped so the (sync) lock is released before the await below.
+        let mut state = cache.sweep.lock();
+        let now = Instant::now();
+        if state.in_progress || !sweep_is_due(trigger, state.last_sweep, now) {
+            return;
+        }
+        state.in_progress = true;
+        state.last_sweep = Some(now);
+        SweepInProgress(Arc::clone(&cache.sweep))
+    };
+    enforce_webapp_cache_budget(cache, Some(in_use)).await;
 }
 
 /// True if the contract was reconciled against the network within the last
@@ -318,12 +951,26 @@ async fn is_locally_known(
 /// The refresh timer is only advanced on success, so a transient fetch failure
 /// does not suppress the next request's retry. `ensure_contract_cached` skips
 /// the disk rewrite when the state hash is unchanged (`unpack_if_stale`).
+///
+/// This is also where both cache-reading handlers (`variable_content` and
+/// `serve_sandbox_content`) mark the entry as in use for the LRU size bound, so
+/// the marking happens exactly once per request and only for entries that exist.
 async fn refresh_cache_if_due(
     instance_id: ContractInstanceId,
     request_sender: &HttpClientApiRequest,
+    cache: &WebappCache,
 ) -> Result<(), WebSocketApiError> {
-    let hash_path = state_hash_path(&instance_id);
+    let hash_path = cache.hash_path(&instance_id);
     let cache_warm = tokio::fs::try_exists(&hash_path).await.unwrap_or(false);
+
+    // The entry is about to be read, so mark it in use before anything else:
+    // that both steers a concurrent budget sweep away from it for the duration
+    // of this request and keeps its LRU marker current. Gated on `cache_warm`
+    // because an arbitrary key reaching this handler has not yet cleared the
+    // #3945 presence gate — see the bounding note on `WEBAPP_CACHE_ACCESS`.
+    if cache_warm {
+        note_cache_access(cache, instance_id).await;
+    }
 
     // Fast path: a warm cache reconciled within the TTL needs no work and must
     // not contend on the refresh lock.
@@ -334,12 +981,19 @@ async fn refresh_cache_if_due(
     // Slow path: refresh looks due. Serialize concurrent refreshers for this
     // contract so only the first issues a GET; the rest re-check below.
     let _guard = acquire_refresh_lock(&instance_id).await;
-    // Re-check on the timer alone (not the pre-lock `cache_warm` snapshot): a
-    // concurrent refresher that completed while we waited recorded a fresh
-    // timer AND populated the cache via `ensure_contract_cached`, so a fresh
-    // timer means there is nothing left to do even if our snapshot saw the
-    // cache as cold.
-    if cache_reconciled_recently(&instance_id) {
+    // Re-check under the lock, and RE-STAT rather than trusting the timer
+    // alone. The timer is per-process; the cache directory is per-USER, and the
+    // documented multi-peer setup (peer-manager.sh) runs several nodes as one
+    // user. Another node's budget sweep can therefore evict this entry at any
+    // moment, and its `CONTRACT_CACHE_REFRESH.remove` — the in-process
+    // mitigation — is invisible to us. Returning on a fresh timer alone would
+    // then skip the refetch and serve 404s out of the emptied directory for the
+    // rest of our TTL window. Requiring warm AND fresh also still covers the
+    // in-process race this check was originally for: a concurrent refresher
+    // that completed while we waited both populated the cache and recorded a
+    // fresh timer, so it satisfies both halves.
+    let still_warm = tokio::fs::try_exists(&hash_path).await.unwrap_or(false);
+    if still_warm && cache_reconciled_recently(&instance_id) {
         return Ok(());
     }
 
@@ -358,21 +1012,25 @@ async fn refresh_cache_if_due(
     // random-key amplification vector. Gating it would also silently break the
     // #3977 republish-pickup for a contract that is cached warm but currently
     // unsubscribed (it would serve the stale bundle instead of refreshing).
-    // Note `cache_warm` is the PRE-LOCK snapshot, which is exactly right here:
-    // a concurrent refresher that warmed the cache while we waited also
-    // recorded a fresh timer, so the `cache_reconciled_recently` re-check above
-    // already returned for that race — reaching this point with
-    // `cache_warm == false` means the cache was genuinely cold for us.
-    if !cache_warm && !is_locally_known(instance_id, request_sender).await {
+    // The gate reads `cache_warm || still_warm`: a sentinel seen at EITHER
+    // observation is proof this node legitimately fetched the contract before,
+    // which is the whole basis for exempting the warm path. Requiring both
+    // would send a legitimate entry that another process just evicted through
+    // the presence query, and requiring only the pre-lock snapshot would miss a
+    // concurrent refresher that warmed the cache while we waited.
+    if !(cache_warm || still_warm || is_locally_known(instance_id, request_sender).await) {
         return Ok(());
     }
 
-    ensure_contract_cached(instance_id, request_sender, None).await?;
+    ensure_contract_cached(instance_id, request_sender, None, cache).await?;
     CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+    // The fetch populated the entry, so it now exists and is about to be read.
+    note_cache_access(cache, instance_id).await;
     Ok(())
 }
 
-#[instrument(level = "debug", skip(request_sender))]
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip(request_sender, cache))]
 pub(super) async fn contract_home(
     key: String,
     request_sender: HttpClientApiRequest,
@@ -381,7 +1039,8 @@ pub(super) async fn contract_home(
     query_string: Option<String>,
     sub_path: Option<&str>,
     hosted_mode: bool,
-) -> Result<impl IntoResponse, WebSocketApiError> {
+    cache: &WebappCache,
+) -> Result<impl IntoResponse + use<>, WebSocketApiError> {
     let instance_id = ContractInstanceId::from_base58(&key).map_err(|err| {
         debug!("contract_home: Failed to parse contract key: {}", err);
         WebSocketApiError::InvalidParam {
@@ -396,8 +1055,13 @@ pub(super) async fn contract_home(
         instance_id,
         &request_sender,
         Some((assigned_token.clone(), instance_id)),
+        cache,
     )
     .await?;
+    // The fetch populated the entry, so it now exists and is about to be read
+    // by the iframe load that immediately follows. Marking it in use steers a
+    // concurrent budget sweep away from it for that request.
+    note_cache_access(cache, instance_id).await;
     // Record the reconciliation so the iframe load that immediately follows
     // (`?__sandbox=1`) and any subresource fetches reuse this fresh state
     // instead of issuing their own redundant GET within the TTL window.
@@ -444,6 +1108,7 @@ async fn ensure_contract_cached(
     instance_id: ContractInstanceId,
     request_sender: &HttpClientApiRequest,
     assigned_token: Option<(AuthToken, ContractInstanceId)>,
+    cache: &WebappCache,
 ) -> Result<(), WebSocketApiError> {
     let (response_sender, mut response_recv) = mpsc::unbounded_channel();
     request_sender
@@ -487,7 +1152,7 @@ async fn ensure_contract_cached(
 
     let recv_result =
         tokio::time::timeout(std::time::Duration::from_secs(30), response_recv.recv()).await;
-    let outcome = handle_get_response(instance_id, recv_result).await;
+    let outcome = handle_get_response(instance_id, recv_result, cache).await;
 
     // Disconnect regardless of whether the fetch succeeded, so the node
     // can reap the transient client registration. A send failure means the
@@ -516,6 +1181,7 @@ async fn ensure_contract_cached(
 async fn handle_get_response(
     instance_id: ContractInstanceId,
     recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed>,
+    cache: &WebappCache,
 ) -> Result<(), WebSocketApiError> {
     match recv_result {
         // Transient: the 30s fetch wrapper elapsed before the node answered.
@@ -539,7 +1205,7 @@ async fn handle_get_response(
                     ..
                 })),
             ..
-        })) => unpack_if_stale(&contract, state.as_ref()).await,
+        })) => unpack_if_stale(&contract, state.as_ref(), cache).await,
         Ok(Some(HostCallbackResult::Result {
             result:
                 Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
@@ -575,15 +1241,19 @@ async fn handle_get_response(
 /// on `remove_dir_all` + `create_dir_all` + `unpack`. The hash is re-read
 /// inside the lock — if a prior holder already wrote the current state, the
 /// follower exits without repeating the work.
+///
+/// Both exits then run [`maybe_enforce_webapp_cache_budget`], which is what
+/// keeps the cache from growing without bound (see [`WEBAPP_CACHE_MAX_BYTES`]).
 async fn unpack_if_stale(
     contract: &ContractContainer,
     state_bytes: &[u8],
+    cache: &WebappCache,
 ) -> Result<(), WebSocketApiError> {
     let contract_key = contract.key();
     let instance_id = *contract_key.id();
-    let path = contract_web_path(&instance_id);
+    let path = cache.entry_dir(&instance_id);
     let current_hash = hash_state(state_bytes);
-    let hash_path = state_hash_path(&instance_id);
+    let hash_path = cache.hash_path(&instance_id);
 
     let _guard = acquire_cache_lock(&instance_id).await;
 
@@ -600,6 +1270,12 @@ async fn unpack_if_stale(
         _ => true,
     };
     if !needs_update {
+        // Nothing grew, but this is still the one code path every reconcile
+        // reaches, so give the debounced sweep a chance: a node that upgrades
+        // with an already-oversized cache may keep serving contracts whose
+        // state hash never changes and would otherwise never sweep.
+        drop(_guard);
+        maybe_enforce_webapp_cache_budget(cache, instance_id, SweepTrigger::Reconcile).await;
         return Ok(());
     }
 
@@ -633,16 +1309,26 @@ async fn unpack_if_stale(
             error_cause: format!("Failed to write state hash: {e}"),
         })?;
 
+    // The unpack above is the only thing that grows the webapp cache, so it is
+    // the natural (and cheapest) sweep trigger: the directory walk it costs is
+    // small change next to the `remove_dir_all` + `unpack` just performed, and
+    // no request that merely reads from a warm cache pays for it. Released the
+    // per-contract lock first so the sweep's `try_lock` guard is only reporting
+    // on OTHER contracts' in-flight unpacks.
+    drop(_guard);
+    maybe_enforce_webapp_cache_budget(cache, instance_id, SweepTrigger::Unpack).await;
+
     Ok(())
 }
 
-#[instrument(level = "debug", skip(request_sender))]
+#[instrument(level = "debug", skip(request_sender, cache))]
 pub(super) async fn variable_content(
     key: String,
     req_path: String,
     api_version: ApiVersion,
     request_sender: HttpClientApiRequest,
-) -> Result<impl IntoResponse, Box<WebSocketApiError>> {
+    cache: &WebappCache,
+) -> Result<impl IntoResponse + use<>, Box<WebSocketApiError>> {
     debug!(
         "variable_content: Processing request for key: {}, path: {}",
         key, req_path
@@ -652,7 +1338,7 @@ pub(super) async fn variable_content(
         ContractInstanceId::from_base58(&key).map_err(|err| WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
         })?;
-    let base_path = contract_web_path(&instance_id);
+    let base_path = cache.entry_dir(&instance_id);
     debug!("variable_content: Base path resolved to: {:?}", base_path);
 
     // Fetch + unpack the contract if its cache is cold OR stale. Without the
@@ -667,7 +1353,7 @@ pub(super) async fn variable_content(
     // `refresh_cache_if_due` / `is_locally_known`): an unknown random key 404s
     // from the empty cache below instead of triggering an outbound network GET,
     // closing the DoS amplification #3942 opened. See #3945.
-    refresh_cache_if_due(instance_id, &request_sender)
+    refresh_cache_if_due(instance_id, &request_sender, cache)
         .await
         .map_err(Box::new)?;
 
@@ -945,7 +1631,8 @@ pub(super) async fn serve_sandbox_content(
     api_version: ApiVersion,
     sub_path: Option<&str>,
     request_sender: HttpClientApiRequest,
-) -> Result<impl IntoResponse, WebSocketApiError> {
+    cache: &WebappCache,
+) -> Result<impl IntoResponse + use<>, WebSocketApiError> {
     let page = sub_path.unwrap_or("index.html");
     debug!("serve_sandbox_content: serving iframe content for key: {key}, page: {page}");
     let instance_id =
@@ -958,9 +1645,9 @@ pub(super) async fn serve_sandbox_content(
     // already extracted, so a republished contract kept serving the old bundle
     // here until the shell root (`/`) was hit again. The TTL gate bounds the
     // network GET rate to at most one per contract per window. See #3977.
-    refresh_cache_if_due(instance_id, &request_sender).await?;
+    refresh_cache_if_due(instance_id, &request_sender, cache).await?;
 
-    let path = contract_web_path(&instance_id);
+    let path = cache.entry_dir(&instance_id);
     if !path.exists() {
         return Err(WebSocketApiError::NodeError {
             error_cause: format!("Contract not cached yet: {key}"),
@@ -1192,20 +1879,6 @@ fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocketApiError>>
     Ok(file_path)
 }
 
-/// Returns the base directory for webapp cache.
-/// Uses XDG cache directory (~/.cache/freenet on Linux) to avoid permission
-/// conflicts when multiple users run freenet on the same machine.
-fn webapp_cache_dir() -> PathBuf {
-    directories::ProjectDirs::from("", "The Freenet Project Inc", "freenet")
-        .map(|dirs| dirs.cache_dir().to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir().join("freenet"))
-        .join("webapp_cache")
-}
-
-fn contract_web_path(instance_id: &ContractInstanceId) -> PathBuf {
-    webapp_cache_dir().join(instance_id.encode())
-}
-
 fn hash_state(state: &[u8]) -> u64 {
     use std::hash::Hasher;
     let mut hasher = ahash::AHasher::default();
@@ -1213,8 +1886,29 @@ fn hash_state(state: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// The cache the handler tests seed and serve from: one per-process temp dir,
+/// never the developer's real cache. Production builds its own from the node's
+/// config, so nothing here can reach a real directory even by mistake.
+#[cfg(test)]
+fn test_webapp_cache() -> WebappCache {
+    static TEST_CACHE: LazyLock<WebappCache> = LazyLock::new(|| {
+        static ROOT: LazyLock<tempfile::TempDir> =
+            LazyLock::new(|| tempfile::tempdir().expect("test webapp cache root"));
+        WebappCache::with_root(ROOT.path().to_path_buf())
+    });
+    TEST_CACHE.clone()
+}
+
+/// Cache paths of [`test_webapp_cache`], so a test can seed an entry the
+/// handlers will then find.
+#[cfg(test)]
+fn contract_web_path(instance_id: &ContractInstanceId) -> PathBuf {
+    test_webapp_cache().entry_dir(instance_id)
+}
+
+#[cfg(test)]
 fn state_hash_path(instance_id: &ContractInstanceId) -> PathBuf {
-    webapp_cache_dir().join(format!("{}.hash", instance_id.encode()))
+    test_webapp_cache().hash_path(instance_id)
 }
 
 #[cfg(test)]
@@ -1231,9 +1925,10 @@ mod tests {
         (HttpClientApiRequest::from_sender(tx), rx)
     }
 
-    /// Clears any webapp cache state for `instance_id` on disk. `contract_web_path`
-    /// and `state_hash_path` resolve to a shared process-global directory, so
-    /// tests that exercise the cache must use unique keys AND scrub any stale
+    /// Clears any webapp cache state for `instance_id` on disk.
+    /// `contract_web_path` and `state_hash_path` resolve to the one per-process
+    /// temp root of [`test_webapp_cache`], shared by every test in this module,
+    /// so tests that exercise the cache must use unique keys AND scrub any stale
     /// filesystem residue from a prior run before asserting on behaviour.
     ///
     /// Also drops the in-memory `CONTRACT_CACHE_REFRESH` timer (process-global,
@@ -1248,6 +1943,1006 @@ mod tests {
             .ok();
         CONTRACT_CACHE_REFRESH.remove(instance_id);
         CONTRACT_REFRESH_LOCKS.remove(instance_id);
+    }
+
+    // =========================================================================
+    // Webapp cache size bound (LRU eviction)
+    //
+    // These exercise `enforce_webapp_cache_budget` against a `TempDir` root
+    // rather than the node's real configured root, so they neither depend on nor
+    // disturb residue in the developer's XDG cache. The in-memory
+    // side-tables (`WEBAPP_CACHE_ACCESS`, `CONTRACT_CACHE_LOCKS`,
+    // `CONTRACT_CACHE_REFRESH`) ARE process-global, so every test uses its own
+    // instance ids and `seed_cache_entry` scrubs them first.
+    // =========================================================================
+
+    /// Size of the `{key}.hash` sentinel `seed_cache_entry` writes; entry sizes
+    /// the sweep sees are payload + this.
+    const SENTINEL_BYTES: u64 = 8;
+
+    /// A cache over `root` with an explicit budget and its own sweep state.
+    ///
+    /// Every cache test builds one of these. Nothing here may reach the default
+    /// cache with the production budget: the sweep DELETES, so a test that swept
+    /// `crate::config::default_webapp_cache_dir()` would evict the developer's
+    /// real cache and, on a machine running a node as the same user, entries
+    /// that node is serving. Constructed field-by-field rather than through
+    /// `with_root` so a test budget can be set; `with_root`'s own behaviour is
+    /// covered by `with_root_creates_the_cache_directory_it_will_sweep`.
+    fn cache(root: &Path, max_bytes: u64) -> WebappCache {
+        WebappCache {
+            root: root.to_path_buf(),
+            max_bytes,
+            sweep: Arc::new(parking_lot::Mutex::new(SweepState::default())),
+        }
+    }
+
+    /// Distinct instance id per (test, slot) pair, so process-global state from
+    /// a sibling test can never protect or evict this test's entries.
+    fn cache_id(test: u8, slot: u8) -> ContractInstanceId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xc0;
+        bytes[1] = test;
+        bytes[2] = slot;
+        ContractInstanceId::new(bytes)
+    }
+
+    /// Materialize one cache entry of `payload` bytes under `root` whose
+    /// last-used marker sits `age` in the past. Returns its total size as the
+    /// sweep will account it.
+    fn seed_cache_entry(
+        root: &Path,
+        instance_id: &ContractInstanceId,
+        payload: usize,
+        age: Duration,
+    ) -> u64 {
+        WEBAPP_CACHE_ACCESS.remove(instance_id);
+        CONTRACT_CACHE_REFRESH.remove(instance_id);
+        let encoded = instance_id.encode();
+        let dir = root.join(&encoded);
+        std::fs::create_dir_all(&dir).expect("create entry dir");
+        std::fs::write(dir.join("index.html"), vec![b'x'; payload]).expect("write payload");
+        let hash_path = root.join(format!("{encoded}.hash"));
+        std::fs::write(&hash_path, 0u64.to_be_bytes()).expect("write sentinel");
+        set_marker_age(&hash_path, age);
+        payload as u64 + SENTINEL_BYTES
+    }
+
+    fn set_marker_age(path: &Path, age: Duration) {
+        let when = SystemTime::now() - age;
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(when))
+            .expect("set marker mtime");
+    }
+
+    fn dir_present(root: &Path, instance_id: &ContractInstanceId) -> bool {
+        root.join(instance_id.encode()).exists()
+    }
+
+    /// A contract plus a state carrying a REAL packed web archive, so
+    /// `unpack_if_stale` performs a genuine extraction instead of taking its
+    /// matching-hash early return. `seed` distinguishes contract keys.
+    fn webapp_contract_and_state(seed: &[u8]) -> (ContractContainer, WrappedState) {
+        let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+        let body: &[u8] = b"<html><body>hello</body></html>";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "index.html", body)
+            .expect("append to archive");
+        let packed = WebApp::from_data(Vec::new(), archive)
+            .expect("build web app")
+            .pack()
+            .expect("pack web app");
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(seed.to_vec())),
+            Parameters::from(vec![0]),
+        )));
+        (contract, WrappedState::new(packed))
+    }
+
+    fn sentinel_present(root: &Path, instance_id: &ContractInstanceId) -> bool {
+        root.join(format!("{}.hash", instance_id.encode())).exists()
+    }
+
+    /// `with_root` materializes the directory it is going to sweep, including
+    /// missing parents.
+    ///
+    /// The point is the startup log next to it: nothing else in the node names
+    /// the directory this code DELETES from, so the one moment the cache takes
+    /// ownership of a path is the moment to say which path it is. Creating it
+    /// here is what makes that log a statement of fact rather than of intent,
+    /// and it is what turns "the root is a file" or "the root is not writable"
+    /// into a startup warning instead of a cache that silently never populates.
+    #[test]
+    fn with_root_creates_the_cache_directory_it_will_sweep() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("nested").join("webapp_cache");
+        assert!(
+            !root.exists(),
+            "premise: the root must be missing, or creating it proves nothing"
+        );
+
+        let cache = WebappCache::with_root(root.clone());
+
+        assert!(
+            root.is_dir(),
+            "with_root must create the directory (and its parents) it will \
+             unpack into and sweep"
+        );
+        assert_eq!(
+            cache.root(),
+            root.as_path(),
+            "and must still be rooted exactly where it was told"
+        );
+    }
+
+    /// A root that already exists as a FILE must not panic the server at
+    /// startup.
+    ///
+    /// This is one of the two shapes the eager `create_dir_all` exists to
+    /// surface (the other is an unwritable path). Both are operator
+    /// misconfigurations, and both leave the webapp cache non-functional, but
+    /// neither is fatal to the node: everything except web-contract serving is
+    /// unaffected, so the correct response is a warning naming the path, not a
+    /// refusal to start. A future `.expect()` here would take a node down over
+    /// a stray file.
+    #[test]
+    fn with_root_tolerates_a_root_that_is_not_a_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("webapp_cache");
+        std::fs::write(&root, b"not a directory").expect("seed a file at the root path");
+
+        let cache = WebappCache::with_root(root.clone());
+
+        assert_eq!(
+            cache.root(),
+            root.as_path(),
+            "construction must succeed and keep the configured root"
+        );
+        assert!(
+            root.is_file(),
+            "and must not have replaced the operator's file with a directory"
+        );
+    }
+
+    /// Boundary: a cache whose total is exactly the budget is left untouched.
+    #[tokio::test]
+    async fn webapp_cache_sweep_is_noop_at_or_under_budget() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (old, new) = (cache_id(1, 0), cache_id(1, 1));
+        let old_size = seed_cache_entry(root.path(), &old, 4096, Duration::from_secs(86_400));
+        let new_size = seed_cache_entry(root.path(), &new, 4096, Duration::from_secs(60));
+
+        let sweep =
+            enforce_webapp_cache_budget(&cache(root.path(), old_size + new_size), None).await;
+
+        assert_eq!(sweep.total_before, old_size + new_size);
+        assert!(
+            sweep.evicted.is_empty(),
+            "a cache exactly at budget must not evict: {sweep:?}"
+        );
+        assert!(dir_present(root.path(), &old) && dir_present(root.path(), &new));
+    }
+
+    /// The core property: victims are chosen oldest-USE-first, and the sweep
+    /// stops as soon as the cache fits.
+    #[tokio::test]
+    async fn webapp_cache_sweep_evicts_least_recently_used_first() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ids: Vec<_> = (0..4).map(|slot| cache_id(2, slot)).collect();
+        // Oldest first: 4 days, 3 days, 2 days, 1 hour.
+        let ages = [
+            Duration::from_secs(4 * 86_400),
+            Duration::from_secs(3 * 86_400),
+            Duration::from_secs(2 * 86_400),
+            Duration::from_secs(3_600),
+        ];
+        let mut size = 0;
+        for (id, age) in ids.iter().zip(ages) {
+            size = seed_cache_entry(root.path(), id, 4096, age);
+        }
+
+        // Budget fits exactly two entries, so the two coldest must go.
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), size * 2), None).await;
+
+        assert_eq!(sweep.evicted, vec![ids[0], ids[1]], "sweep: {sweep:?}");
+        assert_eq!(sweep.bytes_freed, size * 2);
+        assert!(!dir_present(root.path(), &ids[0]));
+        assert!(!dir_present(root.path(), &ids[1]));
+        assert!(dir_present(root.path(), &ids[2]));
+        assert!(dir_present(root.path(), &ids[3]));
+    }
+
+    /// Eviction must be least-recently-USED, not least-recently-created:
+    /// refreshing the on-disk marker for the oldest-created entry has to move it
+    /// to the front of the keep set. This is the end-to-end proof that
+    /// `persist_cache_access_marker` feeds the ranking `scan_webapp_cache` reads.
+    #[tokio::test]
+    async fn webapp_cache_access_marker_makes_an_old_entry_most_recently_used() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (oldest, middle, newest) = (cache_id(3, 0), cache_id(3, 1), cache_id(3, 2));
+        let size = seed_cache_entry(root.path(), &oldest, 4096, Duration::from_secs(30 * 86_400));
+        seed_cache_entry(root.path(), &middle, 4096, Duration::from_secs(86_400));
+        seed_cache_entry(root.path(), &newest, 4096, Duration::from_secs(3_600));
+
+        // The oldest-created entry is the one being used right now.
+        persist_cache_access_marker(root.path().join(format!("{}.hash", oldest.encode()))).await;
+
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), size), None).await;
+
+        assert_eq!(
+            sweep.evicted,
+            vec![middle, newest],
+            "the touched entry must survive as most-recently-used: {sweep:?}"
+        );
+        assert!(dir_present(root.path(), &oldest));
+    }
+
+    /// The entry whose request triggered the sweep is never its own victim,
+    /// even when it is the coldest thing on disk.
+    #[tokio::test]
+    async fn webapp_cache_sweep_never_evicts_the_entry_in_use() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (in_use, other) = (cache_id(4, 0), cache_id(4, 1));
+        let size = seed_cache_entry(root.path(), &in_use, 4096, Duration::from_secs(30 * 86_400));
+        seed_cache_entry(root.path(), &other, 4096, Duration::from_secs(3_600));
+
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), size), Some(in_use)).await;
+
+        assert_eq!(sweep.evicted, vec![other], "sweep: {sweep:?}");
+        assert!(dir_present(root.path(), &in_use));
+        assert!(!dir_present(root.path(), &other));
+    }
+
+    /// An entry a request touched moments ago is protected even though the
+    /// request holds no lock — this is the in-flight guard for the serve paths,
+    /// which read the unpacked files without taking `CONTRACT_CACHE_LOCKS`.
+    #[tokio::test]
+    async fn webapp_cache_sweep_skips_recently_accessed_entry() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (serving, other) = (cache_id(5, 0), cache_id(5, 1));
+        let size = seed_cache_entry(
+            root.path(),
+            &serving,
+            4096,
+            Duration::from_secs(30 * 86_400),
+        );
+        seed_cache_entry(root.path(), &other, 4096, Duration::from_secs(3_600));
+
+        record_cache_access(serving);
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), size), None).await;
+
+        assert_eq!(sweep.evicted, vec![other], "sweep: {sweep:?}");
+        assert!(dir_present(root.path(), &serving));
+    }
+
+    /// The in-flight exemption is time-bounded (AGENTS.md: GC exemptions must
+    /// expire). Once `WEBAPP_CACHE_EVICTION_MIN_IDLE` has passed, the same entry
+    /// is evictable again — otherwise a single visit would pin a webapp forever.
+    #[tokio::test(start_paused = true)]
+    async fn webapp_cache_sweep_access_exemption_expires() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (served, other) = (cache_id(6, 0), cache_id(6, 1));
+        let size = seed_cache_entry(root.path(), &served, 4096, Duration::from_secs(30 * 86_400));
+        seed_cache_entry(root.path(), &other, 4096, Duration::from_secs(3_600));
+
+        // Pin the window itself, not just that *some* window elapses: the
+        // advance below is expressed in terms of the constant, so without this
+        // the test would keep passing if the exemption were widened to
+        // effectively-permanent. It must outlast the 30s network fetch in
+        // `ensure_contract_cached` and stay far short of a browsing session.
+        assert!(
+            WEBAPP_CACHE_EVICTION_MIN_IDLE > Duration::from_secs(30)
+                && WEBAPP_CACHE_EVICTION_MIN_IDLE < Duration::from_secs(3_600),
+            "in-flight exemption is not a sane finite window: {WEBAPP_CACHE_EVICTION_MIN_IDLE:?}"
+        );
+
+        record_cache_access(served);
+        let protected = enforce_webapp_cache_budget(&cache(root.path(), size), None).await;
+        assert_eq!(protected.evicted, vec![other], "sweep: {protected:?}");
+
+        tokio::time::advance(WEBAPP_CACHE_EVICTION_MIN_IDLE + Duration::from_secs(1)).await;
+        let expired = enforce_webapp_cache_budget(&cache(root.path(), 0), None).await;
+
+        assert_eq!(expired.evicted, vec![served], "sweep: {expired:?}");
+        assert!(!dir_present(root.path(), &served));
+    }
+
+    /// An eviction must never race a re-extraction: while `unpack_if_stale`
+    /// holds a contract's cache lock, the sweep leaves that entry alone and
+    /// takes the next-coldest victim instead.
+    #[tokio::test]
+    async fn webapp_cache_sweep_skips_entry_with_unpack_in_flight() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (unpacking, other) = (cache_id(7, 0), cache_id(7, 1));
+        let size = seed_cache_entry(
+            root.path(),
+            &unpacking,
+            4096,
+            Duration::from_secs(30 * 86_400),
+        );
+        seed_cache_entry(root.path(), &other, 4096, Duration::from_secs(3_600));
+
+        let guard = acquire_cache_lock(&unpacking).await;
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), size), None).await;
+        drop(guard);
+
+        assert_eq!(sweep.evicted, vec![other], "sweep: {sweep:?}");
+        assert!(dir_present(root.path(), &unpacking));
+    }
+
+    /// Evicting must remove the `{key}.hash` sentinel as well as the tree. A
+    /// leftover sentinel reads as a WARM cache over an empty directory, which
+    /// would 404 every request until the contract's state happened to change.
+    #[tokio::test]
+    async fn webapp_cache_sweep_removes_sentinel_with_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let evicted = cache_id(8, 0);
+        seed_cache_entry(
+            root.path(),
+            &evicted,
+            4096,
+            Duration::from_secs(30 * 86_400),
+        );
+
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), 0), None).await;
+
+        assert_eq!(sweep.evicted, vec![evicted], "sweep: {sweep:?}");
+        assert!(!dir_present(root.path(), &evicted));
+        assert!(
+            !sentinel_present(root.path(), &evicted),
+            "sentinel left behind would make the empty cache read as warm"
+        );
+    }
+
+    /// `refresh_cache_if_due` short-circuits on a fresh `CONTRACT_CACHE_REFRESH`
+    /// timer alone, so an evicted contract that kept its timer would serve 404s
+    /// from the emptied directory for the rest of the TTL window.
+    #[tokio::test]
+    async fn webapp_cache_sweep_clears_refresh_timer_for_evicted_entry() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let evicted = cache_id(9, 0);
+        seed_cache_entry(
+            root.path(),
+            &evicted,
+            4096,
+            Duration::from_secs(30 * 86_400),
+        );
+        CONTRACT_CACHE_REFRESH.insert(evicted, Instant::now());
+
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), 0), None).await;
+
+        assert_eq!(sweep.evicted, vec![evicted], "sweep: {sweep:?}");
+        assert!(
+            !CONTRACT_CACHE_REFRESH.contains_key(&evicted),
+            "an evicted contract must not keep a fresh reconcile timer"
+        );
+        assert!(
+            !WEBAPP_CACHE_ACCESS.contains_key(&evicted),
+            "an evicted contract must not keep an access record"
+        );
+    }
+
+    /// Resilience: one entry that cannot be removed must not abort the sweep.
+    /// The failure is injected by replacing a sentinel with a directory, so
+    /// `remove_file` fails deterministically (EISDIR) for any user on any
+    /// platform — no permission tricks that root would bypass.
+    ///
+    /// The unremovable entry is also left INTACT rather than half-deleted: the
+    /// alternative (drop the tree, keep the sentinel) is the warm-but-empty
+    /// shape that 404s.
+    #[tokio::test]
+    async fn webapp_cache_sweep_continues_after_entry_removal_failure() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (broken, other) = (cache_id(10, 0), cache_id(10, 1));
+        let size = seed_cache_entry(root.path(), &broken, 4096, Duration::from_secs(30 * 86_400));
+        seed_cache_entry(root.path(), &other, 4096, Duration::from_secs(3_600));
+
+        // Replace the sentinel with a directory of the same name.
+        let sentinel = root.path().join(format!("{}.hash", broken.encode()));
+        std::fs::remove_file(&sentinel).expect("remove sentinel");
+        std::fs::create_dir(&sentinel).expect("sentinel as dir");
+        // Sentinel gone as a file, so the entry ranks on its directory mtime.
+        set_marker_age(
+            &root.path().join(broken.encode()),
+            Duration::from_secs(30 * 86_400),
+        );
+
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), size), None).await;
+
+        assert_eq!(
+            sweep.evicted,
+            vec![other],
+            "a failed removal must not abort the sweep: {sweep:?}"
+        );
+        assert!(
+            dir_present(root.path(), &broken),
+            "an entry whose sentinel cannot be removed must be left intact"
+        );
+        assert!(!dir_present(root.path(), &other));
+    }
+
+    /// The sweep owns only `<base58>` / `<base58>.hash` pairs: anything else in
+    /// the cache root is neither counted nor deleted.
+    #[tokio::test]
+    async fn webapp_cache_sweep_ignores_unrecognized_paths() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let known = cache_id(11, 0);
+        let size = seed_cache_entry(root.path(), &known, 4096, Duration::from_secs(30 * 86_400));
+        std::fs::write(root.path().join("README.txt"), vec![b'z'; 8192]).expect("write stray file");
+        let stray_dir = root.path().join("not a contract key");
+        std::fs::create_dir(&stray_dir).expect("stray dir");
+        std::fs::write(stray_dir.join("payload.bin"), vec![b'z'; 8192]).expect("stray payload");
+
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), 0), None).await;
+
+        assert_eq!(
+            sweep.total_before, size,
+            "unrecognized paths must not be accounted: {sweep:?}"
+        );
+        assert_eq!(sweep.evicted, vec![known], "sweep: {sweep:?}");
+        assert!(root.path().join("README.txt").exists());
+        assert!(stray_dir.join("payload.bin").exists());
+    }
+
+    /// Scale edge case: when every entry is protected the sweep leaves the cache
+    /// over budget rather than deleting something in use, and returns normally
+    /// (the next sweep retries).
+    #[tokio::test]
+    async fn webapp_cache_sweep_stays_over_budget_when_all_entries_protected() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (first, second) = (cache_id(12, 0), cache_id(12, 1));
+        seed_cache_entry(root.path(), &first, 4096, Duration::from_secs(30 * 86_400));
+        seed_cache_entry(root.path(), &second, 4096, Duration::from_secs(30 * 86_400));
+        record_cache_access(first);
+        record_cache_access(second);
+
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), 0), None).await;
+
+        assert!(sweep.evicted.is_empty(), "sweep: {sweep:?}");
+        assert_eq!(sweep.bytes_freed, 0);
+        assert!(dir_present(root.path(), &first) && dir_present(root.path(), &second));
+    }
+
+    /// A missing cache root must read as "no entries", not blow up. Asserted on
+    /// the scan directly: a panic inside the sweep's `spawn_blocking` would be
+    /// caught by the `JoinError` arm and reported as an empty sweep, so the
+    /// sweep-level assertion below cannot tell graceful handling from a
+    /// swallowed panic.
+    #[test]
+    fn webapp_cache_scan_of_missing_root_is_empty_not_a_panic() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(scan_webapp_cache(&root.path().join("does-not-exist")).is_empty());
+    }
+
+    /// An empty cache root must not panic or report anything to evict.
+    #[tokio::test]
+    async fn webapp_cache_sweep_handles_empty_and_missing_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let empty = enforce_webapp_cache_budget(&cache(root.path(), 0), None).await;
+        assert_eq!(empty.total_before, 0);
+        assert!(empty.evicted.is_empty());
+
+        let missing =
+            enforce_webapp_cache_budget(&cache(&root.path().join("does-not-exist"), 0), None).await;
+        assert_eq!(missing.total_before, 0);
+        assert!(missing.evicted.is_empty());
+    }
+
+    /// The on-disk marker refresh is throttled: the first access of a window
+    /// persists, subsequent ones don't, and a new window persists again. Without
+    /// the throttle every subresource of every page load would pay an
+    /// `utimensat`.
+    #[tokio::test(start_paused = true)]
+    async fn webapp_cache_access_marker_refresh_is_throttled() {
+        let id = cache_id(13, 0);
+        WEBAPP_CACHE_ACCESS.remove(&id);
+
+        assert!(
+            record_cache_access(id),
+            "first access of an entry must persist the marker"
+        );
+        assert!(
+            !record_cache_access(id),
+            "a second access in the same window must not re-touch the marker"
+        );
+
+        tokio::time::advance(WEBAPP_CACHE_ACCESS_TOUCH_INTERVAL - Duration::from_secs(1)).await;
+        assert!(!record_cache_access(id), "still inside the throttle window");
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            record_cache_access(id),
+            "a new window must persist the marker again"
+        );
+    }
+
+    /// The marker refresh must actually move the sentinel's mtime forward (this
+    /// is what makes the ranking survive a restart), and must not disturb its
+    /// contents — those are the state hash `unpack_if_stale` compares against.
+    #[tokio::test]
+    async fn webapp_cache_access_marker_updates_mtime_without_touching_contents() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let id = cache_id(14, 0);
+        seed_cache_entry(root.path(), &id, 1024, Duration::from_secs(30 * 86_400));
+        let sentinel = root.path().join(format!("{}.hash", id.encode()));
+        let before = std::fs::metadata(&sentinel)
+            .and_then(|meta| meta.modified())
+            .expect("sentinel mtime");
+
+        persist_cache_access_marker(sentinel.clone()).await;
+
+        let after = std::fs::metadata(&sentinel)
+            .and_then(|meta| meta.modified())
+            .expect("sentinel mtime");
+        assert!(after > before, "marker refresh must move the mtime forward");
+        assert_eq!(
+            std::fs::read(&sentinel).expect("sentinel contents"),
+            0u64.to_be_bytes(),
+            "the state hash must survive a marker refresh"
+        );
+    }
+
+    /// A marker refresh against a cold cache (no sentinel yet) is a no-op, not
+    /// an error that could fail a user's request.
+    #[tokio::test]
+    async fn webapp_cache_access_marker_tolerates_missing_sentinel() {
+        let root = tempfile::tempdir().expect("tempdir");
+        persist_cache_access_marker(root.path().join("absent.hash")).await;
+    }
+
+    /// `from_base58` is not a strict filter — stdlib zero-pads a short decode
+    /// instead of rejecting it, so ordinary directory names made of base58
+    /// characters (`tmp`, `data`, `assets`) parse into well-formed but WRONG
+    /// ids. Without the round-trip check the sweep would charge those bytes to
+    /// a phantom entry, "evict" a path that does not exist, and count bytes it
+    /// never freed — reporting success while staying over budget.
+    #[tokio::test]
+    async fn webapp_cache_sweep_ignores_names_that_zero_pad_into_valid_ids() {
+        // Guard the premise: if stdlib ever made `from_base58` strict, this
+        // test would silently stop covering anything.
+        let padded =
+            ContractInstanceId::from_base58("tmp").expect("stdlib zero-pads short decodes");
+        assert_ne!(
+            padded.encode(),
+            "tmp",
+            "premise: a short base58 name must decode to a DIFFERENT id"
+        );
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let known = cache_id(15, 0);
+        let size = seed_cache_entry(root.path(), &known, 4096, Duration::from_secs(30 * 86_400));
+        for stray in ["tmp", "data", "assets"] {
+            let dir = root.path().join(stray);
+            std::fs::create_dir(&dir).expect("stray dir");
+            std::fs::write(dir.join("payload.bin"), vec![b'z'; 8192]).expect("stray payload");
+        }
+
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), 0), None).await;
+
+        assert_eq!(
+            sweep.total_before, size,
+            "base58-parseable non-entries must not be accounted: {sweep:?}"
+        );
+        assert_eq!(sweep.evicted, vec![known], "sweep: {sweep:?}");
+        assert_eq!(
+            sweep.bytes_freed, size,
+            "bytes_freed must only count entries actually deleted: {sweep:?}"
+        );
+        for stray in ["tmp", "data", "assets"] {
+            assert!(root.path().join(stray).join("payload.bin").exists());
+        }
+    }
+
+    /// Concurrent sweeps must not each evict a full deficit's worth. Each takes
+    /// its own `live` snapshot, so without the in-progress gate N simultaneous
+    /// unpacks drive the cache well below budget and over-report `bytes_freed`.
+    #[tokio::test]
+    async fn webapp_cache_concurrent_sweeps_do_not_over_evict() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ids: Vec<_> = (0..6).map(|slot| cache_id(16, slot)).collect();
+        let mut size = 0;
+        for (offset, id) in ids.iter().enumerate() {
+            size = seed_cache_entry(
+                root.path(),
+                id,
+                4096,
+                Duration::from_secs((30 - offset as u64) * 86_400),
+            );
+        }
+        // Budget for 4 of the 6 entries, so a single correct sweep evicts 2.
+        let shared = cache(root.path(), size * 4);
+        let in_use = ids[5];
+
+        let mut sweeps = Vec::new();
+        for _ in 0..4 {
+            let shared = shared.clone();
+            sweeps.push(tokio::spawn(async move {
+                maybe_enforce_webapp_cache_budget(&shared, in_use, SweepTrigger::Unpack).await;
+            }));
+        }
+        for sweep in sweeps {
+            sweep.await.expect("sweep task must not panic");
+        }
+
+        let survivors = ids.iter().filter(|id| dir_present(root.path(), id)).count();
+        assert_eq!(
+            survivors, 4,
+            "concurrent sweeps must together evict the deficit exactly once"
+        );
+    }
+
+    /// The debounce decision, isolated from the filesystem. An unpack grew the
+    /// cache so it always sweeps; a reconcile rewrote nothing so it waits out
+    /// `WEBAPP_CACHE_SWEEP_INTERVAL`, otherwise every contract's 30-second
+    /// refresh would pay for a directory walk.
+    #[tokio::test(start_paused = true)]
+    async fn webapp_cache_sweep_is_due_debounces_only_reconciles() {
+        let now = Instant::now();
+        assert!(
+            sweep_is_due(SweepTrigger::Reconcile, None, now),
+            "a never-swept cache is due"
+        );
+        assert!(
+            !sweep_is_due(SweepTrigger::Reconcile, Some(now), now),
+            "a reconcile right after a sweep must be debounced"
+        );
+        assert!(
+            sweep_is_due(SweepTrigger::Unpack, Some(now), now),
+            "an unpack grew the cache, so it always sweeps"
+        );
+        assert!(
+            !sweep_is_due(
+                SweepTrigger::Reconcile,
+                Some(now),
+                now + WEBAPP_CACHE_SWEEP_INTERVAL - Duration::from_secs(1)
+            ),
+            "still inside the debounce window"
+        );
+        assert!(
+            sweep_is_due(
+                SweepTrigger::Reconcile,
+                Some(now),
+                now + WEBAPP_CACHE_SWEEP_INTERVAL
+            ),
+            "the debounce window must expire"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Wiring: the size bound has to actually RUN, and the in-flight guard has to
+    // actually ARM, on the real handler paths. Everything above tests the sweep
+    // in isolation, so without these the whole feature could be deleted from
+    // `unpack_if_stale` / `refresh_cache_if_due` with a green suite.
+    // -------------------------------------------------------------------------
+
+    /// Drives the real reconcile path — `refresh_cache_if_due` →
+    /// `ensure_contract_cached` → `handle_get_response` → `unpack_if_stale`
+    /// (matching-hash early return) — and asserts the budget sweep ran.
+    ///
+    /// Pins the `SweepTrigger::Reconcile` call site: delete it and the
+    /// over-budget decoys below survive.
+    #[tokio::test]
+    async fn reconcile_path_enforces_the_webapp_cache_budget() {
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![7, 7, 7, 7])),
+            Parameters::from(vec![1]),
+        )));
+        let instance_id = *contract.key().id();
+        let state = WrappedState::new(vec![4, 4, 4]);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = cache(root.path(), SENTINEL_BYTES);
+        clear_cache(&instance_id).await;
+        WEBAPP_CACHE_ACCESS.remove(&instance_id);
+
+        // Warm + matching hash ⇒ `unpack_if_stale` takes its early return, so
+        // this exercises the RECONCILE trigger rather than the unpack one.
+        std::fs::create_dir_all(webapp_cache.entry_dir(&instance_id)).expect("entry dir");
+        std::fs::write(
+            webapp_cache.hash_path(&instance_id),
+            hash_state(state.as_ref()).to_be_bytes(),
+        )
+        .expect("sentinel");
+
+        // Decoys the sweep must evict to get under the (tiny) budget.
+        let decoys: Vec<_> = (0..2).map(|slot| cache_id(17, slot)).collect();
+        for decoy in &decoys {
+            seed_cache_entry(root.path(), decoy, 4096, Duration::from_secs(30 * 86_400));
+        }
+
+        let (sender, mut rx) = request_channel();
+        let handler = {
+            let webapp_cache = webapp_cache.clone();
+            tokio::spawn(async move {
+                refresh_cache_if_due(instance_id, &sender, &webapp_cache)
+                    .await
+                    .map(|_| ())
+            })
+        };
+        serve_one_get(&mut rx, &contract, &state).await;
+        handler
+            .await
+            .expect("handler must not panic")
+            .expect("reconcile must succeed");
+
+        for decoy in &decoys {
+            assert!(
+                !dir_present(root.path(), decoy),
+                "the reconcile path must enforce the size bound"
+            );
+        }
+        assert!(
+            dir_present(root.path(), &instance_id),
+            "the contract being reconciled must never be its own sweep's victim"
+        );
+    }
+
+    /// Same wiring, one layer down and on the UNPACK trigger: `unpack_if_stale`
+    /// re-extracts a real web archive and must then sweep. Pins the
+    /// `SweepTrigger::Unpack` call site.
+    #[tokio::test]
+    async fn unpack_enforces_the_webapp_cache_budget() {
+        let (contract, state) = webapp_contract_and_state(&[0xa1]);
+        let instance_id = *contract.key().id();
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = cache(root.path(), SENTINEL_BYTES);
+        clear_cache(&instance_id).await;
+        WEBAPP_CACHE_ACCESS.remove(&instance_id);
+
+        let decoys: Vec<_> = (0..2).map(|slot| cache_id(18, slot)).collect();
+        for decoy in &decoys {
+            seed_cache_entry(root.path(), decoy, 4096, Duration::from_secs(30 * 86_400));
+        }
+
+        // No sentinel ⇒ a genuine unpack, which is the only event that grows
+        // the cache and therefore always sweeps.
+        unpack_if_stale(&contract, state.as_ref(), &webapp_cache)
+            .await
+            .expect("unpack must succeed");
+
+        assert!(
+            webapp_cache.hash_path(&instance_id).exists(),
+            "premise: the unpack must have actually happened"
+        );
+        for decoy in &decoys {
+            assert!(
+                !dir_present(root.path(), decoy),
+                "an unpack must enforce the size bound"
+            );
+        }
+    }
+
+    /// The in-flight guard has to arm on the serve path: `refresh_cache_if_due`
+    /// must record the access for a warm entry, otherwise a concurrent sweep has
+    /// nothing telling it the entry is being read right now. Pins the
+    /// `note_cache_access` call site in `refresh_cache_if_due`.
+    #[tokio::test]
+    async fn serving_a_warm_entry_marks_it_in_use() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xc1;
+        bytes[1] = 0x01;
+        let instance_id = ContractInstanceId::new(bytes);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = cache(root.path(), u64::MAX);
+        clear_cache(&instance_id).await;
+        WEBAPP_CACHE_ACCESS.remove(&instance_id);
+
+        std::fs::create_dir_all(webapp_cache.entry_dir(&instance_id)).expect("entry dir");
+        std::fs::write(webapp_cache.hash_path(&instance_id), 0u64.to_be_bytes()).expect("sentinel");
+        // Fresh reconcile timer ⇒ the warm fast path returns before any fetch,
+        // so the access record is the only thing this can be observing.
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        let (sender, _rx) = request_channel();
+        refresh_cache_if_due(instance_id, &sender, &webapp_cache)
+            .await
+            .expect("warm fast path must succeed");
+
+        assert!(
+            accessed_recently(&instance_id),
+            "serving a warm entry must mark it in use for the eviction guard"
+        );
+    }
+
+    /// Same, for the shell root: `contract_home` fetches and then serves, so it
+    /// must mark the entry in use too. Pins the `note_cache_access` call site in
+    /// `contract_home_in`.
+    #[tokio::test]
+    async fn contract_home_marks_the_entry_in_use() {
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![3, 1, 4, 1])),
+            Parameters::from(vec![5, 9]),
+        )));
+        let instance_id = *contract.key().id();
+        let state = WrappedState::new(vec![2, 6, 5]);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = cache(root.path(), u64::MAX);
+        clear_cache(&instance_id).await;
+        WEBAPP_CACHE_ACCESS.remove(&instance_id);
+
+        // Matching hash ⇒ no unpack needed; we only care about the marking.
+        std::fs::create_dir_all(webapp_cache.entry_dir(&instance_id)).expect("entry dir");
+        std::fs::write(
+            webapp_cache.hash_path(&instance_id),
+            hash_state(state.as_ref()).to_be_bytes(),
+        )
+        .expect("sentinel");
+
+        let (sender, mut rx) = request_channel();
+        let key = instance_id.to_string();
+        let handler = {
+            let webapp_cache = webapp_cache.clone();
+            tokio::spawn(async move {
+                contract_home(
+                    key,
+                    sender,
+                    AuthToken::generate(),
+                    ApiVersion::V1,
+                    None,
+                    None,
+                    false,
+                    &webapp_cache,
+                )
+                .await
+                .map(|_| ())
+            })
+        };
+        serve_one_get(&mut rx, &contract, &state).await;
+        handler
+            .await
+            .expect("handler must not panic")
+            .expect("contract_home must succeed");
+
+        assert!(
+            accessed_recently(&instance_id),
+            "contract_home must mark the entry in use for the eviction guard"
+        );
+    }
+
+    /// Cross-process regression. The cache directory is per-USER but the guards
+    /// are per-process, and the documented multi-peer setup runs several nodes
+    /// as one user. When another process evicts an entry, this process's
+    /// reconcile timer is still fresh and knows nothing about it — so returning
+    /// on the timer alone served 404s out of the emptied directory for the rest
+    /// of the TTL window. The re-stat under the refresh lock must notice the
+    /// entry is gone and refetch.
+    #[tokio::test]
+    async fn eviction_by_another_process_forces_a_refetch_despite_a_fresh_timer() {
+        // A real archive: the entry is genuinely cold here, so the refetch this
+        // test is asserting on runs a real unpack rather than the matching-hash
+        // early return.
+        let (contract, state) = webapp_contract_and_state(&[0xb2]);
+        let instance_id = *contract.key().id();
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = cache(root.path(), u64::MAX);
+        clear_cache(&instance_id).await;
+        WEBAPP_CACHE_ACCESS.remove(&instance_id);
+
+        // The state another process left behind: entry gone from disk, but OUR
+        // reconcile timer still fresh (its `CONTRACT_CACHE_REFRESH.remove` only
+        // reached its own process).
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+        assert!(
+            !webapp_cache.hash_path(&instance_id).exists(),
+            "premise: the entry must be absent"
+        );
+
+        let (sender, mut rx) = request_channel();
+        let handler = {
+            let webapp_cache = webapp_cache.clone();
+            tokio::spawn(async move {
+                refresh_cache_if_due(instance_id, &sender, &webapp_cache)
+                    .await
+                    .map(|_| ())
+            })
+        };
+
+        // A refetch means the #3945 cold-path gate runs first; answer it as
+        // "the node stores this contract", then serve the GET.
+        answer_presence_query_hosted(&mut rx, instance_id).await;
+        serve_one_get(&mut rx, &contract, &state).await;
+        handler
+            .await
+            .expect("handler must not panic")
+            .expect("refresh must succeed");
+
+        assert!(
+            webapp_cache.hash_path(&instance_id).exists(),
+            "a fresh timer must not suppress the refetch of an entry another \
+             process evicted — otherwise the request 404s for the rest of the TTL"
+        );
+        // Pins the COLD-fetch `note_cache_access`, which no other test reaches:
+        // the entry was cold, so the warm-path call is skipped and this is the
+        // only writer. Without it a freshly-fetched entry is unprotected between
+        // the fetch and the caller's read of the files.
+        assert!(
+            accessed_recently(&instance_id),
+            "a contract fetched to populate a cold entry must be marked in use \
+             before the caller reads it"
+        );
+    }
+
+    /// The reconcile debounce has to be wired into the sweep gate, not merely
+    /// exist: `sweep_is_due` is unit-tested in isolation, so dropping the call
+    /// to it would leave every 30-second refresh of every contract paying for a
+    /// full recursive directory walk.
+    #[tokio::test]
+    async fn reconcile_sweeps_are_debounced_in_practice() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = cache(root.path(), 0);
+        let in_use = cache_id(19, 0);
+
+        let first = cache_id(19, 1);
+        seed_cache_entry(root.path(), &first, 4096, Duration::from_secs(30 * 86_400));
+        maybe_enforce_webapp_cache_budget(&webapp_cache, in_use, SweepTrigger::Reconcile).await;
+        assert!(
+            !dir_present(root.path(), &first),
+            "premise: the first reconcile must sweep, or the debounce below \
+             proves nothing"
+        );
+
+        // Re-seed and immediately reconcile again. The budget is still 0, so a
+        // sweep that ran would evict — the debounce is the only thing that can
+        // keep this entry alive.
+        let second = cache_id(19, 2);
+        seed_cache_entry(root.path(), &second, 4096, Duration::from_secs(30 * 86_400));
+        maybe_enforce_webapp_cache_budget(&webapp_cache, in_use, SweepTrigger::Reconcile).await;
+
+        assert!(
+            dir_present(root.path(), &second),
+            "a second reconcile inside WEBAPP_CACHE_SWEEP_INTERVAL must skip the \
+             sweep entirely"
+        );
+    }
+
+    /// One sweep deletes at most `WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP`, so the
+    /// first sweep on a node upgrading with an unbounded legacy cache cannot
+    /// stall a request behind an unbounded number of `remove_dir_all`s. The
+    /// remainder is left for the next sweep rather than dropped.
+    #[tokio::test]
+    async fn webapp_cache_sweep_caps_evictions_per_pass() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let over_cap = WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP + 3;
+        let ids: Vec<_> = (0..over_cap).map(|slot| cache_id(20, slot as u8)).collect();
+        for (offset, id) in ids.iter().enumerate() {
+            seed_cache_entry(
+                root.path(),
+                id,
+                4096,
+                Duration::from_secs((over_cap - offset) as u64 * 86_400),
+            );
+        }
+
+        let sweep = enforce_webapp_cache_budget(&cache(root.path(), 0), None).await;
+
+        assert_eq!(
+            sweep.evicted.len(),
+            WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP,
+            "one sweep must not delete more than the cap: {sweep:?}"
+        );
+        // The cap must take the COLDEST entries, not an arbitrary prefix.
+        assert_eq!(
+            sweep.evicted,
+            ids[..WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP],
+            "the capped sweep must still evict least-recently-used first"
+        );
+        let survivors = ids.iter().filter(|id| dir_present(root.path(), id)).count();
+        assert_eq!(survivors, over_cap - WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP);
+
+        // Still over budget, so the next sweep picks up where this one stopped.
+        let next = enforce_webapp_cache_budget(&cache(root.path(), 0), None).await;
+        assert_eq!(
+            next.evicted.len(),
+            over_cap - WEBAPP_CACHE_MAX_EVICTIONS_PER_SWEEP,
+            "the remainder must be evicted by the following sweep: {next:?}"
+        );
     }
 
     /// Regression test for #3940, updated for the #3945 store-presence gate.
@@ -1290,6 +2985,7 @@ mod tests {
                     format!("/v1/contract/web/{key}/image.jpg"),
                     ApiVersion::V1,
                     sender,
+                    &test_webapp_cache(),
                 )
                 .await
                 .map(|_| ())
@@ -1338,6 +3034,7 @@ mod tests {
                     format!("/v1/contract/web/{key}/image.jpg"),
                     ApiVersion::V1,
                     sender,
+                    &test_webapp_cache(),
                 )
                 .await
                 .map(|r| r.into_response())
@@ -1415,6 +3112,7 @@ mod tests {
                     format!("/v1/contract/web/{key}/image.jpg"),
                     ApiVersion::V1,
                     sender,
+                    &test_webapp_cache(),
                 )
                 .await
                 .map(|r| r.into_response())
@@ -1520,6 +3218,7 @@ mod tests {
                     format!("/v1/contract/web/{key}/image.jpg"),
                     ApiVersion::V1,
                     sender,
+                    &test_webapp_cache(),
                 )
                 .await
                 .map(|r| r.into_response())
@@ -1601,6 +3300,7 @@ mod tests {
             format!("/v1/contract/web/{key}/image.jpg"),
             ApiVersion::V1,
             sender,
+            &test_webapp_cache(),
         )
         .await
         .map(|r| r.into_response());
@@ -1639,6 +3339,7 @@ mod tests {
                     format!("/v1/contract/web/{key}/image.jpg"),
                     ApiVersion::V1,
                     sender,
+                    &test_webapp_cache(),
                 )
                 .await
                 .map(|_| ())
@@ -1690,10 +3391,11 @@ mod tests {
             .unwrap();
 
         let (sender, mut rx) = request_channel();
-        let handler =
-            tokio::spawn(
-                async move { refresh_cache_if_due(instance_id, &sender).await.map(|_| ()) },
-            );
+        let handler = tokio::spawn(async move {
+            refresh_cache_if_due(instance_id, &sender, &test_webapp_cache())
+                .await
+                .map(|_| ())
+        });
 
         // The FIRST message must be the fetch's NewConnection — NOT a presence
         // query. `expect_fetch_pair` (the warm variant) asserts exactly that:
@@ -1736,6 +3438,7 @@ mod tests {
             format!("/v1/contract/web/{key}/image.jpg"),
             ApiVersion::V1,
             sender,
+            &test_webapp_cache(),
         )
         .await;
 
@@ -1969,9 +3672,15 @@ mod tests {
         let handler = {
             let key = key.clone();
             tokio::spawn(async move {
-                serve_sandbox_content(key.clone(), ApiVersion::V1, None, sender)
-                    .await
-                    .map(|_| ())
+                serve_sandbox_content(
+                    key.clone(),
+                    ApiVersion::V1,
+                    None,
+                    sender,
+                    &test_webapp_cache(),
+                )
+                .await
+                .map(|_| ())
             })
         };
 
@@ -2006,7 +3715,14 @@ mod tests {
         CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
 
         let (sender, mut rx) = request_channel();
-        let result = serve_sandbox_content(key.clone(), ApiVersion::V1, None, sender).await;
+        let result = serve_sandbox_content(
+            key.clone(),
+            ApiVersion::V1,
+            None,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await;
 
         let response = result.expect("fresh-cache sandbox request must succeed");
         let body = response_body(response).await;
@@ -2051,10 +3767,11 @@ mod tests {
         tokio::time::advance(CONTRACT_CACHE_REFRESH_TTL + Duration::from_secs(1)).await;
 
         let (sender, mut rx) = request_channel();
-        let handler =
-            tokio::spawn(
-                async move { refresh_cache_if_due(instance_id, &sender).await.map(|_| ()) },
-            );
+        let handler = tokio::spawn(async move {
+            refresh_cache_if_due(instance_id, &sender, &test_webapp_cache())
+                .await
+                .map(|_| ())
+        });
 
         // A stale timer must trigger a fetch despite the warm on-disk cache.
         expect_fetch_pair(&mut rx, instance_id).await;
@@ -2152,7 +3869,9 @@ mod tests {
         for _ in 0..8 {
             let sender = sender.clone();
             handlers.push(tokio::spawn(async move {
-                refresh_cache_if_due(instance_id, &sender).await.map(|_| ())
+                refresh_cache_if_due(instance_id, &sender, &test_webapp_cache())
+                    .await
+                    .map(|_| ())
             }));
         }
         drop(sender); // channel closes once all 8 handlers finish.
@@ -2211,7 +3930,9 @@ mod tests {
             .unwrap();
 
         let (sender, mut rx) = request_channel();
-        let handler = tokio::spawn(async move { refresh_cache_if_due(instance_id, &sender).await });
+        let handler = tokio::spawn(async move {
+            refresh_cache_if_due(instance_id, &sender, &test_webapp_cache()).await
+        });
 
         // Warm cache → the #3945 presence gate does NOT run; the failure-path
         // GET below is reached directly.
@@ -2284,6 +4005,7 @@ mod tests {
                     },
                 )),
             })),
+            &test_webapp_cache(),
         )
         .await;
 
@@ -2318,7 +4040,7 @@ mod tests {
         .expect_err("timeout must fire");
         let recv_result: Result<Option<HostCallbackResult>, _> = Err(elapsed);
 
-        let result = handle_get_response(instance_id, recv_result).await;
+        let result = handle_get_response(instance_id, recv_result, &test_webapp_cache()).await;
         assert!(
             matches!(
                 result,
@@ -2342,7 +4064,7 @@ mod tests {
 
         let recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed> = Ok(None);
 
-        let result = handle_get_response(instance_id, recv_result).await;
+        let result = handle_get_response(instance_id, recv_result, &test_webapp_cache()).await;
         assert!(
             matches!(
                 result,
@@ -3030,6 +4752,7 @@ mod tests {
                     None,
                     Some("news/"),
                     false,
+                    &test_webapp_cache(),
                 )
                 .await
                 .map(|resp| resp.into_response())

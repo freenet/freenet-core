@@ -180,6 +180,10 @@ impl HttpClientApi {
             socket,
             origin_contracts,
             crate::contract::user_input::pending_prompts(),
+            // Standalone composition with no node config behind it (local-node
+            // mode, tests). Falls back to the same directory `build()` would
+            // have derived.
+            crate::config::default_webapp_cache_dir(),
         )
     }
 
@@ -190,6 +194,7 @@ impl HttpClientApi {
         socket: &SocketAddr,
         origin_contracts: OriginContractMap,
         pending_prompts: crate::contract::user_input::PendingPrompts,
+        webapp_cache_dir: std::path::PathBuf,
     ) -> (Self, Router) {
         // Controls the cookie Secure flag: when true, cookies are sent over HTTP
         // (no HTTPS required). Includes is_unspecified() so that 0.0.0.0 bindings
@@ -210,7 +215,7 @@ impl HttpClientApi {
 
         let (proxy_request_sender, request_to_server) = mpsc::channel(1);
 
-        let config = Config { localhost };
+        let config = Config::new(localhost, webapp_cache_dir);
 
         // Per-node route to the executor for the hosted-mode export endpoint.
         // The SAME handle is injected as a request `Extension` (read by the
@@ -291,6 +296,26 @@ impl HttpClientApi {
 #[derive(Clone, Debug)]
 struct Config {
     localhost: bool,
+    /// This node's unpacked-webapp cache. Built once per server from
+    /// `WebsocketApiConfig::webapp_cache_dir` and shared by every request, so
+    /// the LRU sweep's debounce and in-progress flag are per-node rather than
+    /// per-request. Threaded rather than read from a global because the sweep
+    /// DELETES — see [`path_handlers::WebappCache`].
+    webapp_cache: path_handlers::WebappCache,
+}
+
+impl Config {
+    fn new(localhost: bool, webapp_cache_dir: std::path::PathBuf) -> Self {
+        Self {
+            localhost,
+            webapp_cache: path_handlers::WebappCache::with_root(webapp_cache_dir),
+        }
+    }
+
+    #[cfg(test)]
+    fn webapp_cache_root(&self) -> &std::path::Path {
+        self.webapp_cache.root()
+    }
 }
 
 #[instrument(level = "debug")]
@@ -349,7 +374,15 @@ async fn web_home(
         .unwrap_or(false);
 
     if is_sandbox {
-        return serve_sandbox_response(key, api_version, None, &req_headers, rs).await;
+        return serve_sandbox_response(
+            key,
+            api_version,
+            None,
+            &req_headers,
+            rs,
+            &config.webapp_cache,
+        )
+        .await;
     }
 
     // Root document load: render the shell that wraps the contract root.
@@ -411,6 +444,7 @@ async fn render_shell_response(
         query_string,
         sub_path,
         hosted_mode,
+        &config.webapp_cache,
     )
     .await?;
 
@@ -490,6 +524,7 @@ async fn web_subpages(
             Some(&last_path),
             &req_headers,
             request_sender,
+            &config.webapp_cache,
         )
         .await;
     }
@@ -534,14 +569,20 @@ async fn web_subpages(
 
     let version_prefix = api_version.prefix();
     let full_path: String = format!("/{version_prefix}/contract/web/{key}/{last_path}");
-    path_handlers::variable_content(key, full_path, api_version, request_sender)
-        .await
-        .map_err(|e| *e)
-        .map(|r| {
-            let mut response = r.into_response();
-            add_sandbox_cors_headers(&mut response);
-            response
-        })
+    path_handlers::variable_content(
+        key,
+        full_path,
+        api_version,
+        request_sender,
+        &config.webapp_cache,
+    )
+    .await
+    .map_err(|e| *e)
+    .map(|r| {
+        let mut response = r.into_response();
+        add_sandbox_cors_headers(&mut response);
+        response
+    })
 }
 
 /// Builds a 303 redirect to the contract's shell root, preserving
@@ -678,6 +719,7 @@ async fn serve_sandbox_response(
     sub_path: Option<&str>,
     req_headers: &axum::http::HeaderMap,
     request_sender: HttpClientApiRequest,
+    webapp_cache: &path_handlers::WebappCache,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     // Block top-level navigation to sandbox URLs. Sec-Fetch-Dest: iframe is set
     // by the browser automatically and cannot be spoofed by scripts.
@@ -689,8 +731,14 @@ async fn serve_sandbox_response(
         return redirect_to_shell_root(&key, api_version, None);
     }
 
-    let contract_response =
-        path_handlers::serve_sandbox_content(key, api_version, sub_path, request_sender).await?;
+    let contract_response = path_handlers::serve_sandbox_content(
+        key,
+        api_version,
+        sub_path,
+        request_sender,
+        webapp_cache,
+    )
+    .await?;
     let mut response = contract_response.into_response();
     add_sandbox_cors_headers(&mut response);
     // See `sandbox_csp_for_origin` for why we interpolate a concrete origin
@@ -1313,10 +1361,55 @@ mod tests {
         ));
     }
 
-    /// A minimal localhost `Config` for handler tests (controls only the
-    /// cookie Secure flag).
+    /// The router state must be rooted at the directory the node's config
+    /// names, not at a process-wide default.
+    ///
+    /// This is the half of the isolation that lives in core; the other half is
+    /// the `#[freenet_test]` harness setting `webapp_cache_dir` (pinned in
+    /// `freenet-macros`). The cache is LRU-EVICTED, so a builder that fell back
+    /// to the default would put every integration test back to deleting from
+    /// the developer's real `~/.cache/freenet/webapp_cache` — the bug a
+    /// `#[cfg(test)]`-gated redirect missed, because `cfg(test)` is false when
+    /// an integration test links the lib as an ordinary dependency.
+    ///
+    /// Scope, stated plainly: this pins `Config::new`, the one constructor the
+    /// router uses, against ignoring its argument. It does not re-prove the
+    /// call chain above it — that is the compiler's job, since the root is a
+    /// required parameter with no default anywhere between here and
+    /// `WebsocketApiConfig`.
+    #[test]
+    fn router_config_is_rooted_at_the_configured_webapp_cache_dir() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let configured = root.path().join("webapp_cache");
+        assert_ne!(
+            configured,
+            crate::config::default_webapp_cache_dir(),
+            "premise: the configured dir must differ from the default, or this \
+             test would pass even if the argument were ignored"
+        );
+
+        let config = Config::new(true, configured.clone());
+
+        assert_eq!(
+            config.webapp_cache_root(),
+            configured.as_path(),
+            "the router's cache must be rooted where the node's config says"
+        );
+    }
+
+    /// A minimal localhost `Config` for handler tests. The webapp cache is
+    /// rooted in a per-process temp dir: it is LRU-size-bounded, so a handler
+    /// test that reached the real directory would DELETE from the developer's
+    /// cache.
     fn localhost_config() -> Config {
-        Config { localhost: true }
+        static TEST_CACHE_ROOT: std::sync::LazyLock<tempfile::TempDir> =
+            std::sync::LazyLock::new(|| tempfile::tempdir().expect("test webapp cache root"));
+        Config {
+            localhost: true,
+            webapp_cache: path_handlers::WebappCache::with_root(
+                TEST_CACHE_ROOT.path().to_path_buf(),
+            ),
+        }
     }
 
     /// End-to-end regression for #3841: a top-level document load of an
