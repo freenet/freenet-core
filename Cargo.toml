@@ -63,6 +63,7 @@ moka = { version = "0.12", features = ["sync"] }
 # File I/O
 directories = "6"
 dirs = "6"
+filetime = "0.2"
 flate2 = "1"
 notify = "8"
 tar = "0.4"

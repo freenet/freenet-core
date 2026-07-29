@@ -60,6 +60,10 @@ directories = { workspace = true }
 dirs = { workspace = true }
 either = { features = ["serde"], workspace = true }
 event-listener = { workspace = true }
+# `utimensat`-backed mtime refresh for the webapp cache's LRU marker
+# (server/path_handlers.rs). Already in the tree as a `tar` dependency, so this
+# is a re-export of an already-compiled crate rather than a new build unit.
+filetime = { workspace = true }
 flate2 = { workspace = true }
 flatbuffers = { workspace = true }
 futures = { workspace = true }

@@ -2058,6 +2058,7 @@ dependencies = [
  "ed25519-dalek",
  "either",
  "event-listener",
+ "filetime",
  "flatbuffers 25.12.19",
  "flate2",
  "freenet-macros 0.1.0",
