@@ -4652,35 +4652,46 @@ mod test {
         Ok(())
     }
 
-    /// `SecretsStore::new` must build its retention from
-    /// `RetentionPolicy::from_env()`, not `::default()` — otherwise the
-    /// operator's `FREENET_SECRET_SNAPSHOT_BYTES_PER_SECRET` override
-    /// silently stops applying.
+    /// `SecretsStore::new` must build its retention from the env-aware
+    /// constructor, not the pure one — otherwise the operator's
+    /// `FREENET_SECRET_SNAPSHOT_BYTES_PER_SECRET` override silently stops
+    /// applying.
     ///
-    /// This is a SOURCE pin rather than a behavioural one, which is a
-    /// deliberate trade. The two constructors differ only in whether they
-    /// consult `environ`, so observing the difference at runtime means a
-    /// test that calls `setenv` — and `setenv` races every concurrent
-    /// `getenv` in the process, which in a lib-test binary means every other
-    /// test constructing a store. A source scrape catches the same mutation
-    /// with no data race. The parsing and the `with_budget_from` wiring are
-    /// pinned behaviourally in `secret_snapshots`.
+    /// This is a SOURCE pin rather than a behavioural one, deliberately. The
+    /// two constructors differ only in whether they consult `environ`, so
+    /// observing the difference at runtime means a test that calls `setenv`
+    /// — and `setenv` races every concurrent `getenv` in the process, which
+    /// in a lib-test binary means every other test constructing a store. A
+    /// source scrape catches the same mutation with no data race. The
+    /// parsing and the override wiring are pinned behaviourally in
+    /// `secret_snapshots`.
+    ///
+    /// TWO-SIDED on purpose: the earlier one-sided version of this test
+    /// silently passed under its own mutation, because the doc comment
+    /// above it spelled the needle out in full and the scrape matched
+    /// itself. Every needle here is assembled with `concat!` so it cannot
+    /// appear verbatim anywhere in this file, and the negative assertion
+    /// fails independently if the call is swapped back.
     #[test]
     fn secrets_store_new_uses_env_aware_retention() {
-        // Split so the needle cannot match this test's own source, which is
-        // part of the same `include_str!`.
-        let needle = concat!("RetentionPolicy", "::from_env()");
-        // Match against whitespace-stripped source so a rustfmt reflow of the
-        // call cannot silently disarm the pin.
+        // Whitespace-stripped so a rustfmt reflow cannot disarm the pin.
         let src: String = include_str!("store.rs")
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        let stripped_needle: String = needle.chars().filter(|c| !c.is_whitespace()).collect();
+        let required = concat!("retention:RetentionPolicy::", "from_env()");
+        let forbidden = concat!("retention:RetentionPolicy::", "default()");
         assert!(
-            src.contains(&stripped_needle),
-            "SecretsStore::new must construct its retention via {needle}; using \
-             RetentionPolicy::default() there drops the operator byte-budget override"
+            src.contains(required),
+            "SecretsStore::new must build its retention from the env-aware \
+             constructor ({required}); the pure one drops the operator \
+             byte-budget override"
+        );
+        assert!(
+            !src.contains(forbidden),
+            "SecretsStore::new must not build its retention from the pure \
+             constructor ({forbidden}); that drops the operator byte-budget \
+             override"
         );
     }
 

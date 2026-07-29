@@ -1337,6 +1337,48 @@ mod tests {
         );
     }
 
+    /// The environment read must live in exactly one place: `from_env` does
+    /// it, `Default` does not.
+    ///
+    /// SOURCE pin, because neither half is behaviourally observable without
+    /// a `setenv` — and removing `setenv` from this binary is the whole
+    /// point (a `getenv`/`setenv` race is UB, and `Default` is reached from
+    /// every `SecretsStore` construction). Needles are assembled with
+    /// `concat!` so this test's own source cannot satisfy them, and each
+    /// block is sliced out before searching so the negative assertion cannot
+    /// be tripped by unrelated code.
+    #[test]
+    fn env_read_lives_only_in_from_env() {
+        let src = include_str!("secret_snapshots.rs");
+        let slice_from = |key: &str, end: &str| -> String {
+            let start = src
+                .find(key)
+                .unwrap_or_else(|| panic!("source must still contain {key:?}"));
+            let rest = &src[start..];
+            let len = rest
+                .find(end)
+                .unwrap_or_else(|| panic!("no terminator {end:?} after {key:?}"));
+            rest[..len].to_string()
+        };
+
+        // `from_env` MUST read the environment — it is the only thing it does.
+        let from_env_body = slice_from(concat!("pub fn from_env()", " -> Self {"), "\n    }\n");
+        assert!(
+            from_env_body.contains(concat!("std::env::", "var(SNAPSHOT_BUDGET_ENV)")),
+            "from_env must read SNAPSHOT_BUDGET_ENV, otherwise the operator \
+             override is dead code; body was:\n{from_env_body}"
+        );
+
+        // `Default` MUST NOT: it is reached from every SecretsStore
+        // construction, so a getenv there races any setenv in the process.
+        let default_impl = slice_from(concat!("impl Default for ", "RetentionPolicy"), "\n}\n");
+        assert!(
+            !default_impl.contains(concat!("env::", "var")),
+            "Default for RetentionPolicy must stay pure — no environment read. \
+             Put the override in from_env instead; impl was:\n{default_impl}"
+        );
+    }
+
     // ===== recovery-path exemption =====
 
     #[test]
