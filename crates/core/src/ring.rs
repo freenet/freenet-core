@@ -2989,14 +2989,16 @@ impl Ring {
             // Disk-usage accounting maintenance (#4683). Runs OUTSIDE any
             // hosting-cache write lock (the du-walks would stall cache readers).
             // First tick lazily seeds the tracker from the true on-disk state
-            // total; every tick re-walks the `du`-measured WASM-blob and
-            // compile-cache totals so telemetry stays fresh. Observational only
-            // in this PR — no admission/eviction decision reads these yet.
+            // total; every tick re-walks the four `du`-measured totals (WASM
+            // blobs, compile cache, the storage backend's database file and the
+            // webapp cache, #5007) so telemetry stays fresh. These feed live
+            // decisions since #4702: the eviction floor and the pre-write
+            // admission gate both read the aggregate.
             //
-            // The seed + refresh are synchronous, blocking disk I/O: a recursive
-            // `std::fs` walk of `contracts_dir` + the wasmtime cache dir on every
-            // tick, plus a one-time sync redb `load_all_hosting_metadata` on the
-            // seeding tick. `contracts_dir` is unbounded and non-self-pruning, so
+            // The seed + refresh are synchronous, blocking disk I/O: recursive
+            // `std::fs` walks of `contracts_dir`, the wasmtime cache dir and the
+            // webapp cache plus a shallow walk of `db_dir` on every tick, plus a
+            // one-time sync redb `load_all_hosting_metadata` on the seeding tick. `contracts_dir` is unbounded and non-self-pruning, so
             // on a node hosting many contracts the walk can run for a while with
             // no `.await` point. Push it onto a blocking thread so it can never
             // stall other tasks on the async reactor — the same discipline

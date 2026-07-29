@@ -86,6 +86,30 @@
 //! live `state_bytes` delta already captures the marginal cost of an in-flight
 //! write; the sweep reconciles it against ground truth once a minute.
 //!
+//! The gap between the two — `db_file_bytes − state_bytes` — is the database's
+//! dead space, and it is not merely a reporting curiosity: growth that fits
+//! inside it costs no disk at all, which is why
+//! [`DiskUsageTracker::admit_state_update`] admits such an UPDATE even on an
+//! over-budget node. Refusing it would freeze a hosted contract's state while
+//! the node kept serving and advertising it (invariant 1's stale host) in
+//! exchange for zero bytes saved.
+//!
+//! # How a file is measured (allocated, not apparent)
+//!
+//! Every walk charges a file's **allocated blocks**, not its apparent length —
+//! see [`file_disk_bytes`]. redb's file is sparse on some peers (measured:
+//! 2.56 GiB apparent against 1.71 GiB allocated on the production gateway), so
+//! charging the apparent length over-states the dominant term by up to ~50% and
+//! makes the admission gate refuse writes the disk can still take. Allocation is
+//! also the unit `available` is measured in (`statvfs` free blocks), so the two
+//! terms of the budget's basis have to agree.
+//!
+//! A walk that CANNOT read its directory keeps the gauge's previous value and
+//! warns, instead of recording 0 — see [`DiskUsageTracker::store_measurement`].
+//! Recording 0 for an unreadable database directory would silently revert the
+//! aggregate to the exact under-count this module exists to fix, and would look
+//! like a healthy small node in telemetry.
+//!
 //! # The webapp cache is reported, not budgeted (#5007)
 //!
 //! The unpacked-webapp cache (XDG cache dir, `~/.cache/freenet/webapp_cache`)
@@ -240,6 +264,16 @@ pub(crate) struct DiskUsageTracker {
     /// same sweep. REPORTED ONLY — never part of [`Self::total_bytes`]; see the
     /// module docs for why double-bounding it would be wrong.
     webapp_cache_bytes: AtomicU64,
+    /// Edge-trigger flags for "the last `du`-walk of this gauge failed", one per
+    /// measured gauge (#5007 follow-up). A failed walk keeps the gauge's
+    /// previous value and warns ONCE, instead of silently recording 0 and
+    /// reverting the aggregate to the pre-#5007 under-count. See
+    /// [`Self::store_measurement`]; separate flags so a warning about one
+    /// directory cannot suppress a warning about another.
+    wasm_measure_failed: AtomicBool,
+    compile_cache_measure_failed: AtomicBool,
+    db_file_measure_failed: AtomicBool,
+    webapp_cache_measure_failed: AtomicBool,
     /// The directories all of the above are measured from.
     paths: HostingDiskPaths,
 }
@@ -256,6 +290,10 @@ impl DiskUsageTracker {
             state_sizes: Mutex::new(HashMap::new()),
             db_file_bytes: AtomicU64::new(0),
             webapp_cache_bytes: AtomicU64::new(0),
+            wasm_measure_failed: AtomicBool::new(false),
+            compile_cache_measure_failed: AtomicBool::new(false),
+            db_file_measure_failed: AtomicBool::new(false),
+            webapp_cache_measure_failed: AtomicBool::new(false),
             paths,
         }
     }
@@ -300,21 +338,18 @@ impl DiskUsageTracker {
     }
 
     /// Snapshot all gauges for telemetry.
+    ///
+    /// `total_bytes` delegates to [`Self::total_bytes`] rather than re-deriving
+    /// the aggregate, so the budgeted formula has exactly one definition and a
+    /// future change to it cannot land in one place and not the other.
     pub(crate) fn stats(&self) -> DiskUsageStats {
-        let state_bytes = self.state_bytes.load(Ordering::Relaxed);
-        let db_file_bytes = self.db_file_bytes.load(Ordering::Relaxed);
-        let wasm_bytes = self.wasm_bytes.load(Ordering::Relaxed);
-        let compile_cache_bytes = self.compile_cache_bytes.load(Ordering::Relaxed);
         DiskUsageStats {
-            state_bytes,
-            db_file_bytes,
-            wasm_bytes,
-            compile_cache_bytes,
+            state_bytes: self.state_bytes.load(Ordering::Relaxed),
+            db_file_bytes: self.db_file_bytes.load(Ordering::Relaxed),
+            wasm_bytes: self.wasm_bytes.load(Ordering::Relaxed),
+            compile_cache_bytes: self.compile_cache_bytes.load(Ordering::Relaxed),
             webapp_cache_bytes: self.webapp_cache_bytes.load(Ordering::Relaxed),
-            total_bytes: state_bytes
-                .max(db_file_bytes)
-                .saturating_add(wasm_bytes)
-                .saturating_add(compile_cache_bytes),
+            total_bytes: self.total_bytes(),
         }
     }
 
@@ -322,8 +357,22 @@ impl DiskUsageTracker {
     /// `(contract, state_size)` pairs (the caller reads these from redb rows so
     /// this module stays storage-backend-agnostic and unit-testable). Also runs
     /// the initial WASM, compile-cache, database-file and webapp-cache
-    /// measurements, so every gauge is meaningful the moment `is_seeded` flips
-    /// (the telemetry and budget paths both gate on that flag).
+    /// measurements, so the gauges the telemetry and budget paths read are
+    /// populated by the time this returns rather than waiting for the first 60s
+    /// sweep.
+    ///
+    /// The four measurements run AFTER the `seeded` flag flips, so a concurrent
+    /// reader can briefly observe `is_seeded() == true` with the `du`-measured
+    /// gauges still 0. That window is permissive, not blocking: the admission
+    /// gate compares against `disk_budget_bytes`, which is `u64::MAX` until the
+    /// first `recompute_effective_budget`, and that recompute runs after this
+    /// seed in the same sweep iteration. The walks are deliberately not moved
+    /// ahead of the flag — they must run outside the `state_sizes` lock, and
+    /// measuring first would open the opposite window in which a WASM blob
+    /// written between the walk and the flag is missed by both the walk and the
+    /// (still-unseeded, therefore skipped) delta in
+    /// [`Self::record_wasm_write`], which is an under-count of a gate input
+    /// rather than an over-permissive gauge.
     ///
     /// Idempotent-guarded: only the FIRST call takes effect; later calls are a
     /// no-op so a racing second sweep tick cannot double-count.
@@ -598,9 +647,47 @@ impl DiskUsageTracker {
     ///
     /// Therefore this check is **growth-only**: when `new_size <= old_for_key`
     /// (the delta is non-positive) it admits unconditionally, even when the
-    /// aggregate is already over budget. Only genuine growth (`new_size >
-    /// old_for_key`) is subjected to the same projected-aggregate bound as
-    /// `admit_state_write`.
+    /// aggregate is already over budget.
+    ///
+    /// # Growth absorbed by the database's dead space is also admitted (#5007)
+    ///
+    /// Genuine growth still is not automatically a *disk* cost. redb reuses
+    /// freed pages rather than truncating, so a node carrying dead space
+    /// (`db_file_bytes − state_bytes`, the gap #5007 made visible) absorbs
+    /// growth up to that gap without the file growing by a single byte. The
+    /// honest projection of the storage term is therefore
+    /// `max(db_file_bytes, state_bytes − old + new)` — NOT
+    /// `max(db_file_bytes, state_bytes) − old + new`, which charges the delta on
+    /// top of a file that will not move.
+    ///
+    /// This matters because of what refusing costs. A rejected UPDATE aborts the
+    /// write while the node keeps the contract, keeps serving it, and keeps
+    /// advertising as a host — a copy that has dropped out of the update mesh
+    /// but still answers reads, which `hosting-invariants.md` invariant 1 says
+    /// must be impossible by construction. And for a relayed UPDATE the
+    /// rejection is fire-and-forget: no `UpdateMsg::Error`, so no peer learns.
+    /// Growth is the normal case for the flagship contract class (a River room
+    /// appends messages), and #5007 widens the over-budget population by making
+    /// `used` honest. Refusing a merge that consumes no disk would manufacture
+    /// stale hosts and buy nothing — eviction has no lever on dead space either,
+    /// so there is no shed that would have made room.
+    ///
+    /// So the bound applies only to growth that genuinely enlarges the
+    /// footprint. When the projected storage term exceeds the current one, the
+    /// increment is real and is subjected to the aggregate budget.
+    ///
+    /// Two bounded imprecisions, both self-correcting on the next 60s
+    /// re-measurement: `state_bytes` counts state payload only, so
+    /// `db_file_bytes − state_bytes` also includes live non-state rows (params,
+    /// hosting metadata, indices, B-tree overhead) and slightly over-states what
+    /// is truly reclaimable; and `db_file_bytes` is up to one sweep window
+    /// stale.
+    ///
+    /// **Residual:** growth that exceeds the dead space on an over-budget node
+    /// is still refused, and that stale-host window stays open. That case is
+    /// genuine disk exhaustion where admitting the write would overflow the
+    /// budget; closing it means de-registering hosting and re-homing the
+    /// contract's subscribers (epic #4642, piece D), not widening this gate.
     ///
     /// Read-only, same deferred-`+delta` discipline and inclusive-admit boundary
     /// as [`Self::admit_state_write`].
@@ -610,7 +697,7 @@ impl DiskUsageTracker {
         new_size: u64,
         budget_bytes: u64,
     ) -> Result<(), DiskBudgetExceeded> {
-        // Hold the delta-path lock so the `old` read and the `total` read are a
+        // Hold the delta-path lock so the `old` read and the storage reads are a
         // consistent snapshot (same rationale as `admit_state_write`).
         let sizes = self.state_sizes.lock();
         let old = sizes.get(key).copied().unwrap_or(0);
@@ -618,9 +705,25 @@ impl DiskUsageTracker {
         if new_size <= old {
             return Ok(());
         }
-        let total = self.total_bytes();
+        let state = self.state_bytes.load(Ordering::Relaxed);
+        let db_file = self.db_file_bytes.load(Ordering::Relaxed);
         drop(sizes);
-        let projected = total.saturating_sub(old).saturating_add(new_size);
+
+        let current_storage = state.max(db_file);
+        let projected_storage = state
+            .saturating_sub(old)
+            .saturating_add(new_size)
+            .max(db_file);
+        // The growth fits inside the database file that is already on disk and
+        // already counted: it costs no new bytes, so there is nothing for the
+        // budget to protect and refusing would only stall convergence.
+        if projected_storage <= current_storage {
+            return Ok(());
+        }
+
+        let projected = projected_storage
+            .saturating_add(self.wasm_bytes.load(Ordering::Relaxed))
+            .saturating_add(self.compile_cache_bytes.load(Ordering::Relaxed));
         if projected > budget_bytes {
             Err(DiskBudgetExceeded {
                 projected_bytes: projected,
@@ -654,20 +757,92 @@ impl DiskUsageTracker {
         }
     }
 
+    /// Store the result of one `du`-walk, distinguishing **"measured 0"** from
+    /// **"could not measure"** (#5007 follow-up).
+    ///
+    /// Every walk in this module used to swallow its `read_dir` error and return
+    /// 0. That is a silent regression to the pre-#5007 under-count on the term
+    /// that now dominates the aggregate: a single EACCES (a packaging or user
+    /// change), a transient EMFILE on a busy node, or the directory being
+    /// replaced would set `db_file_bytes = 0`, `max(state, 0) == state` would
+    /// revert the whole figure to exactly the number #5007 exists to fix, and
+    /// telemetry would show a perfectly plausible `hosting_disk_db_bytes: 0`
+    /// with no log to contradict it. Under EACCES it is permanent and
+    /// indistinguishable from a healthy small node.
+    ///
+    /// So a failed walk leaves the gauge at its **previous** value and warns.
+    /// This is the same fail-loud discipline the state seed already follows (see
+    /// "Seeding discipline" in the module docs) — a measurement that cannot read
+    /// the truth must surface that rather than publish an under-count.
+    ///
+    /// `NotFound` is NOT a failure: a directory that does not exist holds no
+    /// bytes, and that is the legitimate state for a store that has not been
+    /// created yet (and for unit-test trackers pointed at nonexistent paths).
+    ///
+    /// The warning is edge-triggered on a per-gauge flag, so a node whose
+    /// database directory is permanently unreadable logs once rather than once
+    /// per 60s sweep forever, and logs again if the condition recurs after a
+    /// recovery.
+    fn store_measurement(
+        &self,
+        gauge: &AtomicU64,
+        already_warned: &AtomicBool,
+        dir: &Path,
+        what: &'static str,
+        walk: fn(&Path) -> std::io::Result<u64>,
+    ) {
+        match walk(dir) {
+            Ok(bytes) => {
+                gauge.store(bytes, Ordering::Relaxed);
+                already_warned.store(false, Ordering::Relaxed);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                gauge.store(0, Ordering::Relaxed);
+                already_warned.store(false, Ordering::Relaxed);
+            }
+            Err(err) => {
+                if !already_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        measurement = what,
+                        dir = %dir.display(),
+                        error = %err,
+                        retained_bytes = gauge.load(Ordering::Relaxed),
+                        "could not measure a hosting disk-usage directory; keeping \
+                         the previous measurement. Recording 0 here would silently \
+                         restore the pre-#5007 under-count and read as a healthy \
+                         small node"
+                    );
+                }
+            }
+        }
+    }
+
     /// Re-measure the on-disk WASM blob total by `du`-walking `contracts_dir`.
     /// Cheap and re-run on the telemetry cadence; deduping is inherent (each
-    /// distinct `code_hash` is one file).
+    /// distinct `code_hash` is one file). A walk that fails keeps the previous
+    /// value — see [`Self::store_measurement`].
     pub(crate) fn refresh_wasm(&self) {
-        self.wasm_bytes
-            .store(du_walk_wasm(&self.paths.contracts_dir), Ordering::Relaxed);
+        self.store_measurement(
+            &self.wasm_bytes,
+            &self.wasm_measure_failed,
+            &self.paths.contracts_dir,
+            "wasm_blobs",
+            du_walk_wasm,
+        );
     }
 
     /// Re-measure the wasmtime compile-cache total by `du`-walking its dir.
     /// Wasmtime writes the cache opaquely, so this re-walk (not a delta) is the
-    /// only way to account for it.
+    /// only way to account for it. A walk that fails keeps the previous value —
+    /// see [`Self::store_measurement`].
     pub(crate) fn refresh_compile_cache(&self) {
-        self.compile_cache_bytes
-            .store(du_walk(&self.paths.wasmtime_cache_dir), Ordering::Relaxed);
+        self.store_measurement(
+            &self.compile_cache_bytes,
+            &self.compile_cache_measure_failed,
+            &self.paths.wasmtime_cache_dir,
+            "compile_cache",
+            du_walk,
+        );
     }
 
     /// Re-measure the storage backend's database footprint (#5007).
@@ -684,9 +859,19 @@ impl DiskUsageTracker {
     /// Cheap: one `read_dir` over a directory holding a handful of entries,
     /// versus the recursive walks the wasm and compile-cache gauges already do
     /// on the same 60s cadence.
+    ///
+    /// A walk that FAILS keeps the previous value and warns rather than
+    /// recording 0: this is the dominant term, and a phantom 0 here reverts the
+    /// whole aggregate to the pre-#5007 under-count silently. See
+    /// [`Self::store_measurement`].
     pub(crate) fn refresh_db_file(&self) {
-        self.db_file_bytes
-            .store(du_walk_shallow(&self.paths.db_dir), Ordering::Relaxed);
+        self.store_measurement(
+            &self.db_file_bytes,
+            &self.db_file_measure_failed,
+            &self.paths.db_dir,
+            "database_file",
+            du_walk_shallow,
+        );
     }
 
     /// Re-measure the unpacked-webapp cache (#5007).
@@ -696,10 +881,16 @@ impl DiskUsageTracker {
     /// the blind spot (nothing measured or reported these bytes at all);
     /// charging them to the hosting budget would double-bound something #5012
     /// already caps at 64 MiB, using a lever hosting eviction does not have.
-    /// See the module docs.
+    /// See the module docs. A walk that fails keeps the previous value — see
+    /// [`Self::store_measurement`].
     pub(crate) fn refresh_webapp_cache(&self) {
-        self.webapp_cache_bytes
-            .store(du_walk(&self.paths.webapp_cache_dir), Ordering::Relaxed);
+        self.store_measurement(
+            &self.webapp_cache_bytes,
+            &self.webapp_cache_measure_failed,
+            &self.paths.webapp_cache_dir,
+            "webapp_cache",
+            du_walk,
+        );
     }
 
     /// Free bytes on the mount holding the tracked `contracts_dir` — the
@@ -710,45 +901,103 @@ impl DiskUsageTracker {
     pub(crate) fn available_bytes(&self) -> Option<u64> {
         available_bytes(&self.paths.contracts_dir)
     }
+
+    /// Test-only: install a measured database-file size directly.
+    ///
+    /// Budget arithmetic has to be exercised across footprints up to tens of
+    /// gigabytes, which no fixture can materialize on disk. It cannot be faked
+    /// with a sparse file either: since the walks measure allocated blocks, a
+    /// `set_len` file measures 0 and would make such a fixture silently vacuous.
+    #[cfg(test)]
+    pub(crate) fn set_db_file_bytes_for_test(&self, bytes: u64) {
+        self.db_file_bytes.store(bytes, Ordering::Relaxed);
+    }
 }
 
-/// Sum the byte size of every regular file **directly inside** `dir`, without
-/// descending into subdirectories (#5007).
+/// The disk a single file actually consumes: its **allocated blocks**, not its
+/// apparent length (#5007 follow-up).
+///
+/// `Metadata::len()` is what `ls` reports — the file's logical extent. For a
+/// **sparse** file that over-states consumption, because the holes occupy no
+/// blocks at all. redb's database file is sparse on some peers: measured on the
+/// production gateway (2026-07-29, stable across repeated samples),
+/// `len()` reported 2,749,370,368 bytes against 1,839,210,496 bytes actually
+/// allocated — a 910 MB / 49% over-charge on the term that now dominates the
+/// aggregate. (The same file on another peer was not sparse at all, so this
+/// varies with the peer's compaction history and cannot be corrected by a
+/// constant.) Over-charging makes the admission gate refuse writes the disk can
+/// still take: the mirror image of the under-count #5007 fixed, and no more
+/// honest.
+///
+/// Allocated blocks are also the only unit that composes with the budget's other
+/// term. The disk budget is `pct * (used + available)` where `available` is
+/// `statvfs`'s `f_bavail * f_frsize` — real free blocks. `used` has to be in the
+/// same currency, so block slack on a small file IS charged (the filesystem
+/// genuinely spent that block, and `available` already reflects it) and a hole
+/// is not. This makes the module's `du`-walk naming true: `du` reports
+/// allocation, `ls` reports length.
+///
+/// `st_blocks` is defined in 512-byte units regardless of the filesystem's own
+/// block size. Windows has no equivalent in `std`, so non-unix falls back to the
+/// apparent length.
+fn file_disk_bytes(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+/// Sum the allocated size of every regular file **directly inside** `dir`,
+/// without descending into subdirectories (#5007).
 ///
 /// The non-recursive counterpart to [`du_walk`], for the database directory:
 /// `db_dir` in `Network` mode contains the `local/` mode split, whose bytes
-/// belong to a different node instance and must not be charged here. Same
-/// best-effort error handling as [`du_walk`] — a missing directory or an
-/// unreadable entry contributes 0.
-fn du_walk_shallow(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
+/// belong to a different node instance and must not be charged here.
+///
+/// Returns `Err` when `dir` itself cannot be read. That is deliberate and is the
+/// difference between "measured 0" and "could not measure": see
+/// [`DiskUsageTracker::store_measurement`]. An individual unreadable entry
+/// inside a readable directory still contributes 0 (best effort).
+fn du_walk_shallow(dir: &Path) -> std::io::Result<u64> {
     let mut total: u64 = 0;
-    for entry in entries.flatten() {
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else {
+            continue;
+        };
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
         if file_type.is_file() {
             if let Ok(meta) = entry.metadata() {
-                total = total.saturating_add(meta.len());
+                total = total.saturating_add(file_disk_bytes(&meta));
             }
         }
     }
-    total
+    Ok(total)
 }
 
-/// Recursively sum the byte size of every regular file under `dir`. A missing
-/// directory (not yet created) or an unreadable entry contributes 0 rather than
-/// erroring — the refresh path is best-effort telemetry, unlike the fail-loud
-/// state seed.
-fn du_walk(dir: &Path) -> u64 {
+/// Recursively sum the allocated size of every regular file under `dir`.
+///
+/// `Err` when the ROOT `dir` cannot be read (the caller keeps its previous
+/// measurement rather than recording a phantom 0); an unreadable *sub*directory
+/// or entry contributes 0, since a partial tree is still a better estimate than
+/// discarding the whole measurement.
+fn du_walk(dir: &Path) -> std::io::Result<u64> {
     let mut total: u64 = 0;
     let mut stack = vec![dir.to_path_buf()];
+    let mut at_root = true;
     while let Some(path) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&path) else {
-            continue;
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(err) if at_root => return Err(err),
+            Err(_) => continue,
         };
+        at_root = false;
         for entry in entries.flatten() {
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -757,24 +1006,29 @@ fn du_walk(dir: &Path) -> u64 {
                 stack.push(entry.path());
             } else if file_type.is_file() {
                 if let Ok(meta) = entry.metadata() {
-                    total = total.saturating_add(meta.len());
+                    total = total.saturating_add(file_disk_bytes(&meta));
                 }
             }
         }
     }
-    total
+    Ok(total)
 }
 
 /// Like [`du_walk`] but only counts `*.wasm` files — the code-blob subset of
 /// `contracts_dir` (which also holds the `local/` mode split). Directory
 /// traversal is recursive so both the network and `local/` blobs are counted.
-fn du_walk_wasm(dir: &Path) -> u64 {
+/// Same root-vs-subtree error contract as [`du_walk`].
+fn du_walk_wasm(dir: &Path) -> std::io::Result<u64> {
     let mut total: u64 = 0;
     let mut stack = vec![dir.to_path_buf()];
+    let mut at_root = true;
     while let Some(path) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&path) else {
-            continue;
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(err) if at_root => return Err(err),
+            Err(_) => continue,
         };
+        at_root = false;
         for entry in entries.flatten() {
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -785,13 +1039,13 @@ fn du_walk_wasm(dir: &Path) -> u64 {
                 let p = entry.path();
                 if p.extension().and_then(|e| e.to_str()) == Some("wasm") {
                     if let Ok(meta) = entry.metadata() {
-                        total = total.saturating_add(meta.len());
+                        total = total.saturating_add(file_disk_bytes(&meta));
                     }
                 }
             }
         }
     }
-    total
+    Ok(total)
 }
 
 /// Free bytes on the filesystem mount that holds `path`, as seen by an
@@ -895,13 +1149,48 @@ mod tests {
         DiskUsageTracker::new(nonexistent_paths())
     }
 
-    /// Write a file of `len` zero bytes at `path`, creating parents.
+    /// Write a file of `len` bytes at `path`, creating parents.
+    ///
+    /// The content is a cheap pseudo-random stream, not zeros, so a filesystem
+    /// with transparent compression (btrfs `compress`, ZFS) cannot collapse the
+    /// fixture to a fraction of its blocks and quietly change what the walks
+    /// measure. The walks charge ALLOCATED blocks, so fixture content matters.
     fn write_file(path: &Path, len: usize) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
+        let mut state: u32 = 0x9E37_79B9;
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
         let mut f = std::fs::File::create(path).unwrap();
-        f.write_all(&vec![0u8; len]).unwrap();
+        f.write_all(&bytes).unwrap();
+    }
+
+    /// The disk `path` actually occupies, re-derived independently of the code
+    /// under test.
+    ///
+    /// Fixture files are small, so their allocated size is the filesystem's
+    /// block size rather than the byte count written; and the block size varies
+    /// by filesystem, so a hard-coded expectation would be wrong somewhere. The
+    /// walk tests below therefore assert *which files were counted*, and
+    /// [`file_disk_bytes`]'s own rule — allocated, not apparent — is pinned
+    /// separately by `sparse_file_is_charged_by_allocation_not_apparent_length`
+    /// and `block_slack_on_a_small_file_is_charged`.
+    fn alloc(path: &Path) -> u64 {
+        let meta = std::fs::metadata(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            meta.blocks() * 512
+        }
+        #[cfg(not(unix))]
+        {
+            meta.len()
+        }
     }
 
     #[test]
@@ -988,11 +1277,17 @@ mod tests {
             contracts_dir: contracts.clone(),
             ..nonexistent_paths()
         });
+        let blobs =
+            alloc(&contracts.join("aaaa.wasm")) + alloc(&contracts.join("local").join("bbbb.wasm"));
         t.seed(std::iter::empty());
-        assert_eq!(t.stats().wasm_bytes, 140);
+        assert_eq!(
+            t.stats().wasm_bytes,
+            blobs,
+            "both blobs counted, the non-wasm sibling not"
+        );
         // Re-walking is deduped by construction (same files) — idempotent.
         t.refresh_wasm();
-        assert_eq!(t.stats().wasm_bytes, 140);
+        assert_eq!(t.stats().wasm_bytes, blobs);
     }
 
     #[test]
@@ -1185,6 +1480,83 @@ mod tests {
         assert_eq!(err.budget_bytes, 149);
     }
 
+    /// Growth that fits inside the database's dead space is admitted even when
+    /// the node is over budget, because it costs no disk.
+    ///
+    /// redb reuses freed pages rather than truncating, so a write that keeps
+    /// total live state at or below the measured file size does not grow the
+    /// file by a byte. Refusing it would abort the merge while the node kept
+    /// serving and advertising the contract — invariant 1's stale host — and
+    /// would free nothing, since eviction has no lever on dead space either.
+    #[test]
+    fn admit_state_update_growth_absorbed_by_dead_space_is_admitted_over_budget() {
+        let t = tracker();
+        t.seed([(test_key(1), 100)]);
+        // 1000-byte file holding 100 bytes of live rows: 900 bytes of dead space.
+        t.set_db_file_bytes_for_test(1000);
+        assert_eq!(t.total_bytes(), 1000);
+
+        // Well over budget: a fresh PUT is refused, as it should be.
+        assert!(t.admit_state_write(&test_key(2), 1, 500).is_err());
+
+        // The same node must still merge a growing UPDATE that fits in the dead
+        // space: live state goes 100 → 900, the file does not move.
+        assert!(
+            t.admit_state_update(&test_key(1), 900, 500).is_ok(),
+            "growth inside the dead space costs no disk and must not be refused"
+        );
+        // Right up to the file size.
+        assert!(t.admit_state_update(&test_key(1), 1000, 500).is_ok());
+    }
+
+    /// The exemption stops exactly where the dead space does: growth that would
+    /// push live state past the measured file DOES enlarge the footprint, and is
+    /// held to the budget like any other growth.
+    #[test]
+    fn admit_state_update_growth_beyond_dead_space_is_still_bounded() {
+        let t = tracker();
+        t.seed([(test_key(1), 100)]);
+        t.set_db_file_bytes_for_test(1000);
+
+        let err = t
+            .admit_state_update(&test_key(1), 1001, 1000)
+            .expect_err("growth past the file must be charged");
+        assert_eq!(
+            err.projected_bytes, 1001,
+            "projection is max(file, state − old + new), not the file plus the delta"
+        );
+        assert_eq!(err.budget_bytes, 1000);
+        // …and is admitted when the budget has room for the real increment.
+        assert!(t.admit_state_update(&test_key(1), 1001, 1001).is_ok());
+    }
+
+    /// The projection must not charge the delta on top of a file that will not
+    /// move. Before this rule, `total − old + new` against a file-dominated
+    /// total over-charged every growing UPDATE by its full delta.
+    #[test]
+    fn admit_state_update_does_not_charge_growth_twice_against_the_file() {
+        let t = tracker();
+        t.seed([(test_key(1), 100)]);
+        t.set_db_file_bytes_for_test(1000);
+        // Budget exactly at the measured file. Growing the key by 1 byte inside
+        // 900 bytes of dead space must not be projected past it.
+        assert!(
+            t.admit_state_update(&test_key(1), 101, 1000).is_ok(),
+            "the file is the footprint; the delta lands inside it"
+        );
+    }
+
+    /// The exemption is scoped to UPDATEs. A fresh PUT on an over-budget node is
+    /// still refused: admitting new tenants is the decision the budget exists to
+    /// make, and a PUT has no already-hosted state whose merge would stall.
+    #[test]
+    fn dead_space_does_not_exempt_a_fresh_put() {
+        let t = tracker();
+        t.seed(std::iter::empty());
+        t.set_db_file_bytes_for_test(1000);
+        assert!(t.admit_state_write(&test_key(1), 1, 500).is_err());
+    }
+
     #[test]
     fn admit_state_update_is_read_only() {
         // Like admit_state_write, the growth-only check never mutates the counter.
@@ -1271,15 +1643,217 @@ mod tests {
             wasmtime_cache_dir: cache.clone(),
             ..nonexistent_paths()
         });
+        let nested = alloc(&cache.join("sub").join("mod.cache"));
         t.seed(std::iter::empty());
-        assert_eq!(t.stats().compile_cache_bytes, 512);
+        assert_eq!(
+            t.stats().compile_cache_bytes,
+            nested,
+            "the walk descends into subdirectories"
+        );
 
         // Grow the cache; a refresh must observe the new total.
         let mut g = std::fs::File::create(cache.join("mod2.cache")).unwrap();
         g.write_all(&[0u8; 88]).unwrap();
+        let both = nested + alloc(&cache.join("mod2.cache"));
         t.refresh_compile_cache();
-        assert_eq!(t.stats().compile_cache_bytes, 600);
-        assert_eq!(t.total_bytes(), 600);
+        assert_eq!(t.stats().compile_cache_bytes, both);
+        assert_eq!(t.total_bytes(), both);
+    }
+
+    // --- How a file is measured: allocation, not apparent length -------------
+
+    /// A SPARSE file must be charged for the blocks it actually occupies, not
+    /// for the length `ls` reports.
+    ///
+    /// Measured on the production gateway (2026-07-29): the redb database
+    /// reported 2,749,370,368 bytes of apparent length against 1,839,210,496
+    /// bytes allocated — a 910 MB / 49% over-charge on the term that dominates
+    /// the aggregate. Over-charging makes the admission gate refuse writes the
+    /// disk can still take, which is the same class of dishonesty as the
+    /// under-count #5007 fixed, pointing the other way. (The same file on
+    /// another peer was not sparse at all, so no constant correction exists.)
+    #[cfg(unix)]
+    #[test]
+    fn sparse_file_is_charged_by_allocation_not_apparent_length() {
+        const APPARENT: u64 = 64 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        // A hole, not data: length without allocation, exactly the shape redb's
+        // file takes on the peers where this was measured.
+        std::fs::File::create(db.join("db"))
+            .unwrap()
+            .set_len(APPARENT)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(db.join("db")).unwrap().len(),
+            APPARENT,
+            "fixture must have the large apparent length we are testing against"
+        );
+
+        let t = DiskUsageTracker::new(HostingDiskPaths {
+            db_dir: db.clone(),
+            ..nonexistent_paths()
+        });
+        t.seed(std::iter::empty());
+        let measured = t.stats().db_file_bytes;
+        assert_eq!(
+            measured,
+            alloc(&db.join("db")),
+            "the walk must report the allocated size"
+        );
+        assert!(
+            measured < APPARENT / 2,
+            "a hole occupies no disk, so charging it would over-state the \
+             dominant term (measured {measured} against {APPARENT} apparent)"
+        );
+    }
+
+    /// The other direction of the same rule: a file smaller than one filesystem
+    /// block still consumes a whole block, and the budget's `available` term
+    /// (`statvfs` free blocks) has already accounted for it. Charging the
+    /// apparent length would under-state usage against a basis measured in
+    /// blocks.
+    #[cfg(unix)]
+    #[test]
+    fn block_slack_on_a_small_file_is_charged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        write_file(&db.join("db"), 1);
+
+        let t = DiskUsageTracker::new(HostingDiskPaths {
+            db_dir: db.clone(),
+            ..nonexistent_paths()
+        });
+        t.seed(std::iter::empty());
+        assert_eq!(t.stats().db_file_bytes, alloc(&db.join("db")));
+        assert!(
+            t.stats().db_file_bytes > 1,
+            "a one-byte file occupies a whole block, and `available` already \
+             reflects that block being gone"
+        );
+    }
+
+    // --- A failed measurement is not a measurement of zero -------------------
+
+    /// A `du`-walk that CANNOT read its directory must keep the gauge's previous
+    /// value, not record 0.
+    ///
+    /// Recording 0 for the database directory reverts `max(state, 0) == state`
+    /// to exactly the pre-#5007 under-count, silently, with a perfectly
+    /// plausible `hosting_disk_db_bytes: 0` in telemetry and nothing to
+    /// contradict it. Under a persistent EACCES it is permanent and looks
+    /// identical to a healthy small node.
+    ///
+    /// The failure is injected by replacing the directory with a FILE (ENOTDIR),
+    /// which fails for root as well — a permissions-based fixture would silently
+    /// pass by measuring successfully when the suite runs as root.
+    #[test]
+    fn an_unreadable_database_directory_keeps_the_previous_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        write_file(&db.join("db"), 256 * 1024);
+
+        let t = DiskUsageTracker::new(HostingDiskPaths {
+            db_dir: db.clone(),
+            ..nonexistent_paths()
+        });
+        t.seed([(test_key(1), 10)]);
+        let measured = t.stats().db_file_bytes;
+        assert!(
+            measured > 0,
+            "fixture must measure something to then retain"
+        );
+
+        // The directory becomes unreadable (ENOTDIR here; EACCES/EMFILE in
+        // production).
+        std::fs::remove_dir_all(&db).unwrap();
+        write_file(&db, 8);
+        assert!(std::fs::read_dir(&db).is_err(), "fixture must make it fail");
+
+        t.refresh_db_file();
+        assert_eq!(
+            t.stats().db_file_bytes,
+            measured,
+            "a failed measurement must not be published as zero"
+        );
+        assert_eq!(
+            t.total_bytes(),
+            measured,
+            "and so the aggregate must not collapse to the pre-#5007 row sum"
+        );
+    }
+
+    /// Same rule for the webapp cache, which is walked recursively.
+    #[test]
+    fn an_unreadable_webapp_cache_keeps_the_previous_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let webapp = dir.path().join("webapp");
+        write_file(&webapp.join("aaaa").join("index.html"), 256 * 1024);
+
+        let t = DiskUsageTracker::new(HostingDiskPaths {
+            webapp_cache_dir: webapp.clone(),
+            ..nonexistent_paths()
+        });
+        t.seed(std::iter::empty());
+        let measured = t.stats().webapp_cache_bytes;
+        assert!(measured > 0);
+
+        std::fs::remove_dir_all(&webapp).unwrap();
+        write_file(&webapp, 8);
+        t.refresh_webapp_cache();
+        assert_eq!(t.stats().webapp_cache_bytes, measured);
+    }
+
+    /// A directory that does not exist is a legitimate measurement of zero, NOT
+    /// a failure: that is the state of a store not yet created, and of every
+    /// unit-test tracker pointed at nonexistent paths. Retaining a stale value
+    /// there would be its own kind of lie.
+    #[test]
+    fn a_missing_directory_measures_zero_rather_than_retaining() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        write_file(&db.join("db"), 256 * 1024);
+
+        let t = DiskUsageTracker::new(HostingDiskPaths {
+            db_dir: db.clone(),
+            ..nonexistent_paths()
+        });
+        t.seed(std::iter::empty());
+        assert!(t.stats().db_file_bytes > 0);
+
+        std::fs::remove_dir_all(&db).unwrap();
+        t.refresh_db_file();
+        assert_eq!(t.stats().db_file_bytes, 0, "gone means zero, not retained");
+    }
+
+    /// A recoverable failure must not poison the gauge: once the directory is
+    /// readable again the measurement resumes.
+    #[test]
+    fn measurement_resumes_after_a_transient_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        write_file(&db.join("db"), 256 * 1024);
+
+        let t = DiskUsageTracker::new(HostingDiskPaths {
+            db_dir: db.clone(),
+            ..nonexistent_paths()
+        });
+        t.seed(std::iter::empty());
+        let first = t.stats().db_file_bytes;
+
+        std::fs::remove_dir_all(&db).unwrap();
+        write_file(&db, 8);
+        t.refresh_db_file();
+        assert_eq!(t.stats().db_file_bytes, first);
+
+        // Readable again, and larger.
+        std::fs::remove_file(&db).unwrap();
+        write_file(&db.join("db"), 512 * 1024);
+        let grown = alloc(&db.join("db"));
+        assert!(grown > first);
+        t.refresh_db_file();
+        assert_eq!(t.stats().db_file_bytes, grown);
     }
 
     // --- Database-file measurement (#5007) -----------------------------------
@@ -1295,16 +1869,17 @@ mod tests {
         write_file(&db.join("db"), 4000);
 
         let t = DiskUsageTracker::new(HostingDiskPaths {
-            db_dir: db,
+            db_dir: db.clone(),
             ..nonexistent_paths()
         });
+        let file = alloc(&db.join("db"));
         // Logical rows total only 400 — the pre-#5007 figure.
         t.seed([(test_key(1), 300), (test_key(2), 100)]);
         assert_eq!(t.stats().state_bytes, 400, "logical rows still reported");
-        assert_eq!(t.stats().db_file_bytes, 4000);
+        assert_eq!(t.stats().db_file_bytes, file);
         assert_eq!(
             t.total_bytes(),
-            4000,
+            file,
             "aggregate must reflect the database file, not the row sum"
         );
     }
@@ -1324,11 +1899,12 @@ mod tests {
         write_file(&db.join("db"), 1000);
 
         let t = DiskUsageTracker::new(HostingDiskPaths {
-            db_dir: db,
+            db_dir: db.clone(),
             ..nonexistent_paths()
         });
+        let file = alloc(&db.join("db"));
         t.seed([(test_key(1), 600), (test_key(2), 400)]);
-        assert_eq!(t.total_bytes(), 1000);
+        assert_eq!(t.total_bytes(), file);
 
         // Shed everything. The file did not shrink, so neither does the figure.
         t.record_state_removed(&test_key(1));
@@ -1336,7 +1912,7 @@ mod tests {
         assert_eq!(t.stats().state_bytes, 0);
         assert_eq!(
             t.total_bytes(),
-            1000,
+            file,
             "shedding rows must not fictitiously reduce the measured footprint"
         );
     }
@@ -1351,16 +1927,17 @@ mod tests {
         write_file(&db.join("db"), 500);
 
         let t = DiskUsageTracker::new(HostingDiskPaths {
-            db_dir: db,
+            db_dir: db.clone(),
             ..nonexistent_paths()
         });
+        let file = alloc(&db.join("db"));
         t.seed(std::iter::empty());
-        assert_eq!(t.total_bytes(), 500, "measured file dominates while idle");
+        assert_eq!(t.total_bytes(), file, "measured file dominates while idle");
 
         // A write burst pushes live bytes past the last measurement; the file
         // must have grown at least that far, so the live figure takes over.
-        t.record_state_write(&test_key(1), 900);
-        assert_eq!(t.total_bytes(), 900);
+        t.record_state_write(&test_key(1), file + 400);
+        assert_eq!(t.total_bytes(), file + 400);
     }
 
     #[test]
@@ -1377,14 +1954,20 @@ mod tests {
         write_file(&db.join("local").join("db"), 9999);
 
         let t = DiskUsageTracker::new(HostingDiskPaths {
-            db_dir: db,
+            db_dir: db.clone(),
             ..nonexistent_paths()
         });
+        let siblings = alloc(&db.join("db")) + alloc(&db.join("db.backup"));
         t.seed(std::iter::empty());
         assert_eq!(
             t.stats().db_file_bytes,
-            125,
+            siblings,
             "shallow walk counts siblings of the database but not the local/ split"
+        );
+        assert!(
+            t.stats().db_file_bytes < siblings + alloc(&db.join("local").join("db")),
+            "the local/ split must be excluded, and the fixture must make its \
+             inclusion visible"
         );
     }
 
@@ -1409,15 +1992,19 @@ mod tests {
             db_dir: db.clone(),
             ..nonexistent_paths()
         });
+        let seeded = alloc(&db.join("db"));
         t.seed(std::iter::empty());
-        assert_eq!(t.total_bytes(), 200);
+        assert_eq!(t.total_bytes(), seeded);
 
         // The database grows (copy-on-write dead space, new pages, whatever) —
-        // the next sweep's re-measure must pick it up.
-        write_file(&db.join("db"), 1500);
+        // the next sweep's re-measure must pick it up. The growth spans several
+        // filesystem blocks so it is visible whatever the block size is.
+        write_file(&db.join("db"), 256 * 1024);
+        let grown = alloc(&db.join("db"));
+        assert!(grown > seeded, "fixture must actually grow the allocation");
         t.refresh_db_file();
-        assert_eq!(t.stats().db_file_bytes, 1500);
-        assert_eq!(t.total_bytes(), 1500);
+        assert_eq!(t.stats().db_file_bytes, grown);
+        assert_eq!(t.total_bytes(), grown);
     }
 
     #[test]
@@ -1431,18 +2018,20 @@ mod tests {
         write_file(&db.join("db"), 1000);
 
         let t = DiskUsageTracker::new(HostingDiskPaths {
-            db_dir: db,
+            db_dir: db.clone(),
             ..nonexistent_paths()
         });
+        // Budget == the measured file, so the node is exactly full.
+        let budget = alloc(&db.join("db"));
         t.seed(std::iter::empty()); // zero logical rows
         assert!(
-            t.admit_state_write(&test_key(1), 1, 1000).is_err(),
+            t.admit_state_write(&test_key(1), 1, budget).is_err(),
             "a full database must refuse a fresh PUT even with no rows tracked"
         );
         // Sanity: the same call against the pre-#5007 figure would have admitted.
         let blind = tracker();
         blind.seed(std::iter::empty());
-        assert!(blind.admit_state_write(&test_key(1), 1, 1000).is_ok());
+        assert!(blind.admit_state_write(&test_key(1), 1, budget).is_ok());
     }
 
     // --- Webapp cache: measured and reported, never budgeted (#5007) ----------
@@ -1460,12 +2049,15 @@ mod tests {
             webapp_cache_dir: webapp.clone(),
             ..nonexistent_paths()
         });
+        let seeded = alloc(&webapp.join("aaaa").join("index.html"))
+            + alloc(&webapp.join("bbbb").join("app.js"));
         t.seed(std::iter::empty());
-        assert_eq!(t.stats().webapp_cache_bytes, 500);
+        assert_eq!(t.stats().webapp_cache_bytes, seeded);
 
         write_file(&webapp.join("cccc").join("app.js"), 50);
+        let grown = seeded + alloc(&webapp.join("cccc").join("app.js"));
         t.refresh_webapp_cache();
-        assert_eq!(t.stats().webapp_cache_bytes, 550);
+        assert_eq!(t.stats().webapp_cache_bytes, grown);
     }
 
     #[test]
@@ -1480,11 +2072,13 @@ mod tests {
         write_file(&webapp.join("aaaa").join("index.html"), 4096);
 
         let t = DiskUsageTracker::new(HostingDiskPaths {
-            webapp_cache_dir: webapp,
+            webapp_cache_dir: webapp.clone(),
             ..nonexistent_paths()
         });
+        let cached = alloc(&webapp.join("aaaa").join("index.html"));
         t.seed([(test_key(1), 100)]);
-        assert_eq!(t.stats().webapp_cache_bytes, 4096, "measured");
+        assert_eq!(t.stats().webapp_cache_bytes, cached, "measured");
+        assert!(cached > 0, "fixture must have measurable bytes to exclude");
         assert_eq!(t.total_bytes(), 100, "but not budgeted");
         assert_eq!(t.stats().total_bytes, 100);
         // ...so it cannot influence the admission gate either.
@@ -1495,16 +2089,31 @@ mod tests {
     fn all_four_measured_dirs_are_read_from_their_own_path() {
         // Guards the transposition hazard `HostingDiskPaths` exists to make
         // unlikely: four same-typed paths, each of which must feed exactly one
-        // gauge. Distinct sizes make any swap visible.
+        // gauge. Distinct sizes make any swap visible — and they have to differ
+        // by whole filesystem blocks, since the walks charge allocation, so a
+        // few bytes apart would collapse to the same measurement.
+        const BLOCKS: usize = 64 * 1024;
         let dir = tempfile::tempdir().unwrap();
         let contracts = dir.path().join("contracts");
         let wasmtime = dir.path().join("wasmtime");
         let db = dir.path().join("db");
         let webapp = dir.path().join("webapp");
-        write_file(&contracts.join("aaaa.wasm"), 11);
-        write_file(&wasmtime.join("mod.cache"), 22);
-        write_file(&db.join("db"), 33);
-        write_file(&webapp.join("aaaa").join("index.html"), 44);
+        write_file(&contracts.join("aaaa.wasm"), BLOCKS);
+        write_file(&wasmtime.join("mod.cache"), 2 * BLOCKS);
+        write_file(&db.join("db"), 3 * BLOCKS);
+        write_file(&webapp.join("aaaa").join("index.html"), 4 * BLOCKS);
+        let wasm = alloc(&contracts.join("aaaa.wasm"));
+        let compile = alloc(&wasmtime.join("mod.cache"));
+        let dbf = alloc(&db.join("db"));
+        let web = alloc(&webapp.join("aaaa").join("index.html"));
+        assert_eq!(
+            [wasm, compile, dbf, web]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4,
+            "fixture sizes must stay distinct or a transposition would be invisible"
+        );
 
         let t = DiskUsageTracker::new(HostingDiskPaths {
             contracts_dir: contracts,
@@ -1514,12 +2123,12 @@ mod tests {
         });
         t.seed(std::iter::empty());
         let s = t.stats();
-        assert_eq!(s.wasm_bytes, 11);
-        assert_eq!(s.compile_cache_bytes, 22);
-        assert_eq!(s.db_file_bytes, 33);
-        assert_eq!(s.webapp_cache_bytes, 44);
-        // Budgeted aggregate = max(state=0, db=33) + wasm + compile cache.
-        assert_eq!(s.total_bytes, 33 + 11 + 22);
+        assert_eq!(s.wasm_bytes, wasm);
+        assert_eq!(s.compile_cache_bytes, compile);
+        assert_eq!(s.db_file_bytes, dbf);
+        assert_eq!(s.webapp_cache_bytes, web);
+        // Budgeted aggregate = max(state=0, db) + wasm + compile cache.
+        assert_eq!(s.total_bytes, dbf + wasm + compile);
     }
 
     /// `available_bytes` on a real, existing mount returns a plausible positive

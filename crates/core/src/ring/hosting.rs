@@ -658,8 +658,14 @@ impl HostingManager {
     /// The tightening happens where it should: the aggregate admission gate
     /// ([`Self::admit_state_write`]) compares the full `used` against the disk
     /// budget, so making `used` honest costs `(1 − pct)` of every newly-visible
-    /// byte in headroom. That is the mechanism that keeps a node's footprint
-    /// bounded instead of merely reclaiming it once per restart.
+    /// byte in headroom.
+    ///
+    /// That bounds what a full node ACCEPTS; it does not bound the footprint
+    /// itself. Nothing here shrinks a database file — dead space is reclaimed by
+    /// the startup compaction (#5005) and by nothing else — so a node whose file
+    /// has already grown past its budget refuses new tenants at that size rather
+    /// than returning to a smaller one. Making the figure honest is what lets an
+    /// operator see that; a runtime compaction trigger would be what fixes it.
     pub(crate) fn recompute_effective_budget(&self, available: u64) -> Option<u64> {
         let stats = {
             let guard = self.disk_tracker.read();
@@ -701,6 +707,15 @@ impl HostingManager {
     /// startup compaction (#5005) and by nothing else, so it has to be audible
     /// rather than leaving an operator to infer it from rejected writes.
     ///
+    /// It also has a consequence beyond refused PUTs that the operator cannot
+    /// see from the byte counts alone. UPDATEs to already-hosted contracts still
+    /// flow while they shrink, hold, or fit inside the dead space, but an UPDATE
+    /// whose growth exceeds the dead space is refused — and the node goes on
+    /// serving and advertising that contract with its last accepted state. The
+    /// warning names that, because a peer that answers reads with state it has
+    /// stopped merging is the failure mode `hosting-invariants.md` invariant 1
+    /// exists to forbid, and it is not visible in the disk gauges.
+    ///
     /// Edge-triggered via a stored flag, so a node that sits over budget logs
     /// once, not once per 60s sweep forever.
     ///
@@ -725,9 +740,12 @@ impl HostingManager {
                 wasm_bytes = stats.wasm_bytes,
                 compile_cache_bytes = stats.compile_cache_bytes,
                 "aggregate on-disk usage is over the disk budget; fresh PUTs \
-                 will be refused until it comes back under. Database dead space \
-                 is reclaimed only by the startup compaction, so a large \
-                 db_dead_space_bytes here needs a node restart, not eviction"
+                 will be refused until it comes back under, and an UPDATE whose \
+                 growth exceeds db_dead_space_bytes is refused while this node \
+                 keeps serving and advertising that contract at its last \
+                 accepted state. Database dead space is reclaimed only by the \
+                 startup compaction, so a large db_dead_space_bytes here needs a \
+                 node restart, not eviction"
             );
         } else {
             tracing::info!(
@@ -769,9 +787,13 @@ impl HostingManager {
     /// (fresh PUT), a shrinking or size-holding UPDATE (`new_size <= old`) is
     /// admitted unconditionally — even when the aggregate is over budget —
     /// because an UPDATE mutates an already-counted footprint and rejecting it
-    /// would stall CRDT convergence without freeing any bytes. Only genuine
-    /// growth is subjected to the aggregate bound. No-op admit when the tracker
-    /// is absent or unseeded, same as [`Self::admit_state_write`].
+    /// would stall CRDT convergence without freeing any bytes. So is growth that
+    /// fits inside the database's existing dead space, which costs no disk (see
+    /// `DiskUsageTracker::admit_state_update`): refusing it would leave the node
+    /// serving and advertising a contract whose state has stopped merging, for
+    /// zero bytes saved. Only growth that genuinely enlarges the footprint is
+    /// subjected to the aggregate bound. No-op admit when the tracker is absent
+    /// or unseeded, same as [`Self::admit_state_write`].
     pub(crate) fn admit_state_update(
         &self,
         key: &ContractKey,
@@ -991,6 +1013,17 @@ impl HostingManager {
     {
         if let Some(tracker) = self.disk_tracker.read().as_ref() {
             tracker.seed(rows);
+        }
+    }
+
+    /// Test-only: install a measured database-file size on the configured
+    /// tracker, so budget arithmetic can be driven across footprints far larger
+    /// than any fixture could materialize. See
+    /// `DiskUsageTracker::set_db_file_bytes_for_test`.
+    #[cfg(test)]
+    pub(crate) fn set_db_file_bytes_for_test(&self, bytes: u64) {
+        if let Some(tracker) = self.disk_tracker.read().as_ref() {
+            tracker.set_db_file_bytes_for_test(bytes);
         }
     }
 
@@ -7283,13 +7316,19 @@ mod tests {
     /// region, and at the cap) so the property is checked where the clamp could
     /// otherwise hide an inversion.
     ///
-    /// The extra bytes are supplied through a REAL database file rather than by
-    /// inflating the seeded row total, because the mutation this has to catch is
-    /// a recompute that treats the newly-visible non-state footprint as a charge
-    /// against the budget (`disk_budget − non_state`) instead of as part of its
-    /// basis. Driving `used` purely through state rows leaves `non_state == 0`
-    /// and the test passes under that mutation — verified, and the reason the
-    /// fixture looks like this.
+    /// The extra bytes are supplied as a measured DATABASE FILE size rather than
+    /// by inflating the seeded row total, because the mutation this has to catch
+    /// is a recompute that treats the newly-visible non-state footprint as a
+    /// charge against the budget (`disk_budget − non_state`) instead of as part
+    /// of its basis. Driving `used` purely through state rows leaves
+    /// `non_state == 0` and the test passes under that mutation — verified, and
+    /// the reason the fixture looks like this.
+    ///
+    /// The size is injected rather than materialized. It has to reach tens of
+    /// gigabytes to exercise the cap, and a sparse `set_len` file cannot stand
+    /// in: the walks charge ALLOCATED blocks, so a hole measures 0 and every
+    /// entry in the sweep below would collapse to the same `used`, making the
+    /// whole test vacuous.
     #[test]
     fn effective_budget_never_falls_as_measured_usage_rises() {
         const MIB: u64 = 1024 * 1024;
@@ -7307,28 +7346,17 @@ mod tests {
                     // state changing: 583 MB of rows in a 2.68 GB file was the
                     // production measurement.
                     for db_bytes in [0, 128 * MIB, 583 * MIB, 2680 * MIB, 40 * GIB] {
-                        let dir = tempfile::tempdir().unwrap();
-                        let db = dir.path().join("db");
-                        std::fs::create_dir_all(&db).unwrap();
-                        // Sparse: `set_len` gives the file the length the walk
-                        // measures without allocating blocks for it.
-                        std::fs::File::create(db.join("db"))
-                            .unwrap()
-                            .set_len(db_bytes)
-                            .unwrap();
-
                         let manager = HostingManager::new(ram);
                         manager.configure_disk_budget(0.5, cap);
-                        manager.configure_disk_tracker(HostingDiskPaths {
-                            contracts_dir: std::path::PathBuf::from("/nonexistent/contracts"),
-                            wasmtime_cache_dir: std::path::PathBuf::from("/nonexistent/cache"),
-                            db_dir: db,
-                            webapp_cache_dir: std::path::PathBuf::from("/nonexistent/webapp"),
-                        });
-                        manager.seed_configured_disk_tracker_for_test([(
-                            make_contract_key(1),
-                            STATE_ROWS,
-                        )]);
+                        manager.seed_disk_tracker_for_test([(make_contract_key(1), STATE_ROWS)]);
+                        manager.set_db_file_bytes_for_test(db_bytes);
+                        // The fixture is only meaningful while the injected file
+                        // dominates the live rows — that is what makes
+                        // `non_state` non-zero and the mutation visible.
+                        assert!(
+                            db_bytes == 0 || db_bytes > STATE_ROWS,
+                            "fixture must drive `used` through non-state bytes"
+                        );
 
                         let eff = manager
                             .recompute_effective_budget(available)
@@ -7427,16 +7455,35 @@ mod tests {
     /// post-growth size. Dropping any of the four calls from
     /// `refresh_disk_usage` leaves that gauge at its stale seed value and fails
     /// here.
+    ///
+    /// Sizes are whole multiples of 64 KiB and the post-growth sizes are read
+    /// back from the filesystem, because the walks charge ALLOCATED blocks: a
+    /// fixture growing a file from 11 to 1100 bytes would not move the
+    /// measurement at all on a 4 KiB-block filesystem, and the pin would pass
+    /// while measuring nothing.
     #[test]
     fn refresh_disk_usage_measures_database_and_webapp_cache() {
         use std::io::Write;
+        const CHUNK: usize = 64 * 1024;
 
         fn write_file(path: &std::path::Path, len: usize) {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::File::create(path)
                 .unwrap()
-                .write_all(&vec![0u8; len])
+                .write_all(&vec![7u8; len])
                 .unwrap();
+        }
+        fn alloc(path: &std::path::Path) -> u64 {
+            let meta = std::fs::metadata(path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                meta.blocks() * 512
+            }
+            #[cfg(not(unix))]
+            {
+                meta.len()
+            }
         }
 
         let dir = tempfile::tempdir().unwrap();
@@ -7444,12 +7491,16 @@ mod tests {
         let wasmtime = dir.path().join("wasmtime");
         let db = dir.path().join("db");
         let webapp = dir.path().join("webapp");
+        let wasm_file = contracts.join("aaaa.wasm");
+        let cache_file = wasmtime.join("mod.cache");
+        let db_file = db.join("db");
+        let webapp_file = webapp.join("aaaa").join("index.html");
 
-        // Seed-time sizes.
-        write_file(&contracts.join("aaaa.wasm"), 11);
-        write_file(&wasmtime.join("mod.cache"), 22);
-        write_file(&db.join("db"), 33);
-        write_file(&webapp.join("aaaa").join("index.html"), 44);
+        // Seed-time sizes, distinct so a transposed gauge is visible.
+        write_file(&wasm_file, CHUNK);
+        write_file(&cache_file, 2 * CHUNK);
+        write_file(&db_file, 3 * CHUNK);
+        write_file(&webapp_file, 4 * CHUNK);
 
         let manager = HostingManager::new(1024 * 1024 * 1024);
         manager.configure_disk_tracker(HostingDiskPaths {
@@ -7461,12 +7512,26 @@ mod tests {
         // A tiny logical state total inside a much larger database — the shape of
         // an under-counting node (583 MB of rows in a 2.68 GB file).
         manager.seed_configured_disk_tracker_for_test([(make_contract_key(1), 100)]);
+        let seeded = manager.disk_usage_stats().expect("seeded");
 
         // Everything grows after the seed. Only a re-measure can see this.
-        write_file(&contracts.join("aaaa.wasm"), 1100);
-        write_file(&wasmtime.join("mod.cache"), 2200);
-        write_file(&db.join("db"), 3300);
-        write_file(&webapp.join("aaaa").join("index.html"), 4400);
+        write_file(&wasm_file, 11 * CHUNK);
+        write_file(&cache_file, 22 * CHUNK);
+        write_file(&db_file, 33 * CHUNK);
+        write_file(&webapp_file, 44 * CHUNK);
+        let (wasm, cache, dbf, web) = (
+            alloc(&wasm_file),
+            alloc(&cache_file),
+            alloc(&db_file),
+            alloc(&webapp_file),
+        );
+        assert!(
+            wasm > seeded.wasm_bytes
+                && cache > seeded.compile_cache_bytes
+                && dbf > seeded.db_file_bytes
+                && web > seeded.webapp_cache_bytes,
+            "every gauge must actually grow, or a dropped refresh would be invisible"
+        );
 
         manager.refresh_disk_usage();
 
@@ -7475,21 +7540,21 @@ mod tests {
             .expect("seeded tracker reports stats");
         assert_eq!(stats.state_bytes, 100, "logical rows are delta-tracked");
         assert_eq!(
-            stats.db_file_bytes, 3300,
+            stats.db_file_bytes, dbf,
             "the sweep must RE-MEASURE the database file; without that call the \
              aggregate reverts to the logical row sum and the dead space a \
              long-running peer accumulates is invisible again (#5007)"
         );
         assert_eq!(
-            stats.webapp_cache_bytes, 4400,
+            stats.webapp_cache_bytes, web,
             "the sweep must RE-MEASURE the webapp cache; without that call those \
              bytes are invisible again (#5007)"
         );
-        assert_eq!(stats.wasm_bytes, 1100);
-        assert_eq!(stats.compile_cache_bytes, 2200);
+        assert_eq!(stats.wasm_bytes, wasm);
+        assert_eq!(stats.compile_cache_bytes, cache);
         // Budgeted aggregate = max(state, db) + wasm + compile cache. The webapp
         // cache is measured but not charged.
-        assert_eq!(stats.total_bytes, 3300 + 1100 + 2200);
+        assert_eq!(stats.total_bytes, dbf + wasm + cache);
     }
 
     /// The recompute takes only the O(1) `set_budget_bytes` cache write lock, so
@@ -7768,6 +7833,155 @@ mod tests {
                 .admit_state_update(&make_contract_key(1), 300 * MIB)
                 .is_err(),
             "growth over budget must still reject"
+        );
+    }
+
+    // --- What an over-budget node actually DOES (#5007) ----------------------
+    //
+    // The PR that made `used` honest argued that the resulting over-budget state
+    // is "narrow and bounded". That claim was pinned only by the boolean return
+    // of the log helper. These three tests pin the behavior itself: what still
+    // flows, what the eviction floor does, and how the state clears.
+
+    /// A node whose DATABASE FILE alone exceeds its disk budget still merges
+    /// UPDATEs to the contracts it hosts.
+    ///
+    /// This is the state #5007 makes reachable: the dead space is real, eviction
+    /// has no lever on it, and it will not clear before a restart. If a growing
+    /// UPDATE were refused there, the node would keep serving and advertising a
+    /// contract whose state had stopped merging — the stale host
+    /// `hosting-invariants.md` invariant 1 forbids — while freeing nothing.
+    /// Growth is the normal case for a River room, so this is not a corner.
+    #[test]
+    fn over_budget_from_dead_space_still_merges_hosted_updates() {
+        const MIB: u64 = 1024 * 1024;
+        // The production measurement: 583 MB of live rows inside a 2.68 GB file.
+        const ROWS: u64 = 583 * MIB;
+        const FILE: u64 = 2680 * MIB;
+
+        let manager = HostingManager::new(64 * 1024 * MIB);
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        manager.seed_disk_tracker_for_test([(make_contract_key(1), ROWS)]);
+        manager.set_db_file_bytes_for_test(FILE);
+        manager.recompute_effective_budget(0);
+
+        let budget = manager.disk_budget_bytes();
+        assert!(
+            manager.disk_usage_stats().unwrap().total_bytes > budget,
+            "precondition: the file alone must put the node over budget"
+        );
+
+        // A fresh PUT is refused. That is the intended emergent refusal.
+        assert!(
+            manager.admit_state_write(&make_contract_key(2), 1).is_err(),
+            "a full node refuses new tenants"
+        );
+
+        // Shrinking and size-holding UPDATEs flow (pre-existing rule).
+        assert!(
+            manager
+                .admit_state_update(&make_contract_key(1), ROWS / 2)
+                .is_ok()
+        );
+        assert!(
+            manager
+                .admit_state_update(&make_contract_key(1), ROWS)
+                .is_ok()
+        );
+
+        // And so does growth that fits in the dead space: the file does not move,
+        // so refusing would cost convergence and save nothing.
+        assert!(
+            manager
+                .admit_state_update(&make_contract_key(1), ROWS + 100 * MIB)
+                .is_ok(),
+            "growth inside the dead space must merge on an over-budget node"
+        );
+        assert!(
+            manager
+                .admit_state_update(&make_contract_key(1), FILE)
+                .is_ok(),
+            "up to the measured file size, nothing new is written"
+        );
+
+        // Beyond the file, the growth is real and the budget applies again.
+        assert!(
+            manager
+                .admit_state_update(&make_contract_key(1), FILE + 1)
+                .is_err(),
+            "growth that enlarges the footprint stays bounded"
+        );
+    }
+
+    /// Being over budget must not make the eviction floor shed MORE than it did
+    /// while the same node was under-counting itself.
+    ///
+    /// `used` sits in the budget's own basis, so an honest (larger) figure can
+    /// only raise the installed floor. Stated as a direct comparison between two
+    /// nodes identical except for whether the database file is measured, because
+    /// "10x the usage against the same budget evicts everything" is the obvious
+    /// fear and it points the wrong way.
+    #[test]
+    fn honest_over_budget_usage_does_not_tighten_the_eviction_floor() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+
+        let blind = HostingManager::new(GIB);
+        blind.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        blind.seed_disk_tracker_for_test([(make_contract_key(1), 583 * MIB)]);
+        blind.recompute_effective_budget(GIB);
+        let blind_floor = blind.hosting_budget_bytes();
+
+        let honest = HostingManager::new(GIB);
+        honest.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        honest.seed_disk_tracker_for_test([(make_contract_key(1), 583 * MIB)]);
+        honest.set_db_file_bytes_for_test(2680 * MIB);
+        honest.recompute_effective_budget(GIB);
+        let honest_floor = honest.hosting_budget_bytes();
+
+        assert!(
+            honest_floor >= blind_floor,
+            "measuring the database file must not lower the eviction floor \
+             ({honest_floor} < {blind_floor})"
+        );
+
+        // And the floor is a fixed point: re-running the sweep without anything
+        // changing installs the same value, so there is no shed-then-shrink
+        // treadmill.
+        honest.recompute_effective_budget(GIB);
+        assert_eq!(honest.hosting_budget_bytes(), honest_floor);
+    }
+
+    /// The over-budget state clears when free space comes back, without a
+    /// restart and without any eviction: the budget is sized from
+    /// `used + available`, so a larger `available` lifts it back over `used`.
+    #[test]
+    fn over_budget_clears_when_free_space_grows() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+
+        let manager = HostingManager::new(64 * GIB);
+        manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
+        manager.seed_disk_tracker_for_test([(make_contract_key(1), 583 * MIB)]);
+        manager.set_db_file_bytes_for_test(2680 * MIB);
+
+        manager.recompute_effective_budget(0);
+        assert!(
+            manager.disk_usage_stats().unwrap().total_bytes > manager.disk_budget_bytes(),
+            "precondition: over budget with no free space"
+        );
+        assert!(manager.admit_state_write(&make_contract_key(2), 1).is_err());
+
+        // Free space appears (the operator cleared something, or another
+        // consumer released it). Nothing about the node's own footprint changed.
+        manager.recompute_effective_budget(64 * GIB);
+        assert!(
+            manager.disk_usage_stats().unwrap().total_bytes <= manager.disk_budget_bytes(),
+            "a larger `available` must lift the budget back over `used`"
+        );
+        assert!(
+            manager.admit_state_write(&make_contract_key(2), 1).is_ok(),
+            "and fresh PUTs must be accepted again"
         );
     }
 }
