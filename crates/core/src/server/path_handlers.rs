@@ -300,7 +300,38 @@ impl WebappCache {
     ///
     /// One instance per server, cloned into the router state, so the sweep
     /// debounce and in-progress flag are shared across that node's requests.
+    ///
+    /// Creates the directory and names it in the log, once, here: this is where
+    /// the cache takes ownership of a path it will DELETE from, and nothing else
+    /// in the node identifies that path. An operator asking "what is removing
+    /// files from here" or "where did this disk go" otherwise has nowhere to
+    /// look, and a sweeper should say which directory it sweeps.
+    ///
+    /// Creating it eagerly also converts the two silent-misconfiguration shapes
+    /// into a startup warning: a root that exists as a FILE, or one that cannot
+    /// be created (permissions, read-only mount). Either leaves every unpack
+    /// failing and the sweep scanning nothing, i.e. a cache that never populates
+    /// and a bound that never runs, with no error surfaced anywhere because both
+    /// paths are best-effort by design. That failure is not fatal and must not
+    /// be, since the node serves everything except web contracts perfectly well,
+    /// so this warns and carries on rather than refusing to start.
     pub(crate) fn with_root(root: PathBuf) -> Self {
+        match std::fs::create_dir_all(&root) {
+            Ok(()) => tracing::info!(
+                path = %root.display(),
+                max_bytes = WEBAPP_CACHE_MAX_BYTES,
+                "webapp cache: unpacked web contracts are cached here; \
+                 least-recently-used entries are DELETED from here to hold the \
+                 directory under its size bound"
+            ),
+            Err(err) => tracing::warn!(
+                path = %root.display(),
+                "webapp cache: cannot create the cache directory ({err}); web \
+                 contracts will fail to unpack and the size bound will not run. \
+                 Check that the path is a directory and is writable, or point \
+                 the node elsewhere with FREENET_WEBAPP_CACHE_DIR."
+            ),
+        }
         Self {
             root,
             max_bytes: WEBAPP_CACHE_MAX_BYTES,
@@ -1894,9 +1925,10 @@ mod tests {
         (HttpClientApiRequest::from_sender(tx), rx)
     }
 
-    /// Clears any webapp cache state for `instance_id` on disk. `contract_web_path`
-    /// and `state_hash_path` resolve to a shared process-global directory, so
-    /// tests that exercise the cache must use unique keys AND scrub any stale
+    /// Clears any webapp cache state for `instance_id` on disk.
+    /// `contract_web_path` and `state_hash_path` resolve to the one per-process
+    /// temp root of [`test_webapp_cache`], shared by every test in this module,
+    /// so tests that exercise the cache must use unique keys AND scrub any stale
     /// filesystem residue from a prior run before asserting on behaviour.
     ///
     /// Also drops the in-memory `CONTRACT_CACHE_REFRESH` timer (process-global,
@@ -1917,8 +1949,8 @@ mod tests {
     // Webapp cache size bound (LRU eviction)
     //
     // These exercise `enforce_webapp_cache_budget` against a `TempDir` root
-    // rather than the process-global `webapp_cache_dir()`, so they neither
-    // depend on nor disturb residue in the shared XDG cache. The in-memory
+    // rather than the node's real configured root, so they neither depend on nor
+    // disturb residue in the developer's XDG cache. The in-memory
     // side-tables (`WEBAPP_CACHE_ACCESS`, `CONTRACT_CACHE_LOCKS`,
     // `CONTRACT_CACHE_REFRESH`) ARE process-global, so every test uses its own
     // instance ids and `seed_cache_entry` scrubs them first.
@@ -1932,10 +1964,11 @@ mod tests {
     ///
     /// Every cache test builds one of these. Nothing here may reach the default
     /// cache with the production budget: the sweep DELETES, so a test that swept
-    /// `webapp_cache_dir()` would evict the developer's real cache and, on a
-    /// machine running a node as the same user, entries that node is serving.
-    /// (`PRODUCTION_WEBAPP_CACHE` is additionally redirected to a temp dir in
-    /// test builds, so that mistake is unreachable rather than merely avoided.)
+    /// `crate::config::default_webapp_cache_dir()` would evict the developer's
+    /// real cache and, on a machine running a node as the same user, entries
+    /// that node is serving. Constructed field-by-field rather than through
+    /// `with_root` so a test budget can be set; `with_root`'s own behaviour is
+    /// covered by `with_root_creates_the_cache_directory_it_will_sweep`.
     fn cache(root: &Path, max_bytes: u64) -> WebappCache {
         WebappCache {
             root: root.to_path_buf(),
@@ -2011,6 +2044,67 @@ mod tests {
 
     fn sentinel_present(root: &Path, instance_id: &ContractInstanceId) -> bool {
         root.join(format!("{}.hash", instance_id.encode())).exists()
+    }
+
+    /// `with_root` materializes the directory it is going to sweep, including
+    /// missing parents.
+    ///
+    /// The point is the startup log next to it: nothing else in the node names
+    /// the directory this code DELETES from, so the one moment the cache takes
+    /// ownership of a path is the moment to say which path it is. Creating it
+    /// here is what makes that log a statement of fact rather than of intent,
+    /// and it is what turns "the root is a file" or "the root is not writable"
+    /// into a startup warning instead of a cache that silently never populates.
+    #[test]
+    fn with_root_creates_the_cache_directory_it_will_sweep() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("nested").join("webapp_cache");
+        assert!(
+            !root.exists(),
+            "premise: the root must be missing, or creating it proves nothing"
+        );
+
+        let cache = WebappCache::with_root(root.clone());
+
+        assert!(
+            root.is_dir(),
+            "with_root must create the directory (and its parents) it will \
+             unpack into and sweep"
+        );
+        assert_eq!(
+            cache.root(),
+            root.as_path(),
+            "and must still be rooted exactly where it was told"
+        );
+    }
+
+    /// A root that already exists as a FILE must not panic the server at
+    /// startup.
+    ///
+    /// This is one of the two shapes the eager `create_dir_all` exists to
+    /// surface (the other is an unwritable path). Both are operator
+    /// misconfigurations, and both leave the webapp cache non-functional, but
+    /// neither is fatal to the node: everything except web-contract serving is
+    /// unaffected, so the correct response is a warning naming the path, not a
+    /// refusal to start. A future `.expect()` here would take a node down over
+    /// a stray file.
+    #[test]
+    fn with_root_tolerates_a_root_that_is_not_a_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("webapp_cache");
+        std::fs::write(&root, b"not a directory").expect("seed a file at the root path");
+
+        let cache = WebappCache::with_root(root.clone());
+
+        assert_eq!(
+            cache.root(),
+            root.as_path(),
+            "construction must succeed and keep the configured root"
+        );
+        assert!(
+            root.is_file(),
+            "and must not have replaced the operator's file with a directory"
+        );
     }
 
     /// Boundary: a cache whose total is exactly the budget is left untouched.
