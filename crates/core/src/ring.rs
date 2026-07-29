@@ -4785,10 +4785,17 @@ impl Ring {
     /// first two, because a run that never matures and a contract with no
     /// attributed work both read as an absent entry.
     ///
-    /// `info!` rather than `debug!` deliberately: release builds compile
-    /// `debug!` out via `release_max_level_info`, and this has to be readable
-    /// on a release binary in the field. Volume is one line per axis per 60s
-    /// sweep, three orders of magnitude under the per-callsite rate limit.
+    /// `warn!`, not `info!` or `debug!`. Two constraints stack on the target
+    /// node: release builds compile `debug!` out via `release_max_level_info`,
+    /// AND that node persists nothing below WARN — its log directory holds only
+    /// `freenet.error.*.log` (WARN and above), journald carries only the
+    /// rate-limiter's `eprintln!` summaries, and an INFO probe found zero lines
+    /// in either sink. WARN is semantically wrong for a diagnostic and this is
+    /// why the build is measurement-only and never merged.
+    ///
+    /// Volume: at most `TOP_N` × 3 axes = 9 lines per 60s sweep, far under the
+    /// 30/s per-callsite rate limit, and small next to the ~2k WARN/hour the
+    /// node already emits.
     fn log_cost_gate_diag(
         &self,
         built: &[hosting::CostAxisPressure],
@@ -4811,7 +4818,7 @@ impl Ring {
                     0.0
                 };
                 let hosting_side = self.hosting_manager.cost_diag_entry(id);
-                tracing::info!(
+                tracing::warn!(
                     target: "freenet::cost_gate_diag",
                     axis = axis.axis,
                     instance = %id,
