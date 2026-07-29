@@ -751,10 +751,18 @@ async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
             // Bound the history (incl. the reversibility snapshot just
             // added), matching the node runtime's default retention.
             // Best-effort: the restore has already succeeded.
+            //
+            // The per-secret BYTE budget is deliberately not applied here,
+            // exactly as in `SecretsStore::restore_snapshot`: an operator
+            // running `snapshot-restore` is mid-recovery and often walking
+            // versions one at a time, so this is the worst moment to delete
+            // history — the budget could evict several older versions,
+            // including the one just restored from, as a side effect of the
+            // reversibility snapshot. Count tiers and `max_age` still apply.
             let snap_dir = snapshot_dir_for_encoded(&delegate_dir, &args.secret);
             thin_snapshots(
                 &snap_dir,
-                &RetentionPolicy::default(),
+                &RetentionPolicy::default().without_byte_budget(),
                 std::time::SystemTime::now(),
             );
             println!(
@@ -1494,6 +1502,66 @@ mod tests {
         let snap_dir = dir.path().join("D").join(".snapshots").join("S");
         let count = std::fs::read_dir(&snap_dir).unwrap().count();
         assert!(count >= 2, "expected reversibility snapshot, got {count}");
+    }
+
+    /// `snapshot-restore` must NOT apply the per-secret byte budget. An
+    /// operator running it is mid-recovery, often walking versions one at a
+    /// time, so this is the worst moment to garbage-collect: with the budget
+    /// applied, the reversibility snapshot the restore itself adds would push
+    /// an already-over-budget history over the limit and evict older
+    /// versions, including the one just restored FROM.
+    #[tokio::test]
+    async fn snapshot_restore_does_not_apply_byte_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            - 60_000;
+        // Four 1 MiB snapshots: 4 MiB of history against the 3 MiB default
+        // budget, so applying the budget here would visibly evict.
+        const MIB: usize = 1024 * 1024;
+        seed_snapshot(
+            dir.path(),
+            "D",
+            "S",
+            b"current",
+            now_ms - 4000,
+            &vec![1u8; MIB],
+        );
+        let snap_dir = dir.path().join("D").join(".snapshots").join("S");
+        for (i, stamp) in [now_ms - 3000, now_ms - 2000, now_ms - 1000]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(
+                snap_dir.join(format!("{stamp:020}")),
+                vec![2u8 + i as u8; MIB],
+            )
+            .unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&snap_dir).unwrap().count(), 4);
+
+        snapshot_restore(restore_args(dir.path(), "D", "S", now_ms - 4000, true))
+            .await
+            .expect("restore must succeed");
+
+        // 4 seeded + 1 reversibility snapshot, none evicted.
+        assert_eq!(
+            std::fs::read_dir(&snap_dir).unwrap().count(),
+            5,
+            "restore must not evict history for the byte budget"
+        );
+        // The snapshot restored FROM is still there, so the operator can keep
+        // walking versions.
+        assert!(
+            snap_dir.join(format!("{:020}", now_ms - 4000)).exists(),
+            "the snapshot just restored from must survive"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("D").join("S")).unwrap(),
+            vec![1u8; MIB]
+        );
     }
 
     #[tokio::test]
