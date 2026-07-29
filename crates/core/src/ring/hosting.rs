@@ -679,7 +679,8 @@ impl HostingManager {
         // checks projected disk against THIS value (the aggregate bound), not the
         // effective floor installed on the cache below.
         self.disk_budget_bytes.store(disk_budget, Ordering::Relaxed);
-        self.log_disk_budget_transition(&stats, disk_budget);
+        // Return value is only for the edge-behavior test; the sweep just logs.
+        let _logged = self.log_disk_budget_transition(&stats, disk_budget);
         let effective = ram.min(disk_budget);
         // O(1) under the cache write lock; the expensive du-walk already ran
         // OUTSIDE any lock before this call.
@@ -702,10 +703,14 @@ impl HostingManager {
     ///
     /// Edge-triggered via a stored flag, so a node that sits over budget logs
     /// once, not once per 60s sweep forever.
-    fn log_disk_budget_transition(&self, stats: &DiskUsageStats, disk_budget: u64) {
+    ///
+    /// Returns whether this call logged a transition, so the edge behavior is
+    /// assertable (a flag that stuck would silence the signal permanently, which
+    /// looks exactly like a healthy node).
+    fn log_disk_budget_transition(&self, stats: &DiskUsageStats, disk_budget: u64) -> bool {
         let over = stats.total_bytes > disk_budget;
         if self.over_disk_budget.swap(over, Ordering::Relaxed) == over {
-            return;
+            return false;
         }
         // `db_file_bytes − state_bytes` is the database's dead space: bytes the
         // file holds that no live row accounts for.
@@ -731,6 +736,7 @@ impl HostingManager {
                 "aggregate on-disk usage is back under the disk budget"
             );
         }
+        true
     }
 
     /// Pre-write admission gate for a state write (#4683, live since #4702): reject the write
@@ -7341,6 +7347,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The over-budget signal fires on the EDGE, in both directions, and only on
+    /// the edge (#5007).
+    ///
+    /// This is the operable signal for the one state where the honest aggregate
+    /// can hurt: a node whose database dead space alone exceeds its budget
+    /// refuses fresh PUTs and cannot evict its way out, because freeing rows
+    /// returns pages to redb for reuse without shrinking the file. Only a
+    /// restart's compaction (#5005) clears it. Two ways to lose that signal, both
+    /// covered here: a flag that never clears (the recovery is never announced
+    /// and the next episode is silent) and a flag that never sets (60s of log
+    /// spam, which gets muted and then ignored).
+    #[test]
+    fn over_disk_budget_is_logged_on_the_edge_only() {
+        let manager = HostingManager::new(1024 * 1024 * 1024);
+        let over = DiskUsageStats {
+            state_bytes: 100,
+            db_file_bytes: 900,
+            wasm_bytes: 0,
+            compile_cache_bytes: 0,
+            webapp_cache_bytes: 0,
+            total_bytes: 900,
+        };
+        let under = DiskUsageStats {
+            total_bytes: 400,
+            ..over
+        };
+
+        // Starting state is "under", so an under-budget recompute says nothing.
+        assert!(
+            !manager.log_disk_budget_transition(&under, 500),
+            "no transition on the first under-budget observation"
+        );
+        // Crossing over logs once...
+        assert!(
+            manager.log_disk_budget_transition(&over, 500),
+            "crossing over budget must announce itself"
+        );
+        // ...and staying over stays quiet, however many sweeps run.
+        for _ in 0..5 {
+            assert!(
+                !manager.log_disk_budget_transition(&over, 500),
+                "a node parked over budget must not re-log every sweep"
+            );
+        }
+        // Coming back under logs the recovery, once.
+        assert!(
+            manager.log_disk_budget_transition(&under, 500),
+            "returning under budget must announce itself"
+        );
+        assert!(!manager.log_disk_budget_transition(&under, 500));
+
+        // The boundary matches the admission gate's inclusive-admit rule:
+        // `total == budget` is not over.
+        let exactly = DiskUsageStats {
+            total_bytes: 500,
+            ..over
+        };
+        assert!(
+            !manager.log_disk_budget_transition(&exactly, 500),
+            "total == budget is within budget, same as the admission gate"
+        );
     }
 
     /// Call-site pin: the 60s sweep's disk-usage refresh must re-measure the
