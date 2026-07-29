@@ -122,12 +122,6 @@ pub(crate) use hosting::hosting_budget_for_ram;
 /// types, and the shadow-mode set-membership comparator) so the node layer can
 /// build inputs and run the shadow compare (keystone step-2, #4642).
 pub(crate) use hosting::reconcile;
-/// Start-time estimate of the aggregate disk budget (#5014), for consumers that
-/// must size themselves before the disk tracker exists — today the wasmtime
-/// on-disk compile-cache soft limit
-/// (`wasm_runtime::default_wasmtime_cache_size_bytes`), which is charged against
-/// this budget and so must be bounded by it.
-pub(crate) use hosting::startup_disk_budget_estimate;
 pub use hosting::{AccessType, RecordAccessResult};
 /// Aggregate disk-budget defaults (#4683). `config` resolves the persisted
 /// `hosting-disk-pct` / `max-hosting-disk` defaults from these so the operator-
@@ -136,6 +130,14 @@ pub(crate) use hosting::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTE
 /// Clamp bounds re-exported only for the config-default round-trip test.
 #[cfg(test)]
 pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
+/// Start-time estimate of the aggregate disk budget (#5014), for consumers that
+/// must size themselves before the disk tracker exists — today the wasmtime
+/// on-disk compile-cache soft limit
+/// (`wasm_runtime::default_wasmtime_cache_size_bytes`), which is charged against
+/// this budget and so must be bounded by it — plus the startup prune that
+/// enforces the freshly-resolved limit against a cache written under an older,
+/// larger one.
+pub(crate) use hosting::{prune_compile_cache_to_limit, startup_disk_budget_estimate};
 pub mod interest;
 mod live_tx;
 mod location;

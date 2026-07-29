@@ -1286,13 +1286,16 @@ mod executor_pin_tests {
     #[test]
     fn from_config_with_shared_modules_wires_offload_and_budget() {
         let src = include_str!("runtime.rs");
+        // `split_once` (not `split(..).next()`, whose `expect` can never fire) so
+        // a reworded end marker fails loudly instead of silently widening the
+        // region to end-of-file, `mod tests` included.
         let body = src
-            .split("pub(crate) async fn from_config_with_shared_modules(")
-            .nth(1)
+            .split_once("pub(crate) async fn from_config_with_shared_modules(")
             .expect("from_config_with_shared_modules must exist")
-            .split("\n    pub async fn preload(")
-            .next()
-            .expect("end of from_config_with_shared_modules");
+            .1
+            .split_once("\n    pub async fn preload(")
+            .expect("end marker of from_config_with_shared_modules must exist")
+            .0;
         assert!(
             body.contains("offload_compilation: production_offload_compilation()"),
             "must set offload_compilation from the production gate"
@@ -1331,7 +1334,8 @@ mod executor_pin_tests {
     }
 
     /// Pin: `RuntimePool::new` MUST resolve the wasmtime on-disk compile-cache
-    /// soft limit from the DISK signal, and must resolve it exactly once.
+    /// soft limit from the DISK signal, prune an already-oversized cache down to
+    /// it, and thread the resolved value into every executor it builds.
     ///
     /// This is the wiring the #5014 fix lives in, and it is invisible to every
     /// unit test of the pure math: `default_wasmtime_cache_size_bytes` could be
@@ -1339,55 +1343,140 @@ mod executor_pin_tests {
     /// wrong knobs, and nothing else in the tree would notice. The needles are
     /// assembled from `concat!` fragments that appear nowhere verbatim in
     /// `pool.rs`, so the pin cannot match its own source through `include_str!`.
+    ///
+    /// Region delimiters use `split_once(..).expect(..)` rather than
+    /// `split(..).next()`: the latter is `Some` unconditionally, so its `expect`
+    /// can never fire and a reworded end marker would silently widen the region
+    /// to end-of-file (including `mod tests`) while the assertions kept passing
+    /// for the wrong reason.
     #[test]
     fn runtime_pool_resolves_compile_cache_limit_from_the_disk_signal() {
         let src = include_str!("runtime/pool.rs");
         let body = src
-            .split("pub async fn new(")
-            .nth(1)
+            .split_once("pub async fn new(")
             .expect("RuntimePool::new must exist")
-            .split("\n    /// Get the current health status")
-            .next()
-            .expect("end of RuntimePool::new");
+            .1
+            .split_once("\n    /// Get the current health status")
+            .expect("end marker of RuntimePool::new must exist")
+            .0;
         // Whitespace-collapsed so a rustfmt re-wrap of the (multi-argument) call
         // cannot silently vacate the pin.
         let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(
-            collapsed.contains(concat!(
-                "let wasmtime_cache_size_bytes = ",
-                "crate::wasm_runtime::default_wasmtime_",
-                "cache_size_bytes("
-            )),
-            "the pool must resolve the compile-cache soft limit through the \
-             node-relative resolver"
+            collapsed.contains(concat!("crate::ring::startup_disk_", "budget_estimate(")),
+            "the pool must derive the aggregate disk budget from the filesystem \
+             before any executor exists — the tracker does not exist yet (#5014)"
         );
-        // The disk knobs are what make the bound a DISK bound. Passing the
-        // directories but not the operator's pct/cap (or vice versa) would
-        // silently fall back to a budget unrelated to this node's disk.
+        assert!(
+            collapsed.contains(concat!(
+                "let limit = crate::wasm_runtime::default_wasmtime_",
+                "cache_size_bytes(disk_budget)"
+            )),
+            "the compile-cache soft limit must be the resolver applied to THAT \
+             disk budget — passing anything else (a constant, the RAM term alone) \
+             restores the #5014 defect"
+        );
+        // The disk knobs are what make the bound a DISK bound. Binding the wrong
+        // config value to a name (or swapping the two dirs, which both type as
+        // `&Path` and so compile happily) would silently size the cache against a
+        // budget unrelated to this node's disk, so pin the bindings themselves and
+        // then the ORDER in which they reach the estimate.
         for needle in [
-            concat!("&config.contracts", "_dir()"),
-            concat!("&config.wasmtime_", "cache_dir()"),
-            concat!("config.hosting_", "disk_pct"),
-            concat!("config.max_hosting", "_disk"),
+            concat!("let contracts_dir = config.contracts", "_dir();"),
+            concat!("let compile_cache_dir = config.wasmtime_", "cache_dir();"),
+            concat!("let hosting_disk_pct = config.hosting_", "disk_pct;"),
+            concat!("let max_hosting_disk = config.max_hosting", "_disk;"),
         ] {
             assert!(
                 collapsed.contains(needle),
-                "RuntimePool::new must pass `{needle}` to the compile-cache \
+                "RuntimePool::new must bind `{needle}` for the compile-cache \
                  resolver — without it the limit stops tracking this node's disk \
                  budget (#5014)"
             );
         }
-        // Exactly once: the resolver walks the contracts dir, walks the compile
-        // cache dir, and statvfs's the mount. A second call inside `new` would
-        // mean re-measuring per executor, which both wastes startup I/O and
-        // samples a cache dir the first executor has begun writing into.
+        for needle in [
+            "&contracts_dir, &compile_cache_dir",
+            "hosting_disk_pct, max_hosting_disk",
+        ] {
+            assert!(
+                collapsed.contains(needle),
+                "the estimate's arguments must stay in order (`{needle}`): both \
+                 dirs are `&Path`, so a swap compiles and silently measures the \
+                 wrong trees"
+            );
+        }
+        // Lowering the limit does not shrink an existing cache — wasmtime reads it
+        // only on its write-path cleanup, behind an hourly lock — so without this
+        // prune the fix bounds future starts and leaves an already-wedged node
+        // wedged (#5014). It must run against the cache dir and the freshly
+        // resolved limit.
+        assert!(
+            collapsed.contains(concat!(
+                "crate::ring::prune_compile_",
+                "cache_to_limit( &compile_cache_dir, limit )"
+            )) || collapsed.contains(concat!(
+                "crate::ring::prune_compile_",
+                "cache_to_limit(&compile_cache_dir, limit)"
+            )),
+            "the pool must prune an already-oversized compile cache down to the \
+             freshly resolved limit, before the first `Cache::new`"
+        );
+        // Exactly one CALL SITE inside `new`. This is a textual count, so it does
+        // not by itself prove a single runtime invocation — the positional
+        // assertion below is what rules out the case that actually matters
+        // (re-resolving per executor). What the count buys is that a second,
+        // divergent resolution cannot be added without the pin noticing.
         assert_eq!(
             collapsed
                 .matches(concat!("default_wasmtime_", "cache_size_bytes("))
                 .count(),
             1,
-            "the compile-cache soft limit must be resolved exactly once per pool"
+            "the compile-cache soft limit must have exactly one call site in `new`"
+        );
+        // Position: the resolution must precede the FIRST executor construction.
+        // Moving it inside the `for i in 1..pool_size` loop keeps the textual
+        // count at 1 while re-walking the mount once per executor and re-sampling
+        // a cache dir the first engine has begun writing into — the very defect
+        // the count assertion reads as if it prevents.
+        let resolved_at = collapsed
+            .find(concat!("crate::ring::startup_disk_", "budget_estimate("))
+            .expect("estimate call must exist");
+        let first_executor_at = collapsed
+            .find("from_config_with_shared_modules(")
+            .expect("RuntimePool::new must build executors");
+        assert!(
+            resolved_at < first_executor_at,
+            "the disk budget must be resolved BEFORE the first executor is built: \
+             wasmtime fixes the soft limit at `Cache::new` inside that call, and a \
+             later resolution would be both inert and measured against a cache dir \
+             the engine has started writing into"
+        );
+
+        // THE load-bearing wiring edge: the resolved value must actually reach the
+        // executor constructor. Everything above can hold while this argument is a
+        // constant — the value would still be resolved, still logged, still stored
+        // on the pool struct, and the whole #5014 fix inert on every host with a
+        // fully green suite. The first call site is the one that creates the
+        // engine (and so fixes wasmtime's soft limit); the second must agree with
+        // it, since a divergence there is a silent per-executor difference.
+        let threaded = "shared_contract_index.clone(), wasmtime_cache_size_bytes";
+        assert_eq!(
+            collapsed
+                .matches("from_config_with_shared_modules(")
+                .count(),
+            2,
+            "RuntimePool::new is expected to build exactly two executor shapes \
+             (the engine-creating first one and the shared-backend rest); a third \
+             call site would be unpinned by the assertion below"
+        );
+        assert_eq!(
+            collapsed.matches(threaded).count(),
+            2,
+            "every executor `RuntimePool::new` builds must receive the RESOLVED \
+             compile-cache soft limit as its last argument — a constant there \
+             leaves the value resolved, logged and stored while the bound never \
+             reaches wasmtime (#5014)"
         );
 
         // Third call site: a replacement executor must reuse the pool's resolved
@@ -1395,12 +1484,12 @@ mod executor_pin_tests {
         // engine has been filling, and the engine's soft limit was fixed at
         // startup anyway — so a fresh measurement would be both wrong and inert.
         let replacement = src
-            .split("async fn create_replacement_executor(")
-            .nth(1)
+            .split_once("async fn create_replacement_executor(")
             .expect("create_replacement_executor must exist")
-            .split("\n    /// Return an executor to the pool, replacing it")
-            .next()
-            .expect("end of create_replacement_executor");
+            .1
+            .split_once("\n    /// Return an executor to the pool, replacing it")
+            .expect("end marker of create_replacement_executor must exist")
+            .0;
         let replacement = replacement.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             replacement.contains(concat!("self.wasmtime_", "cache_size_bytes")),
@@ -1419,17 +1508,22 @@ mod executor_pin_tests {
     fn runtime_pool_sizes_caches_by_byte_budget() {
         // RuntimePool::new lives in runtime/pool.rs after the split.
         let src = include_str!("runtime/pool.rs");
+        // Bounded by `new`'s end marker rather than by a fixed chunk count: the
+        // count version silently stopped covering the cache construction as soon
+        // as anything was added to the preamble, which is a pin that fails for a
+        // reason unrelated to what it guards. `split_once` (not `split(..).next()`,
+        // whose `expect` can never fire) so a reworded marker fails loudly instead
+        // of widening the region to end-of-file, `mod tests` included.
         let body = src
-            .split("pub async fn new(")
-            .nth(1)
+            .split_once("pub async fn new(")
             .expect("RuntimePool::new must exist")
-            // Take the first chunk of the function body. Whitespace is collapsed
-            // so the assertions below survive line-wrapping / reformatting of the
-            // (now multi-line, metrics-threaded, interest-predicate-threaded)
-            // cache construction.
-            .split("\n    ")
-            .take(110)
-            .collect::<String>()
+            .1
+            .split_once("\n    /// Get the current health status")
+            .expect("end marker of RuntimePool::new must exist")
+            .0
+            // Whitespace is collapsed so the assertions below survive
+            // line-wrapping / reformatting of the (now multi-line,
+            // metrics-threaded, interest-predicate-threaded) cache construction.
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");

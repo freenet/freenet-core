@@ -304,7 +304,7 @@ impl RuntimePool {
         // Resolved exactly once here, before any executor exists, because:
         //   * wasmtime fixes the limit at `Cache::new` (reached from the FIRST
         //     executor's `create_backend_engine`) and never re-reads it, and
-        //   * the resolver measures the data-dir mount — the contracts dir, the
+        //   * the estimate measures the data-dir mount — the contracts dir, the
         //     compile-cache dir, and free space — which is both wasteful to
         //     repeat `pool_size` times and wrong to re-sample once the first
         //     executor's engine has started writing into that cache dir.
@@ -314,17 +314,51 @@ impl RuntimePool {
         // hosting sweep cannot reclaim compile-cache bytes — so a RAM-derived
         // bound left a disk-tight, RAM-rich host able to wedge its own admission
         // gate (#5014).
-        // The two `du` walks and the `statvfs` are synchronous, but this is node
-        // startup: it runs once, before any executor exists or any request can
-        // arrive, immediately after the (also synchronous) ReDb open above.
-        let wasmtime_cache_size_bytes = crate::wasm_runtime::default_wasmtime_cache_size_bytes(
-            &config.contracts_dir(),
-            &config.wasmtime_cache_dir(),
-            config.hosting_disk_pct,
-            config.max_hosting_disk,
-        );
+        //
+        // The disk budget is estimated HERE rather than inside the resolver so
+        // that `wasm_runtime` needs no `ring` dependency: the hosting knobs are
+        // ring's, and the pool already passes these same four values to
+        // `Ring::set_hosting_disk_paths` (see `contract/handler.rs`).
+        //
+        // On `spawn_blocking`: two `du` walks, a `statvfs`, and (only when the
+        // existing cache is oversized) a bounded set of `remove_file`s. The
+        // identical walks in the 60s sweep are pushed onto a blocking thread for
+        // exactly this reason — `contracts_dir` is unbounded and non-self-pruning
+        // — and although this runs at startup, the session actor, the result
+        // router and the Ring background loops are already spawned, so it must
+        // not sit on the reactor either.
+        let contracts_dir = config.contracts_dir();
+        let compile_cache_dir = config.wasmtime_cache_dir();
+        let hosting_disk_pct = config.hosting_disk_pct;
+        let max_hosting_disk = config.max_hosting_disk;
+        let (startup_disk_budget, wasmtime_cache_size_bytes, compile_cache_reclaimed_bytes) =
+            tokio::task::spawn_blocking(move || {
+                let disk_budget = crate::ring::startup_disk_budget_estimate(
+                    &contracts_dir,
+                    &compile_cache_dir,
+                    hosting_disk_pct,
+                    max_hosting_disk,
+                );
+                let limit = crate::wasm_runtime::default_wasmtime_cache_size_bytes(disk_budget);
+                // Lowering the soft limit does NOT shrink an existing cache:
+                // wasmtime reads the limit only in its cleanup pass, that pass is
+                // reachable only from the cache-WRITE path, and it is gated behind
+                // a once-per-hour lock. A node with a stable contract-blob set
+                // performs only cache hits after a restart, so a cache written
+                // under an older, larger limit would persist indefinitely — and on
+                // the wedged node from #5014 that is self-sustaining, since a node
+                // whose admission gate is rejecting cannot take on the new
+                // contracts whose compiles would trigger a cleanup. Prune it here,
+                // before the first `Cache::new`, so a restart is a real remedy.
+                let reclaimed =
+                    crate::ring::prune_compile_cache_to_limit(&compile_cache_dir, limit);
+                (disk_budget, limit, reclaimed)
+            })
+            .await?;
         tracing::info!(
             wasmtime_cache_size_bytes,
+            startup_disk_budget_bytes = startup_disk_budget,
+            compile_cache_reclaimed_bytes,
             "Resolved wasmtime on-disk compile-cache soft limit"
         );
 
