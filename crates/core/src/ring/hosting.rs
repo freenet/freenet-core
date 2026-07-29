@@ -67,7 +67,9 @@ pub use cache::{AccessType, EvictedInUseTeardown, RecordAccessResult};
 /// eviction, #4861). Re-exported so `Ring` (which reads the topology meter)
 /// can build the per-axis snapshots the sweep consumes; the policy constants
 /// and the shared axis assembly live beside the decision in `cache.rs`.
-pub(crate) use cache::{COST_RATE_MIN_WINDOW, CostAxisPressure, build_cost_axes};
+pub(crate) use cache::{
+    COST_RATE_MIN_WINDOW, COST_SHARE_THRESHOLD, CostAxisPressure, build_cost_axes,
+};
 /// Aggregate disk-budget sizing defaults + pure clamp math (#4683). Re-exported
 /// so `config` can resolve the persisted `hosting-disk-pct` / `max-hosting-disk`
 /// defaults and `ring`/`HostingManager` can size the eviction floor.
@@ -2402,6 +2404,24 @@ impl HostingManager {
     #[cfg(test)]
     pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
         self.hosting_cache.read().has_local_client_access(key)
+    }
+
+    /// DIAGNOSTIC (#5040): the hosting-side cost-eviction gate inputs for one
+    /// contract, by instance id. `None` when this node does not host it (the
+    /// meter attributes work to contracts this node executed for, which is not
+    /// the same set as the contracts it hosts).
+    ///
+    /// Returns `(local_subs, downstream_subs, last_genuine_access_age,
+    /// local_client_access_age)`.
+    pub(crate) fn cost_diag_entry(
+        &self,
+        id: &freenet_stdlib::prelude::ContractInstanceId,
+    ) -> Option<(usize, usize, Option<Duration>, Option<Duration>)> {
+        // The cache read guard is released at the end of this statement, before
+        // `local_and_downstream_counts` touches the subscription DashMaps.
+        let (key, last_genuine, local_client) = self.hosting_cache.read().cost_diag_lookup(id)?;
+        let (local, downstream) = self.local_and_downstream_counts(&key);
+        Some((local, downstream, last_genuine, local_client))
     }
 
     /// Whether a local client GET or PUT touched this contract within the renewal

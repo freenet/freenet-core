@@ -296,6 +296,53 @@ impl Meter {
         results
     }
 
+    /// DIAGNOSTIC (#5040): the same per-contract scan as
+    /// [`Self::contract_cost_rates_multi`], but WITHOUT the sustained-run
+    /// filter, reporting each contract's raw windowed rate alongside the length
+    /// of its current above-floor run.
+    ///
+    /// The candidacy map alone cannot distinguish "the meter attributed nothing
+    /// to this contract" from "it is burning CPU but its above-floor run keeps
+    /// gap-resetting, so it never reaches `min_window / 2`". Both read as an
+    /// absent entry (hence a 0.0 rate at the decision site), and they have
+    /// opposite fixes, so the field measurement needs them separated.
+    ///
+    /// Sorted by rate descending. Read once per 60s sweep, off any hot path.
+    pub(crate) fn contract_cost_diag(
+        &self,
+        resources: &[ResourceType],
+        at_time: Instant,
+        min_window: Duration,
+    ) -> Vec<Vec<(ContractInstanceId, f64, Duration)>> {
+        let mut results: Vec<Vec<(ContractInstanceId, f64, Duration)>> =
+            resources.iter().map(|_| Vec::new()).collect();
+        if resources.is_empty() {
+            return results;
+        }
+        for entry in self.attribution_meters.iter() {
+            let AttributionSource::Contract(id) = entry.key() else {
+                continue;
+            };
+            let source_map = &entry.value().map;
+            for (i, resource) in resources.iter().enumerate() {
+                let Some(avg) = source_map.get(resource) else {
+                    continue;
+                };
+                let Some(windowed) = avg.windowed_rate(at_time, min_window) else {
+                    continue;
+                };
+                let per_second = windowed.rate.per_second();
+                if per_second > 0.0 {
+                    results[i].push((*id, per_second, windowed.activity_span));
+                }
+            }
+        }
+        for axis in results.iter_mut() {
+            axis.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        results
+    }
+
     /// Estimates the usage rate for a given resource type based on existing data.
     ///
     /// This function calculates the estimated usage rate by taking the 50th percentile value (or another

@@ -4758,11 +4758,85 @@ impl Ring {
         ];
         let topo = self.connection_manager.topology_manager.read();
         let mut rates = topo.contract_cost_rates_multi(&axes, now, hosting::COST_RATE_MIN_WINDOW);
+        // DIAGNOSTIC (#5040): the unfiltered companion read, taken under the
+        // SAME lock acquisition so it describes the same instant as the
+        // candidacy map it is being compared against.
+        let diag = topo.contract_cost_diag(&axes, now, hosting::COST_RATE_MIN_WINDOW);
         drop(topo);
         let messages = rates.pop().expect("three axis results");
         let fanout_bytes = rates.pop().expect("three axis results");
         let cpu = rates.pop().expect("three axis results");
-        hosting::build_cost_axes(cpu, fanout_bytes, messages)
+        let built = hosting::build_cost_axes(cpu, fanout_bytes, messages);
+        self.log_cost_gate_diag(&built, &diag);
+        built
+    }
+
+    /// DIAGNOSTIC (#5040): report, once per sweep per axis, WHY the top
+    /// attributed-cost contracts were or were not cost-eviction candidates.
+    ///
+    /// `#5040` observed a contract holding 86-99% of this node's attributed
+    /// exec-CPU being shed only 8 times in 3 days while dominating
+    /// continuously. Three gates could produce that, and they have different
+    /// fixes: the 300s `recently_accessed` veto refreshed by the GET/PUT that
+    /// re-hosts it; the meter's sustained-run requirement (its own rate must
+    /// stay above the axis floor for `min_window / 2`, and a >60s report gap
+    /// restarts the run), which bursty-but-relentless load may never satisfy;
+    /// or the axis simply never arming. The candidacy map cannot separate the
+    /// first two, because a run that never matures and a contract with no
+    /// attributed work both read as an absent entry.
+    ///
+    /// `info!` rather than `debug!` deliberately: release builds compile
+    /// `debug!` out via `release_max_level_info`, and this has to be readable
+    /// on a release binary in the field. Volume is one line per axis per 60s
+    /// sweep, three orders of magnitude under the per-callsite rate limit.
+    fn log_cost_gate_diag(
+        &self,
+        built: &[hosting::CostAxisPressure],
+        diag: &[Vec<(freenet_stdlib::prelude::ContractInstanceId, f64, Duration)>],
+    ) {
+        const TOP_N: usize = 3;
+        let sustained_needed = hosting::COST_RATE_MIN_WINDOW / 2;
+        for (axis, diag_axis) in built.iter().zip(diag.iter()) {
+            if diag_axis.is_empty() {
+                continue;
+            }
+            let armed = !axis.total_rate.is_nan() && axis.total_rate > axis.floor;
+            for (id, rate, activity_span) in diag_axis.iter().take(TOP_N) {
+                // Present in the candidacy map == the meter's sustained-run
+                // filter passed it through.
+                let sustained_ok = axis.rates.contains_key(id);
+                let share = if axis.total_rate > 0.0 {
+                    rate / axis.total_rate
+                } else {
+                    0.0
+                };
+                let hosting_side = self.hosting_manager.cost_diag_entry(id);
+                tracing::info!(
+                    target: "freenet::cost_gate_diag",
+                    axis = axis.axis,
+                    instance = %id,
+                    rate,
+                    share,
+                    node_total = axis.total_rate,
+                    floor = axis.floor,
+                    armed,
+                    over_share = share > hosting::COST_SHARE_THRESHOLD,
+                    sustained_ok,
+                    activity_span_secs = activity_span.as_secs(),
+                    sustained_needed_secs = sustained_needed.as_secs(),
+                    hosted = hosting_side.is_some(),
+                    local_subs = hosting_side.map(|h| h.0),
+                    downstream_subs = hosting_side.map(|h| h.1),
+                    genuine_access_age_secs = hosting_side
+                        .and_then(|h| h.2)
+                        .map(|d| d.as_secs()),
+                    local_client_age_secs = hosting_side
+                        .and_then(|h| h.3)
+                        .map(|d| d.as_secs()),
+                    "cost-gate diagnostic (#5040)"
+                );
+            }
+        }
     }
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================

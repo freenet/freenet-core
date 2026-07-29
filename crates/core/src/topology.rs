@@ -450,6 +450,24 @@ impl TopologyManager {
             .contract_cost_rates_multi(resources, now, min_window)
     }
 
+    /// DIAGNOSTIC (#5040): unfiltered companion to
+    /// [`Self::contract_cost_rates_multi`]. Delegates to
+    /// [`crate::topology::meter::Meter::contract_cost_diag`].
+    pub(crate) fn contract_cost_diag(
+        &self,
+        resources: &[ResourceType],
+        now: Instant,
+        min_window: std::time::Duration,
+    ) -> Vec<
+        Vec<(
+            freenet_stdlib::prelude::ContractInstanceId,
+            f64,
+            std::time::Duration,
+        )>,
+    > {
+        self.meter.contract_cost_diag(resources, now, min_window)
+    }
+
     /// Determine whether to add or remove connections based on current connection
     /// count and resource usage.
     ///

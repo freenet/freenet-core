@@ -1499,6 +1499,33 @@ impl<T: TimeSource> HostingCache<T> {
         }
     }
 
+    /// DIAGNOSTIC (#5040): the recency inputs to the cost-eviction candidacy
+    /// gate for one contract, looked up by INSTANCE id (the cost meter is keyed
+    /// by instance, this cache by full key).
+    ///
+    /// Returns `(key, last_genuine_access_age, local_client_access_age)`, both
+    /// ages `None` when never stamped. `recently_accessed` in
+    /// [`Self::evict_cost_pressure`] is derived from exactly these two, so
+    /// logging them says which clause (if either) is vetoing the shed.
+    pub fn cost_diag_lookup(
+        &self,
+        id: &freenet_stdlib::prelude::ContractInstanceId,
+    ) -> Option<(ContractKey, Option<Duration>, Option<Duration>)> {
+        let now = self.time_source.now();
+        self.contracts
+            .iter()
+            .find(|(k, _)| k.id() == id)
+            .map(|(k, e)| {
+                (
+                    *k,
+                    e.last_genuine_access
+                        .map(|t| now.saturating_duration_since(t)),
+                    e.local_client_last_access
+                        .map(|t| now.saturating_duration_since(t)),
+                )
+            })
+    }
+
     /// Check if a contract was accessed by a local client.
     pub fn has_local_client_access(&self, key: &ContractKey) -> bool {
         self.contracts
