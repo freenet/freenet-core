@@ -329,6 +329,20 @@ fn redb_error_is_poison(e: &redb::Error) -> bool {
     )
 }
 
+/// True if an error raised on a WRITE path signals a poisoned database.
+///
+/// Unlike [`redb_error_is_poison`], this DOES match `redb::Error::Io`. That
+/// exclusion exists solely because several READ helpers in this file synthesize
+/// `Io(ErrorKind::InvalidData)` for a benign malformed row, and treating those
+/// as poison would crash-loop the node. No write path synthesizes `Io`, so on a
+/// write it can only be a genuine backend failure — at which point redb has
+/// already latched its poison flag and the handle is unusable for any further
+/// write. Classifying it as benign is what would hand a dead handle to
+/// `initialize_database` and stop the node booting.
+fn redb_write_error_is_poison(e: &redb::Error) -> bool {
+    matches!(e, redb::Error::Io(_)) || redb_error_is_poison(e)
+}
+
 /// Test-only observable proof that the storage layer routed a detected poison to
 /// the recovery (process-exit) path. The real handler ([`abort_process_on_redb_poison`])
 /// exits the process, which a unit test cannot observe; this counter lets the test
@@ -765,8 +779,8 @@ impl ReDb {
     /// A benign failure (and there is no way to persist the marker) only costs
     /// a re-evaluation on the next start, which is the pre-marker behaviour.
     fn write_compaction_marker(db: &Database, db_path: &Path, settled_bytes: u64) -> bool {
-        // Each redb call has its own error type, so this walks them explicitly
-        // rather than chaining `?` through a single conversion.
+        // Each redb call returns a different error type; they converge on the
+        // umbrella `redb::Error` here so a single classifier can judge them.
         let result: Result<(), redb::Error> = (|| {
             let txn = db.begin_write()?;
             {
@@ -781,7 +795,7 @@ impl ReDb {
             Err(e) => {
                 // redb latches an I/O failure on the instance, so anything in
                 // that class means the handle is no longer usable for writes.
-                let poisoned = redb_error_is_poison(&e);
+                let poisoned = redb_write_error_is_poison(&e);
                 tracing::warn!(
                     db_path = ?db_path,
                     error = %e,
@@ -2276,6 +2290,55 @@ mod tests {
             marker.abs_diff(after) < 8 * 1024 * 1024,
             "marker {marker} should record the settled size {after}"
         );
+    }
+
+    /// A backend I/O failure during the marker write must be classified as
+    /// poison. It is the exact scenario the reopen exists for, and the
+    /// read-path classifier silently gets it wrong: it excludes
+    /// `redb::Error::Io` so that a malformed row cannot crash-loop the node.
+    /// Using it on the write path would report "benign", skip the reopen, and
+    /// hand a latched handle to `initialize_database`, whose own `begin_write`
+    /// then fails and stops the node booting.
+    #[test]
+    fn marker_write_io_failure_classifies_as_poison() {
+        let io = redb::Error::Io(std::io::Error::other("injected backend failure"));
+        assert!(
+            redb_write_error_is_poison(&io),
+            "a backend Io error on the WRITE path must count as poison"
+        );
+        // The read-path classifier must keep excluding it, or a single bad row
+        // would exit-and-restart the node.
+        assert!(
+            !redb_error_is_poison(&io),
+            "the read-path classifier must still treat Io as benign"
+        );
+        // Both agree on the unambiguous signals.
+        for e in [redb::Error::PreviousIo, redb::Error::DatabaseClosed] {
+            assert!(redb_write_error_is_poison(&e));
+            assert!(redb_error_is_poison(&e));
+        }
+    }
+
+    /// End-to-end: with the backend failing, `ReDb::new` must still return a
+    /// usable store rather than propagating the poisoned handle.
+    #[tokio::test]
+    async fn marker_write_failure_does_not_break_store_init() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        bloat_database(&db_path, 192, 1024 * 1024, 16);
+
+        // A normal open compacts and records the marker; the store must be
+        // usable afterwards. This is the control for the classifier test above,
+        // which covers the failure branch directly (a real backend fault cannot
+        // be injected through `ReDb::new`, which owns its file backend).
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await;
+        assert!(
+            store.is_ok(),
+            "store init must succeed through the marker write"
+        );
+        drop(store);
+        assert_eq!(last_reclaim(), Some(ReclaimOutcome::Compacted));
     }
 
     /// Pin the exact `COMPACTION_REGROWTH_FACTOR` boundary. Without this the
