@@ -370,7 +370,13 @@ async fn send_update_notification_absent_local_snapshot_does_not_warn() {
         "an ABSENT local snapshot must not WARN (nothing is owed locally); \
          captured: {logs:?}"
     );
-    // The condition is still observable, just at DEBUG.
+    // The condition remains observable at DEBUG *in debug builds only*.
+    // `release_max_level_info` (crates/core/Cargo.toml) compiles `debug!` out of
+    // release, so in a shipped binary the absent case is silent, not merely
+    // quiet. That is deliberate — it is the steady state and carries no operator
+    // action — but it means this assertion pins a line production does not
+    // emit, and a log grep can no longer tell "no subscriber registered" from
+    // "never reached". See #5040.
     assert!(
         logs.iter().any(|l| l.starts_with("DEBUG")
             && l.contains("no local subscriber")
@@ -565,8 +571,20 @@ async fn empty_shared_snapshot_warns_once_not_on_every_update() {
     let instance_id = *key.id();
 
     // Post-`retain` state: entry present, subscriber vec emptied in place.
+    //
+    // The summaries sibling is seeded NON-EMPTY on purpose. That is the shape
+    // the real cleanup leaves behind (the local failure path historically never
+    // pruned per-client summaries), and it is the shape that catches an
+    // orphaned summaries entry. Seeding an empty map instead makes the
+    // `!contains_key` assertion below pass no matter what the production code
+    // does, because a conditional `remove_if(.., is_empty)` would clear it
+    // anyway — a vacuous test that reports success without exercising the fix.
+    let dead_client = ClientId::next();
     shared_notifications.insert(instance_id, Vec::new());
-    shared_summaries.insert(instance_id, std::collections::HashMap::new());
+    shared_summaries.insert(
+        instance_id,
+        std::collections::HashMap::from([(dead_client, None)]),
+    );
 
     let (messages, guard) = install_log_capture();
 
@@ -685,5 +703,76 @@ async fn closed_subscriber_channel_drops_entry_at_point_of_loss() {
     assert!(
         !shared_summaries.contains_key(&instance_id),
         "the summaries sibling must be removed alongside it"
+    );
+}
+
+/// Regression for #5040 — the LOCAL-storage twin of the test above.
+///
+/// Review found the source fix had landed only on the shared branch while the
+/// comments and PR body claimed both. For the identical sequence the local
+/// branch emitted one extra WARN (the entry survived to the next update) and
+/// leaked the dead client's summary, because its channel-closed cleanup only
+/// ran `retain` — it never pruned `subscriber_summaries` and never dropped the
+/// emptied entry. The pooled executor is what production uses, but this branch
+/// is what the mock/simulation harness runs, so it was untested in both senses.
+#[cfg(feature = "trace")]
+#[tokio::test(flavor = "current_thread")]
+async fn closed_subscriber_channel_drops_entry_at_point_of_loss_local() {
+    let mut executor = create_executor().await;
+    let contract = test_contract(b"closed_channel_local_5040");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    // No shared storage installed, so this takes the local branch.
+    let client_id = ClientId::next();
+    let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    drop(rx);
+    executor
+        .update_notifications
+        .insert(instance_id, vec![(client_id, tx)]);
+    executor.subscriber_summaries.insert(
+        instance_id,
+        std::collections::HashMap::from([(client_id, None)]),
+    );
+
+    let (messages, guard) = install_log_capture();
+
+    for state in [vec![1u8, 1, 1], vec![2u8, 2, 2]] {
+        executor
+            .upsert_contract_state(
+                key,
+                either::Either::Left(WrappedState::new(state)),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .expect("store contract");
+    }
+
+    drop(guard);
+
+    let logs = messages.lock().unwrap();
+    assert_eq!(
+        logs.iter()
+            .filter(|l| l.starts_with("ERROR") && l.contains("channel closed"))
+            .count(),
+        1,
+        "a closed subscriber channel must be reported once as an ERROR on the \
+         local branch too; captured: {logs:?}"
+    );
+    assert!(
+        !logs
+            .iter()
+            .any(|l| l.starts_with("WARN") && l.contains("no subscriber snapshot")),
+        "the local branch must also drop the entry at the point of loss, leaving \
+         nothing for the next update to warn about; captured: {logs:?}"
+    );
+    assert!(
+        !executor.update_notifications.contains_key(&instance_id),
+        "the local subscriber entry must be removed as it empties"
+    );
+    assert!(
+        !executor.subscriber_summaries.contains_key(&instance_id),
+        "the local summaries sibling must be removed alongside it"
     );
 }

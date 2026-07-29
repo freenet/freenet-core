@@ -2430,15 +2430,28 @@ where
         let key = *key;
         let instance_id = *key.id();
 
+        // Set by the LOCAL fan-out arm when its channel-closed cleanup empties
+        // the subscriber vec. The removal itself has to happen after the
+        // if/else chain, because that arm holds `&mut` borrows of both maps for
+        // its whole body. The shared arm does the equivalent inline (it works
+        // through `Arc<DashMap>`, not `&mut self`), and leaves this false.
+        let mut local_entry_became_empty = false;
+
         if let (Some(shared_notifications), Some(shared_summaries)) = (
             self.shared_notifications.as_ref(),
             self.shared_summaries.as_ref(),
         ) {
-            // Snapshot subscribers and release the DashMap read-lock before sending
-            let notifiers_snapshot: Vec<(ClientId, mpsc::Sender<HostResult>)> =
+            // Snapshot subscribers and release the DashMap read-lock before sending.
+            // Kept as `Option` rather than collapsed to an empty Vec: ABSENT and
+            // PRESENT-but-EMPTY need different handling below, and distinguishing
+            // them here keeps the ABSENT path — the overwhelmingly common one —
+            // a pure READ. Collapsing first and re-deriving the distinction from
+            // a `remove_if` would take a shard WRITE lock on every committed
+            // update for every contract with no local subscriber.
+            let notifiers_snapshot: Option<Vec<(ClientId, mpsc::Sender<HostResult>)>> =
                 shared_notifications
                     .get(&instance_id)
-                    .map_or_else(Vec::new, |notifiers| notifiers.value().clone());
+                    .map(|notifiers| notifiers.value().clone());
 
             // #4681, re-scoped by #5040: an empty snapshot is TWO distinct
             // states, and only one of them is an anomaly.
@@ -2471,31 +2484,57 @@ where
             //   convention the interest/subscriber maps already use
             //   (`interest.rs`, `hosting.rs`: `remove_if(.., |_, v| v.is_empty())`).
             //
-            // `remove_if` re-checks emptiness under the map lock, so a
-            // subscriber registering between the snapshot above and this call is
-            // never removed.
-            if notifiers_snapshot.is_empty() {
-                let lost_subscriber_entry = shared_notifications
-                    .remove_if(&instance_id, |_, notifiers| notifiers.is_empty())
-                    .is_some();
-                if lost_subscriber_entry {
-                    shared_summaries.remove_if(&instance_id, |_, s| s.is_empty());
-                    tracing::warn!(
-                        %instance_id,
-                        registered_contracts = shared_notifications.len(),
-                        "send_update_notification: no subscriber snapshot for contract \
-                         (shared storage); update notification not delivered"
-                    );
-                } else {
+            // NOTE ON VISIBILITY: `debug!` is compiled OUT of release builds by
+            // `release_max_level_info` (see crates/core/Cargo.toml), so the
+            // ABSENT case below is deliberately INVISIBLE in production, not
+            // merely quieter. That is intended — it is the steady state and
+            // carries no operator action — but it does mean a log grep can no
+            // longer distinguish "no subscriber registered" from "never
+            // reached", which #4681 had relied on. See #5040.
+            let notifiers_snapshot = match notifiers_snapshot {
+                None => {
                     tracing::debug!(
                         %instance_id,
                         registered_contracts = shared_notifications.len(),
                         "send_update_notification: no local subscriber for contract \
                          (shared storage); nothing to deliver locally"
                     );
+                    return Ok(());
                 }
-                return Ok(());
-            }
+                Some(notifiers) if notifiers.is_empty() => {
+                    // Captured BEFORE the removal below, so the count describes
+                    // the moment of observation rather than the moment after
+                    // cleanup (which would undercount by exactly this entry).
+                    let registered_contracts = shared_notifications.len();
+                    // Gate the summaries removal on the notifications removal
+                    // actually happening: `remove_if` re-checks emptiness under
+                    // the shard lock, so if a client registered between the
+                    // snapshot above and here the entry is no longer empty, the
+                    // removal declines — and we must NOT then drop that new
+                    // client's summary. The next committed update serves them.
+                    if shared_notifications
+                        .remove_if(&instance_id, |_, notifiers| notifiers.is_empty())
+                        .is_some()
+                    {
+                        // Unconditional, NOT `remove_if(.., is_empty)`: with no
+                        // channels left under this key, every summary beneath it
+                        // belongs to a client that can no longer be notified. A
+                        // conditional removal would orphan exactly the realistic
+                        // case, because a summaries sibling is typically still
+                        // NON-empty at this point.
+                        shared_summaries.remove(&instance_id);
+                        tracing::warn!(
+                            %instance_id,
+                            registered_contracts,
+                            "send_update_notification: no subscriber snapshot for contract \
+                             (shared storage); stale entry dropped — the subscriber was \
+                             lost on an earlier update (see the prior channel-closed ERROR)"
+                        );
+                    }
+                    return Ok(());
+                }
+                Some(notifiers) => notifiers,
+            };
 
             let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> =
                 shared_summaries
@@ -2579,6 +2618,11 @@ where
                 if let Some(mut notifiers) = shared_notifications.get_mut(&instance_id) {
                     notifiers.retain(|(c, _)| !failures.contains(c));
                 }
+                if let Some(mut contract_summaries) = shared_summaries.get_mut(&instance_id) {
+                    for failed_client in &failures {
+                        contract_summaries.remove(failed_client);
+                    }
+                }
                 // Drop the entry AS it empties rather than leaving `Some([])`
                 // behind (#5040). The stale empty entry was otherwise pruned
                 // only opportunistically (by the next `RuntimePool::
@@ -2586,16 +2630,20 @@ where
                 // committed update re-warned on it and it inflated the
                 // `registered_contracts` count in that warning. The loss
                 // itself is already reported above, one ERROR per closed
-                // channel. Separate statement so the `get_mut` guard is
+                // channel. Separate statement so the `get_mut` guards above are
                 // released before `remove_if` takes the same shard lock.
-                shared_notifications.remove_if(&instance_id, |_, n| n.is_empty());
-
-                if let Some(mut contract_summaries) = shared_summaries.get_mut(&instance_id) {
-                    for failed_client in &failures {
-                        contract_summaries.remove(failed_client);
-                    }
+                //
+                // Same gating as the check-site arm: the summaries sibling is
+                // dropped only when the notifications removal actually happened
+                // (so a concurrently-registered client keeps its summary), and
+                // then unconditionally (any summary under a channel-less key is
+                // dead).
+                if shared_notifications
+                    .remove_if(&instance_id, |_, notifiers| notifiers.is_empty())
+                    .is_some()
+                {
+                    shared_summaries.remove(&instance_id);
                 }
-                shared_summaries.remove_if(&instance_id, |_, s| s.is_empty());
 
                 // Decrement per-client subscription counters for failed clients
                 if let Some(shared_client_counts) = &self.shared_client_counts {
@@ -2695,6 +2743,17 @@ where
 
             if !failures.is_empty() {
                 notifiers.retain(|(c, _)| !failures.contains(c));
+                // Prune the dead clients' summaries too, mirroring the shared
+                // arm. Without this the local path leaked one summary per lost
+                // subscriber until that client's `remove_client` ran (#5040
+                // review): the shared arm did it, the local arm did not, while
+                // the comments claimed the two mirrored each other.
+                for failed_client in &failures {
+                    summaries.remove(failed_client);
+                }
+                // Defer the map-level removal: `notifiers` and `summaries` are
+                // live `&mut` borrows here. See the flag's declaration.
+                local_entry_became_empty = notifiers.is_empty();
                 // Decrement per-client subscription counters for failed clients
                 for failed_client in &failures {
                     if let Some(count) = self.client_subscription_counts.get_mut(failed_client) {
@@ -2736,6 +2795,19 @@ where
                      (local storage); nothing to deliver locally"
                 );
             }
+        }
+
+        // Deferred local-arm cleanup (see the flag's declaration): drop the
+        // entry AS it empties, so no later update finds a stale empty vec to
+        // warn about. This is the local counterpart of the shared arm's
+        // in-place removal; without it the local path relied entirely on the
+        // check-site backstop and warned once more than the shared path for the
+        // identical sequence (#5040 review). Both maps go together — the local
+        // fan-out arm indexes `subscriber_summaries` on the strength of
+        // `update_notifications` having an entry.
+        if local_entry_became_empty {
+            self.update_notifications.remove(&instance_id);
+            self.subscriber_summaries.remove(&instance_id);
         }
         Ok(())
     }
