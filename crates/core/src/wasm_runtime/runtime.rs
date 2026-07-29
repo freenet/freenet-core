@@ -209,7 +209,111 @@ pub struct RuntimeConfig {
     /// Soft size limit (bytes) for the wasmtime compile cache (#4683). `Some`
     /// overrides wasmtime's 512 MiB default via
     /// `CacheConfig::with_files_total_size_soft_limit`; `None` keeps the default.
+    /// Production resolves it from
+    /// [`default_wasmtime_cache_size_bytes`], which scales it to the memory the
+    /// node may use instead of pinning a flat constant.
     pub wasmtime_cache_size_bytes: Option<u64>,
+}
+
+/// Lower clamp for the node-relative wasmtime **on-disk compile cache** soft
+/// limit (128 MiB).
+///
+/// The trade-off this floor encodes: disk is the cheap resource here and CPU is
+/// the expensive one. Every miss in this cache is a Cranelift recompile, which
+/// runs on — and stalls — the single-threaded contract loop (the #4441 failure
+/// mode), and a cold node with no usable compile cache pays that for *every*
+/// contract it touches after each restart. A compiled artifact measures roughly
+/// 0.7-1.5 MiB (measured by
+/// `wasm_runtime::tests::cache::test_compiled_module_size_is_in_expected_range`),
+/// so 128 MiB still keeps ~85-180 modules warm across restarts. Trimming further
+/// would reclaim a few tens of MiB of disk and buy recompiles with it — the
+/// wrong trade.
+///
+/// The floor deliberately binds hardest where the recompile cost is worst: a
+/// small host also gets the smallest **in-memory** module cache
+/// (`MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES`, 64 MiB), so it evicts compiled
+/// modules from RAM more often and leans on this on-disk cache *more* than a
+/// large host does. It is set equal to the hosting budget's own floor
+/// (`MIN_DEFAULT_HOSTING_BUDGET_BYTES`, also 128 MiB) so the two on-disk
+/// allowances stay consistent: the smallest node the code contemplates gets the
+/// same floor for the state it hosts and for the compiled code that serves it.
+pub(crate) const MIN_WASMTIME_CACHE_SIZE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Upper clamp for the node-relative wasmtime on-disk compile cache soft limit
+/// (512 MiB).
+///
+/// Equal to the historical flat value (wasmtime's own default, which #4683
+/// pinned explicitly) ON PURPOSE, mirroring the rationale on
+/// `MAX_DEFAULT_HOSTING_BUDGET_BYTES`: a host with ample memory (>= 4 GiB at the
+/// current divisor) resolves to exactly the previous 512 MiB and sees NO change.
+/// That makes this a pure "small and containerized nodes get less" change rather
+/// than a cache *increase* for anyone — a production gateway keeps the ceiling
+/// it has been running with, so nothing about the large-host recompile profile
+/// moves and the change carries no new disk commitment to validate in the field.
+pub(crate) const MAX_WASMTIME_CACHE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Fraction of the memory the node may use that sizes the on-disk compile
+/// cache: 1/8.
+///
+/// The same divisor the node already applies to its hosted-state budget
+/// (`ring::hosting::cache::DEFAULT_HOSTING_BUDGET_RAM_DIVISOR`) and to its
+/// in-memory module cache (`module_cache::DEFAULT_MODULE_CACHE_RAM_DIVISOR`), so
+/// the node keeps ONE story for how it splits its capability into budgets
+/// instead of three unrelated fractions.
+///
+/// Why a memory signal sizes a *disk* cache: the useful size of this cache is
+/// set by how many distinct contracts the node executes, and that population is
+/// exactly what the RAM-scaled hosting budget already bounds. Sharing the
+/// divisor makes the relationship exact instead of coincidental — with the same
+/// divisor, the same floor, and a strictly lower ceiling, the compile cache can
+/// never exceed the state budget it accelerates (pinned by
+/// `compile_cache_never_exceeds_hosting_state_budget`). That is precisely the
+/// defect this replaced: on a peer under a 2 GiB cgroup the flat 512 MiB limit
+/// let the compile cache reach ~306 MB while that node's ENTIRE contract-state
+/// budget was 256 MiB.
+const WASMTIME_CACHE_RAM_DIVISOR: u64 = 8;
+
+/// Fallback "memory the node may use" estimate (1 GiB) when the OS query fails.
+///
+/// Mirrors the module cache's and the hosting budget's fallback. At 1 GiB the
+/// divisor lands exactly on [`MIN_WASMTIME_CACHE_SIZE_BYTES`], so a host whose
+/// capability we cannot read gets the smallest sane cache rather than the
+/// largest.
+const WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Default soft size limit for the wasmtime **on-disk compile cache**, scaled to
+/// the memory the node may use (host RAM, or a smaller cgroup limit when
+/// containerized — see [`read_total_ram_bytes`](super::read_total_ram_bytes))
+/// and clamped to a sane floor/ceiling.
+///
+/// Returns `clamp(total_ram / WASMTIME_CACHE_RAM_DIVISOR,
+/// MIN_WASMTIME_CACHE_SIZE_BYTES, MAX_WASMTIME_CACHE_SIZE_BYTES)` — currently
+/// `clamp(total_ram / 8, 128 MiB, 512 MiB)`. It replaces a flat 512 MiB constant
+/// that applied regardless of machine size, which let a 2 GiB-cgroup node keep a
+/// compile cache larger than its whole 256 MiB contract-state budget.
+///
+/// This is the **on-disk** cache of compiled artifacts wasmtime writes under the
+/// data dir. It is NOT the in-memory compiled-module LRU
+/// ([`ModuleCache`](super::ModuleCache), sized by
+/// [`default_module_cache_budget_bytes`](super::default_module_cache_budget_bytes)
+/// and overridable via `--module-cache-budget-bytes`). The two are separate
+/// caches with separate budgets; this one has no operator override today (it
+/// never had one — it was a private constant), so this derived default is its
+/// only source.
+pub(crate) fn default_wasmtime_cache_size_bytes() -> u64 {
+    let total_ram = super::read_total_ram_bytes()
+        .map(|v| v as u64)
+        .unwrap_or(WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES);
+    wasmtime_cache_size_for_ram(total_ram)
+}
+
+/// Pure clamp math behind [`default_wasmtime_cache_size_bytes`], split out so the
+/// small-box / large-box / cgroup boundary behavior is unit-testable without
+/// depending on the test host's real RAM. Mirrors the `budget_for_ram` /
+/// `disk_budget_for_clamped` pattern used by the sibling budgets.
+pub(crate) fn wasmtime_cache_size_for_ram(total_ram: u64) -> u64 {
+    (total_ram / WASMTIME_CACHE_RAM_DIVISOR)
+        .clamp(MIN_WASMTIME_CACHE_SIZE_BYTES, MAX_WASMTIME_CACHE_SIZE_BYTES)
 }
 
 impl Default for RuntimeConfig {
@@ -917,3 +1021,191 @@ impl super::contract::ContractStoreBridge for Runtime {
 }
 
 impl super::contract::ContractRuntimeBridge for Runtime {}
+
+#[cfg(test)]
+mod wasmtime_disk_cache_sizing_tests {
+    use super::{
+        MAX_WASMTIME_CACHE_SIZE_BYTES, MIN_WASMTIME_CACHE_SIZE_BYTES,
+        default_wasmtime_cache_size_bytes, wasmtime_cache_size_for_ram,
+    };
+    use crate::ring::hosting_budget_for_ram;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    /// The flat value the on-disk compile-cache soft limit used to carry
+    /// regardless of machine size. Kept here (not imported) so the tests below
+    /// state the OLD behavior they are replacing without re-introducing a
+    /// production constant.
+    const LEGACY_FLAT_SOFT_LIMIT_BYTES: u64 = 512 * MIB;
+
+    /// The three machine shapes this change was sized against, plus the
+    /// strict-monotonicity that a constant-returning implementation cannot
+    /// satisfy.
+    #[test]
+    fn compile_cache_scales_with_the_memory_the_node_may_use() {
+        // The measured peer: a laptop under a 2 GiB cgroup, whose contract-state
+        // budget is 256 MiB. It used to get a 512 MiB compile cache — larger
+        // than the data it accelerates — and now gets 256 MiB.
+        assert_eq!(wasmtime_cache_size_for_ram(2 * GIB), 256 * MIB);
+        assert!(
+            wasmtime_cache_size_for_ram(2 * GIB) < LEGACY_FLAT_SOFT_LIMIT_BYTES,
+            "the containerized peer must get LESS than the old flat limit"
+        );
+
+        // A 15 GiB VM and a 125 GiB server are both far past the point where the
+        // ceiling binds, so they keep exactly the historical 512 MiB: this is a
+        // "small nodes get less" change, never a cache increase.
+        assert_eq!(wasmtime_cache_size_for_ram(15 * GIB), 512 * MIB);
+        assert_eq!(wasmtime_cache_size_for_ram(125 * GIB), 512 * MIB);
+        assert_eq!(
+            wasmtime_cache_size_for_ram(15 * GIB),
+            LEGACY_FLAT_SOFT_LIMIT_BYTES
+        );
+        assert_eq!(
+            wasmtime_cache_size_for_ram(125 * GIB),
+            LEGACY_FLAT_SOFT_LIMIT_BYTES
+        );
+
+        // Strictly node-relative between the clamps: a bigger host gets a bigger
+        // cache. A fixed constant (the defect) would fail every line here.
+        assert!(wasmtime_cache_size_for_ram(2 * GIB) < wasmtime_cache_size_for_ram(3 * GIB));
+        assert!(wasmtime_cache_size_for_ram(3 * GIB) < wasmtime_cache_size_for_ram(4 * GIB));
+        assert_eq!(wasmtime_cache_size_for_ram(3 * GIB), 384 * MIB);
+    }
+
+    /// Floor boundary: tiny and unreadable-capability hosts still get a cache
+    /// big enough to avoid recompiling everything on every start.
+    #[test]
+    fn compile_cache_floor_binds_on_tiny_hosts() {
+        // Degenerate inputs must not produce a zero-size (recompile-everything)
+        // cache.
+        assert_eq!(
+            wasmtime_cache_size_for_ram(0),
+            MIN_WASMTIME_CACHE_SIZE_BYTES
+        );
+        assert_eq!(
+            wasmtime_cache_size_for_ram(1),
+            MIN_WASMTIME_CACHE_SIZE_BYTES
+        );
+
+        // A 512 MiB VPS is well under the floor's binding point.
+        assert_eq!(
+            wasmtime_cache_size_for_ram(512 * MIB),
+            MIN_WASMTIME_CACHE_SIZE_BYTES
+        );
+
+        // Exactly at the binding point: 1 GiB / 8 == 128 MiB == the floor.
+        assert_eq!(
+            wasmtime_cache_size_for_ram(GIB),
+            MIN_WASMTIME_CACHE_SIZE_BYTES
+        );
+        // One divisor-step above it the derived value takes over, so the floor
+        // is a floor and not a second constant.
+        assert_eq!(
+            wasmtime_cache_size_for_ram(GIB + 8),
+            MIN_WASMTIME_CACHE_SIZE_BYTES + 1
+        );
+
+        // The floor keeps a real working set warm: at the measured 0.7-1.5 MiB
+        // per compiled artifact it still holds dozens of modules, so a small
+        // node does not pay a Cranelift recompile for every contract it touches.
+        assert!(
+            MIN_WASMTIME_CACHE_SIZE_BYTES / (3 * MIB / 2) >= 80,
+            "the floor must hold at least ~80 compiled modules at 1.5 MiB each"
+        );
+    }
+
+    /// Ceiling boundary: large hosts stop at the historical flat value and the
+    /// arithmetic cannot overflow on an absurd input.
+    #[test]
+    fn compile_cache_ceiling_binds_on_large_hosts() {
+        // One divisor-step below the binding point the derived value still wins.
+        assert_eq!(
+            wasmtime_cache_size_for_ram(4 * GIB - 8),
+            MAX_WASMTIME_CACHE_SIZE_BYTES - 1
+        );
+        // Exactly at the binding point: 4 GiB / 8 == 512 MiB == the ceiling.
+        assert_eq!(
+            wasmtime_cache_size_for_ram(4 * GIB),
+            MAX_WASMTIME_CACHE_SIZE_BYTES
+        );
+        assert_eq!(
+            wasmtime_cache_size_for_ram(8 * GIB),
+            MAX_WASMTIME_CACHE_SIZE_BYTES
+        );
+        // u64::MAX must clamp, not wrap or panic.
+        assert_eq!(
+            wasmtime_cache_size_for_ram(u64::MAX),
+            MAX_WASMTIME_CACHE_SIZE_BYTES
+        );
+    }
+
+    /// The invariant that motivated the change: the on-disk compile cache must
+    /// never be allowed to grow larger than the contract state it accelerates,
+    /// at ANY host size — including the cgroup-limited shapes where the defect
+    /// was measured. Both budgets read the same "memory the node may use"
+    /// signal, so this holds by construction (same divisor, same floor, strictly
+    /// lower ceiling) and this test is what keeps it holding.
+    #[test]
+    fn compile_cache_never_exceeds_hosting_state_budget() {
+        for total_ram in [
+            0,
+            1,
+            128 * MIB,
+            512 * MIB,
+            GIB,
+            2 * GIB, // the measured cgroup-limited peer
+            3 * GIB,
+            4 * GIB,
+            8 * GIB,
+            15 * GIB, // VM
+            32 * GIB,
+            125 * GIB, // server
+            u64::MAX,
+        ] {
+            let compile_cache = wasmtime_cache_size_for_ram(total_ram);
+            let state_budget = hosting_budget_for_ram(total_ram);
+            assert!(
+                compile_cache <= state_budget,
+                "at total_ram={total_ram} the on-disk compile cache ({compile_cache}) must \
+                 not exceed the contract-state budget it accelerates ({state_budget})"
+            );
+        }
+
+        // The exact shape from the defect report: a 2 GiB-cgroup peer whose
+        // entire contract-state budget is 256 MiB used to permit a 512 MiB
+        // compile cache (and was measured holding ~306 MB).
+        assert_eq!(hosting_budget_for_ram(2 * GIB), 256 * MIB);
+        assert_eq!(wasmtime_cache_size_for_ram(2 * GIB), 256 * MIB);
+        assert!(LEGACY_FLAT_SOFT_LIMIT_BYTES > hosting_budget_for_ram(2 * GIB));
+    }
+
+    /// The live reader (which consults the real host / cgroup limit, so its
+    /// value varies by machine) always lands inside the documented clamps, and
+    /// never returns the unclamped divisor value.
+    #[test]
+    fn default_soft_limit_stays_within_clamps_on_this_host() {
+        let resolved = default_wasmtime_cache_size_bytes();
+        assert!(
+            (MIN_WASMTIME_CACHE_SIZE_BYTES..=MAX_WASMTIME_CACHE_SIZE_BYTES).contains(&resolved),
+            "resolved soft limit {resolved} must be within \
+             [{MIN_WASMTIME_CACHE_SIZE_BYTES}, {MAX_WASMTIME_CACHE_SIZE_BYTES}]"
+        );
+        // The fallback (used when the OS query fails) must itself be a legal
+        // value rather than an unclamped constant.
+        assert_eq!(
+            wasmtime_cache_size_for_ram(super::WASMTIME_CACHE_FALLBACK_TOTAL_RAM_BYTES),
+            MIN_WASMTIME_CACHE_SIZE_BYTES
+        );
+    }
+
+    /// The clamps must stay ordered and the ceiling must stay at the historical
+    /// flat value, so a future edit cannot silently turn this into a cache
+    /// *increase* for hosts that are unaffected today.
+    #[test]
+    fn clamp_bounds_are_ordered_and_ceiling_is_the_historical_default() {
+        assert!(MIN_WASMTIME_CACHE_SIZE_BYTES < MAX_WASMTIME_CACHE_SIZE_BYTES);
+        assert_eq!(MAX_WASMTIME_CACHE_SIZE_BYTES, LEGACY_FLAT_SOFT_LIMIT_BYTES);
+    }
+}

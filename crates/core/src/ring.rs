@@ -113,6 +113,11 @@ pub(crate) use hosting::LEGACY_FLAT_HOSTING_BUDGET_BYTES;
 /// operator-facing default and the in-code fallback can never drift. The
 /// default is RAM-scaled (capability-relative, A2) rather than a flat constant.
 pub(crate) use hosting::default_hosting_budget_bytes;
+/// The hosting budget's pure RAM clamp, re-exported (test-only) so the wasmtime
+/// on-disk compile-cache sizing test can pin that the compile cache never
+/// exceeds the contract-state budget it accelerates.
+#[cfg(test)]
+pub(crate) use hosting::hosting_budget_for_ram;
 /// Re-export the reconcile controller (pure decision core, its input/action
 /// types, and the shadow-mode set-membership comparator) so the node layer can
 /// build inputs and run the shadow compare (keystone step-2, #4642).

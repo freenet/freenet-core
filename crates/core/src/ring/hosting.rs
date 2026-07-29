@@ -52,6 +52,11 @@ pub(crate) use cache::MAX_DEFAULT_HOSTING_BUDGET_BYTES;
 /// clamp lower bound; the config round-trip test asserts the RAM default lands
 /// within [MIN, MAX]). `pub(crate)` so `ring` can re-export it for that test.
 pub(crate) use cache::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
+/// The hosting budget's pure RAM clamp, re-exported (test-only) so the wasmtime
+/// on-disk compile-cache sizing can assert it never exceeds the contract-state
+/// budget it accelerates at ANY host size.
+#[cfg(test)]
+pub(crate) use cache::budget_for_ram as hosting_budget_for_ram;
 /// Re-exported as the single source of truth for the default hosting storage
 /// budget. `config::default_max_hosting_storage()` resolves to this function so
 /// the operator-facing default and the in-code fallback can never drift. The
