@@ -23,12 +23,22 @@ use tracing_subscriber::{Layer, Registry};
 /// would be a serious mistake: at 96 MiB a gateway retains 4.8 hours, so
 /// an 18:00 incident is gone by 09:00.
 ///
-/// Note that ~half of that 20.95 MB/h is redundant: `freenet.error.*` is
-/// currently a byte-for-byte duplicate of the main log (see issue #5015),
-/// because `RUST_LOG` overrides the error layer's WARN default. Fixing
-/// that halves the rate outright and would let this default come down to
-/// ~256 MiB for the same history. Until it lands, this budget cannot be
-/// reduced without costing a gateway real incident history.
+/// That 20.95 MB/h is a **pre-#5015 measurement**, and ~half of it was
+/// redundant: `freenet.error.*` duplicated the main log byte for byte
+/// because `RUST_LOG` overrode the error layer's WARN default. #5015
+/// has since landed ([`build_error_filter`]), so on nodes that set
+/// `RUST_LOG` the error family drops to its WARN+ share (~5 % of its
+/// former bytes) and the same gateway now runs at ~10.8 MB/h — 512 MiB
+/// buys it roughly two days rather than one.
+///
+/// Scope that carefully before retuning this: the duplication only ever
+/// affected nodes whose operator sets `RUST_LOG`. No install template
+/// does, so a stock install was always at the lower rate and sees no
+/// change. The halving therefore applies to gateways provisioned by
+/// `scripts/init-gateway.sh` and similar, not fleet-wide. This default
+/// is deliberately left at 512 MiB here: lowering it is a separate
+/// judgement call about how much history a gateway should keep, not a
+/// mechanical consequence of #5015.
 ///
 /// Do NOT lower this so far that the current-hour files alone can
 /// approach it. The size pass never deletes a file an appender has open,
@@ -389,6 +399,85 @@ async fn periodic_log_prune(log_dir: PathBuf) {
     }
 }
 
+/// The `RUST_LOG` directive string exactly as `EnvFilter` itself would
+/// read it: the variable's value, or the empty string when unset.
+///
+/// Split out from [`build_error_filter`] so that the filter construction
+/// stays a pure function of its input and can be tested without mutating
+/// process-global environment state (which would race across the test
+/// binary's threads).
+fn error_log_directives() -> String {
+    std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).unwrap_or_default()
+}
+
+/// Build the filter for the `freenet.error.*` layer: `max(WARN, RUST_LOG)`,
+/// evaluated per target.
+///
+/// The error log is meant to be a WARN-and-above **subset** of the main
+/// log, so it can be grepped as a high-signal view of what went wrong.
+/// That needs a genuine floor, and `EnvFilter::with_default_directive`
+/// is not one — it is a *fallback* that is applied only when the parsed
+/// directive string produced no directives at all. See
+/// `tracing-subscriber-0.3.23`, `src/filter/env/builder.rs`, the
+/// `if !has_dynamics && filter.statics.is_empty()` branch at the end of
+/// `Builder::from_directives`.
+///
+/// So with `RUST_LOG` set — which production sets — the `WARN` default
+/// was silently discarded and the error layer inherited `RUST_LOG`'s
+/// level: the very same level the main layer uses. The two layers then
+/// wrote identical content to two files, doubling log disk on every node
+/// (issue #5015; the nova gateway's `freenet.error.*` was 19011 INFO /
+/// 776 WARN / 93 ERROR over its first 20000 lines, and every hourly
+/// `freenet.*` / `freenet.error.*` pair was byte-for-byte identical).
+///
+/// AND-ing the env filter with a hard [`LevelFilter::WARN`] makes the
+/// level an actual floor, per target:
+///
+/// - `RUST_LOG` unset → `WARN`+, unchanged from the intended behavior;
+/// - `RUST_LOG=info` / `debug` / `trace` → still only `WARN`+;
+/// - `RUST_LOG=error` → only `ERROR`. A deliberately *more* restrictive
+///   `RUST_LOG` is honored rather than widened — this is `max(WARN, env)`,
+///   not "always at least WARN", so the floor never resurrects records the
+///   operator explicitly asked to suppress;
+/// - per-target directives (`RUST_LOG=freenet::ring=debug`) → that target
+///   at `WARN`+ only, so no INFO/DEBUG can leak into the error log through
+///   a target-scoped directive either.
+///
+/// AND-ing (rather than replacing the env filter outright with a bare
+/// `LevelFilter::WARN`) is what keeps the operator's `RUST_LOG` in force:
+/// a target they silenced stays silent in the error log too.
+///
+/// This layer deliberately does NOT inherit `build_filter`'s `moka=off` /
+/// `sqlx=error` additions. Those exist to suppress third-party INFO/DEBUG
+/// chatter from the main log; at WARN+ they are not a volume concern, and
+/// adopting them here would remove records the error log captures today.
+/// So the error log is a WARN+ subset of the main log for every freenet
+/// target, and additionally keeps moka/sqlx WARN+ that the main log
+/// suppresses.
+///
+/// The one place this change removes records from EVERY sink: because the
+/// main layer sets `moka=off` / `sqlx=error`, moka's INFO and sqlx's INFO
+/// under `RUST_LOG=info` used to reach the error log **and nowhere else**,
+/// and now reach neither. That is the intended WARN+ semantics rather than
+/// an oversight, and it is narrow — moka is the contract cache, and moka
+/// and sqlx WARN/ERROR are still retained here. Anything at WARN or above
+/// from any target still lands in this log.
+///
+/// Only the error layer is affected. The main log's filter (`build_filter`
+/// inside [`init_tracer`]) and the console layer are untouched, so nothing
+/// is lost from the main log or the journal.
+fn build_error_filter<S>(directives: &str) -> impl tracing_subscriber::layer::Filter<S> + 'static
+where
+    S: 'static,
+{
+    use tracing_subscriber::filter::FilterExt;
+
+    tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(LevelFilter::WARN.into())
+        .parse_lossy(directives)
+        .and(LevelFilter::WARN)
+}
+
 pub fn init_tracer(
     level: Option<LevelFilter>,
     _endpoint: Option<String>,
@@ -583,15 +672,11 @@ pub fn init_tracer(
                     .with_writer(main_writer.clone())
                     .with_filter(filter_layer);
 
-                let error_filter = tracing_subscriber::EnvFilter::builder()
-                    .with_default_directive(LevelFilter::WARN.into())
-                    .from_env_lossy();
-
                 let error_layer = tracing_subscriber::fmt::layer()
                     .with_level(true)
                     .with_ansi(false)
                     .with_writer(error_writer.clone())
-                    .with_filter(error_filter);
+                    .with_filter(build_error_filter(&error_log_directives()));
 
                 // Add console layer if running interactively
                 if also_log_to_console {
@@ -617,15 +702,11 @@ pub fn init_tracer(
                     .with_writer(main_writer)
                     .with_filter(filter_layer);
 
-                let error_filter = tracing_subscriber::EnvFilter::builder()
-                    .with_default_directive(LevelFilter::WARN.into())
-                    .from_env_lossy();
-
                 let error_layer = tracing_subscriber::fmt::layer()
                     .with_level(true)
                     .with_ansi(false)
                     .with_writer(error_writer)
-                    .with_filter(error_filter);
+                    .with_filter(build_error_filter(&error_log_directives()));
 
                 // Add console layer if running interactively
                 if also_log_to_console {
@@ -735,6 +816,358 @@ fn init_stdout_tracer(
         tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
     }
     Ok(())
+}
+
+/// Regression coverage for issue #5015: `freenet.error.*` was a
+/// byte-for-byte duplicate of the main log whenever `RUST_LOG` was set.
+#[cfg(test)]
+mod error_filter_tests {
+    use super::{build_error_filter, error_log_directives};
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::layer::{Filter, SubscriberExt};
+    use tracing_subscriber::{Layer, Registry};
+
+    /// The most permissive level the error filter will admit for the
+    /// supplied `RUST_LOG` string. `Filter::max_level_hint` on the
+    /// `And` combinator is `min(env, WARN)`, so this is a direct,
+    /// clock-free, subscriber-free read of the floor.
+    fn error_hint(directives: &str) -> Option<LevelFilter> {
+        Filter::<Registry>::max_level_hint(&build_error_filter::<Registry>(directives))
+    }
+
+    /// Documents the upstream behavior this fix works around, and keeps
+    /// the rest of this module honest: if `with_default_directive` ever
+    /// became a real floor upstream, this assertion fails and the
+    /// workaround can be revisited. It is also the non-vacuity control
+    /// for `error_filter_floors_verbose_rust_log_at_warn` — the two
+    /// differ only by the `.and(LevelFilter::WARN)` under test.
+    #[test]
+    fn env_filter_default_directive_is_a_fallback_not_a_floor() {
+        let unfloored = tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(LevelFilter::WARN.into())
+            .parse_lossy("info");
+        assert_eq!(
+            unfloored.max_level_hint(),
+            Some(LevelFilter::INFO),
+            "with_default_directive(WARN) must be discarded once RUST_LOG parses to \
+             any directive — that discard is the #5015 bug"
+        );
+    }
+
+    /// With `RUST_LOG` unset the error log keeps its pre-existing
+    /// WARN+ behavior. This is the one case that was already correct;
+    /// the fix must not change it.
+    #[test]
+    fn error_filter_is_warn_when_rust_log_unset() {
+        assert_eq!(error_hint(""), Some(LevelFilter::WARN));
+    }
+
+    /// The bug proper: a verbose `RUST_LOG` must not widen the error log.
+    #[test]
+    fn error_filter_floors_verbose_rust_log_at_warn() {
+        for directives in ["info", "debug", "trace", "freenet=info", "freenet=trace"] {
+            assert_eq!(
+                error_hint(directives),
+                Some(LevelFilter::WARN),
+                "RUST_LOG={directives} must not admit anything below WARN into the error log"
+            );
+        }
+    }
+
+    /// Per-target directives must not smuggle INFO/DEBUG into the error
+    /// log through a narrower target scope.
+    #[test]
+    fn error_filter_floors_per_target_directives_at_warn() {
+        for directives in [
+            "freenet::ring=debug",
+            "info,freenet::ring=debug",
+            "freenet::ring=trace,freenet::transport=debug",
+        ] {
+            assert_eq!(
+                error_hint(directives),
+                Some(LevelFilter::WARN),
+                "RUST_LOG={directives} must not admit anything below WARN into the error log"
+            );
+        }
+    }
+
+    /// The floor is `max(WARN, RUST_LOG)`, not "always at least WARN":
+    /// an operator who deliberately asks for *less* must get less, never
+    /// more than they asked for.
+    #[test]
+    fn error_filter_honors_a_more_restrictive_rust_log() {
+        assert_eq!(
+            error_hint("error"),
+            Some(LevelFilter::ERROR),
+            "RUST_LOG=error must leave the error log at ERROR only, not widen it to WARN"
+        );
+        assert_eq!(
+            error_hint("off"),
+            Some(LevelFilter::OFF),
+            "RUST_LOG=off must silence the error log too"
+        );
+        assert_eq!(
+            error_hint("freenet=error"),
+            Some(LevelFilter::ERROR),
+            "a more restrictive per-target directive must also be honored"
+        );
+    }
+
+    /// `error_log_directives` must read exactly the variable `EnvFilter`
+    /// itself reads, so swapping `from_env_lossy()` for
+    /// `parse_lossy(error_log_directives())` is behavior-preserving on
+    /// the env-reading half.
+    #[test]
+    fn error_log_directives_reads_rust_log() {
+        assert_eq!(tracing_subscriber::EnvFilter::DEFAULT_ENV, "RUST_LOG");
+        assert_eq!(
+            error_log_directives(),
+            std::env::var("RUST_LOG").unwrap_or_default()
+        );
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// End-to-end proof that `Filter::enabled` (not just the level hint)
+    /// drops sub-WARN records from an error-log-shaped layer.
+    ///
+    /// Deterministic by construction: the subscriber is installed with
+    /// `tracing::subscriber::with_default` (thread-local, so parallel
+    /// tests cannot observe or perturb it), the writer is synchronous
+    /// and in-memory (no `tracing_appender` worker thread, no flush
+    /// race), no environment variable is mutated, and the event messages
+    /// are unique to this test.
+    #[test]
+    fn error_layer_writes_only_warn_and_above_under_verbose_rust_log() {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let layer = tracing_subscriber::fmt::layer()
+            .with_level(true)
+            .with_ansi(false)
+            .with_writer(CaptureWriter(sink.clone()))
+            .with_filter(build_error_filter("debug"));
+
+        tracing::subscriber::with_default(Registry::default().with(layer), || {
+            tracing::debug!("i5015-debug-must-be-dropped");
+            tracing::info!("i5015-info-must-be-dropped");
+            tracing::warn!("i5015-warn-must-be-kept");
+            tracing::error!("i5015-error-must-be-kept");
+        });
+
+        let captured = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        assert!(
+            !captured.contains("i5015-debug-must-be-dropped"),
+            "DEBUG leaked into the error log under RUST_LOG=debug: {captured}"
+        );
+        assert!(
+            !captured.contains("i5015-info-must-be-dropped"),
+            "INFO leaked into the error log under RUST_LOG=debug: {captured}"
+        );
+        assert!(
+            captured.contains("i5015-warn-must-be-kept"),
+            "WARN must still reach the error log: {captured}"
+        );
+        assert!(
+            captured.contains("i5015-error-must-be-kept"),
+            "ERROR must still reach the error log: {captured}"
+        );
+    }
+
+    /// A sibling layer with the main log's (unfloored) filter must be
+    /// unaffected by the error layer's WARN floor when both are attached
+    /// to the same subscriber.
+    ///
+    /// This is the hard constraint on this fix: per-layer filtering must
+    /// not let the error layer's `Interest::never` for sub-WARN callsites
+    /// short-circuit the main layer. Without this test a regression would
+    /// silently delete INFO/DEBUG from `freenet.*` — a far worse outcome
+    /// than the disk the fix saves.
+    ///
+    /// `init_tracer` builds TWO subscriber shapes and both ship, so both
+    /// are exercised via `with_global_rate_filter`:
+    ///
+    /// - `false` → `Registry.with(main).with(error)`, taken when rate
+    ///   limiting is off, i.e. debug/test builds or
+    ///   `FREENET_DISABLE_LOG_RATE_LIMIT`;
+    /// - `true` → `Registry.with(<global DynFilterFn>).with(main).with(error)`,
+    ///   which is what **release builds actually run**. The global filter
+    ///   layer sits beneath both sinks and composes `max_level_hint`
+    ///   differently, so testing only the first shape would leave the
+    ///   shipping one uncovered.
+    fn assert_error_floor_does_not_starve_main_layer(with_global_rate_filter: bool) {
+        let main_sink = Arc::new(Mutex::new(Vec::new()));
+        let error_sink = Arc::new(Mutex::new(Vec::new()));
+
+        // Built per branch: a layer's `Filter<S>` is parameterized by the
+        // subscriber it attaches to, and `S` differs between the shapes.
+        macro_rules! layers {
+            () => {
+                (
+                    tracing_subscriber::fmt::layer()
+                        .with_level(true)
+                        .with_ansi(false)
+                        .with_writer(CaptureWriter(main_sink.clone()))
+                        .with_filter(tracing_subscriber::EnvFilter::builder().parse_lossy("info")),
+                    tracing_subscriber::fmt::layer()
+                        .with_level(true)
+                        .with_ansi(false)
+                        .with_writer(CaptureWriter(error_sink.clone()))
+                        .with_filter(build_error_filter("info")),
+                )
+            };
+        }
+
+        let emit = || {
+            tracing::info!("i5015-sibling-info");
+            tracing::warn!("i5015-sibling-warn");
+        };
+
+        if with_global_rate_filter {
+            // Always-true so this isolates filter composition rather than
+            // the rate limiter's own behavior; the shape is what matters.
+            let pass_all = tracing_subscriber::filter::DynFilterFn::new(|_meta, _cx| true);
+            let (main_layer, error_layer) = layers!();
+            let subscriber = Registry::default()
+                .with(pass_all)
+                .with(main_layer)
+                .with(error_layer);
+            tracing::subscriber::with_default(subscriber, emit);
+        } else {
+            let (main_layer, error_layer) = layers!();
+            let subscriber = Registry::default().with(main_layer).with(error_layer);
+            tracing::subscriber::with_default(subscriber, emit);
+        }
+
+        let shape = if with_global_rate_filter {
+            "rate-limited (release) shape"
+        } else {
+            "plain (debug/test) shape"
+        };
+        let main = String::from_utf8(main_sink.lock().unwrap().clone()).unwrap();
+        let error = String::from_utf8(error_sink.lock().unwrap().clone()).unwrap();
+
+        assert!(
+            main.contains("i5015-sibling-info"),
+            "[{shape}] the error layer's WARN floor must not suppress INFO on the \
+             main layer: {main}"
+        );
+        assert!(
+            main.contains("i5015-sibling-warn"),
+            "[{shape}] the main layer must still receive WARN: {main}"
+        );
+        assert!(
+            !error.contains("i5015-sibling-info"),
+            "[{shape}] the error layer must still drop INFO: {error}"
+        );
+        assert!(
+            error.contains("i5015-sibling-warn"),
+            "[{shape}] the error layer must still receive WARN: {error}"
+        );
+    }
+
+    #[test]
+    fn main_layer_still_receives_info_alongside_the_floored_error_layer() {
+        assert_error_floor_does_not_starve_main_layer(false);
+    }
+
+    /// Same hard constraint, for the subscriber shape release builds
+    /// actually construct (global rate-limit filter beneath both layers).
+    #[test]
+    fn main_layer_still_receives_info_under_the_release_rate_limited_shape() {
+        assert_error_floor_does_not_starve_main_layer(true);
+    }
+
+    /// Call-site pin. The filter helper being correct is worthless if
+    /// `init_tracer` stops using it, and neither the level-hint tests nor
+    /// the capture tests above would notice: they exercise
+    /// `build_error_filter` directly, so deleting the wiring leaves them
+    /// green. This scrapes the production half of `tracer.rs` and asserts
+    /// that every error-log layer is filtered through the helper.
+    ///
+    /// Needles are matched against whitespace-stripped source so a
+    /// `rustfmt` line-wrap of a growing call cannot silently disarm the
+    /// pin, and the module marker is assembled with `concat!` so this
+    /// test's own source cannot satisfy it.
+    #[test]
+    fn init_tracer_wires_every_error_layer_through_build_error_filter() {
+        let source = include_str!("tracer.rs");
+
+        // Cut at this test module's declaration (the first one in the file)
+        // so test source, including this function, can never satisfy a
+        // production-code assertion. Deliberately NOT cut at `#[cfg(test)]`:
+        // that attribute also appears on individual items, and cutting at the
+        // first one can truncate production code and leave the pin vacuous.
+        // The anchor is this module's own declaration, spelled with
+        // `concat!` so the needle never appears contiguously in source and
+        // cannot match itself. An exact anchor also fails CLOSED: rename the
+        // module and `find` returns `None`, so the `expect` fires loudly. A
+        // looser needle (e.g. just `tests {`) would also match the prose and
+        // the `expect` string below, so a rename would silently slide the cut
+        // point down and swallow test functions into the "production" slice.
+        let cut = source.find(concat!("mod error_filter_", "tests {")).expect(
+            "the call-site pin anchors on this module's declaration; \
+             if it was renamed, update the anchor deliberately",
+        );
+        let production: String = source[..cut]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        let count = |needle: &str| production.matches(needle).count();
+
+        let error_layers = count(".with_writer(error_writer");
+        assert_eq!(
+            error_layers, 2,
+            "expected the two error-log layers (rate-limited and plain registry); \
+             if this changed, update the pin deliberately"
+        );
+
+        // Pin the whole wiring, not just the helper's name: passing anything
+        // other than the live `RUST_LOG` would silently stop honoring a
+        // deliberately more-restrictive operator setting.
+        let floored = count(".with_filter(build_error_filter(&error_log_directives()))");
+        assert_eq!(
+            floored, error_layers,
+            "every freenet.error.* layer must be filtered through \
+             build_error_filter(&error_log_directives()); found {error_layers} error \
+             layers but {floored} floored filters (#5015)"
+        );
+
+        assert_eq!(
+            count(".and(LevelFilter::WARN)"),
+            1,
+            "the WARN floor must live in build_error_filter and nowhere else"
+        );
+
+        // `build_filter` (main + console) is the only remaining
+        // `from_env_lossy` caller. A second one means an error layer
+        // regressed to the unfloored inline shape this fix removed.
+        assert_eq!(
+            count(".from_env_lossy()"),
+            1,
+            "only the main/console filter may use from_env_lossy(); an error layer \
+             using it would inherit RUST_LOG's level again (#5015)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -955,9 +1388,18 @@ mod cleanup_tests {
     /// For contrast, this same budget is not what binds on a quiet peer:
     /// at ~1.4 MB/h a laptop peer reaches `LOG_RETENTION_HOURS` (72h)
     /// having used under 100 MiB, so its retention is decided by age.
+    ///
+    /// The rate below is deliberately the **pre-#5015** measurement, taken
+    /// while `freenet.error.*` still duplicated the main log. Post-#5015
+    /// that gateway runs at ~10.8 MB/h, so keeping the older, higher rate
+    /// makes this guard strictly more conservative: it demands the budget
+    /// hold a day at the worst rate ever observed. Do not "refresh" it to
+    /// the lower figure — that would weaken the assertion, permitting a
+    /// budget that no longer holds a day on any node still logging at the
+    /// old rate.
     #[test]
     fn default_budget_holds_a_day_of_a_busy_gateways_logs() {
-        // nova, 2026-07: 518.9 MiB over 25.97h.
+        // nova, 2026-07, pre-#5015: 518.9 MiB over 25.97h.
         const GATEWAY_BYTES_PER_HOUR: u64 = 20_950_000;
         let hours_retained = LOG_DIR_MAX_BYTES / GATEWAY_BYTES_PER_HOUR;
         assert!(
