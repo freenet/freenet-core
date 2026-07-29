@@ -607,3 +607,83 @@ async fn empty_shared_snapshot_warns_once_not_on_every_update() {
         "the emptied summaries sibling must be removed alongside it"
     );
 }
+
+/// Regression for #5040, source half: the entry is dropped AS it empties, in
+/// the channel-closed `retain` itself, not merely when a later update happens
+/// to observe it.
+///
+/// This is the path that actually creates the empty entry in production (a
+/// subscriber's receiver goes away without a Disconnect reaching the handler).
+/// The loss is worth exactly one line and already has one: the per-client
+/// ERROR at the point of loss. Dropping the entry there means no subsequent
+/// update warns about it at all.
+#[cfg(feature = "trace")]
+#[tokio::test(flavor = "current_thread")]
+async fn closed_subscriber_channel_drops_entry_at_point_of_loss() {
+    let mut executor = create_executor().await;
+    let shared_notifications = std::sync::Arc::new(dashmap::DashMap::new());
+    let shared_summaries = std::sync::Arc::new(dashmap::DashMap::new());
+    executor.set_shared_notifications(
+        shared_notifications.clone(),
+        shared_summaries.clone(),
+        std::sync::Arc::new(dashmap::DashMap::new()),
+    );
+
+    let contract = test_contract(b"closed_channel_5040");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    // A registered subscriber whose receiver has been dropped: the notification
+    // send fails `Closed`, which is what empties the vec in place.
+    let client_id = ClientId::next();
+    let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    drop(rx);
+    shared_notifications.insert(instance_id, vec![(client_id, tx)]);
+    shared_summaries.insert(
+        instance_id,
+        std::collections::HashMap::from([(client_id, None)]),
+    );
+
+    let (messages, guard) = install_log_capture();
+
+    for state in [vec![1u8, 1, 1], vec![2u8, 2, 2]] {
+        executor
+            .upsert_contract_state(
+                key,
+                either::Either::Left(WrappedState::new(state)),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .expect("store contract");
+    }
+
+    drop(guard);
+
+    let logs = messages.lock().unwrap();
+    // The loss is reported once, at the point of loss, naming the client.
+    assert_eq!(
+        logs.iter()
+            .filter(|l| l.starts_with("ERROR") && l.contains("channel closed"))
+            .count(),
+        1,
+        "a closed subscriber channel must be reported once as an ERROR; \
+         captured: {logs:?}"
+    );
+    // The second update must not warn: the entry was already dropped.
+    assert!(
+        !logs
+            .iter()
+            .any(|l| l.starts_with("WARN") && l.contains("no subscriber snapshot")),
+        "dropping the entry at the point of loss must leave nothing for a later \
+         update to warn about; captured: {logs:?}"
+    );
+    assert!(
+        !shared_notifications.contains_key(&instance_id),
+        "the subscriber entry must be removed as it empties"
+    );
+    assert!(
+        !shared_summaries.contains_key(&instance_id),
+        "the summaries sibling must be removed alongside it"
+    );
+}
