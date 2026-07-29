@@ -99,6 +99,25 @@ impl Bucket {
     }
 }
 
+/// Outcome of a token-bucket rate-limit check. Distinguishes a genuine
+/// rate-limit hit from a capacity rejection so callers can decide whether
+/// to fail open or fail closed.
+///
+/// - [`Allowed`](BucketOutcome::Allowed): a token was consumed — proceed.
+/// - [`RateLimited`](BucketOutcome::RateLimited): the key is over its rate
+///   — the caller should throttle.
+/// - [`Untracked`](BucketOutcome::Untracked): the key was absent and the
+///   tracking map is at its [`MAX_TRACKED_KEYS`] cap. A full map is a
+///   sizing accident, not evidence about this key. Callers should **fail
+///   open** (treat as allowed) unless there is a specific security reason
+///   to drop traffic from unknown keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BucketOutcome {
+    Allowed,
+    RateLimited,
+    Untracked,
+}
+
 /// A token-bucket rate limiter keyed by `K`. One token per key is consumed per
 /// allowed event; the bucket holds up to `capacity` and refills one token per
 /// `refill_interval`.
@@ -166,6 +185,45 @@ impl<K: Eq + Hash + Clone> TokenBucketLimiter<K> {
                 });
                 self.allowed_total.fetch_add(1, Ordering::Relaxed);
                 true
+            }
+        }
+    }
+
+    /// Check-and-consume one token, returning a [`BucketOutcome`] that
+    /// distinguishes rate limiting from capacity rejection.
+    ///
+    /// Callers that want to fail open on a full map should gate on
+    /// `matches!(outcome, BucketOutcome::RateLimited)` rather than
+    /// inverting the bool from [`check_and_record`](Self::check_and_record).
+    pub fn check_and_record_detailed(&self, key: K) -> BucketOutcome {
+        let now = self.time_source.now();
+        use dashmap::mapref::entry::Entry;
+        match self.buckets.entry(key) {
+            Entry::Occupied(mut occ) => {
+                let bucket = occ.get_mut();
+                bucket.refill(now, self.capacity, self.refill_interval);
+                if bucket.tokens >= 1.0 {
+                    bucket.tokens -= 1.0;
+                    self.allowed_total.fetch_add(1, Ordering::Relaxed);
+                    BucketOutcome::Allowed
+                } else {
+                    self.suppressed_total.fetch_add(1, Ordering::Relaxed);
+                    BucketOutcome::RateLimited
+                }
+            }
+            Entry::Vacant(vac) => {
+                let prev = self.size.fetch_add(1, Ordering::Relaxed);
+                if prev >= self.max_tracked {
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                    self.suppressed_total.fetch_add(1, Ordering::Relaxed);
+                    return BucketOutcome::Untracked;
+                }
+                vac.insert(Bucket {
+                    tokens: self.capacity - 1.0,
+                    last_refill: now,
+                });
+                self.allowed_total.fetch_add(1, Ordering::Relaxed);
+                BucketOutcome::Allowed
             }
         }
     }
@@ -785,5 +843,118 @@ mod tests {
         ts.advance_time(Duration::from_secs(10));
         l.cleanup();
         assert_eq!(l.len(), 1, "recently-used key must be preserved");
+    }
+
+    #[test]
+    fn check_and_record_detailed_allows_when_tokens_available() {
+        let ts = SharedMockTimeSource::new();
+        let l = new_emit_limiter(Arc::new(ts.clone()));
+        let c = mk_contract(1);
+        assert_eq!(
+            l.check_and_record_detailed(c),
+            BucketOutcome::Allowed,
+            "first check with a full bucket must be Allowed"
+        );
+        // A second check within the burst window is also Allowed (burst=2).
+        assert_eq!(
+            l.check_and_record_detailed(c),
+            BucketOutcome::Allowed,
+            "second check within burst must be Allowed"
+        );
+    }
+
+    #[test]
+    fn check_and_record_detailed_returns_rate_limited_when_drained() {
+        let ts = SharedMockTimeSource::new();
+        let l = new_emit_limiter(Arc::new(ts.clone()));
+        let c = mk_contract(1);
+        // Drain the burst (burst=2).
+        let _ = l.check_and_record_detailed(c);
+        let _ = l.check_and_record_detailed(c);
+        // Third check must be RateLimited (not Untracked — the key is tracked).
+        assert_eq!(
+            l.check_and_record_detailed(c),
+            BucketOutcome::RateLimited,
+            "third check after draining burst must be RateLimited"
+        );
+    }
+
+    #[test]
+    fn check_and_record_detailed_returns_untracked_when_full() {
+        let ts = SharedMockTimeSource::new();
+        // Tiny cap of 2 so we can fill it quickly.
+        let l = TokenBucketLimiter::new(Arc::new(ts.clone()), 1.0, RESPOND_REFILL_INTERVAL, 2);
+        assert_eq!(
+            l.check_and_record_detailed(mk_contract(1)),
+            BucketOutcome::Allowed,
+            "first key fits"
+        );
+        assert_eq!(
+            l.check_and_record_detailed(mk_contract(2)),
+            BucketOutcome::Allowed,
+            "second key fits"
+        );
+        assert_eq!(l.len(), 2);
+        // Third key is refused because the map is full.
+        assert_eq!(
+            l.check_and_record_detailed(mk_contract(3)),
+            BucketOutcome::Untracked,
+            "third key when map is full must be Untracked"
+        );
+        assert_eq!(l.len(), 2, "map size must stay at the cap");
+        // The existing key still works (it is tracked, so it gets RateLimited).
+        assert_eq!(
+            l.check_and_record_detailed(mk_contract(1)),
+            BucketOutcome::RateLimited,
+            "a tracked key that is out of tokens must still be RateLimited, not Untracked"
+        );
+    }
+
+    #[test]
+    fn check_and_record_detailed_fail_open_semantics() {
+        // Verify that the fail-open pattern used by all resync callers works:
+        // only `RateLimited` triggers suppression; `Untracked` is treated as
+        // allowed (a full map is a sizing accident, not evidence).
+        let ts = SharedMockTimeSource::new();
+        // Cap of 1 so a second key hits Untracked.
+        let l = TokenBucketLimiter::new(Arc::new(ts.clone()), 1.0, RESPOND_REFILL_INTERVAL, 1);
+
+        // First key — Allowed, not suppressed.
+        assert!(
+            !matches!(
+                l.check_and_record_detailed(mk_contract(1)),
+                BucketOutcome::RateLimited
+            ),
+            "a normal allow must not be RateLimited"
+        );
+
+        // Same key again — drained, RateLimited, suppressed.
+        assert!(
+            matches!(
+                l.check_and_record_detailed(mk_contract(1)),
+                BucketOutcome::RateLimited
+            ),
+            "a drained tracked key must be RateLimited"
+        );
+
+        // New key when map is full — Untracked, NOT suppressed (fail open).
+        assert!(
+            !matches!(
+                l.check_and_record_detailed(mk_contract(2)),
+                BucketOutcome::RateLimited
+            ),
+            "an Untracked key on a full map must fail open, not be RateLimited"
+        );
+    }
+
+    #[test]
+    fn check_and_record_backward_compat() {
+        // `check_and_record` must still work as before (backward compat).
+        let ts = SharedMockTimeSource::new();
+        let l = new_emit_limiter(Arc::new(ts.clone()));
+        let c = mk_contract(1);
+        assert!(l.check_and_record(c));
+        assert!(l.check_and_record(c));
+        assert!(!l.check_and_record(c));
     }
 }
