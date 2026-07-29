@@ -79,21 +79,32 @@
 //! ## The known-good blob lives exactly as long as the marker
 //!
 //! The retained snapshot is an UNCOMPRESSED copy of the executable (~58 MB
-//! measured on a real peer), and it is reachable ONLY through a probation
-//! marker: [`handle_post_stop_at`] returns [`PostStopOutcome::Proceed`] before
-//! looking at it when [`read_probation_at`] is `None`, and
-//! [`prepare_known_good_for_install_at`] re-captures fresh from the live binary
-//! rather than reading it in that case. Keeping it past the commit therefore
-//! bought nothing — it was dead weight for the days-to-weeks until the next
-//! update — so the commit reclaims it.
+//! measured on a real peer). No AUTOMATED reader can reach it without a
+//! probation marker: [`handle_post_stop_at`] returns
+//! [`PostStopOutcome::Proceed`] before looking at it when [`read_probation_at`]
+//! is `None`, and [`prepare_known_good_for_install_at`] re-captures fresh from
+//! the live binary rather than reading it in that case. Keeping it past the
+//! commit therefore bought this module nothing — it was dead weight for the
+//! days-to-weeks until the next update — so the commit reclaims it.
 //!
-//! The tradeoff this accepts: once probation has committed, a node that
-//! degrades LATER has no local binary to revert to and recovers by
-//! re-installing from GitHub. That is the same position as a node whose
-//! known-good capture failed (already a supported, non-fatal state — see
-//! `commands::update`), and the crash-loop class this module exists for (a bad
-//! release that wedges at boot) is unaffected, because it fires inside the
-//! probation window while the blob is still present.
+//! The tradeoff this accepts, in two parts:
+//!
+//! * **Automated.** Once probation has committed, a node that degrades LATER
+//!   has no local binary to revert to and recovers by re-installing from
+//!   GitHub. That is the same position as a node whose known-good capture
+//!   failed (already a supported, non-fatal state — see `commands::update`),
+//!   and the crash-loop class this module exists for (a bad release that wedges
+//!   at boot) is unaffected, because it fires inside the probation window while
+//!   the blob is still present.
+//! * **Manual.** An OPERATOR with shell access could always `cp` the blob back
+//!   by hand, so it doubled as an offline recovery artifact for the post-commit
+//!   degradation class — a use no code path expresses and this module never
+//!   promised, but a real one. Reclaiming the blob removes it. Note also that
+//!   the commit trigger is a bare 60 s sleep (`bin/freenet.rs`) with no health
+//!   check beyond "the process is still alive", so "committed" means less than
+//!   it sounds like. Whether that warrants keeping an offline copy (or a
+//!   stronger commit condition) is an open question for the maintainer, NOT
+//!   something the code below tries to answer.
 //!
 //! Not compression: adding a decode step to the one path whose failure bricks a
 //! node would weaken the integrity guarantee (the recorded SHA would cover the
@@ -446,18 +457,31 @@ pub(crate) fn prepare_known_good_for_install_at(
 /// This is brick-recovery state, so it only ever unlinks a file it can
 /// positively identify as the now-dead rollback target:
 ///
-/// * It re-reads the marker and does NOTHING if one is present. That makes the
-///   "remove the marker FIRST, then reclaim the blob" ordering structural
-///   rather than merely documented: a caller that reclaims while still armed
-///   gets a no-op instead of an armed marker pointing at a deleted binary. It
-///   also declines when a concurrent `freenet update` has already armed the
-///   NEXT probation over this blob.
 /// * It hashes the candidate and deletes it only when size AND SHA-256 match
 ///   `expected`, so a snapshot a concurrent install captured for a different
 ///   generation is left alone.
+/// * It re-checks for a probation marker in the SAME statement as the unlink,
+///   so the marker is the last thing read before the file goes away.
 /// * It only ever considers `dir/known_good_binary`, never the
 ///   `rollback_binary` path carried in the marker JSON, so a corrupt or
 ///   tampered marker cannot make us unlink an arbitrary file.
+///
+/// # What the marker re-check does and does not cover
+///
+/// It covers SEQUENTIAL misuse completely: a caller that reclaims before
+/// removing the marker gets a no-op rather than an armed marker pointing at a
+/// deleted binary, which is why `commit_probation_at` can rely on it instead of
+/// on a comment.
+///
+/// It does NOT make this safe against a truly CONCURRENT `freenet update`. Both
+/// sides are check-then-act on the same state directory with no lock, so an
+/// installer that writes its marker in the window between the re-check and the
+/// `remove_file` is still not seen. The window is now one syscall wide rather
+/// than a ~58 MB hash wide, and `begin_probation_at` closes the same race from
+/// the other end by disarming when the blob it just recorded has vanished — but
+/// a genuine sub-syscall interleaving remains open, and only a lock on the state
+/// directory would close it. Do not read this guard as "the concurrent installer
+/// case is handled".
 ///
 /// Best-effort by construction: it returns `()`, and every failure is logged
 /// and swallowed. Reclaiming disk must never fail a probation commit or an
@@ -465,8 +489,9 @@ pub(crate) fn prepare_known_good_for_install_at(
 /// install's capture, which is exactly the pre-existing steady state.
 fn discard_known_good_at(dir: &Path, expected: &KnownGoodMeta) {
     if read_probation_at(dir).is_some() {
-        // Still armed (or re-armed by a concurrent install): the blob may be a
-        // live rollback target, so leave it. Never delete while armed.
+        // Still armed (or re-armed): the blob may be a live rollback target.
+        // Cheap early-out before the hash; re-checked below, because a hash of
+        // a ~58 MB file is a very wide window to have decided anything in.
         return;
     }
     let blob = dir.join(KNOWN_GOOD_BINARY_FILE);
@@ -475,6 +500,18 @@ fn discard_known_good_at(dir: &Path, expected: &KnownGoodMeta) {
     }
     match sha256_file(&blob) {
         Ok((size, sha256)) if size == expected.size && sha256 == expected.sha256 => {
+            // Re-read the marker AFTER the hash, immediately before the unlink.
+            // The hash above is a cold ~58 MB read (seconds on slow storage);
+            // a marker armed during it must not be missed, so the decision to
+            // delete is made against the freshest possible read.
+            if read_probation_at(dir).is_some() {
+                tracing::debug!(
+                    path = %blob.display(),
+                    "A probation marker was armed while verifying the retained rollback \
+                     binary; leaving it in place."
+                );
+                return;
+            }
             match std::fs::remove_file(&blob) {
                 Ok(()) => {
                     fsync_dir(dir);
@@ -516,9 +553,11 @@ fn discard_known_good_at(dir: &Path, expected: &KnownGoodMeta) {
 /// known-bad pin, since a successful forward install means we have moved on.
 ///
 /// Returns `Err` if the probation marker could not be persisted (full /
-/// unwritable state dir). In that case the update still succeeded but the new
-/// version has NO crash-loop rollback protection, so the caller MUST surface
-/// the error rather than discard it.
+/// unwritable state dir), or if the known-good blob it names disappeared while
+/// the marker was being written (see [`discard_known_good_at`] — a concurrent
+/// probation commit can reclaim it). In both cases the update still succeeded
+/// but the new version has NO crash-loop rollback protection, so the caller
+/// MUST surface the error rather than discard it.
 pub(crate) fn begin_probation(
     new_version: &str,
     previous_version: &str,
@@ -562,8 +601,36 @@ pub(crate) fn begin_probation_at(
     // Moving forward to a new (non-pinned) version supersedes any prior
     // known-bad pin; best-effort, independent of the marker write.
     clear_known_bad_at(dir);
+    let blob = state.rollback_binary.clone();
     write_probation_at(dir, &state)
-        .context("failed to write crash-loop probation marker; the installed version has no rollback protection")
+        .context("failed to write crash-loop probation marker; the installed version has no rollback protection")?;
+
+    // Verify the rollback target still exists AFTER arming, and disarm if it
+    // does not. A concurrently-running node's probation commit can reclaim the
+    // blob (`discard_known_good_at`) in the window between the caller's
+    // `prepare_known_good_for_install` and this write — reachable in practice
+    // because the tray's "Check for Updates" runs a real install while the
+    // `freenet network` child is still up (`service/wrapper.rs`). Checking
+    // after the write, not before, is what makes this useful: it catches a
+    // reclaim that raced the write itself.
+    //
+    // An armed marker naming a binary that is not there is strictly worse than
+    // no marker: it burns the crash budget to `RollbackUnavailable` instead of
+    // restoring, and it suppresses the ordinary update flow (`handle_post_stop`
+    // returns `Proceed` with no marker, which is the #4549 forward self-heal).
+    // So we would rather ship this cycle with NO rollback protection — the same
+    // state as a failed capture, which the caller already surfaces — than with
+    // a marker that lies.
+    if !blob.exists() {
+        remove_probation_at(dir);
+        anyhow::bail!(
+            "the known-good rollback binary at {} disappeared while arming probation \
+             (most likely reclaimed by a concurrent probation commit); the installed \
+             version has no rollback protection",
+            blob.display()
+        );
+    }
+    Ok(())
 }
 
 /// Read the current probation marker, if any. A missing or unparseable marker
@@ -589,6 +656,14 @@ fn remove_probation_at(dir: &Path) {
 /// Clear probation if the running version matches the marker (it has proven
 /// healthy). A marker for a DIFFERENT version is stale (e.g. left over after a
 /// rollback or external install) and is also removed.
+///
+/// # Blocking
+///
+/// This performs blocking file I/O, including a cold read + SHA-256 of the
+/// ~58 MB known-good blob when there is a marker to retire
+/// ([`discard_known_good_at`]). Callers on a tokio runtime MUST run it via
+/// `spawn_blocking` — `bin/freenet.rs`'s commit task does, and
+/// `commit_probation_runs_on_a_blocking_thread` pins that.
 pub fn commit_probation(current_version: &str) {
     if let Some(dir) = state_dir() {
         match commit_probation_at(dir.as_path(), current_version) {
@@ -625,8 +700,9 @@ pub(crate) fn commit_probation_at(dir: &Path, current_version: &str) -> CommitOu
             // crash in between leaves an orphaned blob that the next install's
             // capture overwrites (today's steady state, harmless); the reverse
             // order would leave an ARMED marker advertising a rollback target
-            // that no longer exists. `discard_known_good_at` re-checks the
-            // marker, so the safe order is enforced, not just documented.
+            // that no longer exists. `discard_known_good_at`'s marker re-check
+            // enforces that ordering for THIS process — it does not make the
+            // reclaim safe against a concurrent `freenet update`; see its docs.
             remove_probation_at(dir);
             discard_known_good_at(dir, &retired_meta(&state));
             CommitOutcome::Committed
@@ -1224,6 +1300,77 @@ mod tests {
     }
 
     #[test]
+    fn commit_leaves_a_same_size_blob_whose_content_differs() {
+        // The size check alone is not enough: a concurrent install can capture
+        // a DIFFERENT binary that happens to be the same length. Identity has
+        // to come from the SHA-256, so this case must survive too. (Without
+        // this, mutating the guard down to a size-only comparison stays green.)
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        setup_probation(dir, "0.2.84", "0.2.83");
+        let recorded = read_probation_at(dir).unwrap();
+        // Same length as b"GOOD-BINARY", one byte different.
+        let impostor = b"GOOD-BINARZ";
+        assert_eq!(impostor.len() as u64, recorded.rollback_size);
+        std::fs::write(known_good_path(dir), impostor).unwrap();
+
+        assert_eq!(commit_probation_at(dir, "0.2.84"), CommitOutcome::Committed);
+
+        assert_eq!(std::fs::read(known_good_path(dir)).unwrap(), impostor);
+    }
+
+    #[test]
+    fn begin_probation_disarms_when_the_known_good_blob_is_missing() {
+        // The concurrent-install race from the other end: if the blob a marker
+        // names has been reclaimed by a node's probation commit while we were
+        // arming, we must NOT leave an armed marker pointing at nothing — that
+        // burns the crash budget to RollbackUnavailable and suppresses the
+        // ordinary forward-update self-heal. Disarm and surface instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let live = dir.join("freenet");
+        write_dummy_binary(&live, b"GOOD-BINARY");
+        let meta = capture_known_good_at(dir, &live).unwrap();
+        // Stand in for a concurrent commit reclaiming the blob.
+        std::fs::remove_file(known_good_path(dir)).unwrap();
+
+        let err = begin_probation_at(dir, "0.2.84", "0.2.83", &live, &meta)
+            .expect_err("must not arm a marker whose rollback target is gone");
+
+        assert!(
+            format!("{err:#}").contains("no rollback protection"),
+            "error must say the version is unprotected: {err:#}"
+        );
+        assert!(
+            read_probation_at(dir).is_none(),
+            "the lying marker must be removed, not left armed"
+        );
+        // And with no marker, a later crash falls through to the normal update
+        // flow (the #4549 forward self-heal) rather than to RollbackUnavailable.
+        assert_eq!(
+            handle_post_stop_at(dir, "101", "0.2.84"),
+            PostStopOutcome::Proceed
+        );
+    }
+
+    #[test]
+    fn begin_probation_arms_normally_when_the_blob_is_present() {
+        // Guard against the check above being over-eager: the ordinary install
+        // path (blob captured, then probation armed) must still arm.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let live = dir.join("freenet");
+        write_dummy_binary(&live, b"GOOD-BINARY");
+        let meta = capture_known_good_at(dir, &live).unwrap();
+
+        begin_probation_at(dir, "0.2.84", "0.2.83", &live, &meta).unwrap();
+
+        let state = read_probation_at(dir).expect("armed");
+        assert_eq!(state.new_version, "0.2.84");
+        assert_eq!(state.previous_version, "0.2.83");
+    }
+
+    #[test]
     fn discard_known_good_refuses_while_a_probation_marker_exists() {
         // The fail-safe ordering (remove the marker, THEN reclaim) is enforced
         // by this guard, not merely documented: reclaiming while armed would
@@ -1247,6 +1394,56 @@ mod tests {
             handle_post_stop_at(dir, "101", "0.2.84"),
             PostStopOutcome::RolledBack { .. }
         ));
+    }
+
+    /// Source pin: the marker re-check must sit BETWEEN the hash and the
+    /// unlink. A behavioural test cannot cover this — the difference is purely
+    /// when the read happens relative to a multi-second hash of a cold ~58 MB
+    /// file, and staging that would mean a sleep-based race, i.e. a flaky test.
+    /// So pin the ordering in the source instead. Needles are split with
+    /// `concat!` so this test cannot match its own text.
+    #[test]
+    fn discard_rechecks_the_marker_after_hashing_and_before_unlinking() {
+        let src = include_str!("rollback.rs");
+        let fn_start = src
+            .find(concat!("fn discard_", "known_good_at("))
+            .expect("discard fn present");
+        let body = &src[fn_start..];
+        let body = &body[..body.find("\n}\n").expect("fn body terminates")];
+
+        let hash_at = body
+            .find(concat!("sha256", "_file("))
+            .expect("the blob is hashed");
+        let unlink_at = body
+            .find(concat!("remove", "_file("))
+            .expect("the blob is unlinked");
+        assert!(hash_at < unlink_at, "hash must precede the unlink");
+        assert!(
+            body[hash_at..unlink_at].contains(concat!("read_", "probation_at(")),
+            "the probation marker MUST be re-read between hashing the blob and \
+             unlinking it — a marker armed during the hash would otherwise be \
+             missed, leaving an armed marker pointing at a deleted binary"
+        );
+    }
+
+    /// Source pin: the probation commit does a cold ~58 MB read + SHA-256, so
+    /// it must never run on a tokio worker thread. It fires at T+60s of the
+    /// first boot after every auto-update, on every peer, during ring
+    /// bootstrap — blocking a worker there is a fleet-wide regression.
+    /// Whitespace-stripped so rustfmt reflowing the call cannot break it.
+    #[test]
+    fn commit_probation_runs_on_a_blocking_thread() {
+        let src = include_str!("../freenet.rs");
+        let stripped: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            stripped.contains(concat!(
+                "spawn_blocking(move||commands::rollback::",
+                "commit_probation(&version))"
+            )),
+            "bin/freenet.rs must call rollback::commit_probation via \
+             spawn_blocking; it performs a cold ~58 MB read + SHA-256 and would \
+             stall a runtime worker during ring bootstrap"
+        );
     }
 
     #[test]
@@ -1395,13 +1592,14 @@ mod tests {
         assert!(!is_version_pinned_bad_at(dir, "0.2.85"));
         assert!(!is_version_pinned_bad_at(dir, "0.2.83"));
 
-        // A successful forward install supersedes the pin.
+        // A successful forward install supersedes the pin. Capture a real
+        // known-good blob first, as every production caller does — arming
+        // probation now verifies its rollback target exists and refuses to
+        // record one that does not (see
+        // begin_probation_disarms_when_the_known_good_blob_is_missing).
         let live = dir.join("freenet");
         write_dummy_binary(&live, b"NEWER");
-        let meta = KnownGoodMeta {
-            size: 5,
-            sha256: "x".repeat(64),
-        };
+        let meta = capture_known_good_at(dir, &live).unwrap();
         begin_probation_at(dir, "0.2.85", "0.2.83", &live, &meta).unwrap();
         assert!(!is_version_pinned_bad_at(dir, "0.2.84"));
     }

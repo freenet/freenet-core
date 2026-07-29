@@ -350,6 +350,14 @@ async fn run_network_node_with_signals(
     // crashes before the window elapses, the task dies with the process and the
     // probation marker stays armed (so the supervisor's post-stop `freenet
     // update` can count the crash and eventually roll back).
+    //
+    // `commit_probation` is BLOCKING file I/O, and not a trivial amount of it:
+    // committing reclaims the retained known-good binary, which means a cold
+    // read + SHA-256 of a ~58 MB file (tens of ms on NVMe, seconds on a spinning
+    // disk or a slow VM). It fires at T+60s of the first boot after every
+    // auto-update — i.e. on every peer, every release, while the ring is still
+    // bootstrapping — so it MUST NOT run on a runtime worker thread. Keep it on
+    // `spawn_blocking`; see `rollback::commit_probation`.
     let commit_probation_task = {
         let version = build_info::VERSION.to_string();
         GlobalExecutor::spawn(async move {
@@ -357,7 +365,12 @@ async fn run_network_node_with_signals(
                 commands::rollback::COMMIT_HEALTHY_UPTIME_SECS,
             ))
             .await;
-            commands::rollback::commit_probation(&version);
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || commands::rollback::commit_probation(&version))
+                    .await
+            {
+                tracing::warn!(error = %e, "Auto-update probation commit task failed to run");
+            }
         })
     };
 
