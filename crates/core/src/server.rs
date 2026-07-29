@@ -652,6 +652,7 @@ async fn serve_client_api_in_impl(
         &ws_socket,
         origin_contracts.clone(),
         crate::contract::user_input::pending_prompts(),
+        config.webapp_cache_dir.clone(),
     );
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_origin_contracts(gw_router, origin_contracts);

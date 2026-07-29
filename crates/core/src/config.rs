@@ -1036,6 +1036,9 @@ impl ConfigArgs {
                 // Runtime-only: resolve the secrets dir for this mode so the WS
                 // serve layer can stamp per-user activity markers (#4561).
                 secrets_dir: config_paths.secrets_dir(mode),
+                // Runtime-only: resolve the unpacked-webapp cache so the HTTP
+                // layer knows which directory its LRU sweep may delete from.
+                webapp_cache_dir: default_webapp_cache_dir(),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -2329,6 +2332,42 @@ pub struct WebsocketApiConfig {
     /// has no secrets tree to mark.
     #[serde(skip)]
     pub secrets_dir: std::path::PathBuf,
+
+    /// Directory holding unpacked web-contract bundles, derived in `build()`
+    /// (see [`default_webapp_cache_dir`]). Runtime-only for the same reason as
+    /// `secrets_dir` above: it is a resolved path, not operator-authored TOML.
+    ///
+    /// The HTTP layer builds its `WebappCache` from this and threads it to the
+    /// web handlers. It is a config value rather than a process global on
+    /// purpose — the cache is size-bounded by LRU EVICTION, so whoever owns the
+    /// path owns a directory something will delete from. Two consequences:
+    /// a node pointed at a temp data dir (every `#[freenet_test]` node) gets an
+    /// isolated cache instead of sweeping the developer's real one, and two
+    /// nodes run by the same user can be given separate caches instead of
+    /// silently sharing one.
+    #[serde(skip)]
+    pub webapp_cache_dir: std::path::PathBuf,
+}
+
+/// Default directory for unpacked web-contract bundles.
+///
+/// The XDG cache dir (`~/.cache/freenet/webapp_cache` on Linux), which is where
+/// this cache has always lived — deliberately unchanged, because relocating it
+/// would strand every existing installation's directory with nothing left to
+/// sweep it, which is the opposite of what the size bound is for.
+///
+/// `FREENET_WEBAPP_CACHE_DIR` overrides it. That exists for operators running
+/// several nodes as one user: the cache is per-user by default but its eviction
+/// guards are per-process, so pointing each node at its own directory is the
+/// clean way to keep one node's sweep away from another's entries.
+pub fn default_webapp_cache_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("FREENET_WEBAPP_CACHE_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    directories::ProjectDirs::from("", "The Freenet Project Inc", "freenet")
+        .map(|dirs| dirs.cache_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("freenet"))
+        .join("webapp_cache")
 }
 
 #[inline]
@@ -2375,6 +2414,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             per_user_op_burst: default_per_user_op_burst(),
             per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
             secrets_dir: std::path::PathBuf::new(),
+            webapp_cache_dir: default_webapp_cache_dir(),
         }
     }
 }
@@ -2394,6 +2434,7 @@ impl Default for WebsocketApiConfig {
             per_user_op_burst: default_per_user_op_burst(),
             per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
             secrets_dir: std::path::PathBuf::new(),
+            webapp_cache_dir: default_webapp_cache_dir(),
         }
     }
 }
@@ -4999,6 +5040,7 @@ mod tests {
                 // serde-skip runtime field; repopulated by build() and not
                 // asserted in the round-trip (bound to `_` in the destructure).
                 secrets_dir: std::path::PathBuf::new(),
+                webapp_cache_dir: default_webapp_cache_dir(),
             },
             secrets: base.secrets.clone(),
             log_level: tracing::log::LevelFilter::Debug,
@@ -5205,6 +5247,9 @@ mod tests {
             per_user_op_burst,
             per_user_export_min_interval_secs,
             secrets_dir: _, // serde-skip runtime field, repopulated by build()
+            // serde-skip runtime field, repopulated by build() from
+            // `default_webapp_cache_dir()` (env-overridable).
+            webapp_cache_dir: _,
         } = ws_api;
         assert_eq!(ws_address, seed.ws_api.address, "ws_api.address");
         assert_eq!(ws_port, seed.ws_api.port, "ws_api.port");

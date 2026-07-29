@@ -521,6 +521,9 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
         let ws_port_var = format_ident!("ws_port_{}", idx);
         let origin_contracts_var = format_ident!("origin_contracts_{}", idx);
         let api_clients_var = format_ident!("api_clients_{}", idx);
+        // Same per-node `temp_N` the config setup created (see
+        // `generate_node_setup`), reused here to scope the webapp cache.
+        let temp_var = format_ident!("temp_{}", idx);
 
         builds.push(quote! {
             tracing::info!("Building node: {}", #node_label);
@@ -530,7 +533,16 @@ fn generate_node_builds(args: &FreenetTestArgs) -> TokenStream {
             // release-then-rebind race window in parallel tests
             let ws_listener = freenet::test_utils::take_reserved_tcp_listener(#ws_port_var)
                 .expect("ws port should have been reserved");
-            let built_config = #config_var.build().await?;
+            let mut built_config = #config_var.build().await?;
+            // Point this node's unpacked-webapp cache at its own temp dir. The
+            // cache is LRU-size-bounded, so serving a web contract DELETES from
+            // whatever directory this names; left at the default it is the
+            // developer's real `~/.cache/freenet/webapp_cache`, and a test that
+            // fetches a shell page (tests/playwright_shell.rs does, on a plain
+            // `cargo test`) would evict it — including entries a node running
+            // as the same user is serving right now.
+            built_config.ws_api.webapp_cache_dir =
+                #temp_var.path().join("webapp_cache");
             let mut node_config = freenet::local_node::NodeConfig::new(built_config.clone()).await?;
             node_config.relay_ready_connections(Some(0));
             #connection_tuning
@@ -855,6 +867,57 @@ mod tests {
              have the event log off by default (#4968) and #[freenet_test] reads \
              it back for failure reports and for assert-absence tests, so \
              dropping this silently empties both. See #4972.\nGenerated:\n{generated}"
+        );
+    }
+
+    /// Every harness node must redirect its unpacked-webapp cache into its own
+    /// temp dir.
+    ///
+    /// That cache is bounded by LRU EVICTION, so serving a web contract DELETES
+    /// from whatever directory the node is pointed at. Left at the default it is
+    /// the developer's real `~/.cache/freenet/webapp_cache`, and
+    /// `tests/playwright_shell.rs` fetches a shell page on a plain `cargo test`
+    /// — so dropping this makes the suite silently evict a real cache down to
+    /// the production budget, and, since the eviction guards are per-process
+    /// while the directory is per-user, evict entries a node running as the same
+    /// user is serving right now.
+    ///
+    /// This is the second attempt at that isolation. The first gated a temp-dir
+    /// redirect on `#[cfg(test)]`, which is FALSE in an integration test (the
+    /// lib is linked as an ordinary dependency there), so it covered unit tests
+    /// only and left the path above wide open. Hence a pin here, on the harness
+    /// that integration tests actually go through.
+    ///
+    /// Asserts against generated TOKENS, per the note on the test above, and
+    /// expects one assignment per node so dropping it from only the gateway arm
+    /// or only the peer arm still trips.
+    #[test]
+    fn every_node_isolates_its_webapp_cache() {
+        let args: FreenetTestArgs = syn::parse2(quote! { nodes = ["gateway", "peer-1"] }).unwrap();
+        let expected = args.nodes.len();
+
+        let generated = generate_node_builds(&args).to_string();
+        let normalized: String = generated.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Vacuity guard: the count below only means "once per node" if the
+        // fixture really builds one server per node.
+        assert_eq!(
+            normalized
+                .matches("serve_client_api_with_listener_and_contracts")
+                .count(),
+            expected,
+            "pin guard: expected one server per node, so this test is asserting \
+             against the wrong thing. Generated:\n{generated}"
+        );
+
+        let count = normalized.matches("ws_api.webapp_cache_dir=").count();
+        assert_eq!(
+            count, expected,
+            "each of the {expected} harness nodes must point \
+             `ws_api.webapp_cache_dir` at its own temp dir (found {count}). The \
+             webapp cache is LRU-evicted, so without this a test that serves a \
+             web contract deletes from the developer's real cache.\n\
+             Generated:\n{generated}"
         );
     }
 }
