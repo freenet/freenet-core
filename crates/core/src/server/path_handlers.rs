@@ -1357,22 +1357,31 @@ pub(super) async fn variable_content(
         .await
         .map_err(Box::new)?;
 
-    // Parse the full request path URI to extract the relative path using the v1 helper.
-    let req_uri =
-        req_path
-            .parse::<axum::http::Uri>()
-            .map_err(|err| WebSocketApiError::InvalidParam {
-                error_cause: format!("Failed to parse request path as URI: {err}"),
-            })?;
-    debug!("variable_content: Parsed request URI: {:?}", req_uri);
-
-    let relative_path = get_file_path(req_uri)?;
+    // Extract the relative asset path from the already-decoded request path.
+    //
+    // `req_path` is built by the caller from axum's percent-DECODED wildcard
+    // segment, so it may legitimately contain characters (spaces, `<`, `>`,
+    // backticks, …) that are invalid in a raw URI. The previous implementation
+    // re-parsed `req_path` as an `axum::http::Uri`, which rejected any such
+    // character with a 400 — so an asset named `my image.png` 404'd/400'd, and
+    // because that error carried no CORS header the sandboxed iframe surfaced
+    // it as an opaque "CORS error" instead of a real status (user report:
+    // SUB0PT1MAL / cirro, 2026-07-29). Strip the prefix textually instead; no
+    // URI round-trip, so the decoded name reaches the filesystem unharmed.
+    let relative_path = relative_asset_path(&req_path).map_err(Box::new)?;
     debug!(
         "variable_content: Extracted relative path: {}",
         relative_path
     );
 
-    let file_path = base_path.join(relative_path);
+    // Resolve the relative path UNDER the contract's cache dir with a
+    // traversal guard. do NOT remove — this is the containment check that
+    // stops `..%2f..%2fetc%2fpasswd` and `%2fetc%2fpasswd` (which decode to
+    // `../../etc/passwd` and `/etc/passwd`) from escaping the cache and
+    // serving arbitrary local files. See `resolve_web_asset_path` and
+    // hosting/security notes; sibling `sandbox_content_body` has the same
+    // guard for HTML pages.
+    let file_path = resolve_web_asset_path(&base_path, &relative_path).map_err(Box::new)?;
     debug!("variable_content: Full file path to serve: {:?}", file_path);
     debug!(
         "variable_content: Checking if file exists: {}",
@@ -1847,13 +1856,16 @@ const WEBSOCKET_SHIM_JS: &str = include_str!("path_handlers/assets/websocket_shi
 const NAVIGATION_INTERCEPTOR_JS: &str =
     include_str!("path_handlers/assets/navigation_interceptor.js");
 
-/// Extracts the relative file path from a contract web URI.
+/// Strips the version + contract + key prefix from a request path and returns
+/// the remaining relative asset path (e.g. `assets/app.js`, or `my image.png`).
 ///
-/// Strips the version and contract key prefix (e.g. `/v1/contract/web/{key}/`)
-/// and returns the remaining path (e.g. `assets/app.js`).
-fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocketApiError>> {
-    let path_str = uri.path();
-
+/// Operates on the raw string rather than an `axum::http::Uri` so a decoded
+/// filename containing URI-invalid characters (spaces, `<`, `>`, backticks)
+/// survives — re-parsing such a string as a `Uri` is what produced the spurious
+/// 400 behind the SUB0PT1MAL/cirro CORS report. Query/fragment stripping is
+/// unnecessary here: the caller builds this path from axum's `{*path}` wildcard,
+/// which already excludes the query string.
+fn relative_asset_path(path_str: &str) -> Result<String, WebSocketApiError> {
     let remainder = if let Some(rem) = path_str.strip_prefix("/v1/contract/web/") {
         rem
     } else if let Some(rem) = path_str.strip_prefix("/v1/contract/") {
@@ -1863,20 +1875,75 @@ fn get_file_path(uri: axum::http::Uri) -> Result<String, Box<WebSocketApiError>>
     } else if let Some(rem) = path_str.strip_prefix("/v2/contract/") {
         rem
     } else {
-        return Err(Box::new(WebSocketApiError::InvalidParam {
+        return Err(WebSocketApiError::InvalidParam {
             error_cause: format!(
                 "URI path '{path_str}' does not start with /v1/contract/ or /v2/contract/"
             ),
-        }));
+        });
     };
 
     // remainder contains "{key}/{path}" or just "{key}"
     let file_path = match remainder.split_once('/') {
         Some((_key, path)) => path.to_string(),
-        None => "".to_string(),
+        None => String::new(),
     };
 
     Ok(file_path)
+}
+
+/// Resolves a decoded relative asset path underneath `base` (the contract's
+/// on-disk cache directory), rejecting any path that would escape it.
+///
+/// # Why this exists (path traversal — arbitrary local file read)
+///
+/// The relative path comes from axum's percent-DECODED `{*path}` wildcard, so
+/// `..%2f..%2fetc%2fpasswd` arrives as `../../etc/passwd` and `%2fetc%2fpasswd`
+/// as the absolute `/etc/passwd`. `Path::join` with an absolute path REPLACES
+/// the base entirely, and `..` components walk out of it — so joining the raw
+/// relative path and serving it read any file the node process could open. The
+/// sandbox CORS header (`Access-Control-Allow-Origin: *`) is added to this
+/// path's responses, which let a malicious web contract's iframe JS read the
+/// escaped file cross-origin. This guard closes both.
+///
+/// A component-level check rejects `..`, root, and drive-prefix components
+/// WITHOUT requiring the target to exist, so a genuinely-missing asset still
+/// falls through to a normal 404 (callers serve `base.join(rel)` and 404 on a
+/// missing file). When the resolved path DOES exist we additionally canonicalize
+/// and re-verify containment as a symlink/TOCTOU guard, mirroring the sibling
+/// `sandbox_content_body`.
+///
+/// do NOT remove or weaken — this is a security boundary.
+fn resolve_web_asset_path(base: &Path, relative: &str) -> Result<PathBuf, WebSocketApiError> {
+    use std::path::Component;
+
+    let rel = Path::new(relative);
+    for component in rel.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(WebSocketApiError::InvalidParam {
+                error_cause: "Path traversal not allowed".to_string(),
+            });
+        }
+    }
+
+    let joined = base.join(rel);
+
+    // Defense-in-depth against a symlink inside the cache dir pointing out, and
+    // against any lexical corner the component scan missed: if the path resolves
+    // on disk, its canonical form must still live under the canonical base. A
+    // missing file (canonicalize fails) is left to the caller's normal 404 —
+    // enforcing existence here would turn every absent asset into an error.
+    if let (Ok(canonical_file), Ok(canonical_base)) = (joined.canonicalize(), base.canonicalize()) {
+        if !canonical_file.starts_with(&canonical_base) {
+            return Err(WebSocketApiError::InvalidParam {
+                error_cause: "Path traversal not allowed".to_string(),
+            });
+        }
+    }
+
+    Ok(joined)
 }
 
 fn hash_state(state: &[u8]) -> u64 {
@@ -3455,6 +3522,164 @@ mod tests {
 
         // Clean up last so a failed assertion above doesn't leave residue
         // that flips the next run's cold-cache check into warm-cache state.
+        clear_cache(&instance_id).await;
+    }
+
+    /// Regression for the SUB0PT1MAL/cirro CORS report (2026-07-29): an asset
+    /// whose (decoded) filename contains a space must be SERVED, not rejected.
+    ///
+    /// The browser requests `.../my%20image.png`; axum decodes the wildcard to
+    /// `my image.png`; the caller rebuilds `/v1/contract/web/{key}/my image.png`
+    /// and passes it here. The old code re-parsed that as an `axum::http::Uri`,
+    /// which fails on the space with a 400 — and because the sandboxed iframe's
+    /// subresource fetch has a null origin, the CORS-less 400 surfaced to the
+    /// app as an opaque "CORS error". The fix strips the prefix textually, so
+    /// the space survives and the file is served byte-for-byte.
+    #[tokio::test]
+    async fn variable_content_serves_asset_with_space_in_filename() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x50;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(cache_dir.join("my image.png"), b"png-bytes-here")
+            .await
+            .unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        let (sender, _rx) = request_channel();
+        let response = variable_content(
+            key.clone(),
+            // The reconstructed path carries the DECODED space, exactly as the
+            // caller builds it from axum's `{*path}` wildcard.
+            format!("/v1/contract/web/{key}/my image.png"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await
+        .expect("a spaced filename must not be rejected as an invalid URI")
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "asset with a space in its name must serve 200, not 400"
+        );
+        let body = response_body(response).await;
+        assert_eq!(body, "png-bytes-here", "must serve the primed file bytes");
+
+        clear_cache(&instance_id).await;
+    }
+
+    /// Security regression: a `../`-style traversal in the (decoded) asset path
+    /// must NOT read a file outside the contract's cache directory.
+    ///
+    /// `..%2f..%2f…` decodes to `../../…`; the old code joined it onto the cache
+    /// dir with no containment check and served whatever it resolved to — an
+    /// unauthenticated arbitrary local-file read, made cross-origin-readable by
+    /// the sandbox `Access-Control-Allow-Origin: *` header. The guard rejects
+    /// the escape.
+    #[tokio::test]
+    async fn variable_content_rejects_parent_dir_traversal() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x51;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        // Warm cache so we get past the refresh gate, plus a "secret" file
+        // planted one level ABOVE the entry dir (i.e. in the cache root) that a
+        // successful `../` escape would expose.
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+        let secret_name = format!("SECRET-{key}.txt");
+        let secret_path = cache_dir.parent().unwrap().join(&secret_name);
+        tokio::fs::write(&secret_path, b"TOP-SECRET").await.unwrap();
+
+        let (sender, _rx) = request_channel();
+        let result = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/../{secret_name}"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await;
+
+        // Must be rejected (Err), and even if a future refactor returns a
+        // response, it must NOT contain the secret bytes.
+        let leaked = match result {
+            Err(_) => false,
+            Ok(r) => response_body(r).await.contains("TOP-SECRET"),
+        };
+        assert!(
+            !leaked,
+            "`../` traversal must not read a file outside the contract cache dir"
+        );
+
+        tokio::fs::remove_file(&secret_path).await.ok();
+        clear_cache(&instance_id).await;
+    }
+
+    /// Security regression: an ABSOLUTE path smuggled in via `%2f` (which
+    /// decodes to a leading `/`, e.g. `%2fetc%2fhostname` → `/etc/hostname`)
+    /// must NOT be served. `Path::join` with an absolute path replaces the base
+    /// entirely, so without the guard this read arbitrary absolute paths.
+    #[tokio::test]
+    async fn variable_content_rejects_absolute_path_escape() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x52;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        // A secret at an absolute path outside any cache dir.
+        let secret_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret_file.path(), b"ABSOLUTE-SECRET").unwrap();
+        let abs = secret_file.path().to_string_lossy().into_owned();
+
+        let (sender, _rx) = request_channel();
+        // The `//` mirrors what the caller builds when the decoded segment is
+        // itself absolute (`{key}` + `/` + `/abs/path`).
+        let result = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/{abs}"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await;
+
+        let leaked = match result {
+            Err(_) => false,
+            Ok(r) => response_body(r).await.contains("ABSOLUTE-SECRET"),
+        };
+        assert!(
+            !leaked,
+            "an absolute-path escape must not read a file outside the cache dir"
+        );
+
         clear_cache(&instance_id).await;
     }
 
@@ -5956,8 +6181,7 @@ mod tests {
         let base_dir = PathBuf::from(
             "/tmp/freenet/webapp_cache/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/",
         );
-        let uri: axum::http::Uri = req_path.parse().unwrap();
-        let parsed = get_file_path(uri).unwrap();
+        let parsed = relative_asset_path(req_path).unwrap();
         let result = base_dir.join(parsed);
         assert_eq!(
             PathBuf::from(
@@ -5973,8 +6197,7 @@ mod tests {
         let base_dir = PathBuf::from(
             "/tmp/freenet/webapp_cache/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/",
         );
-        let uri: axum::http::Uri = req_path.parse().unwrap();
-        let parsed = get_file_path(uri).unwrap();
+        let parsed = relative_asset_path(req_path).unwrap();
         let result = base_dir.join(parsed);
         assert_eq!(
             PathBuf::from(
@@ -5988,16 +6211,23 @@ mod tests {
     fn get_path_v2_web() {
         let req_path =
             "/v2/contract/web/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/assets/app.js";
-        let uri: axum::http::Uri = req_path.parse().unwrap();
-        let parsed = get_file_path(uri).unwrap();
+        let parsed = relative_asset_path(req_path).unwrap();
         assert_eq!(parsed, "assets/app.js");
     }
 
+    /// A filename with a space must extract cleanly — the old `Uri`-based
+    /// extractor rejected it (SUB0PT1MAL/cirro CORS report, 2026-07-29).
     #[test]
-    fn get_file_path_rejects_unknown_version() {
+    fn relative_asset_path_preserves_space_in_filename() {
+        let req_path = "/v1/contract/web/HjpgVdSziPUmxFoBgTdMkQ8xiwhXdv1qn5ouQvSaApzD/my image.png";
+        let parsed = relative_asset_path(req_path).unwrap();
+        assert_eq!(parsed, "my image.png");
+    }
+
+    #[test]
+    fn relative_asset_path_rejects_unknown_version() {
         let req_path = "/v3/contract/web/somekey/assets/app.js";
-        let uri: axum::http::Uri = req_path.parse().unwrap();
-        let result = get_file_path(uri);
+        let result = relative_asset_path(req_path);
         assert!(result.is_err(), "expected error for /v3/ prefix");
     }
 

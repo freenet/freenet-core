@@ -569,7 +569,7 @@ async fn web_subpages(
 
     let version_prefix = api_version.prefix();
     let full_path: String = format!("/{version_prefix}/contract/web/{key}/{last_path}");
-    path_handlers::variable_content(
+    let result = path_handlers::variable_content(
         key,
         full_path,
         api_version,
@@ -577,12 +577,21 @@ async fn web_subpages(
         &config.webapp_cache,
     )
     .await
-    .map_err(|e| *e)
-    .map(|r| {
-        let mut response = r.into_response();
-        add_sandbox_cors_headers(&mut response);
-        response
-    })
+    .map_err(|e| *e);
+    // Attach the sandbox CORS headers to BOTH success and error responses. The
+    // sandboxed iframe has a null origin, so a subresource response WITHOUT
+    // `Access-Control-Allow-Origin` is reported by the browser as an opaque
+    // "CORS error" that masks the real status — a plain 404 for a missing asset
+    // (or a 400 for a rejected path) looked like a CORS failure to the app
+    // (user report: SUB0PT1MAL / cirro, 2026-07-29). Building the response from
+    // the error here, and then adding the headers, lets the app see the true
+    // status with CORS allowed.
+    let mut response = match result {
+        Ok(r) => r.into_response(),
+        Err(e) => e.into_response(),
+    };
+    add_sandbox_cors_headers(&mut response);
+    Ok(response)
 }
 
 /// Builds a 303 redirect to the contract's shell root, preserving
@@ -1515,6 +1524,53 @@ mod tests {
                 // not take a redirect branch.
             }
         }
+    }
+
+    /// Regression for the SUB0PT1MAL/cirro CORS report (2026-07-29): an ERROR
+    /// subresource response from `web_subpages` MUST still carry
+    /// `Access-Control-Allow-Origin: *`.
+    ///
+    /// The sandboxed iframe has a null origin, so a subresource fetch whose
+    /// response lacks the CORS header is reported by the browser as an opaque
+    /// "CORS error" that masks the real status. Previously only the SUCCESS
+    /// branch of `web_subpages` added the header; a `variable_content` error
+    /// (e.g. a rejected path, which returns `Err(InvalidParam)` → 400) returned
+    /// a bare response, so the app saw an opaque CORS failure instead of the
+    /// true 400. We drive the error branch with a traversal path (a clean
+    /// `Err`) and assert the response is both 400 AND CORS-allowed.
+    #[tokio::test]
+    async fn web_subpages_error_response_carries_cors_header() {
+        let key = valid_contract_key_b58();
+
+        // A `..` traversal makes `variable_content` return Err(InvalidParam).
+        // Non-HTML + no `Sec-Fetch-Dest` so it falls through to
+        // `variable_content` rather than the shell/sandbox branches.
+        let resp = web_subpages(
+            key,
+            "../../../etc/hostname".to_string(),
+            ApiVersion::V1,
+            None,
+            axum::http::HeaderMap::new(),
+            &localhost_config(),
+            dead_request_sender(),
+            false,
+        )
+        .await
+        .expect("web_subpages must convert the inner error into a response, not propagate it");
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "a rejected traversal path must surface as 400"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|v| v.to_str().unwrap_or("")),
+            Some("*"),
+            "even an error subresource response must carry the sandbox CORS header, \
+             otherwise the null-origin iframe surfaces it as an opaque CORS error"
+        );
     }
 
     /// Regression test pinning the ordering inside `web_subpages`: a
