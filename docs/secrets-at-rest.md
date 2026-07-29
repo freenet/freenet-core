@@ -174,6 +174,31 @@ consequence: if you restore from a snapshot older than the 2-year
 already the active secret by then) and stays reversible — the prior
 active value is captured as a fresh snapshot before the overwrite.
 
+#### What gets snapshotted, and how much history is kept
+
+A snapshot is taken only when a write actually **changes** the secret's
+plaintext. Re-writing a byte-identical value is a no-op for history: the
+snapshot would be a second copy of a value already on disk, and since
+every write draws a fresh AEAD nonce, that copy is a distinct ciphertext
+no deduplication can reclaim later. Any uncertainty about the current
+on-disk value (unreadable file, unexpected size, a blob that does not
+decrypt) falls back to taking the snapshot.
+
+Retained history per secret is bounded on three axes:
+
+| Axis | Default | Effect |
+|------|---------|--------|
+| Count tiers | last 5, then 1/min x10, 1/hour x24, 1/day x7, 1/week x4, 1/month x12 | ~62 versions in steady state |
+| `max_age` | 2 years | drops anything older, overriding the tiers |
+| `max_total_bytes` | 3 MiB | drops the OLDEST survivors until the rest fit |
+
+The byte budget is what keeps a large secret from turning a generous
+version count into tens of megabytes of disk — a ~1 MiB value keeps a
+handful of versions instead of ~30, while small secrets stay well under
+the budget and keep their full tiered history. It never empties a
+history: if a single version is larger than the whole budget it is
+retained anyway, so "undo the last write" always works.
+
 ### Export / import a portable secrets bundle (#4035, P3 of #4381)
 
 Unlike snapshot-restore, `export`/`import` move secrets BETWEEN nodes.

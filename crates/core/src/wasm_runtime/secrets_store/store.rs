@@ -774,8 +774,16 @@ impl SecretsStore {
         //     inode and only `rename` makes it visible at the active path,
         //   - update index AFTER the active rename so a crash between rename
         //     and index-update still gives `get_secret` the new value.
-        if take_snapshots
+        //
+        // A write that does not CHANGE the plaintext is skipped entirely
+        // (`active_plaintext_matches`): the snapshot would be a second,
+        // differently-nonced ciphertext for a value we already hold, so it
+        // buys no recovery and cannot be deduped away later. The check is
+        // fail-safe — any doubt about what is on disk means we snapshot.
+        let needs_snapshot = take_snapshots
             && secret_file_path.exists()
+            && !self.active_plaintext_matches(&encryption, &secret_file_path, plaintext.as_slice());
+        if needs_snapshot
             && let Err(e) = self.snapshot_prior_value(&scope_path, key, &secret_file_path)
         {
             // Snapshotting is best-effort. A failure here must not block the
@@ -961,6 +969,90 @@ impl SecretsStore {
         secret_file_path: &Path,
     ) -> std::io::Result<()> {
         snapshot_active_value(delegate_path, &key.encode(), secret_file_path)
+    }
+
+    /// Does the active secret file already hold exactly `plaintext`?
+    ///
+    /// `store_secret` uses this to skip the pre-overwrite snapshot when a
+    /// write does not change the content. Snapshotting a byte-identical
+    /// value has zero recovery value, and because every write draws a FRESH
+    /// AEAD nonce, the redundant copy is a distinct ciphertext that no
+    /// byte-level dedup can ever reclaim afterwards — on a measured
+    /// production peer, hashing all 1001 snapshot files found zero duplicate
+    /// blobs despite obvious value-level repetition.
+    ///
+    /// FAIL-SAFE BY CONSTRUCTION. Every path except "decrypted the active
+    /// blob and its plaintext hashes equal" returns `false`, i.e. "assume it
+    /// changed, take the snapshot":
+    /// - the file can't be stat'd or read,
+    /// - its length differs from the length this plaintext would produce,
+    /// - it isn't in the current on-disk format,
+    /// - it doesn't decrypt under the scope DEK.
+    ///
+    /// So a corrupt, legacy, or foreign-key blob costs a redundant snapshot,
+    /// never a lost one. That asymmetry is deliberate: the failure mode we
+    /// refuse is "silently declined to preserve a value that was about to be
+    /// overwritten".
+    ///
+    /// The length check runs first and settles the common case for free: an
+    /// on-disk blob is exactly `HEADER_LEN + plaintext + TAG_LEN` bytes, so a
+    /// different plaintext length is proof of a change without reading or
+    /// decrypting anything. Only same-length candidates pay the decrypt,
+    /// which is bounded by the size of the very value this write is already
+    /// encrypting and fsync'ing.
+    ///
+    /// Unlike [`decrypt_secret_blob`], the legacy cipher/format fallback
+    /// chain is deliberately NOT consulted. A blob this node's current writer
+    /// did not produce is exactly the blob most worth preserving before it is
+    /// rewritten, and skipping the chain also keeps this off the write path's
+    /// "migrating a legacy blob" log lines.
+    fn active_plaintext_matches(
+        &self,
+        encryption: &Encryption,
+        secret_file_path: &Path,
+        plaintext: &[u8],
+    ) -> bool {
+        let expected_len = (HEADER_LEN + plaintext.len() + TAG_LEN) as u64;
+        match fs::metadata(secret_file_path) {
+            Ok(md) if md.len() == expected_len => {}
+            // Different size => different plaintext. No read, no decrypt.
+            Ok(_) => return false,
+            Err(e) => {
+                tracing::debug!(
+                    path = %secret_file_path.display(),
+                    error = %e,
+                    "could not stat active secret; snapshotting rather than assuming it is unchanged"
+                );
+                return false;
+            }
+        }
+
+        let blob = match fs::read(secret_file_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(
+                    path = %secret_file_path.display(),
+                    error = %e,
+                    "could not read active secret; snapshotting rather than assuming it is unchanged"
+                );
+                return false;
+            }
+        };
+        // `expected_len` already guarantees `blob.len() >= HEADER_LEN`, but
+        // re-check so this stays correct if the length gate ever moves.
+        if blob.len() < HEADER_LEN || blob.first().copied() != Some(VERSION_V1) {
+            return false;
+        }
+        let nonce = XNonce::from_slice(&blob[1..HEADER_LEN]);
+        let Ok(existing) = encryption.cipher.decrypt(nonce, &blob[HEADER_LEN..]) else {
+            return false;
+        };
+        let existing = Zeroizing::new(existing);
+        // Compare 32-byte BLAKE3 digests rather than the plaintexts: the
+        // comparison then never short-circuits on secret bytes, and a
+        // 256-bit digest makes a false "unchanged" verdict computationally
+        // unreachable.
+        blake3::hash(existing.as_slice()) == blake3::hash(plaintext)
     }
 
     /// Remove a secret under the given `scope`. Local and User scopes are
@@ -4224,6 +4316,7 @@ mod test {
                 max_count: 1,
             }],
             max_age: None,
+            max_total_bytes: None,
         });
 
         let delegate = Delegate::from((&vec![2].into(), &vec![].into()));
@@ -4534,6 +4627,292 @@ mod test {
         Ok(())
     }
 
+    // ===== snapshot-on-write is content-gated =====
+
+    /// Count the snapshot files currently retained for `(delegate, secret)`.
+    fn snapshot_count(secrets_dir: &Path, delegate: &DelegateKey, secret_id: &SecretsId) -> usize {
+        let snap_dir = secrets_dir
+            .join(delegate.encode())
+            .join(SNAPSHOTS_DIR)
+            .join(secret_id.encode());
+        match std::fs::read_dir(&snap_dir) {
+            Ok(rd) => rd.flatten().count(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Total bytes of the snapshot files retained for `(delegate, secret)`.
+    fn snapshot_bytes(secrets_dir: &Path, delegate: &DelegateKey, secret_id: &SecretsId) -> u64 {
+        let snap_dir = secrets_dir
+            .join(delegate.encode())
+            .join(SNAPSHOTS_DIR)
+            .join(secret_id.encode());
+        match std::fs::read_dir(&snap_dir) {
+            Ok(rd) => rd
+                .flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| m.len())
+                .sum(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Re-writing the SAME plaintext must not grow the snapshot history.
+    /// Every write draws a fresh AEAD nonce, so each redundant snapshot is a
+    /// distinct ciphertext that no byte-level dedup can reclaim later — this
+    /// is the 130MB-guarding-6.8MB blowup at its source.
+    #[tokio::test]
+    async fn store_secret_skips_snapshot_when_plaintext_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![41].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![41]);
+
+        let write = |store: &mut SecretsStore, body: &[u8]| -> RuntimeResult<()> {
+            store.store_secret(
+                delegate.key(),
+                &secret_id,
+                SecretScope::Local,
+                Zeroizing::new(body.to_vec()),
+            )?;
+            // Distinct epoch-millis stamps so any snapshot taken is its own
+            // file rather than a collision suffix.
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(())
+        };
+
+        write(&mut store, b"v1")?;
+        assert_eq!(
+            snapshot_count(&secrets_dir, delegate.key(), &secret_id),
+            0,
+            "first write has no prior value to preserve"
+        );
+
+        // Ten identical re-writes: nothing to preserve, nothing written.
+        for _ in 0..10 {
+            write(&mut store, b"v1")?;
+        }
+        assert_eq!(
+            snapshot_count(&secrets_dir, delegate.key(), &secret_id),
+            0,
+            "re-writing an identical plaintext must not create snapshots"
+        );
+
+        // A real change still snapshots the value it replaced.
+        write(&mut store, b"v2")?;
+        assert_eq!(
+            snapshot_count(&secrets_dir, delegate.key(), &secret_id),
+            1,
+            "a changed plaintext must still snapshot the prior value"
+        );
+        // ...and the snapshot holds the value that was overwritten.
+        let snap_dir = secrets_dir
+            .join(delegate.key().encode())
+            .join(SNAPSHOTS_DIR)
+            .join(secret_id.encode());
+        let snaps = list_snapshots(&snap_dir)?;
+        let encryption = store
+            .ciphers
+            .get(delegate.key())
+            .expect("cipher registered")
+            .clone();
+        let blob = std::fs::read(&snaps[0].path)?;
+        let recovered =
+            decrypt_secret_blob(&encryption, &[], None, &blob, &secret_id.encode())?.to_vec();
+        assert_eq!(recovered, b"v1".to_vec());
+
+        // Re-writing the new value is again a no-op for history.
+        for _ in 0..5 {
+            write(&mut store, b"v2")?;
+        }
+        assert_eq!(
+            snapshot_count(&secrets_dir, delegate.key(), &secret_id),
+            1,
+            "identical re-writes after a change must not grow history either"
+        );
+
+        // The active value is still readable and correct throughout.
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
+            b"v2".to_vec()
+        );
+        Ok(())
+    }
+
+    /// The cheap length pre-check must not be mistaken for the whole test:
+    /// a DIFFERENT plaintext of the SAME length must still snapshot.
+    #[tokio::test]
+    async fn store_secret_snapshots_same_length_different_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![42].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![42]);
+
+        // Same length, one byte apart.
+        for body in [b"aaaaaaaa", b"aaaaaaab", b"aaaaaaac"] {
+            store.store_secret(
+                delegate.key(),
+                &secret_id,
+                SecretScope::Local,
+                Zeroizing::new(body.to_vec()),
+            )?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            snapshot_count(&secrets_dir, delegate.key(), &secret_id),
+            2,
+            "same-length content changes must each snapshot the prior value"
+        );
+        Ok(())
+    }
+
+    /// Fail-safe: when the active blob cannot be decrypted (corruption, a
+    /// foreign cipher, a legacy format), we must NOT conclude "unchanged".
+    /// The unreadable value is exactly the one most worth preserving.
+    #[tokio::test]
+    async fn store_secret_snapshots_when_active_blob_is_undecryptable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![43].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![43]);
+
+        let body = b"unchanged-payload".to_vec();
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(body.clone()),
+        )?;
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Corrupt the AEAD tag in place, preserving the blob LENGTH so the
+        // cheap pre-check passes and the decrypt is what rejects it.
+        let secret_path = secrets_dir
+            .join(delegate.key().encode())
+            .join(secret_id.encode());
+        let mut blob = std::fs::read(&secret_path)?;
+        let last = blob.len() - 1;
+        blob[last] ^= 0xff;
+        let len_before = blob.len();
+        std::fs::write(&secret_path, &blob)?;
+
+        // Write the same plaintext again: the on-disk blob is the right size
+        // but does not decrypt, so it must be snapshotted, not skipped.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(body),
+        )?;
+
+        assert_eq!(
+            snapshot_count(&secrets_dir, delegate.key(), &secret_id),
+            1,
+            "an undecryptable active blob must be preserved before overwrite"
+        );
+        // The preserved bytes are the corrupt blob itself (forensics), which
+        // is only meaningful if it really was the same size as a valid one.
+        let snap_dir = secrets_dir
+            .join(delegate.key().encode())
+            .join(SNAPSHOTS_DIR)
+            .join(secret_id.encode());
+        let snaps = list_snapshots(&snap_dir)?;
+        assert_eq!(snaps[0].size_bytes, len_before as u64);
+        Ok(())
+    }
+
+    /// Snapshot history for one secret is bounded in BYTES, not just in
+    /// version count: many large distinct values must not accumulate an
+    /// unbounded history the way ~1 MiB room states did (30.7 MB / 34
+    /// versions on the measured peer).
+    #[tokio::test]
+    async fn store_secret_snapshot_history_respects_byte_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        // Generous count tiers so the BYTE budget is unambiguously what
+        // bounds the history; 40 KiB budget keeps the test fast.
+        const BUDGET: u64 = 40 * 1024;
+        const VALUE_LEN: usize = 10 * 1024;
+        store.set_retention_policy(RetentionPolicy {
+            keep_last: 1000,
+            buckets: vec![],
+            max_age: None,
+            max_total_bytes: Some(BUDGET),
+        });
+
+        let delegate = Delegate::from((&vec![44].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![44]);
+
+        // 30 distinct 10 KiB values: ~300 KiB of history without a budget.
+        for i in 0u8..30 {
+            store.store_secret(
+                delegate.key(),
+                &secret_id,
+                SecretScope::Local,
+                Zeroizing::new(vec![i; VALUE_LEN]),
+            )?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let bytes = snapshot_bytes(&secrets_dir, delegate.key(), &secret_id);
+        let count = snapshot_count(&secrets_dir, delegate.key(), &secret_id);
+        assert!(
+            bytes <= BUDGET,
+            "snapshot history must fit the byte budget; got {bytes} bytes in {count} files"
+        );
+        // Not vacuous: the budget has to leave real, recoverable history.
+        assert!(
+            count >= 3,
+            "a {BUDGET}-byte budget should hold several {VALUE_LEN}-byte versions; got {count}"
+        );
+        // And what survives is the most RECENT history: the newest snapshot
+        // holds the value the last write replaced.
+        let snap_dir = secrets_dir
+            .join(delegate.key().encode())
+            .join(SNAPSHOTS_DIR)
+            .join(secret_id.encode());
+        let snaps = list_snapshots(&snap_dir)?;
+        let newest = snaps.last().expect("history is non-empty");
+        let encryption = store
+            .ciphers
+            .get(delegate.key())
+            .expect("cipher registered")
+            .clone();
+        let blob = std::fs::read(&newest.path)?;
+        let recovered =
+            decrypt_secret_blob(&encryption, &[], None, &blob, &secret_id.encode())?.to_vec();
+        assert_eq!(recovered, vec![28u8; VALUE_LEN], "newest snapshot retained");
+        Ok(())
+    }
+
     /// list_snapshots on a never-written secret returns an empty Vec (not an
     /// error). This mirrors `next_snapshot_path` + the missing-dir branch of
     /// `list_snapshots` in secret_snapshots.rs.
@@ -4830,6 +5209,7 @@ mod test {
             keep_last: 100,
             buckets: vec![],
             max_age: None,
+            max_total_bytes: None,
         });
 
         let delegate = Delegate::from((&vec![70].into(), &vec![].into()));
@@ -5284,6 +5664,7 @@ mod test {
             keep_last: 100,
             buckets: vec![],
             max_age: None,
+            max_total_bytes: None,
         });
 
         // Restore byte-copies legacy AEAD back to the active path.

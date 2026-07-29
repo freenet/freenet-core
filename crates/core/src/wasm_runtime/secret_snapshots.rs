@@ -1,13 +1,18 @@
 //! Tiered retention thinning for delegate secret snapshots.
 //!
 //! Each `(delegate, secret_id)` pair has its own snapshot history. Before a
-//! `store_secret` overwrites an existing value, the previous ciphertext is
-//! moved into a `.snapshots/{secret_id}/{epoch_ms}` file. Retention is then
-//! thinned per the policy below: recent history stays dense, older history
-//! is sampled at progressively coarser intervals (minute / hour / day /
-//! week / month), and an absolute `max_age` cap drops anything older
-//! regardless of which clause selected it. Worst case ~62 entries per
-//! secret in steady state.
+//! `store_secret` overwrites an existing value with DIFFERENT content, the
+//! previous ciphertext is moved into a `.snapshots/{secret_id}/{epoch_ms}`
+//! file. (A write that leaves the plaintext unchanged is skipped — see
+//! `SecretsStore::active_plaintext_matches` — since a second, differently-
+//! nonced copy of a value we already hold buys no recovery.) Retention is
+//! then thinned per the policy below: recent history stays dense, older
+//! history is sampled at progressively coarser intervals (minute / hour /
+//! day / week / month), an absolute `max_age` cap drops anything older
+//! regardless of which clause selected it, and a per-secret
+//! `max_total_bytes` budget drops the oldest survivors until the retained
+//! history fits on disk. Worst case ~62 entries per secret in steady state,
+//! and at most ~`max_total_bytes` of disk for any one secret.
 //!
 //! Snapshots are encrypted with whatever cipher the delegate had configured
 //! when the snapshot was taken; without that cipher the bytes are useless.
@@ -47,6 +52,42 @@ pub const SNAPSHOT_NAME_WIDTH: usize = 20;
 /// caller can log instead of silently overwriting an existing snapshot.
 const MAX_SNAPSHOT_COLLISION_SUFFIX: u32 = 1024;
 
+/// Default per-secret byte budget for retained snapshot history
+/// ([`RetentionPolicy::max_total_bytes`]).
+///
+/// The count-based tiers alone are unbounded in BYTES: ~62 retained
+/// versions costs a few hundred KiB for a small secret and ~62 MiB for a
+/// ~1 MiB one. Measured on a production peer, 130 MB of snapshots guarded
+/// 6.8 MB of live secrets (19x), and a SINGLE ~1 MiB River room-state
+/// secret accounted for 30.7 MB of that across 34 versions.
+///
+/// 3 MiB is the compromise:
+/// - Small secrets (bytes to low-KiB) never come near it, so they keep the
+///   full tiered history — deep history is nearly free there, and it is
+///   where an operator most plausibly wants to walk back several versions.
+/// - A ~1 MiB room state gets ~3 versions instead of ~30, which still
+///   covers the case snapshots exist for (undo an accidental or buggy
+///   overwrite) at a tenth of the disk.
+/// - Even at the cap, one secret's history is ~2x the ENTIRE live secret
+///   footprint of a measured production gateway (1.6 MB), so the budget is
+///   generous in absolute terms.
+///
+/// Note this is a PER-SECRET bound, so a node's total snapshot footprint is
+/// still `keys x 3 MiB` in the worst case; bounding the aggregate would need
+/// a cross-secret sweep, which is deliberately out of scope here.
+pub const DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET: u64 = 3 * 1024 * 1024;
+
+/// Floor on how many snapshots the byte budget is allowed to leave behind.
+///
+/// The budget evicts oldest-first, but it must never empty the history: the
+/// newest snapshot is the value that the most recent write overwrote, i.e.
+/// exactly what "undo the last write" needs. So a single secret larger than
+/// the whole budget keeps one version and exceeds the budget, rather than
+/// silently having no recoverable history at all. Deleting user data to
+/// satisfy a disk heuristic is the failure mode this floor exists to
+/// prevent.
+const MIN_SNAPSHOTS_KEPT_UNDER_BUDGET: usize = 1;
+
 /// One tier of a [`RetentionPolicy`]: aim to keep one snapshot per
 /// `interval` of clock time, up to `max_count` snapshots in this tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,11 +111,17 @@ pub struct SnapshotMetadata {
 
 /// Tiered retention policy. The first `keep_last` snapshots (by recency) are
 /// kept regardless of bucket coverage; each bucket independently selects
-/// representatives at its own granularity; and `max_age` is an absolute
-/// upper bound that drops snapshots older than the threshold even if a
-/// recency or bucket clause would otherwise keep them. The absolute cap
-/// satisfies the cleanup-exemption rule in AGENTS.md: every retained
-/// entry has a finite lifetime.
+/// representatives at its own granularity; `max_age` is an absolute upper
+/// bound that drops snapshots older than the threshold even if a recency or
+/// bucket clause would otherwise keep them; and `max_total_bytes` is a
+/// per-secret disk budget that drops the oldest survivors of all of the
+/// above until the retained history fits. The absolute age cap satisfies the
+/// cleanup-exemption rule in AGENTS.md: every retained entry has a finite
+/// lifetime.
+///
+/// Every clause is subtractive: the count tiers propose a keep-set, and
+/// `max_age` / `max_total_bytes` only ever remove from it. Nothing here can
+/// resurrect a snapshot another clause dropped.
 #[derive(Debug, Clone)]
 pub struct RetentionPolicy {
     pub keep_last: usize,
@@ -85,6 +132,16 @@ pub struct RetentionPolicy {
     /// `Some(d)` drops snapshots older than `now - d` regardless of which
     /// clause would have kept them.
     pub max_age: Option<Duration>,
+    /// Upper bound, in bytes, on the total on-disk size of the snapshots
+    /// retained for ONE secret. `None` disables the budget (the count tiers
+    /// then bound the number of versions but not their size, which is what
+    /// let a ~1 MiB secret accumulate ~30 MiB of history). `Some(n)` drops
+    /// the OLDEST otherwise-retained snapshots until the rest fit in `n`,
+    /// never going below [`MIN_SNAPSHOTS_KEPT_UNDER_BUDGET`].
+    ///
+    /// Applied to the size the entries actually occupy on disk, so it bounds
+    /// disk directly rather than proxying it through a version count.
+    pub max_total_bytes: Option<u64>,
 }
 
 impl Default for RetentionPolicy {
@@ -92,8 +149,10 @@ impl Default for RetentionPolicy {
     /// 10 minutes, one per hour for the last 24 hours, one per day for the
     /// last week, one per week for the last 4 weeks, one per month for the
     /// last 12 months, with an absolute 2-year ceiling so stale snapshots
-    /// from secrets that stopped being written eventually age out. Worst
-    /// case ~62 entries per secret in steady state.
+    /// from secrets that stopped being written eventually age out, and a
+    /// [`DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET`] disk budget on top. Worst
+    /// case ~62 entries per secret in steady state, and never more than the
+    /// byte budget (plus the one-snapshot floor) of disk.
     fn default() -> Self {
         const MIN: u64 = 60;
         const HOUR: u64 = 60 * MIN;
@@ -131,6 +190,10 @@ impl Default for RetentionPolicy {
             // ciphertext from secrets the user stopped writing to ages
             // out instead of lingering forever.
             max_age: Some(Duration::from_secs(2 * YEAR)),
+            // Bounds the DISK the count tiers above would otherwise leave
+            // unbounded: 62 versions is cheap for a small secret and ~62 MiB
+            // for a ~1 MiB one. See the constant's docs for the sizing.
+            max_total_bytes: Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET),
         }
     }
 }
@@ -184,6 +247,51 @@ impl RetentionPolicy {
                     .map(|age| age <= max_age)
                     .unwrap_or(true)
             });
+        }
+
+        keep
+    }
+
+    /// [`Self::select_keep`] plus the [`Self::max_total_bytes`] disk budget.
+    ///
+    /// `entries` is `(timestamp, size_bytes)` sorted ASCENDING by timestamp
+    /// (same contract as `select_keep`'s `timestamps`); the returned indices
+    /// are into `entries`. Everything `select_keep` already dropped stays
+    /// dropped — the budget only ever removes MORE, so a snapshot excluded
+    /// by `max_age` can never be resurrected by having spare byte budget.
+    ///
+    /// Eviction order is OLDEST-first, because the newest snapshot is the
+    /// value the most recent write replaced and is what an operator undoing
+    /// a bad overwrite reaches for. The floor at
+    /// [`MIN_SNAPSHOTS_KEPT_UNDER_BUDGET`] means a secret whose single
+    /// version is larger than the whole budget keeps that version and
+    /// overshoots the budget, rather than being left with no history: the
+    /// budget is a disk heuristic and must never be the reason user data
+    /// stops being recoverable.
+    pub fn select_keep_within_budget(
+        &self,
+        now: SystemTime,
+        entries: &[(SystemTime, u64)],
+    ) -> BTreeSet<usize> {
+        let timestamps: Vec<SystemTime> = entries.iter().map(|(ts, _)| *ts).collect();
+        let mut keep = self.select_keep(now, &timestamps);
+
+        let Some(budget) = self.max_total_bytes else {
+            return keep;
+        };
+
+        let mut total = keep
+            .iter()
+            .fold(0u64, |acc, &i| acc.saturating_add(entries[i].1));
+        // `BTreeSet<usize>` iterates ascending, and `entries` is sorted
+        // oldest-first, so this walks candidates from oldest to newest.
+        let oldest_first: Vec<usize> = keep.iter().copied().collect();
+        for i in oldest_first {
+            if total <= budget || keep.len() <= MIN_SNAPSHOTS_KEPT_UNDER_BUDGET {
+                break;
+            }
+            keep.remove(&i);
+            total = total.saturating_sub(entries[i].1);
         }
 
         keep
@@ -245,16 +353,17 @@ pub fn next_snapshot_path(snap_dir: &Path) -> std::io::Result<PathBuf> {
     ))
 }
 
-/// Apply the retention policy to a snapshot directory: delete any file
-/// whose timestamp is not selected by `policy` relative to `now`. Files
-/// whose names don't parse as `{epoch_ms}` (with optional `.{counter}`
-/// suffix) and non-regular-file entries are left untouched.
+/// Apply the retention policy to a snapshot directory: delete any file the
+/// `policy` does not select relative to `now`, counting both its timestamp
+/// (count tiers + `max_age`) and its on-disk size (`max_total_bytes`).
+/// Files whose names don't parse as `{epoch_ms}` (with optional
+/// `.{counter}` suffix) and non-regular-file entries are left untouched.
 ///
 /// Best-effort: I/O errors during enumeration or unlink are logged but
 /// do not propagate, since thinning is a maintenance operation that must
 /// never fail the primary write path.
 pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime) {
-    let mut entries: Vec<(SystemTime, PathBuf)> = match fs::read_dir(snap_dir) {
+    let mut entries: Vec<(SystemTime, u64, PathBuf)> = match fs::read_dir(snap_dir) {
         Ok(rd) => rd
             .filter_map(|res| match res {
                 Ok(entry) => Some(entry),
@@ -274,7 +383,21 @@ pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime
                 }
                 let path = entry.path();
                 let stamp = parse_snapshot_stamp(&path)?;
-                Some((UNIX_EPOCH + Duration::from_millis(stamp), path))
+                // A stat failure is charged as 0 bytes: it makes the entry
+                // free against `max_total_bytes`, so it is RETAINED and some
+                // other (measurable) entry is evicted instead. Erring toward
+                // keeping is the right default for a best-effort disk
+                // heuristic operating on user data.
+                let size = match entry.metadata() {
+                    Ok(md) => md.len(),
+                    Err(err) => {
+                        tracing::debug!(
+                            "failed to stat snapshot {path:?}: {err}; charging 0 bytes"
+                        );
+                        0
+                    }
+                };
+                Some((UNIX_EPOCH + Duration::from_millis(stamp), size, path))
             })
             .collect(),
         Err(err) => {
@@ -282,11 +405,16 @@ pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime
             return;
         }
     };
-    entries.sort_by_key(|(ts, _)| *ts);
+    // Total order, not just by timestamp: same-millisecond collision entries
+    // share a stamp, and the byte budget evicts oldest-first, so the tie has
+    // to break deterministically. Names are fixed-width zero-padded, so
+    // lexicographic path order is `(stamp, suffix)` order with the
+    // unsuffixed entry first — the same order `list_snapshots` reports.
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
 
-    let timestamps: Vec<SystemTime> = entries.iter().map(|(t, _)| *t).collect();
-    let keep = policy.select_keep(now, &timestamps);
-    for (i, (_, path)) in entries.iter().enumerate() {
+    let sized: Vec<(SystemTime, u64)> = entries.iter().map(|(t, s, _)| (*t, *s)).collect();
+    let keep = policy.select_keep_within_budget(now, &sized);
+    for (i, (_, _, path)) in entries.iter().enumerate() {
         if !keep.contains(&i) {
             if let Err(err) = fs::remove_file(path) {
                 tracing::warn!("failed to thin snapshot {path:?}: {err}");
@@ -568,6 +696,7 @@ mod tests {
             keep_last: 3,
             buckets: vec![],
             max_age: None,
+            max_total_bytes: None,
         };
         let now = SystemTime::now();
         // Five very-old snapshots: only the trailing 3 should survive.
@@ -587,6 +716,7 @@ mod tests {
                 max_count: 10,
             }],
             max_age: None,
+            max_total_bytes: None,
         };
         let now = SystemTime::now();
         let ts: Vec<_> = (0..600).map(|i| t(now, 599 - i)).collect();
@@ -604,6 +734,7 @@ mod tests {
                 max_count: 10,
             }],
             max_age: None,
+            max_total_bytes: None,
         };
         let now = SystemTime::now();
         let ts: Vec<_> = (0..1000).map(|_| t(now, 5)).collect();
@@ -642,6 +773,7 @@ mod tests {
                 max_count: 5,
             }],
             max_age: None,
+            max_total_bytes: None,
         };
         let now = SystemTime::now();
         let ts = vec![now + Duration::from_secs(120), t(now, 30)];
@@ -661,6 +793,7 @@ mod tests {
             keep_last: 5,
             buckets: vec![],
             max_age: Some(Duration::from_secs(60)),
+            max_total_bytes: None,
         };
         let now = SystemTime::now();
         // 5 snapshots, all 1 hour old. keep_last=5 would normally keep all,
@@ -681,6 +814,7 @@ mod tests {
             keep_last: 1,
             buckets: vec![],
             max_age: Some(Duration::from_secs(60)),
+            max_total_bytes: None,
         };
         let now = SystemTime::now();
         let ts = vec![now + Duration::from_secs(120)];
@@ -696,6 +830,7 @@ mod tests {
             keep_last: 10,
             buckets: vec![],
             max_age: Some(Duration::from_secs(120)),
+            max_total_bytes: None,
         };
         let now = SystemTime::now();
         // 3 fresh (within 2 min), 3 stale (> 2 min). keep_last=10 selects
@@ -714,6 +849,219 @@ mod tests {
             vec![3, 4, 5],
             "only fresh entries should remain"
         );
+    }
+
+    // ===== per-secret byte budget (`max_total_bytes`) =====
+
+    /// Helper: a policy that keeps everything by count, so the tests below
+    /// isolate the byte budget from the tiering.
+    fn budget_only(max_total_bytes: Option<u64>) -> RetentionPolicy {
+        RetentionPolicy {
+            keep_last: usize::MAX,
+            buckets: vec![],
+            max_age: None,
+            max_total_bytes,
+        }
+    }
+
+    #[test]
+    fn byte_budget_evicts_oldest_first() {
+        let now = SystemTime::now();
+        // Four 100-byte snapshots, budget 250 => the two newest fit.
+        let entries: Vec<(SystemTime, u64)> =
+            (0..4).map(|i| (t(now, 400 - i * 100), 100u64)).collect();
+        let keep = budget_only(Some(250)).select_keep_within_budget(now, &entries);
+        assert_eq!(
+            keep.into_iter().collect::<Vec<_>>(),
+            vec![2, 3],
+            "budget must drop the OLDEST entries and keep the newest"
+        );
+    }
+
+    #[test]
+    fn byte_budget_none_keeps_everything() {
+        let now = SystemTime::now();
+        let entries: Vec<(SystemTime, u64)> = (0..4)
+            .map(|i| (t(now, 400 - i * 100), 10_000_000u64))
+            .collect();
+        let keep = budget_only(None).select_keep_within_budget(now, &entries);
+        assert_eq!(keep.len(), 4, "no budget => count tiers alone decide");
+    }
+
+    #[test]
+    fn byte_budget_never_empties_the_history() {
+        // A single snapshot far larger than the whole budget is KEPT: the
+        // budget is a disk heuristic and must never be why a value stops
+        // being recoverable.
+        let now = SystemTime::now();
+        let entries = vec![(t(now, 10), 50_000_000u64)];
+        let keep = budget_only(Some(1024)).select_keep_within_budget(now, &entries);
+        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn byte_budget_zero_still_keeps_the_newest() {
+        // Degenerate budget: floor at one entry, and it must be the newest
+        // (the value the last write overwrote).
+        let now = SystemTime::now();
+        let entries: Vec<(SystemTime, u64)> =
+            (0..5).map(|i| (t(now, 500 - i * 100), 100u64)).collect();
+        let keep = budget_only(Some(0)).select_keep_within_budget(now, &entries);
+        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn byte_budget_exactly_at_budget_keeps_all() {
+        // Boundary: total == budget is NOT over budget.
+        let now = SystemTime::now();
+        let entries: Vec<(SystemTime, u64)> =
+            (0..4).map(|i| (t(now, 400 - i * 100), 100u64)).collect();
+        let keep = budget_only(Some(400)).select_keep_within_budget(now, &entries);
+        assert_eq!(keep.len(), 4);
+        // One byte less and the oldest goes.
+        let keep = budget_only(Some(399)).select_keep_within_budget(now, &entries);
+        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn byte_budget_empty_input_keeps_nothing() {
+        let now = SystemTime::now();
+        assert!(
+            budget_only(Some(1024))
+                .select_keep_within_budget(now, &[])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn byte_budget_only_subtracts_never_resurrects() {
+        // An entry dropped by `max_age` must stay dropped even though there
+        // is plenty of byte budget left over.
+        let p = RetentionPolicy {
+            keep_last: 10,
+            buckets: vec![],
+            max_age: Some(Duration::from_secs(120)),
+            max_total_bytes: Some(u64::MAX),
+        };
+        let now = SystemTime::now();
+        let entries = vec![
+            (t(now, 1000), 1u64), // stale
+            (t(now, 500), 1),     // stale
+            (t(now, 30), 1),      // fresh
+        ];
+        let keep = p.select_keep_within_budget(now, &entries);
+        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn byte_budget_counts_only_entries_the_tiers_kept() {
+        // Entries the count tiers already dropped must not consume budget:
+        // keep_last=2 leaves two 100-byte entries, which fit a 250 budget
+        // even though the eight dropped ones would have blown it.
+        let p = RetentionPolicy {
+            keep_last: 2,
+            buckets: vec![],
+            max_age: None,
+            max_total_bytes: Some(250),
+        };
+        let now = SystemTime::now();
+        let entries: Vec<(SystemTime, u64)> =
+            (0..10).map(|i| (t(now, 1000 - i * 10), 100u64)).collect();
+        let keep = p.select_keep_within_budget(now, &entries);
+        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![8, 9]);
+    }
+
+    #[test]
+    fn byte_budget_saturates_on_overflowing_sizes() {
+        // Pathological sizes must not panic on overflow in debug builds.
+        let now = SystemTime::now();
+        let entries = vec![(t(now, 30), u64::MAX), (t(now, 20), u64::MAX)];
+        let keep = budget_only(Some(1024)).select_keep_within_budget(now, &entries);
+        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// The DEFAULT policy must bound bytes, not just version count. This is
+    /// the behavioral pin on `DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET` being
+    /// wired into `RetentionPolicy::default()`.
+    #[test]
+    fn default_policy_bounds_bytes_per_secret() {
+        let p = RetentionPolicy::default();
+        let now = SystemTime::now();
+        // 40 versions of a ~1 MiB secret written one minute apart: the count
+        // tiers alone would keep dozens (~40 MiB).
+        let size = 1024 * 1024u64;
+        let entries: Vec<(SystemTime, u64)> =
+            (0..40).map(|i| (t(now, (39 - i) * 60), size)).collect();
+        let keep = p.select_keep_within_budget(now, &entries);
+        let total: u64 = keep.iter().map(|&i| entries[i].1).sum();
+        assert!(
+            total <= DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET,
+            "default policy must bound per-secret snapshot bytes; kept {} entries = {total} bytes",
+            keep.len()
+        );
+        assert!(
+            !keep.is_empty(),
+            "default policy must still retain recoverable history"
+        );
+        // Sanity: the count tiers on their own really would have kept far more.
+        let timestamps: Vec<SystemTime> = entries.iter().map(|(ts, _)| *ts).collect();
+        assert!(
+            p.select_keep(now, &timestamps).len() > keep.len(),
+            "test is vacuous unless the byte budget is what trimmed the set"
+        );
+    }
+
+    #[test]
+    fn thin_snapshots_enforces_byte_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now_ms = recent_ms();
+        // Five 1000-byte snapshots, one second apart.
+        for i in 0..5u64 {
+            write_snapshot(dir.path(), now_ms - (5 - i) * 1000, &vec![b'x'; 1000]);
+        }
+        let policy = RetentionPolicy {
+            keep_last: usize::MAX,
+            buckets: vec![],
+            max_age: None,
+            max_total_bytes: Some(2500),
+        };
+        thin_snapshots(dir.path(), &policy, SystemTime::now());
+
+        let remaining = list_snapshots(dir.path()).expect("list");
+        assert_eq!(
+            remaining.len(),
+            2,
+            "2500 bytes fits exactly two 1000B files"
+        );
+        // And it kept the NEWEST two.
+        assert_eq!(
+            remaining.iter().map(|m| m.timestamp_ms).collect::<Vec<_>>(),
+            vec![now_ms - 2000, now_ms - 1000]
+        );
+    }
+
+    #[test]
+    fn thin_snapshots_byte_budget_keeps_one_oversized_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now_ms = recent_ms();
+        write_snapshot(dir.path(), now_ms - 2000, &vec![b'a'; 5000]);
+        write_snapshot(dir.path(), now_ms - 1000, &vec![b'b'; 5000]);
+        let policy = RetentionPolicy {
+            keep_last: usize::MAX,
+            buckets: vec![],
+            max_age: None,
+            max_total_bytes: Some(100),
+        };
+        thin_snapshots(dir.path(), &policy, SystemTime::now());
+
+        let remaining = list_snapshots(dir.path()).expect("list");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the floor keeps exactly one even when it busts the budget"
+        );
+        assert_eq!(remaining[0].timestamp_ms, now_ms - 1000, "newest survives");
+        assert_eq!(fs::read(&remaining[0].path).unwrap(), vec![b'b'; 5000]);
     }
 
     #[test]
@@ -796,6 +1144,7 @@ mod tests {
                 max_count: 0,
             }],
             max_age: None,
+            max_total_bytes: None,
         };
         let now = SystemTime::now();
         let ts: Vec<_> = (0..10).map(|i| t(now, i)).collect();
