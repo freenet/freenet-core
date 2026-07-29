@@ -1674,19 +1674,18 @@ async fn sandbox_content_body(
     page: &str,
 ) -> Result<impl IntoResponse + use<>, WebSocketApiError> {
     // Sanitize the page path to prevent directory traversal and absolute paths.
-    // Path::join with an absolute path replaces the base entirely on Unix,
-    // so we must reject absolute paths, parent directory components, and root
-    // directory components before joining.
+    // Path::join with an absolute path replaces the base entirely on Unix, and a
+    // Windows drive-relative `C:foo` resolves off the base drive, so we reject
+    // `..`, root, and drive-prefix components before joining.
+    //
+    // do NOT remove or weaken — security boundary. Uses the SAME
+    // `has_escaping_component` check as `resolve_web_asset_path` (the non-HTML
+    // asset path) so the two guards cannot drift.
     let normalized = Path::new(page);
-    for component in normalized.components() {
-        if matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::RootDir
-        ) {
-            return Err(WebSocketApiError::InvalidParam {
-                error_cause: "Path traversal not allowed".to_string(),
-            });
-        }
+    if has_escaping_component(normalized) {
+        return Err(WebSocketApiError::InvalidParam {
+            error_cause: "Path traversal not allowed".to_string(),
+        });
     }
 
     let mut web_path = path.join(page);
@@ -1891,6 +1890,25 @@ fn relative_asset_path(path_str: &str) -> Result<String, WebSocketApiError> {
     Ok(file_path)
 }
 
+/// Whether any component of `path` could escape a base directory when joined:
+/// `..` (`ParentDir`), an absolute root (`RootDir`), or a Windows drive prefix
+/// (`Prefix`, e.g. `C:foo` — a drive-relative path with NO `RootDir` component,
+/// so a `ParentDir | RootDir`-only check would let it through and `Path::join`
+/// could resolve it off the base drive's current directory).
+///
+/// Shared by BOTH web-content containment guards — `resolve_web_asset_path`
+/// (non-HTML assets) and `sandbox_content_body` (HTML pages) — so they cannot
+/// drift apart. do NOT weaken — this is a security boundary.
+fn has_escaping_component(path: &Path) -> bool {
+    use std::path::Component;
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
 /// Resolves a decoded relative asset path underneath `base` (the contract's
 /// on-disk cache directory), rejecting any path that would escape it.
 ///
@@ -1905,45 +1923,50 @@ fn relative_asset_path(path_str: &str) -> Result<String, WebSocketApiError> {
 /// path's responses, which let a malicious web contract's iframe JS read the
 /// escaped file cross-origin. This guard closes both.
 ///
-/// A component-level check rejects `..`, root, and drive-prefix components
-/// WITHOUT requiring the target to exist, so a genuinely-missing asset still
-/// falls through to a normal 404 (callers serve `base.join(rel)` and 404 on a
-/// missing file). When the resolved path DOES exist we additionally canonicalize
-/// and re-verify containment as a symlink/TOCTOU guard, mirroring the sibling
-/// `sandbox_content_body`.
+/// A component-level check (`has_escaping_component`) rejects `..`, root, and
+/// drive-prefix components WITHOUT requiring the target to exist, so a
+/// genuinely-missing asset still falls through to a normal 404 (callers serve
+/// `base.join(rel)` and 404 on a missing file). When the resolved path DOES
+/// exist we additionally canonicalize and re-verify containment, catching a
+/// symlink inside the cache dir (a contract's web archive is attacker-authored)
+/// that points outside it.
 ///
-/// do NOT remove or weaken — this is a security boundary.
+/// The returned path is the CANONICAL one when the target exists, so the caller
+/// opens the already-resolved path rather than re-walking the symlinks — closing
+/// the check-then-open TOCTOU window exactly as the sibling `sandbox_content_body`
+/// does (it opens `canonical_file`, not the user path).
+///
+/// do NOT remove or weaken — this is a security boundary. Keep in sync with the
+/// containment guard in `sandbox_content_body`.
 fn resolve_web_asset_path(base: &Path, relative: &str) -> Result<PathBuf, WebSocketApiError> {
-    use std::path::Component;
-
     let rel = Path::new(relative);
-    for component in rel.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            return Err(WebSocketApiError::InvalidParam {
-                error_cause: "Path traversal not allowed".to_string(),
-            });
-        }
+    if has_escaping_component(rel) {
+        return Err(WebSocketApiError::InvalidParam {
+            error_cause: "Path traversal not allowed".to_string(),
+        });
     }
 
     let joined = base.join(rel);
 
-    // Defense-in-depth against a symlink inside the cache dir pointing out, and
-    // against any lexical corner the component scan missed: if the path resolves
-    // on disk, its canonical form must still live under the canonical base. A
-    // missing file (canonicalize fails) is left to the caller's normal 404 —
-    // enforcing existence here would turn every absent asset into an error.
-    if let (Ok(canonical_file), Ok(canonical_base)) = (joined.canonicalize(), base.canonicalize()) {
-        if !canonical_file.starts_with(&canonical_base) {
-            return Err(WebSocketApiError::InvalidParam {
-                error_cause: "Path traversal not allowed".to_string(),
-            });
+    // If the path resolves on disk, its canonical form must live under the
+    // canonical base — this catches a symlink inside the cache dir pointing out.
+    // Serve the CANONICAL path so a symlink swapped between this check and the
+    // open cannot redirect the read outside the base (TOCTOU), matching the
+    // canonical-open in `sandbox_content_body`. When the target does not exist
+    // (canonicalize fails) there is no symlink to resolve and the lexical scan
+    // already rejected `..`/root/prefix, so the plain join is contained; return
+    // it and let the caller 404 on the missing file.
+    match (joined.canonicalize(), base.canonicalize()) {
+        (Ok(canonical_file), Ok(canonical_base)) => {
+            if !canonical_file.starts_with(&canonical_base) {
+                return Err(WebSocketApiError::InvalidParam {
+                    error_cause: "Path traversal not allowed".to_string(),
+                });
+            }
+            Ok(canonical_file)
         }
+        _ => Ok(joined),
     }
-
-    Ok(joined)
 }
 
 fn hash_state(state: &[u8]) -> u64 {
@@ -3681,6 +3704,139 @@ mod tests {
         );
 
         clear_cache(&instance_id).await;
+    }
+
+    /// Security regression (end-to-end): a symlink INSIDE the contract cache dir
+    /// that points OUTSIDE it must not be served. A contract's unpacked web
+    /// archive is attacker-authored, so a planted symlink is a real vector — and
+    /// it is the ONE case the lexical `..`/root scan cannot catch (the symlink
+    /// name is a plain `Normal` component). Only the canonicalize+containment
+    /// half of `resolve_web_asset_path` stops it, so this exercises that half
+    /// (which the `../` and absolute tests never reach).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn variable_content_rejects_symlink_escape() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x53;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        // Secret outside the cache root, and a symlink inside the cache dir
+        // (a plain-looking `escape.png`) pointing at it.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"SYMLINK-SECRET").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), cache_dir.join("escape.png"))
+            .unwrap();
+
+        let (sender, _rx) = request_channel();
+        let result = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/escape.png"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await;
+
+        let leaked = match result {
+            Err(_) => false,
+            Ok(r) => response_body(r).await.contains("SYMLINK-SECRET"),
+        };
+        assert!(
+            !leaked,
+            "a symlink inside the cache dir pointing outside it must not be served"
+        );
+
+        tokio::fs::remove_file(cache_dir.join("escape.png"))
+            .await
+            .ok();
+        clear_cache(&instance_id).await;
+    }
+
+    /// Direct boundary table for `resolve_web_asset_path`, pinning the guard far
+    /// more exhaustively (and cheaply) than the integration tests: it rejects
+    /// `..` in any position (leading AND mid-path), absolute and root paths, and
+    /// accepts legitimate nested/`.`-prefixed asset paths — so a "hardening"
+    /// regression that started rejecting real webapp subresources (e.g.
+    /// `assets/app.js`) would fail here instead of shipping green and 400-ing
+    /// every Dioxus bundle.
+    #[test]
+    fn resolve_web_asset_path_boundary_table() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let base = base_dir.path();
+
+        // Rejected: any `..` segment (leading or mid-path), absolute, root.
+        for bad in [
+            "../secret",
+            "../../etc/passwd",
+            "a/../../etc/passwd",
+            "assets/../../../etc/passwd",
+            "/etc/passwd",
+        ] {
+            assert!(
+                resolve_web_asset_path(base, bad).is_err(),
+                "{bad:?} must be rejected as traversal"
+            );
+        }
+
+        // Accepted: legitimate relative asset paths (targets need not exist —
+        // a missing asset is the caller's 404, not a rejection here). Each must
+        // resolve to a path contained under the base.
+        for good in [
+            "a.png",
+            "assets/app.js",
+            "assets/sub/app_bg.wasm",
+            "./a.png",
+        ] {
+            let resolved = resolve_web_asset_path(base, good)
+                .unwrap_or_else(|_| panic!("{good:?} must be accepted"));
+            assert!(
+                resolved.starts_with(base),
+                "{good:?} resolved to {resolved:?}, which escapes the base {base:?}"
+            );
+        }
+    }
+
+    /// Direct test of the shared containment predicate used by BOTH the asset
+    /// guard (`resolve_web_asset_path`) and the HTML guard (`sandbox_content_body`).
+    /// Pins the `..`/root rejection cross-platform; the `Prefix` (Windows drive)
+    /// case is unconstructable on non-Windows (`Path` parses `C:foo` as a single
+    /// `Normal` component off Windows) so it is asserted only under `cfg(windows)`.
+    #[test]
+    fn has_escaping_component_flags_traversal() {
+        for bad in ["../x", "a/../../etc", "a/b/../../..", "/etc/passwd"] {
+            assert!(
+                has_escaping_component(Path::new(bad)),
+                "{bad:?} must be flagged as escaping"
+            );
+        }
+        for good in [
+            "a.png",
+            "assets/app.js",
+            "a/b/c.png",
+            "./a.png",
+            "my image.png",
+        ] {
+            assert!(
+                !has_escaping_component(Path::new(good)),
+                "{good:?} is a legitimate contained path"
+            );
+        }
+        #[cfg(windows)]
+        {
+            // Drive-relative `C:temp` has a Prefix but no RootDir — the exact
+            // case a `ParentDir | RootDir`-only check would miss.
+            assert!(has_escaping_component(Path::new("C:temp")));
+        }
     }
 
     /// Receives the `is_locally_known` (#3945) handshake and asserts it is the
