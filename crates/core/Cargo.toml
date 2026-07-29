@@ -60,9 +60,12 @@ directories = { workspace = true }
 dirs = { workspace = true }
 either = { features = ["serde"], workspace = true }
 event-listener = { workspace = true }
-# `utimensat`-backed mtime refresh for the webapp cache's LRU marker
-# (server/path_handlers.rs). Already in the tree as a `tar` dependency, so this
-# is a re-export of an already-compiled crate rather than a new build unit.
+# Timestamp-only mtime refresh for the webapp cache's LRU marker
+# (server/path_handlers.rs) — 0.2.29 opens the file and calls `futimens`. Used
+# instead of rewriting the file because the marker IS the state-hash sentinel,
+# and a rewrite would race a concurrent unpack. Already in the tree as a `tar`
+# dependency, so this is a re-export of an already-compiled crate rather than a
+# new build unit.
 filetime = { workspace = true }
 flate2 = { workspace = true }
 flatbuffers = { workspace = true }
