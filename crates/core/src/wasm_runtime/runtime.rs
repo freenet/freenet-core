@@ -1699,7 +1699,10 @@ mod wasmtime_disk_cache_sizing_tests {
                 let ram_term = wasmtime_cache_size_for_ram(total_ram);
                 let disk_term = wasmtime_cache_size_for_disk_budget(disk_budget);
                 let resolved = wasmtime_cache_size_for(total_ram, disk_budget);
-                assert!(resolved <= ram_term && resolved <= disk_budget);
+                // Against `disk_term`, not `disk_budget`: the budget is 4x the
+                // term, so the weaker form would hold even if the cache were
+                // allowed three quarters of the budget.
+                assert!(resolved <= ram_term && resolved <= disk_term);
                 assert!(resolved == ram_term || resolved == disk_term);
             }
         }

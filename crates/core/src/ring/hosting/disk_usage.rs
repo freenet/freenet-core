@@ -695,14 +695,19 @@ pub fn available_bytes(path: &Path) -> Option<u64> {
 ///
 /// It is NOT immaterial, and it bites hardest on exactly the hosts the disk term
 /// exists for. Worked example: a 16 GiB VM holding 1 GiB of contract state,
-/// 50 MiB of wasm, a 50 MiB cache and 200 MiB free. The live budget (pct = 0.5)
-/// is `0.5 × 1.3 GiB ≈ 665 MiB`, so a live-consistent disk term would be
-/// ~166 MiB; the estimate sees `50 + 50 + 200 = 300 MiB`, halves it to 150 MiB,
-/// the MIN clamp lifts that to 128 MiB, and the resolved limit is the 32 MiB
-/// floor. The error is always in the safe direction (the cache is bounded more
-/// tightly than the live budget licenses, never less), but "the bound lands
-/// where the live budget would put it" is false on a state-heavy, disk-tight
-/// host, and that is the shape most likely to hit it.
+/// 50 MiB of wasm, a 50 MiB cache and 200 MiB free.
+///
+/// * Live: `used = 1024 + 50 + 50 = 1124 MiB`, `available = 200 MiB`, so at
+///   pct = 0.5 the budget is ~662 MiB and a live-consistent disk term would be
+///   ~165 MiB.
+/// * Estimate: `used = 50 + 50 = 100 MiB`, so the basis is 300 MiB, the budget
+///   150 MiB, and the resolved limit ~37 MiB — about 4.5x under.
+///
+/// The error is always in the safe direction (the cache is bounded more tightly
+/// than the live budget licenses, never less), and the gap widens without bound
+/// as `--max-hosting-storage` rises. But "the bound lands where the live budget
+/// would put it" is false on a state-heavy, disk-tight host, and that is the
+/// shape most likely to hit it, so do not restate this omission as immaterial.
 ///
 /// The reason is the redb *row* total, not the database *file*: the file's size
 /// is a plain `metadata()` read and needs no storage layer. Adding it is a real
@@ -847,6 +852,10 @@ const COMPILE_CACHE_PRUNE_TARGET_PCT: u64 = 70;
 /// Best-effort throughout: a file that fails to delete is skipped and not
 /// counted as reclaimed, exactly like the `du` walks that measure this tree.
 pub(crate) fn prune_compile_cache_to_limit(compile_cache_dir: &Path, soft_limit: u64) -> u64 {
+    // Trigger on [`du_walk`] specifically — the same function
+    // [`DiskUsageTracker::refresh_compile_cache`] uses to charge this tree to the
+    // budget — so the prune fires on exactly the quantity the budget counts,
+    // rather than on a second notion of the cache's size.
     let total = du_walk(compile_cache_dir);
     if total <= soft_limit {
         return 0;
