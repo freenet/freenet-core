@@ -151,7 +151,12 @@ pub fn default_hosting_budget_bytes() -> u64 {
 /// small-box / large-box boundary behavior is unit-testable without depending
 /// on the test host's real RAM. Returns the hosting-cache byte budget for a
 /// host with `total_ram` bytes of usable memory.
-fn budget_for_ram(total_ram: u64) -> u64 {
+///
+/// `pub(crate)` (re-exported test-only as `ring::hosting_budget_for_ram`) so the
+/// wasmtime on-disk compile-cache sizing can pin the invariant that the compile
+/// cache never exceeds the contract state it accelerates — see
+/// `wasm_runtime::runtime::wasmtime_cache_size_for_ram`.
+pub(crate) fn budget_for_ram(total_ram: u64) -> u64 {
     (total_ram / DEFAULT_HOSTING_BUDGET_RAM_DIVISOR).clamp(
         MIN_DEFAULT_HOSTING_BUDGET_BYTES,
         MAX_DEFAULT_HOSTING_BUDGET_BYTES,
