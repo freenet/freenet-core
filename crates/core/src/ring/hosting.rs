@@ -727,8 +727,13 @@ impl HostingManager {
         if self.over_disk_budget.swap(over, Ordering::Relaxed) == over {
             return false;
         }
-        // `db_file_bytes − state_bytes` is the database's dead space: bytes the
-        // file holds that no live row accounts for.
+        // `db_file_bytes − state_bytes` is the database directory's dead space:
+        // bytes the shallow walk found that no live state row accounts for.
+        // Mostly interior redb free pages, but it also covers live non-state
+        // rows and, importantly for the advice below, an orphaned
+        // `db.backup.<timestamp>` from a schema migration
+        // (`redb.rs::backup_and_remove_database`), which nothing in the tree ever
+        // deletes and which the startup compaction cannot touch.
         let db_dead_space = stats.db_file_bytes.saturating_sub(stats.state_bytes);
         if over {
             tracing::warn!(
@@ -745,7 +750,11 @@ impl HostingManager {
                  keeps serving and advertising that contract at its last \
                  accepted state. Database dead space is reclaimed only by the \
                  startup compaction, so a large db_dead_space_bytes here needs a \
-                 node restart, not eviction"
+                 node restart, not eviction. One exception: if the database \
+                 directory still holds a db.backup.<timestamp> left by a schema \
+                 migration, those bytes are counted here, are never removed \
+                 automatically, and no restart reclaims them; delete that file \
+                 once the current database is known good"
             );
         } else {
             tracing::info!(
