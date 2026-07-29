@@ -364,7 +364,11 @@ impl SecretsStore {
             },
             legacy_migration_encryption,
             secrets,
-            retention: RetentionPolicy::default(),
+            // `from_env`, NOT `default`: the per-secret byte budget is
+            // operator-overridable via `SNAPSHOT_BUDGET_ENV`, and `default`
+            // is deliberately pure. Pinned by
+            // `secrets_store_new_uses_env_aware_retention`.
+            retention: RetentionPolicy::from_env(),
             snapshots_enabled: std::env::var_os(DISABLE_SNAPSHOTS_ENV).is_none(),
             max_registered_keys_per_scope: MAX_REGISTERED_KEYS_PER_SCOPE,
             // Quota OFF by default. Production opts in via `with_user_quota`
@@ -4646,6 +4650,38 @@ mod test {
             "no snapshot should exist after a single write"
         );
         Ok(())
+    }
+
+    /// `SecretsStore::new` must build its retention from
+    /// `RetentionPolicy::from_env()`, not `::default()` — otherwise the
+    /// operator's `FREENET_SECRET_SNAPSHOT_BYTES_PER_SECRET` override
+    /// silently stops applying.
+    ///
+    /// This is a SOURCE pin rather than a behavioural one, which is a
+    /// deliberate trade. The two constructors differ only in whether they
+    /// consult `environ`, so observing the difference at runtime means a
+    /// test that calls `setenv` — and `setenv` races every concurrent
+    /// `getenv` in the process, which in a lib-test binary means every other
+    /// test constructing a store. A source scrape catches the same mutation
+    /// with no data race. The parsing and the `with_budget_from` wiring are
+    /// pinned behaviourally in `secret_snapshots`.
+    #[test]
+    fn secrets_store_new_uses_env_aware_retention() {
+        // Split so the needle cannot match this test's own source, which is
+        // part of the same `include_str!`.
+        let needle = concat!("RetentionPolicy", "::from_env()");
+        // Match against whitespace-stripped source so a rustfmt reflow of the
+        // call cannot silently disarm the pin.
+        let src: String = include_str!("store.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let stripped_needle: String = needle.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            src.contains(&stripped_needle),
+            "SecretsStore::new must construct its retention via {needle}; using \
+             RetentionPolicy::default() there drops the operator byte-budget override"
+        );
     }
 
     // ===== snapshot-on-write is content-gated =====

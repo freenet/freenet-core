@@ -85,18 +85,22 @@ pub const DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET: u64 = 3 * 1024 * 1024;
 /// want. Three is the smallest count that gives a real walk-back window, and
 /// it is cheap where it binds:
 ///
-/// - At the default 3 MiB budget the floor is INERT for any secret up to
-///   1 MiB, because three of those versions already fit inside the budget.
-///   It only takes effect for the genuinely large values (a ~1 MiB River
-///   room state and up) — exactly the case where the budget is aggressive
-///   and a one-entry history would be thinnest.
+/// - At the default 3 MiB budget the floor is INERT for any secret UNDER
+///   ~1 MiB, because three of those versions already fit inside the budget.
+///   Precisely: a snapshot costs `HEADER_LEN + plaintext + TAG_LEN` = 41
+///   bytes of overhead, so three fit iff `3 x (n + 41) <= 3_145_728`, i.e.
+///   plaintext `n <= 1_048_535` bytes. At exactly 1 MiB (1_048_576) the
+///   floor already binds. So it takes effect only for the genuinely large
+///   values (a ~1 MiB River room state and up) — exactly the case where the
+///   budget is aggressive and a one-entry history would be thinnest.
 /// - Worst case it retains `3 x largest_snapshot` rather than an unbounded
 ///   count, so it cannot reintroduce the version-count blowup this budget
 ///   exists to fix.
 ///
-/// Deliberately not 5 (matching `keep_last`): that would make the floor bind
-/// for every secret over ~600 KiB and raise the worst case to 5x, buying two
-/// more versions of the values that cost the most to keep.
+/// Deliberately not 5 (matching `keep_last`): by the same arithmetic that
+/// would bind for every secret over ~614 KiB (`n > 629_104`) and raise the
+/// worst case to 5x, buying two more versions of the values that cost the
+/// most to keep.
 ///
 /// Note this floor is what makes the budget's guarantee "at most
 /// `max(max_total_bytes, 3 x largest snapshot)`", not a hard byte cap.
@@ -166,6 +170,19 @@ pub struct RetentionPolicy {
     /// Applied to the size the entries actually occupy on disk, so it bounds
     /// disk directly rather than proxying it through a version count.
     ///
+    /// **Beware the `0` asymmetry when constructing this directly.**
+    /// `Some(0)` here is the MOST aggressive budget there is — zero bytes
+    /// allowed, so eviction runs until it hits the floor. Setting
+    /// [`SNAPSHOT_BUDGET_ENV`] to the string `"0"` means the OPPOSITE:
+    /// [`parse_snapshot_budget`] maps it to `None`, i.e. no budget at all.
+    /// The env spelling is the operator-facing "turn this off" switch (an
+    /// operator typing `0` means "no limit", not "limit of nothing"), while
+    /// the field is the internal numeric bound and `Some(0)` is its natural
+    /// extreme. Tests rely on the aggressive `Some(0)` reading. If you add a
+    /// constructor that takes a byte count from anywhere operator-facing,
+    /// route it through [`parse_snapshot_budget`] rather than wrapping it in
+    /// `Some` yourself.
+    ///
     /// **This clause is RETROACTIVE.** Unlike the count tiers, which a node
     /// upgrading into them satisfies gradually, the first thinning pass after
     /// this field starts being set collapses an existing over-budget history
@@ -218,11 +235,6 @@ pub fn parse_snapshot_budget(raw: Option<&str>) -> Option<u64> {
     }
 }
 
-/// [`parse_snapshot_budget`] applied to the live process environment.
-fn snapshot_budget_from_env() -> Option<u64> {
-    parse_snapshot_budget(std::env::var(SNAPSHOT_BUDGET_ENV).ok().as_deref())
-}
-
 impl Default for RetentionPolicy {
     /// Default: keep the last 5 snapshots, plus one per minute for the last
     /// 10 minutes, one per hour for the last 24 hours, one per day for the
@@ -234,10 +246,12 @@ impl Default for RetentionPolicy {
     /// `max(budget, MIN_SNAPSHOTS_KEPT_UNDER_BUDGET x largest snapshot)` of
     /// disk.
     ///
-    /// Reads [`SNAPSHOT_BUDGET_ENV`] for the byte budget, mirroring how
-    /// `SecretsStore::new` reads `FREENET_DISABLE_SECRET_SNAPSHOTS`. Every
-    /// other field is a compile-time constant, so this is the only reason
-    /// two `default()` values can differ within a process.
+    /// PURE: every field is a compile-time constant, so two `default()`
+    /// values are always identical. The operator override lives in
+    /// [`RetentionPolicy::from_env`], deliberately NOT here — a `Default`
+    /// impl that read `environ` would make every `SecretsStore` construction
+    /// a `getenv`, which is a data race against any `setenv` in the same
+    /// process (and unit tests are exactly where `setenv` happens).
     fn default() -> Self {
         const MIN: u64 = 60;
         const HOUR: u64 = 60 * MIN;
@@ -278,30 +292,85 @@ impl Default for RetentionPolicy {
             // Bounds the DISK the count tiers above would otherwise leave
             // unbounded: 62 versions is cheap for a small secret and ~62 MiB
             // for a ~1 MiB one. See the constant's docs for the sizing, and
-            // `SNAPSHOT_BUDGET_ENV` for the operator override.
-            max_total_bytes: snapshot_budget_from_env(),
+            // `Self::from_env` for the operator override.
+            max_total_bytes: Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET),
         }
     }
 }
 
 impl RetentionPolicy {
+    /// [`Self::default`] with the byte budget taken from a raw
+    /// [`SNAPSHOT_BUDGET_ENV`] string, per [`parse_snapshot_budget`].
+    ///
+    /// Split out from [`Self::from_env`] so the override is testable without
+    /// touching process-global `environ`: `setenv` races every concurrent
+    /// `getenv` in the process, and in a lib-test binary those `getenv`s are
+    /// other tests constructing stores. Tests call this; only `from_env`
+    /// reads the environment.
+    pub fn with_budget_from(raw: Option<&str>) -> Self {
+        Self {
+            max_total_bytes: parse_snapshot_budget(raw),
+            ..Self::default()
+        }
+    }
+
+    /// [`Self::default`] with the operator's [`SNAPSHOT_BUDGET_ENV`] override
+    /// applied.
+    ///
+    /// This is the ONLY place in this module that reads the environment, and
+    /// it has no test that mutates `environ` — see [`Self::with_budget_from`]
+    /// for why. Production stores are built from this (see
+    /// `SecretsStore::new`); anything that thins with a real byte budget
+    /// should use it rather than [`Self::default`], or the operator's
+    /// override silently stops applying.
+    pub fn from_env() -> Self {
+        Self::with_budget_from(std::env::var(SNAPSHOT_BUDGET_ENV).ok().as_deref())
+    }
+
     /// This policy with the byte budget removed; the count tiers and
     /// `max_age` are untouched.
     ///
     /// Used by the RECOVERY path (`SecretsStore::restore_snapshot` and
     /// `freenet secrets snapshot-restore`). A restore is what an operator
-    /// runs when they are trying to get a value back, often walking versions
-    /// one at a time, and it is the worst possible moment to garbage-collect
-    /// history: applying the budget there could evict several older versions
-    /// — including the one just restored FROM — as a side effect of the
-    /// reversibility snapshot the restore itself adds. The budget is a
-    /// disk-pressure heuristic, and a manual restore is not disk pressure.
+    /// runs when they are trying to get a value back, and it is the worst
+    /// possible moment to garbage-collect history: applying the budget there
+    /// could evict several older versions — including the one just restored
+    /// FROM — as a side effect of the reversibility snapshot the restore
+    /// itself adds. The budget is a disk-pressure heuristic, and a manual
+    /// restore is not disk pressure.
     ///
     /// This is not an unbounded cleanup exemption: `max_age` still applies at
-    /// the restore, so every entry keeps a finite lifetime, and the next
-    /// ordinary `store_secret` for that secret applies the budget in full.
-    /// The effect is that this PR leaves the restore path's thinning
-    /// behaviour byte-for-byte what it was before the budget existed.
+    /// the restore, so every entry keeps a finite lifetime, and the exemption
+    /// is per-CALL, not a property stamped on the history.
+    ///
+    /// # How long the exemption actually holds
+    ///
+    /// Be precise about this, because the two restore entry points differ:
+    ///
+    /// - **`freenet secrets snapshot-restore` (the operator-facing path):**
+    ///   the exemption holds for as long as the operator needs. The CLI
+    ///   requires the node to be STOPPED (see `docs/secrets-at-rest.md`), so
+    ///   no delegate write can intervene, and an operator can list, restore,
+    ///   inspect, and restore again across the full retained history.
+    ///
+    /// - **`SecretsStore::restore_snapshot` (the in-process API):** the
+    ///   exemption lasts only until the next `store_secret` for that secret.
+    ///   `store_secret` thins with the FULL policy on every call — it is
+    ///   gated on whether snapshots are enabled, not on whether this
+    ///   particular write took a snapshot — so a live node whose delegate
+    ///   touches that secret collapses the restored history to the floor,
+    ///   including on one of the identical re-writes that skip snapshotting.
+    ///   Do NOT read this method as buying a working window on a live node.
+    ///   (Today that API has no production callers; it is exercised by tests
+    ///   and available to embedders.)
+    ///
+    /// Gating `store_secret`'s thin on `needs_snapshot` — i.e. not
+    /// garbage-collecting on a write that adds nothing to the history —
+    /// would widen the live-node window. It is deliberately NOT done here:
+    /// it is a real semantic change to when reclaim happens, the supported
+    /// recovery procedure is the stopped-node CLI where it buys nothing, and
+    /// a write that skips its snapshot still leaves a history that the
+    /// operator's configured budget says is too large.
     pub fn without_byte_budget(&self) -> Self {
         Self {
             max_total_bytes: None,
@@ -1217,53 +1286,55 @@ mod tests {
         }
     }
 
-    /// `RetentionPolicy::default()` must actually CONSULT the environment
-    /// rather than hardcoding the constant. This is the wiring pin for the
-    /// operator override; the parsing itself is covered above.
+    /// The operator override must flow through to the policy. Pure: takes
+    /// the raw env string rather than touching process-global `environ`, so
+    /// nothing here races the `getenv` in `RetentionPolicy::from_env`.
     #[test]
-    fn default_policy_reads_the_budget_env() {
-        use std::sync::Mutex as StdMutex;
-        // Serializes this test against its own re-entry only; the real
-        // cross-test isolation is nextest's per-process model (see the
-        // SAFETY notes below). The override value is deliberately a LARGE
-        // finite budget, so a concurrent `default()` under a plain
-        // multi-threaded `cargo test` sees a still-bounded policy rather
-        // than an unbounded or 0-byte one.
-        static ENV_GUARD: StdMutex<()> = StdMutex::new(());
-        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    fn with_budget_from_applies_the_override() {
+        // Unset behaves exactly like `default()`.
+        assert_eq!(
+            RetentionPolicy::with_budget_from(None).max_total_bytes,
+            Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET)
+        );
+        // An explicit byte count is honoured...
+        assert_eq!(
+            RetentionPolicy::with_budget_from(Some("7340032")).max_total_bytes,
+            Some(7 * 1024 * 1024)
+        );
+        // ...an explicit `0` disables the budget...
+        assert_eq!(
+            RetentionPolicy::with_budget_from(Some("0")).max_total_bytes,
+            None
+        );
+        // ...and garbage degrades to the bounded default.
+        assert_eq!(
+            RetentionPolicy::with_budget_from(Some("three megabytes")).max_total_bytes,
+            Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET)
+        );
+    }
 
-        let prev = std::env::var(SNAPSHOT_BUDGET_ENV).ok();
+    /// The override must change only the budget — a policy built from an
+    /// env value keeps every count tier and the age cap.
+    #[test]
+    fn with_budget_from_touches_only_the_budget() {
+        let d = RetentionPolicy::default();
+        let overridden = RetentionPolicy::with_budget_from(Some("4096"));
+        assert_eq!(overridden.max_total_bytes, Some(4096));
+        assert_eq!(overridden.keep_last, d.keep_last);
+        assert_eq!(overridden.max_age, d.max_age);
+        assert_eq!(overridden.buckets, d.buckets);
+    }
 
-        // SAFETY: `set_var`/`remove_var` are unsound only under CONCURRENT
-        // env access. CI runs these lib tests under `cargo nextest`, which
-        // executes each test in its own process, so nothing else mutates
-        // `environ` while this test runs; the prior value is restored at the
-        // end. (`ENV_GUARD` only serializes this test against its own
-        // re-entry, so under a plain multi-threaded `cargo test` this is
-        // best-effort — nextest's per-process isolation is the guarantee.)
-        unsafe { std::env::remove_var(SNAPSHOT_BUDGET_ENV) };
+    /// `default()` is PURE — no environment read. If it ever starts
+    /// consulting `environ` again, every `SecretsStore` construction becomes
+    /// a `getenv` racing any `setenv` in the process.
+    #[test]
+    fn default_policy_is_pure() {
         assert_eq!(
             RetentionPolicy::default().max_total_bytes,
             Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET),
-            "unset env must yield the built-in default"
+            "default() must be the built-in constant, independent of the environment"
         );
-
-        // SAFETY: as above — nextest runs this test in its own process; the
-        // prior value is restored below.
-        unsafe { std::env::set_var(SNAPSHOT_BUDGET_ENV, "7340032") };
-        assert_eq!(
-            RetentionPolicy::default().max_total_bytes,
-            Some(7 * 1024 * 1024),
-            "default() must read the operator override, not a hardcoded constant"
-        );
-
-        // SAFETY: as above — restoring the environment to its prior state.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(SNAPSHOT_BUDGET_ENV, v),
-                None => std::env::remove_var(SNAPSHOT_BUDGET_ENV),
-            }
-        }
     }
 
     // ===== recovery-path exemption =====
@@ -1298,10 +1369,7 @@ mod tests {
     #[test]
     fn default_policy_bounds_bytes_per_secret() {
         let p = RetentionPolicy::default();
-        // Read the budget off the policy rather than the constant: under a
-        // plain multi-threaded `cargo test`, `default_policy_reads_the_budget_env`
-        // may have the override set. It only ever sets a LARGE FINITE value,
-        // so the bound below still holds and stays non-vacuous.
+        // `default()` is pure (no environment read), so this is deterministic.
         let budget = p
             .max_total_bytes
             .expect("default policy must carry a byte budget");

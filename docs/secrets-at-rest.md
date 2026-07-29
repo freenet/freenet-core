@@ -199,10 +199,12 @@ the budget and keep their full tiered history.
 
 It never empties a history. At least **three** snapshots are always kept,
 even when that exceeds the budget, so an operator always has a few
-versions to walk back through. For a secret up to 1 MiB this floor never
-comes into play (three of those versions already fit in 3 MiB); it only
-matters for the genuinely large values, where the practical bound becomes
-`max(3 MiB, 3 x the largest version)`.
+versions to walk back through. For a secret under ~1 MiB this floor never
+comes into play — three of those versions already fit in 3 MiB (each
+snapshot costs its plaintext plus 41 bytes of header and AEAD tag, so
+three fit for plaintexts up to 1,048,535 bytes; at exactly 1 MiB the
+floor already binds). It only matters for the genuinely large values,
+where the practical bound becomes `max(3 MiB, 3 x the largest version)`.
 
 ##### The byte budget is applied retroactively — read this before upgrading
 
@@ -236,12 +238,23 @@ entirely, which is the opposite.
 ##### Recovery is exempt
 
 `snapshot-restore` — both the CLI and the node runtime's restore path —
-thins **without** the byte budget. An operator running a restore is often
-walking back through versions one at a time, and applying the budget there
-could evict several older versions (including the one just restored from)
-as a side effect of the reversibility snapshot the restore itself adds.
-The count tiers and `max_age` still apply, and the next ordinary write
-enforces the budget in full.
+thins **without** the byte budget. Applying it there could evict several
+older versions (including the one just restored from) as a side effect of
+the reversibility snapshot the restore itself adds. The count tiers and
+`max_age` still apply.
+
+How long that exemption lasts depends on which path you are on, and the
+difference matters:
+
+- **`freenet secrets snapshot-restore` (what you should be using):** it
+  lasts as long as you need. The command requires the node to be stopped,
+  so no delegate write can intervene — you can list, restore, inspect and
+  restore again across the whole retained history.
+- **The in-process `SecretsStore::restore_snapshot` API:** it lasts only
+  until the next write to that secret. An ordinary write thins with the
+  full policy, so on a *running* node a delegate touching that secret
+  collapses the restored history to the three-snapshot floor. This is one
+  more reason the supported recovery procedure stops the node first.
 
 ### Export / import a portable secrets bundle (#4035, P3 of #4381)
 
