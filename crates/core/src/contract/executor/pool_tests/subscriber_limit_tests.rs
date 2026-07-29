@@ -438,6 +438,16 @@ async fn send_update_notification_empty_local_snapshot_emits_warn() {
         "an empty (present) local snapshot must still WARN naming instance_id \
          {id_str}; captured: {logs:?}"
     );
+    drop(logs);
+    // Deterministic, non-log discriminator. This test and its shared twin were
+    // the only two carried entirely by a positive log assertion, which is what
+    // #4927 flakes on (a dropped capture reads as a missing WARN). The entry
+    // removal is observable in the map, so a #4927-class flake can no longer
+    // turn either of them into a silent false result.
+    assert!(
+        !executor.update_notifications.contains_key(&instance_id),
+        "the emptied local entry must also be dropped"
+    );
 }
 
 /// Re-scope of #4681 by #5040, SHARED-storage branch: an ABSENT shared
@@ -538,6 +548,22 @@ async fn send_update_notification_empty_shared_snapshot_emits_warn() {
             && l.contains(&id_str)),
         "an empty (present) shared snapshot must still WARN naming instance_id \
          {id_str}; captured: {logs:?}"
+    );
+    // The corrected wording is part of the fix: the old text claimed a delivery
+    // was being dropped at this instant, when the subscriber was actually lost
+    // on an earlier update and already reported by the per-client ERROR. Pinned
+    // so a revert to the misleading phrasing fails.
+    assert!(
+        logs.iter()
+            .any(|l| l.starts_with("WARN") && l.contains("stale entry dropped")),
+        "the WARN must say the entry was stale, not that a delivery was just \
+         dropped; captured: {logs:?}"
+    );
+    drop(logs);
+    // Deterministic, non-log discriminator — see the local twin above.
+    assert!(
+        !shared_notifications.contains_key(&instance_id),
+        "the emptied shared entry must also be dropped"
     );
 }
 
@@ -774,5 +800,142 @@ async fn closed_subscriber_channel_drops_entry_at_point_of_loss_local() {
     assert!(
         !executor.subscriber_summaries.contains_key(&instance_id),
         "the local summaries sibling must be removed alongside it"
+    );
+}
+
+/// Regression for #5040: PARTIAL failure — one subscriber dies, one survives.
+///
+/// This is the only shape in which the per-client summaries prune matters, and
+/// therefore the only shape that can catch its absence. Every other test here
+/// uses all-or-nothing failure, where the whole-entry cleanup removes the
+/// summaries map anyway and so masks a missing per-client prune entirely (the
+/// prune was a surviving mutant until this test existed).
+///
+/// With a survivor present the vec stays non-empty, the entry is never dropped,
+/// and a dead client's summary would persist for the lifetime of the contract.
+/// Also the only test asserting a live subscriber actually RECEIVES its
+/// notification, which pins that the fan-out path still works at all.
+#[cfg(feature = "trace")]
+#[tokio::test(flavor = "current_thread")]
+async fn partial_failure_prunes_only_the_dead_subscriber_local() {
+    let mut executor = create_executor().await;
+    let contract = test_contract(b"partial_failure_5040");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    let dead_client = ClientId::next();
+    let live_client = ClientId::next();
+    let (dead_tx, dead_rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    drop(dead_rx);
+
+    // Sorted by ClientId, matching the production insert order.
+    let mut subs = vec![(dead_client, dead_tx), (live_client, live_tx)];
+    subs.sort_by_key(|(c, _)| *c);
+    executor.update_notifications.insert(instance_id, subs);
+    executor.subscriber_summaries.insert(
+        instance_id,
+        std::collections::HashMap::from([(dead_client, None), (live_client, None)]),
+    );
+
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![5, 5, 5])),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("store contract");
+
+    // The dead subscriber is pruned from BOTH maps; the survivor is untouched.
+    let notifiers = executor
+        .update_notifications
+        .get(&instance_id)
+        .expect("entry must survive — a live subscriber remains");
+    assert_eq!(
+        notifiers.len(),
+        1,
+        "only the dead subscriber may be removed from the notifier list"
+    );
+    assert_eq!(
+        notifiers[0].0, live_client,
+        "the surviving subscriber must be the live one"
+    );
+
+    let summaries = executor
+        .subscriber_summaries
+        .get(&instance_id)
+        .expect("summaries entry must survive alongside the notifier entry");
+    assert!(
+        !summaries.contains_key(&dead_client),
+        "the dead subscriber's summary must be pruned — otherwise it leaks for \
+         the lifetime of the contract, which is exactly what the per-client \
+         prune exists to prevent"
+    );
+    assert!(
+        summaries.contains_key(&live_client),
+        "the live subscriber's summary must NOT be collaterally removed"
+    );
+
+    // And the survivor actually got its notification.
+    match live_rx.try_recv() {
+        Ok(Ok(resp)) => {
+            let as_str = format!("{resp:?}");
+            assert!(
+                as_str.contains("UpdateNotification"),
+                "the live subscriber must receive an UpdateNotification; got: {as_str}"
+            );
+        }
+        other => panic!("the live subscriber must receive its notification; got: {other:?}"),
+    }
+}
+
+/// Source-scrape pin for the #5040 TOCTOU fix in
+/// `RuntimePool::register_contract_notifier`.
+///
+/// Why a source pin and not a behavioral test: nothing in the suite constructs
+/// a real `RuntimePool` (its only `new` call site is production wiring in
+/// `handler.rs`, needing a Config + OpManager). Every `register_contract_notifier`
+/// test in this file builds an `Executor`, which resolves to the *other* impl
+/// — `bridged_register_contract_notifier` — so the pool path is unreachable
+/// from here and reverting the fix would leave the whole suite green.
+///
+/// The invariant: the already-registered path acquires the
+/// `shared_notifications` guard EXACTLY ONCE, doing the binary search and the
+/// channel write under that same guard. The split version computed the index
+/// under a read guard, released it, then re-acquired `get_mut` — a window in
+/// which the entry can shrink (out-of-bounds panic) or vanish entirely
+/// (silently skipped write, so the client gets a successful subscribe that
+/// never delivers — the failure mode #5040's entry-dropping introduced).
+///
+/// Whitespace-insensitive so rustfmt cannot break it.
+#[test]
+fn register_contract_notifier_takes_one_guard_for_search_and_write() {
+    let src = include_str!("../runtime/pool.rs");
+    let start = src
+        .find("fn register_contract_notifier(")
+        .expect("register_contract_notifier not found in pool.rs");
+    let after = &src[start..];
+    let end = after
+        .find("// New subscriber: enforce per-contract limit")
+        .expect("new-subscriber arm anchor not found in register_contract_notifier");
+    let already_registered: String = after[..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    assert_eq!(
+        already_registered
+            .matches("self.shared_notifications")
+            .count(),
+        1,
+        "the already-registered path must touch `shared_notifications` exactly \
+         once; a second acquisition reopens the TOCTOU #5040 closed"
+    );
+    assert!(
+        already_registered.contains("self.shared_notifications.get_mut("),
+        "the single acquisition must be a WRITE guard (`get_mut`), so the \
+         binary search and the channel write happen under it"
     );
 }

@@ -2530,6 +2530,23 @@ where
                              (shared storage); stale entry dropped — the subscriber was \
                              lost on an earlier update (see the prior channel-closed ERROR)"
                         );
+                    } else {
+                        // The removal DECLINED: a client registered between the
+                        // snapshot above and this call, so the entry is no
+                        // longer empty. This update is not delivered to them
+                        // (the snapshot predates their arrival); the next
+                        // committed update is.
+                        //
+                        // Logged rather than left silent: a registered
+                        // subscriber, a committed update, and zero log evidence
+                        // is precisely the #4681 shape this callsite exists to
+                        // make visible.
+                        tracing::debug!(
+                            %instance_id,
+                            "send_update_notification: subscriber registered concurrently with \
+                             the stale-entry cleanup; this update was not delivered to it, the \
+                             next one will be"
+                        );
                     }
                     return Ok(());
                 }
@@ -2779,11 +2796,16 @@ where
                 .get(&instance_id)
                 .is_some_and(|notifiers| notifiers.is_empty());
             if lost_subscriber_entry {
+                // Captured BEFORE the removal, matching the shared arm — both
+                // branches must report the same thing under the same field name
+                // (the count at the moment of observation, INCLUDING the entry
+                // being dropped).
+                let registered_contracts = self.update_notifications.len();
                 self.update_notifications.remove(&instance_id);
                 self.subscriber_summaries.remove(&instance_id);
                 tracing::warn!(
                     %instance_id,
-                    registered_contracts = self.update_notifications.len(),
+                    registered_contracts,
                     "send_update_notification: no subscriber snapshot for contract \
                      (local storage); update notification not delivered"
                 );
