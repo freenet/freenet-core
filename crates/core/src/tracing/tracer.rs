@@ -6,17 +6,34 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{Layer, Registry};
 
-/// Number of hours to keep log files (using hourly rotation).
-/// At typical gateway log rates (~500KB/hour), 72 hours ≈ 36MB.
-const LOG_RETENTION_HOURS: usize = 72;
-
-/// Backstop on the total bytes the freenet log directory may occupy.
-/// When log volume spikes above the steady-state assumption baked into
-/// `LOG_RETENTION_HOURS` (e.g., the executor-queue overflow in issue
-/// #4251 producing thousands of events per second), the time-based
-/// retention alone cannot bound disk usage within a single session.
-/// This cap deletes oldest-first after the time pass to bring the
-/// directory back under the limit.
+/// Bound on the total bytes the freenet log directory may occupy.
+///
+/// Bytes, not hours, are what has to be bounded: rotation is hourly, but
+/// an hour of log is a few KiB on an idle peer and ~21 MB on a busy
+/// gateway (measured, below), so a fixed hour count buys wildly
+/// different amounts of disk from node to node. Which bound actually
+/// binds therefore differs by node, and that is intended — a busy node
+/// is held by these bytes, a quiet one by `LOG_RETENTION_HOURS`.
+///
+/// **Sized from the busiest observed node, not the quietest.** The
+/// production gateway (nova) was measured at 54 rotating files totalling
+/// 518.9 MiB over 25.97 hours — **20.95 MB/hour**. So 512 MiB is the
+/// binding constraint there and buys ~25.6 hours; an evening incident is
+/// still on disk the next morning. Sizing this from a quiet peer instead
+/// would be a serious mistake: at 96 MiB a gateway retains 4.8 hours, so
+/// an 18:00 incident is gone by 09:00.
+///
+/// Note that ~half of that 20.95 MB/h is redundant: `freenet.error.*` is
+/// currently a byte-for-byte duplicate of the main log (see issue #5015),
+/// because `RUST_LOG` overrides the error layer's WARN default. Fixing
+/// that halves the rate outright and would let this default come down to
+/// ~256 MiB for the same history. Until it lands, this budget cannot be
+/// reduced without costing a gateway real incident history.
+///
+/// Do NOT lower this so far that the current-hour files alone can
+/// approach it. The size pass never deletes a file an appender has open,
+/// so a budget those files can fill leaves *only* them — discarding
+/// exactly the onset of the incident the logs exist to explain.
 ///
 /// Enforcement runs both at tracer init (node start) AND periodically
 /// on the background prune loop spawned by `init_tracer` (issue #4699),
@@ -24,19 +41,45 @@ const LOG_RETENTION_HOURS: usize = 72;
 /// without needing a restart.
 const LOG_DIR_MAX_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 
+/// Absolute age after which a rotated log file is deleted regardless of
+/// how little disk it occupies.
+///
+/// On a quiet node this is what binds — such a node never approaches the
+/// byte budget, so without an age bound it would accumulate rotated
+/// files indefinitely. On a busy node `LOG_DIR_MAX_BYTES` binds first
+/// (at the measured gateway rate, 72 hours would be ~1.4 GiB).
+///
+/// Three days covers a Friday-evening fault reported on Monday morning.
+const LOG_RETENTION_HOURS: u64 = 72; // 3 days
+
 /// How often the background prune loop re-applies `cleanup_old_logs`.
 /// Matches the hourly rotation cadence: a fresh file is sealed every
 /// hour, so re-checking the time + size passes hourly keeps the
 /// directory bounded between restarts without wasteful churn.
 const LOG_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Match the rolling-appender naming convention used by
-/// `RollingFileAppender::Rotation::HOURLY` for the `freenet` /
+/// Which of the two rolling appenders a log file belongs to.
+///
+/// `init_tracer` builds TWO `RollingFileAppender`s over the SAME
+/// directory, so at any moment there are TWO files open for writing,
+/// one per family. Anything that deletes files here must know which
+/// family a file belongs to — see [`prune_log_files`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFamily {
+    /// `freenet.YYYY-MM-DD-HH.log` — the main appender (INFO+).
+    Main,
+    /// `freenet.error.YYYY-MM-DD-HH.log` — the error appender (WARN+).
+    Error,
+}
+
+/// Classify a file name against the rolling-appender naming convention
+/// used by `RollingFileAppender::Rotation::HOURLY` for the `freenet` /
 /// `freenet.error` prefixes:
 ///
-///   freenet.YYYY-MM-DD-HH.log
-///   freenet.error.YYYY-MM-DD-HH.log
+///   freenet.YYYY-MM-DD-HH.log        → [`LogFamily::Main`]
+///   freenet.error.YYYY-MM-DD-HH.log  → [`LogFamily::Error`]
 ///
+/// Returns `None` (i.e. "not ours, never delete") for everything else.
 /// Intentionally does NOT match:
 /// - `freenet.log` / `freenet.error.log` — legacy systemd /launchd
 ///   StandardOutput targets that the OS holds open; deleting them
@@ -44,24 +87,38 @@ const LOG_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3
 ///   and does not free disk space until restart.
 /// - `freenet.error.log.last` — transient per-launch scratch file the
 ///   macOS wrapper overwrites each iteration.
-fn is_rotating_freenet_log(name: &str) -> bool {
-    // freenet.error.YYYY-MM-DD-HH.log → after stripping the prefix and
-    // suffix, the remainder must be the date-hour stem. We don't parse
-    // the stem strictly; cheap shape check: at least one '-' and all
-    // remaining characters in [0-9-].
-    let stem = if let Some(rest) = name.strip_prefix("freenet.error.") {
-        rest
+/// - `known_good_binary` / `update_probation.json` / `known_bad_version`
+///   — on Linux the auto-updater's state dir IS the log dir, and those
+///   files are the crash-loop rollback machinery. They do not start
+///   with `freenet.`, so they are skipped here; do not loosen this
+///   filter into a bare `freenet` prefix match.
+fn rotating_log_family(name: &str) -> Option<LogFamily> {
+    // Order matters: `freenet.error.` is a superset of `freenet.`, so it
+    // must be tested first. Testing the shorter prefix first does NOT
+    // merely mis-file error logs as Main — it drops them out of the
+    // filter entirely, because the leftover stem `error.<date>` fails the
+    // all-digits check below and yields `None`. Nothing that returns
+    // `None` is ever pruned, so the error family would grow without
+    // bound.
+    let (family, stem) = if let Some(rest) = name.strip_prefix("freenet.error.") {
+        (LogFamily::Error, rest)
     } else if let Some(rest) = name.strip_prefix("freenet.") {
-        rest
+        (LogFamily::Main, rest)
     } else {
-        return false;
+        return None;
     };
-    let Some(date_part) = stem.strip_suffix(".log") else {
-        return false;
-    };
-    !date_part.is_empty()
+    // After stripping the prefix and suffix, the remainder must be the
+    // date-hour stem. We don't parse the stem strictly; cheap shape
+    // check: at least one '-' and all remaining characters in [0-9-].
+    let date_part = stem.strip_suffix(".log")?;
+    if !date_part.is_empty()
         && date_part.contains('-')
         && date_part.chars().all(|c| c.is_ascii_digit() || c == '-')
+    {
+        Some(family)
+    } else {
+        None
+    }
 }
 
 /// Guards for non-blocking file appenders - must be kept alive for the lifetime of the program
@@ -91,35 +148,41 @@ pub fn get_log_dir() -> Option<PathBuf> {
     }
 }
 
-/// Clean up old log files on startup.
+/// One rotated log file the pruner may consider deleting.
+#[derive(Debug, Clone)]
+struct LogFile {
+    path: std::path::PathBuf,
+    modified: std::time::SystemTime,
+    size: u64,
+    family: LogFamily,
+}
+
+/// Prune the log directory. The single pruning authority for the two
+/// rolling appenders (see the `max_log_files` note in `init_tracer`).
 ///
-/// First pass: remove files older than `LOG_RETENTION_HOURS`.
-/// Second pass: if the total size of remaining `freenet*.log` files
-/// still exceeds `LOG_DIR_MAX_BYTES`, delete oldest-first until under
-/// the limit. The size cap is a backstop for runaway log rates that
-/// the time-based retention alone can't bound.
+/// Reads the directory, then hands the rotating log files to
+/// [`prune_log_files`], which owns both retention passes.
 fn cleanup_old_logs(log_dir: &std::path::Path) {
     use std::time::{Duration, SystemTime};
 
-    let retention = Duration::from_secs(LOG_RETENTION_HOURS as u64 * 3600);
+    let retention = Duration::from_secs(LOG_RETENTION_HOURS * 3600);
     let cutoff = SystemTime::now() - retention;
 
     let Ok(entries) = std::fs::read_dir(log_dir) else {
         return;
     };
 
-    // First pass: time-based deletion, collect survivors for the
-    // size-cap pass.
-    let mut survivors: Vec<(std::path::PathBuf, SystemTime, u64)> = Vec::new();
+    let mut files: Vec<LogFile> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
 
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !is_rotating_freenet_log(name) {
+        // Anything unclassified is not ours and is never touched.
+        let Some(family) = rotating_log_family(name) else {
             continue;
-        }
+        };
 
         let Ok(metadata) = path.metadata() else {
             continue;
@@ -127,16 +190,175 @@ fn cleanup_old_logs(log_dir: &std::path::Path) {
         let Ok(modified) = metadata.modified() else {
             continue;
         };
-        if modified < cutoff {
-            if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!("Failed to remove old log file {}: {}", path.display(), e);
+        files.push(LogFile {
+            path,
+            modified,
+            size: metadata.len(),
+            family,
+        });
+    }
+
+    prune_log_files(files, cutoff, LOG_DIR_MAX_BYTES);
+}
+
+/// The indices, in a `files` sorted ascending by `(modified, path)`, of
+/// the newest file of each family.
+///
+/// Discovered from the data rather than by walking a hand-written list
+/// of [`LogFamily`] variants: adding a third appender must not require
+/// remembering to extend a list here, because forgetting would silently
+/// re-expose that appender's open file to deletion — precisely the bug
+/// this function exists to prevent.
+///
+/// **This INFERS which file each appender has open; it does not know.**
+/// There is no portable way to ask whether some other part of the
+/// process holds a descriptor, so "newest of its family" is a proxy. It
+/// is right whenever time moves forward, which is why the caller sorts
+/// by `(modified, path)` — see [`prune_log_files`]. A backward clock step
+/// mid-hour can defeat it: the appender does not roll (rotation is keyed
+/// on the clock too), so its open file's mtime can end up older than a
+/// closed sibling's, and the proxy picks the wrong file. The consequence
+/// is bounded — it is the same exposure this code removed in the common
+/// case, not a new one — and no cheaper signal is available.
+fn live_file_indices(files: &[LogFile]) -> Vec<usize> {
+    let mut newest: Vec<(LogFamily, usize)> = Vec::new();
+    for (idx, file) in files.iter().enumerate() {
+        match newest.iter_mut().find(|(family, _)| *family == file.family) {
+            // Ascending mtime, so a later index is always newer.
+            Some((_, slot)) => *slot = idx,
+            None => newest.push((file.family, idx)),
+        }
+    }
+    newest.into_iter().map(|(_, idx)| idx).collect()
+}
+
+/// Apply both retention passes to `files`, deleting from the filesystem.
+///
+/// 1. **Age**: drop files older than `cutoff`, however small.
+/// 2. **Bytes**: if what survives still exceeds `max_bytes`, delete
+///    oldest-first until it doesn't.
+///
+/// Which pass binds depends on the node: a busy one is held by bytes, a
+/// quiet one by age. See [`LOG_DIR_MAX_BYTES`].
+///
+/// **The live files are exempt from BOTH passes.** They are the files
+/// the two appenders have open; deleting one leaves its appender writing
+/// to an unlinked inode, so the space is not reclaimed and everything
+/// written for the rest of the hour is invisible to
+/// `freenet service report`. The age pass needs this exemption just as
+/// much as the size pass does, and for a reason that is easy to miss:
+/// rotation is lazy. An appender that is not written to never rotates,
+/// so its open file's mtime stays frozen at creation — and a node that
+/// goes a full `LOG_RETENTION_HOURS` without a warning therefore has a
+/// *live* error log that looks, to a plain `modified < cutoff` test,
+/// exactly like an abandoned one.
+///
+/// # Why this GC exemption has no TTL
+///
+/// AGENTS.md requires cleanup exemptions to expire via TTL or be
+/// overridden by an absolute age threshold, because unbounded exemptions
+/// create permanent GC blind spots. This one has neither, deliberately.
+/// It is bounded by **rotation** instead of by time, and the thing the
+/// rule protects against — a blind spot that grows — cannot happen here:
+///
+/// * **Bounded in cardinality.** [`live_file_indices`] yields at most one
+///   index per distinct [`LogFamily`], so the exempt set is at most two
+///   files, structurally. It cannot grow with uptime, file count, or log
+///   volume.
+/// * **Bounded in bytes.** An exempt file cannot grow once its rotation
+///   period passes. `RollingFileAppender::write` calls `should_rollover`
+///   and swaps in a fresh file *before* writing the buffer
+///   (`tracing-appender-0.2.5/src/rolling.rs:227-236`), so the first
+///   write after the boundary lands in a NEW file, never in the stale
+///   one. Each exempt file is therefore frozen at whatever its family
+///   wrote during a single rotation period — on the measured gateway,
+///   ~21 MB/hour across both families, against a 512 MiB budget.
+///
+///   **This leg rests on an EXTERNAL property that no test here pins.**
+///   Nothing in this crate would fail if a `tracing-appender` bump moved
+///   the rollover check after the write; the byte bound would silently
+///   become false while all these tests stayed green. It is audited at
+///   0.2.5, and `Cargo.toml` carries a pointer back here so a bump is
+///   prompted to re-read `rolling.rs`. A local test cannot cover it:
+///   forcing a rotation needs control of the appender's clock, which
+///   `tracing-appender` exposes only to its own `cfg(test)` builds.
+///   If you bump the dependency, re-check that ordering by hand.
+/// * **Self-clearing.** The only event that could make an exempt file
+///   grow is a write, and a write is exactly what rotates it away: the
+///   exemption transfers to the newly-created file and the superseded one
+///   becomes an ordinary candidate that the very next prune sweeps. So
+///   the exemption is positional, not sticky — it cannot accumulate.
+///
+/// The exemption is thus unbounded in *time* but bounded in *bytes* and
+/// in *count*, which is what the rule is actually protecting. Pinned by
+/// `live_file_exemption_clears_once_the_appender_rotates`.
+///
+/// An absolute-age override — "delete it anyway past N days" — would be
+/// strictly worse, not merely unnecessary. The appender still holds the
+/// descriptor, so unlinking reclaims no space until it rotates anyway;
+/// the GC gains nothing and the node loses the rest of that hour's logs.
+/// It would reintroduce precisely the bug this function exists to fix.
+/// Do not add one.
+fn prune_log_files(mut files: Vec<LogFile>, cutoff: std::time::SystemTime, max_bytes: u64) {
+    // Sorting is load-bearing, not cosmetic: `live_file_indices` reads
+    // the live file off the END of each family's run, and the size pass
+    // walks this order to delete oldest-first. `cleanup_old_logs` feeds
+    // us `read_dir` order, which is arbitrary (hash order on ext4).
+    //
+    // The path is a tiebreak rather than mtime alone, because mtime is
+    // NOT a total order here: on a coarse-granularity filesystem the old
+    // file's final write and the new file's creation can land in the same
+    // tick, and a stable sort would then fall back to `read_dir` order —
+    // leaving the genuinely-open file looking like the older of the two
+    // and thus collectable. These file names embed a zero-padded
+    // `YYYY-MM-DD-HH` stamp under a fixed per-family prefix, so within a
+    // family lexicographic order IS chronological order.
+    files.sort_by(|a, b| {
+        a.modified
+            .cmp(&b.modified)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    // Computed once, on the full set, and honoured by both passes below.
+    let live = live_file_indices(&files);
+
+    // Pass 1 — age.
+    let mut retained: Vec<usize> = Vec::with_capacity(files.len());
+    let mut retained_bytes: u64 = 0;
+    for (idx, file) in files.iter().enumerate() {
+        if !live.contains(&idx) && file.modified < cutoff {
+            if let Err(e) = std::fs::remove_file(&file.path) {
+                eprintln!(
+                    "Failed to remove old log file {}: {}",
+                    file.path.display(),
+                    e
+                );
             }
             continue;
         }
-        survivors.push((path, modified, metadata.len()));
+        retained.push(idx);
+        retained_bytes = retained_bytes.saturating_add(file.size);
     }
 
-    enforce_log_dir_size_cap(survivors, LOG_DIR_MAX_BYTES);
+    // Pass 2 — bytes. `retained` is still mtime-ascending, so walking it
+    // forward deletes oldest-first.
+    for idx in retained {
+        if retained_bytes <= max_bytes {
+            break;
+        }
+        if live.contains(&idx) {
+            continue;
+        }
+        let file = &files[idx];
+        match std::fs::remove_file(&file.path) {
+            Ok(()) => retained_bytes = retained_bytes.saturating_sub(file.size),
+            Err(e) => eprintln!(
+                "Failed to enforce log dir size cap on {}: {}",
+                file.path.display(),
+                e
+            ),
+        }
+    }
 }
 
 /// Background loop that re-invokes [`cleanup_old_logs`] on an hourly
@@ -164,52 +386,6 @@ async fn periodic_log_prune(log_dir: PathBuf) {
     loop {
         interval.tick().await;
         cleanup_old_logs(&log_dir);
-    }
-}
-
-/// Delete oldest log files until the total size of the supplied list is
-/// at or below `max_bytes`. Mutates the filesystem; the input vector
-/// is consumed. Parameterized for test isolation.
-///
-/// The most-recently-modified file is preserved unconditionally even
-/// when it alone exceeds `max_bytes`: it is the file currently being
-/// written by `RollingFileAppender`. On Linux, removing it would leave
-/// the appender writing to an unlinked inode (disk space not reclaimed
-/// until the next rotation); on Windows, `remove_file` would simply
-/// fail. Either way the live file should not be a cleanup target.
-fn enforce_log_dir_size_cap(
-    mut files: Vec<(std::path::PathBuf, std::time::SystemTime, u64)>,
-    max_bytes: u64,
-) {
-    let total: u64 = files.iter().map(|(_, _, size)| *size).sum();
-    if total <= max_bytes {
-        return;
-    }
-
-    // Oldest first; remove from this end and stop before the newest.
-    files.sort_by_key(|(_, modified, _)| *modified);
-    let live = files.pop(); // newest mtime — never deleted
-    let live_size = live.as_ref().map(|(_, _, size)| *size).unwrap_or(0);
-    let mut non_live_remaining: u64 = files.iter().map(|(_, _, size)| *size).sum();
-
-    for (path, _, size) in files {
-        // Final on-disk size after additional deletions =
-        //   live_size + non_live_remaining (decreasing each loop).
-        if live_size.saturating_add(non_live_remaining) <= max_bytes {
-            break;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                non_live_remaining = non_live_remaining.saturating_sub(size);
-            }
-            Err(e) => {
-                eprintln!(
-                    "Failed to enforce log dir size cap on {}: {}",
-                    path.display(),
-                    e
-                );
-            }
-        }
     }
 }
 
@@ -332,19 +508,36 @@ pub fn init_tracer(
             // (issue #4699). Tracer-owned: it needs only the log dir path.
             crate::config::GlobalExecutor::spawn(periodic_log_prune(log_dir.to_path_buf()));
 
-            // Create rolling file appender for main log (hourly rotation)
+            // Create the rolling file appenders (hourly rotation).
+            //
+            // Deliberately NO max-log-files budget on either appender —
+            // `cleanup_old_logs` is the single pruning authority. Do not
+            // re-add it (pinned by
+            // `appenders_must_not_delegate_pruning_to_max_log_files`):
+            // tracing-appender's own `prune_old_logs` selects victims with
+            // a bare `filename.starts_with(prefix)` test, and BOTH families
+            // plus the legacy bare files start with `freenet`. So the main
+            // appender's budget silently counted and deleted the error
+            // appender's files (halving each family's real retention), and
+            // once the budget was exceeded it deleted oldest-first — which
+            // is exactly the systemd/launchd-held `freenet.log` /
+            // `freenet.error.log` that `rotating_log_family` refuses to
+            // touch, leaking an unlinked-but-open inode.
+            //
+            // `cleanup_old_logs` gets all of this right: it is family-aware,
+            // skips the legacy and rollback-state files, spares both live
+            // files, and bounds by bytes rather than file count. It runs at
+            // startup and hourly thereafter (`periodic_log_prune`), the same
+            // cadence rotation-time pruning had.
             let main_appender = RollingFileAppender::builder()
                 .rotation(Rotation::HOURLY)
-                .max_log_files(LOG_RETENTION_HOURS)
                 .filename_prefix("freenet")
                 .filename_suffix("log")
                 .build(log_dir)
                 .map_err(|e| anyhow::anyhow!("Failed to create log appender: {e}"))?;
 
-            // Create rolling file appender for error log (hourly rotation)
             let error_appender = RollingFileAppender::builder()
                 .rotation(Rotation::HOURLY)
-                .max_log_files(LOG_RETENTION_HOURS)
                 .filename_prefix("freenet.error")
                 .filename_suffix("log")
                 .build(log_dir)
@@ -547,7 +740,8 @@ fn init_stdout_tracer(
 #[cfg(test)]
 mod cleanup_tests {
     use super::{
-        LOG_DIR_MAX_BYTES, cleanup_old_logs, enforce_log_dir_size_cap, periodic_log_prune,
+        LOG_DIR_MAX_BYTES, LogFamily, LogFile, cleanup_old_logs, live_file_indices,
+        periodic_log_prune, prune_log_files, rotating_log_family,
     };
     use std::fs;
     use std::time::{Duration, SystemTime};
@@ -560,10 +754,29 @@ mod cleanup_tests {
         f.set_times(times).unwrap();
     }
 
+    /// Build a [`LogFile`], deriving the family from the file name the
+    /// same way production does.
+    fn log_file(path: &std::path::Path, modified: SystemTime, size: u64) -> LogFile {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap();
+        let family = rotating_log_family(name)
+            .unwrap_or_else(|| panic!("{name} is not a rotating log file"));
+        LogFile {
+            path: path.to_path_buf(),
+            modified,
+            size,
+            family,
+        }
+    }
+
+    /// Run only the size pass, by giving the age pass a cutoff nothing
+    /// can be older than.
+    fn size_pass_only(files: Vec<LogFile>, max_bytes: u64) {
+        prune_log_files(files, SystemTime::UNIX_EPOCH, max_bytes);
+    }
+
     /// Regression for issue #4251: when log volume blows past the
-    /// time-based retention's implicit assumption (~500 KB/h), the
-    /// size cap must delete oldest-first until the directory is
-    /// under the supplied limit.
+    /// time-based retention's implicit assumption, the size cap must
+    /// delete oldest-first until the directory is under the limit.
     #[test]
     fn size_cap_deletes_oldest_first_until_under_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -574,16 +787,21 @@ mod cleanup_tests {
         let newest = dir.path().join("freenet.2026-05-25-14.log");
 
         // 4 KiB each; total 12 KiB. Cap at 8 KiB → oldest must go.
-        write_with_mtime(&oldest, 4096, now - Duration::from_secs(3600));
-        write_with_mtime(&middle, 4096, now - Duration::from_secs(60));
-        write_with_mtime(&newest, 4096, now - Duration::from_secs(30));
+        let t_old = now - Duration::from_secs(3600);
+        let t_mid = now - Duration::from_secs(60);
+        let t_new = now - Duration::from_secs(30);
+        write_with_mtime(&oldest, 4096, t_old);
+        write_with_mtime(&middle, 4096, t_mid);
+        write_with_mtime(&newest, 4096, t_new);
 
-        let files = vec![
-            (oldest.clone(), now - Duration::from_secs(3600), 4096),
-            (middle.clone(), now - Duration::from_secs(60), 4096),
-            (newest.clone(), now - Duration::from_secs(30), 4096),
-        ];
-        enforce_log_dir_size_cap(files, 8192);
+        size_pass_only(
+            vec![
+                log_file(&oldest, t_old, 4096),
+                log_file(&middle, t_mid, 4096),
+                log_file(&newest, t_new, 4096),
+            ],
+            8192,
+        );
 
         assert!(
             !oldest.exists(),
@@ -601,32 +819,35 @@ mod cleanup_tests {
         let small = dir.path().join("freenet.2026-05-25-15.log");
         write_with_mtime(&small, 1024, now);
 
-        let files = vec![(small.clone(), now, 1024)];
-        enforce_log_dir_size_cap(files, 1024 * 1024 * 1024);
+        size_pass_only(vec![log_file(&small, now, 1024)], 1024 * 1024 * 1024);
 
         assert!(small.exists(), "file under cap must survive");
     }
 
-    /// The time-based pass in `cleanup_old_logs` still removes files
-    /// older than the retention window, even when total size is under
-    /// the cap.
+    /// The age pass still removes files older than the retention window,
+    /// even when total size is under the cap.
     #[test]
     fn time_pass_removes_files_older_than_retention() {
         let dir = tempfile::tempdir().unwrap();
         // 100 days old, 1 KiB — well under size cap but past time cap.
+        // A second, newer file of the same family keeps it off the live
+        // list, which is what makes it eligible at all.
         let ancient = dir.path().join("freenet.2026-02-14-00.log");
+        let recent = dir.path().join("freenet.2026-05-25-14.log");
         write_with_mtime(
             &ancient,
             1024,
             SystemTime::now() - Duration::from_secs(100 * 24 * 3600),
         );
+        write_with_mtime(&recent, 1024, SystemTime::now());
 
         cleanup_old_logs(dir.path());
 
         assert!(
             !ancient.exists(),
-            "ancient file must be removed by time pass"
+            "ancient file must be removed by age pass"
         );
+        assert!(recent.exists(), "the live file must survive");
     }
 
     /// Non-`freenet*` files in the same directory must be ignored.
@@ -641,11 +862,10 @@ mod cleanup_tests {
         assert!(other.exists(), "non-freenet files must not be touched");
     }
 
-    /// The size cap must NEVER delete the most-recently-modified file
-    /// (the live file the rolling appender is currently writing to).
-    /// Removing it would leave the appender writing to an unlinked inode
-    /// on Linux, or fail on Windows. Regression for review findings on
-    /// issue #4251.
+    /// The size cap must NEVER delete a file an appender has open, even
+    /// when that file alone exceeds the cap. Removing it would leave the
+    /// appender writing to an unlinked inode on Linux, or fail on
+    /// Windows. Regression for review findings on issue #4251.
     #[test]
     fn size_cap_preserves_most_recently_modified_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -655,8 +875,7 @@ mod cleanup_tests {
         let live = dir.path().join("freenet.2026-05-25-18.log");
         write_with_mtime(&live, 16 * 1024, now);
 
-        let files = vec![(live.clone(), now, 16 * 1024)];
-        enforce_log_dir_size_cap(files, 1024); // cap below file size
+        size_pass_only(vec![log_file(&live, now, 16 * 1024)], 1024);
 
         assert!(
             live.exists(),
@@ -664,40 +883,39 @@ mod cleanup_tests {
         );
     }
 
-    /// Even with the live file preserved, older files must be deleted
-    /// to bring the total down. Regression for the live-file fix
-    /// composing correctly with the eviction loop.
+    /// Even with the live file preserved, older files must be deleted to
+    /// bring the total down.
     #[test]
     fn size_cap_deletes_oldest_but_keeps_live() {
         let dir = tempfile::tempdir().unwrap();
         let now = SystemTime::now();
 
-        // Two oversized files: cap at 5 KiB, live=4 KiB, old=4 KiB,
-        // total 8 KiB → old gets deleted, live survives, final = 4 KiB.
+        // Cap at 5 KiB, live=4 KiB, old=4 KiB, total 8 KiB → old gets
+        // deleted, live survives, final = 4 KiB.
         let old = dir.path().join("freenet.2026-05-25-12.log");
         let live = dir.path().join("freenet.2026-05-25-18.log");
-        write_with_mtime(&old, 4096, now - Duration::from_secs(3600));
+        let t_old = now - Duration::from_secs(3600);
+        write_with_mtime(&old, 4096, t_old);
         write_with_mtime(&live, 4096, now);
 
-        let files = vec![
-            (old.clone(), now - Duration::from_secs(3600), 4096),
-            (live.clone(), now, 4096),
-        ];
-        enforce_log_dir_size_cap(files, 5120);
+        size_pass_only(
+            vec![log_file(&old, t_old, 4096), log_file(&live, now, 4096)],
+            5120,
+        );
 
         assert!(!old.exists(), "older file must be deleted");
         assert!(live.exists(), "live file must survive");
     }
 
-    /// `cleanup_old_logs` must NOT touch the legacy bare
-    /// `freenet.log` / `freenet.error.log` paths — systemd/launchd
-    /// hold them open and deletion leaks the inode (Linux) or fails
-    /// (Windows). Only the rolling-appender date-suffixed files are
-    /// eligible. Regression for review findings on issue #4251.
+    /// `cleanup_old_logs` must NOT touch the legacy bare `freenet.log` /
+    /// `freenet.error.log` paths — systemd/launchd hold them open and
+    /// deletion leaks the inode (Linux) or fails (Windows). Only the
+    /// rolling-appender date-suffixed files are eligible. Regression for
+    /// review findings on issue #4251.
     #[test]
     fn cleanup_skips_legacy_bare_freenet_log_names() {
         let dir = tempfile::tempdir().unwrap();
-        // Make these old so they'd be deleted by the time pass if it
+        // Make these old so they'd be deleted by the age pass if it
         // applied to them.
         let bare = dir.path().join("freenet.log");
         let bare_err = dir.path().join("freenet.error.log");
@@ -726,56 +944,430 @@ mod cleanup_tests {
         );
     }
 
-    /// The size cap must engage exactly at the `LOG_DIR_MAX_BYTES`
-    /// boundary (now 512 MiB, lowered from 1 GiB in issue #4699).
-    /// Clock-free: exercises the pure size math on a synthetic list with
-    /// no filesystem entries, so it asserts the boundary regardless of
-    /// how large the const is. `budget + 1` total must trigger a delete;
-    /// `budget` exactly must not. The newest file is always preserved.
+    /// The budget must hold a full day of a BUSY node's logs.
+    ///
+    /// Sizing it from a quiet peer is the mistake this test exists to
+    /// prevent. Measured on the production gateway (nova): 54 rotating
+    /// files, 518.9 MiB, spanning 25.97 hours = 20.95 MB/hour. At 96 MiB
+    /// that node would retain 4.8 hours, so an 18:00 incident would be
+    /// gone by 09:00 — the logs would be bounded but useless.
+    ///
+    /// For contrast, this same budget is not what binds on a quiet peer:
+    /// at ~1.4 MB/h a laptop peer reaches `LOG_RETENTION_HOURS` (72h)
+    /// having used under 100 MiB, so its retention is decided by age.
     #[test]
-    fn size_cap_engages_at_512mib_boundary() {
-        let cap = LOG_DIR_MAX_BYTES;
-        assert_eq!(cap, 512 * 1024 * 1024, "cap must be 512 MiB (#4699)");
+    fn default_budget_holds_a_day_of_a_busy_gateways_logs() {
+        // nova, 2026-07: 518.9 MiB over 25.97h.
+        const GATEWAY_BYTES_PER_HOUR: u64 = 20_950_000;
+        let hours_retained = LOG_DIR_MAX_BYTES / GATEWAY_BYTES_PER_HOUR;
+        assert!(
+            hours_retained >= 24,
+            "default budget of {LOG_DIR_MAX_BYTES} bytes retains only \
+             {hours_retained}h at the measured gateway rate of \
+             {GATEWAY_BYTES_PER_HOUR} B/h; an overnight incident must still \
+             be on disk in the morning"
+        );
+    }
 
+    /// The size cap must engage exactly at the budget boundary.
+    /// Clock-free: exercises the pure size math, so it asserts the
+    /// boundary regardless of how large the budget is. `budget + 1` total
+    /// must trigger a delete; `budget` exactly must not. The live file is
+    /// always preserved.
+    #[test]
+    fn size_cap_engages_exactly_at_the_budget_boundary() {
+        let cap = LOG_DIR_MAX_BYTES;
         let dir = tempfile::tempdir().unwrap();
         let now = SystemTime::now();
+        let hour_ago = now - Duration::from_secs(3600);
 
-        // Two files. Sized so that live + old == cap + 1 → over by one
-        // byte → the old (non-live) file must be deleted to get back to
-        // the cap. Split the budget so the live file alone is under cap.
-        let live_size = cap / 2;
-        let old_size = cap - live_size + 1; // total = cap + 1
+        // `prune_log_files` takes sizes from the supplied list, never
+        // from the filesystem (reading real metadata is
+        // `cleanup_old_logs`'s job), so the on-disk files are empty
+        // placeholders whose only role is to make `.exists()` meaningful.
+        // Materialising `cap` bytes here would write ~512 MiB per run for
+        // no additional coverage.
         let old = dir.path().join("freenet.2026-05-25-12.log");
         let live = dir.path().join("freenet.2026-05-25-13.log");
-        write_with_mtime(&old, old_size as usize, now - Duration::from_secs(3600));
-        write_with_mtime(&live, live_size as usize, now);
 
-        let over_by_one = vec![
-            (old.clone(), now - Duration::from_secs(3600), old_size),
-            (live.clone(), now, live_size),
-        ];
-        enforce_log_dir_size_cap(over_by_one, cap);
+        // Sized so that live + old == cap + 1 → over by one byte → the
+        // old (non-live) file must be deleted to get back to the cap.
+        // Split the budget so the live file alone is under cap.
+        let live_size = cap / 2;
+        let old_size = cap - live_size + 1; // total = cap + 1
+        write_with_mtime(&old, 0, hour_ago);
+        write_with_mtime(&live, 0, now);
+
+        size_pass_only(
+            vec![
+                log_file(&old, hour_ago, old_size),
+                log_file(&live, now, live_size),
+            ],
+            cap,
+        );
         assert!(!old.exists(), "cap+1 must delete the oldest non-live file");
         assert!(live.exists(), "live file must always survive");
 
-        // Rewrite the old file and feed a list totalling exactly `cap`:
+        // Recreate the old file and feed a list totalling exactly `cap`:
         // no deletion may occur (boundary is inclusive: total <= cap).
-        write_with_mtime(
-            &old,
-            (cap - live_size) as usize,
-            now - Duration::from_secs(3600),
+        write_with_mtime(&old, 0, hour_ago);
+        size_pass_only(
+            vec![
+                log_file(&old, hour_ago, cap - live_size),
+                log_file(&live, now, live_size),
+            ],
+            cap,
         );
-        let exactly_cap = vec![
-            (
-                old.clone(),
-                now - Duration::from_secs(3600),
-                cap - live_size,
-            ),
-            (live.clone(), now, live_size),
-        ];
-        enforce_log_dir_size_cap(exactly_cap, cap);
         assert!(old.exists(), "total == cap must NOT delete anything");
         assert!(live.exists(), "live file must survive at the boundary");
+    }
+
+    /// Both rolling appenders hold a file open at once, so the size pass
+    /// must spare the newest file of EACH family — not merely the newest
+    /// file overall.
+    ///
+    /// The two appenders' open files do not advance in lockstep, so the
+    /// live error log is routinely NOT the newest file in the directory:
+    /// whenever the main log has been written more recently, a pruner
+    /// that spares one file treats the live error log as an ordinary
+    /// deletion candidate. Deleting it makes its appender write to an
+    /// unlinked inode — the space is not reclaimed, and everything logged
+    /// for the rest of the hour is invisible to `freenet service report`.
+    #[test]
+    fn size_cap_spares_the_live_file_of_both_appenders() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+
+        let main_old_at = now - Duration::from_secs(3 * 3600);
+        let error_live_at = now - Duration::from_secs(2 * 3600);
+        let main_live_at = now - Duration::from_secs(3600);
+
+        let main_old = dir.path().join("freenet.2026-05-25-12.log");
+        // Newest of the error family, but NOT the newest file overall.
+        let error_live = dir.path().join("freenet.error.2026-05-25-13.log");
+        let main_live = dir.path().join("freenet.2026-05-25-14.log");
+
+        write_with_mtime(&main_old, 4096, main_old_at);
+        write_with_mtime(&error_live, 4096, error_live_at);
+        write_with_mtime(&main_live, 4096, main_live_at);
+
+        // 12 KiB total against a 5 KiB cap. Deleting the one evictable
+        // file (main_old) still leaves 8 KiB — deliberately over the cap,
+        // so a pruner that spares only one file would go on to delete the
+        // live error log to chase the budget.
+        size_pass_only(
+            vec![
+                log_file(&main_old, main_old_at, 4096),
+                log_file(&error_live, error_live_at, 4096),
+                log_file(&main_live, main_live_at, 4096),
+            ],
+            5120,
+        );
+
+        assert!(
+            !main_old.exists(),
+            "the one evictable (non-live) file must be deleted"
+        );
+        assert!(
+            error_live.exists(),
+            "the error appender's open file must survive even though it is not \
+             the newest file overall and the directory is still over the cap"
+        );
+        assert!(
+            main_live.exists(),
+            "the main appender's open file must survive"
+        );
+    }
+
+    /// The AGE pass must spare the live files too, not just the size
+    /// pass.
+    ///
+    /// Rotation is lazy: an appender that is not written to never
+    /// rotates, so its open file's mtime stays frozen at creation. A node
+    /// that goes a full retention window without a warning therefore has
+    /// a *live* error log that a plain `modified < cutoff` test cannot
+    /// distinguish from an abandoned one — and deleting it is the same
+    /// unlinked-inode bug the size pass guards against.
+    #[test]
+    fn time_pass_spares_a_live_file_whose_mtime_has_aged_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+
+        // Both error files are past the 72h horizon. The newer of the two
+        // is the one the appender still has open.
+        let error_abandoned = dir.path().join("freenet.error.2026-05-17-00.log");
+        let error_live = dir.path().join("freenet.error.2026-05-21-00.log");
+        let main_live = dir.path().join("freenet.2026-05-25-14.log");
+
+        write_with_mtime(
+            &error_abandoned,
+            1024,
+            now - Duration::from_secs(200 * 3600),
+        );
+        write_with_mtime(&error_live, 1024, now - Duration::from_secs(100 * 3600));
+        write_with_mtime(&main_live, 1024, now);
+
+        cleanup_old_logs(dir.path());
+
+        assert!(
+            error_live.exists(),
+            "the error appender's OPEN file must survive the age pass even \
+             though its mtime is older than the retention horizon — it is \
+             frozen only because nothing has been logged at WARN+ since"
+        );
+        assert!(
+            !error_abandoned.exists(),
+            "a genuinely superseded file of the same family must still be \
+             swept, or the age pass would never reclaim anything"
+        );
+        assert!(main_live.exists(), "the main appender's open file survives");
+    }
+
+    /// `prune_log_files` must sort before it does anything else.
+    ///
+    /// `live_file_indices` reads the live file off the END of each
+    /// family's run, and the size pass walks the same order to delete
+    /// oldest-first — both are wrong on unsorted input. Its one
+    /// production caller passes `read_dir` order, which is arbitrary
+    /// (hash order on ext4), so the sort is the only thing making either
+    /// correct. Nothing else in this suite feeds it out-of-order input:
+    /// without this test, deleting the sort would pass or fail depending
+    /// on how the filesystem happened to enumerate a temp directory.
+    #[test]
+    fn prune_log_files_sorts_before_choosing_victims() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+
+        let at = |hours_ago: u64| now - Duration::from_secs(hours_ago * 3600);
+        let m1 = dir.path().join("freenet.2026-05-25-10.log");
+        let e1 = dir.path().join("freenet.error.2026-05-25-11.log");
+        let m2 = dir.path().join("freenet.2026-05-25-12.log");
+        let e2 = dir.path().join("freenet.error.2026-05-25-13.log");
+        let m3 = dir.path().join("freenet.2026-05-25-14.log");
+        for (path, hours) in [(&m1, 5), (&e1, 4), (&m2, 3), (&e2, 2), (&m3, 1)] {
+            write_with_mtime(path, 1024, at(hours));
+        }
+
+        // Deliberately shuffled: newest first, oldest in the middle.
+        // A pruner that trusted this order would treat m2 and e2 as the
+        // live files and delete the genuinely-open m3.
+        size_pass_only(
+            vec![
+                log_file(&m3, at(1), 1024),
+                log_file(&e1, at(4), 1024),
+                log_file(&m1, at(5), 1024),
+                log_file(&e2, at(2), 1024),
+                log_file(&m2, at(3), 1024),
+            ],
+            2048,
+        );
+
+        assert!(
+            m3.exists(),
+            "the newest Main file is the open one and must survive however \
+             the caller ordered the input"
+        );
+        assert!(
+            e2.exists(),
+            "the newest Error file is the open one and must survive however \
+             the caller ordered the input"
+        );
+        for (path, name) in [(&m1, "m1"), (&e1, "e1"), (&m2, "m2")] {
+            assert!(!path.exists(), "{name} is evictable and must be deleted");
+        }
+    }
+
+    /// An mtime tie inside one family must break by name, not by input
+    /// order.
+    ///
+    /// `SystemTime` is not a total order over these files: on a
+    /// coarse-granularity filesystem the outgoing file's last write and
+    /// the incoming file's creation can land in the same tick, exactly at
+    /// the rotation instant. A stable sort keyed on mtime alone then
+    /// preserves `read_dir` order, so whichever the filesystem happened
+    /// to enumerate last is taken for the open file — and the real one
+    /// becomes an ordinary deletion candidate.
+    #[test]
+    fn live_pick_breaks_mtime_ties_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // Identical mtimes, as a same-tick rotation would produce.
+        let tied = SystemTime::now();
+
+        let older = dir.path().join("freenet.error.2026-05-25-12.log");
+        let newer = dir.path().join("freenet.error.2026-05-25-13.log");
+        write_with_mtime(&older, 1024, tied);
+        write_with_mtime(&newer, 1024, tied);
+
+        // Ordered so that mtime-only sorting leaves `older` last, i.e.
+        // mistaken for the live file.
+        size_pass_only(
+            vec![log_file(&newer, tied, 1024), log_file(&older, tied, 1024)],
+            1024,
+        );
+
+        assert!(
+            newer.exists(),
+            "the later rotation stamp is the open file and must survive the tie"
+        );
+        assert!(
+            !older.exists(),
+            "the superseded file must be the one collected"
+        );
+    }
+
+    /// The live-file exemption must be **positional, not sticky**: once
+    /// the appender rotates, the file it used to hold open stops being
+    /// exempt and becomes an ordinary collection candidate.
+    ///
+    /// This is the bound that lets the exemption exist without a TTL (see
+    /// [`super::prune_log_files`]). AGENTS.md forbids unbounded GC
+    /// exemptions because they become permanent blind spots; this one
+    /// cannot accumulate, because the only event that would let an exempt
+    /// file grow — a write — is the same event that rotates it away and
+    /// moves the exemption to the new file.
+    ///
+    /// An age ceiling is NOT the alternative: it would unlink a
+    /// descriptor the appender still holds, reclaiming nothing and losing
+    /// the rest of the hour's logs.
+    #[test]
+    fn live_file_exemption_clears_once_the_appender_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+
+        // A near-silent error appender: one file, open, mtime frozen far
+        // outside the retention horizon because nothing has hit WARN+.
+        let error_a = dir.path().join("freenet.error.2026-05-21-00.log");
+        let main_live = dir.path().join("freenet.2026-05-25-14.log");
+        write_with_mtime(&error_a, 1024, now - Duration::from_secs(100 * 3600));
+        write_with_mtime(&main_live, 1024, now);
+
+        cleanup_old_logs(dir.path());
+        assert!(
+            error_a.exists(),
+            "while it is the newest of its family it is the open file, so it \
+             is exempt however old its frozen mtime looks"
+        );
+
+        // The appender finally logs a warning. tracing-appender rolls
+        // before writing, so the write lands in a NEW file and `error_a`
+        // is closed at whatever size it already had.
+        let error_b = dir.path().join("freenet.error.2026-05-25-14.log");
+        write_with_mtime(&error_b, 1024, now);
+
+        cleanup_old_logs(dir.path());
+        assert!(
+            !error_a.exists(),
+            "once superseded, the previously-exempt file must be collected \
+             on the very next prune — the exemption is positional, not \
+             sticky, which is what bounds it without a TTL"
+        );
+        assert!(error_b.exists(), "the new open file inherits the exemption");
+        assert!(main_live.exists(), "the main appender's open file survives");
+    }
+
+    /// The live set is derived from the files present, not from a
+    /// hand-written list of [`LogFamily`] variants — forgetting to extend
+    /// such a list when a third appender is added would silently re-expose
+    /// that appender's open file to deletion.
+    #[test]
+    fn live_file_indices_is_the_newest_of_every_family_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let at = |secs| base + Duration::from_secs(secs);
+
+        // Interleaved and mtime-ascending, as `prune_log_files` sorts it.
+        let files = vec![
+            log_file(&dir.path().join("freenet.2026-05-25-10.log"), at(0), 1),
+            log_file(
+                &dir.path().join("freenet.error.2026-05-25-11.log"),
+                at(10),
+                1,
+            ),
+            log_file(&dir.path().join("freenet.2026-05-25-12.log"), at(20), 1),
+            log_file(
+                &dir.path().join("freenet.error.2026-05-25-13.log"),
+                at(30),
+                1,
+            ),
+            log_file(&dir.path().join("freenet.2026-05-25-14.log"), at(40), 1),
+        ];
+
+        let mut live = live_file_indices(&files);
+        live.sort_unstable();
+        assert_eq!(
+            live,
+            vec![3, 4],
+            "expected the newest Error (index 3) and the newest Main (index 4)"
+        );
+
+        // Every family present must be represented exactly once.
+        assert_eq!(live.len(), 2);
+        let families: Vec<LogFamily> = live.iter().map(|&i| files[i].family).collect();
+        assert!(families.contains(&LogFamily::Main));
+        assert!(families.contains(&LogFamily::Error));
+    }
+
+    /// `freenet.error.*` must classify as [`LogFamily::Error`], not
+    /// [`LogFamily::Main`]. `freenet.error.` is a superset of `freenet.`,
+    /// so testing the shorter prefix first drops error logs out of the
+    /// filter entirely (their leftover stem fails the all-digits check),
+    /// and nothing unclassified is ever pruned — the family would grow
+    /// without bound.
+    #[test]
+    fn error_logs_classify_as_their_own_family() {
+        assert_eq!(
+            rotating_log_family("freenet.2026-05-25-14.log"),
+            Some(LogFamily::Main)
+        );
+        assert_eq!(
+            rotating_log_family("freenet.error.2026-05-25-14.log"),
+            Some(LogFamily::Error)
+        );
+
+        // Files the pruner must never claim, and so never delete.
+        for foreign in [
+            "freenet.log",
+            "freenet.error.log",
+            "freenet.error.log.last",
+            "other.log",
+            // On Linux the auto-updater's state dir IS the log dir.
+            "known_good_binary",
+            "update_probation.json",
+            "known_bad_version",
+        ] {
+            assert_eq!(
+                rotating_log_family(foreign),
+                None,
+                "{foreign} must not be claimed by the log pruner"
+            );
+        }
+    }
+
+    /// Neither appender may delegate pruning back to tracing-appender's
+    /// `max_log_files`.
+    ///
+    /// Its `prune_old_logs` picks victims with a bare
+    /// `filename.starts_with(prefix)` test. Both families AND the legacy
+    /// bare files start with `freenet`, so the main appender's budget
+    /// counts and deletes the error appender's files (halving each
+    /// family's real retention) and, once over budget, deletes
+    /// oldest-first — reaching the systemd/launchd-held `freenet.log`
+    /// that `rotating_log_family` deliberately refuses to touch.
+    /// `cleanup_old_logs` is the single pruning authority instead.
+    #[test]
+    fn appenders_must_not_delegate_pruning_to_max_log_files() {
+        // Split so this needle cannot match its own source text.
+        let needle = concat!(".max_log", "_files(");
+        let source: String = include_str!("tracer.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !source.contains(needle),
+            "tracer.rs must not call the rolling appender's max-log-files \
+             builder method: its prefix match spans both log families and the \
+             systemd-owned bare files. Prune via cleanup_old_logs instead."
+        );
     }
 
     /// The periodic prune loop (issue #4699) must apply the same
@@ -791,11 +1383,12 @@ mod cleanup_tests {
         let now = SystemTime::now();
 
         // 4 KiB each, total 12 KiB. We cannot pass a custom cap into the
-        // loop (it uses the const), so instead we rely on the time pass:
-        // make the two older files past the 72h retention window and the
-        // newest within it. The periodic cleanup must delete the two old
-        // ones and keep the live file, proving the loop actually invokes
-        // cleanup_old_logs on its tick.
+        // loop (it reads the process-wide budget), so instead we rely on
+        // the age pass: make the two older files past the
+        // LOG_RETENTION_HOURS horizon and the newest within it. The
+        // periodic cleanup must delete the two old ones and keep the live
+        // file, proving the loop actually invokes cleanup_old_logs on its
+        // tick.
         let old_ts = SystemTime::now() - Duration::from_secs(100 * 24 * 3600);
         let oldest = dir.path().join("freenet.2026-02-14-00.log");
         let middle = dir.path().join("freenet.2026-02-14-01.log");
