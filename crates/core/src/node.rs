@@ -4749,6 +4749,7 @@ mod tests {
         let handler_key = key;
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(clippy::wildcard_enum_match_arm)]
                 let response = match ev {
                     ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
                         key: Some(handler_key),
@@ -4868,6 +4869,7 @@ mod tests {
         let handler_flag = update_query_seen.clone();
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(clippy::wildcard_enum_match_arm)]
                 let response = match ev {
                     ContractHandlerEvent::UpdateQuery { .. } => {
                         handler_flag.store(true, Ordering::SeqCst);
@@ -4997,6 +4999,7 @@ mod tests {
         let handler_flag = update_query_seen.clone();
         let _handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(clippy::wildcard_enum_match_arm)]
                 let response = match ev {
                     ContractHandlerEvent::UpdateQuery { .. } => {
                         handler_flag.store(true, Ordering::SeqCst);

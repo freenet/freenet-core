@@ -752,6 +752,8 @@ mod tests {
     use crate::message::{InnerMessage, Transaction};
     use crate::operations::test_utils::make_contract_key;
 
+    type ProbeCase = (bool, usize, Option<Vec<u8>>, Option<Vec<u8>>);
+
     #[test]
     fn put_msg_id_returns_transaction() {
         let tx = Transaction::new::<PutMsg>();
@@ -1020,7 +1022,7 @@ mod tests {
     fn put_msg_probe_response_serde_roundtrip() {
         let key = make_contract_key(4);
         // (holder_found, hop_count, holder_summary bytes, reverse_delta bytes)
-        let cases: [(bool, usize, Option<Vec<u8>>, Option<Vec<u8>>); 3] = [
+        let cases: [ProbeCase; 3] = [
             // No holder: both trailing fields absent.
             (false, 0usize, None, None),
             // Holder found, originator current-or-ahead: summary present, no

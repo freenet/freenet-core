@@ -1643,10 +1643,12 @@ mod tests {
         );
         // The cap must sit above the crash-loop rollback threshold so rollback
         // always fires first.
-        assert!(
-            super::super::rollback::ROLLBACK_CRASH_THRESHOLD < 50,
-            "wrapper cap must exceed the rollback crash threshold"
-        );
+        const {
+            assert!(
+                super::super::rollback::ROLLBACK_CRASH_THRESHOLD < 50,
+                "wrapper cap must exceed the rollback crash threshold"
+            );
+        }
         // The cap must target a tight crash LOOP, not occasional crashes: a child
         // that ran healthily long enough resets the streak so it never
         // accumulates to the cap over a long lifetime.

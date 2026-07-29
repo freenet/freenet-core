@@ -1598,6 +1598,7 @@ mod remove_contract_tests {
         let resp = executor
             .delegate_request(req, Some(&origin_contract), None, None)
             .expect("register-with-predecessors must succeed");
+        #[allow(clippy::wildcard_enum_match_arm)]
         match resp {
             HostResponse::DelegateResponse { key, .. } => {
                 assert_eq!(&key, succ.key(), "response carries the successor key");

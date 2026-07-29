@@ -3179,7 +3179,7 @@ mod tests {
         // per-drop SAMPLE cap so the scan returns them all and it is the per-drop
         // re-root cap (not the scan cap) that does the bounding this test measures.
         const _: () =
-            assert!(MAX_PROMPT_REROOTS_PER_DROP * 3 + 1 <= CONNECTION_DROP_SHADOW_SAMPLE_CAP);
+            assert!(MAX_PROMPT_REROOTS_PER_DROP * 3 < CONNECTION_DROP_SHADOW_SAMPLE_CAP);
         let m = MAX_PROMPT_REROOTS_PER_DROP * 3 + 1;
         let mut instance_ids = Vec::new();
         for i in 0..m {

@@ -3964,6 +3964,7 @@ mod tests {
 
         let handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(clippy::wildcard_enum_match_arm)]
                 let response = match ev {
                     ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
                         key: None,
@@ -4238,6 +4239,7 @@ mod tests {
         let counter = update_query_count.clone();
         let handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(clippy::wildcard_enum_match_arm)]
                 let response = match ev {
                     ContractHandlerEvent::GetQuery { .. } => ContractHandlerEvent::GetResponse {
                         key: None,
@@ -4400,7 +4402,7 @@ mod tests {
 
         // Two delta failures (count = 2, below the trip threshold).
         for bytes in [vec![1u8], vec![2u8]] {
-            let _ = drive_relay_broadcast_to(
+            _ = drive_relay_broadcast_to(
                 &op_manager,
                 Transaction::new::<UpdateMsg>(),
                 key,
@@ -4430,7 +4432,7 @@ mod tests {
 
         // A 3rd delta failure now trips (count 2 → 3), proving the success did
         // NOT reset it to 0 (else the count would only reach 1 here).
-        let _ = drive_relay_broadcast_to(
+        _ = drive_relay_broadcast_to(
             &op_manager,
             Transaction::new::<UpdateMsg>(),
             key,
@@ -4482,7 +4484,7 @@ mod tests {
 
         // Sender A trips its own Invalid channel (3 consecutive delta failures).
         for bytes in [vec![1u8], vec![2u8], vec![3u8]] {
-            let _ = drive_relay_broadcast_to(
+            _ = drive_relay_broadcast_to(
                 &op_manager,
                 Transaction::new::<UpdateMsg>(),
                 key,
@@ -4559,7 +4561,7 @@ mod tests {
         // Five consecutive queue-full delta failures (well past the N=3 Invalid
         // trip threshold). None may be recorded to the backoff.
         for bytes in [vec![1u8], vec![2u8], vec![3u8], vec![4u8], vec![5u8]] {
-            let _ = drive_relay_broadcast_to(
+            _ = drive_relay_broadcast_to(
                 &op_manager,
                 Transaction::new::<UpdateMsg>(),
                 key,
@@ -4607,7 +4609,7 @@ mod tests {
         let sender_count = 6u16;
         for i in 0..sender_count {
             let sender: SocketAddr = format!("127.0.0.1:{}", 13000 + i).parse().unwrap();
-            let _ = drive_relay_broadcast_to(
+            _ = drive_relay_broadcast_to(
                 &op_manager,
                 Transaction::new::<UpdateMsg>(),
                 key,
@@ -5827,7 +5829,7 @@ mod tests {
                 break;
             }
         }
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 
         assert!(
             !fired.is_empty(),
