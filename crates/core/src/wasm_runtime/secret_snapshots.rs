@@ -79,14 +79,38 @@ pub const DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET: u64 = 3 * 1024 * 1024;
 
 /// Floor on how many snapshots the byte budget is allowed to leave behind.
 ///
-/// The budget evicts oldest-first, but it must never empty the history: the
-/// newest snapshot is the value that the most recent write overwrote, i.e.
-/// exactly what "undo the last write" needs. So a single secret larger than
-/// the whole budget keeps one version and exceeds the budget, rather than
-/// silently having no recoverable history at all. Deleting user data to
-/// satisfy a disk heuristic is the failure mode this floor exists to
-/// prevent.
-const MIN_SNAPSHOTS_KEPT_UNDER_BUDGET: usize = 1;
+/// The budget evicts oldest-first, but it must never collapse the history to
+/// a single entry: one survivor only supports "undo the last write", with no
+/// room to walk back when the operator does not yet know which version they
+/// want. Three is the smallest count that gives a real walk-back window, and
+/// it is cheap where it binds:
+///
+/// - At the default 3 MiB budget the floor is INERT for any secret up to
+///   1 MiB, because three of those versions already fit inside the budget.
+///   It only takes effect for the genuinely large values (a ~1 MiB River
+///   room state and up) — exactly the case where the budget is aggressive
+///   and a one-entry history would be thinnest.
+/// - Worst case it retains `3 x largest_snapshot` rather than an unbounded
+///   count, so it cannot reintroduce the version-count blowup this budget
+///   exists to fix.
+///
+/// Deliberately not 5 (matching `keep_last`): that would make the floor bind
+/// for every secret over ~600 KiB and raise the worst case to 5x, buying two
+/// more versions of the values that cost the most to keep.
+///
+/// Note this floor is what makes the budget's guarantee "at most
+/// `max(max_total_bytes, 3 x largest snapshot)`", not a hard byte cap.
+const MIN_SNAPSHOTS_KEPT_UNDER_BUDGET: usize = 3;
+
+/// Environment variable overriding [`DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET`],
+/// in bytes. Parsed by [`parse_snapshot_budget`].
+///
+/// Exists because the budget is the one retention clause that can DELETE
+/// pre-existing history on upgrade (see [`RetentionPolicy::max_total_bytes`]),
+/// and the only other snapshot knob,
+/// `FREENET_DISABLE_SECRET_SNAPSHOTS`, points the wrong way for an operator
+/// who wants MORE history rather than none.
+pub const SNAPSHOT_BUDGET_ENV: &str = "FREENET_SECRET_SNAPSHOT_BYTES_PER_SECRET";
 
 /// One tier of a [`RetentionPolicy`]: aim to keep one snapshot per
 /// `interval` of clock time, up to `max_count` snapshots in this tier.
@@ -141,7 +165,62 @@ pub struct RetentionPolicy {
     ///
     /// Applied to the size the entries actually occupy on disk, so it bounds
     /// disk directly rather than proxying it through a version count.
+    ///
+    /// **This clause is RETROACTIVE.** Unlike the count tiers, which a node
+    /// upgrading into them satisfies gradually, the first thinning pass after
+    /// this field starts being set collapses an existing over-budget history
+    /// down to the budget in one go, and those deletions are irreversible.
+    /// That is intended (it is how the ~30 MiB histories get reclaimed) but it
+    /// is a one-way door, so it is documented for operators in
+    /// `docs/secrets-at-rest.md` and overridable via [`SNAPSHOT_BUDGET_ENV`].
+    /// It is also why [`Self::without_byte_budget`] exists: the RECOVERY path
+    /// deliberately does not apply it.
     pub max_total_bytes: Option<u64>,
+}
+
+/// Resolve the per-secret byte budget from a raw [`SNAPSHOT_BUDGET_ENV`]
+/// value.
+///
+/// - absent, empty, or whitespace-only → the built-in default (treated as
+///   "operator said nothing").
+/// - `0` → `None`, i.e. the budget is DISABLED and only the count tiers and
+///   `max_age` bound the history. This is the escape hatch for an operator
+///   who wants the pre-budget behavior back.
+/// - any other valid `u64` → that many bytes.
+/// - unparseable → the built-in default, with a warning.
+///
+/// Degrade-safe in one direction on purpose: a malformed value falls back to
+/// the bounded default rather than to "unlimited" (which would silently
+/// re-open the disk blowup) or to "0 bytes" (which would silently shrink
+/// every history to the floor). Only an explicit, well-formed `0` disables
+/// the budget.
+pub fn parse_snapshot_budget(raw: Option<&str>) -> Option<u64> {
+    let Some(raw) = raw else {
+        return Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET);
+    }
+    match trimmed.parse::<u64>() {
+        // Explicit opt-out: count tiers + max_age still bound the history.
+        Ok(0) => None,
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            tracing::warn!(
+                env = SNAPSHOT_BUDGET_ENV,
+                value = %trimmed,
+                error = %err,
+                "unparseable snapshot byte budget; falling back to the default"
+            );
+            Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET)
+        }
+    }
+}
+
+/// [`parse_snapshot_budget`] applied to the live process environment.
+fn snapshot_budget_from_env() -> Option<u64> {
+    parse_snapshot_budget(std::env::var(SNAPSHOT_BUDGET_ENV).ok().as_deref())
 }
 
 impl Default for RetentionPolicy {
@@ -151,8 +230,14 @@ impl Default for RetentionPolicy {
     /// last 12 months, with an absolute 2-year ceiling so stale snapshots
     /// from secrets that stopped being written eventually age out, and a
     /// [`DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET`] disk budget on top. Worst
-    /// case ~62 entries per secret in steady state, and never more than the
-    /// byte budget (plus the one-snapshot floor) of disk.
+    /// case ~62 entries per secret in steady state, and never more than
+    /// `max(budget, MIN_SNAPSHOTS_KEPT_UNDER_BUDGET x largest snapshot)` of
+    /// disk.
+    ///
+    /// Reads [`SNAPSHOT_BUDGET_ENV`] for the byte budget, mirroring how
+    /// `SecretsStore::new` reads `FREENET_DISABLE_SECRET_SNAPSHOTS`. Every
+    /// other field is a compile-time constant, so this is the only reason
+    /// two `default()` values can differ within a process.
     fn default() -> Self {
         const MIN: u64 = 60;
         const HOUR: u64 = 60 * MIN;
@@ -192,13 +277,38 @@ impl Default for RetentionPolicy {
             max_age: Some(Duration::from_secs(2 * YEAR)),
             // Bounds the DISK the count tiers above would otherwise leave
             // unbounded: 62 versions is cheap for a small secret and ~62 MiB
-            // for a ~1 MiB one. See the constant's docs for the sizing.
-            max_total_bytes: Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET),
+            // for a ~1 MiB one. See the constant's docs for the sizing, and
+            // `SNAPSHOT_BUDGET_ENV` for the operator override.
+            max_total_bytes: snapshot_budget_from_env(),
         }
     }
 }
 
 impl RetentionPolicy {
+    /// This policy with the byte budget removed; the count tiers and
+    /// `max_age` are untouched.
+    ///
+    /// Used by the RECOVERY path (`SecretsStore::restore_snapshot` and
+    /// `freenet secrets snapshot-restore`). A restore is what an operator
+    /// runs when they are trying to get a value back, often walking versions
+    /// one at a time, and it is the worst possible moment to garbage-collect
+    /// history: applying the budget there could evict several older versions
+    /// — including the one just restored FROM — as a side effect of the
+    /// reversibility snapshot the restore itself adds. The budget is a
+    /// disk-pressure heuristic, and a manual restore is not disk pressure.
+    ///
+    /// This is not an unbounded cleanup exemption: `max_age` still applies at
+    /// the restore, so every entry keeps a finite lifetime, and the next
+    /// ordinary `store_secret` for that secret applies the budget in full.
+    /// The effect is that this PR leaves the restore path's thinning
+    /// behaviour byte-for-byte what it was before the budget existed.
+    pub fn without_byte_budget(&self) -> Self {
+        Self {
+            max_total_bytes: None,
+            ..self.clone()
+        }
+    }
+
     /// Given `timestamps` sorted ascending, return the indices to KEEP.
     /// Indices not in the returned set should be deleted.
     ///
@@ -363,7 +473,21 @@ pub fn next_snapshot_path(snap_dir: &Path) -> std::io::Result<PathBuf> {
 /// do not propagate, since thinning is a maintenance operation that must
 /// never fail the primary write path.
 pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime) {
-    let mut entries: Vec<(SystemTime, u64, PathBuf)> = match fs::read_dir(snap_dir) {
+    /// One candidate entry for a thinning pass.
+    struct Candidate {
+        timestamp: SystemTime,
+        /// Collision-suffix ordering key for entries sharing `timestamp`.
+        /// `(0, 0)` for the unsuffixed file, `(1, n)` for `.n` — the exact
+        /// key [`list_snapshots`] sorts by. NUMERIC on purpose: sorting the
+        /// file names as text puts `.10` before `.9`, which would let the
+        /// byte budget evict the numerically-newest entry of a
+        /// same-millisecond burst and keep an older sibling.
+        suffix_key: (u8, u32),
+        size_bytes: u64,
+        path: PathBuf,
+    }
+
+    let mut entries: Vec<Candidate> = match fs::read_dir(snap_dir) {
         Ok(rd) => rd
             .filter_map(|res| match res {
                 Ok(entry) => Some(entry),
@@ -382,13 +506,13 @@ pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime
                     return None;
                 }
                 let path = entry.path();
-                let stamp = parse_snapshot_stamp(&path)?;
+                let (stamp, suffix) = parse_snapshot_name(&path)?;
                 // A stat failure is charged as 0 bytes: it makes the entry
                 // free against `max_total_bytes`, so it is RETAINED and some
                 // other (measurable) entry is evicted instead. Erring toward
                 // keeping is the right default for a best-effort disk
                 // heuristic operating on user data.
-                let size = match entry.metadata() {
+                let size_bytes = match entry.metadata() {
                     Ok(md) => md.len(),
                     Err(err) => {
                         tracing::debug!(
@@ -397,7 +521,15 @@ pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime
                         0
                     }
                 };
-                Some((UNIX_EPOCH + Duration::from_millis(stamp), size, path))
+                Some(Candidate {
+                    timestamp: UNIX_EPOCH + Duration::from_millis(stamp),
+                    suffix_key: match suffix {
+                        None => (0, 0),
+                        Some(n) => (1, n),
+                    },
+                    size_bytes,
+                    path,
+                })
             })
             .collect(),
         Err(err) => {
@@ -407,17 +539,24 @@ pub fn thin_snapshots(snap_dir: &Path, policy: &RetentionPolicy, now: SystemTime
     };
     // Total order, not just by timestamp: same-millisecond collision entries
     // share a stamp, and the byte budget evicts oldest-first, so the tie has
-    // to break deterministically. Names are fixed-width zero-padded, so
-    // lexicographic path order is `(stamp, suffix)` order with the
-    // unsuffixed entry first — the same order `list_snapshots` reports.
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+    // to break deterministically — in the SAME order `list_snapshots` and the
+    // restore disambiguation use, so "the newest snapshot" names the same
+    // entry everywhere.
+    entries.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.suffix_key.cmp(&b.suffix_key))
+    });
 
-    let sized: Vec<(SystemTime, u64)> = entries.iter().map(|(t, s, _)| (*t, *s)).collect();
+    let sized: Vec<(SystemTime, u64)> = entries
+        .iter()
+        .map(|c| (c.timestamp, c.size_bytes))
+        .collect();
     let keep = policy.select_keep_within_budget(now, &sized);
-    for (i, (_, _, path)) in entries.iter().enumerate() {
+    for (i, candidate) in entries.iter().enumerate() {
         if !keep.contains(&i) {
-            if let Err(err) = fs::remove_file(path) {
-                tracing::warn!("failed to thin snapshot {path:?}: {err}");
+            if let Err(err) = fs::remove_file(&candidate.path) {
+                tracing::warn!("failed to thin snapshot {:?}: {err}", candidate.path);
             }
         }
     }
@@ -477,17 +616,17 @@ pub fn list_snapshots(snap_dir: &Path) -> std::io::Result<Vec<SnapshotMetadata>>
     Ok(out)
 }
 
-/// Parse a snapshot file name back into its epoch-millis timestamp.
+/// Parse a snapshot file name back into its epoch-millis timestamp and
+/// optional numeric collision suffix.
+///
 /// Accepts only `{digits}` or `{digits}.{digits}`; any other shape
 /// (including `42.tmp`, `foo`, `1.2.3`, etc.) returns `None` so stray
 /// files in the snapshot directory are not mistaken for snapshots.
-pub(crate) fn parse_snapshot_stamp(path: &Path) -> Option<u64> {
-    parse_snapshot_name(path).map(|(ts, _)| ts)
-}
-
-/// Like [`parse_snapshot_stamp`] but also returns the optional numeric
-/// collision suffix. Surfaced through [`SnapshotMetadata`] so callers
-/// can disambiguate multiple writes that landed in the same millisecond.
+///
+/// The suffix is surfaced through [`SnapshotMetadata`] so callers can
+/// disambiguate multiple writes that landed in the same millisecond, and
+/// [`thin_snapshots`] orders on it so its eviction agrees with what
+/// [`list_snapshots`] reports.
 pub(crate) fn parse_snapshot_name(path: &Path) -> Option<(u64, Option<u32>)> {
     let name = path.file_name()?.to_str()?;
     let (stamp_part, suffix_part) = match name.split_once('.') {
@@ -867,15 +1006,35 @@ mod tests {
     #[test]
     fn byte_budget_evicts_oldest_first() {
         let now = SystemTime::now();
-        // Four 100-byte snapshots, budget 250 => the two newest fit.
+        // Eight 100-byte snapshots, budget 450 => the four newest fit. Sized
+        // so the answer is the BUDGET's, not the floor's.
         let entries: Vec<(SystemTime, u64)> =
-            (0..4).map(|i| (t(now, 400 - i * 100), 100u64)).collect();
-        let keep = budget_only(Some(250)).select_keep_within_budget(now, &entries);
+            (0..8).map(|i| (t(now, 800 - i * 100), 100u64)).collect();
+        let keep = budget_only(Some(450)).select_keep_within_budget(now, &entries);
         assert_eq!(
             keep.into_iter().collect::<Vec<_>>(),
-            vec![2, 3],
+            vec![4, 5, 6, 7],
             "budget must drop the OLDEST entries and keep the newest"
         );
+    }
+
+    /// The floor stops eviction at [`MIN_SNAPSHOTS_KEPT_UNDER_BUDGET`] even
+    /// when the survivors blow the budget wide open. A disk heuristic must
+    /// never be the reason an operator has no version to walk back to.
+    #[test]
+    fn byte_budget_floor_keeps_three_over_budget() {
+        let now = SystemTime::now();
+        // Ten 1 MiB snapshots against a 1-byte budget.
+        let entries: Vec<(SystemTime, u64)> = (0..10)
+            .map(|i| (t(now, (10 - i) * 100), 1024 * 1024u64))
+            .collect();
+        let keep = budget_only(Some(1)).select_keep_within_budget(now, &entries);
+        assert_eq!(
+            keep.iter().copied().collect::<Vec<_>>(),
+            vec![7, 8, 9],
+            "floor must retain the three NEWEST entries, not just any three"
+        );
+        assert_eq!(keep.len(), MIN_SNAPSHOTS_KEPT_UNDER_BUDGET);
     }
 
     #[test]
@@ -900,14 +1059,14 @@ mod tests {
     }
 
     #[test]
-    fn byte_budget_zero_still_keeps_the_newest() {
-        // Degenerate budget: floor at one entry, and it must be the newest
-        // (the value the last write overwrote).
+    fn byte_budget_zero_still_keeps_the_floor() {
+        // Degenerate budget: floor's worth of entries survive, and they are
+        // the newest (the values the last writes overwrote).
         let now = SystemTime::now();
         let entries: Vec<(SystemTime, u64)> =
             (0..5).map(|i| (t(now, 500 - i * 100), 100u64)).collect();
         let keep = budget_only(Some(0)).select_keep_within_budget(now, &entries);
-        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![4]);
+        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![2, 3, 4]);
     }
 
     #[test]
@@ -915,12 +1074,12 @@ mod tests {
         // Boundary: total == budget is NOT over budget.
         let now = SystemTime::now();
         let entries: Vec<(SystemTime, u64)> =
-            (0..4).map(|i| (t(now, 400 - i * 100), 100u64)).collect();
-        let keep = budget_only(Some(400)).select_keep_within_budget(now, &entries);
-        assert_eq!(keep.len(), 4);
-        // One byte less and the oldest goes.
-        let keep = budget_only(Some(399)).select_keep_within_budget(now, &entries);
-        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+            (0..5).map(|i| (t(now, 500 - i * 100), 100u64)).collect();
+        let keep = budget_only(Some(500)).select_keep_within_budget(now, &entries);
+        assert_eq!(keep.len(), 5);
+        // One byte less and exactly one entry — the oldest — goes.
+        let keep = budget_only(Some(499)).select_keep_within_budget(now, &entries);
+        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -974,10 +1133,163 @@ mod tests {
     #[test]
     fn byte_budget_saturates_on_overflowing_sizes() {
         // Pathological sizes must not panic on overflow in debug builds.
+        //
+        // The running total saturates at `u64::MAX`, so subtracting the first
+        // evicted entry's size takes it straight to 0 and the loop stops
+        // early. Saturation therefore makes the budget UNDER-evict (keep
+        // more), never over-evict — the correct direction for a disk
+        // heuristic operating on user data. Only reachable with sizes summing
+        // past 2^64 bytes, i.e. never in practice; what is asserted here is
+        // the absence of a panic and the safe failure direction, not an exact
+        // survivor set (which would be pinning the artifact).
         let now = SystemTime::now();
-        let entries = vec![(t(now, 30), u64::MAX), (t(now, 20), u64::MAX)];
+        let entries: Vec<(SystemTime, u64)> =
+            (0..5).map(|i| (t(now, 500 - i * 100), u64::MAX)).collect();
         let keep = budget_only(Some(1024)).select_keep_within_budget(now, &entries);
-        assert_eq!(keep.into_iter().collect::<Vec<_>>(), vec![1]);
+        assert!(
+            keep.len() >= MIN_SNAPSHOTS_KEPT_UNDER_BUDGET,
+            "saturation must never evict below the floor; kept {}",
+            keep.len()
+        );
+        assert!(
+            keep.contains(&4),
+            "the newest entry must survive regardless"
+        );
+    }
+
+    // ===== `SNAPSHOT_BUDGET_ENV` parsing =====
+
+    #[test]
+    fn budget_env_absent_or_blank_uses_the_default() {
+        for raw in [None, Some(""), Some("   "), Some("\t\n")] {
+            assert_eq!(
+                parse_snapshot_budget(raw),
+                Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET),
+                "raw={raw:?} must fall back to the default budget"
+            );
+        }
+    }
+
+    #[test]
+    fn budget_env_zero_disables_the_budget() {
+        // The escape hatch for an operator who wants the pre-budget
+        // behaviour back: count tiers + max_age only.
+        assert_eq!(parse_snapshot_budget(Some("0")), None);
+        assert_eq!(parse_snapshot_budget(Some("  0  ")), None);
+    }
+
+    #[test]
+    fn budget_env_accepts_explicit_byte_counts() {
+        assert_eq!(parse_snapshot_budget(Some("1")), Some(1));
+        assert_eq!(parse_snapshot_budget(Some("12345678")), Some(12_345_678));
+        assert_eq!(parse_snapshot_budget(Some(" 4096 ")), Some(4096));
+        assert_eq!(
+            parse_snapshot_budget(Some(&u64::MAX.to_string())),
+            Some(u64::MAX)
+        );
+        // `u64::from_str` accepts a leading `+`, and "+5" is an unambiguous
+        // way of writing 5 bytes, so it is honoured rather than rejected.
+        assert_eq!(parse_snapshot_budget(Some("+5")), Some(5));
+    }
+
+    /// Garbage must degrade to the DEFAULT, never to "unlimited" (which
+    /// would silently re-open the disk blowup) and never to "0 bytes"
+    /// (which would silently shrink every history to the floor).
+    #[test]
+    fn budget_env_garbage_degrades_to_the_default() {
+        for raw in [
+            "abc",
+            "-1",
+            "3.5",
+            "3MiB",
+            "1_000",
+            "0x10",
+            "99999999999999999999999", // overflows u64
+            "5 bytes",
+            "",
+            " 3 MiB",
+        ] {
+            assert_eq!(
+                parse_snapshot_budget(Some(raw)),
+                Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET),
+                "raw={raw:?} must degrade to the default budget"
+            );
+        }
+    }
+
+    /// `RetentionPolicy::default()` must actually CONSULT the environment
+    /// rather than hardcoding the constant. This is the wiring pin for the
+    /// operator override; the parsing itself is covered above.
+    #[test]
+    fn default_policy_reads_the_budget_env() {
+        use std::sync::Mutex as StdMutex;
+        // Serializes this test against its own re-entry only; the real
+        // cross-test isolation is nextest's per-process model (see the
+        // SAFETY notes below). The override value is deliberately a LARGE
+        // finite budget, so a concurrent `default()` under a plain
+        // multi-threaded `cargo test` sees a still-bounded policy rather
+        // than an unbounded or 0-byte one.
+        static ENV_GUARD: StdMutex<()> = StdMutex::new(());
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+
+        let prev = std::env::var(SNAPSHOT_BUDGET_ENV).ok();
+
+        // SAFETY: `set_var`/`remove_var` are unsound only under CONCURRENT
+        // env access. CI runs these lib tests under `cargo nextest`, which
+        // executes each test in its own process, so nothing else mutates
+        // `environ` while this test runs; the prior value is restored at the
+        // end. (`ENV_GUARD` only serializes this test against its own
+        // re-entry, so under a plain multi-threaded `cargo test` this is
+        // best-effort — nextest's per-process isolation is the guarantee.)
+        unsafe { std::env::remove_var(SNAPSHOT_BUDGET_ENV) };
+        assert_eq!(
+            RetentionPolicy::default().max_total_bytes,
+            Some(DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET),
+            "unset env must yield the built-in default"
+        );
+
+        // SAFETY: as above — nextest runs this test in its own process; the
+        // prior value is restored below.
+        unsafe { std::env::set_var(SNAPSHOT_BUDGET_ENV, "7340032") };
+        assert_eq!(
+            RetentionPolicy::default().max_total_bytes,
+            Some(7 * 1024 * 1024),
+            "default() must read the operator override, not a hardcoded constant"
+        );
+
+        // SAFETY: as above — restoring the environment to its prior state.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(SNAPSHOT_BUDGET_ENV, v),
+                None => std::env::remove_var(SNAPSHOT_BUDGET_ENV),
+            }
+        }
+    }
+
+    // ===== recovery-path exemption =====
+
+    #[test]
+    fn without_byte_budget_drops_only_the_budget() {
+        let p = RetentionPolicy::default();
+        let stripped = p.without_byte_budget();
+        assert_eq!(stripped.max_total_bytes, None);
+        assert_eq!(stripped.keep_last, p.keep_last);
+        assert_eq!(stripped.max_age, p.max_age);
+        assert_eq!(stripped.buckets, p.buckets);
+        // And it is what makes the selection budget-free.
+        let now = SystemTime::now();
+        let entries: Vec<(SystemTime, u64)> = (0..5)
+            .map(|i| (t(now, 500 - i * 100), 10 * 1024 * 1024u64))
+            .collect();
+        assert_eq!(
+            stripped.select_keep_within_budget(now, &entries).len(),
+            5,
+            "50 MiB of history must survive when the budget is stripped"
+        );
+        assert!(
+            p.select_keep_within_budget(now, &entries).len() < 5,
+            "test is vacuous unless the un-stripped policy would have evicted"
+        );
     }
 
     /// The DEFAULT policy must bound bytes, not just version count. This is
@@ -986,6 +1298,13 @@ mod tests {
     #[test]
     fn default_policy_bounds_bytes_per_secret() {
         let p = RetentionPolicy::default();
+        // Read the budget off the policy rather than the constant: under a
+        // plain multi-threaded `cargo test`, `default_policy_reads_the_budget_env`
+        // may have the override set. It only ever sets a LARGE FINITE value,
+        // so the bound below still holds and stays non-vacuous.
+        let budget = p
+            .max_total_bytes
+            .expect("default policy must carry a byte budget");
         let now = SystemTime::now();
         // 40 versions of a ~1 MiB secret written one minute apart: the count
         // tiers alone would keep dozens (~40 MiB).
@@ -995,7 +1314,7 @@ mod tests {
         let keep = p.select_keep_within_budget(now, &entries);
         let total: u64 = keep.iter().map(|&i| entries[i].1).sum();
         assert!(
-            total <= DEFAULT_MAX_SNAPSHOT_BYTES_PER_SECRET,
+            total <= budget,
             "default policy must bound per-secret snapshot bytes; kept {} entries = {total} bytes",
             keep.len()
         );
@@ -1011,57 +1330,112 @@ mod tests {
         );
     }
 
+    /// Policy that keeps everything by count, so filesystem-level tests
+    /// isolate the byte budget from the tiering.
+    fn fs_budget_only(max_total_bytes: Option<u64>) -> RetentionPolicy {
+        RetentionPolicy {
+            keep_last: usize::MAX,
+            buckets: vec![],
+            max_age: None,
+            max_total_bytes,
+        }
+    }
+
     #[test]
     fn thin_snapshots_enforces_byte_budget() {
         let dir = tempfile::tempdir().expect("tempdir");
         let now_ms = recent_ms();
-        // Five 1000-byte snapshots, one second apart.
-        for i in 0..5u64 {
-            write_snapshot(dir.path(), now_ms - (5 - i) * 1000, &vec![b'x'; 1000]);
+        // Eight 1000-byte snapshots, one second apart. Budget 4500 keeps the
+        // newest four — comfortably above the floor, so this pins the BUDGET.
+        for i in 0..8u64 {
+            write_snapshot(dir.path(), now_ms - (8 - i) * 1000, &vec![b'x'; 1000]);
         }
-        let policy = RetentionPolicy {
-            keep_last: usize::MAX,
-            buckets: vec![],
-            max_age: None,
-            max_total_bytes: Some(2500),
-        };
-        thin_snapshots(dir.path(), &policy, SystemTime::now());
+        thin_snapshots(dir.path(), &fs_budget_only(Some(4500)), SystemTime::now());
 
         let remaining = list_snapshots(dir.path()).expect("list");
         assert_eq!(
             remaining.len(),
-            2,
-            "2500 bytes fits exactly two 1000B files"
+            4,
+            "4500 bytes fits exactly four 1000B files"
         );
-        // And it kept the NEWEST two.
         assert_eq!(
             remaining.iter().map(|m| m.timestamp_ms).collect::<Vec<_>>(),
-            vec![now_ms - 2000, now_ms - 1000]
+            vec![now_ms - 4000, now_ms - 3000, now_ms - 2000, now_ms - 1000],
+            "the NEWEST four survive"
         );
     }
 
     #[test]
-    fn thin_snapshots_byte_budget_keeps_one_oversized_snapshot() {
+    fn thin_snapshots_byte_budget_stops_at_the_floor() {
         let dir = tempfile::tempdir().expect("tempdir");
         let now_ms = recent_ms();
-        write_snapshot(dir.path(), now_ms - 2000, &vec![b'a'; 5000]);
-        write_snapshot(dir.path(), now_ms - 1000, &vec![b'b'; 5000]);
-        let policy = RetentionPolicy {
-            keep_last: usize::MAX,
-            buckets: vec![],
-            max_age: None,
-            max_total_bytes: Some(100),
-        };
-        thin_snapshots(dir.path(), &policy, SystemTime::now());
+        // Five 5000-byte snapshots against a 100-byte budget: the floor, not
+        // the budget, decides how many survive.
+        for i in 0..5u64 {
+            write_snapshot(
+                dir.path(),
+                now_ms - (5 - i) * 1000,
+                &vec![b'a' + i as u8; 5000],
+            );
+        }
+        thin_snapshots(dir.path(), &fs_budget_only(Some(100)), SystemTime::now());
 
         let remaining = list_snapshots(dir.path()).expect("list");
         assert_eq!(
             remaining.len(),
-            1,
-            "the floor keeps exactly one even when it busts the budget"
+            MIN_SNAPSHOTS_KEPT_UNDER_BUDGET,
+            "the floor keeps its minimum even when that busts the budget"
         );
-        assert_eq!(remaining[0].timestamp_ms, now_ms - 1000, "newest survives");
-        assert_eq!(fs::read(&remaining[0].path).unwrap(), vec![b'b'; 5000]);
+        let newest = remaining.last().expect("floor keeps at least one");
+        assert_eq!(newest.timestamp_ms, now_ms - 1000, "newest survives");
+        assert_eq!(fs::read(&newest.path).unwrap(), vec![b'a' + 4; 5000]);
+    }
+
+    /// A single snapshot larger than the whole budget is still retained: the
+    /// budget must never leave a secret with no recoverable history.
+    #[test]
+    fn thin_snapshots_byte_budget_keeps_a_lone_oversized_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now_ms = recent_ms();
+        write_snapshot(dir.path(), now_ms - 1000, &vec![b'b'; 50_000]);
+        thin_snapshots(dir.path(), &fs_budget_only(Some(100)), SystemTime::now());
+
+        let remaining = list_snapshots(dir.path()).expect("list");
+        assert_eq!(remaining.len(), 1, "history must never be emptied");
+        assert_eq!(fs::read(&remaining[0].path).unwrap(), vec![b'b'; 50_000]);
+    }
+
+    /// Same-millisecond collision entries must be ordered NUMERICALLY by
+    /// suffix, not lexicographically by file name: text order puts `.10`
+    /// before `.9`, which would let the budget evict the numerically-newest
+    /// entry of a burst and keep an older sibling.
+    #[test]
+    fn thin_snapshots_orders_collision_suffixes_numerically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stamp = recent_ms();
+        let base = format!("{stamp:0width$}", width = SNAPSHOT_NAME_WIDTH);
+        // Unsuffixed plus `.0` ..= `.10` — twelve entries in one millisecond.
+        fs::write(dir.path().join(&base), b"unsuffixed").unwrap();
+        for n in 0..=10u32 {
+            fs::write(dir.path().join(format!("{base}.{n}")), format!("body-{n}")).unwrap();
+        }
+
+        // Budget 0 => only the floor survives, and it must be the three
+        // NUMERICALLY newest: `.8`, `.9`, `.10`.
+        thin_snapshots(dir.path(), &fs_budget_only(Some(0)), SystemTime::now());
+
+        let remaining = list_snapshots(dir.path()).expect("list");
+        assert_eq!(
+            remaining.iter().map(|m| m.suffix).collect::<Vec<_>>(),
+            vec![Some(8), Some(9), Some(10)],
+            "lexicographic ordering would have kept .1/.10 and dropped .9"
+        );
+    }
+
+    /// The stamp half of [`parse_snapshot_name`], which is all the
+    /// timestamp-ordering callers need.
+    fn parse_snapshot_stamp(path: &Path) -> Option<u64> {
+        parse_snapshot_name(path).map(|(ts, _)| ts)
     }
 
     #[test]

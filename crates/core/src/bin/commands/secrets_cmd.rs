@@ -751,10 +751,18 @@ async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
             // Bound the history (incl. the reversibility snapshot just
             // added), matching the node runtime's default retention.
             // Best-effort: the restore has already succeeded.
+            //
+            // The per-secret BYTE budget is deliberately not applied here,
+            // exactly as in `SecretsStore::restore_snapshot`: an operator
+            // running `snapshot-restore` is mid-recovery and often walking
+            // versions one at a time, so this is the worst moment to delete
+            // history — the budget could evict several older versions,
+            // including the one just restored from, as a side effect of the
+            // reversibility snapshot. Count tiers and `max_age` still apply.
             let snap_dir = snapshot_dir_for_encoded(&delegate_dir, &args.secret);
             thin_snapshots(
                 &snap_dir,
-                &RetentionPolicy::default(),
+                &RetentionPolicy::default().without_byte_budget(),
                 std::time::SystemTime::now(),
             );
             println!(

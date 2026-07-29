@@ -1689,10 +1689,24 @@ impl SecretsStore {
         // intact for a clean retry instead of having already pruned source
         // snapshots. Thinning touches only `.snapshots/`; a failure here
         // self-corrects on the next write.
+        //
+        // WITHOUT the byte budget: a restore is a RECOVERY operation, and
+        // an operator walking back through versions is the worst moment to
+        // garbage-collect. Applying the budget here would let the
+        // reversibility snapshot the restore just added push several older
+        // versions — possibly including the one just restored FROM — over
+        // the limit and delete them. The count tiers and `max_age` still
+        // apply, so nothing is exempt indefinitely, and the next ordinary
+        // `store_secret` enforces the budget in full. See
+        // `RetentionPolicy::without_byte_budget`.
         if self.snapshots_enabled {
             let snap_dir = snapshot_dir_for(&scope_path, key);
             if snap_dir.exists() {
-                thin_snapshots(&snap_dir, &self.retention, SystemTime::now());
+                thin_snapshots(
+                    &snap_dir,
+                    &self.retention.without_byte_budget(),
+                    SystemTime::now(),
+                );
             }
         }
 
@@ -2338,9 +2352,16 @@ impl SecretsStore {
     /// caller reports it as skipped) — but the index is still reconciled
     /// (idempotent ensure) so a prior partial import that wrote the file but
     /// failed before indexing converges on retry. If `overwrite` is true, the
-    /// value is rewritten (the prior value is snapshotted first by the normal
-    /// `store_secret` write discipline) and re-indexed. Returns `Ok(true)` only
-    /// when a new value was written.
+    /// value is rewritten (the prior value is snapshotted first, on the same
+    /// tmp+fsync+rename discipline as `store_secret`) and re-indexed. Returns
+    /// `Ok(true)` only when a new value was written.
+    ///
+    /// Note the snapshot here is UNCONDITIONAL, unlike `store_secret`, which
+    /// skips it when the plaintext is unchanged. An import is an infrequent,
+    /// operator-driven migration/restore rather than the delegate write path
+    /// that made redundant snapshots expensive, and it is the point at which
+    /// foreign data lands on top of local data — so it always preserves what
+    /// it replaces.
     pub fn import_secret_by_hash(
         &mut self,
         delegate: &DelegateKey,
@@ -4856,8 +4877,10 @@ mod test {
         let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
 
         // Generous count tiers so the BYTE budget is unambiguously what
-        // bounds the history; 40 KiB budget keeps the test fast.
-        const BUDGET: u64 = 40 * 1024;
+        // bounds the history. 60 KiB / 10 KiB values leaves room for ~5
+        // versions, comfortably above MIN_SNAPSHOTS_KEPT_UNDER_BUDGET, so a
+        // pass here means the BUDGET did the work rather than the floor.
+        const BUDGET: u64 = 60 * 1024;
         const VALUE_LEN: usize = 10 * 1024;
         store.set_retention_policy(RetentionPolicy {
             keep_last: 1000,
@@ -4888,10 +4911,14 @@ mod test {
             bytes <= BUDGET,
             "snapshot history must fit the byte budget; got {bytes} bytes in {count} files"
         );
-        // Not vacuous: the budget has to leave real, recoverable history.
+        // Not vacuous, and not merely the floor: a {BUDGET}-byte budget must
+        // hold strictly more than MIN_SNAPSHOTS_KEPT_UNDER_BUDGET versions,
+        // so this asserts the BUDGET bounded the history rather than the
+        // floor rescuing it.
         assert!(
-            count >= 3,
-            "a {BUDGET}-byte budget should hold several {VALUE_LEN}-byte versions; got {count}"
+            count > 3,
+            "a {BUDGET}-byte budget should hold more than the floor's worth of \
+             {VALUE_LEN}-byte versions; got {count}"
         );
         // And what survives is the most RECENT history: the newest snapshot
         // holds the value the last write replaced.
@@ -4910,6 +4937,89 @@ mod test {
         let recovered =
             decrypt_secret_blob(&encryption, &[], None, &blob, &secret_id.encode())?.to_vec();
         assert_eq!(recovered, vec![28u8; VALUE_LEN], "newest snapshot retained");
+        Ok(())
+    }
+
+    /// A restore is a RECOVERY operation and must NOT garbage-collect the
+    /// history the operator is walking through. `restore_snapshot` therefore
+    /// thins without the byte budget, so an over-budget history survives the
+    /// restore intact — while the next ordinary write still enforces it.
+    #[tokio::test]
+    async fn restore_snapshot_does_not_apply_byte_budget() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![45].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![45]);
+
+        const VALUE_LEN: usize = 4 * 1024;
+        // Build the history under a budget-free policy so the setup itself
+        // isn't what trims it.
+        let permissive = RetentionPolicy {
+            keep_last: 1000,
+            buckets: vec![],
+            max_age: None,
+            max_total_bytes: None,
+        };
+        store.set_retention_policy(permissive.clone());
+        for i in 0u8..7 {
+            store.store_secret(
+                delegate.key(),
+                &secret_id,
+                SecretScope::Local,
+                Zeroizing::new(vec![i; VALUE_LEN]),
+            )?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before = store.list_snapshots(delegate.key(), &secret_id, SecretScope::Local)?;
+        assert_eq!(before.len(), 6, "6 overwrites → 6 snapshots");
+        let oldest_ts = before[0].timestamp_ms;
+
+        // Now impose a budget so tight that applying it would collapse the
+        // history to the floor, and run the RECOVERY path.
+        store.set_retention_policy(RetentionPolicy {
+            max_total_bytes: Some(1),
+            ..permissive
+        });
+        store.restore_snapshot(delegate.key(), &secret_id, SecretScope::Local, oldest_ts)?;
+
+        let after = store.list_snapshots(delegate.key(), &secret_id, SecretScope::Local)?;
+        assert_eq!(
+            after.len(),
+            7,
+            "restore must not evict history: 6 prior + 1 reversibility snapshot"
+        );
+        // The value the operator restored FROM is still on disk, so they can
+        // keep walking versions.
+        assert!(
+            after.iter().any(|m| m.timestamp_ms == oldest_ts),
+            "the snapshot just restored from must survive the restore"
+        );
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
+            vec![0u8; VALUE_LEN],
+            "restore still put the oldest value back"
+        );
+
+        // Contrast: the very next ordinary write DOES apply the budget.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(vec![99u8; VALUE_LEN]),
+        )?;
+        assert_eq!(
+            snapshot_count(&secrets_dir, delegate.key(), &secret_id),
+            3,
+            "a normal write must enforce the budget down to the floor"
+        );
         Ok(())
     }
 

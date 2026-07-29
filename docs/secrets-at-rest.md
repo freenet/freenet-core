@@ -195,9 +195,53 @@ Retained history per secret is bounded on three axes:
 The byte budget is what keeps a large secret from turning a generous
 version count into tens of megabytes of disk — a ~1 MiB value keeps a
 handful of versions instead of ~30, while small secrets stay well under
-the budget and keep their full tiered history. It never empties a
-history: if a single version is larger than the whole budget it is
-retained anyway, so "undo the last write" always works.
+the budget and keep their full tiered history.
+
+It never empties a history. At least **three** snapshots are always kept,
+even when that exceeds the budget, so an operator always has a few
+versions to walk back through. For a secret up to 1 MiB this floor never
+comes into play (three of those versions already fit in 3 MiB); it only
+matters for the genuinely large values, where the practical bound becomes
+`max(3 MiB, 3 x the largest version)`.
+
+##### The byte budget is applied retroactively — read this before upgrading
+
+Unlike the count tiers, which a node upgrading into them satisfies
+gradually, the byte budget takes effect **all at once**: on a node that
+accumulated a large history before the budget existed, the first
+`store_secret` for a given secret after the upgrade thins that secret's
+history down to the budget in a single pass, and **those deletions are
+permanent**. On a peer where snapshots had grown to 130 MB, that is the
+intended reclaim — but it is a one-way door.
+
+If you want to keep an existing history, either copy
+`<secrets_dir>/<delegate>/.snapshots/` aside before starting the upgraded
+node, or raise/disable the budget (below) before the first write.
+
+##### Tuning or disabling the byte budget
+
+`FREENET_SECRET_SNAPSHOT_BYTES_PER_SECRET` overrides the per-secret budget,
+in bytes:
+
+| Value | Effect |
+|-------|--------|
+| unset, empty, or unparseable | 3 MiB default (an unparseable value logs a warning and keeps the default) |
+| `0` | budget **disabled** — only the count tiers and `max_age` bound the history, i.e. the pre-budget behaviour |
+| any other number | that many bytes |
+
+This is the knob for "I want more history". The separate
+`FREENET_DISABLE_SECRET_SNAPSHOTS` variable turns snapshotting off
+entirely, which is the opposite.
+
+##### Recovery is exempt
+
+`snapshot-restore` — both the CLI and the node runtime's restore path —
+thins **without** the byte budget. An operator running a restore is often
+walking back through versions one at a time, and applying the budget there
+could evict several older versions (including the one just restored from)
+as a side effect of the reversibility snapshot the restore itself adds.
+The count tiers and `max_age` still apply, and the next ordinary write
+enforces the budget in full.
 
 ### Export / import a portable secrets bundle (#4035, P3 of #4381)
 
@@ -261,8 +305,10 @@ bundle FILE, by contrast, is never written in plaintext.
 **Collision handling.** On import, a secret that already exists at the
 same delegate+id is left untouched and reported as skipped, unless
 `--overwrite` is passed (in which case the prior value is snapshotted
-first, like a normal write). `--out` on export refuses to overwrite an
-existing file.
+first). That snapshot is unconditional — unlike an ordinary delegate
+write, an import does not skip it when the content happens to match,
+because an import is where foreign data lands on top of local data.
+`--out` on export refuses to overwrite an existing file.
 
 ## File permissions (PR #4195 / issue #4141)
 
