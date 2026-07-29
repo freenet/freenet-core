@@ -6,8 +6,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{Layer, Registry};
 
-/// Default bound on the total bytes the freenet log directory may
-/// occupy. Override per-node with [`LOG_DIR_MAX_BYTES_ENV_VAR`].
+/// Bound on the total bytes the freenet log directory may occupy.
 ///
 /// Bytes, not hours, are what has to be bounded: rotation is hourly, but
 /// an hour of log is a few KiB on an idle peer and ~21 MB on a busy
@@ -31,9 +30,9 @@ use tracing_subscriber::{Layer, Registry};
 /// ~256 MiB for the same history. Until it lands, this budget cannot be
 /// reduced without costing a gateway real incident history.
 ///
-/// Do NOT set this so low that `live_size` alone can approach it. The
-/// size pass never deletes a file an appender has open, so a budget the
-/// current-hour files can fill leaves *only* those files — discarding
+/// Do NOT lower this so far that the current-hour files alone can
+/// approach it. The size pass never deletes a file an appender has open,
+/// so a budget those files can fill leaves *only* them — discarding
 /// exactly the onset of the incident the logs exist to explain.
 ///
 /// Enforcement runs both at tracer init (node start) AND periodically
@@ -41,16 +40,6 @@ use tracing_subscriber::{Layer, Registry};
 /// so a long-uptime node under sustained runaway logging is bounded
 /// without needing a restart.
 const LOG_DIR_MAX_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
-
-/// Operator override for [`LOG_DIR_MAX_BYTES`], as a byte count.
-///
-/// One default cannot serve both shapes of node this code runs on: at
-/// the measured rates, a gateway needs ~500 MiB to hold a day while a
-/// background laptop peer reaches its 72-hour horizon in well under 100
-/// MiB and would rather have the disk back. The default is sized for the
-/// gateway (losing incident history is the worse failure), and this lets
-/// the small-node case dial it down.
-const LOG_DIR_MAX_BYTES_ENV_VAR: &str = "FREENET_LOG_DIR_MAX_BYTES";
 
 /// Absolute age after which a rotated log file is deleted regardless of
 /// how little disk it occupies.
@@ -62,36 +51,6 @@ const LOG_DIR_MAX_BYTES_ENV_VAR: &str = "FREENET_LOG_DIR_MAX_BYTES";
 ///
 /// Three days covers a Friday-evening fault reported on Monday morning.
 const LOG_RETENTION_HOURS: u64 = 72; // 3 days
-
-/// The byte budget in force for this process: the operator override if
-/// it is set and usable, otherwise [`LOG_DIR_MAX_BYTES`].
-fn log_dir_max_bytes() -> u64 {
-    parse_log_dir_max_bytes(std::env::var(LOG_DIR_MAX_BYTES_ENV_VAR).ok().as_deref())
-}
-
-/// Pure half of [`log_dir_max_bytes`], split out so it is testable
-/// without mutating process-global environment state from tests that run
-/// in parallel.
-///
-/// Degrade-safe: an absent, empty, unparseable, or zero value yields the
-/// default. Misconfiguration must not be able to disable log retention
-/// (`0` would mean "delete everything the size pass is allowed to") nor
-/// stop the node.
-fn parse_log_dir_max_bytes(raw: Option<&str>) -> u64 {
-    let Some(raw) = raw else {
-        return LOG_DIR_MAX_BYTES;
-    };
-    match raw.trim().parse::<u64>() {
-        Ok(bytes) if bytes > 0 => bytes,
-        _ => {
-            eprintln!(
-                "Ignoring invalid {LOG_DIR_MAX_BYTES_ENV_VAR}={raw:?} \
-                 (want a positive byte count); using the {LOG_DIR_MAX_BYTES}-byte default"
-            );
-            LOG_DIR_MAX_BYTES
-        }
-    }
-}
 
 /// How often the background prune loop re-applies `cleanup_old_logs`.
 /// Matches the hourly rotation cadence: a fresh file is sealed every
@@ -239,7 +198,7 @@ fn cleanup_old_logs(log_dir: &std::path::Path) {
         });
     }
 
-    prune_log_files(files, cutoff, log_dir_max_bytes());
+    prune_log_files(files, cutoff, LOG_DIR_MAX_BYTES);
 }
 
 /// The indices, in a `files` sorted ascending by `(modified, path)`, of
@@ -782,7 +741,7 @@ fn init_stdout_tracer(
 mod cleanup_tests {
     use super::{
         LOG_DIR_MAX_BYTES, LogFamily, LogFile, cleanup_old_logs, live_file_indices,
-        parse_log_dir_max_bytes, periodic_log_prune, prune_log_files, rotating_log_family,
+        periodic_log_prune, prune_log_files, rotating_log_family,
     };
     use std::fs;
     use std::time::{Duration, SystemTime};
@@ -985,9 +944,9 @@ mod cleanup_tests {
         );
     }
 
-    /// The default budget must hold a full day of a BUSY node's logs.
+    /// The budget must hold a full day of a BUSY node's logs.
     ///
-    /// Sizing this from a quiet peer is the mistake this test exists to
+    /// Sizing it from a quiet peer is the mistake this test exists to
     /// prevent. Measured on the production gateway (nova): 54 rotating
     /// files, 518.9 MiB, spanning 25.97 hours = 20.95 MB/hour. At 96 MiB
     /// that node would retain 4.8 hours, so an 18:00 incident would be
@@ -996,8 +955,6 @@ mod cleanup_tests {
     /// For contrast, this same budget is not what binds on a quiet peer:
     /// at ~1.4 MB/h a laptop peer reaches `LOG_RETENTION_HOURS` (72h)
     /// having used under 100 MiB, so its retention is decided by age.
-    /// Operators on small disks dial the budget down via
-    /// `FREENET_LOG_DIR_MAX_BYTES`.
     #[test]
     fn default_budget_holds_a_day_of_a_busy_gateways_logs() {
         // nova, 2026-07: 518.9 MiB over 25.97h.
@@ -1382,38 +1339,6 @@ mod cleanup_tests {
                 rotating_log_family(foreign),
                 None,
                 "{foreign} must not be claimed by the log pruner"
-            );
-        }
-    }
-
-    /// The operator override must be degrade-safe: anything unusable
-    /// falls back to the default rather than disabling retention or
-    /// failing the node.
-    #[test]
-    fn log_dir_max_bytes_override_is_degrade_safe() {
-        assert_eq!(
-            parse_log_dir_max_bytes(Some("134217728")),
-            134217728,
-            "a positive byte count must be honoured"
-        );
-        assert_eq!(
-            parse_log_dir_max_bytes(Some("  134217728\n")),
-            134217728,
-            "surrounding whitespace must be tolerated"
-        );
-
-        for bad in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("-1"),
-            Some("128MiB"),
-            Some("nonsense"),
-        ] {
-            assert_eq!(
-                parse_log_dir_max_bytes(bad),
-                LOG_DIR_MAX_BYTES,
-                "{bad:?} must fall back to the default budget"
             );
         }
     }
