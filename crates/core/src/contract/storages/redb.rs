@@ -17,6 +17,24 @@ const MIN_COMPACTION_RECLAIM_BYTES: u64 = 64 * 1024 * 1024;
 /// database with proportionally trivial dead space is left alone.
 const MIN_COMPACTION_RECLAIM_FRACTION: f64 = 0.25;
 
+/// Records the file size the last compaction attempt settled at, so a database
+/// that cannot be compacted further is not rewritten on every start.
+///
+/// redb's compaction leaves a variable amount of unreclaimable free space: a
+/// gateway settled at 1.9% but a laptop peer at 28.4%, which is above the
+/// gate's 25% fraction. Without this marker that peer re-ran a full (and
+/// entirely futile) compaction pass on every single restart.
+const COMPACTION_MARKER_TABLE: TableDefinition<&[u8], u64> =
+    TableDefinition::new("compaction_marker");
+
+/// Key under which the post-compaction file size is stored.
+const COMPACTION_MARKER_KEY: &[u8] = b"settled_at_bytes";
+
+/// How much the file must grow past the last settled size before compaction is
+/// worth attempting again. Compaction cannot help until genuinely new dead
+/// space has accumulated, and the marker records where it bottomed out.
+const COMPACTION_REGROWTH_FACTOR: f64 = 1.25;
+
 /// What the startup reclaim pass decided. Returned so the decision itself is
 /// observable: asserting on the resulting file size cannot distinguish "the gate
 /// declined" from "compaction ran and happened to reclaim little", which made an
@@ -31,6 +49,9 @@ pub(crate) enum ReclaimOutcome {
     TrimSufficed,
     /// A full compaction ran.
     Compacted,
+    /// Already compacted at (about) this size; compaction cannot help until the
+    /// file grows further.
+    AlreadySettled,
     /// Could not be determined (stat, stats or transaction failure); skipped.
     Undetermined,
 }
@@ -308,6 +329,20 @@ fn redb_error_is_poison(e: &redb::Error) -> bool {
     )
 }
 
+/// True if an error raised on a WRITE path signals a poisoned database.
+///
+/// Unlike [`redb_error_is_poison`], this DOES match `redb::Error::Io`. That
+/// exclusion exists solely because several READ helpers in this file synthesize
+/// `Io(ErrorKind::InvalidData)` for a benign malformed row, and treating those
+/// as poison would crash-loop the node. No write path synthesizes `Io`, so on a
+/// write it can only be a genuine backend failure — at which point redb has
+/// already latched its poison flag and the handle is unusable for any further
+/// write. Classifying it as benign is what would hand a dead handle to
+/// `initialize_database` and stop the node booting.
+fn redb_write_error_is_poison(e: &redb::Error) -> bool {
+    matches!(e, redb::Error::Io(_)) || redb_error_is_poison(e)
+}
+
 /// Test-only observable proof that the storage layer routed a detected poison to
 /// the recovery (process-exit) path. The real handler ([`abort_process_on_redb_poison`])
 /// exits the process, which a unit test cannot observe; this counter lets the test
@@ -551,6 +586,23 @@ impl ReDb {
             return Ok(db);
         }
 
+        // A previous compaction recorded where it bottomed out. Free space below
+        // that point is space compaction provably cannot reclaim, so re-running
+        // it would burn a full-file pass to achieve nothing.
+        if let Some(settled_bytes) = Self::read_compaction_marker(&db) {
+            if (file_bytes as f64) <= (settled_bytes as f64) * COMPACTION_REGROWTH_FACTOR {
+                tracing::info!(
+                    db_path = ?db_path,
+                    file_bytes,
+                    settled_bytes,
+                    phase = "compaction_skipped",
+                    "Contract database already compacted at this size; skipping"
+                );
+                record_reclaim(ReclaimOutcome::AlreadySettled);
+                return Ok(db);
+            }
+        }
+
         let Some(in_use_bytes) = Self::pages_in_use_bytes(&db, db_path) else {
             record_reclaim(ReclaimOutcome::Undetermined);
             return Ok(db);
@@ -633,8 +685,17 @@ impl ReDb {
                     phase = "compaction_done",
                     "Contract database compaction finished"
                 );
+                // Record where it settled. Whatever free space remains at this
+                // size is unreclaimable, so the next start must not try again
+                // until the file has grown past it.
+                let healthy = Self::write_compaction_marker(&db, db_path, now_bytes);
                 record_reclaim(ReclaimOutcome::Compacted);
-                Ok(db)
+                if healthy {
+                    Ok(db)
+                } else {
+                    drop(db);
+                    Self::reopen_after_trim(db_path)
+                }
             }
             Err(e) => {
                 // Deliberately NOT routed through `storage_error_is_poison` /
@@ -693,6 +754,57 @@ impl ReDb {
             "Could not reopen the contract database after trimming; cannot continue"
         );
         Err(e.into())
+    }
+
+    /// The file size the last compaction settled at, if one has been recorded.
+    ///
+    /// A missing table or key simply means no compaction has completed yet, so
+    /// every failure here reads as "no marker" and lets the normal gate decide.
+    fn read_compaction_marker(db: &Database) -> Option<u64> {
+        let txn = db.begin_read().ok()?;
+        let table = txn.open_table(COMPACTION_MARKER_TABLE).ok()?;
+        let value = table.get(COMPACTION_MARKER_KEY).ok()??.value();
+        Some(value)
+    }
+
+    /// Record where compaction bottomed out.
+    ///
+    /// Returns `false` if the write failed in a way that may have poisoned the
+    /// handle, so the caller can reopen rather than hand a latched `Database` to
+    /// `initialize_database` — whose own `begin_write` would then return
+    /// `PreviousIo` and fail startup. That is the same failure mode the
+    /// compaction-error path reopens for, and this write runs immediately after
+    /// a whole-file rewrite, the highest-I/O-risk moment in the function.
+    ///
+    /// A benign failure (and there is no way to persist the marker) only costs
+    /// a re-evaluation on the next start, which is the pre-marker behaviour.
+    fn write_compaction_marker(db: &Database, db_path: &Path, settled_bytes: u64) -> bool {
+        // Each redb call returns a different error type; they converge on the
+        // umbrella `redb::Error` here so a single classifier can judge them.
+        let result: Result<(), redb::Error> = (|| {
+            let txn = db.begin_write()?;
+            {
+                let mut table = txn.open_table(COMPACTION_MARKER_TABLE)?;
+                table.insert(COMPACTION_MARKER_KEY, settled_bytes)?;
+            }
+            txn.commit()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                // redb latches an I/O failure on the instance, so anything in
+                // that class means the handle is no longer usable for writes.
+                let poisoned = redb_write_error_is_poison(&e);
+                tracing::warn!(
+                    db_path = ?db_path,
+                    error = %e,
+                    poisoned,
+                    "Could not record the compaction marker; the next start will re-evaluate"
+                );
+                !poisoned
+            }
+        }
     }
 
     /// Bytes held by pages the btrees actually occupy, or `None` if it could not
@@ -2104,6 +2216,203 @@ mod tests {
             last_reclaim()
         );
         assert_eq!(state_contents(&db_path), expected);
+    }
+
+    /// Regression test for repeat compaction on every restart.
+    ///
+    /// redb's compaction leaves a variable amount of unreclaimable free space.
+    /// A production laptop peer settled at 28.4% free — above the 25% fraction
+    /// gate — and so re-ran a full, futile compaction pass on every restart
+    /// (observed live: `compacted=false`, file byte-identical). A gateway
+    /// settled at 1.9% and was unaffected.
+    ///
+    /// That data-dependence is exactly why this does NOT rely on a fixture
+    /// reproducing the 28% residual: a synthetic fixture settles near 7%, where
+    /// the ordinary gate already declines, so it would pass with or without the
+    /// marker and prove nothing. Instead it plants a marker at the current size
+    /// and asserts the decision, which pins the marker path deterministically
+    /// whatever redb's allocator happens to leave behind.
+    #[tokio::test]
+    async fn startup_compaction_skips_when_already_settled_at_this_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        // A fixture that WOULD otherwise be compacted (verified by the sibling
+        // test), so a skip here can only be the marker's doing.
+        let live_rows = bloat_database(&db_path, 192, 1024 * 1024, 16);
+        let expected = state_contents(&db_path);
+        let file_bytes = std::fs::metadata(&db_path).unwrap().len();
+
+        // Plant the marker: "compaction already bottomed out at this size".
+        {
+            let db = Database::create(&db_path).unwrap();
+            ReDb::write_compaction_marker(&db, &db_path, file_bytes);
+            drop(db);
+        }
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+
+        assert_eq!(
+            last_reclaim(),
+            Some(ReclaimOutcome::AlreadySettled),
+            "a database already settled at this size must not be recompacted; got {:?}",
+            last_reclaim()
+        );
+        assert_eq!(state_contents(&db_path), expected);
+        assert_eq!(expected.len(), live_rows);
+    }
+
+    /// A completed compaction must record where it settled, otherwise the next
+    /// start has nothing to consult and the repeat-compaction loop returns.
+    #[tokio::test]
+    async fn compaction_records_where_it_settled() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        bloat_database(&db_path, 192, 1024 * 1024, 16);
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(last_reclaim(), Some(ReclaimOutcome::Compacted));
+
+        let after = std::fs::metadata(&db_path).unwrap().len();
+        let marker = {
+            let db = Database::create(&db_path).unwrap();
+            let m = ReDb::read_compaction_marker(&db);
+            drop(db);
+            m
+        };
+        let marker = marker.expect("compaction must record a marker");
+        // Written from the post-compaction size, before the marker's own commit
+        // grows the file slightly, so allow a small delta.
+        assert!(
+            marker.abs_diff(after) < 8 * 1024 * 1024,
+            "marker {marker} should record the settled size {after}"
+        );
+    }
+
+    /// A backend I/O failure during the marker write must be classified as
+    /// poison. It is the exact scenario the reopen exists for, and the
+    /// read-path classifier silently gets it wrong: it excludes
+    /// `redb::Error::Io` so that a malformed row cannot crash-loop the node.
+    /// Using it on the write path would report "benign", skip the reopen, and
+    /// hand a latched handle to `initialize_database`, whose own `begin_write`
+    /// then fails and stops the node booting.
+    #[test]
+    fn marker_write_io_failure_classifies_as_poison() {
+        let io = redb::Error::Io(std::io::Error::other("injected backend failure"));
+        assert!(
+            redb_write_error_is_poison(&io),
+            "a backend Io error on the WRITE path must count as poison"
+        );
+        // The read-path classifier must keep excluding it, or a single bad row
+        // would exit-and-restart the node.
+        assert!(
+            !redb_error_is_poison(&io),
+            "the read-path classifier must still treat Io as benign"
+        );
+        // Both agree on the unambiguous signals.
+        for e in [redb::Error::PreviousIo, redb::Error::DatabaseClosed] {
+            assert!(redb_write_error_is_poison(&e));
+            assert!(redb_error_is_poison(&e));
+        }
+    }
+
+    /// End-to-end: with the backend failing, `ReDb::new` must still return a
+    /// usable store rather than propagating the poisoned handle.
+    #[tokio::test]
+    async fn marker_write_failure_does_not_break_store_init() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        bloat_database(&db_path, 192, 1024 * 1024, 16);
+
+        // A normal open compacts and records the marker; the store must be
+        // usable afterwards. This is the control for the classifier test above,
+        // which covers the failure branch directly (a real backend fault cannot
+        // be injected through `ReDb::new`, which owns its file backend).
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await;
+        assert!(
+            store.is_ok(),
+            "store init must succeed through the marker write"
+        );
+        drop(store);
+        assert_eq!(last_reclaim(), Some(ReclaimOutcome::Compacted));
+    }
+
+    /// Pin the exact `COMPACTION_REGROWTH_FACTOR` boundary. Without this the
+    /// constant survives mutation: the sibling tests sit far either side of it.
+    #[test]
+    fn compaction_marker_regrowth_boundary() {
+        // The decision the marker path makes is
+        //   file_bytes <= settled_bytes * COMPACTION_REGROWTH_FACTOR  -> skip
+        let settled: u64 = 400 * 1024 * 1024;
+        let threshold = (settled as f64) * COMPACTION_REGROWTH_FACTOR;
+        let skips = |file: u64| (file as f64) <= threshold;
+
+        // 1.25 x 400 MiB = exactly 500 MiB.
+        assert!(
+            skips(500 * 1024 * 1024),
+            "exactly at the threshold must skip"
+        );
+        assert!(
+            !skips(500 * 1024 * 1024 + 1),
+            "one byte past the threshold must re-evaluate"
+        );
+        // Well inside: a settled database at its own size.
+        assert!(skips(settled));
+        // Well past: genuine regrowth.
+        assert!(!skips(settled * 2));
+    }
+
+    /// The marker must not wedge compaction shut: once the file grows well past
+    /// where it settled, a fresh compaction is allowed again.
+    #[tokio::test]
+    async fn compaction_resumes_after_the_file_grows_past_the_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("db");
+        bloat_database(&db_path, 192, 1024 * 1024, 16);
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(last_reclaim(), Some(ReclaimOutcome::Compacted));
+
+        // Grow well past the marker, then create fresh interior dead space.
+        {
+            let db = Database::create(&db_path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(STATE_TABLE).unwrap();
+                let v = vec![0x5Au8; 1024 * 1024];
+                for i in 1000..1400usize {
+                    t.insert(&i.to_be_bytes()[..], v.as_slice()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(STATE_TABLE).unwrap();
+                for i in 1000..1400usize {
+                    if i % 16 != 0 {
+                        t.remove(&i.to_be_bytes()[..]).unwrap();
+                    }
+                }
+            }
+            txn.commit().unwrap();
+            drop(db);
+        }
+
+        clear_last_reclaim();
+        let store = ReDb::new(temp_dir.path()).await.unwrap();
+        drop(store);
+        assert_eq!(
+            last_reclaim(),
+            Some(ReclaimOutcome::Compacted),
+            "a database that grew past its marker must be compactable again; got {:?}",
+            last_reclaim()
+        );
     }
 
     /// The gate must leave a healthy database alone, so a restart loop never
