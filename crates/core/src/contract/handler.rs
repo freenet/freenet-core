@@ -1488,44 +1488,53 @@ pub mod test {
         );
         let args = call_arguments(&src, call);
 
-        for (field, accessor) in [
+        // Each needle PAIRS the field with its accessor, matched against the
+        // whitespace-collapsed source. Asserting the two independently — which
+        // this pin originally did — catches an omitted field and a wrong
+        // accessor but NOT a TRANSPOSITION, which is the exact hazard
+        // `HostingDiskPaths` exists to prevent (four same-typed `PathBuf`s that
+        // the type system will happily let you swap). Under independent
+        // assertions, `contracts_dir: config.db_dir(), db_dir:
+        // config.contracts_dir()` leaves all four field names and all four
+        // accessor strings present, so the pin passes — and then the wasm gauge
+        // walks `db_dir` for `*.wasm` (0 bytes), the database gauge walks
+        // `contracts_dir`, and `available_bytes()` statvfs's the wrong mount.
+        for pair in [
             // Pre-#5007 pair. Present so the pin covers the whole struct, not
             // only the fields the issue added.
-            (
-                concat!("contracts", "_dir:"),
-                concat!("config.contracts", "_dir()"),
-            ),
-            (
-                concat!("wasmtime_cache", "_dir:"),
-                concat!("config.wasmtime_cache", "_dir()"),
-            ),
+            concat!("contracts", "_dir:", "config.contracts", "_dir()"),
+            concat!("wasmtime_cache", "_dir:", "config.wasmtime_cache", "_dir()"),
             // #5007 blind spot 1: the storage backend's database directory. Its
             // measured size is the only term that can see redb's dead space.
-            (concat!("db", "_dir:"), concat!("config.db", "_dir()")),
+            concat!("db", "_dir:", "config.db", "_dir()"),
             // #5007 blind spot 2: the unpacked-webapp cache. Reported, not
             // budgeted — but it has to be measured to be reported at all, and it
             // must come from the node's OWN config, never the process-wide
             // default, for the same reason `server.rs` threads it.
-            (
-                concat!("webapp_cache", "_dir:"),
-                concat!("config.ws_api.webapp_cache", "_dir"),
+            concat!(
+                "webapp_cache",
+                "_dir:",
+                "config.ws_api.webapp_cache",
+                "_dir"
             ),
         ] {
             assert!(
-                args.contains(field),
-                "the disk tracker must be installed with `{field}`; found \
-                 arguments `{args}`"
-            );
-            assert!(
-                args.contains(accessor),
-                "`{field}` must be resolved from the node's config via \
-                 `{accessor}`; found arguments `{args}`"
+                args.contains(pair),
+                "the disk tracker must be installed with `{pair}` — each field \
+                 paired with its OWN accessor, so a transposition between two \
+                 same-typed `PathBuf` fields is caught, not just an omission; \
+                 found arguments `{args}`"
             );
         }
 
-        // The substitution template must not exist on this path at all: the
-        // process-wide webapp-cache default would measure some other node's
-        // directory (or the developer's) instead of this one's.
+        // FORWARD GUARD, not a pin on today's code: `default_webapp_cache_dir`
+        // does not appear in this file, so deleting production code can never
+        // make this assertion fire. (The positive pair above is what catches a
+        // wrong webapp-cache accessor.) What it does catch is a FUTURE edit that
+        // reaches for the process-wide default here — which would measure some
+        // other node's directory, or the developer's, instead of the one this
+        // node serves from. Kept for that, and labelled so the next reader does
+        // not mistake it for coverage.
         assert!(
             !src.contains(concat!("default_webapp", "_cache_dir")),
             "the node's disk accounting must never resolve the process-wide \
