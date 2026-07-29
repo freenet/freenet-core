@@ -37,6 +37,14 @@
 //!   the number of distinct compiled modules and self-pruned by wasmtime at its
 //!   soft-size limit.
 //!
+//! Of the three, the compile cache is the one the hosting sweep **cannot
+//! reclaim** — eviction sheds contract state, and wasmtime owns its cache
+//! directory. So its soft limit has to be bounded by the same disk budget it is
+//! charged against, or a disk-tight host can push `total_bytes()` past the
+//! budget with bytes nothing in the node is able to free (#5014). Wasmtime fixes
+//! that limit at `Cache::new`, before this tracker exists, which is what
+//! [`startup_disk_budget_estimate`] is for.
+//!
 //! # Seeding discipline (fail-loud)
 //!
 //! [`DiskUsageTracker::seed`] mirrors the #4561 secrets `seeded_user_total`
@@ -670,6 +678,98 @@ pub fn available_bytes(path: &Path) -> Option<u64> {
     }
 }
 
+/// Bytes Freenet already occupies on the data-dir mount, measured WITHOUT a
+/// [`DiskUsageTracker`] (#5014). Sums the same two `du`-measured terms the
+/// tracker maintains — `*.wasm` code blobs under `contracts_dir` and the
+/// relocated wasmtime compile cache — using the same walkers, so the two agree
+/// on what "Freenet's own bytes" means.
+///
+/// The tracker's THIRD term, persisted contract-state bytes, is deliberately
+/// omitted: it comes from redb rows, which are not readable before the storage
+/// layer exists. Omitting it can only make the measured total SMALLER, and
+/// [`startup_disk_budget_estimate`] is monotone non-decreasing in this value, so
+/// the omission can only make the derived budget smaller — the conservative
+/// direction for a bound whose failure mode is over-allocation. It is also
+/// immaterial exactly where the bound binds: a host whose Freenet-reachable
+/// capacity is small enough for the disk term to matter cannot be holding much
+/// state in the first place.
+pub(crate) fn measure_startup_disk_used(contracts_dir: &Path, compile_cache_dir: &Path) -> u64 {
+    du_walk_wasm(contracts_dir).saturating_add(du_walk(compile_cache_dir))
+}
+
+/// Pure clamp math behind [`startup_disk_budget_estimate`] (#5014), with the
+/// filesystem reads lifted out as parameters — the same determinism seam
+/// [`super::HostingManager::recompute_effective_budget`] uses for `available`.
+///
+/// `available: None` means the platform free-space query failed, and falls back
+/// to `u64::MAX` exactly as the live recompute does: a free-space read that
+/// cannot be trusted must not silently shrink a budget (the result then clamps
+/// to `max_hosting_disk`).
+///
+/// Delegates to [`disk_budget_for_clamped`](super::cache::disk_budget_for_clamped)
+/// with the same MIN floor and operator cap as the live budget, so the start-time
+/// estimate and the live value have exactly one implementation of the math.
+pub(crate) fn startup_disk_budget_from_measurements(
+    measured_used: u64,
+    available: Option<u64>,
+    pct: f64,
+    max_hosting_disk: u64,
+) -> u64 {
+    super::cache::disk_budget_for_clamped(
+        measured_used,
+        available.unwrap_or(u64::MAX),
+        pct,
+        super::cache::MIN_DEFAULT_HOSTING_BUDGET_BYTES,
+        max_hosting_disk,
+    )
+}
+
+/// Start-time estimate of the aggregate disk budget, for consumers that must
+/// size themselves BEFORE the [`DiskUsageTracker`] is configured and seeded
+/// (#5014).
+///
+/// # Why this exists
+///
+/// The wasmtime on-disk compile cache is charged against the aggregate disk
+/// budget ([`DiskUsageTracker::total_bytes`] sums state + wasm + compile-cache
+/// bytes, and that total gates `admit_state_write` / `admit_wasm_write`), but
+/// wasmtime fixes the cache's soft limit once, at `Cache::new` — inside
+/// `Executor::from_config_with_shared_modules`, which runs before the tracker
+/// exists. A limit derived from RAM needs nothing from disk and so left a
+/// disk-tight, RAM-rich host completely unprotected. This gives that call site
+/// the disk signal it needs at the only moment it can use it.
+///
+/// # It is an estimate, and it errs low
+///
+/// It reuses the live budget's own math ([`startup_disk_budget_from_measurements`])
+/// on the same basis — `freenet_used + available` — but its `freenet_used` term
+/// omits persisted contract state (see [`measure_startup_disk_used`]). Since
+/// `disk_budget_for_clamped` is monotone non-decreasing in `freenet_used`, the
+/// estimate is always `<=` the budget the first 60s recompute will install.
+///
+/// # Why it does NOT feed back on itself
+///
+/// The basis is `freenet_used + available`, not free space. Every byte the
+/// compile cache writes moves one byte from `available` into `freenet_used` on
+/// the SAME mount, so the sum is the mount's Freenet-reachable capacity and is
+/// invariant under the cache's own size. That is why `measure_startup_disk_used`
+/// must include the compile-cache walk: an estimate built on bare free space
+/// would shrink when the cache is full and grow when it is empty, so each
+/// restart would re-derive a different limit and the value would oscillate.
+pub(crate) fn startup_disk_budget_estimate(
+    contracts_dir: &Path,
+    compile_cache_dir: &Path,
+    pct: f64,
+    max_hosting_disk: u64,
+) -> u64 {
+    startup_disk_budget_from_measurements(
+        measure_startup_disk_used(contracts_dir, compile_cache_dir),
+        available_bytes(contracts_dir),
+        pct,
+        max_hosting_disk,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1085,5 +1185,191 @@ mod tests {
         );
         #[cfg(not(unix))]
         let _ = missing;
+    }
+}
+
+/// Tests for the start-time disk-budget estimate (#5014) — the signal the
+/// wasmtime compile-cache soft limit is sized from, resolved before the tracker
+/// exists.
+#[cfg(test)]
+mod startup_estimate_tests {
+    use super::{
+        measure_startup_disk_used, startup_disk_budget_estimate,
+        startup_disk_budget_from_measurements,
+    };
+    use std::io::Write;
+    use std::path::Path;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    /// `DEFAULT_MAX_HOSTING_DISK_BYTES`, restated so these tests pin the value
+    /// the production caller passes rather than tracking a constant edit.
+    const CAP: u64 = 32 * GIB;
+
+    fn write_file(path: &Path, len: usize) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&vec![0u8; len]).unwrap();
+    }
+
+    /// The measured-used term counts exactly the two things the live tracker
+    /// `du`-measures: `*.wasm` blobs under the contracts dir (recursively, so
+    /// the `local/` split counts) and EVERY file under the compile-cache dir
+    /// (wasmtime writes `.stats` sidecars beside its artifacts).
+    #[test]
+    fn measured_used_counts_wasm_blobs_and_the_whole_compile_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let contracts = dir.path().join("contracts");
+        let cache = dir.path().join("wasmtime-cache");
+        std::fs::create_dir_all(&contracts).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+
+        write_file(&contracts.join("a.wasm"), 1000);
+        write_file(&contracts.join("local").join("b.wasm"), 2000);
+        // Non-wasm files in the contracts dir are NOT code blobs and must not
+        // be charged (the tracker's `du_walk_wasm` skips them).
+        write_file(&contracts.join("index.db"), 9_000);
+        // The compile cache is walked in full, sidecars included.
+        write_file(&cache.join("sub").join("artifact"), 4000);
+        write_file(&cache.join("sub").join("artifact.stats"), 8);
+
+        assert_eq!(
+            measure_startup_disk_used(&contracts, &cache),
+            1000 + 2000 + 4000 + 8,
+            "must count wasm blobs (recursively) + the entire compile-cache tree, \
+             and nothing else"
+        );
+    }
+
+    /// Missing directories contribute 0 rather than erroring — a first-ever
+    /// start has neither dir populated, and the estimate must still resolve.
+    #[test]
+    fn measured_used_is_zero_when_nothing_exists_yet() {
+        assert_eq!(
+            measure_startup_disk_used(
+                Path::new("/nonexistent/contracts"),
+                Path::new("/nonexistent/cache"),
+            ),
+            0
+        );
+    }
+
+    /// THE anti-feedback property (#5014): the estimate must not move when
+    /// bytes shift between the compile cache and free space on the same mount.
+    ///
+    /// Moving `delta` bytes from `available` into `measured_used` is exactly
+    /// what growing the compile cache does. If the estimate changed, each
+    /// restart would re-derive a different soft limit from the previous run's
+    /// cache size and the value would oscillate. An estimate built on bare free
+    /// space (the tempting simplification) fails every line here.
+    #[test]
+    fn estimate_is_invariant_under_cache_growth_on_the_same_mount() {
+        let capacity = 4 * GIB;
+        for cache_bytes in [0, 32 * MIB, 128 * MIB, 512 * MIB, 2 * GIB, capacity] {
+            let available = capacity - cache_bytes;
+            assert_eq!(
+                startup_disk_budget_from_measurements(cache_bytes, Some(available), 0.5, CAP),
+                2 * GIB,
+                "budget must depend on used+available (the mount's reachable \
+                 capacity), not on how much of it the cache currently holds"
+            );
+        }
+    }
+
+    /// Monotone non-decreasing in the measured-used term. This is what makes
+    /// omitting persisted state bytes SAFE: the estimate is then never larger
+    /// than the live budget computed from the complete total.
+    #[test]
+    fn estimate_is_monotone_in_measured_used() {
+        let available = 400 * MIB;
+        let mut previous = 0;
+        for used in [0, 1, 128 * MIB, 512 * MIB, 4 * GIB, 64 * GIB, u64::MAX] {
+            let budget = startup_disk_budget_from_measurements(used, Some(available), 0.5, CAP);
+            assert!(
+                budget >= previous,
+                "budget must not shrink as measured usage grows (used={used})"
+            );
+            previous = budget;
+        }
+        // Concretely: omitting a 300 MiB state term yields a SMALLER budget than
+        // including it, never a larger one.
+        let without_state =
+            startup_disk_budget_from_measurements(512 * MIB, Some(available), 0.5, CAP);
+        let with_state =
+            startup_disk_budget_from_measurements(512 * MIB + 300 * MIB, Some(available), 0.5, CAP);
+        assert!(without_state < with_state);
+        assert_eq!(without_state, 456 * MIB);
+    }
+
+    /// An unreadable free-space query must not silently shrink the budget: it
+    /// falls back to `u64::MAX`, which clamps to the operator cap. Same rule the
+    /// live recompute applies.
+    #[test]
+    fn unreadable_free_space_clamps_to_the_cap_not_to_zero() {
+        assert_eq!(
+            startup_disk_budget_from_measurements(0, None, 0.5, CAP),
+            CAP,
+            "a free-space read we cannot trust must degrade to cap-only"
+        );
+        // And with a smaller operator cap, to that cap.
+        assert_eq!(
+            startup_disk_budget_from_measurements(0, None, 0.5, GIB),
+            GIB
+        );
+    }
+
+    /// Boundary values: zero capacity, a pct of zero, and an absurd basis all
+    /// have to land inside the documented clamp instead of panicking, wrapping,
+    /// or returning zero. A zero-capacity mount still yields the 128 MiB MIN.
+    #[test]
+    fn estimate_boundaries_stay_inside_the_clamp() {
+        assert_eq!(
+            startup_disk_budget_from_measurements(0, Some(0), 0.5, CAP),
+            128 * MIB,
+            "an empty mount must still resolve to the MIN floor, never 0"
+        );
+        assert_eq!(
+            startup_disk_budget_from_measurements(0, Some(u64::MAX), 1.0, CAP),
+            CAP,
+            "an enormous basis must clamp to the cap, not wrap"
+        );
+        assert_eq!(
+            startup_disk_budget_from_measurements(u64::MAX, Some(u64::MAX), 1.0, CAP),
+            CAP,
+            "saturating basis: no overflow into a small budget"
+        );
+        assert_eq!(
+            startup_disk_budget_from_measurements(4 * GIB, Some(4 * GIB), 0.0, CAP),
+            128 * MIB,
+            "pct=0 collapses to the MIN floor"
+        );
+    }
+
+    /// The impure entry point must compose the two pure pieces on the real
+    /// filesystem. Driven with `pct = 0.0` so the expected value is the MIN
+    /// floor on every host — no dependence on the CI machine's free space, so
+    /// this cannot flake.
+    #[test]
+    fn estimate_composes_the_du_walk_and_the_clamp_on_a_real_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let contracts = dir.path().join("contracts");
+        let cache = dir.path().join("wasmtime-cache");
+        write_file(&contracts.join("a.wasm"), 4096);
+        write_file(&cache.join("artifact"), 4096);
+
+        assert_eq!(
+            startup_disk_budget_estimate(&contracts, &cache, 0.0, CAP),
+            128 * MIB,
+            "pct=0 must resolve to the MIN floor regardless of the host's disk"
+        );
+        // With a real pct the value is host-dependent, so only the invariant is
+        // assertable: it stays inside the documented clamp.
+        let live = startup_disk_budget_estimate(&contracts, &cache, 0.5, CAP);
+        assert!(
+            (128 * MIB..=CAP).contains(&live),
+            "estimate {live} escaped the [MIN, cap] clamp"
+        );
     }
 }

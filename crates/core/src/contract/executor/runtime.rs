@@ -9,7 +9,6 @@ use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
     RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD, StateStoreError, now_nanos,
 };
-use crate::wasm_runtime::default_wasmtime_cache_size_bytes;
 pub(crate) use contract_ops::ReclaimOutcome;
 pub use pool::RuntimePool;
 pub(crate) use pool::{ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS};
@@ -438,6 +437,7 @@ impl Executor<Runtime> {
         inherited_origins: crate::wasm_runtime::SharedInheritedOrigins,
         shared_backend: Option<BackendEngine>,
         shared_contract_index: SharedContractIndex,
+        wasmtime_cache_size_bytes: u64,
     ) -> anyhow::Result<Self> {
         let db = shared_state_store.storage();
         // Pool executors all share ONE contract instance index (#4218), so a
@@ -462,13 +462,14 @@ impl Executor<Runtime> {
             // pin its soft-size limit (#4683) so it lives on the mount whose
             // free space sizes the disk budget and is measurable as freenet's
             // own on-disk usage. `with_directory` requires an absolute path;
-            // the data dir is absolute. The soft limit is derived from the
-            // memory the node may use rather than a flat constant, so a small or
-            // containerized node no longer gets a compile cache larger than the
-            // contract state it accelerates — see
-            // `default_wasmtime_cache_size_bytes`.
+            // the data dir is absolute. The soft limit is resolved ONCE per pool
+            // by `RuntimePool::new` (it walks the data-dir mount, so re-deriving
+            // it per executor would repeat that walk pool_size times) and
+            // threaded in here — see `default_wasmtime_cache_size_bytes`, which
+            // bounds the cache by the DISK budget it is charged against (#5014)
+            // rather than by a RAM signal that a disk-tight host does not feel.
             wasmtime_cache_dir: Some(config.wasmtime_cache_dir()),
-            wasmtime_cache_size_bytes: Some(default_wasmtime_cache_size_bytes()),
+            wasmtime_cache_size_bytes: Some(wasmtime_cache_size_bytes),
             ..RuntimeConfig::default()
         };
         let mut rt = Runtime::build_with_shared_module_caches(
@@ -1307,19 +1308,108 @@ mod executor_pin_tests {
             body.contains("Engine::create_backend_engine(&runtime_config)"),
             "backend engine must be built from the threaded runtime_config"
         );
-        // The wasmtime ON-DISK compile cache's soft limit must be derived from
-        // the memory the node may use, never re-hardcoded to a flat constant: a
-        // fixed 512 MiB let a 2 GiB-cgroup node keep a compile cache larger than
-        // its entire 256 MiB contract-state budget. Whitespace is collapsed so
-        // the pin survives a rustfmt line-wrap of the field.
+        // The wasmtime ON-DISK compile cache's soft limit must come from the
+        // value the POOL resolved (which bounds it by the disk budget the cache
+        // is charged against, #5014), never from a constant and never re-derived
+        // per executor against a cache dir the first executor's engine has
+        // already started writing into. Whitespace is collapsed so the pin
+        // survives a rustfmt line-wrap of the field.
         let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             collapsed.contains(concat!(
-                "wasmtime_cache_size_bytes: Some(",
-                "default_wasmtime_cache_size_bytes())"
+                "wasmtime_cache_size_bytes: ",
+                "Some(wasmtime_cache_size_bytes)"
             )),
-            "the wasmtime on-disk compile-cache soft limit must come from \
-             default_wasmtime_cache_size_bytes() (node-relative), not a constant"
+            "the wasmtime on-disk compile-cache soft limit must be the threaded \
+             parameter, not a constant or a per-executor re-derivation"
+        );
+        assert!(
+            !collapsed.contains(concat!("default_wasmtime_", "cache_size_bytes(")),
+            "from_config_with_shared_modules must NOT call the resolver itself — \
+             it walks the data-dir mount and must run exactly once per pool"
+        );
+    }
+
+    /// Pin: `RuntimePool::new` MUST resolve the wasmtime on-disk compile-cache
+    /// soft limit from the DISK signal, and must resolve it exactly once.
+    ///
+    /// This is the wiring the #5014 fix lives in, and it is invisible to every
+    /// unit test of the pure math: `default_wasmtime_cache_size_bytes` could be
+    /// perfectly disk-aware while this call site passed a constant, `0`, or the
+    /// wrong knobs, and nothing else in the tree would notice. The needles are
+    /// assembled from `concat!` fragments that appear nowhere verbatim in
+    /// `pool.rs`, so the pin cannot match its own source through `include_str!`.
+    #[test]
+    fn runtime_pool_resolves_compile_cache_limit_from_the_disk_signal() {
+        let src = include_str!("runtime/pool.rs");
+        let body = src
+            .split("pub async fn new(")
+            .nth(1)
+            .expect("RuntimePool::new must exist")
+            .split("\n    /// Get the current health status")
+            .next()
+            .expect("end of RuntimePool::new");
+        // Whitespace-collapsed so a rustfmt re-wrap of the (multi-argument) call
+        // cannot silently vacate the pin.
+        let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            collapsed.contains(concat!(
+                "let wasmtime_cache_size_bytes = ",
+                "crate::wasm_runtime::default_wasmtime_",
+                "cache_size_bytes("
+            )),
+            "the pool must resolve the compile-cache soft limit through the \
+             node-relative resolver"
+        );
+        // The disk knobs are what make the bound a DISK bound. Passing the
+        // directories but not the operator's pct/cap (or vice versa) would
+        // silently fall back to a budget unrelated to this node's disk.
+        for needle in [
+            concat!("&config.contracts", "_dir()"),
+            concat!("&config.wasmtime_", "cache_dir()"),
+            concat!("config.hosting_", "disk_pct"),
+            concat!("config.max_hosting", "_disk"),
+        ] {
+            assert!(
+                collapsed.contains(needle),
+                "RuntimePool::new must pass `{needle}` to the compile-cache \
+                 resolver — without it the limit stops tracking this node's disk \
+                 budget (#5014)"
+            );
+        }
+        // Exactly once: the resolver walks the contracts dir, walks the compile
+        // cache dir, and statvfs's the mount. A second call inside `new` would
+        // mean re-measuring per executor, which both wastes startup I/O and
+        // samples a cache dir the first executor has begun writing into.
+        assert_eq!(
+            collapsed
+                .matches(concat!("default_wasmtime_", "cache_size_bytes("))
+                .count(),
+            1,
+            "the compile-cache soft limit must be resolved exactly once per pool"
+        );
+
+        // Third call site: a replacement executor must reuse the pool's resolved
+        // value. Re-deriving there would measure a compile-cache dir the live
+        // engine has been filling, and the engine's soft limit was fixed at
+        // startup anyway — so a fresh measurement would be both wrong and inert.
+        let replacement = src
+            .split("async fn create_replacement_executor(")
+            .nth(1)
+            .expect("create_replacement_executor must exist")
+            .split("\n    /// Return an executor to the pool, replacing it")
+            .next()
+            .expect("end of create_replacement_executor");
+        let replacement = replacement.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            replacement.contains(concat!("self.wasmtime_", "cache_size_bytes")),
+            "a replacement executor must reuse the pool's resolved compile-cache \
+             soft limit"
+        );
+        assert!(
+            !replacement.contains(concat!("default_wasmtime_", "cache_size_bytes(")),
+            "a replacement executor must NOT re-derive the compile-cache soft limit"
         );
     }
 

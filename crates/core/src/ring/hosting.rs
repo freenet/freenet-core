@@ -76,6 +76,10 @@ use cache::{HostingCache, HostingCacheStats, disk_budget_for_clamped};
 use dashmap::{DashMap, DashSet};
 use demand::ProximityPrior;
 use disk_usage::DiskUsageTracker;
+/// Start-time disk-budget estimate (#5014), for the wasmtime compile-cache soft
+/// limit, which wasmtime fixes at `Cache::new` — before this manager's tracker
+/// is configured or seeded.
+pub(crate) use disk_usage::startup_disk_budget_estimate;
 pub(crate) use disk_usage::{DiskBudgetExceeded, DiskUsageStats};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
