@@ -92,6 +92,12 @@ opentelemetry-jaeger = "0.22"
 opentelemetry-otlp = "0.32.0"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 tracing = "0.1"
+# Bumping this? Re-read `rolling.rs`'s `impl io::Write for
+# RollingFileAppender` first. The log pruner's GC-exemption argument
+# (crates/core/src/tracing/tracer.rs::prune_log_files) depends on the
+# rollover check running BEFORE the buffer is written — audited at 0.2.5.
+# If that order ever flips, the exemption stops being bounded in bytes
+# and nothing in our test suite will notice.
 tracing-appender = "0.2"
 tracing-core = "0.1"
 tracing-opentelemetry = "0.33.0"

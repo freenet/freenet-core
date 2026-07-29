@@ -242,14 +242,25 @@ fn cleanup_old_logs(log_dir: &std::path::Path) {
     prune_log_files(files, cutoff, log_dir_max_bytes());
 }
 
-/// The indices in a **mtime-ascending** `files` of the newest file of
-/// each family — i.e. the file each appender currently has open.
+/// The indices, in a `files` sorted ascending by `(modified, path)`, of
+/// the newest file of each family.
 ///
 /// Discovered from the data rather than by walking a hand-written list
 /// of [`LogFamily`] variants: adding a third appender must not require
 /// remembering to extend a list here, because forgetting would silently
 /// re-expose that appender's open file to deletion — precisely the bug
 /// this function exists to prevent.
+///
+/// **This INFERS which file each appender has open; it does not know.**
+/// There is no portable way to ask whether some other part of the
+/// process holds a descriptor, so "newest of its family" is a proxy. It
+/// is right whenever time moves forward, which is why the caller sorts
+/// by `(modified, path)` — see [`prune_log_files`]. A backward clock step
+/// mid-hour can defeat it: the appender does not roll (rotation is keyed
+/// on the clock too), so its open file's mtime can end up older than a
+/// closed sibling's, and the proxy picks the wrong file. The consequence
+/// is bounded — it is the same exposure this code removed in the common
+/// case, not a new one — and no cheaper signal is available.
 fn live_file_indices(files: &[LogFile]) -> Vec<usize> {
     let mut newest: Vec<(LogFamily, usize)> = Vec::new();
     for (idx, file) in files.iter().enumerate() {
@@ -303,6 +314,16 @@ fn live_file_indices(files: &[LogFile]) -> Vec<usize> {
 ///   one. Each exempt file is therefore frozen at whatever its family
 ///   wrote during a single rotation period — on the measured gateway,
 ///   ~21 MB/hour across both families, against a 512 MiB budget.
+///
+///   **This leg rests on an EXTERNAL property that no test here pins.**
+///   Nothing in this crate would fail if a `tracing-appender` bump moved
+///   the rollover check after the write; the byte bound would silently
+///   become false while all these tests stayed green. It is audited at
+///   0.2.5, and `Cargo.toml` carries a pointer back here so a bump is
+///   prompted to re-read `rolling.rs`. A local test cannot cover it:
+///   forcing a rotation needs control of the appender's clock, which
+///   `tracing-appender` exposes only to its own `cfg(test)` builds.
+///   If you bump the dependency, re-check that ordering by hand.
 /// * **Self-clearing.** The only event that could make an exempt file
 ///   grow is a write, and a write is exactly what rotates it away: the
 ///   exemption transfers to the newly-created file and the superseded one
@@ -320,7 +341,24 @@ fn live_file_indices(files: &[LogFile]) -> Vec<usize> {
 /// It would reintroduce precisely the bug this function exists to fix.
 /// Do not add one.
 fn prune_log_files(mut files: Vec<LogFile>, cutoff: std::time::SystemTime, max_bytes: u64) {
-    files.sort_by_key(|file| file.modified);
+    // Sorting is load-bearing, not cosmetic: `live_file_indices` reads
+    // the live file off the END of each family's run, and the size pass
+    // walks this order to delete oldest-first. `cleanup_old_logs` feeds
+    // us `read_dir` order, which is arbitrary (hash order on ext4).
+    //
+    // The path is a tiebreak rather than mtime alone, because mtime is
+    // NOT a total order here: on a coarse-granularity filesystem the old
+    // file's final write and the new file's creation can land in the same
+    // tick, and a stable sort would then fall back to `read_dir` order —
+    // leaving the genuinely-open file looking like the older of the two
+    // and thus collectable. These file names embed a zero-padded
+    // `YYYY-MM-DD-HH` stamp under a fixed per-family prefix, so within a
+    // family lexicographic order IS chronological order.
+    files.sort_by(|a, b| {
+        a.modified
+            .cmp(&b.modified)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     // Computed once, on the full set, and honoured by both passes below.
     let live = live_file_indices(&files);
@@ -1126,6 +1164,98 @@ mod cleanup_tests {
              swept, or the age pass would never reclaim anything"
         );
         assert!(main_live.exists(), "the main appender's open file survives");
+    }
+
+    /// `prune_log_files` must sort before it does anything else.
+    ///
+    /// `live_file_indices` reads the live file off the END of each
+    /// family's run, and the size pass walks the same order to delete
+    /// oldest-first — both are wrong on unsorted input. Its one
+    /// production caller passes `read_dir` order, which is arbitrary
+    /// (hash order on ext4), so the sort is the only thing making either
+    /// correct. Nothing else in this suite feeds it out-of-order input:
+    /// without this test, deleting the sort would pass or fail depending
+    /// on how the filesystem happened to enumerate a temp directory.
+    #[test]
+    fn prune_log_files_sorts_before_choosing_victims() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+
+        let at = |hours_ago: u64| now - Duration::from_secs(hours_ago * 3600);
+        let m1 = dir.path().join("freenet.2026-05-25-10.log");
+        let e1 = dir.path().join("freenet.error.2026-05-25-11.log");
+        let m2 = dir.path().join("freenet.2026-05-25-12.log");
+        let e2 = dir.path().join("freenet.error.2026-05-25-13.log");
+        let m3 = dir.path().join("freenet.2026-05-25-14.log");
+        for (path, hours) in [(&m1, 5), (&e1, 4), (&m2, 3), (&e2, 2), (&m3, 1)] {
+            write_with_mtime(path, 1024, at(hours));
+        }
+
+        // Deliberately shuffled: newest first, oldest in the middle.
+        // A pruner that trusted this order would treat m2 and e2 as the
+        // live files and delete the genuinely-open m3.
+        size_pass_only(
+            vec![
+                log_file(&m3, at(1), 1024),
+                log_file(&e1, at(4), 1024),
+                log_file(&m1, at(5), 1024),
+                log_file(&e2, at(2), 1024),
+                log_file(&m2, at(3), 1024),
+            ],
+            2048,
+        );
+
+        assert!(
+            m3.exists(),
+            "the newest Main file is the open one and must survive however \
+             the caller ordered the input"
+        );
+        assert!(
+            e2.exists(),
+            "the newest Error file is the open one and must survive however \
+             the caller ordered the input"
+        );
+        for (path, name) in [(&m1, "m1"), (&e1, "e1"), (&m2, "m2")] {
+            assert!(!path.exists(), "{name} is evictable and must be deleted");
+        }
+    }
+
+    /// An mtime tie inside one family must break by name, not by input
+    /// order.
+    ///
+    /// `SystemTime` is not a total order over these files: on a
+    /// coarse-granularity filesystem the outgoing file's last write and
+    /// the incoming file's creation can land in the same tick, exactly at
+    /// the rotation instant. A stable sort keyed on mtime alone then
+    /// preserves `read_dir` order, so whichever the filesystem happened
+    /// to enumerate last is taken for the open file — and the real one
+    /// becomes an ordinary deletion candidate.
+    #[test]
+    fn live_pick_breaks_mtime_ties_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // Identical mtimes, as a same-tick rotation would produce.
+        let tied = SystemTime::now();
+
+        let older = dir.path().join("freenet.error.2026-05-25-12.log");
+        let newer = dir.path().join("freenet.error.2026-05-25-13.log");
+        write_with_mtime(&older, 1024, tied);
+        write_with_mtime(&newer, 1024, tied);
+
+        // Ordered so that mtime-only sorting leaves `older` last, i.e.
+        // mistaken for the live file.
+        size_pass_only(
+            vec![log_file(&newer, tied, 1024), log_file(&older, tied, 1024)],
+            1024,
+        );
+
+        assert!(
+            newer.exists(),
+            "the later rotation stamp is the open file and must survive the tie"
+        );
+        assert!(
+            !older.exists(),
+            "the superseded file must be the one collected"
+        );
     }
 
     /// The live-file exemption must be **positional, not sticky**: once
