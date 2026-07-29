@@ -1131,6 +1131,14 @@ where
                 );
                 // Safety: `already_registered` was derived from `self.update_notifications.get(&instance_id)`
                 // succeeding, so the entry is guaranteed to exist.
+                //
+                // This keeps the read-index / re-acquire / write shape that the
+                // `RuntimePool` twin deliberately collapsed (#5040). It is
+                // exempt, not overlooked: this map is a plain `HashMap` behind
+                // `&mut self` with no `.await` between the two lookups, so no
+                // other code can run in the window and the entry cannot vanish.
+                // The pool twin works through `Arc<DashMap>`, where that
+                // guarantee does not hold. Do NOT copy this shape there.
                 if let Some(channels) = self.update_notifications.get_mut(&instance_id) {
                     channels[idx] = (cli_id, notification_ch);
                 }
@@ -2537,10 +2545,13 @@ where
                         // (the snapshot predates their arrival); the next
                         // committed update is.
                         //
-                        // Logged rather than left silent: a registered
-                        // subscriber, a committed update, and zero log evidence
-                        // is precisely the #4681 shape this callsite exists to
-                        // make visible.
+                        // Logged rather than left silent, though note this is a
+                        // DEBUG-BUILD aid only: `release_max_level_info`
+                        // compiles it out, so in production this path is as
+                        // silent as it was. It is recorded because a registered
+                        // subscriber, a committed update, and zero evidence is
+                        // the #4681 shape, and a debug-build trace is better
+                        // than nothing while the window stays unreachable.
                         tracing::debug!(
                             %instance_id,
                             "send_update_notification: subscriber registered concurrently with \
@@ -2651,10 +2662,18 @@ where
                 // released before `remove_if` takes the same shard lock.
                 //
                 // Same gating as the check-site arm: the summaries sibling is
-                // dropped only when the notifications removal actually happened
-                // (so a concurrently-registered client keeps its summary), and
-                // then unconditionally (any summary under a channel-less key is
-                // dead).
+                // dropped only when the notifications removal actually happened,
+                // and then unconditionally (any summary under a channel-less key
+                // is dead).
+                //
+                // The gate covers a registration whose notifications-insert
+                // lands BEFORE the `remove_if`. It does NOT cover one landing
+                // entirely between the successful `remove_if` and the
+                // `shared_summaries.remove` below — registration writes the two
+                // maps in that order, so such a client ends up with a live
+                // channel and no summary. That degrades to a full-state send
+                // instead of a delta, never a fault, and it is unreachable
+                // while both paths run on the serial contract loop.
                 if shared_notifications
                     .remove_if(&instance_id, |_, notifiers| notifiers.is_empty())
                     .is_some()

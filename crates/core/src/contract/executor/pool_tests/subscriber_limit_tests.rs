@@ -815,7 +815,9 @@ async fn closed_subscriber_channel_drops_entry_at_point_of_loss_local() {
 /// and a dead client's summary would persist for the lifetime of the contract.
 /// Also the only test asserting a live subscriber actually RECEIVES its
 /// notification, which pins that the fan-out path still works at all.
-#[cfg(feature = "trace")]
+///
+/// No `trace` gate: this asserts on map state and a delivered notification,
+/// not on captured logs.
 #[tokio::test(flavor = "current_thread")]
 async fn partial_failure_prunes_only_the_dead_subscriber_local() {
     let mut executor = create_executor().await;
@@ -891,6 +893,91 @@ async fn partial_failure_prunes_only_the_dead_subscriber_local() {
     }
 }
 
+/// The SHARED-storage twin of the partial-failure test above — the branch
+/// production actually runs (`handler.rs` wires `ContractExecutor =
+/// RuntimePool`, and every pooled executor gets shared storage).
+///
+/// Same reasoning: the shared per-client summaries prune is masked by
+/// all-or-nothing failure, because the whole-entry cleanup removes the
+/// summaries map anyway. Only a surviving subscriber exposes it.
+#[tokio::test(flavor = "current_thread")]
+async fn partial_failure_prunes_only_the_dead_subscriber_shared() {
+    let mut executor = create_executor().await;
+    let shared_notifications = std::sync::Arc::new(dashmap::DashMap::new());
+    let shared_summaries = std::sync::Arc::new(dashmap::DashMap::new());
+    executor.set_shared_notifications(
+        shared_notifications.clone(),
+        shared_summaries.clone(),
+        std::sync::Arc::new(dashmap::DashMap::new()),
+    );
+
+    let contract = test_contract(b"partial_failure_shared_5040");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    let dead_client = ClientId::next();
+    let live_client = ClientId::next();
+    let (dead_tx, dead_rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    drop(dead_rx);
+
+    let mut subs = vec![(dead_client, dead_tx), (live_client, live_tx)];
+    subs.sort_by_key(|(c, _)| *c);
+    shared_notifications.insert(instance_id, subs);
+    shared_summaries.insert(
+        instance_id,
+        std::collections::HashMap::from([(dead_client, None), (live_client, None)]),
+    );
+
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![6, 6, 6])),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("store contract");
+
+    let notifiers = shared_notifications
+        .get(&instance_id)
+        .expect("entry must survive — a live subscriber remains");
+    assert_eq!(
+        notifiers.len(),
+        1,
+        "only the dead subscriber may be removed from the notifier list"
+    );
+    assert_eq!(
+        notifiers[0].0, live_client,
+        "the surviving subscriber must be the live one"
+    );
+    drop(notifiers);
+
+    let summaries = shared_summaries
+        .get(&instance_id)
+        .expect("summaries entry must survive alongside the notifier entry");
+    assert!(
+        !summaries.contains_key(&dead_client),
+        "the dead subscriber's summary must be pruned on the shared branch too"
+    );
+    assert!(
+        summaries.contains_key(&live_client),
+        "the live subscriber's summary must NOT be collaterally removed"
+    );
+    drop(summaries);
+
+    match live_rx.try_recv() {
+        Ok(Ok(resp)) => {
+            let as_str = format!("{resp:?}");
+            assert!(
+                as_str.contains("UpdateNotification"),
+                "the live subscriber must receive an UpdateNotification; got: {as_str}"
+            );
+        }
+        other => panic!("the live subscriber must receive its notification; got: {other:?}"),
+    }
+}
+
 /// Source-scrape pin for the #5040 TOCTOU fix in
 /// `RuntimePool::register_contract_notifier`.
 ///
@@ -913,13 +1000,22 @@ async fn partial_failure_prunes_only_the_dead_subscriber_local() {
 #[test]
 fn register_contract_notifier_takes_one_guard_for_search_and_write() {
     let src = include_str!("../runtime/pool.rs");
+    // Slice the `already_registered` STATEMENT itself, bounded by two code
+    // anchors (both unique in pool.rs), not by prose and not by a wider region.
+    //
+    // An earlier revision of this pin ended at `MAX_SUBSCRIBERS_PER_CONTRACT`,
+    // reasoning that API surface beats a comment as an anchor. It does, but
+    // that anchor sits PAST the `else` branch's own `shared_notifications`
+    // read, so the region swallowed a second, legitimate acquisition and the
+    // count assertion failed on correct code. Bounding the statement exactly
+    // is both stabler and narrower than either.
     let start = src
-        .find("fn register_contract_notifier(")
-        .expect("register_contract_notifier not found in pool.rs");
+        .find("let already_registered =")
+        .expect("`already_registered` binding not found in pool.rs");
     let after = &src[start..];
     let end = after
-        .find("// New subscriber: enforce per-contract limit")
-        .expect("new-subscriber arm anchor not found in register_contract_notifier");
+        .find("if let Some(same_channel)")
+        .expect("`if let Some(same_channel)` not found after the binding");
     let already_registered: String = after[..end]
         .chars()
         .filter(|c| !c.is_whitespace())
@@ -937,5 +1033,16 @@ fn register_contract_notifier_takes_one_guard_for_search_and_write() {
         already_registered.contains("self.shared_notifications.get_mut("),
         "the single acquisition must be a WRITE guard (`get_mut`), so the \
          binary search and the channel write happen under it"
+    );
+    // The guard alone is not the invariant — the WRITE has to still be there.
+    // Without this, deleting the refresh entirely satisfies both assertions
+    // above while leaving a reconnected client wired to its dead sender
+    // forever, receiving nothing. Unreachable behaviorally: nothing in the
+    // tree constructs a `RuntimePool`, so no test can observe it.
+    assert!(
+        already_registered.contains("channels[idx]=(cli_id,notification_ch.clone())"),
+        "the reconnect path must actually REFRESH the stored channel; without \
+         the write a reconnected client keeps its dead sender and silently \
+         receives nothing"
     );
 }
