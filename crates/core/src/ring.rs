@@ -100,10 +100,6 @@ pub use connection_manager::{set_nn_lattice_enabled, set_nn_lattice_force_active
 mod connection;
 mod hosting;
 pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
-/// Pre-write admission-gate rejection type (#4683, PR 3). Surfaced to the
-/// executor chokepoints so a write that would overflow the aggregate disk
-/// budget is refused before any bytes land.
-pub(crate) use hosting::DiskBudgetExceeded;
 /// The pre-A2 flat 1 GiB budget, used as the upgrade-migration sentinel in
 /// `config::ConfigArgs::build` so an upgraded node re-derives its hosting budget
 /// instead of keeping the historically-pinned default (#4565).
@@ -127,6 +123,10 @@ pub use hosting::{AccessType, RecordAccessResult};
 /// `hosting-disk-pct` / `max-hosting-disk` defaults from these so the operator-
 /// facing defaults and the in-code sizing math share one source of truth.
 pub(crate) use hosting::{DEFAULT_HOSTING_DISK_PCT, DEFAULT_MAX_HOSTING_DISK_BYTES};
+/// Pre-write admission-gate rejection type (#4683, PR 3). Surfaced to the
+/// executor chokepoints so a write that would overflow the aggregate disk
+/// budget is refused before any bytes land.
+pub(crate) use hosting::{DiskBudgetExceeded, HostingDiskPaths};
 /// Clamp bounds re-exported only for the config-default round-trip test.
 #[cfg(test)]
 pub(crate) use hosting::{MAX_DEFAULT_HOSTING_BUDGET_BYTES, MIN_DEFAULT_HOSTING_BUDGET_BYTES};
@@ -1776,14 +1776,19 @@ impl Ring {
             snapshot.hosting_local_hits_total = Some(ring.hosting_manager.local_get_serves());
             snapshot.hosting_local_misses_total = Some(ring.hosting_manager.local_get_forwards());
 
-            // Aggregate on-disk usage gauges (#4683): state (delta-tracked) +
-            // WASM blobs + wasmtime compile cache (both du-measured) + their sum.
+            // Aggregate on-disk usage gauges (#4683, #5007): logical state
+            // (delta-tracked) + the measured database file + WASM blobs +
+            // wasmtime compile cache + the measured webapp cache. `state` vs
+            // `db` is the pair that makes the #5007 under-count legible in
+            // central telemetry: their difference is the database's dead space.
             // `None` until the tracker is configured and seeded (early startup),
-            // in which case the fields stay unset. Observational only in this PR.
+            // in which case the fields stay unset.
             if let Some(disk) = ring.hosting_manager.disk_usage_stats() {
                 snapshot.hosting_disk_state_bytes = Some(disk.state_bytes);
+                snapshot.hosting_disk_db_bytes = Some(disk.db_file_bytes);
                 snapshot.hosting_disk_wasm_bytes = Some(disk.wasm_bytes);
                 snapshot.hosting_disk_compile_cache_bytes = Some(disk.compile_cache_bytes);
+                snapshot.hosting_disk_webapp_cache_bytes = Some(disk.webapp_cache_bytes);
                 snapshot.hosting_disk_total_bytes = Some(disk.total_bytes);
             }
 
@@ -3175,19 +3180,18 @@ impl Ring {
         self.hosting_manager.set_storage(storage);
     }
 
-    /// Install the aggregate disk-usage tracker's paths (#4683). Called once at
-    /// startup with the node's mode-resolved contracts dir and the relocated
-    /// wasmtime compile-cache dir. The tracker is seeded lazily on the first
-    /// sweep tick.
-    pub fn set_hosting_disk_paths(
+    /// Install the aggregate disk-usage tracker's paths (#4683, #5007). Called
+    /// once at startup with every directory the node's footprint lands in: the
+    /// mode-resolved contracts dir, the relocated wasmtime compile-cache dir,
+    /// the storage backend's database dir, and the unpacked-webapp cache. The
+    /// tracker is seeded lazily on the first sweep tick.
+    pub(crate) fn set_hosting_disk_paths(
         &self,
-        contracts_dir: std::path::PathBuf,
-        wasmtime_cache_dir: std::path::PathBuf,
+        paths: HostingDiskPaths,
         hosting_disk_pct: f64,
         max_hosting_disk: u64,
     ) {
-        self.hosting_manager
-            .configure_disk_tracker(contracts_dir, wasmtime_cache_dir);
+        self.hosting_manager.configure_disk_tracker(paths);
         // #4683 eviction-floor sizing knobs (mirrors the disk paths install; the
         // config is only reachable here). The 60s sweep's recompute reads them.
         self.hosting_manager
@@ -4223,8 +4227,10 @@ impl Ring {
         // usage.
         let disk = self.hosting_manager.disk_usage_stats();
         let disk_state_bytes = disk.map(|d| d.state_bytes);
+        let disk_db_bytes = disk.map(|d| d.db_file_bytes);
         let disk_wasm_bytes = disk.map(|d| d.wasm_bytes);
         let disk_compile_cache_bytes = disk.map(|d| d.compile_cache_bytes);
+        let disk_webapp_cache_bytes = disk.map(|d| d.webapp_cache_bytes);
         let disk_total_bytes = disk.map(|d| d.total_bytes);
         // `disk_budget_bytes` starts at `u64::MAX` until the first 60s
         // recompute installs a real value (see `HostingManager::
@@ -4241,8 +4247,10 @@ impl Ring {
             evictions_of_recently_read_total: stats.evictions_of_recently_read_total,
             contracts,
             disk_state_bytes,
+            disk_db_bytes,
             disk_wasm_bytes,
             disk_compile_cache_bytes,
+            disk_webapp_cache_bytes,
             disk_total_bytes,
             disk_budget_bytes,
         }

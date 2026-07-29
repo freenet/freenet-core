@@ -2314,12 +2314,20 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!(snapshot.hosting_disk_state_bytes),
                 );
                 obj.insert(
+                    "hosting_disk_db_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_disk_db_bytes),
+                );
+                obj.insert(
                     "hosting_disk_wasm_bytes".to_string(),
                     serde_json::json!(snapshot.hosting_disk_wasm_bytes),
                 );
                 obj.insert(
                     "hosting_disk_compile_cache_bytes".to_string(),
                     serde_json::json!(snapshot.hosting_disk_compile_cache_bytes),
+                );
+                obj.insert(
+                    "hosting_disk_webapp_cache_bytes".to_string(),
+                    serde_json::json!(snapshot.hosting_disk_webapp_cache_bytes),
                 );
                 obj.insert(
                     "hosting_disk_total_bytes".to_string(),
@@ -2827,15 +2835,22 @@ mod tests {
         let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
             .expect("construct RouterSnapshotInfo for test");
         info.hosting_disk_state_bytes = Some(401);
+        info.hosting_disk_db_bytes = Some(431);
         info.hosting_disk_wasm_bytes = Some(409);
         info.hosting_disk_compile_cache_bytes = Some(419);
-        info.hosting_disk_total_bytes = Some(1229);
+        info.hosting_disk_webapp_cache_bytes = Some(433);
+        info.hosting_disk_total_bytes = Some(1259);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("hosting_disk_state_bytes", 401),
+            // #5007: the database measurement and the webapp cache are the two
+            // gauges that were entirely absent. Without them in the OTLP body
+            // there is no way to see the dead-space gap from central telemetry.
+            ("hosting_disk_db_bytes", 431),
             ("hosting_disk_wasm_bytes", 409),
             ("hosting_disk_compile_cache_bytes", 419),
-            ("hosting_disk_total_bytes", 1229),
+            ("hosting_disk_webapp_cache_bytes", 433),
+            ("hosting_disk_total_bytes", 1259),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

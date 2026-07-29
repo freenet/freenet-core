@@ -1621,14 +1621,24 @@ pub struct HostingSnapshot {
     /// disk tracker is configured and seeded (early startup) — distinct from
     /// `Some(0)`, which means seeded-and-empty.
     pub disk_state_bytes: Option<u64>,
+    /// Measured byte size of the storage backend's database directory (#5007).
+    /// `disk_db_bytes − disk_state_bytes` is the database's dead space: bytes
+    /// the file holds that no live row accounts for, reclaimable only by the
+    /// startup compaction. Same seeded-gate semantics as `disk_state_bytes`.
+    pub disk_db_bytes: Option<u64>,
     /// Aggregate on-disk bytes used by `*.wasm` code blobs. Same
     /// seeded-gate semantics as `disk_state_bytes`.
     pub disk_wasm_bytes: Option<u64>,
     /// Aggregate on-disk bytes used by the wasmtime compile cache. Same
     /// seeded-gate semantics as `disk_state_bytes`.
     pub disk_compile_cache_bytes: Option<u64>,
-    /// Sum of `disk_state_bytes` + `disk_wasm_bytes` + `disk_compile_cache_bytes`
-    /// — the aggregate the disk budget bounds. Same seeded-gate semantics.
+    /// Measured byte size of the unpacked-webapp cache (#5007). Reported for
+    /// visibility but NOT part of `disk_total_bytes`: #5012 caps it separately
+    /// and hosting eviction has no lever on it. Same seeded-gate semantics.
+    pub disk_webapp_cache_bytes: Option<u64>,
+    /// `max(disk_state_bytes, disk_db_bytes)` + `disk_wasm_bytes` +
+    /// `disk_compile_cache_bytes` — the aggregate the disk budget bounds. Same
+    /// seeded-gate semantics.
     pub disk_total_bytes: Option<u64>,
     /// The aggregate disk budget the admission gate checks projected writes
     /// against (`HostingManager::disk_budget_bytes`, #4702). `None` while it

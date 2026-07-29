@@ -116,6 +116,9 @@ pub struct ConfigArgs {
     /// are evicted (least-valuable-first) and their on-disk state reclaimed.
     /// This bounds tracked contract state only — WASM code blobs and ReDb/
     /// SQLite database overhead are additional and not counted against it.
+    /// The separate aggregate DISK budget (`hosting-disk-pct` /
+    /// `max-hosting-disk`) does count them, including the database file's own
+    /// footprint since #5007.
     /// Default: 1 GiB.
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
@@ -1206,6 +1209,9 @@ pub struct Config {
     /// are evicted (least-valuable-first) and their on-disk state reclaimed.
     /// This bounds tracked contract state only — WASM code blobs and ReDb/
     /// SQLite database overhead are additional and not counted against it.
+    /// The separate aggregate DISK budget (`hosting-disk-pct` /
+    /// `max-hosting-disk`) does count them, including the database file's own
+    /// footprint since #5007.
     ///
     /// The default is capability-relative (RAM-scaled): `clamp(total_ram / 8,
     /// 128 MiB, 1 GiB)`, so a memory-constrained host gets a proportionally
