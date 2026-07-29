@@ -1131,6 +1131,14 @@ where
                 );
                 // Safety: `already_registered` was derived from `self.update_notifications.get(&instance_id)`
                 // succeeding, so the entry is guaranteed to exist.
+                //
+                // This keeps the read-index / re-acquire / write shape that the
+                // `RuntimePool` twin deliberately collapsed (#5040). It is
+                // exempt, not overlooked: this map is a plain `HashMap` behind
+                // `&mut self` with no `.await` between the two lookups, so no
+                // other code can run in the window and the entry cannot vanish.
+                // The pool twin works through `Arc<DashMap>`, where that
+                // guarantee does not hold. Do NOT copy this shape there.
                 if let Some(channels) = self.update_notifications.get_mut(&instance_id) {
                     channels[idx] = (cli_id, notification_ch);
                 }
@@ -2430,34 +2438,131 @@ where
         let key = *key;
         let instance_id = *key.id();
 
+        // Set by the LOCAL fan-out arm when its channel-closed cleanup empties
+        // the subscriber vec. The removal itself has to happen after the
+        // if/else chain, because that arm holds `&mut` borrows of both maps for
+        // its whole body. The shared arm does the equivalent inline (it works
+        // through `Arc<DashMap>`, not `&mut self`), and leaves this false.
+        let mut local_entry_became_empty = false;
+
         if let (Some(shared_notifications), Some(shared_summaries)) = (
             self.shared_notifications.as_ref(),
             self.shared_summaries.as_ref(),
         ) {
-            // Snapshot subscribers and release the DashMap read-lock before sending
-            let notifiers_snapshot: Vec<(ClientId, mpsc::Sender<HostResult>)> =
+            // Snapshot subscribers and release the DashMap read-lock before sending.
+            // Kept as `Option` rather than collapsed to an empty Vec: ABSENT and
+            // PRESENT-but-EMPTY need different handling below, and distinguishing
+            // them here keeps the ABSENT path — the overwhelmingly common one —
+            // a pure READ. Collapsing first and re-deriving the distinction from
+            // a `remove_if` would take a shard WRITE lock on every committed
+            // update for every contract with no local subscriber.
+            let notifiers_snapshot: Option<Vec<(ClientId, mpsc::Sender<HostResult>)>> =
                 shared_notifications
                     .get(&instance_id)
-                    .map_or_else(Vec::new, |notifiers| notifiers.value().clone());
+                    .map(|notifiers| notifiers.value().clone());
 
-            // #4681: a committed update found no LIVE subscriber for this
-            // contract — either no map entry at all, OR an empty subscriber vec
-            // left behind by the channel-closed cleanup below (`retain` removes
-            // the last dead subscriber but leaves the emptied entry in the map,
-            // so the next committed update snapshots `Some([])`). Both cases are
-            // fully silent drops for a contract that may have had a registered
-            // subscriber, so surface them with a WARN (instance + total
-            // registered-contract count) instead of returning silently — a
-            // notification dropped for a registered subscriber is never invisible.
-            if notifiers_snapshot.is_empty() {
-                tracing::warn!(
-                    %instance_id,
-                    registered_contracts = shared_notifications.len(),
-                    "send_update_notification: no subscriber snapshot for contract \
-                     (shared storage); update notification not delivered"
-                );
-                return Ok(());
-            }
+            // #4681, re-scoped by #5040: an empty snapshot is TWO distinct
+            // states, and only one of them is an anomaly.
+            //
+            // * ABSENT entry — no local client is subscribed: either none ever
+            //   was, or the last one disconnected cleanly (`RuntimePool::
+            //   remove_client` drops the entry outright). This is the NORMAL
+            //   steady state for a contract this node hosts for the NETWORK:
+            //   the network mesh is fed by `broadcast_state_change`, not by
+            //   this local fan-out, so nothing is undelivered and nothing is
+            //   lost. Warning per occurrence made a routine fact read as a
+            //   dropped notification and buried the real signal below — one
+            //   production node logged 22,413 of these in a single day, 96.6%
+            //   of them for one zero-subscriber contract (#5040). PR #4773's
+            //   own reviewer note predicted exactly this ("fires on the commit
+            //   path for contracts with zero local subscribers (common on
+            //   relays/gateways) ... a follow-up could rate-limit it if it
+            //   proves noisy").
+            //
+            // * PRESENT but EMPTY — a subscriber's channel closed without a
+            //   Disconnect reaching the handler, so the failure `retain` below
+            //   emptied the vec in place. That loss is already reported at the
+            //   point of loss (one ERROR per closed channel, naming the client),
+            //   so this is a backstop: it is reported ONCE and the stale entry
+            //   (with its already-emptied summaries sibling) is dropped, rather
+            //   than re-warning on every committed update forever. The `retain`
+            //   below now also removes the entry as it empties, which is the
+            //   real source fix; this arm catches anything that still slips
+            //   through. Both adopt the "drop the entry when it goes empty"
+            //   convention the interest/subscriber maps already use
+            //   (`interest.rs`, `hosting.rs`: `remove_if(.., |_, v| v.is_empty())`).
+            //
+            // NOTE ON VISIBILITY: `debug!` is compiled OUT of release builds by
+            // `release_max_level_info` (see crates/core/Cargo.toml), so the
+            // ABSENT case below is deliberately INVISIBLE in production, not
+            // merely quieter. That is intended — it is the steady state and
+            // carries no operator action — but it does mean a log grep can no
+            // longer distinguish "no subscriber registered" from "never
+            // reached", which #4681 had relied on. See #5040.
+            let notifiers_snapshot = match notifiers_snapshot {
+                None => {
+                    tracing::debug!(
+                        %instance_id,
+                        registered_contracts = shared_notifications.len(),
+                        "send_update_notification: no local subscriber for contract \
+                         (shared storage); nothing to deliver locally"
+                    );
+                    return Ok(());
+                }
+                Some(notifiers) if notifiers.is_empty() => {
+                    // Captured BEFORE the removal below, so the count describes
+                    // the moment of observation rather than the moment after
+                    // cleanup (which would undercount by exactly this entry).
+                    let registered_contracts = shared_notifications.len();
+                    // Gate the summaries removal on the notifications removal
+                    // actually happening: `remove_if` re-checks emptiness under
+                    // the shard lock, so if a client registered between the
+                    // snapshot above and here the entry is no longer empty, the
+                    // removal declines — and we must NOT then drop that new
+                    // client's summary. The next committed update serves them.
+                    if shared_notifications
+                        .remove_if(&instance_id, |_, notifiers| notifiers.is_empty())
+                        .is_some()
+                    {
+                        // Unconditional, NOT `remove_if(.., is_empty)`: with no
+                        // channels left under this key, every summary beneath it
+                        // belongs to a client that can no longer be notified. A
+                        // conditional removal would orphan exactly the realistic
+                        // case, because a summaries sibling is typically still
+                        // NON-empty at this point.
+                        shared_summaries.remove(&instance_id);
+                        tracing::warn!(
+                            %instance_id,
+                            registered_contracts,
+                            "send_update_notification: no subscriber snapshot for contract \
+                             (shared storage); stale entry dropped — the subscriber was \
+                             lost on an earlier update (see the prior channel-closed ERROR)"
+                        );
+                    } else {
+                        // The removal DECLINED: a client registered between the
+                        // snapshot above and this call, so the entry is no
+                        // longer empty. This update is not delivered to them
+                        // (the snapshot predates their arrival); the next
+                        // committed update is.
+                        //
+                        // Logged rather than left silent, though note this is a
+                        // DEBUG-BUILD aid only: `release_max_level_info`
+                        // compiles it out, so in production this path is as
+                        // silent as it was. It is recorded because a registered
+                        // subscriber, a committed update, and zero evidence is
+                        // the #4681 shape, and a debug-build trace is better
+                        // than nothing while the window stays unreachable.
+                        tracing::debug!(
+                            %instance_id,
+                            "send_update_notification: subscriber registered concurrently with \
+                             the stale-entry cleanup; this update was not delivered to it, the \
+                             next one will be"
+                        );
+                    }
+                    return Ok(());
+                }
+                Some(notifiers) => notifiers,
+            };
 
             let summaries_snapshot: HashMap<ClientId, Option<StateSummary<'static>>> =
                 shared_summaries
@@ -2541,11 +2646,39 @@ where
                 if let Some(mut notifiers) = shared_notifications.get_mut(&instance_id) {
                     notifiers.retain(|(c, _)| !failures.contains(c));
                 }
-
                 if let Some(mut contract_summaries) = shared_summaries.get_mut(&instance_id) {
                     for failed_client in &failures {
                         contract_summaries.remove(failed_client);
                     }
+                }
+                // Drop the entry AS it empties rather than leaving `Some([])`
+                // behind (#5040). The stale empty entry was otherwise pruned
+                // only opportunistically (by the next `RuntimePool::
+                // remove_client` from any client), so until then every
+                // committed update re-warned on it and it inflated the
+                // `registered_contracts` count in that warning. The loss
+                // itself is already reported above, one ERROR per closed
+                // channel. Separate statement so the `get_mut` guards above are
+                // released before `remove_if` takes the same shard lock.
+                //
+                // Same gating as the check-site arm: the summaries sibling is
+                // dropped only when the notifications removal actually happened,
+                // and then unconditionally (any summary under a channel-less key
+                // is dead).
+                //
+                // The gate covers a registration whose notifications-insert
+                // lands BEFORE the `remove_if`. It does NOT cover one landing
+                // entirely between the successful `remove_if` and the
+                // `shared_summaries.remove` below — registration writes the two
+                // maps in that order, so such a client ends up with a live
+                // channel and no summary. That degrades to a full-state send
+                // instead of a delta, never a fault, and it is unreachable
+                // while both paths run on the serial contract loop.
+                if shared_notifications
+                    .remove_if(&instance_id, |_, notifiers| notifiers.is_empty())
+                    .is_some()
+                {
+                    shared_summaries.remove(&instance_id);
                 }
 
                 // Decrement per-client subscription counters for failed clients
@@ -2646,6 +2779,17 @@ where
 
             if !failures.is_empty() {
                 notifiers.retain(|(c, _)| !failures.contains(c));
+                // Prune the dead clients' summaries too, mirroring the shared
+                // arm. Without this the local path leaked one summary per lost
+                // subscriber until that client's `remove_client` ran (#5040
+                // review): the shared arm did it, the local arm did not, while
+                // the comments claimed the two mirrored each other.
+                for failed_client in &failures {
+                    summaries.remove(failed_client);
+                }
+                // Defer the map-level removal: `notifiers` and `summaries` are
+                // live `&mut` borrows here. See the flag's declaration.
+                local_entry_became_empty = notifiers.is_empty();
                 // Decrement per-client subscription counters for failed clients
                 for failed_client in &failures {
                     if let Some(count) = self.client_subscription_counts.get_mut(failed_client) {
@@ -2657,17 +2801,54 @@ where
                 }
             }
         } else {
-            // #4681: mirror the shared-storage observability for the local
-            // (non-pool) executor — a committed update with no LIVE subscriber
-            // for this contract (no map entry at all, OR an empty subscriber vec
-            // left behind by the channel-closed cleanup above) must not vanish
-            // silently.
-            tracing::warn!(
-                %instance_id,
-                registered_contracts = self.update_notifications.len(),
-                "send_update_notification: no subscriber snapshot for contract \
-                 (local storage); update notification not delivered"
-            );
+            // #4681, re-scoped by #5040: mirror the shared-storage branch's
+            // absent-vs-empty split (see the rationale there). Reached when the
+            // entry is absent (no local subscriber — the ordinary case, and not
+            // a drop) OR present-but-empty (a subscriber was lost, already
+            // reported per-client as an ERROR above). The emptied entry and its
+            // summaries sibling are removed together — the fan-out arm above
+            // indexes `subscriber_summaries` on the strength of
+            // `update_notifications` having an entry, so the two must stay
+            // paired.
+            let lost_subscriber_entry = self
+                .update_notifications
+                .get(&instance_id)
+                .is_some_and(|notifiers| notifiers.is_empty());
+            if lost_subscriber_entry {
+                // Captured BEFORE the removal, matching the shared arm — both
+                // branches must report the same thing under the same field name
+                // (the count at the moment of observation, INCLUDING the entry
+                // being dropped).
+                let registered_contracts = self.update_notifications.len();
+                self.update_notifications.remove(&instance_id);
+                self.subscriber_summaries.remove(&instance_id);
+                tracing::warn!(
+                    %instance_id,
+                    registered_contracts,
+                    "send_update_notification: no subscriber snapshot for contract \
+                     (local storage); update notification not delivered"
+                );
+            } else {
+                tracing::debug!(
+                    %instance_id,
+                    registered_contracts = self.update_notifications.len(),
+                    "send_update_notification: no local subscriber for contract \
+                     (local storage); nothing to deliver locally"
+                );
+            }
+        }
+
+        // Deferred local-arm cleanup (see the flag's declaration): drop the
+        // entry AS it empties, so no later update finds a stale empty vec to
+        // warn about. This is the local counterpart of the shared arm's
+        // in-place removal; without it the local path relied entirely on the
+        // check-site backstop and warned once more than the shared path for the
+        // identical sequence (#5040 review). Both maps go together — the local
+        // fan-out arm indexes `subscriber_summaries` on the strength of
+        // `update_notifications` having an entry.
+        if local_entry_became_empty {
+            self.update_notifications.remove(&instance_id);
+            self.subscriber_summaries.remove(&instance_id);
         }
         Ok(())
     }

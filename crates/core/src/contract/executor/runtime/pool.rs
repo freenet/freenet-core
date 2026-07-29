@@ -1060,23 +1060,35 @@ impl ContractExecutor for RuntimePool {
         // when the subscription is registered or when updates arrive.
         let owned_summary = summary.map(StateSummary::into_owned);
 
-        // Check if this client is already registered for this contract
-        let already_registered = self
-            .shared_notifications
-            .get(&instance_id)
-            .and_then(|channels| {
-                channels
-                    .binary_search_by_key(&&cli_id, |(p, _)| p)
-                    .ok()
-                    .map(|i| (i, channels[i].1.same_channel(&notification_ch)))
-            });
+        // Check if this client is already registered for this contract, and if
+        // so refresh its channel — all under ONE write guard.
+        //
+        // This used to compute the index under a read guard, release it, then
+        // re-acquire `get_mut` and write `channels[idx]`. That is a TOCTOU: the
+        // entry can change between the two acquisitions. It was masked by the
+        // serial `contract_handling` loop, but the maps are typed
+        // `Arc<DashMap>` and the failure modes are bad in both directions —
+        // before #5040 a shrunk vec meant `channels[idx]` panicked on an
+        // out-of-bounds index; once #5040 made the executor DROP an emptied
+        // entry, the re-acquired `get_mut` would instead return `None`, the
+        // update would be silently skipped, and the client would get a
+        // successful subscribe that never delivers. Doing the search and the
+        // write under a single guard removes the window entirely rather than
+        // trading one failure mode for a quieter one.
+        let already_registered =
+            self.shared_notifications
+                .get_mut(&instance_id)
+                .and_then(|mut channels| {
+                    let idx = channels.binary_search_by_key(&&cli_id, |(p, _)| p).ok()?;
+                    let same_channel = channels[idx].1.same_channel(&notification_ch);
+                    if !same_channel {
+                        channels[idx] = (cli_id, notification_ch.clone());
+                    }
+                    Some(same_channel)
+                });
 
-        if let Some((idx, same_channel)) = already_registered {
+        if let Some(same_channel) = already_registered {
             if !same_channel {
-                // Client reconnected with new channel, update it.
-                if let Some(mut channels) = self.shared_notifications.get_mut(&instance_id) {
-                    channels[idx] = (cli_id, notification_ch);
-                }
                 tracing::debug!(
                     client = %cli_id,
                     contract = %instance_id,
