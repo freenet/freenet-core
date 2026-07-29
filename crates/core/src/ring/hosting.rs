@@ -7276,32 +7276,68 @@ mod tests {
     /// Swept across the whole shape of the clamp (below MIN, in the linear
     /// region, and at the cap) so the property is checked where the clamp could
     /// otherwise hide an inversion.
+    ///
+    /// The extra bytes are supplied through a REAL database file rather than by
+    /// inflating the seeded row total, because the mutation this has to catch is
+    /// a recompute that treats the newly-visible non-state footprint as a charge
+    /// against the budget (`disk_budget − non_state`) instead of as part of its
+    /// basis. Driving `used` purely through state rows leaves `non_state == 0`
+    /// and the test passes under that mutation — verified, and the reason the
+    /// fixture looks like this.
     #[test]
     fn effective_budget_never_falls_as_measured_usage_rises() {
         const MIB: u64 = 1024 * 1024;
         const GIB: u64 = 1024 * 1024 * 1024;
+        // A fixed, small live-row total under every database size below, so the
+        // growth is entirely in the dead space #5007 made visible.
+        const STATE_ROWS: u64 = 16 * MIB;
 
         for available in [0, 64 * MIB, 2 * GIB, 100 * GIB] {
             for ram in [64 * MIB, GIB, 8 * GIB] {
-                let mut previous: Option<u64> = None;
-                // Ascending measured usage: what #5007 does is move a node from
-                // an early entry in this list to a later one.
-                for used in [0, 128 * MIB, 583 * MIB, 2680 * MIB, 32 * GIB] {
-                    let manager = HostingManager::new(ram);
-                    manager.configure_disk_budget(0.5, DEFAULT_MAX_HOSTING_DISK_BYTES);
-                    manager.seed_disk_tracker_for_test([(make_contract_key(1), used)]);
-                    let eff = manager
-                        .recompute_effective_budget(available)
-                        .expect("seeded → recompute runs");
-                    if let Some(prev) = previous {
-                        assert!(
-                            eff >= prev,
-                            "effective budget fell from {prev} to {eff} when measured \
-                             usage rose to {used} (ram={ram}, available={available}); \
-                             honest accounting must never tighten the eviction floor"
-                        );
+                for cap in [256 * MIB, DEFAULT_MAX_HOSTING_DISK_BYTES] {
+                    let mut previous: Option<u64> = None;
+                    // Ascending measured footprint. #5007 moves a real node from
+                    // an early entry in this list to a later one WITHOUT its live
+                    // state changing: 583 MB of rows in a 2.68 GB file was the
+                    // production measurement.
+                    for db_bytes in [0, 128 * MIB, 583 * MIB, 2680 * MIB, 40 * GIB] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let db = dir.path().join("db");
+                        std::fs::create_dir_all(&db).unwrap();
+                        // Sparse: `set_len` gives the file the length the walk
+                        // measures without allocating blocks for it.
+                        std::fs::File::create(db.join("db"))
+                            .unwrap()
+                            .set_len(db_bytes)
+                            .unwrap();
+
+                        let manager = HostingManager::new(ram);
+                        manager.configure_disk_budget(0.5, cap);
+                        manager.configure_disk_tracker(HostingDiskPaths {
+                            contracts_dir: std::path::PathBuf::from("/nonexistent/contracts"),
+                            wasmtime_cache_dir: std::path::PathBuf::from("/nonexistent/cache"),
+                            db_dir: db,
+                            webapp_cache_dir: std::path::PathBuf::from("/nonexistent/webapp"),
+                        });
+                        manager.seed_configured_disk_tracker_for_test([(
+                            make_contract_key(1),
+                            STATE_ROWS,
+                        )]);
+
+                        let eff = manager
+                            .recompute_effective_budget(available)
+                            .expect("seeded → recompute runs");
+                        if let Some(prev) = previous {
+                            assert!(
+                                eff >= prev,
+                                "effective budget fell from {prev} to {eff} when the \
+                                 measured database grew to {db_bytes} (ram={ram}, \
+                                 available={available}, cap={cap}); honest accounting \
+                                 must never tighten the eviction floor"
+                            );
+                        }
+                        previous = Some(eff);
                     }
-                    previous = Some(eff);
                 }
             }
         }
