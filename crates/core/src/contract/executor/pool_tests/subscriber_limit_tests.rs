@@ -323,17 +323,23 @@ fn install_log_capture() -> (
     (messages, guard)
 }
 
-/// Regression for #4681 (partial hardening): a committed state install for a
-/// contract that has NO subscriber snapshot must emit an observable WARN
-/// (carrying the contract `instance_id`) instead of returning silently. The
-/// silent early-return was the observability gap that let a cross-node
-/// subscriber miss a committed `UpdateNotification` with nothing logged.
+/// Re-scope of #4681 by #5040: an ABSENT subscriber entry must NOT warn.
+///
+/// #4773 deliberately treated "missing" and "empty" snapshots uniformly and
+/// warned on both. In production the missing case is the ordinary steady state
+/// for any contract a node hosts for the NETWORK with no local client attached
+/// (the network mesh is fed by `broadcast_state_change`, not by this local
+/// fan-out), so nothing is undelivered. Warning on it produced 22,413 lines in
+/// one day on a single node — 96.6% of them for one zero-subscriber contract —
+/// which buried the empty-entry case that #4681 actually exists to surface.
+/// PR #4773's own reviewer note predicted this ("a follow-up could rate-limit
+/// it if it proves noisy").
 ///
 /// The mock executor has no shared storage, so this exercises the LOCAL-storage
 /// (`else`) branch — see the `_shared_*` tests below for the shared branch.
 #[cfg(feature = "trace")]
 #[tokio::test(flavor = "current_thread")]
-async fn send_update_notification_without_subscribers_emits_warn() {
+async fn send_update_notification_absent_local_snapshot_does_not_warn() {
     let mut executor = create_executor().await;
     let contract = test_contract(b"warn_no_subscribers_4681");
     let key = contract.key();
@@ -358,11 +364,19 @@ async fn send_update_notification_without_subscribers_emits_warn() {
     let logs = messages.lock().unwrap();
     let id_str = instance_id.to_string();
     assert!(
-        logs.iter().any(|l| l.starts_with("WARN")
-            && l.contains("no subscriber snapshot")
+        !logs
+            .iter()
+            .any(|l| l.starts_with("WARN") && l.contains("no subscriber snapshot")),
+        "an ABSENT local snapshot must not WARN (nothing is owed locally); \
+         captured: {logs:?}"
+    );
+    // The condition is still observable, just at DEBUG.
+    assert!(
+        logs.iter().any(|l| l.starts_with("DEBUG")
+            && l.contains("no local subscriber")
             && l.contains("local storage")
             && l.contains(&id_str)),
-        "expected a local-storage WARN naming instance_id {id_str}; captured: {logs:?}"
+        "expected a local-storage DEBUG naming instance_id {id_str}; captured: {logs:?}"
     );
 }
 
@@ -420,12 +434,14 @@ async fn send_update_notification_empty_local_snapshot_emits_warn() {
     );
 }
 
-/// Regression for #4681: the SHARED-storage branch — the exact path the issue
-/// cites (`shared_notifications.get(&instance_id) == None`). A committed update
-/// with no shared subscriber entry must emit a shared-storage WARN.
+/// Re-scope of #4681 by #5040, SHARED-storage branch: an ABSENT shared
+/// subscriber entry must NOT warn. This is the exact production path that
+/// produced the 22k/day storm (`shared_notifications.get(&instance_id) ==
+/// None` for a network-hosted contract with no local client). See the
+/// local-storage sibling above for the full rationale.
 #[cfg(feature = "trace")]
 #[tokio::test(flavor = "current_thread")]
-async fn send_update_notification_missing_shared_snapshot_emits_warn() {
+async fn send_update_notification_absent_shared_snapshot_does_not_warn() {
     let mut executor = create_executor().await;
     // Attach empty shared storage so `send_update_notification` takes the
     // shared branch instead of the local one.
@@ -456,11 +472,18 @@ async fn send_update_notification_missing_shared_snapshot_emits_warn() {
     let logs = messages.lock().unwrap();
     let id_str = instance_id.to_string();
     assert!(
-        logs.iter().any(|l| l.starts_with("WARN")
-            && l.contains("no subscriber snapshot")
+        !logs
+            .iter()
+            .any(|l| l.starts_with("WARN") && l.contains("no subscriber snapshot")),
+        "an ABSENT shared snapshot must not WARN (nothing is owed locally); \
+         captured: {logs:?}"
+    );
+    assert!(
+        logs.iter().any(|l| l.starts_with("DEBUG")
+            && l.contains("no local subscriber")
             && l.contains("shared storage")
             && l.contains(&id_str)),
-        "expected a shared-storage WARN naming instance_id {id_str}; captured: {logs:?}"
+        "expected a shared-storage DEBUG naming instance_id {id_str}; captured: {logs:?}"
     );
 }
 
@@ -509,5 +532,78 @@ async fn send_update_notification_empty_shared_snapshot_emits_warn() {
             && l.contains(&id_str)),
         "an empty (present) shared snapshot must still WARN naming instance_id \
          {id_str}; captured: {logs:?}"
+    );
+}
+
+/// Regression for #5040 — the storm itself, and the assertion that actually
+/// fails without the fix.
+///
+/// The empty-but-present entry was pruned only opportunistically (by the next
+/// `RuntimePool::remove_client` from ANY client), so until that happened EVERY
+/// committed update on the contract re-emitted the WARN. On a contract taking
+/// sustained update traffic with no local subscriber that is unbounded: the
+/// reporting node logged 22,413 lines in a day, 96.6% for one contract.
+///
+/// The loss is worth exactly one line — it is already reported per-client as an
+/// ERROR at the point of loss — so the entry is dropped when it goes empty and
+/// every subsequent update reads as ABSENT (DEBUG). Two committed updates must
+/// therefore produce ONE WARN, not two.
+#[cfg(feature = "trace")]
+#[tokio::test(flavor = "current_thread")]
+async fn empty_shared_snapshot_warns_once_not_on_every_update() {
+    let mut executor = create_executor().await;
+    let shared_notifications = std::sync::Arc::new(dashmap::DashMap::new());
+    let shared_summaries = std::sync::Arc::new(dashmap::DashMap::new());
+    executor.set_shared_notifications(
+        shared_notifications.clone(),
+        shared_summaries.clone(),
+        std::sync::Arc::new(dashmap::DashMap::new()),
+    );
+
+    let contract = test_contract(b"warn_once_5040");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    // Post-`retain` state: entry present, subscriber vec emptied in place.
+    shared_notifications.insert(instance_id, Vec::new());
+    shared_summaries.insert(instance_id, std::collections::HashMap::new());
+
+    let (messages, guard) = install_log_capture();
+
+    // Two committed updates over the same empty entry.
+    for state in [vec![1u8, 1, 1], vec![2u8, 2, 2]] {
+        executor
+            .upsert_contract_state(
+                key,
+                either::Either::Left(WrappedState::new(state)),
+                RelatedContracts::default(),
+                Some(contract.clone()),
+            )
+            .await
+            .expect("store contract");
+    }
+
+    drop(guard);
+
+    let logs = messages.lock().unwrap();
+    let warns = logs
+        .iter()
+        .filter(|l| l.starts_with("WARN") && l.contains("no subscriber snapshot"))
+        .count();
+    assert_eq!(
+        warns, 1,
+        "an emptied subscriber entry must WARN exactly once, not once per \
+         committed update (#5040); captured: {logs:?}"
+    );
+
+    // The entry (and its summaries sibling) is gone, so the next update reads
+    // as ABSENT rather than re-warning — this is what bounds the storm.
+    assert!(
+        !shared_notifications.contains_key(&instance_id),
+        "the emptied subscriber entry must be removed once observed"
+    );
+    assert!(
+        !shared_summaries.contains_key(&instance_id),
+        "the emptied summaries sibling must be removed alongside it"
     );
 }

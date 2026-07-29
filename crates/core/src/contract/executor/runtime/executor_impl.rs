@@ -2440,22 +2440,60 @@ where
                     .get(&instance_id)
                     .map_or_else(Vec::new, |notifiers| notifiers.value().clone());
 
-            // #4681: a committed update found no LIVE subscriber for this
-            // contract — either no map entry at all, OR an empty subscriber vec
-            // left behind by the channel-closed cleanup below (`retain` removes
-            // the last dead subscriber but leaves the emptied entry in the map,
-            // so the next committed update snapshots `Some([])`). Both cases are
-            // fully silent drops for a contract that may have had a registered
-            // subscriber, so surface them with a WARN (instance + total
-            // registered-contract count) instead of returning silently — a
-            // notification dropped for a registered subscriber is never invisible.
+            // #4681, re-scoped by #5040: an empty snapshot is TWO distinct
+            // states, and only one of them is an anomaly.
+            //
+            // * ABSENT entry — no local client is subscribed: either none ever
+            //   was, or the last one disconnected cleanly (`RuntimePool::
+            //   remove_client` drops the entry outright). This is the NORMAL
+            //   steady state for a contract this node hosts for the NETWORK:
+            //   the network mesh is fed by `broadcast_state_change`, not by
+            //   this local fan-out, so nothing is undelivered and nothing is
+            //   lost. Warning per occurrence made a routine fact read as a
+            //   dropped notification and buried the real signal below — one
+            //   production node logged 22,413 of these in a single day, 96.6%
+            //   of them for one zero-subscriber contract (#5040). PR #4773's
+            //   own reviewer note predicted exactly this ("fires on the commit
+            //   path for contracts with zero local subscribers (common on
+            //   relays/gateways) ... a follow-up could rate-limit it if it
+            //   proves noisy").
+            //
+            // * PRESENT but EMPTY — a subscriber's channel closed without a
+            //   Disconnect reaching the handler, so the failure `retain` below
+            //   emptied the vec in place. That loss is already reported at the
+            //   point of loss (one ERROR per closed channel, naming the client),
+            //   so this is a backstop: it is reported ONCE and the stale entry
+            //   (with its already-emptied summaries sibling) is dropped, rather
+            //   than re-warning on every committed update forever. The `retain`
+            //   below now also removes the entry as it empties, which is the
+            //   real source fix; this arm catches anything that still slips
+            //   through. Both adopt the "drop the entry when it goes empty"
+            //   convention the interest/subscriber maps already use
+            //   (`interest.rs`, `hosting.rs`: `remove_if(.., |_, v| v.is_empty())`).
+            //
+            // `remove_if` re-checks emptiness under the map lock, so a
+            // subscriber registering between the snapshot above and this call is
+            // never removed.
             if notifiers_snapshot.is_empty() {
-                tracing::warn!(
-                    %instance_id,
-                    registered_contracts = shared_notifications.len(),
-                    "send_update_notification: no subscriber snapshot for contract \
-                     (shared storage); update notification not delivered"
-                );
+                let lost_subscriber_entry = shared_notifications
+                    .remove_if(&instance_id, |_, notifiers| notifiers.is_empty())
+                    .is_some();
+                if lost_subscriber_entry {
+                    shared_summaries.remove_if(&instance_id, |_, s| s.is_empty());
+                    tracing::warn!(
+                        %instance_id,
+                        registered_contracts = shared_notifications.len(),
+                        "send_update_notification: no subscriber snapshot for contract \
+                         (shared storage); update notification not delivered"
+                    );
+                } else {
+                    tracing::debug!(
+                        %instance_id,
+                        registered_contracts = shared_notifications.len(),
+                        "send_update_notification: no local subscriber for contract \
+                         (shared storage); nothing to deliver locally"
+                    );
+                }
                 return Ok(());
             }
 
@@ -2541,12 +2579,23 @@ where
                 if let Some(mut notifiers) = shared_notifications.get_mut(&instance_id) {
                     notifiers.retain(|(c, _)| !failures.contains(c));
                 }
+                // Drop the entry AS it empties rather than leaving `Some([])`
+                // behind (#5040). The stale empty entry was otherwise pruned
+                // only opportunistically (by the next `RuntimePool::
+                // remove_client` from any client), so until then every
+                // committed update re-warned on it and it inflated the
+                // `registered_contracts` count in that warning. The loss
+                // itself is already reported above, one ERROR per closed
+                // channel. Separate statement so the `get_mut` guard is
+                // released before `remove_if` takes the same shard lock.
+                shared_notifications.remove_if(&instance_id, |_, n| n.is_empty());
 
                 if let Some(mut contract_summaries) = shared_summaries.get_mut(&instance_id) {
                     for failed_client in &failures {
                         contract_summaries.remove(failed_client);
                     }
                 }
+                shared_summaries.remove_if(&instance_id, |_, s| s.is_empty());
 
                 // Decrement per-client subscription counters for failed clients
                 if let Some(shared_client_counts) = &self.shared_client_counts {
@@ -2657,17 +2706,36 @@ where
                 }
             }
         } else {
-            // #4681: mirror the shared-storage observability for the local
-            // (non-pool) executor — a committed update with no LIVE subscriber
-            // for this contract (no map entry at all, OR an empty subscriber vec
-            // left behind by the channel-closed cleanup above) must not vanish
-            // silently.
-            tracing::warn!(
-                %instance_id,
-                registered_contracts = self.update_notifications.len(),
-                "send_update_notification: no subscriber snapshot for contract \
-                 (local storage); update notification not delivered"
-            );
+            // #4681, re-scoped by #5040: mirror the shared-storage branch's
+            // absent-vs-empty split (see the rationale there). Reached when the
+            // entry is absent (no local subscriber — the ordinary case, and not
+            // a drop) OR present-but-empty (a subscriber was lost, already
+            // reported per-client as an ERROR above). The emptied entry and its
+            // summaries sibling are removed together — the fan-out arm above
+            // indexes `subscriber_summaries` on the strength of
+            // `update_notifications` having an entry, so the two must stay
+            // paired.
+            let lost_subscriber_entry = self
+                .update_notifications
+                .get(&instance_id)
+                .is_some_and(|notifiers| notifiers.is_empty());
+            if lost_subscriber_entry {
+                self.update_notifications.remove(&instance_id);
+                self.subscriber_summaries.remove(&instance_id);
+                tracing::warn!(
+                    %instance_id,
+                    registered_contracts = self.update_notifications.len(),
+                    "send_update_notification: no subscriber snapshot for contract \
+                     (local storage); update notification not delivered"
+                );
+            } else {
+                tracing::debug!(
+                    %instance_id,
+                    registered_contracts = self.update_notifications.len(),
+                    "send_update_notification: no local subscriber for contract \
+                     (local storage); nothing to deliver locally"
+                );
+            }
         }
         Ok(())
     }
