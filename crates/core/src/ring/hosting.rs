@@ -7502,4 +7502,66 @@ mod tests {
             "growth over budget must still reject"
         );
     }
+
+    /// The one residual hole in the #5014 bound has to be VISIBLE (F1): the
+    /// compile cache's soft limit is fixed for the process, so an external
+    /// consumer filling the data mount drives the live budget below it and the
+    /// wedge returns with no in-process recovery. Nothing else reports that —
+    /// the operator sees only rejected PUTs.
+    ///
+    /// Asserts the latch transitions rather than captured log lines (subscriber-
+    /// capture tests are flaky here): the latch IS the emit decision, since the
+    /// helper returns early exactly when it does not change.
+    #[test]
+    fn compile_cache_over_share_warning_is_edge_triggered() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let armed = || {
+            manager
+                .compile_cache_over_share_warned
+                .load(Ordering::Relaxed)
+        };
+
+        // Well under its share: nothing to report.
+        manager.warn_if_compile_cache_over_share(10, 1000);
+        assert!(!armed());
+        // Exactly its share is NOT over — the sizing rule caps AT a quarter.
+        manager.warn_if_compile_cache_over_share(250, 1000);
+        assert!(!armed(), "the boundary must not warn");
+        // Crossing up reports once...
+        manager.warn_if_compile_cache_over_share(300, 1000);
+        assert!(armed());
+        // ...and a node parked in this state must not warn every 60s.
+        manager.warn_if_compile_cache_over_share(400, 1000);
+        assert!(armed());
+        // Recovery re-arms, so a flapping mount reports each crossing rather
+        // than only the first.
+        manager.warn_if_compile_cache_over_share(200, 1000);
+        assert!(!armed());
+
+        // The threshold must be the SIZING rule's own divisor, not a second,
+        // drifting notion of "its share": at 1000 the boundary sits at 250, so a
+        // divisor of 2 would stay quiet here and a divisor of 8 would warn.
+        assert_eq!(crate::wasm_runtime::WASMTIME_CACHE_DISK_BUDGET_DIVISOR, 4);
+    }
+
+    /// Pin: the 60s recompute must actually CALL the over-share check. The check
+    /// is the only surfacing of the residual hole above, and dropping the call is
+    /// invisible to every test of the helper itself.
+    #[test]
+    fn recompute_effective_budget_runs_the_over_share_check() {
+        let src = include_str!("hosting.rs");
+        let body = src
+            .split_once("pub(crate) fn recompute_effective_budget(")
+            .expect("recompute_effective_budget must exist")
+            .1
+            .split_once("\n    /// Surface the one residual hole")
+            .expect("end marker of recompute_effective_budget must exist")
+            .0;
+        assert!(
+            body.contains(concat!("self.warn_if_compile_", "cache_over_share(")),
+            "recompute_effective_budget must run the over-share check — it is the \
+             only signal that the compile cache's fixed soft limit no longer fits \
+             the live budget (#5014)"
+        );
+    }
 }
