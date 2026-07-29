@@ -37,6 +37,11 @@ use crate::{
 
 pub use app_packaging::WebApp;
 
+/// Startup reclaim of the unpacked-webapp cache (#5035). Public because the
+/// node binary is its only caller — see the rustdoc on the function for why it
+/// is wired there and not into the serve path.
+pub use path_handlers::{WebappCacheStartupSweep, reclaim_webapp_cache_at_startup};
+
 // Export types needed for integration testing
 pub use client_api::{OriginContract, OriginContractMap};
 

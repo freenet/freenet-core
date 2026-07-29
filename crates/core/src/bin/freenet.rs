@@ -170,6 +170,21 @@ async fn run(config: Config) -> anyhow::Result<()> {
         "Freenet node starting"
     );
 
+    // Reclaim the unpacked-webapp cache before this node serves anything
+    // (#5035). #5012 bounded that cache at 64 MiB but wired enforcement only to
+    // the web handlers, so a node that serves no webapp requests — a gateway,
+    // normally — never enforced the bound and kept its whole legacy cache (1236
+    // MiB measured) forever. This is the missing trigger.
+    //
+    // It lives HERE, in the binary, rather than beside the cache in
+    // `serve_client_api_in_impl`, because a dozen in-process integration tests
+    // call that with `webapp_cache_dir` resolved to the developer's REAL
+    // `~/.cache/freenet/webapp_cache`; sweeping there would make `cargo test`
+    // evict it, the exact regression #5012 fixed twice. See the rustdoc on
+    // `reclaim_webapp_cache_at_startup`. Runs for both modes: `freenet local`
+    // shares the same per-user cache directory.
+    freenet::server::reclaim_webapp_cache_at_startup(config.ws_api.webapp_cache_dir.clone()).await;
+
     match config.mode {
         OperationMode::Local => run_local(config).await,
         OperationMode::Network => run_network(config).await,
@@ -1295,6 +1310,84 @@ fn main() {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::parse_listening_inode;
+
+    /// Production half of this file, comment-stripped and whitespace-collapsed,
+    /// for the source pins below.
+    ///
+    /// Cut at `mod tests {`, NOT at `#[cfg(test)]`, which also sits on
+    /// individual test-only items. Only lines whose TRIMMED prefix is `//` are
+    /// dropped, so a `//` inside a string literal (this file has URLs) cannot
+    /// truncate a real line of code — the #5026 item-2 trap. Whitespace is then
+    /// collapsed so rustfmt re-wrapping a call cannot rot a needle. The cut
+    /// needle is split so it cannot match its own source through `include_str!`.
+    fn production_source() -> String {
+        const FULL: &str = include_str!("freenet.rs");
+        let cutoff = FULL
+            .find(concat!("mod ", "tests {"))
+            .expect("freenet.rs must have a test module");
+        FULL[..cutoff]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// #5035: `run` must reclaim the webapp cache before it starts a node.
+    ///
+    /// This is a SOURCE pin because the call site cannot be reached from a
+    /// test: `run` starts a real node, and the reason the call lives in the
+    /// binary at all is that no in-process test may reach it (an in-process
+    /// caller resolves the developer's real `~/.cache/freenet/webapp_cache` and
+    /// would have `cargo test` evict it — see the rustdoc on
+    /// `reclaim_webapp_cache_at_startup`). The sweep's own behaviour is covered
+    /// by the `server::path_handlers` tests; what is unpinnable by behaviour,
+    /// and pinned here, is that `run` still calls it.
+    ///
+    /// Comments are stripped before scanning on purpose: the call site's own
+    /// comment names the function in prose, so an un-stripped scan would stay
+    /// green with the call deleted.
+    #[test]
+    fn run_reclaims_the_webapp_cache_before_starting_a_node() {
+        let src = production_source();
+        let sig = concat!("asyncfn", "run(config:Config)");
+        let start = src
+            .find(sig)
+            .expect("pin guard: `run` not found in the production slice");
+        let after = &src[start + sig.len()..];
+        let end = after
+            .find(concat!("asyncfn", "run_local("))
+            .expect("pin guard: `run_local` follows `run`; slice extraction is wrong");
+        let body = &after[..end];
+
+        // Vacuity guard: prove the slice is the real body of `run` rather than
+        // an empty or mis-sliced range, which would pass no matter what.
+        assert!(
+            body.contains(concat!("OperationMode::Local=>", "run_local(config)")),
+            "pin guard: the extracted slice is not `run`'s body, so this pin \
+             proves nothing. Slice:\n{body}"
+        );
+
+        let call = concat!(
+            "reclaim_webapp",
+            "_cache_at_startup(config.ws_api.webapp_cache_dir"
+        );
+        assert!(
+            body.contains(call),
+            "`run` must reclaim the webapp cache before starting a node (#5035). \
+             Without this call the 64 MiB bound from #5012 is enforced only by \
+             web requests, so a node that serves none — a gateway — never \
+             enforces it at all. Slice:\n{body}"
+        );
+        // Ordering: the sweep must precede the mode dispatch, so it completes
+        // before anything can serve from (or write to) the cache.
+        assert!(
+            body.find(call) < body.find("matchconfig.mode"),
+            "the reclaim must run BEFORE the mode dispatch starts a node. \
+             Slice:\n{body}"
+        );
+    }
 
     #[test]
     fn auto_update_default_stays_enabled_flag_and_dirty_disable() {
