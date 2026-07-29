@@ -36,6 +36,8 @@ use crate::node::OpManager;
 /// An append-only log for network events.
 mod aof;
 
+pub(crate) use aof::reclaim_orphaned_event_log;
+
 /// Event aggregation across multiple nodes for debugging and testing.
 pub mod event_aggregator;
 
