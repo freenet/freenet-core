@@ -62,8 +62,9 @@
 //!    version as on-probation ([`begin_probation`]).
 //! 2. **Commit**: once the new version has run healthily for
 //!    [`COMMIT_HEALTHY_UPTIME_SECS`] the node clears the probation marker
-//!    ([`commit_probation`]). After that, ordinary later crashes never trigger
-//!    a rollback.
+//!    ([`commit_probation`]) and reclaims the known-good snapshot
+//!    ([`discard_known_good_at`]). After that, ordinary later crashes never
+//!    trigger a rollback.
 //! 3. **Detect + revert**: a crash during probation increments the marker's
 //!    crash counter ([`handle_post_stop`]); on the
 //!    [`ROLLBACK_CRASH_THRESHOLD`]th crash the previous binary is restored
@@ -74,6 +75,30 @@
 //!    (`commands::auto_update`) so we never loop update -> crash -> revert ->
 //!    re-update. A later, strictly-newer release (a fix) is NOT pinned and is
 //!    applied normally.
+//!
+//! ## The known-good blob lives exactly as long as the marker
+//!
+//! The retained snapshot is an UNCOMPRESSED copy of the executable (~58 MB
+//! measured on a real peer), and it is reachable ONLY through a probation
+//! marker: [`handle_post_stop_at`] returns [`PostStopOutcome::Proceed`] before
+//! looking at it when [`read_probation_at`] is `None`, and
+//! [`prepare_known_good_for_install_at`] re-captures fresh from the live binary
+//! rather than reading it in that case. Keeping it past the commit therefore
+//! bought nothing — it was dead weight for the days-to-weeks until the next
+//! update — so the commit reclaims it.
+//!
+//! The tradeoff this accepts: once probation has committed, a node that
+//! degrades LATER has no local binary to revert to and recovers by
+//! re-installing from GitHub. That is the same position as a node whose
+//! known-good capture failed (already a supported, non-fatal state — see
+//! `commands::update`), and the crash-loop class this module exists for (a bad
+//! release that wedges at boot) is unaffected, because it fires inside the
+//! probation window while the blob is still present.
+//!
+//! Not compression: adding a decode step to the one path whose failure bricks a
+//! node would weaken the integrity guarantee (the recorded SHA would cover the
+//! stored bytes, not the installed ones) for a saving that deleting the file
+//! beats outright.
 //!
 //! ## Bounded by construction (no new flap/loop)
 //!
@@ -173,6 +198,10 @@ const PROBATION_FILE: &str = "update_probation.json";
 const KNOWN_BAD_FILE: &str = "known_bad_version";
 
 /// Snapshot of the previous, known-good binary kept as the rollback target.
+///
+/// Captured by [`capture_known_good_at`] just before an install and reclaimed by
+/// [`discard_known_good_at`] when the probation marker that made it reachable is
+/// retired — its lifetime is exactly the marker's.
 const KNOWN_GOOD_BINARY_FILE: &str = "known_good_binary";
 
 /// Persisted post-update probation record.
@@ -406,6 +435,80 @@ pub(crate) fn prepare_known_good_for_install_at(
     Ok((meta, current_version.to_string()))
 }
 
+// ── Known-good reclamation ─────────────────────────────────────────────────
+
+/// Reclaim the retained known-good snapshot once the marker that made it
+/// reachable has been removed (see the module docs: the blob's lifetime is
+/// exactly the marker's, and it is ~58 MB).
+///
+/// `expected` is the integrity metadata recorded in the marker being retired.
+///
+/// This is brick-recovery state, so it only ever unlinks a file it can
+/// positively identify as the now-dead rollback target:
+///
+/// * It re-reads the marker and does NOTHING if one is present. That makes the
+///   "remove the marker FIRST, then reclaim the blob" ordering structural
+///   rather than merely documented: a caller that reclaims while still armed
+///   gets a no-op instead of an armed marker pointing at a deleted binary. It
+///   also declines when a concurrent `freenet update` has already armed the
+///   NEXT probation over this blob.
+/// * It hashes the candidate and deletes it only when size AND SHA-256 match
+///   `expected`, so a snapshot a concurrent install captured for a different
+///   generation is left alone.
+/// * It only ever considers `dir/known_good_binary`, never the
+///   `rollback_binary` path carried in the marker JSON, so a corrupt or
+///   tampered marker cannot make us unlink an arbitrary file.
+///
+/// Best-effort by construction: it returns `()`, and every failure is logged
+/// and swallowed. Reclaiming disk must never fail a probation commit or an
+/// update — a blob we fail to delete is simply overwritten by the next
+/// install's capture, which is exactly the pre-existing steady state.
+fn discard_known_good_at(dir: &Path, expected: &KnownGoodMeta) {
+    if read_probation_at(dir).is_some() {
+        // Still armed (or re-armed by a concurrent install): the blob may be a
+        // live rollback target, so leave it. Never delete while armed.
+        return;
+    }
+    let blob = dir.join(KNOWN_GOOD_BINARY_FILE);
+    if !blob.exists() {
+        return;
+    }
+    match sha256_file(&blob) {
+        Ok((size, sha256)) if size == expected.size && sha256 == expected.sha256 => {
+            match std::fs::remove_file(&blob) {
+                Ok(()) => {
+                    fsync_dir(dir);
+                    tracing::info!(
+                        bytes = size,
+                        path = %blob.display(),
+                        "Reclaimed the retained known-good rollback binary (probation is over, \
+                         nothing can read it)."
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    path = %blob.display(),
+                    "Could not reclaim the retained known-good rollback binary; it is dead \
+                     weight until the next update's capture overwrites it."
+                ),
+            }
+        }
+        Ok((size, _sha256)) => tracing::debug!(
+            size,
+            expected_size = expected.size,
+            path = %blob.display(),
+            "Retained binary is not the rollback target being retired (a concurrent install \
+             most likely re-captured it); leaving it in place."
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            path = %blob.display(),
+            "Could not verify the retained known-good binary before reclaiming it; leaving it \
+             in place."
+        ),
+    }
+}
+
 /// Begin (or refresh) probation for `new_version`, just installed over the live
 /// binary at `target_binary`. `previous_version` and `meta` are the label and
 /// integrity metadata of the rollback target, computed together by
@@ -517,18 +620,43 @@ pub(crate) enum CommitOutcome {
 pub(crate) fn commit_probation_at(dir: &Path, current_version: &str) -> CommitOutcome {
     match read_probation_at(dir) {
         Some(state) if state.new_version == current_version => {
+            // Ordering is load-bearing and fail-safe in this direction only:
+            // drop the marker FIRST, then reclaim the blob it pointed at. A
+            // crash in between leaves an orphaned blob that the next install's
+            // capture overwrites (today's steady state, harmless); the reverse
+            // order would leave an ARMED marker advertising a rollback target
+            // that no longer exists. `discard_known_good_at` re-checks the
+            // marker, so the safe order is enforced, not just documented.
             remove_probation_at(dir);
+            discard_known_good_at(dir, &retired_meta(&state));
             CommitOutcome::Committed
         }
         Some(state) => {
             // Running a different version healthily than the marker describes:
-            // the marker can no longer protect anything, so drop it.
+            // the marker can no longer protect anything, so drop it (and the
+            // blob it was the only reader of). Same ordering rationale as above.
             remove_probation_at(dir);
+            discard_known_good_at(dir, &retired_meta(&state));
             CommitOutcome::ClearedStale {
                 marker_version: state.new_version,
             }
         }
-        None => CommitOutcome::Nothing,
+        None => {
+            // No marker means no blob we can positively identify as dead: an
+            // orphan (e.g. left by a post-stop path that removed the marker
+            // itself) is left for the next install's capture to overwrite
+            // rather than deleted on a guess.
+            CommitOutcome::Nothing
+        }
+    }
+}
+
+/// Integrity metadata of the rollback blob described by a marker we are
+/// retiring, used to identify the blob before reclaiming it.
+fn retired_meta(state: &ProbationState) -> KnownGoodMeta {
+    KnownGoodMeta {
+        size: state.rollback_size,
+        sha256: state.rollback_sha256.clone(),
     }
 }
 
@@ -1031,6 +1159,154 @@ mod tests {
         };
         assert_eq!(marker_version, "0.2.84");
         assert!(read_probation_at(dir).is_none());
+        // The stale marker was the blob's only reader, so it is reclaimed too.
+        assert!(!known_good_path(dir).exists());
+    }
+
+    #[test]
+    fn commit_reclaims_the_known_good_blob() {
+        // The ~58 MB snapshot is reachable ONLY through the probation marker,
+        // so committing (which removes the marker) must reclaim it instead of
+        // carrying it for the days-to-weeks until the next update.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        setup_probation(dir, "0.2.84", "0.2.83");
+        assert!(known_good_path(dir).exists(), "precondition: blob captured");
+
+        assert_eq!(commit_probation_at(dir, "0.2.84"), CommitOutcome::Committed);
+
+        assert!(read_probation_at(dir).is_none());
+        assert!(
+            !known_good_path(dir).exists(),
+            "known-good blob must be reclaimed once probation commits"
+        );
+    }
+
+    #[test]
+    fn commit_with_no_marker_leaves_an_unidentifiable_blob() {
+        // Without a marker we have no recorded size/SHA to identify the blob
+        // against, so `Nothing` must not delete on a guess. (Orphans are
+        // overwritten by the next install's capture.)
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let live = dir.join("freenet");
+        write_dummy_binary(&live, b"ORPHAN-BLOB");
+        capture_known_good_at(dir, &live).unwrap();
+
+        assert_eq!(commit_probation_at(dir, "0.2.84"), CommitOutcome::Nothing);
+
+        assert!(known_good_path(dir).exists());
+    }
+
+    #[test]
+    fn commit_leaves_a_blob_that_is_not_the_retired_rollback_target() {
+        // Race guard: a concurrent `freenet update` can capture a FRESH
+        // known-good over the same path between our marker read and our
+        // reclaim. That blob belongs to the next probation generation, so its
+        // content will not match the retired marker's meta and it must survive
+        // — deleting it would leave the next marker pointing at nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        setup_probation(dir, "0.2.84", "0.2.83");
+        // Stand in for the concurrent install's fresh capture.
+        std::fs::write(
+            known_good_path(dir),
+            b"FRESHLY-CAPTURED-BY-CONCURRENT-INSTALL",
+        )
+        .unwrap();
+
+        assert_eq!(commit_probation_at(dir, "0.2.84"), CommitOutcome::Committed);
+
+        assert_eq!(
+            std::fs::read(known_good_path(dir)).unwrap(),
+            b"FRESHLY-CAPTURED-BY-CONCURRENT-INSTALL"
+        );
+    }
+
+    #[test]
+    fn discard_known_good_refuses_while_a_probation_marker_exists() {
+        // The fail-safe ordering (remove the marker, THEN reclaim) is enforced
+        // by this guard, not merely documented: reclaiming while armed would
+        // leave a marker advertising a rollback target that no longer exists.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        setup_probation(dir, "0.2.84", "0.2.83");
+        let armed = read_probation_at(dir).expect("armed");
+
+        discard_known_good_at(dir, &retired_meta(&armed));
+
+        assert!(
+            known_good_path(dir).exists(),
+            "must never delete the rollback target while probation is armed"
+        );
+        // And the still-armed marker can still roll back.
+        for _ in 0..ROLLBACK_CRASH_THRESHOLD - 1 {
+            handle_post_stop_at(dir, "101", "0.2.84");
+        }
+        assert!(matches!(
+            handle_post_stop_at(dir, "101", "0.2.84"),
+            PostStopOutcome::RolledBack { .. }
+        ));
+    }
+
+    #[test]
+    fn commit_succeeds_even_when_the_blob_cannot_be_verified() {
+        // Reclamation is best-effort: an unreadable blob must be left alone and
+        // must not change (or fail) the commit outcome.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        setup_probation(dir, "0.2.84", "0.2.83");
+        // A directory at the blob path: exists, but hashing it fails.
+        std::fs::remove_file(known_good_path(dir)).unwrap();
+        std::fs::create_dir(known_good_path(dir)).unwrap();
+
+        assert_eq!(commit_probation_at(dir, "0.2.84"), CommitOutcome::Committed);
+
+        assert!(read_probation_at(dir).is_none(), "commit still happened");
+        assert!(
+            known_good_path(dir).is_dir(),
+            "an unverifiable blob is left in place, never removed on a guess"
+        );
+    }
+
+    #[test]
+    fn next_install_recaptures_a_fresh_blob_after_commit_reclaimed_it() {
+        // End-to-end: the reclaim must not break the NEXT update cycle. From a
+        // state where the blob is ABSENT (not merely stale),
+        // prepare_known_good_for_install_at has to capture the live binary
+        // fresh, label it the version being replaced, and produce a rollback
+        // target that actually restores.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let live = setup_probation(dir, "0.2.84", "0.2.83");
+        assert_eq!(commit_probation_at(dir, "0.2.84"), CommitOutcome::Committed);
+        assert!(!known_good_path(dir).exists(), "blob reclaimed at commit");
+        assert!(read_probation_at(dir).is_none());
+
+        // The next install snapshots the (now proven-good) 0.2.84 binary.
+        let (meta, previous) = prepare_known_good_for_install_at(dir, "0.2.84", &live).unwrap();
+        assert_eq!(previous, "0.2.84", "fresh capture is labelled 0.2.84");
+        assert_eq!(std::fs::read(known_good_path(dir)).unwrap(), b"BAD-BINARY");
+        let (size, hash) = sha256_file(&known_good_path(dir)).unwrap();
+        assert_eq!(meta.size, size);
+        assert_eq!(meta.sha256, hash);
+
+        // Arm 0.2.85 over it and confirm the fresh target really restores.
+        write_dummy_binary(&live, b"WORSE-BINARY");
+        begin_probation_at(dir, "0.2.85", &previous, &live, &meta).unwrap();
+        for _ in 0..ROLLBACK_CRASH_THRESHOLD - 1 {
+            handle_post_stop_at(dir, "101", "0.2.85");
+        }
+        let PostStopOutcome::RolledBack {
+            restored_version,
+            bad_version,
+        } = handle_post_stop_at(dir, "101", "0.2.85")
+        else {
+            panic!("expected RolledBack");
+        };
+        assert_eq!(restored_version, "0.2.84");
+        assert_eq!(bad_version, "0.2.85");
+        assert_eq!(std::fs::read(&live).unwrap(), b"BAD-BINARY");
     }
 
     #[test]
