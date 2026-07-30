@@ -15257,6 +15257,266 @@ fn test_summary_first_put_reverse_delta_converges_originator() {
 }
 
 // =============================================================================
+// Hash-first summary exchange (#4965) — behavioral simulation test
+// =============================================================================
+//
+// Unlike the summary-first PUT sims above, hash-first is ON by default in every
+// simulation (`SimNetwork::SIM_MIGRATION_ENABLED_FLOOR`): it changes only the
+// ENCODING of an exchange every sim already runs, with identical convergence
+// semantics, so defaulting it on costs unrelated sims nothing and gives a
+// version-gated wire change integration coverage BEFORE the release that lifts
+// the crate version past its production floor. This test states its premise
+// explicitly at the call site anyway, so a future edit to that default cannot
+// silently make it vacuous.
+
+/// **A/B falsifier: hash-first must ship strictly fewer summary bytes without
+/// costing more messages, and without changing what the network converges to.**
+///
+/// Runs the SAME seed, topology and operations twice — once with the hash-first
+/// exchange enabled, once pinned to the pre-0.2.116 full-bytes fallback.
+///
+/// # Why this test exists
+///
+/// Everything else in this PR proves hash-first BREAKS nothing. Nothing else
+/// proves it HELPS. The whole change is justified by a bandwidth saving, and
+/// until something measures that saving end-to-end it is a hypothesis.
+///
+/// # Why bytes alone would be the wrong assertion
+///
+/// Hash-first trades bytes for messages on the mismatch path: one `Summaries`
+/// becomes `SummaryDigests` -> `SummaryRequest` -> `Summaries`. #4861
+/// established per-peer broadcast MESSAGES/s — not bytes — as the load-bearing
+/// storm signal, so a version that halved bytes while multiplying messages
+/// would regress the exact axis that caused the storm. Both are asserted.
+///
+/// # Why an absolute "zero summary bytes" assertion would be wrong
+///
+/// `RemoteConnection::remote_protoc_version` is `None` on the joiner->gateway
+/// path (the gateway's `AckConnection` carries no version), so a regular node
+/// never learns its gateway's version, fails closed, and keeps sending
+/// full-bytes `Summaries` UP to its gateway while receiving digests DOWN from
+/// it. That makes this topology a genuine mixed-encoding link — which is the
+/// production rollout shape, and convergence across it is worth having.
+#[test_log::test]
+fn test_hash_first_summaries_ships_fewer_bytes_and_still_converges() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    const SEED: u64 = 0x4965_5F01_CAFE;
+
+    struct Run {
+        digest_msgs: u64,
+        full_msgs: u64,
+        full_bytes: u64,
+        byte_requests: u64,
+        agree_single: u64,
+        agree_multi: u64,
+        mismatch_single: u64,
+        mismatch_multi: u64,
+        hosting: Vec<String>,
+    }
+
+    impl Run {
+        /// Every message the summary exchange put on the wire, both encodings.
+        /// The #4861 axis: a byte saving bought with a message multiplication
+        /// is not a saving.
+        fn exchange_msgs(&self) -> u64 {
+            self.digest_msgs + self.full_msgs + self.byte_requests
+        }
+    }
+
+    fn run(name: &str, hash_first: bool) -> Run {
+        setup_deterministic_state(SEED);
+        let rt = create_runtime();
+
+        let gateway = NodeLabel::gateway(name, 0);
+        let node1 = NodeLabel::node(name, 1);
+
+        let contract = SimOperation::create_test_contract(0x49);
+        let contract_key = contract.key();
+        let state = SimOperation::create_test_state(0x49);
+
+        let mut sim = rt.block_on(async { SimNetwork::new(name, 1, 1, 7, 3, 10, 2, SEED).await });
+        if hash_first {
+            sim.enable_hash_first_summaries();
+        } else {
+            sim.disable_hash_first_summaries();
+        }
+
+        // Subscribe makes node1 an interested peer; the UPDATE then drives the
+        // proactive summary notification — the send site that fires on every
+        // state change to every interested peer, and the one hash-first is
+        // most meant to shrink.
+        let operations = vec![
+            ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: state.clone(),
+                    subscribe: true,
+                },
+            ),
+            ScheduledOperation::new(
+                node1.clone(),
+                SimOperation::Subscribe {
+                    contract_id: *contract_key.id(),
+                },
+            ),
+            ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Update {
+                    key: contract_key,
+                    data: SimOperation::create_test_state(0x4A),
+                },
+            ),
+        ];
+
+        let result = sim.run_controlled_simulation(
+            SEED,
+            operations,
+            Duration::from_secs(120),
+            Duration::from_secs(30),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "hash-first sim ({name}) failed: {:?}",
+            result.turmoil_result.err()
+        );
+
+        // Strip the per-run network-name prefix. `NodeLabel` renders as
+        // `<network>-gateway-0`, and the two runs necessarily use DIFFERENT
+        // network names (turmoil keys its DNS on them), so comparing raw
+        // labels compares the run names and can never match. What is being
+        // compared is which ROLES converged, not what the networks were
+        // called.
+        let prefix = format!("{name}-");
+        let mut hosting: Vec<String> = result
+            .node_storages
+            .iter()
+            .filter(|(_, s)| s.get_stored_state(&contract_key).is_some())
+            .map(|(label, _)| {
+                let full = label.to_string();
+                full.strip_prefix(&prefix).unwrap_or(&full).to_string()
+            })
+            .collect();
+        hosting.sort();
+
+        Run {
+            digest_msgs: GlobalTestMetrics::summary_digest_msgs(),
+            full_msgs: GlobalTestMetrics::summary_full_msgs(),
+            full_bytes: GlobalTestMetrics::summary_full_bytes(),
+            byte_requests: GlobalTestMetrics::summary_byte_requests(),
+            agree_single: GlobalTestMetrics::summary_digest_agreements_single(),
+            agree_multi: GlobalTestMetrics::summary_digest_agreements_multi(),
+            mismatch_single: GlobalTestMetrics::summary_digest_mismatches_single(),
+            mismatch_multi: GlobalTestMetrics::summary_digest_mismatches_multi(),
+            hosting,
+        }
+    }
+
+    let on = run("hash-first-on", true);
+    let off = run("hash-first-off", false);
+
+    tracing::info!(
+        on_digest_msgs = on.digest_msgs,
+        on_full_msgs = on.full_msgs,
+        on_full_bytes = on.full_bytes,
+        on_byte_requests = on.byte_requests,
+        on_exchange_msgs = on.exchange_msgs(),
+        on_agree_single = on.agree_single,
+        on_agree_multi = on.agree_multi,
+        on_mismatch_single = on.mismatch_single,
+        on_mismatch_multi = on.mismatch_multi,
+        off_full_msgs = off.full_msgs,
+        off_full_bytes = off.full_bytes,
+        off_exchange_msgs = off.exchange_msgs(),
+        "hash-first A/B counters"
+    );
+
+    // ---- PREMISES, asserted before any conclusion is drawn ----
+    //
+    // Without these, two runs that both did the same thing produce an
+    // equal-bytes result that reads as "no regression" rather than "the test
+    // never exercised the feature". That is the vacuous-test shape.
+    assert_eq!(
+        off.digest_msgs, 0,
+        "premise: the pinned-fallback run must emit NO SummaryDigests. If it \
+         does, disable_hash_first_summaries is not taking effect and every \
+         comparison below is meaningless"
+    );
+    assert!(
+        on.digest_msgs > 0,
+        "premise: the enabled run must emit SummaryDigests. Zero means the \
+         hash-first path never ran — the exact way this test would go quiet \
+         if the sim default or the version gate changed underneath it"
+    );
+    assert!(
+        off.full_bytes > 0,
+        "premise: the fallback run must actually ship summary bytes, or there \
+         is no baseline to improve on"
+    );
+    assert!(
+        !off.hosting.is_empty(),
+        "premise: at least one peer must host the contract, or the convergence \
+         comparison is between two empty sets"
+    );
+
+    // ---- THE CLAIM ----
+    assert!(
+        on.full_bytes < off.full_bytes,
+        "hash-first must ship strictly FEWER summary bytes for identical work \
+         ({} enabled vs {} fallback). This is the entire justification for the \
+         wire change; if it does not hold, the change is not paying for itself.",
+        on.full_bytes,
+        off.full_bytes
+    );
+
+    // ---- ...WITHOUT PAYING FOR IT IN MESSAGES (#4861) ----
+    assert!(
+        on.exchange_msgs() <= off.exchange_msgs(),
+        "hash-first must not cost MORE summary-exchange messages than the \
+         fallback ({} enabled vs {} fallback). #4861 established per-peer \
+         messages/s as the load-bearing storm signal, so a byte saving bought \
+         with a message multiplication would regress the axis that caused the \
+         storm.",
+        on.exchange_msgs(),
+        off.exchange_msgs()
+    );
+
+    // ---- WHERE THE SAVING COMES FROM ----
+    assert!(
+        on.agree_single + on.agree_multi > 0,
+        "the enabled run must settle at least one contract by digest agreement \
+         — that is the mechanism; a run that saved bytes with zero agreements \
+         saved them for some other reason and this test would be measuring the \
+         wrong thing"
+    );
+    assert_eq!(
+        off.agree_single + off.agree_multi,
+        0,
+        "the fallback run cannot agree by digest — it never sends one"
+    );
+
+    // ---- CONVERGENCE IS UNAFFECTED ----
+    // Guard the normalisation itself. If `NodeLabel`'s rendering changes so the
+    // prefix no longer strips, both sides stay run-scoped and the equality
+    // below fails loudly — fine. The dangerous direction is the other one: if
+    // both sides normalised to the same constant, the comparison would pass
+    // vacuously. Requiring a recognisable role name rules that out.
+    assert!(
+        on.hosting.iter().any(|l| l.contains("gateway")),
+        "convergence labels should be role-scoped after stripping the run \
+         prefix, got {:?} — the normalisation is not doing what it claims",
+        on.hosting
+    );
+    assert_eq!(
+        on.hosting, off.hosting,
+        "the same peers must end up hosting the contract under both encodings \
+         — hash-first changes how summaries are ADVERTISED, never what the \
+         network converges to"
+    );
+}
+
+// =============================================================================
 // NEAREST-NEIGHBOR RING LATTICE — validation + regression (feat(topology)).
 //
 // The lattice SEEKS AND TIGHTENS each peer's closest connected SUCCESSOR (higher
