@@ -1,5 +1,5 @@
-use std::process::Command;
 use chrono::TimeZone;
+use std::process::Command;
 
 fn main() {
     // Emit build metadata for startup logging
@@ -111,22 +111,27 @@ fn read_min_compatible_from_cargo_toml() -> Option<String> {
 
 fn emit_build_metadata() {
     // Git commit hash
-    let git_hash = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    let git_hash = std::env::var("FREENET_GIT_COMMIT_HASH").unwrap_or_else(|_| {
+        Command::new("git")
+            .args(["rev-parse", "--short=12", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    });
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
 
     // Git dirty flag
-    let git_dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+    let git_dirty = match std::env::var("FREENET_GIT_IS_DIRTY") {
+        Ok(v) if !v.is_empty() => true,
+        _ => Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false),
+    };
     let dirty_suffix = if git_dirty { "-dirty" } else { "" };
     println!("cargo:rustc-env=GIT_DIRTY={dirty_suffix}");
 

@@ -11,12 +11,25 @@
       flake-utils,
       ...
     }:
+    let
+      inherit (nixpkgs) lib;
+    in
     {
       overlays.default = _: pkgs: {
-        freenet = pkgs.callPackage (import ./package.nix) { };
+        freenet = pkgs.callPackage (import ./package.nix) {
+          gitDirty = !(self ? rev);
+          gitCommitHash =
+            if self ? rev then
+              lib.substring 0 12 self.rev
+            else
+              lib.substring 0 12 (lib.removeSuffix "-dirty" self.dirtyRev);
+        };
         freenet-autoupdate = pkgs.writeShellApplication {
           name = "freenet-autoupdate";
-          runtimeInputs = [ pkgs.gh pkgs.nix ];
+          runtimeInputs = [
+            pkgs.gh
+            pkgs.nix
+          ];
           text = ''
             while true; do
                 vsn="$(gh release view --repo freenet/freenet-core \
