@@ -6920,4 +6920,53 @@ mod tests {
         }
         panic!("unterminated body for {signature_prefix}");
     }
+    /// Regression test for #5038: when both `config.toml` and `config.bak.toml`
+    /// exist in the same directory, `read_config` must prefer the exact match
+    /// over any fuzzy-matching backup file. The old single-pass `find_map` over
+    /// `read_dir` relied on non-deterministic iteration order and could silently
+    /// pick up `config.bak.toml` instead of the real config.
+    #[test]
+    fn read_config_prefers_exact_config_toml_over_backup() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+
+        let exact_toml = "mode = \"local\"\nlog_level = \"debug\"\n";
+        let backup_toml = "mode = \"local\"\nlog_level = \"trace\"\n";
+
+        fs::write(dir.join("config.toml"), exact_toml).unwrap();
+        fs::write(dir.join("config.bak.toml"), backup_toml).unwrap();
+
+        let config = ConfigArgs::read_config(&dir.to_path_buf())
+            .expect("read_config should succeed")
+            .expect("a config file should be found");
+
+        assert_eq!(
+            config.log_level,
+            tracing::log::LevelFilter::Debug,
+            "read_config must load config.toml (log_level = debug), not config.bak.toml (trace)"
+        );
+    }
+
+    /// When only a backup-style name exists (no exact `config.toml` or
+    /// `config.json`), the fuzzy fallback must still find it.
+    #[test]
+    fn read_config_fuzzy_fallback_when_no_exact_match() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+
+        let backup_toml = "mode = \"local\"\nlog_level = \"warn\"\n";
+
+        fs::write(dir.join("config.bak.toml"), backup_toml).unwrap();
+
+        let config = ConfigArgs::read_config(&dir.to_path_buf())
+            .expect("read_config should succeed")
+            .expect("a config file should be found");
+
+        assert_eq!(
+            config.log_level,
+            tracing::log::LevelFilter::Warn,
+            "fuzzy fallback should pick up config.bak.toml when no exact match exists"
+        );
+    }
+
 }
