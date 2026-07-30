@@ -543,32 +543,53 @@ impl ConfigArgs {
         if !dir.exists() {
             return Ok(None);
         }
-        let mut read_dir = std::fs::read_dir(dir)?;
-        let config_args: Option<(String, String)> = read_dir.find_map(|e| {
-            if let Ok(e) = e {
-                if e.path().is_dir() {
-                    return None;
-                }
-                let filename = e.file_name().to_string_lossy().into_owned();
-                let ext = filename.rsplit('.').next().map(|s| s.to_owned());
-                if let Some(ext) = ext {
-                    if filename.starts_with("config") {
-                        match ext.as_str() {
-                            "toml" => {
-                                tracing::debug!(filename = %filename, "Found configuration file");
-                                return Some((filename, ext));
+
+        // Prefer an exact `config.toml` / `config.json` match over any other
+        // `config*` name (e.g. `config.bak.toml`). `read_dir`'s iteration order
+        // is not guaranteed, so the fuzzy fallback below could otherwise
+        // silently pick up a backup file instead of the real config. This pass
+        // deliberately does not touch `read_dir` at all, so it is immune to
+        // iteration-order nondeterminism by construction rather than by luck
+        // — which is what `read_config_finds_exact_config_without_listing_the_directory`
+        // pins. (#5038)
+        const EXACT_NAMES: &[(&str, &str)] = &[("config.toml", "toml"), ("config.json", "json")];
+        let mut config_args: Option<(String, String)> = None;
+        for (filename, ext) in EXACT_NAMES {
+            if dir.join(filename).is_file() {
+                tracing::debug!(filename = %filename, "Found exact configuration file");
+                config_args = Some((filename.to_string(), ext.to_string()));
+                break;
+            }
+        }
+
+        if config_args.is_none() {
+            let mut read_dir = std::fs::read_dir(dir)?;
+            config_args = read_dir.find_map(|e| {
+                if let Ok(e) = e {
+                    if e.path().is_dir() {
+                        return None;
+                    }
+                    let filename = e.file_name().to_string_lossy().into_owned();
+                    let ext = filename.rsplit('.').next().map(|s| s.to_owned());
+                    if let Some(ext) = ext {
+                        if filename.starts_with("config") {
+                            match ext.as_str() {
+                                "toml" => {
+                                    tracing::debug!(filename = %filename, "Found configuration file (fuzzy)");
+                                    return Some((filename, ext));
+                                }
+                                "json" => {
+                                    return Some((filename, ext));
+                                }
+                                _ => {}
                             }
-                            "json" => {
-                                return Some((filename, ext));
-                            }
-                            _ => {}
                         }
                     }
                 }
-            }
 
-            None
-        });
+                None
+            });
+        }
 
         match config_args {
             Some((filename, ext)) => {
