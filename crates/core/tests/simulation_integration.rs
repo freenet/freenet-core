@@ -3392,6 +3392,185 @@ fn test_sustained_update_fanout_no_full_state_storm() {
     );
 }
 
+/// #4965 sibling of the star test above, on a topology where the co-host
+/// exclusion is not a no-op.
+///
+/// ## Why the star test cannot catch a regression here
+///
+/// `test_sustained_update_fanout_no_full_state_storm` is 1 gateway + 2 DIRECT
+/// subscribers. Each subscriber's only advertised co-host is the gateway — and
+/// the gateway is the update's sender, so it was ALREADY excluded from the
+/// proactive summary notification long before #4965. In that topology the new
+/// exclusion removes nobody. Any regression in it is structurally invisible
+/// there, no matter how many updates the test drives.
+///
+/// ## The topology this needs
+///
+/// 1 gateway + 3 peers, ALL subscribed, with `max_connections` wide enough for
+/// the peers to connect to each other as well as to the gateway. Every peer
+/// then hosts the contract and announces it (`HostingAnnounce`), so each peer's
+/// advertised co-host set contains the OTHER PEERS, not just the sender. When
+/// a peer applies a relayed broadcast and fires its proactive notification, the
+/// #4965 exclusion now drops real recipients — which is exactly the thing under
+/// test.
+///
+/// ## What the metric means here
+///
+/// A peer's broadcast to a neighbor is a DELTA only while it holds a cached
+/// summary for that neighbor. The standalone `Summaries` notification and the
+/// broadcast's own `sender_summary_bytes` are the two paths that seed that
+/// cache. #4965 removes the first for co-hosts on the claim that the second
+/// already covers them. If that claim is wrong — the exclusion over-excludes,
+/// or the broadcast that was supposed to carry the summary never happens — the
+/// peers stop seeding each other's summaries and their broadcasts fall back to
+/// full state. So `delta_sends > full_state_sends` is the discriminator, the
+/// same one the star test uses, on a topology where it is actually sensitive.
+///
+/// ## Premise checks (without these the assertion is vacuous)
+///
+/// - `neighbor_hosting_updates() > 0`: the peers really exchanged hosting
+///   advertisements. If they never did, no peer has any advertised co-host,
+///   the exclusion removes nobody, and the test degenerates into the star case
+///   it exists to improve on.
+/// - `delta_sends + full_state_sends > 0`: broadcasts actually happened.
+#[test_log::test]
+#[cfg(feature = "simulation_tests")]
+fn test_cohost_mesh_update_fanout_stays_delta_dominated() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4965_0001_0001;
+    const NETWORK_NAME: &str = "i4965-cohost-mesh";
+    // Three peers so each has TWO non-sender co-hosts; with two, a peer's only
+    // co-host besides the sender is the single other peer, which makes the
+    // exclusion much thinner.
+    const PEERS: usize = 3;
+    const SUSTAINED_UPDATES: usize = 20;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,     // 1 gateway (the update source)
+            PEERS, // peers that all subscribe AND co-host
+            7,     // max_htl
+            3,     // rnd_if_htl_above
+            // Wide enough that the peers connect to EACH OTHER, not just to the
+            // gateway. This is the whole point: at a narrower cap a pure star
+            // forms and every peer's only co-host is the sender, reproducing the
+            // blind spot this test exists to cover.
+            10, // max_connections
+            2,  // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // CRDT contract so post-bootstrap broadcasts compute real version-aware
+    // deltas — a plain hash contract's "delta" is full state, which would make
+    // the delta/full crossover meaningless.
+    let contract = SimOperation::create_test_contract(0x49);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let initial_state = SimOperation::create_crdt_state(1, 0x10);
+    let mut operations = Vec::new();
+
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: initial_state,
+            subscribe: true,
+        },
+    ));
+    for node_idx in 1..=PEERS {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, node_idx),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    for v in 0..SUSTAINED_UPDATES {
+        let version = (v as u64) + 2;
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(version, 0x20 + v as u8),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence =
+        rt.block_on(async { freenet::dev_tool::check_convergence_from_logs(&logs_handle).await });
+    let delta_sends = GlobalTestMetrics::delta_sends();
+    let full_state_sends = GlobalTestMetrics::full_state_sends();
+    let hosting_updates = GlobalTestMetrics::neighbor_hosting_updates();
+
+    tracing::info!(
+        "i4965 cohost mesh: delta_sends={}, full_state_sends={}, \
+         neighbor_hosting_updates={}, converged={}/{}",
+        delta_sends,
+        full_state_sends,
+        hosting_updates,
+        convergence.converged.len(),
+        convergence.total_contracts(),
+    );
+
+    // PREMISE 1: the peers really registered as each other's co-hosts. Without
+    // this the #4965 exclusion drops nobody and the assertion below is vacuous
+    // — the exact defect that makes the star test unable to guard this change.
+    assert!(
+        hosting_updates > 0,
+        "premise: no hosting advertisements were exchanged, so no peer has an \
+         advertised co-host and the #4965 exclusion is a no-op here. This test \
+         would then prove nothing about the change it guards."
+    );
+
+    // PREMISE 2: broadcasts actually happened.
+    assert!(
+        delta_sends + full_state_sends > 0,
+        "premise: no broadcasts were recorded — the fan-out scenario did not run"
+    );
+
+    // THE DISCRIMINATOR.
+    assert!(
+        delta_sends > full_state_sends,
+        "#4965 REGRESSION: co-hosting peers stopped seeding each other's \
+         summaries, so broadcasts fell back to full state: \
+         delta_sends={delta_sends} <= full_state_sends={full_state_sends}. \
+         Either the notification exclusion drops peers the broadcast does NOT \
+         cover, or the broadcast that was supposed to carry \
+         `sender_summary_bytes` never ran for them."
+    );
+
+    assert!(
+        convergence.is_converged(),
+        "#4965: peers failed to converge under sustained fan-out. \
+         {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len(),
+    );
+}
+
 // =============================================================================
 // #4233: Event-loop liveness under wide-star sustained UPDATE fan-out
 // =============================================================================
