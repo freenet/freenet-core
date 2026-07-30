@@ -396,18 +396,18 @@ struct Window {
     /// convention every future call site has to honour — but it is asserted
     /// anyway (`summaries_sub_arms_reconcile_with_the_parent_arm`), since a
     /// silently non-reconciling split is worse than no split.
-    summaries_msgs: [u64; 5],
-    summaries_bytes: [u64; 5],
-    summaries_max_bytes: [u64; 5],
+    summaries_msgs: [u64; SUMMARIES_ARMS.len()],
+    summaries_bytes: [u64; SUMMARIES_ARMS.len()],
+    summaries_max_bytes: [u64; SUMMARIES_ARMS.len()],
     /// Total `SummaryEntry` count across the window's messages, per sub-arm.
     /// Divided by `summaries_msgs` this gives mean entries per message, the
     /// independent check that a call site is labelled correctly — see
     /// [`SummariesDetail::entries`].
-    summaries_entries: [u64; 5],
+    summaries_entries: [u64; SUMMARIES_ARMS.len()],
     /// Largest single message's entry count, per sub-arm. Separates "every
     /// reply is moderately wide" from "one peer shares 400 contracts with us",
     /// which the mean cannot.
-    summaries_max_entries: [u64; 5],
+    summaries_max_entries: [u64; SUMMARIES_ARMS.len()],
     /// InterestSync summary comparisons where both sides held a summary and
     /// the bytes were IDENTICAL. See [`OutboundMix::record_summary_comparison`].
     summary_entries_identical: u64,
@@ -1237,7 +1237,10 @@ mod tests {
         record_summaries(&mix, SummariesEmitter::InterestsReply, 4, 200);
         record_summaries(&mix, SummariesEmitter::ChangeInterestsReply, 3, 400);
         record_summaries(&mix, SummariesEmitter::Rejection, 1, 800);
-        record_summaries(&mix, SummariesEmitter::Other, 1, 1600);
+        // #4965 legs: the full-bytes answer to a request, and the request.
+        record_summaries(&mix, SummariesEmitter::SummaryRequestReply, 2, 1600);
+        record_summaries(&mix, SummariesEmitter::SummaryRequest, 5, 3200);
+        record_summaries(&mix, SummariesEmitter::Other, 1, 6400);
 
         let w = mix.take_window();
         let bytes_of = |e| w.summaries_bytes[summaries_index(e)];
@@ -1245,7 +1248,9 @@ mod tests {
         assert_eq!(bytes_of(SummariesEmitter::InterestsReply), 200);
         assert_eq!(bytes_of(SummariesEmitter::ChangeInterestsReply), 400);
         assert_eq!(bytes_of(SummariesEmitter::Rejection), 800);
-        assert_eq!(bytes_of(SummariesEmitter::Other), 1600);
+        assert_eq!(bytes_of(SummariesEmitter::SummaryRequestReply), 1600);
+        assert_eq!(bytes_of(SummariesEmitter::SummaryRequest), 3200);
+        assert_eq!(bytes_of(SummariesEmitter::Other), 6400);
 
         for emitter in SUMMARIES_ARMS {
             assert_eq!(
@@ -1551,8 +1556,34 @@ mod tests {
 
         // file → the arms it tags, one entry per DISTINCT arm.
         let expected_arms: BTreeMap<&str, Vec<&str>> = [
-            ("node.rs", vec!["ChangeInterestsReply", "InterestsReply"]),
+            (
+                "node.rs",
+                // #4965 added SummaryRequestReply: the full-bytes answer to a
+                // `SummaryRequest`, the one full-bytes send hash-first ADDS
+                // rather than replaces.
+                vec![
+                    "ChangeInterestsReply",
+                    "InterestsReply",
+                    "SummaryRequestReply",
+                ],
+            ),
             ("operations/update.rs", vec!["Notification", "Rejection"]),
+            // The rollup's own index/stem tables name every arm. Listing them
+            // here means adding a `SummariesEmitter` variant without wiring it
+            // a telemetry stem fails this pin rather than silently reporting
+            // under a neighbouring field.
+            (
+                "node/network_bridge/outbound_message_mix.rs",
+                vec![
+                    "ChangeInterestsReply",
+                    "InterestsReply",
+                    "Notification",
+                    "Other",
+                    "Rejection",
+                    "SummaryRequest",
+                    "SummaryRequestReply",
+                ],
+            ),
         ]
         .into_iter()
         .collect();
@@ -1568,7 +1599,14 @@ mod tests {
         );
 
         let mentions = concat!("InterestMessage::", "Summaries {");
-        let tag = concat!("emitter: ", "SummariesEmitter::");
+        // Bare `SummariesEmitter::`, not `emitter: SummariesEmitter::`.
+        // #4965 centralised construction behind `node::summaries_reply_for_peer`
+        // / `full_summaries_message`, so the arm is now named as a call
+        // ARGUMENT at the emitter site rather than as a struct field. Matching
+        // only the field form would have silently found zero arms in both
+        // emitter files and passed — this pin would have gone quiet at exactly
+        // the moment it became load-bearing.
+        let tag = concat!("SummariesEmitter", "::");
 
         let mut found_files: BTreeSet<String> = Default::default();
         let mut found_arms: BTreeMap<String, Vec<String>> = Default::default();
@@ -1586,8 +1624,24 @@ mod tests {
             let Ok(src) = std::fs::read_to_string(path) else {
                 continue;
             };
-            let prod = strip_cfg_test_regions(&src);
-            if !prod.contains(mentions) {
+            // Strip COMMENT lines before scanning. An emitter site is code;
+            // prose that merely names an arm is not. Without this, a rustdoc
+            // intra-doc link (`[\`SummariesEmitter::Other\`]` in message.rs)
+            // registers as an emitter, and worse, any future doc edit that
+            // mentions an arm trips a pin about wire attribution.
+            let prod_all = strip_cfg_test_regions(&src);
+            let prod: String = prod_all
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // A file counts if it CONSTRUCTS/matches the variant OR merely
+            // NAMES an arm. #4965 moved construction behind
+            // `node::summaries_reply_for_peer`, so `operations/update.rs` now
+            // only names its arms — under the old construct-only test it
+            // dropped out of scope entirely and its two emitters stopped being
+            // pinned, silently.
+            if !prod.contains(mentions) && !prod.contains(tag) {
                 continue;
             }
             found_files.insert(rel.clone());

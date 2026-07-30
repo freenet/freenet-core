@@ -8725,7 +8725,7 @@ mod tests {
                  contain its get_matching_contracts lookup"
             );
             assert!(
-                body.contains("full_summaries_message(entries)"),
+                body.contains("full_summaries_message("),
                 "the SummaryRequest arm must reply through \
                  full_summaries_message — the instrumented full-bytes \
                  constructor"
@@ -8749,7 +8749,7 @@ mod tests {
         fn digest_arm_shares_the_single_heal_path() {
             let src = include_str!("node.rs");
             let arm = src
-                .find("InterestMessage::SummaryDigests { entries } => {")
+                .find("InterestMessage::SummaryDigests { entries, .. } => {")
                 .expect("SummaryDigests arm not found");
             let end = src[arm..]
                 .find("InterestMessage::SummaryRequest { hashes } => {")
