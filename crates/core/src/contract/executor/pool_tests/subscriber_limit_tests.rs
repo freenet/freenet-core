@@ -15,6 +15,7 @@ use crate::contract::executor::{
     SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE,
 };
 use crate::wasm_runtime::MockStateStorage;
+use freenet_stdlib::client_api::ContractResponse;
 
 /// Helper to create a MockWasmRuntime executor (uses production bridged_* paths).
 async fn create_executor() -> Executor<MockWasmRuntime, MockStateStorage> {
@@ -975,6 +976,96 @@ async fn partial_failure_prunes_only_the_dead_subscriber_shared() {
             );
         }
         other => panic!("the live subscriber must receive its notification; got: {other:?}"),
+    }
+}
+
+/// Regression for #4681 mechanism 2: a notification dropped because the
+/// subscriber's channel was FULL must invalidate that client's cached summary,
+/// so the NEXT update resyncs it with full state instead of another delta.
+///
+/// Why this is a correctness bug and not just staleness: deltas are
+/// incremental. A missed delta is never made up by subsequent deltas, so
+/// without the invalidation the subscriber is permanently DIVERGED — silently
+/// wrong, not merely behind. The old code dropped the notification with a WARN
+/// and no recovery of any kind.
+///
+/// The mock runtime returns the full state as its "delta", so the payload bytes
+/// are identical either way; the discriminator is the `UpdateData` VARIANT.
+#[tokio::test(flavor = "current_thread")]
+async fn full_channel_drop_forces_full_state_resync_local() {
+    let mut executor = create_executor().await;
+    let contract = test_contract(b"full_channel_resync_4681");
+    let key = contract.key();
+    let instance_id = *key.id();
+
+    let client_id = ClientId::next();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
+    executor
+        .update_notifications
+        .insert(instance_id, vec![(client_id, tx.clone())]);
+    // A cached summary is what makes this client eligible for DELTAS.
+    executor.subscriber_summaries.insert(
+        instance_id,
+        std::collections::HashMap::from([(
+            client_id,
+            Some(StateSummary::from(vec![1u8, 2, 3]).into_owned()),
+        )]),
+    );
+
+    // Saturate the channel so the next try_send returns Full.
+    for _ in 0..SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE {
+        tx.try_send(Ok(freenet_stdlib::client_api::HostResponse::Ok))
+            .expect("prefill the subscriber channel to capacity");
+    }
+
+    // Update 1: dropped, because the channel is full.
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![7, 7, 7])),
+            RelatedContracts::default(),
+            Some(contract.clone()),
+        )
+        .await
+        .expect("store contract");
+
+    assert!(
+        executor
+            .subscriber_summaries
+            .get(&instance_id)
+            .and_then(|s| s.get(&client_id))
+            .expect("the client must stay registered")
+            .is_none(),
+        "a full-channel drop must invalidate the cached summary, otherwise the \
+         next update is another delta and the client stays diverged forever"
+    );
+
+    // Drain, so the next notification can actually be delivered.
+    while rx.try_recv().is_ok() {}
+
+    // Update 2: must be FULL STATE, not a delta.
+    executor
+        .upsert_contract_state(
+            key,
+            either::Either::Left(WrappedState::new(vec![8, 8, 8])),
+            RelatedContracts::default(),
+            Some(contract),
+        )
+        .await
+        .expect("store contract");
+
+    let received = rx.try_recv().expect("the resync notification must arrive");
+    match received {
+        Ok(freenet_stdlib::client_api::HostResponse::ContractResponse(
+            ContractResponse::UpdateNotification { update, .. },
+        )) => {
+            assert!(
+                matches!(update, UpdateData::State(_)),
+                "after a full-channel drop the client must be resynced with FULL \
+                 STATE; got {update:?}, which leaves it diverged"
+            );
+        }
+        other => panic!("expected an UpdateNotification; got {other:?}"),
     }
 }
 

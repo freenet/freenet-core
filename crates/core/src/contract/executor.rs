@@ -79,6 +79,59 @@ pub(crate) const MAX_DELTA_COMPUTATIONS_PER_FANOUT: usize = 32;
 /// contracts with high fan-out before they hit the hard cap.
 pub(crate) const FANOUT_WARNING_THRESHOLD: usize = 50;
 
+/// Process-global counters for local `UpdateNotification` delivery outcomes
+/// (#4681).
+///
+/// These exist because the per-occurrence logs cannot serve this purpose in
+/// production. The "no local subscriber" case is `debug!`, which
+/// `release_max_level_info` compiles out of every shipped binary, and warning
+/// on it instead is exactly what produced the 22,413-lines-per-day storm in
+/// #5040. A monotonic counter gives an operator the RATE without either the
+/// spam or the blind spot, and it survives release builds.
+///
+/// Counters, not per-event records: this is read once per router snapshot, so
+/// it adds no per-event telemetry stream.
+pub(crate) mod notification_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A notification was dropped because the subscriber's channel was FULL.
+    /// The subscriber's cached summary is invalidated at the same time so the
+    /// next update resyncs it with full state, so this counts recoveries, not
+    /// permanent losses. A sustained nonzero rate means a client is not
+    /// draining fast enough.
+    static DROPPED_CHANNEL_FULL: AtomicU64 = AtomicU64::new(0);
+
+    /// A notification was dropped because the subscriber's channel was CLOSED.
+    /// The subscriber is unregistered at that point.
+    static DROPPED_CHANNEL_CLOSED: AtomicU64 = AtomicU64::new(0);
+
+    /// A committed update found NO local subscriber for the contract. Normal
+    /// and expected for any contract this node hosts on behalf of the network;
+    /// tracked so its rate is visible without logging it per occurrence.
+    static NO_LOCAL_SUBSCRIBER: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn record_dropped_channel_full() {
+        DROPPED_CHANNEL_FULL.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_dropped_channel_closed() {
+        DROPPED_CHANNEL_CLOSED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_no_local_subscriber() {
+        NO_LOCAL_SUBSCRIBER.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(dropped_channel_full, dropped_channel_closed, no_local_subscriber)`.
+    pub(crate) fn snapshot() -> (u64, u64, u64) {
+        (
+            DROPPED_CHANNEL_FULL.load(Ordering::Relaxed),
+            DROPPED_CHANNEL_CLOSED.load(Ordering::Relaxed),
+            NO_LOCAL_SUBSCRIBER.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Maximum delegate creation chain depth (A creates B creates C...).
 /// Prevents recursive fork-bomb attacks via delegate spawning.
 pub(crate) const MAX_DELEGATE_CREATION_DEPTH: u32 = 4;

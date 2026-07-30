@@ -1759,6 +1759,13 @@ impl Ring {
             // (CPU / broadcast fan-out) dominated the node's total. Nonzero =
             // the trigger is firing; runaway = floors/share miscalibrated.
             snapshot.hosting_cost_evictions_total = Some(hosting.cost_evictions_total);
+            // Local notification-delivery outcomes (#4681). Process-global
+            // counters, read once per snapshot — no per-event stream.
+            let (notif_full, notif_closed, notif_none) =
+                crate::contract::notification_stats::snapshot();
+            snapshot.notifications_dropped_channel_full = Some(notif_full);
+            snapshot.notifications_dropped_channel_closed = Some(notif_closed);
+            snapshot.notifications_no_local_subscriber = Some(notif_none);
             // Phantom-hosting falsifier (SUBSCRIBE-retirement step 10 §1d):
             // current count of contracts in-use via a downstream subscriber with
             // NO state on disk (contract_in_use && !contract_state_present). After
