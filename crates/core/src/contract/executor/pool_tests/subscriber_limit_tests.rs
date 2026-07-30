@@ -1157,6 +1157,80 @@ async fn full_channel_drop_forces_full_state_resync_shared() {
     }
 }
 
+/// Source-scrape pin for the #4681 delivery counters.
+///
+/// Why a source pin: every recorder call is gated behind
+/// `if let Some(op_manager) = self.op_manager.as_ref()`, and every executor in
+/// this suite is built by `Executor::new_mock_wasm(.., None, None)` — i.e.
+/// `op_manager = None`. So no behavioral test here can enter the counting
+/// branch, and removing all three calls would leave the suite green. The
+/// gauge test pins only JSON serialization of hand-stamped fields; it never
+/// runs the counting logic.
+///
+/// The PR's own claim is that these counters are the only production visibility
+/// into local notification delivery, so an untested recording path is exactly
+/// the gap worth pinning. Asserts each recorder is called from the arm that
+/// owns it, in BOTH the shared and local fan-out branches.
+#[test]
+fn notification_delivery_counters_are_recorded_from_their_arms() {
+    let whole = include_str!("../runtime/executor_impl.rs");
+    let squash = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+
+    // Scope to `send_update_notification`. The file has a THIRD
+    // `TrySendError::Full` arm, on the delegate-notification path, which is a
+    // different concern with its own counter — an unscoped scrape picks it up
+    // and the pin fails on correct code.
+    let fn_start = whole
+        .find("async fn send_update_notification(")
+        .expect("send_update_notification not found");
+    let fn_end = whole[fn_start..]
+        .find("mod full_state_version_gate_pins")
+        .expect("end-of-function anchor not found")
+        + fn_start;
+    let src = &whole[fn_start..fn_end];
+
+    // Each `Full` arm runs from its match pattern to the `Closed` pattern that
+    // follows it. Two fan-out branches => two of each.
+    let full_arms: Vec<&str> = src
+        .match_indices("Err(mpsc::error::TrySendError::Full(_)) => {")
+        .map(|(i, _)| {
+            let rest = &src[i..];
+            let end = rest
+                .find("Err(mpsc::error::TrySendError::Closed(_))")
+                .expect("a Full arm must be followed by the Closed arm");
+            &rest[..end]
+        })
+        .collect();
+    assert_eq!(
+        full_arms.len(),
+        2,
+        "expected the shared and local fan-out branches to each have a Full arm"
+    );
+    for arm in &full_arms {
+        assert!(
+            squash(arm).contains("record_notification_dropped_channel_full()"),
+            "each full-channel drop must be counted; without it the only \
+             production visibility into this drop disappears silently"
+        );
+    }
+
+    assert_eq!(
+        squash(src)
+            .matches("record_notification_dropped_channel_closed()")
+            .count(),
+        2,
+        "both fan-out branches must count closed-channel drops"
+    );
+    assert_eq!(
+        squash(src)
+            .matches("record_notification_no_local_subscriber()")
+            .count(),
+        2,
+        "both fan-out branches must count the no-local-subscriber case — this is \
+         the counter that replaced the diagnostic #5040 had to remove"
+    );
+}
+
 /// Source-scrape pin for the #5040 TOCTOU fix in
 /// `RuntimePool::register_contract_notifier`.
 ///
