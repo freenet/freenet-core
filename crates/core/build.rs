@@ -1,4 +1,5 @@
 use std::process::Command;
+use chrono::TimeZone;
 
 fn main() {
     // Emit build metadata for startup logging
@@ -130,8 +131,21 @@ fn emit_build_metadata() {
     println!("cargo:rustc-env=GIT_DIRTY={dirty_suffix}");
 
     // Build timestamp (ISO 8601)
-    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let now = match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(val) => {
+            let epoch: i64 = val
+                .parse()
+                .unwrap_or_else(|_| panic!("SOURCE_DATE_EPOCH ({val}) is not a valid integer"));
+            chrono::Utc
+                .timestamp_opt(epoch, 0)
+                .single()
+                .unwrap_or_else(|| panic!("SOURCE_DATE_EPOCH ({val}) is not a valid timestamp"))
+        }
+        Err(_) => chrono::Utc::now(),
+    };
+    let timestamp = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     println!("cargo:rustc-env=BUILD_TIMESTAMP={timestamp}");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
     // Rebuild if git HEAD changes
     println!("cargo:rerun-if-changed=.git/HEAD");
